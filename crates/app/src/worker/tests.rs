@@ -83,10 +83,13 @@ fn settled(w: &SimWorker) -> Snapshot {
 }
 
 /// The headless context for the GPU backend tests (`None` without an adapter: they skip).
+/// Also sets the providers' dimer-gate backend to it (M7 Task 11), as `main` does with the window's device: a test
+/// whose scene needs pseudo-H or pseudo-He generates them on the GPU (≈ 1 min), never on the CPU fallback (≈ 40 min).
 pub(crate) fn gpu_ctx() -> Option<GpuContext> {
     let c = GpuContext::new_headless();
-    if c.is_none() {
-        eprintln!("no GPU adapter: skipping the GPU backend");
+    match &c {
+        Some(c) => providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(c.clone())),
+        None => eprintln!("no GPU adapter: skipping the GPU backend"),
     }
     c
 }
@@ -2118,6 +2121,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         density_label: None,
         orbital_label: None,
         orbital_waiting: false,
+        pseudo_generating: None,
         draft_banner: None,
         bonds_label: None,
         probe: None,
@@ -2179,12 +2183,13 @@ fn replays_pass() {
         .collect();
     scripts.sort();
     assert!(scripts.len() >= 10, "{} scripts in {}", scripts.len(), dir.display());
-    // every script pins the grid and the walls it was written for (the merge of main, 2026-10-14:
-    // the app's defaults became Accurate 81³ and walls on), so it never depends on the defaults
+    // every script pins the grid, the walls and (M7 Task 9) the ionic policy it was written for (the merge
+    // of main, 2026-10-14: the app's defaults became Accurate 81³ and walls on; M7: cores only), so it
+    // never depends on the defaults
     for s in &scripts {
         let text = std::fs::read_to_string(s).unwrap();
-        for pin in ["action quality ", "action walls "] {
-            assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's grid and walls)", s.display());
+        for pin in ["action ionic ", "action quality ", "action walls "] {
+            assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's ionic policy, grid and walls)", s.display());
         }
     }
     let mut failed = Vec::new();
@@ -2887,4 +2892,125 @@ fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
         s.dynamics.orbitals.as_ref().and_then(|o| o.unoccupied.as_ref()).is_some_and(|u| u.requested == 2 && u.current)
     });
     assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
+}
+
+// ---- pseudopotentials through the worker (M7 Task 9) ----
+
+/// Spec §8 row 9: the worker generates a species' pseudopotential on first use (a note in the
+/// snapshot's EvalStats) and reuses the process-wide cache afterwards; O is pseudised, H is not
+/// (CoresOnly), and the energy readout's species list says so.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn worker_generates_on_first_use_and_caches() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let mut s = Scene::preset("h2o").unwrap();
+    s.ionic = sim::IonicPolicy::CoresOnly;
+    (s.grid_n, s.grid_h) = (81, 0.15);
+    // (the GPU tests are serialised by `gpu_lock`, and no other test generates a table: this reading is not racy)
+    let had_o = providers::pseudo::cache().lock().unwrap().has_table(8);
+    let w = SimWorker::spawn(s, Backend::Gpu, Some(ctx));
+    let first = settled(&w);
+    assert_eq!(first.dynamics.last_error, None);
+    let zs: Vec<u8> = first.dynamics.eval.pseudised.iter().map(|p| p.z).collect();
+    assert_eq!(zs, vec![8], "CoresOnly: O pseudised, H all-electron");
+    assert!(providers::pseudo::cache().lock().unwrap().has_table(8));
+    if !had_o {
+        assert!(first.dynamics.eval.notes.iter().any(|n| n.contains("generated the O pseudopotential")), "{:?}", first.dynamics.eval.notes);
+    }
+    // the energy is a valence energy (O keeps 6 electrons): far from the all-electron O + 2 H total (about -75 Ha)
+    assert!(first.dynamics.energy_ks > -30.0, "E_KS {}", first.dynamics.energy_ks);
+    w.send(Command::MoveNucleus { index: 1, pos: [1.45, 1.11, 0.0] });
+    let second = idle(&w);
+    assert!(!second.dynamics.eval.notes.iter().any(|n| n.contains("generated the O pseudopotential")), "the second solve reuses the cache: {:?}", second.dynamics.eval.notes);
+}
+
+/// Review NOTE: a policy switch at run time changes E_KS by tens of Ha per pseudised O — the conserved-energy and
+/// drift readouts reset as on a grid change: the run's time, step count and energy history restart.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn policy_switch_resets_the_energy_history() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
+    settled(&w);
+    w.send(Command::Dyn(DynCommand::Step(3)));
+    let stepped = snapshot_until(&w, "three steps", |s| s.dynamics.step >= 3 && !s.working);
+    assert!(stepped.dynamics.history.len() >= 3, "{} history points", stepped.dynamics.history.len());
+    // setup, not the property under test: pseudo-H with its dimer gate (M7 Task 11, ≈ 1 min on the GPU) into the
+    // process cache before the switch, so the switched solve is a solve and not a generation
+    let t0 = Instant::now();
+    let hy = providers::pseudo::table_for(1).expect("pseudo-H generates");
+    eprintln!("pseudo-H for the switch: f = {}, dimer gate: {} ({:.0} s)", hy.f, hy.record.dimer, t0.elapsed().as_secs_f64());
+    w.send(Command::SetIonicPolicy(sim::IonicPolicy::All));
+    let s = snapshot_until(&w, "the switched scene", |s| s.dynamics.scene.ionic == sim::IonicPolicy::All && !s.working);
+    assert_eq!(s.dynamics.scene.ionic, sim::IonicPolicy::All);
+    assert!(s.dynamics.drift_per_ps.is_none(), "the drift history restarts");
+    assert_eq!(s.dynamics.step, 0, "a new run: time restarts as on a grid change");
+    assert!(s.dynamics.history.len() <= 1, "the energy history restarts: {} points", s.dynamics.history.len());
+    // pseudo-H has no core: the pseudised list is H under All
+    assert_eq!(s.dynamics.eval.pseudised.iter().map(|p| p.z).collect::<Vec<_>>(), vec![1], "{:?}", s.dynamics.eval.notes);
+}
+
+/// "Show what training is solving": a real pass's snapshots carry the geometry being solved (the
+/// reference atom, then nudges, scan points and burst steps over the scene's species, one per
+/// stage in order), every snapshot of a running pass has one, the finished job's flash data
+/// advances by one per solve, and the snapshot that ends the pass — finished, or cancelled — has
+/// none (the viewer shows the scene again). Scripted Morse teacher: no GPU.
+#[test]
+fn a_running_pass_ships_the_geometry_it_is_solving() {
+    // 150 ms per teacher solve: the pass lasts seconds, so the cancel below cannot lose a race to its end
+    let w = morse_estimated_at(h2_33(), 0.15);
+    let idle = snapshots_until(&w, "an idle worker", |_| {}, |s| !s.working);
+    assert!(idle.dynamics.ghost.is_none(), "no pass, no ghost");
+    let plan = SamplingPlan { perturbations: 6, hot_burst_steps: 6, scan_points_per_pair: 4, ..SamplingPlan::default() };
+    w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
+    let mut ghosts: Vec<sim::PassGhost> = Vec::new();
+    let mut active_without = 0;
+    let end = snapshots_until(
+        &w,
+        "the pass to finish",
+        |s| {
+            if sampling_active(&s.dynamics) {
+                match &s.dynamics.ghost {
+                    Some(g) => ghosts.push(g.clone()),
+                    // the last solve's snapshot: nothing left to solve but skip rows, or the burst's end
+                    None => active_without += 1,
+                }
+            } else {
+                assert!(s.dynamics.ghost.is_none(), "an ended pass has no ghost");
+            }
+        },
+        pass_done,
+    );
+    assert!(end.dynamics.ghost.is_none());
+    assert!(ghosts.len() >= 8, "{} ghosts over the pass", ghosts.len());
+    assert!(active_without <= 2, "{active_without} running snapshots without one");
+    // the geometry is the scene's species (H), and the stages come in the pass's order
+    assert!(ghosts.iter().all(|g| g.atoms.iter().all(|a| a.z == 1) && g.atoms.iter().all(|a| a.pos.iter().all(|x| x.is_finite()))));
+    let order = ["references", "perturbations", "scans", "hot burst"];
+    let rank = |g: &sim::PassGhost| order.iter().position(|s| *s == g.stage).expect("a known stage");
+    assert!(ghosts.windows(2).all(|p| rank(&p[0]) <= rank(&p[1])), "stages out of order: {:?}", ghosts.iter().map(|g| g.stage).collect::<Vec<_>>());
+    for stage in &order[1..] {
+        assert!(ghosts.iter().any(|g| g.stage == *stage && g.atoms.len() == 2), "no ghost of the {stage} stage");
+    }
+    // a scan ghost names the scanned pair of this scene, its point and r/r₀
+    let scan = ghosts.iter().find_map(|g| match g.job {
+        sim::GhostJob::Scan { i, j, k, of, ratio, r } => Some((i, j, k, of, ratio, r)),
+        _ => None,
+    });
+    let (i, j, k, of, ratio, r) = scan.expect("a scan ghost");
+    assert_eq!((i, j, of), (0, 1, 4));
+    assert!(k >= 1 && (0.7 - 1e-9..=1.8 + 1e-9).contains(&ratio) && r > 0.0);
+    // the finished job's serial counts up one per job
+    let serials: Vec<u64> = ghosts.iter().filter_map(|g| g.finished.as_ref().map(|f| f.serial)).collect();
+    assert!(serials.windows(2).all(|p| p[1] >= p[0]) && serials.last().is_some_and(|&n| n >= 8), "{serials:?}");
+
+    // cancelled: a second pass, cancelled while it runs, ends without a ghost
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    let running = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+    assert!(running.dynamics.ghost.is_some(), "a ghost from the first snapshot of a pass");
+    w.send(Command::Dyn(DynCommand::CancelSampling));
+    let cancelled = snapshot_until(&w, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.cancelled));
+    assert!(cancelled.dynamics.ghost.is_none(), "cancelled: the scene returns");
 }

@@ -10,6 +10,15 @@ pub enum QmError {
     /// above tolerance.
     #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
     ScfNotConverged(usize, f64),
+    /// The SCF stall stop (`scf::StallWatch`; `scf` module doc, "The stall stop"): the best Δρ
+    /// so far did not improve by a factor ≥ 2 within `window` iterations while it was still at
+    /// or above the stall level `level` (e; `SCF_STALL_LEVEL_PER_ELECTRON` × the electrons the
+    /// solve carries), so the solve ended after `iterations`, before `max_iter`. `best_delta_rho`
+    /// is the lowest Δρ reached, `tol` the target. Raised by both solvers with the same rule;
+    /// callers treat it like `ScfNotConverged` (no converged state; a warm attempt is retried
+    /// cold, R15).
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations, still above the stall level {level:.1e} (target {tol:.2e}; stopped after {iterations} iterations)")]
+    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, level: f64 },
     /// Non-finite or rank-deficient numerics inside a GPU solve (NaN Gram, NaN residual,
     /// p·Ap ≤ 0, a failed Cholesky); the solver discards its state (the next solve is cold).
     /// The message names the check that failed. A caller in a dynamics loop can react (halve

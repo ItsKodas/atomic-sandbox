@@ -343,6 +343,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().start_pass(scene, plan, refs)
     }
 
+    fn start_teach(&mut self, scene: &Scene) -> Result<(), String> {
+        self.lock().start_teach(scene)
+    }
+
     fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
         self.lock().pass_step(should_abort)
     }
@@ -357,6 +361,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
 
     fn progress(&self) -> Option<SamplingProgress> {
         self.lock().progress()
+    }
+
+    fn pass_ghost(&self) -> Option<crate::sampling::PassGhost> {
+        self.lock().pass_ghost()
     }
 
     fn refit(&mut self) -> Result<String, String> {

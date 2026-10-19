@@ -587,6 +587,11 @@ impl ViewState {
     }
 }
 
+/// The note of a lone pseudised atom's orbital list (M7, until the orbital viewer's core reconstruction exists —
+/// `docs/superpowers/plans/2026-10-15-orbital-viewer.md` Task 8): atomic names (1s, 2p…) are read from a
+/// pseudo-orbital's node count, which has no core nodes — the valence 2s would be named 1s — so the rows read #k.
+pub const PSEUDO_LABELS_NOTE: &str = "pseudised atom: the orbitals are numbered #k — a pseudo-orbital has no core nodes, so its 2s would read 1s; the atomic names wait for the core reconstruction (planned)";
+
 /// A display texture type of a [`Pool`].
 pub trait PoolTexture {
     fn create(ctx: &GpuContext, dims: [u32; 3]) -> Self;
@@ -718,7 +723,8 @@ impl CpuView {
         let n = [raw[0].len(), raw[1].len()];
         let n_occ = [state.orbitals_up.len(), state.orbitals_dn.len()];
         let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
-        let lone = nuclei.len() == 1;
+        // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows, `PSEUDO_LABELS_NOTE`)
+        let lone = nuclei.len() == 1 && state.ionic.is_none();
         let refs = |ch: usize| -> Vec<&[f64]> { raw[ch].clone() };
         let (ms, rp) = if lone {
             ([0, 1].map(|ch| qo::moments_many(grid, &refs(ch), pos[0])), [0, 1].map(|ch| qo::radial_profiles(grid, &refs(ch), pos[0])))
@@ -738,7 +744,12 @@ impl CpuView {
             let e = if ch == 0 { &state.evals_up } else { &state.evals_dn };
             e.iter().chain(info.map_or(&[][..], |u| &u.evals[ch][..])).copied().collect::<Vec<f64>>()
         });
-        let occ: [Vec<f64>; 2] = [0, 1].map(|ch| (0..n[ch]).map(|i| if i < n_occ[ch] { 1.0 } else { 0.0 }).collect::<Vec<f64>>());
+        // the state's own occupations (M7): 1 under Aufbau, and under DegenerateShells a fraction on a shared shell
+        // and 0 on the gap witnesses it stores (they are stored vectors, hence inside n_occ, but not occupied)
+        let occ: [Vec<f64>; 2] = [0, 1].map(|ch| {
+            let o = if ch == 0 { &state.occ_up } else { &state.occ_dn };
+            (0..n[ch]).map(|i| if i < n_occ[ch] { o.get(i).copied().unwrap_or(1.0) } else { 0.0 }).collect::<Vec<f64>>()
+        });
         let input = qo::UpdateInput {
             evals: [&evals[0], &evals[1]],
             occupations: [&occ[0], &occ[1]],
@@ -760,7 +771,9 @@ impl CpuView {
         let out = self.tracker.update(&input);
         let owned = |ch: usize| raw[ch].iter().map(|v| v.to_vec()).collect::<Vec<Vec<f64>>>();
         self.prev = [qo::apply_rotation(&owned(0), &out, qo::Spin::Up), qo::apply_rotation(&owned(1), &out, qo::Spin::Down)];
-        let spin = qo::spin_summary(grid, &state.rho_up, &state.rho_dn, n_occ[0], n_occ[1]);
+        // the electrons per channel (Σ f): the stored orbitals include a shared shell's gap witnesses
+        let n_el = [0, 1].map(|ch| occ[ch][..n_occ[ch]].iter().sum::<f64>().round() as usize);
+        let spin = qo::spin_summary(grid, &state.rho_up, &state.rho_dn, n_el[0], n_el[1]);
         let pick = view.pick(&out);
         let field = match &pick.kind {
             PickKind::None => None,

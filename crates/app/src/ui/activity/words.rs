@@ -27,6 +27,25 @@ pub fn face_distance(scene: &sim::Scene, p: [f64; 3]) -> f64 {
     half - p.iter().fold(0.0f64, |m, x| m.max(x.abs()))
 }
 
+/// A pass's stage in words, a teach-around pass with its blocker ("teaching around #345").
+pub fn pass_stage(p: &sim::SamplingProgress) -> String {
+    match (p.stage, p.target) {
+        ("teaching", Some(t)) => format!("teaching around #{t}"),
+        (s, _) => stage_word(s).to_string(),
+    }
+}
+
+/// The same, taking the stage of the job being solved now from the pass's ghost when there is one
+/// (the progress's stage is the last finished job's); the teach-around blocker comes from the
+/// progress.
+pub fn pass_stage_of(p: &sim::SamplingProgress, ghost: Option<&sim::PassGhost>) -> String {
+    let stage = ghost.map_or(p.stage, |g| g.stage);
+    match (stage, p.target) {
+        ("teaching", Some(t)) => format!("teaching around #{t}"),
+        (s, _) => stage_word(s).to_string(),
+    }
+}
+
 /// A sampling pass stage as the chip and the job row word it.
 pub fn stage_word(stage: &str) -> &str {
     match stage {
@@ -63,6 +82,8 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("reference {} m{multiplicity}", symbol(z)),
         R::Pass(PassJob::Perturbation) => "nudge".into(),
         R::Pass(PassJob::Scan) => "bond scan".into(),
+        R::Pass(PassJob::Teach { blocker, holdout: false }) => format!("teach #{blocker}"),
+        R::Pass(PassJob::Teach { blocker, holdout: true }) => format!("check #{blocker}"),
         R::Pass(PassJob::HotBurst) => match burst_t {
             Some(t) => format!("hot burst {t:.0} K"),
             None => "hot burst".into(),
@@ -133,6 +154,8 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("sampling: the isolated {} atom (spin multiplicity {multiplicity}), for its reference energy", symbol(z)),
         R::Pass(PassJob::Perturbation) => "sampling: a random nudge of the scene".into(),
         R::Pass(PassJob::Scan) => "sampling: a bond-length scan".into(),
+        R::Pass(PassJob::Teach { blocker, holdout: false }) => format!("teaching: a geometry near training sample #{blocker}, which the rest of the data could not predict"),
+        R::Pass(PassJob::Teach { blocker, holdout: true }) => format!("teaching: a held-out check near training sample #{blocker} (never fitted — it tests the result)"),
         R::Pass(PassJob::HotBurst) => "sampling: a hot MD burst".into(),
     }
 }
@@ -146,6 +169,8 @@ pub fn outcome_label(o: K) -> String {
         K::KeptReleased { released, .. } => format!("kept, released {released}"),
         K::Thinned => "skipped: similar".into(),
         K::BoxNotKept => "not kept: box".into(),
+        K::UnfitNotKept => "not kept: cores / occupations".into(),
+        K::ShellNotKept => "not kept: cutoff shell".into(),
         K::FenceDisagrees => "not kept: fence".into(),
         K::WaitingForPass => "not kept: waiting for a pass".into(),
         K::NotOffered => "not kept: other settings".into(),
@@ -166,6 +191,8 @@ pub fn outcome_sentence(o: K) -> String {
         K::KeptReleased { released, superseded } => format!("kept: it agrees with the model, so {released} quarantined samples were released ({superseded} superseded)"),
         K::Thinned => format!("skipped: too similar to a sample already held (one in {THIN_EVERY} such is kept)"),
         K::BoxNotKept => "not kept: it touches the box walls — the box's squeeze, not the molecule".into(),
+        K::UnfitNotKept => "used for this step, not kept: two atoms' cores overlap (the frozen-core approximation fails there) or the shared-shell occupation changed since the last step (the energy jumps)".into(),
+        K::ShellNotKept => "used for this step, not kept and not judged: a pair lies in the cutoff shell a shell check measured — the model's cutoff cannot represent it (a shell fence)".into(),
         K::FenceDisagrees => "not kept: next to a geometry the model could not learn, and the teacher still disagrees with the model there".into(),
         K::WaitingForPass => "not kept: many answers are held without a model — run a sampling pass".into(),
         K::NotOffered => "used for this step, not kept for this model: its settings differ".into(),
@@ -233,8 +260,8 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
-        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (refit to recover)", mha(c.value), mha(c.limit)),
-        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (refit to recover)", mha(c.value), mha(c.limit)),
+        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
+        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
         TrustKey::Audit => {
             let what = match seen {
                 AuditSeen::Never if audit_every == 0 => "none, audits are off".to_string(),

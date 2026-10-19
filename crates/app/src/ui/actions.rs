@@ -57,6 +57,12 @@ pub enum Action {
     SetCharge(i32),
     SetMultiplicity(Option<u32>),
     SetSigma(Option<f64>),
+    /// Physics ▸ Ionic potential (M7): all-electron, pseudopotentials for species with a core, or for
+    /// every species. Replaces the scene (`Command::SetIonicPolicy`); presets loaded afterwards keep it.
+    Ionic(sim::IonicPolicy),
+    /// View ▸ Density ▸ with partial core (M7): the density shown includes the pseudised species' ρ_pc —
+    /// a display of the generator's core model, not solved (`Command::DisplayPartialCore`).
+    ShowPartialCore(bool),
     /// Send the pending grid edit (`UiState::grid_n`, `grid_h`).
     ApplyGrid,
     /// Temperatures on screen: K, °C or °F (display only).
@@ -71,13 +77,25 @@ pub enum Action {
     /// replay touches only its script and the files it names).
     LoadScene { sidecar: bool },
     SaveModel,
+    /// Load the model file chosen in the dialog (`UiState::model_file`, else next to the scene). Its provenance is read
+    /// first (`surrogate::sidecar::read_provenance`): equal to the scene's → `DynCommand::LoadModel`; different → no
+    /// command, the offer card opens (`UiState::model_offer`, `ui::model_offer`).
     LoadModel,
+    /// The offer card's "Apply the model's settings and load": the scene edits (`SetGrid`, `SetSigma`, `SetCharge`,
+    /// `SetMultiplicity`, `SetIonicPolicy`, `SetIsotope`) that make the scene match the model's provenance, then
+    /// `DynCommand::LoadModel`. Refused (an error, nothing sent) when a setting cannot be applied.
+    ApplyModelSettings,
+    /// The offer card's "Cancel": closes it; nothing is sent, nothing changes.
+    CancelModelOffer,
     /// "Forget model": the first click arms, a second within 4 s forgets.
     Forget,
     /// "Start sampling" / "Sample more" with the panel's plan; `long` = the pass would take longer
     /// than `sim::PASS_TARGET_S`, which needs a second click ("Start anyway").
     Sample { long: bool },
     CancelSampling,
+    /// "Teach around N blockers": a teach-around pass (`DynCommand::StartTeaching`; the surrogate's
+    /// "Teaching around the blockers"). Recorded like Sample, not replayable (it solves).
+    TeachAroundBlockers,
     /// The automatic first pass's "Start anyway" with the plan it offered.
     StartOffered(SamplingPlan),
     /// "Forget it and sample this scene" (after a refused autoload).
@@ -104,6 +122,8 @@ pub enum Action {
     ShowBonds(bool),
     ShowLabels(bool),
     ShowBadge(bool),
+    /// View ▸ Bonds and molecules ▸ bond angles (display only; script word `angles`).
+    ShowAngles(bool),
     /// View ▸ Bonds and molecules ▸ name style (display only).
     NameStyle(crate::names::NameStyle),
     /// Relax the geometry (FIRE, M6 spec §6): `DynCommand::Relax` — refused while a sampling pass
@@ -184,7 +204,9 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::Preset(name) => {
             // at the panel's quality (Accurate by default), the preset's own box kept
-            if let (Some(file), Some(s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
+            if let (Some(file), Some(mut s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
+                // the policy in force (Accepted by default in the app since M7 Task 11): a preset file itself is all-electron
+                s.ionic = st.ionic;
                 if let Err(e) = vram_check(st, &s) {
                     out.error = Some(e);
                     return;
@@ -251,6 +273,23 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 out.commands.push(Command::SetSigma(s));
             }
         }
+        Action::Ionic(p) => {
+            // the policy of the scene: the pseudo footprint is checked like a grid change
+            let s = Scene { ionic: p, ..input.scene.clone() };
+            match vram_check(st, &s) {
+                Ok(()) => {
+                    st.ionic = p;
+                    if p != input.scene.ionic {
+                        out.commands.push(Command::SetIonicPolicy(p));
+                    }
+                }
+                Err(e) => out.error = Some(e),
+            }
+        }
+        Action::ShowPartialCore(on) => {
+            st.show_partial_core = on;
+            out.commands.push(Command::DisplayPartialCore(on));
+        }
         Action::ApplyGrid => match validate_grid(st.grid_n, st.grid_h).and_then(|()| {
             let s = Scene { grid_n: st.grid_n, grid_h: st.grid_h, ..input.scene.clone() };
             vram_check(st, &s)
@@ -295,16 +334,65 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             Err(e) => out.error = Some(e),
         },
         Action::SaveModel => {
-            let path = model_path(&st.scene_path);
+            let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
             st.set_status(format!("saving the model to {}", path.display()));
         }
         Action::LoadModel => {
-            let path = model_path(&st.scene_path);
-            if path.exists() {
-                out.commands.push(dyn_(DynCommand::LoadModel(path)));
-            } else {
+            let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+            st.model_offer = None;
+            if !path.exists() {
                 out.error = Some(format!("no model file {}", path.display()));
+            } else {
+                match model_offer_for(st, input, &path) {
+                    // the settings match (or the header cannot be read: the driver says why, as it always did)
+                    None => out.commands.push(dyn_(DynCommand::LoadModel(path))),
+                    Some(offer) => {
+                        st.set_status(format!("{} was taught at other settings than this scene's — see the card over the view", path.display()));
+                        st.model_offer = Some(offer);
+                    }
+                }
+            }
+        }
+        Action::CancelModelOffer => st.model_offer = None,
+        Action::ApplyModelSettings => {
+            let Some(shown) = st.model_offer.take() else { return };
+            if input.sampling() {
+                st.model_offer = Some(shown);
+                out.error = Some("a sampling pass is running: cancel it first, then load the model".into());
+                return;
+            }
+            // against the scene as it is now, not as the card first saw it
+            match model_offer_for(st, input, &shown.path) {
+                None => out.commands.push(dyn_(DynCommand::LoadModel(shown.path))),
+                Some(offer) => {
+                    if let Some(why) = offer.blocked() {
+                        out.error = Some(format!("the model's settings cannot be applied: {why}"));
+                        st.model_offer = Some(offer);
+                        return;
+                    }
+                    for e in &offer.edits {
+                        use super::model_offer::Edit;
+                        match e {
+                            Edit::Grid { n, h } => {
+                                // as Apply grid: the new box is the one later quality changes keep
+                                (st.grid_n, st.grid_h) = (*n, *h);
+                                st.box_len = (*n as f64 - 1.0) * *h;
+                                out.commands.push(Command::SetGrid { n: *n, h: *h });
+                            }
+                            Edit::Sigma(x) => out.commands.push(Command::SetSigma(*x)),
+                            Edit::Charge(c) => out.commands.push(Command::SetCharge(*c)),
+                            Edit::Multiplicity(m) => out.commands.push(Command::SetMultiplicity(*m)),
+                            Edit::Ionic(p) => {
+                                st.ionic = *p;
+                                out.commands.push(Command::SetIonicPolicy(*p));
+                            }
+                            Edit::Isotope { index, a } => out.commands.push(dyn_(DynCommand::SetIsotope { index: *index, a: *a })),
+                        }
+                    }
+                    st.set_status(format!("applied the settings of {} and loading it", offer.path.display()));
+                    out.commands.push(dyn_(DynCommand::LoadModel(offer.path)));
+                }
             }
         }
         Action::Forget => {
@@ -325,6 +413,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::CancelSampling => out.commands.push(dyn_(DynCommand::CancelSampling)),
+        Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
         Action::SampleAfterRefusal => {
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
@@ -362,6 +451,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::ShowBonds(on) => st.show_bonds = on,
         Action::ShowLabels(on) => st.show_labels = on,
         Action::ShowBadge(on) => st.show_badge = on,
+        Action::ShowAngles(on) => st.show_angles = on,
         Action::NameStyle(s) => st.name_style = s,
         Action::Relax => {
             if input.sampling() {
@@ -376,8 +466,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             let was = st.show;
             st.show = mode;
             if mode != ShowMode::Density {
-                st.dock_open = true;
-                st.dock_tab = DockTab::Orbitals;
+                st.open_tab(DockTab::Orbitals);
                 // Orbitals mode before anything was picked: the HOMO of the payload on screen, if
                 // there is one (else the provider's fallback shows it and the viewer adopts it)
                 if mode == ShowMode::Orbitals && st.orbital_pick.is_none() {
@@ -393,8 +482,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             st.orbital_pick = Some((spin, track));
             st.orbital_pick_adopted = false;
             st.show = ShowMode::Orbitals;
-            st.dock_open = true;
-            st.dock_tab = DockTab::Orbitals;
+            st.open_tab(DockTab::Orbitals);
             send_orbital_view(st, out);
         }
         Action::OrbitalPhase(phase) => {
@@ -500,6 +588,8 @@ impl Action {
             SetCharge(c) => format!("charge {c}"),
             SetMultiplicity(m) => format!("multiplicity {}", opt(m.map(|m| m.to_string()))),
             SetSigma(s) => format!("sigma {}", opt(s.map(|s| s.to_string()))),
+            Ionic(p) => format!("ionic {}", p.word()),
+            ShowPartialCore(b) => format!("partial-core {b}"),
             Forget => "forget".into(),
             CancelSampling => "cancel-sampling".into(),
             SetAudit(n) => format!("audit {n}"),
@@ -512,6 +602,7 @@ impl Action {
             ShowBonds(b) => format!("bonds {b}"),
             ShowLabels(b) => format!("labels {b}"),
             ShowBadge(b) => format!("badge {b}"),
+            ShowAngles(b) => format!("angles {b}"),
             NameStyle(s) => format!("names {}", style_word(*s)),
             Relax => "relax".into(),
             StopRelax => "stop-relax".into(),
@@ -533,7 +624,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
         })
     }
 
@@ -634,16 +725,22 @@ impl Action {
                 want(3)?;
                 Thermostat { on: flag(args[0])?, t: num(head, args[1])?, tau: num(head, args[2])? }
             }
-            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" => {
+            "ionic" => {
+                want(1)?;
+                Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores, accepted or all, got '{}'", args[0]))?)
+            }
+            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
                 want(1)?;
                 let b = flag(args[0])?;
                 match head {
+                    "partial-core" => ShowPartialCore(b),
                     "gravity" => Gravity(b),
                     "com-correction" => ComCorrection(b),
                     "draft" => Draft(b),
                     "bonds" => ShowBonds(b),
                     "labels" => ShowLabels(b),
                     "badge" => ShowBadge(b),
+                    "angles" => ShowAngles(b),
                     _ => SmoothMotion(b),
                 }
             }
@@ -866,6 +963,22 @@ pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> SampleButton {
         None => format!("{n} solves"),
     });
     SampleButton { label, long, armed, cost }
+}
+
+/// The offer for loading `path` into the scene in force (`ui::model_offer`): `None` when the model's
+/// settings match the scene's, or when its header cannot be read (the driver's own refusal then says why).
+fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path) -> Option<super::model_offer::ModelOffer> {
+    let prov = surrogate::sidecar::read_provenance(path).ok()?;
+    // the teacher the session has: the provider's name when a model is up, else what the machine decides
+    let teacher = input.model().map_or(if st.gpu_available { "Kohn-Sham (GPU)" } else { "Kohn-Sham (CPU)" }, |m| m.teacher);
+    let vram = |s: &Scene| vram_check(st, s);
+    let ctx = super::model_offer::Context {
+        teacher,
+        sample_tol: crate::worker::SAMPLE_TOL,
+        pseudised: !super::pseudo::pseudised(input).is_empty(),
+        vram: &vram,
+    };
+    super::model_offer::offer(path, &prov, input.scene, &ctx)
 }
 
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the

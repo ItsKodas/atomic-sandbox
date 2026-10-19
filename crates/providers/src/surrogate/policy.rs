@@ -93,10 +93,38 @@ pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
     c
 }
 
+/// The force-label noise prior of a pseudopotential scene, Ha/Bohr per component (M7 Task 9; Task 8b review
+/// ruling (b), Task 8a review): the teacher's own path scatter on the GPU at the sampling tolerance — measured
+/// 4.7–4.8e-5 on lone pseudo-O and on OH, up to ≈ 7e-5 on warm teacher chains — which no model can represent.
+/// It floors the fit's force noise s_F (`FitOptions::sigma_f_min`: the posterior is never more confident about
+/// forces than the labels can support) and, tripled, the tier a force audit judges against
+/// ([`audit_force_floor`]). The default tiers (`FallbackPolicy::force_std_abs` = 2e-3) are 40× above it, so the
+/// floors are inert there; they bind only on a tightened policy.
+pub const PSEUDO_FORCE_NOISE: f64 = 5e-5;
+
+/// The label-noise prior of the surface `ionic` (`Provenance::ionic`): [`PSEUDO_FORCE_NOISE`] for a pseudised
+/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before).
+pub(super) fn force_noise_prior(ionic: &str) -> f64 {
+    if ionic == "none" { 0.0 } else { PSEUDO_FORCE_NOISE }
+}
+
+/// The least tier an audit's force check may use on the surface `ionic`: 3σ of ONE label's noise, 0 on the
+/// all-electron surface. Deliberately the stricter 3σ, not 3√2σ (which would account for the model's labels and the
+/// audit's both being noisy): rule 6 forbids loosening a tolerance, and the floor is inert at the default tiers. The
+/// price is a false-fail rate for a tightened policy: with the warm-chain scatter of 7e-5 per component, 1.5e-4 is
+/// 2.1σ of the per-atom RMS-of-3 statistic, P(χ²₃ > 13.8) ≈ 3e-3 per atom (≈ 3 % per audit of a 10-atom scene).
+pub(super) fn audit_force_floor(ionic: &str) -> f64 {
+    3.0 * force_noise_prior(ionic)
+}
+
 /// The worst atom's force residual ‖F_model − F_teacher‖/√3 against its bound (the variance
-/// rule's, at the teacher's force): (residual, bound) of the atom with the largest ratio.
-pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]]) -> Option<(f64, f64)> {
-    let residuals = model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft));
+/// rule's, at the teacher's force, never below `floor`): (residual, bound) of the atom with the
+/// largest ratio.
+pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]], floor: f64) -> Option<(f64, f64)> {
+    let residuals = model.iter().zip(teacher).map(|(fm, ft)| {
+        let (d, b) = p.force_residual(fm, ft);
+        (d, b.max(floor))
+    });
     // a NaN residual is the worst (`total_cmp` ranks a negative NaN below everything; activity
     // Task 3b), else the largest ratio as before
     residuals.clone().find(|(d, b)| (d / b).is_nan()).or_else(|| residuals.max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1))))
@@ -119,6 +147,39 @@ pub(super) fn non_finite_answer(pred: &surrogate::Prediction) -> Option<Refusal>
             None,
         )
     })
+}
+
+/// Whether a refusal is a fact about the geometry rather than about the fit's global state
+/// (round 1 of the 2026-10-18 trust review, MUST-1): outside the training envelope (5a–5c), an
+/// unspanned direction (5d, and 5e at γ = ∞), beyond the grade (5e), a non-finite answer, or a
+/// quarantine fence. Rule 4 (untrusted), 4b (class), 5e without a grade (MaxVol unconverged:
+/// global) and 6–7 (uncertainty) lift with more data or a refit, so a draft-mode audit refused only
+/// by those is an ordinary audit.
+pub(super) fn geometry_specific(rule: TeachRule) -> bool {
+    matches!(
+        rule,
+        TeachRule::IsolatedAtom
+            | TeachRule::Coordination
+            | TeachRule::Spread
+            | TeachRule::NewEnvironment
+            | TeachRule::UnspannedAtom
+            | TeachRule::Grade
+            | TeachRule::NonFiniteAnswer
+            | TeachRule::NearQuarantine
+    )
+}
+
+/// Rule 5d's refusal at novelty `nu` (> 1), naming the atom whose force rows reach furthest
+/// (`None`: the energy row) — the text `evaluate` has always carried.
+pub(super) fn novelty_refusal(nu: f64, at: Option<usize>) -> Refusal {
+    Refusal::new(
+        format!(
+            "surrogate: new environment (feature never seen in training) — {} {nu:.1e}× farther into directions no training row spans than rounding allows",
+            at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
+        ),
+        TeachRule::NewEnvironment,
+        at,
+    )
 }
 
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
@@ -209,6 +270,8 @@ pub(super) struct Gate {
     pub(super) reason: Refusal,
     pub(super) keep_sample: bool,
     pub(super) thin: bool,
+    /// A copy of a stored sample is never kept (`is_label_copy`; round 1, MUST-2).
+    pub(super) dedup: bool,
     /// Rule 4 (an untrusted fit): the only gate draft mode answers past.
     pub(super) untrusted: bool,
 }
@@ -226,13 +289,13 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();
-        self.class_loo = self.compute_class_loo();
+        self.refresh_class_loo();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.
     pub(super) fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
-            return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, untrusted: false });
+            return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, dedup: false, untrusted: false });
         };
         if model.provenance != *prov {
             return Err(Gate {
@@ -247,6 +310,7 @@ impl SurrogateKs {
                 ),
                 keep_sample: false,
                 thin: false,
+                dedup: false,
                 untrusted: false,
             });
         }
@@ -264,6 +328,7 @@ impl SurrogateKs {
                 ),
                 keep_sample: true,
                 thin: false,
+                dedup: false,
                 untrusted: false,
             });
         }
@@ -271,7 +336,10 @@ impl SurrogateKs {
             return Err(Gate {
                 reason: Refusal::new(format!("surrogate untrusted: {why}"), TeachRule::Untrusted(key), None),
                 keep_sample: true,
+                // thinned unless the fit is short of samples; never a copy, short or not:
+                // copies would meet the counts and shrink the fitted noise (round 1, MUST-2)
                 thin: !self.trust_needs_samples(),
+                dedup: true,
                 untrusted: true,
             });
         }

@@ -480,7 +480,7 @@ use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, Orbit
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
-use crate::sampling::{SamplingPlan, SamplingProgress};
+use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::thermostat::Csvr;
 use health::{History, Point};
@@ -638,6 +638,9 @@ pub enum DynCommand {
     /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
     /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
     StartSampling(SamplingPlan),
+    /// Start a teach-around pass (`Trainable::start_teach`): like `StartSampling`, a pass that
+    /// pauses the dynamics until it ends. Surrogate only.
+    StartTeaching,
     /// End the running pass early (no-op without one); the samples so far are refitted.
     CancelSampling,
     /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
@@ -658,6 +661,12 @@ pub enum DynCommand {
     /// The orbital view (module doc, "Orbital display"): display only — accepted at any time,
     /// never aborts a step, never touches the dynamics.
     SetOrbitalView(OrbitalViewRequest),
+    /// M7: the density shown includes the pseudised species' partial core ρ_pc (a display of the
+    /// generator's core model, never solved): forwarded to the provider
+    /// ([`ForceProvider::set_display_partial_core`]) and kept, so a rebuilt driver re-applies it.
+    /// Display only — accepted at any time, never an edit, never aborts a step; it takes effect
+    /// from the next evaluation (a paused scene shows it after the next step).
+    SetDisplayPartialCore(bool),
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -732,6 +741,8 @@ pub struct DynSnapshot {
     pub orbitals_side: Option<SideKind>,
     /// The orbital view as the app last set it (`SetOrbitalView`; rebuilt drivers re-apply it).
     pub orbital_view: OrbitalViewRequest,
+    /// The partial-core display as the app last set it (`SetDisplayPartialCore`; rebuilt drivers re-apply it).
+    pub display_partial_core: bool,
     /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K); shared, so cloning a
     /// snapshot is cheap.
     pub history: Arc<[(f64, f64, f64)]>,
@@ -772,6 +783,9 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// What the running pass is solving now (`Trainable::pass_ghost`; display only): `Some` only
+    /// while a pass runs — `None` once it ended, was cancelled or failed.
+    pub ghost: Option<PassGhost>,
     /// The running relaxation's progress, or the last one's final state (`converged` is
     /// `Some`) until the next `Relax`; `None` before any (module doc, "Relax").
     pub relax: Option<RelaxProgress>,
@@ -813,7 +827,7 @@ impl DynSnapshot {
 impl Default for DynSnapshot {
     fn default() -> DynSnapshot {
         DynSnapshot {
-            scene: Scene { nuclei: Vec::new(), cell: Cell { n: 0, h: 0.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] },
+            scene: Scene { nuclei: Vec::new(), cell: Cell { n: 0, h: 0.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None },
             forces: Vec::new(),
             forces_stale: true,
             energy_ks: 0.0,
@@ -846,6 +860,7 @@ impl Default for DynSnapshot {
             orbitals_seq: 0,
             orbitals_side: None,
             orbital_view: OrbitalViewRequest::default(),
+            display_partial_core: false,
             history: Arc::from(Vec::new()),
             history_source: Arc::from(Vec::new()),
             history_guess: Arc::from(Vec::new()),
@@ -863,6 +878,7 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            ghost: None,
             relax: None,
             side_display: None,
             walls: None,
@@ -933,6 +949,8 @@ pub struct Dynamics {
     /// driver's rate flag), and the newest payload with its time, sequence number and side kind
     /// (module doc, "Orbital display").
     orbital_view: OrbitalViewRequest,
+    /// The partial-core display request (`SetDisplayPartialCore`).
+    display_partial_core: bool,
     orbital_forwarded: Option<OrbitalViewRequest>,
     orbitals: Option<OrbitalDisplay>,
     orbitals_t: f64,
@@ -985,6 +1003,8 @@ pub struct Dynamics {
     /// The progress of the sampling pass (module doc, "Sampling"; the pass itself runs inside the
     /// provider), kept after it ends (the snapshot's `sampling`).
     sampling: Option<SamplingProgress>,
+    /// The pass's ghost (`DynSnapshot::ghost`), refreshed wherever `sampling` is.
+    ghost: Option<PassGhost>,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
     /// The running relaxation (module doc, "Relax").
@@ -1048,6 +1068,7 @@ impl Dynamics {
             eval: EvalStats::default(),
             display: None,
             orbital_view: OrbitalViewRequest::default(),
+            display_partial_core: false,
             orbital_forwarded: None,
             orbitals: None,
             orbitals_t: 0.0,
@@ -1085,6 +1106,7 @@ impl Dynamics {
             notes_total: 0,
             seq: 0,
             sampling: None,
+            ghost: None,
             sample_ms: 0.0,
             fire: None,
             relax: None,
@@ -1124,7 +1146,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Rewind if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
@@ -1318,11 +1340,16 @@ impl Dynamics {
                 self.drop_bonds();
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
+            DynCommand::StartTeaching => self.start_teaching(),
             DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
             DynCommand::LoadModel(path) => self.load_model(path),
             DynCommand::SetOrbitalView(req) => self.set_orbital_view(req),
+            DynCommand::SetDisplayPartialCore(on) => {
+                self.display_partial_core = on;
+                self.provider.set_display_partial_core(on);
+            }
         }
     }
 
@@ -1675,6 +1702,7 @@ impl Dynamics {
             orbitals_seq: self.orbitals_seq,
             orbitals_side: self.orbitals_side,
             orbital_view: self.orbital_view.clone(),
+            display_partial_core: self.display_partial_core,
             history: Arc::from(self.history.tail()),
             history_source: Arc::from(self.history.sources()),
             history_guess: Arc::from(self.history.guesses()),
@@ -1696,6 +1724,7 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            ghost: self.ghost.clone(),
             relax: self.relax.clone(),
             side_display: self.side_display.clone(),
             walls: self.walls,
@@ -1737,6 +1766,12 @@ impl Dynamics {
         self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
     }
 
+    /// The ghost of the pass in the provider (`Trainable::pass_ghost`): what it solves next, `None`
+    /// without a running pass (ended, cancelled, failed — the viewer then shows the scene again).
+    fn refresh_ghost(&mut self) {
+        self.ghost = self.provider.as_trainable().and_then(|t| t.pass_ghost());
+    }
+
     /// A sampling pass is running in the provider.
     fn pass_active(&mut self) -> bool {
         self.provider.as_trainable().is_some_and(|t| t.pass_active())
@@ -1769,6 +1804,29 @@ impl Dynamics {
         self.pending_steps = 0;
         self.take_provider_notes();
         self.sampling = p;
+        self.refresh_ghost();
+    }
+
+    /// A teach-around pass (`DynCommand::StartTeaching`): `start_sampling`'s bookkeeping around
+    /// `Trainable::start_teach`.
+    fn start_teaching(&mut self) {
+        let Some(t) = self.provider.as_trainable() else {
+            return self.no_surrogate("teach around the blockers");
+        };
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::sampling::EMPTY_SCENE.into());
+        }
+        if t.pass_active() {
+            return self.reject("teach around the blockers: a pass is already running (cancel it first)".into());
+        }
+        if let Err(e) = t.start_teach(&self.scene) {
+            return self.reject(format!("teach around the blockers: {e}"));
+        }
+        let p = t.progress();
+        self.paused = true;
+        self.pending_steps = 0;
+        self.take_provider_notes();
+        self.sampling = p;
     }
 
     /// Spends the tick's remaining budget on the pass (module doc).
@@ -1791,6 +1849,7 @@ impl Dynamics {
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
                     self.sample_ms = if self.sample_ms == 0.0 { ms } else { 0.8 * self.sample_ms + 0.2 * ms };
                     self.sampling = Some(p);
+                    self.refresh_ghost();
                     self.seq += 1;
                 }
                 Ok(None) => break Some(Ok(())),
@@ -1827,6 +1886,7 @@ impl Dynamics {
         t.rescale_pass(plan);
         self.take_provider_notes();
         self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.refresh_ghost();
         self.seq += 1;
     }
 
@@ -1834,6 +1894,7 @@ impl Dynamics {
     /// sample geometry's and refitted over everything it holds): its final progress.
     fn pass_ended(&mut self) {
         self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.refresh_ghost();
         self.seq += 1;
     }
 
@@ -1841,6 +1902,7 @@ impl Dynamics {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("forget model") };
         t.forget();
         self.sampling = None;
+        self.ghost = None;
         self.take_provider_notes();
     }
 
@@ -1865,6 +1927,7 @@ impl Dynamics {
         let loaded = t.load(&path, &self.scene);
         if loaded.is_ok() {
             self.sampling = None;
+            self.ghost = None;
         }
         self.take_provider_notes();
         if let Err(e) = loaded {
@@ -2412,7 +2475,8 @@ impl Dynamics {
         }
         let (tol, name) = self.reference_solver();
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
-        let key_for = |z| ReferenceKey::new(&cell, sigma, tol, name, z);
+        let ionic = self.provider.ionic_tag(&self.scene);
+        let key_for = |z| ReferenceKey::new(&cell, sigma, tol, name, z, &ionic);
         let species: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
         let failed = &self.ref_failed;
         self.ref_queue = self.refs.missing(key_for, &species).into_iter().filter(|&z| !failed.contains(&key_for(z))).collect();
@@ -2560,7 +2624,8 @@ impl Dynamics {
         };
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
         let (tol, name) = self.reference_solver();
-        let key = ReferenceKey::new(&cell, sigma, tol, name, z);
+        let ionic = self.provider.ionic_tag(&self.scene);
+        let key = ReferenceKey::new(&cell, sigma, tol, name, z, &ionic);
         let (started, total) = (Instant::now(), crate::references::multiplicities(z));
         let scene = &self.scene;
         if self.provider.as_trainable().is_some_and(|t| t.request_atom_reference(z, mass, scene)) {
@@ -2571,7 +2636,7 @@ impl Dynamics {
         let Some(side) = self.side.take().or_else(|| self.provider.side_solver()) else {
             let species: Vec<&str> = self.ref_queue.iter().map(|&q| units::isotopes::symbol(q)).collect();
             self.note(format!("atom references for {} cannot be solved: the provider '{}' has no side solver — no bonds are detected", species.join(", "), self.provider.name()));
-            let keys: Vec<ReferenceKey> = self.ref_queue.drain(..).map(|q| ReferenceKey::new(&cell, sigma, tol, name, q)).collect();
+            let keys: Vec<ReferenceKey> = self.ref_queue.drain(..).map(|q| ReferenceKey::new(&cell, sigma, tol, name, q, &ionic)).collect();
             self.ref_failed.extend(keys);
             self.seq += 1;
             return;
@@ -2581,9 +2646,10 @@ impl Dynamics {
         let progress = Arc::new(AtomicUsize::new(0));
         let count = progress.clone();
         let (tx, rx) = std::sync::mpsc::channel::<ReferenceAnswer>();
+        let policy = self.scene.ionic;
         let spawned = std::thread::Builder::new().name(format!("atom reference Z={z}")).spawn(move || {
             let mut side = side;
-            let r = solve_atom_reporting(side.as_mut(), &cell, sigma, z, mass, &mut || flag.load(Ordering::Relaxed), &mut |k| count.store(k, Ordering::Relaxed));
+            let r = solve_atom_reporting(side.as_mut(), &cell, sigma, policy, z, mass, &mut || flag.load(Ordering::Relaxed), &mut |k| count.store(k, Ordering::Relaxed));
             let _ = tx.send((side, r));
         });
         match spawned {
@@ -2616,9 +2682,10 @@ impl Dynamics {
         let n = self.scene.nuclei.len();
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
         let (tol, name) = self.reference_solver();
+        let ionic = self.provider.ionic_tag(&self.scene);
         let pos: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|x| x.pos).collect();
         let z: Vec<u8> = self.scene.nuclei.iter().map(|x| x.z).collect();
-        let Ok(pro) = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(&cell, sigma, tol, name, zz), &cell, &pos, &z) else {
+        let Ok(pro) = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(&cell, sigma, tol, name, zz, &ionic), &cell, &pos, &z) else {
             return; // a reference is pending: no graph until it lands
         };
         let mut det = Detector::new(&pos);

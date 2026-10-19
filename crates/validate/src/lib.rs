@@ -34,7 +34,7 @@
 //!
 //! Measured (Task 11, release): H h = 0.15 → a = −0.477710, +0.96 mHa; He h = 0.15 →
 //! −2.788945, +45.9 mHa (fails 15), h = 0.10 → −2.822561, +12.3 mHa; Li h = 0.15 → −7.004270,
-//! +331 mHa (fails 40). The misses are extrapolation bias, not grid error: the quartic fitted to
+//! +340 mHa against NIST LSD −7.343957 (fails 40). The misses are extrapolation bias, not grid error: the quartic fitted to
 //! the He h = 0.10 ladder reproduces the h = 0.15 ladder's E(0.15) to 0.3 mHa (and the H h = 0.15
 //! fit reproduces Task 9's h = 0.25 E(0.25) to 0.1 mHa) while the intercepts differ by 34 mHa.
 //! E(σ) − a is 0.77 → 0.71 (H), 0.73 → 0.67 (He, h = 0.10), 0.50 → 0.48 (Li) of the first-order

@@ -174,7 +174,7 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
 }
 
 /// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
-/// empty, h, h2, he, lih, h2o. A scene loaded from a file highlights no preset (every one can be
+/// empty, h, h2, he, lih, h2o, h2s, hcl, ph3, sih4. A scene loaded from a file highlights no preset (every one can be
 /// picked), and Reset reloads that file (final review app I1).
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
@@ -341,6 +341,9 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
     use crate::quality::{accuracy_hint, grid_n, level_of, scaled_cost, title, LEVELS, H_MAX, H_MIN};
     let scene = input.scene;
     theme::section(ui, "Quality");
+    // M7: a level coarser than a pseudised species' h_req is refused by the provider (T8's certificate);
+    // the menu says so before the click, from the same record
+    let pseudised = super::pseudo::pseudised(input);
     let cost = |n: usize| match st.last_solve {
         Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
         None => "—".into(),
@@ -356,7 +359,10 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
             }
             ui.label(RichText::new(format!("{n}³")).monospace().size(10.5));
             ui.label(RichText::new(cost(n)).monospace().size(10.5).color(theme::INK_DIM));
-            ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM));
+            match super::pseudo::needs_finer(&pseudised, *h) {
+                Some(why) => ui.label(RichText::new(why).size(10.5).color(super::AMBER)).on_hover_text("this level's grid is coarser than the pseudopotential is certified for (T8): the solver refuses such a scene rather than answer it wrongly"),
+                None => ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM)),
+            };
             ui.end_row();
         }
     });
@@ -372,6 +378,9 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
         }
         let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
         ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
+        if let Some(why) = super::pseudo::needs_finer(&pseudised, crate::quality::snap(st.quality_slider)) {
+            ui.label(RichText::new(why).size(10.5).color(super::AMBER));
+        }
     });
     let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);
     let l = (scene.grid_n as f64 - 1.0) * scene.grid_h;
@@ -442,6 +451,38 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
 
 /// The estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud"): atomic
 /// superposition between DFT clouds, and the display refresh.
+/// View ▸ Display aids ▸ Trails (`crate::trails`, user request 2026-10-17): a fading line behind
+/// each atom. Display only: written straight to `UiState`, never sent to the worker.
+fn trail_controls(ui: &mut Ui, st: &mut UiState) {
+    use crate::trails;
+    ui.checkbox(&mut st.show_trails, "trails").on_hover_text(
+        "a thin fading line behind each atom, in its element colour, showing where it has been (display only; turning it on starts from now). Teleporting an atom, changing the nucleus count, loading a scene or a rewind starts a fresh trail; dragging keeps it",
+    );
+    if !st.show_trails {
+        return;
+    }
+    let mut x = trails::length_to_slider(st.trail_fs);
+    let length = egui::Slider::new(&mut x, 0.0..=1.0)
+        .text("trail length")
+        .custom_formatter(|v, _| trails::length_text(trails::slider_to_length(v)))
+        .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
+    if ui
+        .add(length)
+        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 1000 steps per tick. Type a value like 250 or 2 ps")
+        .changed()
+    {
+        st.trail_fs = trails::slider_to_length(x);
+    }
+    let mut pct = (st.trail_opacity * 100.0).round();
+    if ui
+        .add(egui::Slider::new(&mut pct, 0.0..=100.0).text("trail opacity").suffix(" %").fixed_decimals(0))
+        .on_hover_text("the newest end's opacity; the trail fades linearly to fully transparent at the chosen length")
+        .changed()
+    {
+        st.trail_opacity = pct / 100.0;
+    }
+}
+
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
@@ -506,6 +547,11 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.add_enabled(st.volume_mode == super::VOLUME_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
         });
+        // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
+        let mut core = st.show_partial_core;
+        if probed("show-partial-core", ui.checkbox(&mut core, "with partial core")).on_hover_text(super::pseudo::PARTIAL_CORE_TIP).changed() {
+            acts.push(Action::ShowPartialCore(core));
+        }
         ui.horizontal(|ui| {
             ui.label("colour dots by");
             ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS && st.show == ShowMode::Coloured, |ui| {
@@ -532,6 +578,9 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.radio_value(&mut st.grid_in_angstrom, false, "1 Bohr");
             ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
         });
+        probed("show-ghost", ui.checkbox(&mut st.show_ghost, "show what training is solving"))
+            .on_hover_text("while a sampling pass runs, the view shows the geometry the teacher is solving right now as a wireframe ghost (a lone reference atom, a random nudge with arrows, the scanned pair, the hot burst with a trail) instead of your scene, flashing green / red / grey as each sample is kept / fails / is skipped; your scene returns when the pass ends or is cancelled. Display only"
+            );
         let mut smooth = st.smooth_motion;
         if ui
             .checkbox(&mut smooth, "smooth motion")
@@ -540,6 +589,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         {
             acts.push(Action::SmoothMotion(smooth));
         }
+        trail_controls(ui, st);
     });
     ui.separator();
     // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge
@@ -567,6 +617,17 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         });
         ui.horizontal(|ui| {
+            let mut a = st.show_angles;
+            if probed("show-angles", ui.checkbox(&mut a, "bond angles")).on_hover_text(ANGLES_TIP).changed() {
+                acts.push(Action::ShowAngles(a));
+            }
+        });
+        ui.horizontal(|ui| {
+            probed("show-bond-lengths", ui.checkbox(&mut st.show_bond_lengths, "bond lengths")).on_hover_text(
+                "each drawn bond's length in Å at its middle (the nuclei's distance as drawn now; Bohr in the hover of the Selection tab).                  With more than 12 bonds only those of the selected or hovered atom are labelled. Display only",
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("name style").on_hover_text(NAME_STYLE_TIP);
             let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
             if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
@@ -582,6 +643,12 @@ pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always sh
 
 /// The bonds' tooltip (View ▸ Bonds and molecules).
 pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms are smeared (at the Balanced 0.25 Bohr spacing, and still at the default Accurate 0.15): the topology is expected right, the bond-point numbers are not physical";
+
+/// The bond-angle toggle's tooltip (View ▸ Bonds and molecules; M7 Task 13).
+// Task 11: once the `All` water gate is measured, append "; with every species pseudised it relaxes
+// to {θ}°" with the value recorded in `references.md` "M7 oracles" (plan review NOTE: the tooltip
+// quotes the measurement, not an expectation written before it).
+pub const ANGLES_TIP: &str = "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. An angle is drawn in the style of its weaker bond: dashed and faint at a closed-shell contact, dotted where the bond's kind is not resolved. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there. Under pseudopotentials a bond's kind is a valence-density kind where its bond point lies inside a core radius r_c (Dock ▸ Selection says so)";
 
 /// The honesty lines of spec §3.5 (View menu, Selection tab).
 pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
@@ -606,7 +673,42 @@ pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Resp
     r
 }
 
+/// Physics ▸ Ionic potential (M7, spec §4.7): the three policies, the valence-energy honesty line, and for each
+/// pseudised species of the latest solve its record and the grids it is certified at. The egg-box line (NLCC
+/// ruling 6) is text only — a scene is never refused for it.
+fn ionic_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    use super::pseudo;
+    ui.horizontal(|ui| {
+        theme::section(ui, "Ionic potential");
+        theme::info(ui, pseudo::IONIC_TIP);
+    });
+    // the default's title says so ("accepted species (default)", M7 Task 11 fix round)
+    let titles: Vec<String> = sim::IonicPolicy::ALL.iter().map(|&p| if p == super::DEFAULT_IONIC { format!("{} (default)", p.title()) } else { p.title().to_string() }).collect();
+    let opts: Vec<(sim::IonicPolicy, &str, &str)> = sim::IonicPolicy::ALL.iter().zip(&titles).map(|(&p, t)| (p, t.as_str(), pseudo::IONIC_TIP)).collect();
+    if let Some(p) = theme::segmented(ui, input.scene.ionic, &opts) {
+        acts.push(Action::Ionic(p));
+    }
+    theme::note(ui, "a policy change replaces the scene (pauses; time and the energy history restart). A pseudopotential is generated on first use (seconds per element; H and He ≈ 1 min for their dimer check on the GPU, then kept on disk for this recipe) and kept for the run");
+    let pseudised = pseudo::pseudised(input);
+    let pseudised = &pseudised[..];
+    if pseudised.is_empty() {
+        if input.scene.ionic != sim::IonicPolicy::None && !input.scene.nuclei.is_empty() {
+            theme::note(ui, "nothing in this scene is pseudised (H and He stay all-electron under cores only)");
+        }
+        return;
+    }
+    ui.label(RichText::new(pseudo::VALENCE_NOTE).size(11.0).color(theme::INK_DIM));
+    for p in pseudised {
+        ui.label(RichText::new(pseudo::species_line(p)).monospace().size(10.5).color(theme::INK_DIM));
+    }
+    if let Some(w) = pseudo::egg_box_warning(pseudised, input.scene.grid_h) {
+        ui.label(RichText::new(w).size(11.0).color(super::AMBER)).on_hover_text(pseudo::EGG_BOX_RECORD);
+    }
+}
+
 fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    anchored(ui, st, "m-ionic", |ui, _| ionic_controls(ui, input, acts));
+    ui.separator();
     anchored(ui, st, "m-thermostat", |ui, st| {
         ui.horizontal(|ui| {
             theme::section(ui, "Thermostat");
@@ -808,8 +910,8 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
-    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
-    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
+    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–18 can be placed (Z > 10 run on a generated pseudopotential, or are refused with a reason), heavier elements need the next pseudopotential stage (ONCV, semicore); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
+    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force. Bond angles: an arc and a degree label between each pair of drawn bonds at an atom (more than three bonds at an atom: select or hover it)"),
     ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];
 

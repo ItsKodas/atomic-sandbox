@@ -78,6 +78,17 @@ fn mul_add_sq(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     }
 }
 
+// y += a·x² (the occupation-weighted density of spec §5.7, M7 Task 8a; f = a, 0 < f < 1)
+@compute @workgroup_size(256)
+fn mul_add_sq_w(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let total = P.n * P.n * P.n;
+    for (var idx = gid.x; idx < total; idx = idx + nw.x * 256u) {
+        let q = pidx_of(idx, P.n, P.p);
+        let v = x[q];
+        y[q] = y[q] + P.a * (v * v);
+    }
+}
+
 // clamp_min: y = max(y, a)
 @compute @workgroup_size(256)
 fn clamp_min(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {

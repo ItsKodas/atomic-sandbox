@@ -59,7 +59,7 @@
 //! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
 //! the other callers.
 use crate::references::{AtomReference, AtomReferences};
-use crate::sampling::{SamplingPlan, SamplingProgress};
+use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
 use std::sync::Arc;
@@ -441,6 +441,11 @@ pub struct EnergyBreakdown {
 ///   provider without a grid (analytic, surrogate-answered steps).
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
+/// - `scf_tol_used`: the Δρ tolerance this solve actually stopped at (M7): the provider's `scf_tol`, except
+///   where a GPU solver cannot reach it — under a pseudo setup its stop is max(tol, 2·floor(N)), the f32
+///   density floor growing with the valence electron count (spec §7 risk 6). **A record, never compared**: the
+///   surrogate's provenance carries the stop *rule* (in the ionic tag), the nominal tolerance as before, and
+///   this number is what each answer ran at (`None` from an analytic provider or a model answer).
 /// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);
 ///   `max_eigen_residual`, `poisson_residual`: as `ScfStats` defines them (the worst LOBPCG
 ///   exit residual of the tight-tol steps; the worst relative Poisson residual). On a surrogate
@@ -460,6 +465,7 @@ pub struct EvalStats {
     pub notes: Vec<String>,
     pub face_density: Option<f64>,
     pub eig_tol_used: Option<f64>,
+    pub scf_tol_used: Option<f64>,
     pub energy: EnergyBreakdown,
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
@@ -470,6 +476,58 @@ pub struct EvalStats {
     /// Draft mode (`FallbackPolicy::never_fallback`): the model answered a step it would
     /// otherwise have handed to its teacher — what it guessed beyond.
     pub extrapolation: Option<Extrapolation>,
+    /// M7 (spec §4.7, §5.5): the species of this answer that carry a pseudopotential (empty under
+    /// `IonicPolicy::None` and when nothing in the scene has a core), one summary per Z.
+    pub pseudised: Vec<PseudoSummary>,
+    /// M7 (spec §5.6): the pairs (I, J, R_IJ) whose frozen cores overlap — an answer with any is used
+    /// (every field is finite) and never kept as training data. Each is also a warning, prefixed
+    /// [`CORE_OVERLAP_WARNING`].
+    pub core_overlaps: Vec<(usize, usize, f64)>,
+    /// M7 (spec §5.7; Task 6 review A.6): the shared (fractionally occupied) degenerate shells of
+    /// the final SCF step under `Occupations::DegenerateShells`; empty for integer occupations.
+    pub fractional: Vec<SharedShell>,
+    /// The shared-shell pattern (spin, first level, size) differs from the previous step's
+    /// evaluation by the same provider: E(R) can jump by the orbital-polarisation energy there
+    /// (a few mHa), so the answer is used and never kept as training data (Task 6 review A.6).
+    /// Also a warning, [`OCCUPATION_CHANGE_WARNING`].
+    pub occupation_changed: bool,
+}
+
+/// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
+/// Pinned equal to `qm::ionic::CORE_OVERLAP_WARNING` in `providers`.
+pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
+
+/// The prefix of the warning for a shared-shell pattern that changed between consecutive steps.
+pub const OCCUPATION_CHANGE_WARNING: &str = "occupation pattern changed";
+
+/// One shared (fractionally occupied) cluster of one spin channel (`qm::scf::FractionalShell`): spin
+/// (0 ↑, 1 ↓), the index of its first level in ascending order, its size, the occupation f of each
+/// level and the spread of its eigenvalues (Ha).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedShell {
+    pub spin: u8,
+    pub first: usize,
+    pub count: usize,
+    pub f: f64,
+    pub spread: f64,
+}
+
+/// What the generator recorded for one pseudised species, for the badge, the Selection tab and the
+/// Quality menu (spec §4.7, §5.5): Z, the valence charge Z_v, the softness factor f, the local
+/// channel, the largest r_c (Bohr), the coarsest grid spacing h_req at which the table is certified
+/// (`None`: none on the ladder), the derived core radius, T8(e)'s egg-box grid h_eb (`None`: none —
+/// reported, never refused on) and the full generation record as text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PseudoSummary {
+    pub z: u8,
+    pub z_v: f64,
+    pub f: f64,
+    pub local: String,
+    pub r_c_max: f64,
+    pub h_req: Option<f64>,
+    pub h_eb: Option<f64>,
+    pub r_core: f64,
+    pub record: String,
 }
 
 /// What a draft-mode answer guessed beyond (`providers::surrogate`, "Draft mode").
@@ -501,16 +559,35 @@ impl Default for EvalStats {
             notes: Vec::new(),
             face_density: None,
             eig_tol_used: None,
+            scf_tol_used: None,
             energy: EnergyBreakdown::default(),
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
             atom_uncertainty: None,
             extrapolation: None,
+            pseudised: Vec::new(),
+            core_overlaps: Vec::new(),
+            fractional: Vec::new(),
+            occupation_changed: false,
         }
     }
 }
 
 impl EvalStats {
+    /// Why this answer must never be a training sample, if it must not (M7): the cores of two ions overlap
+    /// ([`CORE_OVERLAP_WARNING`], spec §5.6 — the frozen-core approximation is outside its domain) or the
+    /// shared-shell occupation pattern changed since the previous evaluation ([`OCCUPATION_CHANGE_WARNING`] —
+    /// E(R) jumps by the orbital-polarisation energy there). The answer is still used for its step.
+    pub fn untrainable(&self) -> Option<&'static str> {
+        if !self.core_overlaps.is_empty() {
+            Some(CORE_OVERLAP_WARNING)
+        } else if self.occupation_changed {
+            Some(OCCUPATION_CHANGE_WARNING)
+        } else {
+            None
+        }
+    }
+
     /// The surface `ForceResult::energy` is on (see [`Surface`]).
     pub fn energy_surface(&self) -> Surface {
         match self.source {
@@ -531,6 +608,14 @@ pub enum SolverError {
     /// The SCF loop hit its iteration cap with Δρ (the second field) still above tolerance.
     #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
     ScfNotConverged(usize, f64),
+    /// The SCF stall stop (`qm::QmError::ScfStalled`): the best Δρ did not improve 2× within
+    /// `window` iterations while still at or above the stall level `level` (e), so the solve ended
+    /// after `iterations`, before the cap. `tol` is the stop the solve ran at (the floor-aware one on
+    /// the GPU, what `EvalStats::scf_tol_used` records for a success). A stall can never be the f32
+    /// density floor: the level (1e-3 per electron) is ~10⁴× that floor (5e-8 per electron), so the
+    /// floor note of review S2 was unreachable and was removed (re-review r1-m1).
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations, still above the stall level {level:.1e} (target {tol:.2e}; stopped after {iterations} iterations)")]
+    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, level: f64 },
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
@@ -539,6 +624,30 @@ pub enum SolverError {
     /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
     #[error("GPU busy, a readback from the device failed ({0})")]
     Device(String),
+}
+
+impl SolverError {
+    /// How a failed SCF ended and after how many iterations (the solve log's iteration cell):
+    /// `None` for an error that is not an SCF non-convergence.
+    pub fn scf_end(&self) -> Option<(crate::activity::ScfEnd, usize)> {
+        use crate::activity::ScfEnd;
+        match *self {
+            SolverError::ScfStalled { iterations, .. } => Some((ScfEnd::Stalled, iterations)),
+            SolverError::ScfNotConverged(n, d) if d.is_finite() => Some((ScfEnd::Cap, n)),
+            SolverError::ScfNotConverged(n, _) => Some((ScfEnd::NonFinite, n)),
+            _ => None,
+        }
+    }
+}
+
+impl ProviderError {
+    /// [`SolverError::scf_end`] of a solver error; `None` otherwise.
+    pub fn scf_end(&self) -> Option<(crate::activity::ScfEnd, usize)> {
+        match self {
+            ProviderError::Solver(e) => e.scf_end(),
+            _ => None,
+        }
+    }
 }
 
 /// Why an evaluation produced no forces (module doc, "Errors").
@@ -658,6 +767,20 @@ pub trait ForceProvider: Send {
     /// stepping solve's (R11: only commands that make the step pointless) and is not used for
     /// display work. Default: ignored.
     fn set_display_interrupt(&mut self, _interrupt: DisplayInterrupt) {}
+    /// M7: whether the density shown (`Display`) includes the partial core ρ_pc of the pseudised
+    /// species — a display of the generator's core model, never solved and never fed back
+    /// (spec §6.5). Applies from the next evaluation; the Kohn-Sham adapters honour it, a
+    /// surrogate forwards it to its teacher. No-op by default.
+    fn set_display_partial_core(&mut self, _on: bool) {}
+    /// M7: the identity of the ionic surface this provider solves `scene` on — `"none"` when
+    /// nothing in it is pseudised (the all-electron surface), else `"<policy word>/<recipe hash>"`
+    /// (`providers::pseudo::provenance_tag`). Keys the isolated-atom references
+    /// ([`crate::references::ReferenceKey::ionic`]): a reference solved on one surface is never
+    /// reused on another (the valence energies differ by tens of Ha). The default — for the
+    /// analytic providers, which have no pseudopotentials — is the policy's own word.
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        scene.ionic.word().to_string()
+    }
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task
@@ -701,6 +824,13 @@ pub trait Trainable {
     /// isolated-atom reference cache (a reference found there costs no solve). Err with the
     /// plan's problem (or when a pass is already running); nothing changes then.
     fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String>;
+    /// Starts a **teach-around** pass (`providers::surrogate`, "Teaching around the blockers"): a
+    /// targeted sampling pass around the training samples that keep an environment class untrusted
+    /// (`TrainableStatus::teach_offer`), driven by `pass_step` like any pass. Err when there is
+    /// nothing to teach or a pass is running. The default: unsupported.
+    fn start_teach(&mut self, _scene: &Scene) -> Result<(), String> {
+        Err("this provider cannot teach around blockers".into())
+    }
     /// One teacher solve of the running pass: `Ok(Some(progress))` after it; `Ok(None)` when the
     /// pass has finished — it then refits over everything it holds and notes the outcome;
     /// `Err(Cancelled)` when `should_abort` abandoned the solve (the job stays queued); any other
@@ -714,6 +844,12 @@ pub trait Trainable {
     /// The running pass's progress, else the last pass's final state; `None` before any pass and
     /// after a forget or a load.
     fn progress(&self) -> Option<SamplingProgress>;
+    /// What the running pass is solving now, for the viewer's ghost (display only): `None` without
+    /// a running pass (also after it ended, was cancelled or failed) and for a provider that does
+    /// not say.
+    fn pass_ghost(&self) -> Option<PassGhost> {
+        None
+    }
     /// Rebuilds the model from the samples held (between ticks, never inside `evaluate`): `Ok`
     /// with a one-line summary ("N samples, rmse_E … Ha/atom, rmse_F … Ha/Bohr"), `Err` with the
     /// fit's error (the previous model stays). A refit that moves the energy surface changes
@@ -853,6 +989,9 @@ pub struct TrainableStatus {
     pub superseded: usize,
     /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
     pub box_excluded: usize,
+    /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit
+    /// (`providers::surrogate`, "Draft mode").
+    pub held_out: usize,
     /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
     /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
     pub box_affected: usize,
@@ -860,7 +999,7 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// What the last refit's trust recovery did.
@@ -890,6 +1029,58 @@ pub struct TrainableStatus {
     /// forgotten model and every policy change, also where the surface epoch does not (an
     /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
     pub model_gen: u64,
+    /// Whether the strict policy answers at the scene's current geometry, and if not the rule that
+    /// refuses and why ([`Readiness`]; `None` without a model or nuclei). The `trusted` flag is the
+    /// global trust rule only; this is what "trusted" must mean to a user — "strict mode will answer
+    /// here" (the 2026-10-18 water investigation: a model shown trusted fell back on every step).
+    pub readiness: Option<Readiness>,
+    /// What a teach-around pass would do now (`providers::surrogate`, "Teaching around the
+    /// blockers"): `None` when no class is blocked by teachable samples.
+    pub teach_offer: Option<TeachOffer>,
+}
+
+/// A teach-around offer (`TrainableStatus::teach_offer`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeachOffer {
+    /// The blockers it would teach around: (store index, class name, leave-one-out ratio,
+    /// in-sample ratio) — leverage outliers (in-sample ≤ 1, LOO > 1), at most five.
+    pub blockers: Vec<(usize, &'static str, f64, f64)>,
+    /// Blockers it would not teach: the model cannot represent them (in-sample > 1), or two rounds
+    /// were spent on them already — (store index, class name, in-sample ratio, why); the worst
+    /// five by leave-one-out.
+    pub refused: Vec<(usize, &'static str, f64, &'static str)>,
+    /// How many blockers were refused in all (`refused` lists at most five).
+    pub refused_total: usize,
+    /// The teacher solves the pass would make (the held-out checks included).
+    pub solves: usize,
+    /// What the offer says before it runs (the teach-around review, SHOULD-T3/T5): the cost and
+    /// the risk (a failed check untrusts the model until re-earned), the sample floor a richer
+    /// basis would set, and a pair blocker's pair against r_cut. Informational: decides nothing.
+    pub notes: Vec<String>,
+    /// Set when consecutive class-rule fallbacks are blocked by a sample far from the geometry
+    /// being asked (`providers::surrogate`, `teach_prompt`): the status chip and a card offer the
+    /// pass in these words. Never runs anything by itself.
+    pub prompt: Option<String>,
+}
+
+/// The strict fallback policy's verdict at the current geometry ([`TrainableStatus::readiness`];
+/// `providers::surrogate`, "Readiness"): whether the model would answer a step there with draft
+/// mode off, the rule that refuses (the activity code the step's event would carry) and the
+/// refusal in words — for the class rule (4b) with the class's worst leave-one-out sample named.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Readiness {
+    /// The strict policy answers here.
+    pub answers: bool,
+    /// The refusing rule (`None` when it answers).
+    pub rule: Option<crate::activity::TeachRule>,
+    /// The atom the rule names, if any.
+    pub atom: Option<usize>,
+    /// "strict mode answers here", or the refusal's text without the "surrogate: " prefix.
+    pub text: String,
+    /// The scene's own sampling pass is not in the fit: none of the last pass's samples of this
+    /// composition survived into the fit that stands (box-excluded, quarantined …), in words —
+    /// the model has not learned this scene, whatever the policy says about this one geometry.
+    pub unlearned: Option<String>,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
@@ -956,4 +1147,22 @@ pub struct AuditRecord {
     pub asynchronous: bool,
     /// The teacher solve's wall time (ms).
     pub teacher_ms: f64,
+}
+
+#[cfg(test)]
+mod ionic_tests {
+    use super::*;
+
+    /// M7 Task 9 (spec §5.6; Task 6 review A.6): an answer with overlapping cores or a changed shared-shell pattern
+    /// is untrainable and says why; an ordinary one is not.
+    #[test]
+    fn untrainable_answers_say_why() {
+        let mut s = EvalStats::default();
+        assert_eq!(s.untrainable(), None);
+        s.occupation_changed = true;
+        assert_eq!(s.untrainable(), Some(OCCUPATION_CHANGE_WARNING));
+        s.core_overlaps = vec![(0, 1, 0.8)];
+        assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are named first");
+        assert_eq!(CORE_OVERLAP_WARNING, "cores overlap");
+    }
 }

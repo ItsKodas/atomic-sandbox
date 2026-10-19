@@ -46,6 +46,12 @@
 //! # not replayable: apply-grid  # a recorded action without a script form (below)
 //! ```
 //!
+//! **Pins.** A script that runs real solves names the physics it was written for with three `action`
+//! lines near its start: `action ionic none` (the ionic policy, M7 — the app itself starts its presets under
+//! `cores`), `action quality <level>` and `action walls <on|off> <half-width>`; `replays_pass` refuses a script
+//! without them, `--record` writes the start's policy, quality and walls, so a change of the app's defaults never
+//! moves a replay.
+//!
 //! **Actions a script cannot carry.** Apply grid, save / load scene or model, Sample, the offered
 //! pass and "sample after refusal" mean panel state a script does not hold (the pending grid
 //! fields, the file path, the sampling plan). The recorder writes them as `# not replayable:
@@ -361,7 +367,10 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::LoadScene { .. } => "load-scene",
         Action::SaveModel => "save-model",
         Action::LoadModel => "load-model",
+        Action::ApplyModelSettings => "apply-model-settings",
+        Action::CancelModelOffer => "cancel-model-offer",
         Action::Sample { .. } => "sample",
+        Action::TeachAroundBlockers => "teach-around-blockers",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",
         _ => "action",

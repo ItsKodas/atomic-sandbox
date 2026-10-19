@@ -113,15 +113,32 @@ pub fn gap_cell(e: &sim::TeachEvent) -> (String, Option<String>) {
     }
 }
 
-/// The solve-time cell: ms, or s above 10 s; "—" for a row with no solve.
+/// The solve cell: the time (ms, or s above 10 s) and the SCF iterations with how they ended —
+/// "840 ms · 37 it" converged, "6.1 s · 61 stalled" (the stall stop), "9.8 s · 200 cap"; "—" for a
+/// row with no solve.
 pub fn solve_cell(e: &sim::TeachEvent) -> String {
     if !e.is_solve() {
-        "—".into()
-    } else if e.solve_ms >= 10_000.0 {
-        format!("{:.1} s", e.solve_ms / 1e3)
-    } else {
-        format!("{:.0} ms", e.solve_ms)
+        return "—".into();
     }
+    let t = if e.solve_ms >= 10_000.0 { format!("{:.1} s", e.solve_ms / 1e3) } else { format!("{:.0} ms", e.solve_ms) };
+    match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
+        (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
+        (Some(n), Some(end)) => format!("{t} · {n} {}", end.word()),
+        (None, _) => t,
+    }
+}
+
+/// The solve cell's hover: the iterations and the end in words.
+pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
+    let n = e.scf_steps?;
+    let why = match e.scf_end {
+        Some(sim::ScfEnd::Converged) => " — converged",
+        Some(sim::ScfEnd::Stalled) => " — stalled: the best Δρ did not halve within the stall window, so the solve stopped before the cap",
+        Some(sim::ScfEnd::Cap) => " — stopped at the iteration cap without converging",
+        Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
+        None => "",
+    };
+    Some(format!("{n} SCF iterations{why}"))
 }
 
 /// One line of the displayed list (oldest-first positions are indices into `rows`).
@@ -155,9 +172,9 @@ pub fn items(st: &ActivityState) -> Vec<Item> {
 
 const ROW_H: f32 = 17.0;
 /// Column widths: time, step, origin, rule, outcome, |ΔE|, solve (rule and outcome grow with the
-/// dock).
-const FIXED: [f32; 5] = [54.0, 52.0, 52.0, 56.0, 46.0];
-const MIN_W: f32 = 452.0;
+/// dock; the solve cell holds the time and the iterations, "6.1 s · 61 stalled").
+const FIXED: [f32; 5] = [54.0, 52.0, 52.0, 56.0, 104.0];
+const MIN_W: f32 = 510.0;
 
 fn cell(ui: &Ui, rect: Rect, text: &str, font: FontId, colour: Color32) {
     let mut job = LayoutJob::single_section(text.to_string(), TextFormat { font_id: font, color: colour, ..Default::default() });
@@ -286,5 +303,9 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     }
     col(ui, 4, &words::outcome_label(e.outcome), prop, outcome_colour, Some(outcome_hover));
     col(ui, 5, &gap, mono, theme::INK, gap_hover);
-    col(ui, 6, &solve_cell(e), mono, theme::INK_DIM, e.scf_steps.map(|n| format!("{n} SCF steps")));
+    let solve_colour = match e.scf_end {
+        Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite) => AMBER,
+        _ => theme::INK_DIM,
+    };
+    col(ui, 6, &solve_cell(e), mono, solve_colour, solve_hover(e));
 }

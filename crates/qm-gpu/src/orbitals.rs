@@ -67,8 +67,13 @@
 //! # Unoccupied orbitals ([`OrbitalView::unoccupied`]; `qm::orbitals` §8, plan Task 4)
 //! A display-only eigensolve on the converged state, separate from the stepping solve: per
 //! channel, v_σ = V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out] is built into display scratch with the SCF's
-//! own kernels (`xc_lsda_in`, one `lincomb`; the state's `v_h` is V_H[ρ_out], so no Poisson
-//! solve), then `eigen::lobpcg` finds the lowest n_σ + m + `UNOCC_GUARD` eigenpairs at the SCF's
+//! own kernels (`scf::xc_in`, one `lincomb`; the state's `v_h` is V_H[ρ_out], so no Poisson
+//! solve). Under an ionic setup (M7) H^out is the SCF's full operator: V_nuc is the state's V_loc,
+//! v_xc is of (ρ_σ + ½ρ_pc) when an ion has a partial core (ρ_pc and n_σ staged in the same 5
+//! potential fields), and V_NL acts inside every H·x (`GpuHamiltonian { v, nl }`, the
+//! solver's `GpuIonic` lent by `display_work`); without it the occupied pseudo eigenvalues would
+//! disagree with the SCF's and the solve would be rejected (`unoccupied_uses_the_pseudo_hamiltonian`).
+//! Then `eigen::lobpcg` finds the lowest n_σ + m + `UNOCC_GUARD` eigenpairs at the SCF's
 //! **effective** tol (`GpuSolver::effective_eig_tol`: 5.42e-6 at h = 0.25, review MUST 4) with its
 //! 200-iteration cap, from [copies of the occupied orbitals, this view's previous unoccupied
 //! vectors, `qm::scf::initial_orbitals` (seed 3 ↑ / 4 ↓) uploaded for the rest]. The occupied
@@ -121,10 +126,10 @@ use crate::batch::{Batch, Recorder};
 use crate::eigen::{lobpcg, rayleigh_residuals, GpuHamiltonian, Stop as EigenStop};
 use crate::grid::{readbacks_on_this_thread, Field, GpuGrid};
 use crate::kernels::{workgroups_for, Kernels, COLOUR_MAX_TERMS, WORKGROUP};
-use crate::physics::{xc_lsda_in, NucleusRecord, MAX_NUCLEI};
+use crate::physics::{NucleusRecord, MAX_NUCLEI};
 use crate::pointwise::{fill_in, lincomb_in, mul_add_sq_in, mul_in, unpad_rec, unpad_row_stride};
 use crate::reduce::{neumaier, Reducer, Reduction};
-use crate::scf::{DisplayWork, GpuSolver, GpuState, EIGEN_MAX_ITER};
+use crate::scf::{xc_in, DisplayWork, GpuSolver, GpuState, EIGEN_MAX_ITER};
 use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use nalgebra::DMatrix;
 use qm::orbitals::{block_edge, clusters, occupied_disagreement, occupied_error, tau, Tracker, UpdateInput, N_LM, RADIAL_BIN_H, UNOCC_GUARD};
@@ -380,7 +385,8 @@ impl OrbitalView {
         let raw: [Vec<&Field>; 2] = [state.orbitals_up.iter().chain(&unocc[0]).collect(), state.orbitals_dn.iter().chain(&unocc[1]).collect()];
         let n_ch = [raw[0].len(), raw[1].len()];
         let n_orb = n_ch[0] + n_ch[1];
-        let lone = nuclei.len() == 1;
+        // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows)
+        let lone = nuclei.len() == 1 && state.ionic.is_none();
 
         // the centre of the moments, windows and bins: the nuclear centroid (the nucleus of a
         // lone atom), split into cell + fraction as the nuclear kernels do
@@ -463,7 +469,8 @@ impl OrbitalView {
         // reductions
         let max_abs = [c.ops[..n_ch[0]].to_vec(), c.ops[n_ch[0]..n_orb].to_vec()];
         let s = &c.ops[n_orb..];
-        let spin = SpinSummary { n_up: state.orbitals_up.len(), n_dn: state.orbitals_dn.len(), integral: s[0], abs_integral: s[1], max_abs: s[2], rho_max: s[3] };
+        let n_el = |o: &[f64], n: usize| o.iter().take(n).sum::<f64>().round() as usize;
+        let spin = SpinSummary { n_up: n_el(&state.occ_up, state.orbitals_up.len()), n_dn: n_el(&state.occ_dn, state.orbitals_dn.len()), integral: s[0], abs_integral: s[1], max_abs: s[2], rho_max: s[3] };
         // moments, functionals, outer weights, radial profiles
         let dv = grid.dv();
         let lane = |blk: &[f32], l: usize| neumaier(blk[l * mom_wg..(l + 1) * mom_wg].iter().map(|v| *v as f64)) * dv;
@@ -528,8 +535,12 @@ impl OrbitalView {
             let e = if ch == 0 { &state.evals_up } else { &state.evals_dn };
             e.iter().chain(info.map_or(&[][..], |u| &u.evals[ch][..])).copied().collect()
         });
-        let occ: [Vec<f64>; 2] = std::array::from_fn(|ch| (0..n_computed[ch]).map(|i| if i < n_occ[ch] { 1.0 } else { 0.0 }).collect());
-        let lone = nuclei.len() == 1;
+        // the state's own occupations (M7): a fraction on a shared shell, 0 on the stored gap witnesses
+        let occ: [Vec<f64>; 2] = std::array::from_fn(|ch| {
+            let o = if ch == 0 { &state.occ_up } else { &state.occ_dn };
+            (0..n_computed[ch]).map(|i| if i < n_occ[ch] { o.get(i).copied().unwrap_or(1.0) } else { 0.0 }).collect()
+        });
+        let lone = nuclei.len() == 1 && state.ionic.is_none();
         let input = UpdateInput {
             evals: [&evals[0], &evals[1]],
             occupations: [&occ[0], &occ[1]],
@@ -663,17 +674,25 @@ impl OrbitalView {
         self.follow_grid(solver, st);
         let n = [st.orbitals_up.len(), st.orbitals_dn.len()];
         let (ctx, g, grid) = (self.ctx.clone(), self.g, self.grid.clone());
-        let Some(DisplayWork { k, state, work }) = solver.display_work(n[0].max(n[1]) + ku) else {
+        let Some(DisplayWork { k, state, work, ionic }) = solver.display_work(n[0].max(n[1]) + ku) else {
             unreachable!("a converged state was checked above");
         };
-        // v_σ of ρ_out with the SCF's own kernels and term order
+        // v_σ of ρ_out with the SCF's own kernels and term order: `v_nuc` is V_loc under an ionic
+        // setup, and v_xc is of (ρ_σ + ½ρ_pc) when an ion has a partial core (`scf::xc_in`)
         let [exc, xu, xd, vu, vd]: [Field; 5] = std::array::from_fn(|_| Self::field(&mut self.pool, &ctx, &g));
         let mut b = Batch::new(&ctx, "unoccupied potentials");
-        xc_lsda_in(&mut b, k, &g, &state.rho_up, &state.rho_dn, &exc, &xu, &xd);
+        // the partial core needs no extra field: ρ_pc goes into `exc` and ρ_σ + ½ρ_pc into v_σ, each
+        // consumed by a later dispatch before that dispatch's output overwrites it (xc reads n_σ and
+        // writes exc; the final lincomb reads v_xc,σ and writes v_σ)
+        let has_pc = ionic.is_some_and(|i| i.has_partial_core());
+        if let Some(ion) = ionic.filter(|_| has_pc) { ion.partial_core_in(&mut b, k, &g, &exc); }
+        xc_in(&mut b, k, &g, &state.rho_up, &state.rho_dn, has_pc.then_some((&exc, &vu, &vd)), &exc, &xu, &xd);
         lincomb_in(&mut b, k, &g, &vu, &[(1.0, &state.v_nuc), (1.0, &state.v_h), (1.0, &xu)]);
         lincomb_in(&mut b, k, &g, &vd, &[(1.0, &state.v_nuc), (1.0, &state.v_h), (1.0, &xd)]);
         b.submit();
         self.pool.extend([exc, xu, xd]);
+        // V_NL inside every H·x when the state's ions carry projectors (the SCF's `GpuHamiltonian`)
+        let nl = ionic.and_then(|i| i.nonlocal());
         let mut kept: [Vec<Field>; 2] = [Vec::new(), Vec::new()];
         let mut failure: Option<String> = None;
         let mut aborted = false;
@@ -702,7 +721,7 @@ impl OrbitalView {
                 }
             }
             b.submit();
-            let h = GpuHamiltonian { v };
+            let h = GpuHamiltonian { v, nl };
             let mut ev = vec![0.0; x.len()];
             match lobpcg(&ctx, k, &g, &self.reducer, &h, &mut x, &mut ev, work, tol, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
                 Ok(es) if es.stop == EigenStop::Aborted => {

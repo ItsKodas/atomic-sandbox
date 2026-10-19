@@ -284,7 +284,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     dock::group(ui, st, "d-trust", |ui, st| {
         theme::section(ui, "Trust");
-        trust::show(ui, st, input);
+        trust::show(ui, st, input, acts);
     });
     let target_t = st.plan.hot_burst_t;
     let draft = input.model().is_some_and(|m| m.draft);
@@ -378,8 +378,7 @@ pub fn bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, toolbar: egu
     let hit = root.interact(r.expand2(egui::vec2(0.0, 3.0)), Id::new("activity-bar-hit"), egui::Sense::click());
     super::probe("activity-bar", &hit);
     if hit.on_hover_text(format!("{text}\n(click: the Activity tab)")).clicked() {
-        st.dock_open = true;
-        st.dock_tab = super::DockTab::Activity;
+        st.open_tab(super::DockTab::Activity);
     }
     root.ctx().request_repaint_after(Duration::from_millis(33));
 }

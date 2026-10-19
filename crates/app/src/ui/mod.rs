@@ -26,7 +26,9 @@ mod dock;
 mod icons;
 pub mod logbook;
 mod menus;
+pub mod model_offer;
 mod overlays;
+pub mod pseudo;
 pub mod ptable;
 mod sampling_presets;
 pub mod search;
@@ -83,6 +85,69 @@ pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
 /// The Model tab's sampling row on an empty scene (`sim::sampling::EMPTY_SCENE` refuses a pass).
 pub const EMPTY_SAMPLE: &str = "place atoms to sample";
 
+/// The temperature readouts' one-second average (user request 2026-10-18: a few nuclei's
+/// instantaneous kinetic T swings with every bond stretch and is unreadable). Display only: the
+/// samples are the snapshots' T, one per new step, kept for [`TempAverage::WINDOW_S`] of wall time;
+/// a change of the nucleus count or a step going backwards (a reset, a new scene) starts over.
+#[derive(Clone, Debug, Default)]
+pub struct TempAverage {
+    samples: std::collections::VecDeque<(f64, u64, f64)>,
+    n_nuclei: usize,
+}
+
+impl TempAverage {
+    /// The averaging window, wall-clock seconds.
+    pub const WINDOW_S: f64 = 1.0;
+
+    /// Records the snapshot's T at wall time `now_s` (one sample per step) and drops samples older
+    /// than the window, keeping the newest.
+    pub fn observe(&mut self, now_s: f64, d: &sim::DynSnapshot) {
+        let n = d.scene.nuclei.len();
+        if n != self.n_nuclei || self.samples.back().is_some_and(|&(_, step, _)| d.step < step) {
+            self.samples.clear();
+            self.n_nuclei = n;
+        }
+        if self.samples.back().is_none_or(|&(_, step, _)| step != d.step) {
+            self.samples.push_back((now_s, d.step, d.temperature));
+        }
+        while self.samples.len() > 1 && self.samples.front().is_some_and(|&(t, _, _)| now_s - t > Self::WINDOW_S) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The mean T over the window, if any sample is held.
+    pub fn mean(&self) -> Option<f64> {
+        (!self.samples.is_empty()).then(|| self.samples.iter().map(|s| s.2).sum::<f64>() / self.samples.len() as f64)
+    }
+}
+
+/// The readouts' temperature: the one-second average ([`TempAverage`]) when one is held, else the
+/// snapshot's instantaneous T; "—" with no nuclei.
+pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decimals: usize, units: TempUnits) -> String {
+    if d.scene.nuclei.is_empty() {
+        "—".into()
+    } else {
+        units.show(avg.mean().unwrap_or(d.temperature), decimals)
+    }
+}
+
+/// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
+pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
+/// The auto cadence's bounds (answered steps): never more often than every 200 steps, never
+/// rarer than every 1 000 000.
+pub const AUTO_AUDIT_MIN: usize = 200;
+pub const AUTO_AUDIT_MAX: usize = 1_000_000;
+
+/// The auto audit cadence for a measured play speed: the steps that pass in
+/// [`AUTO_AUDIT_WALL_S`] of wall time, rounded to two significant figures and clamped. `None`
+/// while the speed is not measured (paused, just started).
+pub fn auto_audit_every(fs_per_s: Option<f64>, dt_fs: f64) -> Option<usize> {
+    let steps_per_s = fs_per_s.filter(|v| v.is_finite() && *v > 0.0)? / dt_fs.max(1e-9);
+    let raw = (steps_per_s * AUTO_AUDIT_WALL_S).max(1.0);
+    let mag = 10f64.powf(raw.log10().floor() - 1.0);
+    Some((((raw / mag).round() * mag) as usize).clamp(AUTO_AUDIT_MIN, AUTO_AUDIT_MAX))
+}
+
 /// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
 /// moves; the driver's 0 K is only a finite placeholder).
 pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
@@ -134,7 +199,15 @@ pub enum ToolMode {
     Select,
 }
 
-/// The dock's tabs.
+/// Which edge a dock sits on (user request 2026-10-19: the left dock is what is going on — stats —
+/// the right is what you configure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockSide {
+    Left,
+    Right,
+}
+
+/// The docks' tabs: [`DockTab::LEFT`] on the left dock, [`DockTab::RIGHT`] on the right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockTab {
     Readouts,
@@ -149,7 +222,21 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 7] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Activity, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    /// Every tab, the left dock's first (the tests' sweep).
+    #[cfg(test)]
+    pub const ALL: [DockTab; 7] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    /// The left dock's tabs, in strip order: stats and what is going on.
+    pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
+    /// The right dock's tabs, in strip order: configuring things.
+    pub const RIGHT: [DockTab; 4] = [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+
+    /// The dock this tab lives in.
+    pub fn side(self) -> DockSide {
+        match self {
+            DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
+            DockTab::Model | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+        }
+    }
 
     pub fn title(self) -> &'static str {
         match self {
@@ -160,6 +247,16 @@ impl DockTab {
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
+        }
+    }
+}
+
+impl DockSide {
+    /// The tabs of this dock, in strip order.
+    pub fn tabs(self) -> &'static [DockTab] {
+        match self {
+            DockSide::Left => &DockTab::LEFT,
+            DockSide::Right => &DockTab::RIGHT,
         }
     }
 }
@@ -304,7 +401,19 @@ pub fn gravity_au() -> f64 {
     units::angstrom_to_bohr(9.8 * 1e10) * au_time_s * au_time_s
 }
 
+/// The ionic policy the app starts its presets with (M7 Task 11 fix round, controller ruling on spec §4.7): every species
+/// the recipe accepts is pseudised, H and He included (through the dimer gate; all-electron with a note in a run without
+/// a GPU), a refused one (Li, Be, Na, Mg, Al) all-electron with a note — per species, so nothing flips when an atom is
+/// added. `Scene` literals, scene files without an `ionic` key and the validate suites stay `None`; `--ionic` overrides
+/// this and a `--scene` file keeps its own key. Evidence: references.md "M7 default policy".
+pub const DEFAULT_IONIC: sim::IonicPolicy = sim::IonicPolicy::Accepted;
+
 pub struct UiState {
+    /// The ionic policy the scene in force was set with (Physics ▸ Ionic potential; presets loaded
+    /// next are loaded under it). M7.
+    pub ionic: sim::IonicPolicy,
+    /// View ▸ Density ▸ with partial core: the density shown includes ρ_pc (display only). M7.
+    pub show_partial_core: bool,
     /// Z placed by the Place tool.
     pub element: u8,
     /// Its isotope's mass number (`None` = the most abundant one; the periodic table's isotope row).
@@ -314,6 +423,26 @@ pub struct UiState {
     pub show_bonds: bool,
     pub show_labels: bool,
     pub show_badge: bool,
+    /// View ▸ Display aids ▸ "show what training is solving" (`crate::ghost`): while a sampling pass
+    /// runs, the 3D view shows the geometry the teacher is solving instead of the scene. Display
+    /// only; on by default.
+    pub show_ghost: bool,
+    /// View ▸ Bonds and molecules ▸ bond angles (M7 Task 13): an arc and a degree label between each
+    /// pair of drawn bonds at an atom (`overlay::bond_angles`). Needs "bonds" on; display only; on by
+    /// default.
+    pub show_angles: bool,
+    /// View ▸ Bonds and molecules ▸ bond lengths: each drawn bond's length (Å) at its midpoint
+    /// (user request 2026-10-18). Display only, not recorded.
+    pub show_bond_lengths: bool,
+    /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
+    /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
+    pub follow_selected: bool,
+    /// The audit cadence restored when Model ▸ Audits ▸ "audits on" is ticked again (user request
+    /// 2026-10-18: a switch to turn audits off for smoother playback). Display state only.
+    pub audit_every_on: usize,
+    /// Model ▸ Audits ▸ "auto" (on by default since 2026-10-19, user request): the cadence follows the measured play speed so audits arrive
+    /// about every [`AUTO_AUDIT_WALL_S`] of wall time at any speed (user request 2026-10-18).
+    pub audit_auto: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -377,6 +506,13 @@ pub struct UiState {
     /// shrinks them while an orbital product is drawn, so they do not hide it).
     pub nucleus_scale: Option<f32>,
     pub scene_path: String,
+    /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
+    /// `scene::model_path`). Display/plumbing only.
+    pub model_file: Option<std::path::PathBuf>,
+    /// A picked model file whose settings differ from the scene's (`model_offer`): the card over the 3D view offers to
+    /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
+    /// the user presses Apply.
+    pub model_offer: Option<model_offer::ModelOffer>,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
     /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
@@ -395,6 +531,12 @@ pub struct UiState {
     pub show_axes: bool,
     pub show_place_grid: bool,
     pub grid_in_angstrom: bool,
+    /// Atom trails (`crate::trails`, user request 2026-10-17; display only, not recorded): off by
+    /// default; how long a point stays, in simulated fs ([`trails::LENGTH_MIN_FS`]…
+    /// [`trails::LENGTH_MAX_FS`], logarithmic slider), and the alpha of the newest end (0–1).
+    pub show_trails: bool,
+    pub trail_fs: f64,
+    pub trail_opacity: f32,
     /// Run settings as last sent (re-sent to a new worker, `run_settings`): time step (fs),
     /// steps per tick, thermostat on / target (K) / τ (fs), gravity preset, COM correction.
     pub dt_fs: f64,
@@ -441,13 +583,20 @@ pub struct UiState {
     /// applied at the start of the next frame like a click's.
     pub queued: Vec<Action>,
     // ---- the chrome's own view state (M6 redesign) ----
-    /// The dock's tab, and whether the dock is open (else only its icon strip shows).
+    /// The RIGHT dock's tab (one of [`DockTab::RIGHT`]), and whether it is open (else only its icon
+    /// strip shows). Display state: not recorded.
     pub dock_tab: DockTab,
     pub dock_open: bool,
+    /// The LEFT dock's tab (one of [`DockTab::LEFT`]) and whether it is open — its own state, a width
+    /// of its own (user request 2026-10-19). Display state: not recorded.
+    pub left_tab: DockTab,
+    pub left_open: bool,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
     /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
     pub temp_units: TempUnits,
+    /// The temperature readouts' one-second average (display only).
+    pub temp_avg: TempAverage,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
@@ -465,8 +614,35 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Opens `tab`'s dock on it (a dock is only ever asked for its own tabs): the search, the
+    /// Activity bar, a view mode that needs the Orbitals tab. Display state, never recorded.
+    pub fn open_tab(&mut self, tab: DockTab) {
+        match tab.side() {
+            DockSide::Left => (self.left_open, self.left_tab) = (true, tab),
+            DockSide::Right => (self.dock_open, self.dock_tab) = (true, tab),
+        }
+    }
+
+    /// Whether `tab` is on screen: its dock is open and showing it.
+    pub fn tab_shown(&self, tab: DockTab) -> bool {
+        match tab.side() {
+            DockSide::Left => self.left_open && self.left_tab == tab,
+            DockSide::Right => self.dock_open && self.dock_tab == tab,
+        }
+    }
+
+    /// A dock's open flag and tab, to read or change.
+    pub fn dock_mut(&mut self, side: DockSide) -> (&mut bool, &mut DockTab) {
+        match side {
+            DockSide::Left => (&mut self.left_open, &mut self.left_tab),
+            DockSide::Right => (&mut self.dock_open, &mut self.dock_tab),
+        }
+    }
+
     pub fn new(preset: &str, scene: &Scene) -> UiState {
         UiState {
+            ionic: DEFAULT_IONIC,
+            show_partial_core: false,
             backend: Backend::Cpu,
             gpu_available: false,
             element: 1,
@@ -474,6 +650,12 @@ impl UiState {
             show_bonds: true,
             show_labels: true,
             show_badge: true,
+            show_ghost: true,
+            show_angles: true,
+            show_bond_lengths: true,
+            follow_selected: false,
+            audit_every_on: 2000,
+            audit_auto: true,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,
@@ -503,6 +685,8 @@ impl UiState {
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
+            model_file: None,
+            model_offer: None,
             status: String::new(),
             status_seq: 0,
             show_cell: true,
@@ -510,6 +694,9 @@ impl UiState {
             show_axes: true,
             show_place_grid: true,
             grid_in_angstrom: false,
+            show_trails: false,
+            trail_fs: crate::trails::LENGTH_DEFAULT_FS,
+            trail_opacity: crate::trails::OPACITY_DEFAULT,
             dt_fs: DEFAULT_DT_FS,
             speed: 1,
             thermostat_on: false,
@@ -532,10 +719,13 @@ impl UiState {
             cloud_superposition: true,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
-            dock_tab: DockTab::Readouts,
-            dock_open: true,
+            dock_tab: DockTab::Model,
+            dock_open: false,
+            left_tab: DockTab::Readouts,
+            left_open: true,
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
+            temp_avg: TempAverage::default(),
             show_atom_card: true,
             graph_series: GraphSeries::Both,
             graph_all: false,
@@ -577,6 +767,8 @@ impl UiState {
     pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
         self.source = SceneSource::File(path.to_string());
         self.scene_path = path.to_string();
+        // a file keeps its own policy (no key: all-electron, the physics it was written for)
+        self.ionic = scene.ionic;
         self.adopt(scene);
         self.wall_half_width = default_wall_half_width(scene);
         self.quality_h = scene.grid_h;
@@ -623,6 +815,10 @@ impl UiState {
         // "on" in the panel and off in the new driver
         if self.show != ShowMode::Density {
             v.push(DynCommand::SetOrbitalView(self.orbital_request()));
+        }
+        // likewise the partial-core display
+        if self.show_partial_core {
+            v.push(DynCommand::SetDisplayPartialCore(true));
         }
         v
     }
@@ -735,6 +931,9 @@ pub struct PanelInput<'a> {
     /// An orbital request is out and its payload has not arrived: the display eigensolve may be
     /// running ("computing unoccupied orbitals…", `Viewer::orbital_waiting`).
     pub orbital_waiting: bool,
+    /// A pseudopotential being generated now (`providers::pseudo::generating`: Z, seconds so far, whether its dimer gate
+    /// runs — ≈ 1 min for H/He on the GPU): the status line says so while the first solve waits for it (M7 Task 11).
+    pub pseudo_generating: Option<(u8, f64, bool)>,
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,
@@ -817,7 +1016,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let view = root.available_rect_before_wrap();
     out.view = Some(view);
     // the training views are built only while shown (activity spec §6)
-    let want = st.dock_open && st.dock_tab == DockTab::Activity && st.activity.training_open;
+    let want = st.tab_shown(DockTab::Activity) && st.activity.training_open;
     if want != st.activity.views_sent {
         st.activity.views_sent = want;
         out.commands.push(Command::SetActivityViews(want));
@@ -977,6 +1176,37 @@ fn isotope_buttons(ui: &mut egui::Ui, z: u8, current: Option<u16>, probe_prefix:
 /// The caveat shown with the bond strength (user request, M6; `sim::bonds` module doc, "LSDA").
 pub const LSDA_STRETCHED_NOTE: &str = "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality";
 
+/// Spec §5 and plan review Q10: under pseudopotentials the Laplacian of the density at a bond point
+/// is evaluated on the valence (+ρ_pc) density, which is smooth by construction inside each r_c — so
+/// a bond point there has a kind that is not the all-electron one. (Words, not ∇²: the UI font has
+/// no ∇.)
+pub const VALENCE_KIND_NOTE: &str = "valence-density kind: this bond point lies inside a pseudopotential's core radius r_c, where the valence density is smooth by construction — the sign of the Laplacian of the density here is not the all-electron one";
+
+/// Whether the bond point of i–j (pos_i + s·(pos_j − pos_i)) lies within r_c,max of a pseudised end
+/// atom. `r_c_max_of(z)` is that species' largest core radius (Bohr), `None` for an all-electron
+/// species (so a scene with nothing pseudised never has a valence-density kind).
+// The Selection tab passes `|z| pseudo::of_species(&pseudised, z).map(|p| p.r_c_max)` over the scene's
+// pseudised species (`sim::PseudoSummary`, `pseudo::pseudised`).
+pub fn valence_density_kind(pos: &[[f64; 3]], zs: &[u8], i: usize, j: usize, s: f64, r_c_max_of: impl Fn(u8) -> Option<f64>) -> bool {
+    let (Some(pi), Some(pj)) = (pos.get(i), pos.get(j)) else { return false };
+    let p: [f64; 3] = std::array::from_fn(|k| pi[k] + s * (pj[k] - pi[k]));
+    [i, j].into_iter().any(|a| {
+        let (Some(&z), Some(c)) = (zs.get(a), pos.get(a)) else { return false };
+        r_c_max_of(z).is_some_and(|r_c| (0..3).map(|k| (p[k] - c[k]).powi(2)).sum::<f64>().sqrt() < r_c)
+    })
+}
+
+/// Which surface a bond angle is measured on (Dock ▸ Selection): the angle of a triple whose three
+/// species are all pseudised sits on the pseudopotential surface; otherwise some nucleus is still the
+/// smeared all-electron one (σ = h) and the angle carries the smearing.
+pub fn angle_surface_note(pseudised: &[u8], zs: [u8; 3]) -> &'static str {
+    if zs.iter().all(|z| pseudised.contains(z)) {
+        "pseudopotential surface"
+    } else {
+        "includes smeared all-electron nuclei (σ = h): the angle carries the smearing"
+    }
+}
+
 /// A bond point's QTAIM kind in plain words (`sim::bonds` module doc, "Bond strength").
 pub fn kind_words(kind: sim::BondKind) -> &'static str {
     match kind {
@@ -1130,6 +1360,11 @@ enum TrustKind {
     Stuck,
     /// Trusted, with quarantined samples.
     Quarantined,
+    /// Trusted overall, but the strict policy refuses at the current geometry (`readiness`).
+    NotHere,
+    /// Trusted overall, but an environment class among the scene's atoms is untrusted everywhere
+    /// (rule 4b; round 1, SHOULD-5).
+    ClassUntrusted,
     Trusted,
     Untrusted,
 }
@@ -1141,6 +1376,8 @@ impl TrustKind {
             TrustKind::NoModel => "no model yet",
             TrustKind::Trusted => "trusted",
             TrustKind::Stuck | TrustKind::Quarantined => "trusted, see Model",
+            TrustKind::NotHere => "trusted, not here",
+            TrustKind::ClassUntrusted => "a class untrusted, see Model",
             TrustKind::Untrusted => "untrusted, see Model",
         }
     }
@@ -1175,6 +1412,19 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         };
         let view = v(TrustKind::Stuck, AMBER, text, Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."));
         TrustView { detail: plain.is_some().then(|| why.to_string()), ..view }
+    } else if let Some(r) = m.readiness.as_ref().filter(|r| m.trusted && (!r.answers || r.unlearned.is_some())) {
+        // trusted overall, refused here (fix (a), 2026-10-18): the badge must not say "yes" where
+        // strict mode falls back on every step — nor for a scene whose own pass is not in the fit (e)
+        let class = matches!(r.rule, Some(sim::activity::TeachRule::Class(_)));
+        let lead = if class { "yes overall, but" } else { "not here —" };
+        let text = match (&r.unlearned, r.answers) {
+            (Some(u), true) => format!("not this scene — {u}"),
+            (Some(u), false) => format!("{lead} {}; {u}", r.text),
+            (None, _) => format!("{lead} {}", r.text),
+        };
+        let kind = if class && !r.answers { TrustKind::ClassUntrusted } else { TrustKind::NotHere };
+        let view = v(kind, AMBER, text, Some(if class { CLASS_UNTRUSTED_TIP } else { NOT_HERE_TIP }));
+        TrustView { detail: m.untrusted_reason.clone(), ..view }
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
@@ -1190,6 +1440,12 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         }
     }
 }
+
+/// The tooltip of the "trusted, not here" variant (`ModelStatus::readiness`).
+const NOT_HERE_TIP: &str = "the model passes its global trust rule, but at this geometry strict mode refuses it — every step here is DFT. The reason names the rule. Move on, run a sampling pass here, or switch on draft mode to guess (unsafe).";
+
+/// The tooltip of the class variant (rule 4b; round 1, SHOULD-5).
+const CLASS_UNTRUSTED_TIP: &str = "an environment class (two-atom, or three-or-more-atom) among this scene's atoms is not learned well enough: some training sample of that class cannot be predicted by the rest (leave-one-out), so strict mode refuses that class everywhere — every step with such atoms is DFT. The class's verdict changes only when samples near the named one exist (a sampling pass around it); steps elsewhere do not change it.";
 
 /// The tooltip of the plain untrusted variant.
 const UNTRUSTED_TIP: &str = "an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)";

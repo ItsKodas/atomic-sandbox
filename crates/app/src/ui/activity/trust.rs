@@ -46,12 +46,34 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
         // box-affected samples below the trust floor are fitted, and a model can still pass with
         // them: the line says what is true (activity final review M3)
         let in_fit = m.box_affected.saturating_sub(m.box_excluded);
-        let text = if in_fit == 0 {
+        let mut text = if in_fit == 0 {
             "Samples clear of the box walls".to_string()
         } else {
             format!("Box walls not blocking trust — {in_fit} samples in the fit touch them ({} held)", m.samples)
         };
+        // fix (d), 2026-10-18: the box-affected samples left out of the fit are not training
+        // progress — say how many the walls cost, every time
+        if m.box_excluded > 0 {
+            text = format!("{text}; {} box-affected samples are left out of the fit (they taught nothing: a bigger cell would)", m.box_excluded);
+        }
         v.push(Line { met: true, why: false, text, hover: "box-affected samples are not keeping the model untrusted".into() });
+    }
+    // the strict policy at this geometry (fix (a), 2026-10-18): the line that says whether the
+    // checklist above means the model answers *here*; "this is why" when everything above is met
+    if let Some(r) = &m.readiness {
+        v.push(Line {
+            met: r.answers,
+            why: !r.answers && boxed.is_none() && first.is_none(),
+            text: if r.answers {
+                "Strict mode answers at this geometry".to_string()
+            } else {
+                format!("Strict mode answers at this geometry — no: {}{}", r.text, if m.draft { " (draft mode is answering anyway)" } else { "" })
+            },
+            hover: format!("the fallback policy's verdict here, draft mode off: rule {:?}{}", r.rule, r.atom.map_or(String::new(), |a| format!(", atom {a}"))),
+        });
+        if let Some(u) = &r.unlearned {
+            v.push(Line { met: false, why: r.answers && boxed.is_none() && first.is_none(), text: format!("This scene's own sampling pass is in the fit — no: {u}"), hover: "the last sampling pass of these species: what its samples became in the fit that stands".into() });
+        }
     }
     for l in &m.class_loo {
         v.push(Line {
@@ -83,7 +105,7 @@ fn mark(ui: &mut Ui, met: bool) {
 
 /// The tab's trust group: ✓ / ✗ lines, "this is why" as an amber pill on the refusal's line, and
 /// the stuck variant when a trusted model keeps falling back.
-pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<crate::ui::actions::Action>) {
     let Some(m) = input.model().filter(|m| m.fitted) else {
         theme::note(ui, "no model yet — the checklist appears once a sampling pass has fitted one");
         return;
@@ -98,6 +120,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             ui.add(egui::Label::new(RichText::new(&l.text).size(12.0).color(theme::INK)).wrap()).on_hover_text(&l.hover);
         });
     }
+    crate::ui::dock::model::teach_row(ui, m, input.sampling(), acts);
     if m.trusted {
         if let (Some(info), Some(snap)) = (&m.stuck_info, input.snapshot) {
             ui.horizontal_wrapped(|ui| {

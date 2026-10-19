@@ -54,17 +54,18 @@ fn he_atom_lsda() {
 }
 
 /// Li LSD total energy oracle — **deferred as a documented limitation** (controller ruling
-/// 2026-10-13), not a solver defect. Reference NIST LSD −7.335195 Ha, bound 4e-2 (untouched).
+/// 2026-10-13), not a solver defect. Reference NIST LSD −7.343957 Ha (corrected 2026-10-15, M7 Task 1 review:
+/// −7.335195 is NIST's LDA column), bound 4e-2 (untouched).
 ///
 /// Measured with this design (107³, h = 0.15, 15.9 Bohr box — no face warning, 5e-7 —
 /// σ = 0.15/0.18/0.21/0.24, tol 1e-7): E(σ) = −5.730663 / −5.419456 / −5.138109 / −4.883871,
-/// four-point σ → 0 fit a = **−7.004270, +331 mHa** (8× the bound). SCF is clean: 11–13 DIIS
+/// four-point σ → 0 fit a = **−7.004270, +340 mHa** (8.5× the bound). SCF is clean: 11–13 DIIS
 /// steps, Δρ ≤ 8e-8, (n↑, n↓) = (2, 1), ∫ρ = 3.
 ///
 /// Why: the smearing shift of a hydrogenic cusp is (4πρ(0)/Z)·F(Zσ), and the four-point
 /// σ²/σ³/σ⁴ fit drops the (Zσ)⁵ term, so its bias scales as ρ(0)·Z⁴·σ_max⁵ (`validate` module
 /// doc). With ρ(0) ≈ 13.8 and Z = 3 the first-order model predicts +207 mHa at h = 0.15
-/// (measured +331 once density relaxation is included; the same model predicted +20 / +4 mHa
+/// (measured +340 once density relaxation is included; the same model predicted +20 / +4 mHa
 /// for He at h = 0.15 / 0.10 against measured +46 / +12). At Z·σ_max = 0.72 the series is far
 /// from asymptotic — the fitted σ² coefficient (111) is less than half the physical 2πZρ(0) ≈ 260.
 /// Reaching 40 mHa needs Z·h ≲ 0.2, i.e. h ≲ 0.07 in a 16 Bohr box (≥ 230³ ≈ 12 M points,
@@ -82,7 +83,7 @@ fn he_atom_lsda() {
 fn li_atom_lsda() {
     let (e, warnings) = atom_oracle("Li", 3, 107, 0.15, 13.8);
     assert!(warnings.is_empty(), "{warnings:?}");
-    assert!((e - (-7.335195)).abs() < 4e-2, "Li LSD: got {e}, reference −7.335195");
+    assert!((e - (-7.343957)).abs() < 4e-2, "Li LSD: got {e}, reference −7.343957");
 }
 
 /// F_x on nucleus 0 (at +R/2) for H₂ at bond length `r`, with warm start.

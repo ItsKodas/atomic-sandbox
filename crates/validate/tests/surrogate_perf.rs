@@ -77,6 +77,7 @@ fn scene_of(pos: &[[f64; 3]], z: &[u8]) -> Scene {
         multiplicity: None,
         sigma: None,
         external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
     }
 }
 

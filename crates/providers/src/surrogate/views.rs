@@ -200,7 +200,7 @@ impl SurrogateKs {
 
     /// The last rule of the order: the quarantine fence.
     fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+        if !self.near_quarantined_cached(pos, z).is_empty() || self.near_audit_fence(pos, z).is_some() {
             return Err((TeachRule::NearQuarantine, None));
         }
         Ok(())
@@ -282,6 +282,7 @@ impl SurrogateKs {
                 Q_HELD => SampleState::Quarantined,
                 Q_SUPERSEDED => SampleState::Superseded,
                 Q_BOX => SampleState::BoxExcluded,
+                Q_DRAFT => SampleState::HeldOut,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`
@@ -291,9 +292,9 @@ impl SurrogateKs {
         };
         // audits are tagged Fallback in the store until sidecar v4 (spec A6)
         let kind = |t: SampleTag| match t {
-            SampleTag::Fallback => SampleKind::Fallback,
+            SampleTag::Fallback | SampleTag::Audit | SampleTag::DraftAudit => SampleKind::Fallback,
             SampleTag::LiveStep => SampleKind::Live,
-            SampleTag::Perturbation | SampleTag::HotBurst | SampleTag::Scan | SampleTag::Reference => SampleKind::Pass,
+            SampleTag::Perturbation | SampleTag::HotBurst | SampleTag::Scan | SampleTag::Reference | SampleTag::Targeted => SampleKind::Pass,
         };
         let finite = |e: f64, f: &[[f64; 3]]| e.is_finite() && f.iter().flatten().all(|x| x.is_finite());
         let r_cut = model.basis.r_cut;

@@ -63,13 +63,20 @@ pub fn electrons_line(z: u8) -> String {
     )
 }
 
+/// "solved as a pseudo-ion: 6 valence electrons, the 2-electron core is frozen (not in the diagram's solve)" — the card
+/// draws the textbook neutral atom, the simulation solves Z_v electrons for a pseudised species.
+pub fn pseudo_line(p: &sim::PseudoSummary) -> String {
+    let core = (p.z as f64 - p.z_v).round() as i64;
+    format!("pseudo-ion in the solve: {} valence electrons; the {core} core electrons are frozen into the potential", p.z_v)
+}
+
 /// The caveat under the drawing (short) and behind its "i" (long).
 const CAVEAT: &str = "In a molecule the electrons are shared: the cloud in the 3D view is the real picture. The simulation treats the nucleus as a point of charge +Z.";
 
 /// Draws the card for `nucleus` (index `i` in the scene) with its top-right corner at
 /// `top_right` (the 3D view's corner); returns the card's rect. Call once per frame while a
 /// nucleus is selected.
-pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize) -> egui::Rect {
+pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize, pseudo: Option<&sim::PseudoSummary>) -> egui::Rect {
     let z = nucleus.z;
     let n_neutrons = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
     let shells = shells(z);
@@ -89,6 +96,10 @@ pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usi
                 });
                 ui.label(format!("nucleus #{i}: {}", composition(nucleus)));
                 ui.label(electrons_line(z));
+                // M7: under a pseudopotential only the valence electrons are solved
+                if let Some(p) = pseudo {
+                    ui.label(pseudo_line(p));
+                }
                 let (rect, _) =
                     ui.allocate_exact_size(Vec2::new(220.0, 190.0), egui::Sense::hover());
                 let p = ui.painter_at(rect);
@@ -139,6 +150,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pseudised_species_says_what_is_solved() {
+        let p = sim::PseudoSummary { z: 8, z_v: 6.0, f: 1.0, local: "s-local".into(), r_c_max: 1.35, h_req: Some(0.2), h_eb: Some(0.15), r_core: 0.8, record: String::new() };
+        assert_eq!(pseudo_line(&p), "pseudo-ion in the solve: 6 valence electrons; the 2 core electrons are frozen into the potential");
+    }
+
+    #[test]
     fn shells_fill_the_textbook_way() {
         assert_eq!(shells(1), vec![1]);
         assert_eq!(shells(2), vec![2]);
@@ -155,7 +172,8 @@ mod tests {
         assert_eq!(mass_number(&n(3, None)), Some(7));
         assert_eq!(mass_number(&n(8, None)), Some(16));
         assert_eq!(mass_number(&n(8, Some(18))), Some(18));
-        assert_eq!(mass_number(&n(11, None)), None);
+        assert_eq!(mass_number(&n(11, None)), Some(23));
+        assert_eq!(mass_number(&n(19, None)), None, "beyond the isotope table (Z > 18)");
     }
 
     /// The card's lines follow the nucleus's isotope (merge of main's card refactor with M6's

@@ -294,6 +294,8 @@ pub struct Mouse {
 }
 
 pub struct Viewer {
+    /// The bond-length and angle labels' smoothing (display only; [`LabelSmoother`]).
+    pub label_smooth: std::cell::RefCell<LabelSmoother>,
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
     pub sim: Option<SimWorker>,
     /// The backend `sim` runs.
@@ -362,6 +364,9 @@ pub struct Viewer {
     /// Every command sent to the current worker (`Snapshot::commands` echoes it back): the
     /// replayer's `wait idle` waits for a snapshot that has seen them all.
     commands_sent: u64,
+    /// Atom trails (`crate::trails`, View ▸ Display aids ▸ Trails): the per-atom position history
+    /// of the snapshots received while they are on; empty (nothing collected) while off.
+    pub trails: crate::trails::Trails,
     /// The 3D view's mouse ([`Viewer::input`]).
     pub mouse: Mouse,
     /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
@@ -370,6 +375,8 @@ pub struct Viewer {
     /// ([`Viewer::input`]) keeps the margins to it.
     screen: Option<(f32, f32)>,
     last_play_log: Option<Instant>,
+    /// The flash of the last sample the pass finished (`crate::ghost`).
+    ghost: crate::ghost::Tracker,
 }
 
 impl Viewer {
@@ -378,12 +385,15 @@ impl Viewer {
     /// box at h = σ = 0.15 — 81³ for the 12 Bohr presets).
     pub fn new(preset: &str) -> Option<Viewer> {
         let file = Scene::preset(preset)?;
-        let scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        let mut scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        // the app's presets start under the default ionic policy (the preset file itself is all-electron)
+        scene.ionic = ui::DEFAULT_IONIC;
         let mut ui = UiState::new(preset, &scene);
         ui.box_len = crate::quality::box_len(&file);
         let egui_ctx = egui::Context::default();
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
+            label_smooth: Default::default(),
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
@@ -415,10 +425,12 @@ impl Viewer {
             superposition_built: None,
             edits_sent: 0,
             commands_sent: 0,
+            trails: Default::default(),
             mouse: Mouse::default(),
             chrome_actions: Vec::new(),
             screen: None,
             last_play_log: None,
+            ghost: Default::default(),
         })
     }
 
@@ -432,8 +444,13 @@ impl Viewer {
     /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
     /// else a sampling pass with the panel's plan — once every retiring worker has finished
     /// ([`Viewer::poll_retiring`], called from the event and frame paths). The displayed density
-    /// stays until the new worker publishes.
+    /// stays until the new worker publishes. With a device, the providers' dimer gate (M7 Task 11: pseudo-H and
+    /// pseudo-He are generated with a 3-D dimer check, ≈ 1 min on the GPU) runs on it — whichever solver backend is
+    /// chosen; without one it is the CPU fallback (≈ 40 min per element, said by `ui::pseudo::IONIC_TIP`).
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
+        if let Some(ctx) = &gpu {
+            providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+        }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
             if self.backend == Backend::Estimated {
@@ -452,6 +469,7 @@ impl Viewer {
         let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
         let estimated = backend == Backend::Estimated;
         self.reset_orbital_session();
+        self.trails.clear(); // a new run: its clock restarts, and a trail never crosses a solver switch
         // the new worker has built no training views and was told nothing (activity Task 5 review
         // I2: the old worker's model is not the new one's); its first snapshot starts a new run
         self.ui.activity.new_worker();
@@ -574,6 +592,7 @@ impl Viewer {
     /// Sends a command and applies it to the local mirror. Index-shifting or whole-scene
     /// commands invalidate the selection.
     pub fn send(&mut self, cmd: Command) {
+        self.trails.on_command(&cmd);
         if matches!(cmd, Command::SetScene(_) | Command::RemoveNucleus(_)) {
             self.tool = ToolState::default();
             self.drag_target = None;
@@ -590,6 +609,7 @@ impl Viewer {
                 | Command::SetMultiplicity(_)
                 | Command::SetGrid { .. }
                 | Command::SetSigma(_)
+                | Command::SetIonicPolicy(_)
         );
         if replaces && self.playing {
             self.ui.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
@@ -773,6 +793,7 @@ impl Viewer {
             density_label: None,
             orbital_label: None,
             orbital_waiting: false,
+            pseudo_generating: providers::pseudo::generating(),
             draft_banner: None,
             bonds_label: None,
             probe: self.sim.as_ref().map(|w| w.probe().view()),
@@ -971,7 +992,10 @@ impl Viewer {
                 if s.dynamics.drag.is_none() && !self.tool.dragging {
                     self.drag_target = None;
                 }
+                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
+                self.ghost.follow(ghost, Instant::now());
                 self.snapshot = Some(*s);
+                self.record_trails();
             }
             SimEvent::Error(message) => {
                 eprintln!("worker error: {message}");
@@ -982,9 +1006,48 @@ impl Viewer {
         }
     }
 
+    /// Atom trails: adds the latest snapshot's positions at its simulated time to the history when
+    /// View ▸ Display aids ▸ Trails is on and the snapshot holds every edit sent (one taken before a
+    /// teleport must not extend the trail it broke); with Trails off, forgets the history (nothing
+    /// is collected, and turning it on starts from now).
+    fn record_trails(&mut self) {
+        if !self.ui.show_trails {
+            self.trails.clear();
+            return;
+        }
+        let Some(s) = self.snapshot.as_ref().filter(|s| s.edits == self.edits_sent) else { return };
+        let pos: Vec<[f64; 3]> = s.scene.nuclei.iter().map(|n| n.pos).collect();
+        self.trails.record(s.dynamics.sim_time_fs(), &pos, self.ui.trail_fs);
+    }
+
     /// The scene a frame at `now` draws (smooth motion, [`interpolate`]): the mirror with its
     /// nuclei between the last two playing snapshots — or the mirror itself when smooth motion
     /// is off, paused, or the mirror holds an edit the snapshots have not confirmed yet.
+    /// Model ▸ Audits ▸ auto (user request 2026-10-18): sets the audit cadence from the measured
+    /// play speed ([`ui::auto_audit_every`]), only when audits are on and the new cadence differs
+    /// from the current one by more than 20 % (no command flood while the speed jitters).
+    pub fn auto_audit(&mut self, fs_per_s: Option<f64>) {
+        if !self.ui.audit_auto || self.ui.audit_every == 0 {
+            return;
+        }
+        let Some(n) = ui::auto_audit_every(fs_per_s, self.ui.dt_fs) else { return };
+        let cur = self.ui.audit_every as f64;
+        if (n as f64 - cur).abs() > 0.2 * cur {
+            self.apply(ui::Action::SetAudit(n));
+        }
+    }
+
+    /// Dock ▸ Selection ▸ follow (user request 2026-10-18): centres the camera on the selected
+    /// nucleus as drawn this frame. No selection, or follow off: nothing.
+    pub fn follow_selected(&mut self, shown: &Scene) {
+        if !self.ui.follow_selected {
+            return;
+        }
+        if let Some(n) = self.tool.selected.and_then(|i| shown.nuclei.get(i)) {
+            self.camera.focus(tools::v3(n.pos));
+        }
+    }
+
     pub fn shown_scene(&self, now: Instant) -> Scene {
         match &self.motion {
             [Some(prev), Some(cur)] if self.ui.smooth_motion && self.scene.nuclei == cur.nuclei => Scene {
@@ -1046,7 +1109,7 @@ impl Viewer {
             }
         }
         let (n, h, sigma) = (scene.cell.n, scene.cell.h, scene.sigma);
-        if !s.atom_profiles.iter().all(|p| p.fits(n, h, sigma)) {
+        if !s.atom_profiles.iter().all(|p| p.fits(n, h, sigma, scene.ionic)) {
             return;
         }
         let nuclei: Vec<(u8, [f64; 3])> = scene.nuclei.iter().map(|n| (n.z, n.pos)).collect();
@@ -1160,7 +1223,26 @@ impl Viewer {
     /// Sets the painter's look for this frame (`Painter::set_view`) from the viewer's state.
     pub fn set_view(&self, painter: &mut Painter, ctx: &GpuContext) {
         let (fade, mix) = self.look(painter.drawn(&self.ui), Instant::now());
+        // the ghost replaces the scene: the scene's cloud would hang in the air beside it
+        let fade = if self.ghost_now().is_some() { 0.0 } else { fade };
         painter.set_view(ctx, &self.ui, fade, mix);
+    }
+
+    /// The scale the nuclei's spheres are drawn at now, from the view-mode state `Painter::set_view`
+    /// reads (`gfx::nucleus_scale`): the orbital scale while an orbital mode is on and the newest
+    /// payload is that mode's (the painter draws its orbital layer only then: a payload of another
+    /// request, left over from before a mode switch, draws nothing and the spheres stay full size),
+    /// else the `--ui` override or 1. Computed from the viewer's own state, so the arcs (in
+    /// `overlay_lines`) and the labels (in `run_ui`, before `set_view`) agree on the same frame.
+    fn sphere_scale(&self) -> f32 {
+        let orbital_layer = self.ui.show != ui::ShowMode::Density
+            && self.snapshot.as_ref().and_then(|s| s.dynamics.orbitals.as_ref()).is_some_and(|o| crate::gfx::mode_of_request(&o.what) == self.ui.show);
+        crate::gfx::nucleus_scale(&self.ui, orbital_layer)
+    }
+
+    /// The drawn radius of nucleus `i`'s sphere (Bohr): its element's radius × [`Viewer::sphere_scale`].
+    fn drawn_radius(&self, shown: &Scene, i: usize) -> f32 {
+        shown.nuclei.get(i).map_or(0.0, |n| render::elements::radius(n.z) * self.sphere_scale())
     }
 
     /// Keeps the worker's orbital view in step with what the panel means (`UiState::orbital_request`)
@@ -1226,13 +1308,26 @@ impl Viewer {
         let d = &s.dynamics;
         let model = s.model.as_ref().map_or(String::new(), |m| {
             format!(
-                ", {:?}, fallbacks {:.0} % of 100, model {} samples epoch {} {}{}",
+                ", {:?}, fallbacks {:.0} % of 100, model {} samples epoch {} {}, strict here: {}, draft {}{}{}",
                 d.source,
                 100.0 * d.fallback_fraction_100,
                 m.samples,
                 m.epoch,
                 if m.trusted { "trusted" } else { "untrusted" },
-                d.teacher_gap.map_or(String::new(), |g| format!(", teacher gap {g:+.2e} Ha"))
+                m.readiness.as_ref().map_or("—".to_string(), |r| {
+                    let verdict = if r.answers { "answers".to_string() } else { format!("refuses ({:?}: {})", r.rule.expect("a refusal names its rule"), r.text) };
+                    match &r.unlearned {
+                        Some(u) => format!("{verdict}; {u}"),
+                        None => verdict,
+                    }
+                }),
+                if m.draft { "on" } else { "off" },
+                d.teacher_gap.map_or(String::new(), |g| format!(", teacher gap {g:+.2e} Ha")),
+                // the rule of the step itself when the teacher answered it
+                (d.source != sim::Source::Surrogate)
+                    .then(|| d.eval.notes.first().map(|n| format!(", step's note: {n}")))
+                    .flatten()
+                    .unwrap_or_default()
             )
         });
         if crate::sim::sampling_active(d) {
@@ -1420,18 +1515,123 @@ impl Viewer {
         }
     }
 
-    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`)
-    /// and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
+    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`),
+    /// the atom trails with View ▸ Display aids ▸ Trails on and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
     /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
     pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
         let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        // while a sampling pass runs the ghost of its job replaces the scene: the cell and the
+        // walls stay, the scene's bonds do not
+        if let Some(g) = self.ghost_now() {
+            lines.extend(crate::ghost::build(g, &crate::ghost::CamBasis::of(&self.camera), self.ghost.flash(Instant::now()), &self.ghost.history()));
+            return lines;
+        }
+        if self.ui.show_trails {
+            lines.extend(self.trails.lines(&shown.nuclei, self.ui.trail_fs, self.ui.trail_opacity));
+        }
         if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
             if let Some(g) = &d.bonds {
                 let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
                 lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
             }
         }
+        // M7: pairs whose frozen cores overlap (the latest solve's; drawn between the nuclei as shown now,
+        // only while the counts agree) — always, not a bond display option: the approximation is failing there
+        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|d| !d.eval.core_overlaps.is_empty() && d.scene.nuclei.len() == shown.nuclei.len()) {
+            let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+            lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
+        }
+        if let Some((marks, stale)) = self.angle_marks(shown) {
+            let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+            for m in &marks {
+                lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), stale));
+            }
+        }
         lines
+    }
+
+    /// What the running sampling pass is solving, to be drawn instead of the scene (View ▸ Display
+    /// aids ▸ show what training is solving; `crate::ghost`): `None` when the toggle is off, no pass
+    /// runs (it ended, was cancelled or failed) or the snapshot carries none.
+    pub fn ghost_now(&self) -> Option<&sim::PassGhost> {
+        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics))?;
+        s.dynamics.ghost.as_ref()
+    }
+
+    /// The nuclei the sphere pass draws: the scene's, or none while the ghost replaces them.
+    pub fn drawn_nuclei<'a>(&self, shown: &'a Scene) -> &'a [crate::scene::SceneNucleus] {
+        if self.ghost_now().is_some() { &[] } else { &shown.nuclei }
+    }
+
+    /// The nucleus under the cursor with the Select tool (the badge's and the angles' hover).
+    fn hovered_nucleus(&self, shown: &Scene) -> Option<usize> {
+        match (self.ui.mode, self.tool.cursor) {
+            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
+            _ => None,
+        }
+    }
+
+    /// The bond angles to draw between the nuclei as drawn now (M7 Task 13), with the stale flag of
+    /// the graph (an earlier DFT step's: faded): every angle at an atom with at most
+    /// `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is selected or hovered
+    /// (Select tool). `None` when View ▸ bonds or ▸ bond angles is off, there is no graph, or it
+    /// belongs to another nucleus count.
+    fn angle_marks(&self, shown: &Scene) -> Option<(Vec<crate::overlay::AngleMark>, bool)> {
+        if !(self.ui.show_bonds && self.ui.show_angles) {
+            return None;
+        }
+        let d = &self.snapshot.as_ref()?.dynamics;
+        let g = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len())?;
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        let all = crate::overlay::bond_angles(&pos, g);
+        let selected = self.tool.selected.filter(|&i| i < pos.len());
+        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().cloned().collect();
+        Some((marks, d.bonds_stale))
+    }
+
+    /// The angle labels of this frame (M7 Task 13): the degree text, its anchor in the world and the
+    /// pill's text and background alpha — those of the molecule labels, fading with the bonds when
+    /// the graph is an earlier step's. Empty whenever [`Viewer::angle_marks`] is `None`.
+    pub fn angle_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
+        let Some((marks, stale)) = self.angle_marks(shown) else { return Vec::new() };
+        let (alpha, bg) = if stale { (110, 70) } else { (235, 150) };
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        marks
+            .iter()
+            .map(|m| AngleLabel {
+                text: crate::overlay::angle_label(m),
+                anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)),
+                alpha,
+                bg,
+                key: (0, m.vertex, m.a, m.b),
+                value: m.radians,
+                ends: None,
+            })
+            .collect()
+    }
+
+    /// The bond-length labels of this frame (user request 2026-10-18): each drawn bond's length in Å at
+    /// its midpoint, from the nuclei as drawn now, faded with the bonds when the graph is an earlier
+    /// step's. With more than [`BOND_LENGTH_DECLUTTER`] bonds only the selected or hovered atom's.
+    pub fn bond_length_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
+        if !(self.ui.show_bonds && self.ui.show_bond_lengths) {
+            return Vec::new();
+        }
+        let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics) else { return Vec::new() };
+        let Some(g) = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()) else { return Vec::new() };
+        let (alpha, bg) = if d.bonds_stale { (110, 70) } else { (235, 150) };
+        let focus: Vec<usize> = self.tool.selected.filter(|&i| i < shown.nuclei.len()).into_iter().chain(self.hovered_nucleus(shown)).collect();
+        let all = g.bonds.len() <= BOND_LENGTH_DECLUTTER;
+        g.bonds
+            .iter()
+            .filter(|b| all || focus.contains(&b.i) || focus.contains(&b.j))
+            .filter(|b| b.i < shown.nuclei.len() && b.j < shown.nuclei.len())
+            .map(|b| {
+                let (p, q) = (shown.nuclei[b.i].pos, shown.nuclei[b.j].pos);
+                let r = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg, key: (1, b.i, b.j, 0), value: r, ends: Some((p, q)) }
+            })
+            .collect()
     }
 
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
@@ -1449,8 +1649,8 @@ impl Viewer {
             return None;
         }
         let vp = self.viewport;
-        let hovered = match (self.ui.mode, self.tool.cursor) {
-            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, vp, &shown.nuclei).map(|i| (i, (x, y))),
+        let hovered = match (self.hovered_nucleus(shown), self.tool.cursor) {
+            (Some(i), Some(at)) => Some((i, at)),
             _ => None,
         };
         let (i, at) = match hovered {
@@ -1468,7 +1668,12 @@ impl Viewer {
             .map(|s| &s.dynamics)
             .filter(|d| !d.forces_stale && d.forces.len() == shown.nuclei.len())
             .map(|d| d.forces[i]);
-        Some((crate::badge::badge_text(n.z, n.mass_number()?, force), at))
+        let mut text = crate::badge::badge_text(n.z, n.mass_number()?, force);
+        // a pseudised species says so: its valence charge, its radius and the grid it needs (M7; the latest solve's record)
+        if let Some(p) = self.snapshot.as_ref().and_then(|s| ui::pseudo::of_species(&s.dynamics.eval.pseudised, n.z)) {
+            text.push_str(&format!(" · {}", ui::pseudo::badge_tail(p)));
+        }
+        Some((text, at))
     }
 
     /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
@@ -1490,32 +1695,95 @@ impl Viewer {
             painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
             painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
         };
+        if let Some(g) = self.ghost_now() {
+            // the ghost's label, top centre of the view under the status chip; the scene's molecule labels and badge hide
+            let at = to_pos((vp.origin[0] + 0.5 * vp.size[0], vp.origin[1])) + egui::vec2(0.0, 58.0);
+            // while a finished job's flash fades its outcome is named, in the solve log's word
+            let last = self.ghost.flash(Instant::now()).map(|(f, _)| format!(" · last sample: {}", f.outcome.word())).unwrap_or_default();
+            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(170));
+            let main = painter.layout_no_wrap(crate::ghost::label(g), egui::FontId::proportional(14.5), egui::Color32::WHITE);
+            let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
+            let rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
+            painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(175));
+            let cx = rect.center().x;
+            painter.galley(egui::pos2(cx - galley.size().x / 2.0, rect.top() + 6.0), galley.clone(), egui::Color32::WHITE);
+            painter.galley(egui::pos2(cx - main.size().x / 2.0, rect.top() + 6.0 + galley.size().y + 2.0), main, egui::Color32::WHITE);
+            return;
+        }
         if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
             if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
                 // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
                 let up = self.camera.view().inverse().y_axis.truncate();
+                let mut smooth = self.label_smooth.borrow_mut();
+                smooth.begin_once(root.input(|i| i.time));
                 for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
-                    let px: Vec<(f32, f32)> = members.iter().filter_map(|&m| tools::project(&self.camera, tools::v3(shown.nuclei[m].pos), vp)).collect();
-                    if px.is_empty() {
-                        continue;
-                    }
-                    let cx = px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32;
-                    // above the molecule's highest sphere edge as projected now, so the label clears
-                    // the spheres at every zoom
-                    let top = members
+                    // anchored on the molecule's centre of mass (user request 2026-10-18: the label
+                    // must not ride the vibration — an isolated molecule's centre of mass does not
+                    // vibrate at all), raised by the molecule's extent (its farthest sphere edge from
+                    // the centre, averaged over the last second), and smoothed like the bond labels
+                    let mass = |m: usize| {
+                        let n = &shown.nuclei[m];
+                        n.a.or_else(|| units::most_abundant_a(n.z)).unwrap_or(2 * n.z as u16).max(1) as f64
+                    };
+                    let total: f64 = members.iter().map(|&m| mass(m)).sum();
+                    let com: [f64; 3] = std::array::from_fn(|k| members.iter().map(|&m| mass(m) * shown.nuclei[m].pos[k]).sum::<f64>() / total);
+                    let extent = members
                         .iter()
-                        .filter_map(|&m| {
+                        .map(|&m| {
                             let n = &shown.nuclei[m];
-                            tools::project(&self.camera, tools::v3(n.pos) + up * render::elements::radius(n.z), vp)
+                            (0..3).map(|k| (n.pos[k] - com[k]).powi(2)).sum::<f64>().sqrt() + render::elements::radius(n.z) as f64
                         })
-                        .map(|p| p.1)
-                        .fold(f32::INFINITY, f32::min);
-                    let at = to_pos((cx, top)) - egui::vec2(0.0, 6.0);
-                    pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                        .fold(0.0, f64::max);
+                    let key = (2, members[0], members.len(), 0);
+                    let (anchor, r) = smooth.update(key, com, extent);
+                    let lifted = tools::v3(anchor) + up * r as f32;
+                    if let Some(px) = tools::project(&self.camera, lifted, vp) {
+                        let at = to_pos(px) - egui::vec2(0.0, 6.0);
+                        pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                    }
                 }
+                drop(smooth);
             }
         }
+        // the bond lengths and angles (Task 13; user request 2026-10-18): smoothed anchors and
+        // one-second averaged values, so the labels are readable while the atoms vibrate
+        let mut smooth = self.label_smooth.borrow_mut();
+        smooth.begin_once(root.input(|i| i.time));
+        let centre = {
+            let n = shown.nuclei.len().max(1) as f64;
+            let c: [f64; 3] = std::array::from_fn(|k| shown.nuclei.iter().map(|x| x.pos[k]).sum::<f64>() / n);
+            tools::project(&self.camera, tools::v3(c), vp)
+        };
+        for l in self.bond_length_labels(shown) {
+            let (anchor, r) = smooth.update(l.key, l.anchor, l.value);
+            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+                // beside the bond, on the side away from the molecule's centre (clear of the arcs)
+                let mut at = to_pos(px);
+                if let Some((p, q)) = l.ends {
+                    if let (Some(a), Some(b)) = (tools::project(&self.camera, tools::v3(p), vp), tools::project(&self.camera, tools::v3(q), vp)) {
+                        let mut n = egui::vec2(-(b.1 - a.1), b.0 - a.0);
+                        if n.length() > 1e-3 {
+                            n = n.normalized();
+                            if let Some(c) = centre {
+                                if n.dot(egui::vec2(px.0 - c.0, px.1 - c.1)) < 0.0 {
+                                    n = -n;
+                                }
+                            }
+                            at += n * 14.0;
+                        }
+                    }
+                }
+                pill(at, egui::Align2::CENTER_CENTER, &bond_length_text(r), egui::Color32::from_rgba_unmultiplied(205, 225, 245, l.alpha), l.bg);
+            }
+        }
+        for l in self.angle_labels(shown) {
+            let (anchor, rad) = smooth.update(l.key, l.anchor, l.value);
+            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+                pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
+            }
+        }
+        drop(smooth);
         if let Some((text, at)) = self.badge(shown) {
             pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
         }
@@ -1525,13 +1793,26 @@ impl Viewer {
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
         self.poll_retiring();
+        // Trails switched off forget their history; switched on while paused (no snapshot comes)
+        // they start from the current one
+        if !self.ui.show_trails || self.trails.is_empty() {
+            self.record_trails();
+        }
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
+        self.auto_audit(measured_fs_per_s);
         let shown = self.shown_scene(Instant::now());
+        self.follow_selected(&shown);
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
         let orbital_label = self.orbitals.label(&self.ui, self.snapshot.as_ref());
         let orbital_waiting = self.orbital_waiting && self.ui.show != ui::ShowMode::Density;
+        // the ghost replaces the scene in the view: no distance guides, pins or drag marker of the
+        // hidden nuclei
+        let hidden_by_ghost = self.ghost_now().map(|_| Scene { nuclei: Vec::new(), ..shown.clone() });
+        if self.ghost.animating(Instant::now()) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
         // the live solve state, read per frame: a long solve publishes no snapshot
@@ -1554,6 +1835,7 @@ impl Viewer {
                     density_label: density_label.clone(),
                     orbital_label: orbital_label.clone(),
                     orbital_waiting,
+                    pseudo_generating: providers::pseudo::generating(),
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                     probe,
@@ -1567,7 +1849,7 @@ impl Viewer {
             Self::distance_overlay(
                 root,
                 &self.camera,
-                &shown,
+                hidden_by_ghost.as_ref().unwrap_or(&shown),
                 &self.tool,
                 self.ui.mode,
                 self.drag_target,
@@ -1596,6 +1878,86 @@ impl Viewer {
             self.act_on(out);
         }
         full
+    }
+}
+
+/// More drawn bonds than this: only the selected or hovered atom's bonds get a length label.
+pub const BOND_LENGTH_DECLUTTER: usize = 12;
+
+/// "0.97 Å" for a length in Bohr (display; `units` converts).
+pub fn bond_length_text(r_bohr: f64) -> String {
+    format!("{:.2} Å", units::bohr_to_angstrom(r_bohr))
+}
+
+/// One bond-angle label of a frame (`Viewer::angle_labels`): the degree text, where it anchors in
+/// the world, and the pill's text and background alpha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AngleLabel {
+    pub text: String,
+    pub anchor: [f64; 3],
+    pub alpha: u8,
+    pub bg: u8,
+    /// Which measurement this is ((0, vertex, a, b) for an angle, (1, i, j, 0) for a bond): the
+    /// smoothing's key.
+    pub key: (u8, usize, usize, usize),
+    /// The instantaneous value (radians or Bohr), averaged for display by [`LabelSmoother`].
+    pub value: f64,
+    /// A bond's two ends (to set its label beside the bond, away from the molecule).
+    pub ends: Option<([f64; 3], [f64; 3])>,
+}
+
+/// Wall-clock time constant of the labels' anchor smoothing (s).
+pub const LABEL_SMOOTH_S: f64 = 0.35;
+/// The window of the labels' value average (s), as the temperature readout's.
+pub const LABEL_AVG_S: f64 = 1.0;
+
+/// Readable measurement labels (user request 2026-10-18: bond-length and angle labels bouncing
+/// with the vibrating atoms were hard to read). Each label's world anchor is low-pass filtered with
+/// [`LABEL_SMOOTH_S`] (in world space, so a camera move does not lag) and its value is the mean over
+/// the last [`LABEL_AVG_S`] of wall time. Labels not drawn in a frame are forgotten. Display only.
+#[derive(Default)]
+pub struct LabelSmoother {
+    entries: std::collections::HashMap<(u8, usize, usize, usize), SmoothEntry>,
+    frame: f64,
+}
+
+struct SmoothEntry {
+    anchor: [f64; 3],
+    at: f64,
+    values: std::collections::VecDeque<(f64, f64)>,
+    seen: f64,
+}
+
+impl LabelSmoother {
+    /// Starts a frame at wall time `now` (s); entries not updated in the previous frame are dropped.
+    pub fn begin(&mut self, now: f64) {
+        let last = self.frame;
+        self.entries.retain(|_, e| e.seen >= last);
+        self.frame = now;
+    }
+
+    /// [`LabelSmoother::begin`] unless this frame (same `now`) has already begun — several label
+    /// groups share one smoother per frame.
+    pub fn begin_once(&mut self, now: f64) {
+        if now != self.frame {
+            self.begin(now);
+        }
+    }
+
+    /// The smoothed anchor and averaged value of `key` this frame.
+    pub fn update(&mut self, key: (u8, usize, usize, usize), anchor: [f64; 3], value: f64) -> ([f64; 3], f64) {
+        let now = self.frame;
+        let e = self.entries.entry(key).or_insert_with(|| SmoothEntry { anchor, at: now, values: Default::default(), seen: now });
+        let a = 1.0 - (-(now - e.at).max(0.0) / LABEL_SMOOTH_S).exp();
+        e.anchor = std::array::from_fn(|k| e.anchor[k] + a * (anchor[k] - e.anchor[k]));
+        e.at = now;
+        e.seen = now;
+        e.values.push_back((now, value));
+        while e.values.len() > 1 && e.values.front().is_some_and(|&(t, _)| now - t > LABEL_AVG_S) {
+            e.values.pop_front();
+        }
+        let mean = e.values.iter().map(|v| v.1).sum::<f64>() / e.values.len() as f64;
+        (e.anchor, mean)
     }
 }
 
@@ -1651,12 +2013,294 @@ mod tests {
         assert_eq!(v.badge(&shown), None);
     }
 
+    /// Atom trails (user request 2026-10-17): nothing is collected while Trails is off, a snapshot
+    /// taken before an unconfirmed edit is not recorded, the history is the confirmed snapshots'
+    /// positions, a teleport breaks that atom's trail (a drag does not), and the lines reach the
+    /// overlay only while on.
+    #[test]
+    fn trails_collect_only_while_on_and_break_on_a_teleport() {
+        fn feed(v: &mut Viewer, t_fs: f64, x: f64, edits: u64) {
+            let mut scene = v.scene.clone();
+            scene.nuclei[0].pos = [x, 0.0, 0.0];
+            scene.nuclei[1].pos = [0.0, x, 0.0];
+            let mut d = sim::DynSnapshot::default();
+            d.sim_time = t_fs / units::au_time_to_fs(1.0);
+            v.snapshot = Some(Snapshot {
+                scene,
+                dynamics: d,
+                backend: Backend::Gpu,
+                engine: Backend::Gpu,
+                model: None,
+                atom_profiles: Default::default(),
+                edits,
+                driver_commands: 0,
+                commands: 0,
+                working: false,
+                labels: Default::default(),
+                charge_note: None,
+                activity: Default::default(),
+            });
+            v.record_trails();
+        }
+        let mut v = Viewer::new("h2").unwrap();
+        assert!(!v.ui.show_trails && v.trails.is_empty());
+        // off: no history is collected
+        feed(&mut v, 0.0, 0.0, 0);
+        feed(&mut v, 1.0, 0.1, 0);
+        assert!(v.trails.is_empty());
+        let shown = v.scene.clone();
+        assert!(v.overlay_lines(&shown).len() == crate::overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode).len());
+        // on: from now
+        v.ui.show_trails = true;
+        feed(&mut v, 2.0, 0.2, 0);
+        feed(&mut v, 3.0, 0.3, 0);
+        feed(&mut v, 4.0, 0.4, 0);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (3, 3));
+        // the overlay carries the trail between the oldest point and the drawn position
+        let mut shown = v.scene.clone();
+        shown.nuclei[0].pos = [0.4, 0.0, 0.0];
+        shown.nuclei[1].pos = [0.0, 0.4, 0.0];
+        let base = crate::overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode).len();
+        let with = v.overlay_lines(&shown);
+        assert_eq!(with.len(), base + 2 * 2 * 2, "two segments per atom");
+        v.ui.show_trails = false;
+        assert_eq!(v.overlay_lines(&shown).len(), base);
+        v.ui.show_trails = true;
+        // a snapshot that does not hold every edit sent is not recorded; a teleport breaks its atom's trail
+        v.send(Command::MoveNucleus { index: 0, pos: [2.0, 2.0, 2.0] });
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (0, 3));
+        feed(&mut v, 5.0, 0.5, 0);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (0, 3), "taken before the edit");
+        let sent = v.edits_sent;
+        feed(&mut v, 5.0, 0.5, sent);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (1, 4));
+        // a drag keeps the trail
+        v.send(Command::Dyn(DynCommand::DragEnd));
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (1, 4));
+        // adding a nucleus clears every trail
+        v.send(Command::AddNucleus { z: 1, a: None, pos: [3.0, 0.0, 0.0] });
+        assert!(v.trails.is_empty());
+        // turning Trails off forgets the history
+        v.ui.show_trails = false;
+        v.record_trails();
+        assert!(v.trails.is_empty());
+    }
+
+    /// A snapshot carrying only a bond graph (for the bond-angle overlay's wiring).
+    fn snapshot_with_bonds(scene: &Scene, g: sim::BondGraph, stale: bool) -> Snapshot {
+        let mut d = sim::DynSnapshot::default();
+        d.bonds = Some(std::sync::Arc::new(g));
+        d.bonds_stale = stale;
+        Snapshot {
+            scene: scene.clone(),
+            dynamics: d,
+            backend: Backend::Gpu,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+            activity: Default::default(),
+        }
+    }
+
+    /// Review R1: the spheres are drawn at the orbital scale only while the newest payload is the one
+    /// the current show mode draws — a payload of another request (a mode switch not yet answered)
+    /// draws nothing, so the spheres, and the arcs clearing them, stay at full size.
+    #[test]
+    fn sphere_scale_follows_the_payload_the_painter_draws() {
+        use sim::{OrbitalDisplay, OrbitalRequest, Spin};
+        let payload = |what| OrbitalDisplay {
+            cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows: Vec::new(), field: None,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+        };
+        let empty = sim::BondGraph { bonds: Vec::new(), components: Vec::new(), step: 0, sim_time: 0.0, n_nuclei: 0 };
+        let mut v = Viewer::new("h2").unwrap();
+        let mut snap = snapshot_with_bonds(&v.scene, empty, false);
+        snap.dynamics.orbitals = Some(payload(OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false }));
+        v.snapshot = Some(snap);
+        assert_eq!(v.sphere_scale(), 1.0, "Density mode ignores a payload");
+        v.ui.show = ui::ShowMode::Orbitals;
+        assert_eq!(v.sphere_scale(), 0.3, "an orbital payload in Orbitals mode");
+        v.ui.show = ui::ShowMode::Spin;
+        assert_eq!(v.sphere_scale(), 1.0, "Spin selected, the old orbital payload is not drawn");
+        v.snapshot.as_mut().unwrap().dynamics.orbitals = Some(payload(OrbitalRequest::SpinDensity));
+        assert_eq!(v.sphere_scale(), 0.3, "the spin payload arrived");
+        v.snapshot.as_mut().unwrap().dynamics.orbitals = None;
+        assert_eq!(v.sphere_scale(), 1.0, "no payload yet");
+        v.snapshot.as_mut().unwrap().dynamics.orbitals = Some(payload(OrbitalRequest::SpinDensity));
+        v.ui.nucleus_scale = Some(0.5);
+        assert_eq!(v.sphere_scale(), 0.5, "the --ui nuclei= override wins");
+    }
+
+    /// User request 2026-10-18: with follow on, the camera's target is the selected nucleus as
+    /// drawn; off, or nothing selected, the camera is left alone.
+    #[test]
+    fn follow_keeps_the_camera_on_the_selected_atom() {
+        let mut v = Viewer::new("h2").unwrap();
+        let shown = Scene::parse("grid 49 0.25\ncharge 0\nnucleus 1 1 2 3\nnucleus 1 2 2 3\n").unwrap();
+        let before = v.camera.target;
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, before, "follow off");
+        v.ui.follow_selected = true;
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, before, "nothing selected");
+        v.tool.selected = Some(1);
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, tools::v3([2.0, 2.0, 3.0]));
+    }
+
+    /// User request 2026-10-18: the labels are smoothed — the anchor follows with LABEL_SMOOTH_S and
+    /// the value is the mean over LABEL_AVG_S; a label not drawn for a frame starts afresh.
+    #[test]
+    fn label_smoother_averages_and_follows() {
+        let mut s = LabelSmoother::default();
+        s.begin(0.0);
+        assert_eq!(s.update((1, 0, 1, 0), [0.0; 3], 1.0), ([0.0; 3], 1.0));
+        s.begin(0.35);
+        let (a, v) = s.update((1, 0, 1, 0), [1.0, 0.0, 0.0], 3.0);
+        assert!((a[0] - (1.0 - (-1.0f64).exp())).abs() < 1e-12, "{a:?}");
+        assert_eq!(v, 2.0);
+        s.begin(1.5);
+        let (_, v) = s.update((1, 0, 1, 0), [1.0, 0.0, 0.0], 5.0);
+        assert_eq!(v, 5.0, "older values left the window");
+        s.begin(1.6);
+        s.begin(1.7);
+        let (a, _) = s.update((1, 0, 1, 0), [9.0, 0.0, 0.0], 0.0);
+        assert_eq!(a, [9.0, 0.0, 0.0], "a label not drawn for a frame starts afresh");
+    }
+
+    /// User request 2026-10-18: each drawn bond's length in Å at its midpoint; off with View ▸ bond
+    /// lengths or bonds; a graph of another nucleus count draws nothing; stale graphs fade.
+    #[test]
+    fn bond_lengths_are_labelled_at_the_midpoints() {
+        let mut v = Viewer::new("h2").unwrap();
+        let shown = Scene::parse("grid 49 0.25
+charge 0
+nucleus 1 0 0 0
+nucleus 1 1.4 0 0
+").unwrap();
+        let bond = sim::Bond { i: 0, j: 1, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::bonds::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 };
+        let g = |n| sim::BondGraph { bonds: vec![bond.clone()], components: vec![vec![0, 1]], step: 1, sim_time: 0.0, n_nuclei: n };
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(2), false));
+        let l = v.bond_length_labels(&shown);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].text, bond_length_text(1.4));
+        assert_eq!(l[0].text, "0.74 Å");
+        assert_eq!(l[0].anchor, [0.7, 0.0, 0.0]);
+        assert_eq!((l[0].alpha, l[0].bg), (235, 150));
+        v.ui.show_bond_lengths = false;
+        assert!(v.bond_length_labels(&shown).is_empty());
+        v.ui.show_bond_lengths = true;
+        v.ui.show_bonds = false;
+        assert!(v.bond_length_labels(&shown).is_empty());
+        v.ui.show_bonds = true;
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(3), false));
+        assert!(v.bond_length_labels(&shown).is_empty(), "another nucleus count");
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(2), true));
+        assert_eq!((v.bond_length_labels(&shown)[0].alpha, v.bond_length_labels(&shown)[0].bg), (110, 70), "stale fades");
+    }
+
+    /// M7 Task 13 (review I1): the viewer's wiring of the bond-angle overlay — a methane carbon with
+    /// four bonds shows no angle until it is selected or hovered (hover is the Select tool's pick, not
+    /// the Orbit tool's), an H with one bond never does, View ▸ bond angles / ▸ bonds off and a graph
+    /// of another nucleus count draw nothing, and a stale graph fades the arcs and the labels.
+    #[test]
+    fn bond_angles_follow_the_declutter_gating_and_the_stale_fade() {
+        use crate::overlay;
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.show_cell = false;
+        v.ui.show_floor = false;
+        v.ui.show_axes = false;
+        v.ui.show_place_grid = false;
+        v.ui.walls_on = false;
+        let a = 2.06 / 3f64.sqrt();
+        let shown = Scene::parse(&format!(
+            "grid 49 0.25
+charge 0
+nucleus 6 0 0 0
+nucleus 1 {a} {a} {a}
+nucleus 1 {} {} {a}
+nucleus 1 {} {a} {}
+nucleus 1 {a} {} {}
+",
+            -a, -a, -a, -a, -a, -a
+        ))
+        .unwrap();
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        let graph = |n: usize, pairs: &[(usize, usize)]| sim::BondGraph {
+            bonds: pairs.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 }).collect(),
+            components: vec![(0..n).collect()],
+            step: 1,
+            sim_time: 0.0,
+            n_nuclei: n,
+        };
+        let ch4 = graph(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
+        let bond_len = overlay::bond_lines(&pos, &ch4, false).len();
+        v.snapshot = Some(snapshot_with_bonds(&shown, ch4.clone(), false));
+        v.camera = render::camera::OrbitCamera::new(Vec3::ZERO, 10.0);
+        let arcs = |v: &Viewer| v.overlay_lines(&shown).split_off(bond_len);
+
+        // nothing selected or hovered: four bonds at C, so no angle
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        // selected C: its six angles, fresh alpha; an H (one bond) has none
+        v.tool.selected = Some(0);
+        let fresh = arcs(&v);
+        assert!(!fresh.is_empty() && fresh.iter().all(|p| p.colour[3] == overlay::BOND_ALPHA));
+        let labels = v.angle_labels(&shown);
+        assert_eq!(labels.len(), 6);
+        assert!(labels.iter().all(|l| (l.alpha, l.bg) == (235, 150) && l.text == "109.5°"), "{labels:?}");
+        v.tool.selected = Some(1);
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        // an out-of-range selection (a stale index after a delete) is no selection
+        v.tool.selected = Some(99);
+        assert!(v.angle_labels(&shown).is_empty());
+        // hovered C: only with the Select tool and the cursor over it
+        v.tool.selected = None;
+        let at_c = tools::project(&v.camera, Vec3::ZERO, v.viewport).unwrap();
+        assert_eq!(tools::pick(&v.camera, at_c.0, at_c.1, v.viewport, &shown.nuclei), Some(0), "the test's cursor is over C");
+        v.tool.cursor = Some(at_c);
+        v.ui.mode = ui::ToolMode::Orbit;
+        assert!(v.angle_labels(&shown).is_empty(), "the Orbit tool does not hover");
+        v.ui.mode = ui::ToolMode::Select;
+        assert_eq!(v.angle_labels(&shown).len(), 6, "the Select tool's pick of C");
+        v.tool.cursor = Some((5.0, 5.0));
+        assert!(v.angle_labels(&shown).is_empty(), "off the nuclei");
+        v.tool.cursor = None;
+        // the toggles and a graph of another nucleus count
+        v.tool.selected = Some(0);
+        v.ui.show_angles = false;
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        v.ui.show_angles = true;
+        v.ui.show_bonds = false;
+        assert!(v.overlay_lines(&shown).is_empty() && v.angle_labels(&shown).is_empty(), "bonds off: no bonds, no angles");
+        v.ui.show_bonds = true;
+        let mut fewer = shown.clone();
+        fewer.nuclei.pop();
+        assert!(v.angle_labels(&fewer).is_empty(), "a graph of another nucleus count");
+        // a stale graph: faded arcs and labels
+        v.snapshot = Some(snapshot_with_bonds(&shown, ch4, true));
+        let stale = arcs(&v);
+        assert_eq!(stale.len(), fresh.len());
+        assert!(stale.iter().all(|p| p.colour[3] == overlay::STALE_BOND_ALPHA));
+        assert!(v.angle_labels(&shown).iter().all(|l| (l.alpha, l.bg) == (110, 70)));
+    }
+
     /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr
     /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³) — and for h2 to
     /// the R = 1.6 Bohr geometry (`scene::h2_r16`): these tests measure the viewer and the worker,
     /// not the grid or the preset, and were written and timed at that grid and geometry.
     fn pinned(preset: &str) -> Viewer {
         let mut v = Viewer::new(preset).unwrap();
+        // all-electron, the physics they were written for (the app starts its presets under accepted species, M7 Task 11)
+        v.ui.ionic = sim::IonicPolicy::None;
         // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
         let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };
         v.ui.adopt(&file);
@@ -1667,14 +2311,14 @@ mod tests {
 
     /// A fresh viewer is at the default quality, Accurate: h = σ = 0.15 with the preset's box kept
     /// — 81³ for the 12 Bohr presets (empty included: its worker publishes that cell without a
-    /// solve), 95³ for lih's and h2o's 14 Bohr boxes.
+    /// solve), 95³ for the 14 Bohr boxes (lih, h2o, h2s, hcl, ph3, sih4).
     #[test]
     #[cfg_attr(
         debug_assertions,
         ignore = "release-only: runs real SCF solves; cargo test -p app --release"
     )]
     fn a_fresh_viewer_runs_at_accurate_quality() {
-        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95)] {
+        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95), ("h2s", 95), ("hcl", 95), ("ph3", 95), ("sih4", 95)] {
             let v = Viewer::new(name).unwrap();
             assert_eq!((v.scene.grid_n, v.scene.grid_h, v.scene.sigma), (n, 0.15, None), "{name}");
             assert_eq!(v.ui.quality_h, 0.15);
@@ -1893,20 +2537,36 @@ mod tests {
         for _ in 0..2 {
             discard(v.run_ui(screen(1400.0, 900.0)));
         }
+        let frames = |v: &mut Viewer| {
+            for _ in 0..2 {
+                discard(v.run_ui(screen(1400.0, 900.0)));
+            }
+            v.viewport
+        };
+        // the default: the left dock (Readouts) open, the right one folded to its strip
         let vp = v.viewport;
         eprintln!("viewport at 1400×900: {vp:?}");
-        assert_eq!(vp.origin[0], 0.0, "nothing on the left");
+        assert!((440.0..520.0).contains(&vp.origin[0]), "the left dock and its strip are on the left: {vp:?}");
         assert!((30.0..60.0).contains(&vp.origin[1]), "the top bar is above: {vp:?}");
         let right = vp.origin[0] + vp.size[0];
         let bottom = vp.origin[1] + vp.size[1];
-        assert!((900.0..1100.0).contains(&right), "the dock and strip are on the right: {vp:?}");
+        assert!((1330.0..1360.0).contains(&right), "only the right dock's strip is on the right: {vp:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {vp:?}");
-        // folding the dock widens the view to the strip
+        // opening the right dock takes its width from the right
+        v.ui.open_tab(crate::ui::DockTab::Selection);
+        let both = frames(&mut v);
+        assert_eq!(both.origin, vp.origin, "the left dock did not move");
+        assert!(both.size[0] < vp.size[0] - 250.0, "{both:?}");
+        // folding the left dock widens the view on the left, to its strip
+        v.ui.left_open = false;
+        let right_only = frames(&mut v);
+        assert!((30.0..60.0).contains(&right_only.origin[0]), "{right_only:?}");
+        assert!(right_only.size[0] > both.size[0] + 250.0, "{right_only:?}");
+        // both folded: the view spans the window between the two strips
         v.ui.dock_open = false;
-        for _ in 0..2 {
-            discard(v.run_ui(screen(1400.0, 900.0)));
-        }
-        assert!(v.viewport.size[0] > vp.size[0] + 250.0, "{:?}", v.viewport);
+        let none = frames(&mut v);
+        assert!(none.size[0] > right_only.size[0] + 250.0, "{none:?}");
+        assert!((1340.0..1370.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 60.0, "{none:?}");
         // points → physical pixels, whole pixels
         let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
         assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });
@@ -2447,5 +3107,173 @@ mod tests {
         assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
         let (lit, red, _) = frame(&v, &mut painter);
         assert!(lit > 100 && red > 50, "the CPU orbital is drawn too ({lit} lit, {red} red)");
+    }
+
+    // ---- show what training is solving (`crate::ghost`) ----
+
+    fn ghost_of(job: sim::GhostJob, atoms: Vec<sim::GhostAtom>, serial: Option<(u64, sim::GhostOutcome)>) -> sim::PassGhost {
+        let stage = match job {
+            sim::GhostJob::Reference { .. } => "references",
+            sim::GhostJob::Perturbation { .. } => "perturbations",
+            sim::GhostJob::Scan { .. } | sim::GhostJob::ShellCheck { .. } => "scans",
+            sim::GhostJob::HotBurst { .. } => "hot burst",
+            sim::GhostJob::Teach { .. } => "teaching",
+        };
+        sim::PassGhost {
+            stage,
+            job,
+            base: atoms.iter().map(|a| a.pos).collect(),
+            finished: serial.map(|(serial, outcome)| sim::GhostFinished { serial, outcome, atoms: atoms.clone() }),
+            atoms,
+            trail: Vec::new(),
+        }
+    }
+
+    fn pass_progress(done: usize, finished: bool, cancelled: bool) -> sim::SamplingProgress {
+        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None }
+    }
+
+    fn ghost_snapshot(v: &Viewer, sampling: Option<sim::SamplingProgress>, ghost: Option<sim::PassGhost>) -> Snapshot {
+        let mut d = sim::DynSnapshot::default();
+        d.scene = v.scene.to_sim().expect("the preset is a valid scene");
+        d.sampling = sampling;
+        d.ghost = ghost;
+        Snapshot {
+            scene: v.scene.clone(),
+            dynamics: d,
+            backend: Backend::Estimated,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+            activity: Default::default(),
+        }
+    }
+
+    fn ghost_lines_in(v: &Viewer) -> usize {
+        // vertices in the element colour of the ghost's oxygen: only the ghost draws them (the
+        // scene is H₂)
+        let o = render::elements::colour(8);
+        v.overlay_lines(&v.scene).iter().filter(|p| p.colour[..3] == o[..]).count()
+    }
+
+    /// While a pass runs the view draws the job's ghost instead of the scene — no spheres, no bonds,
+    /// the cell kept — and the scene returns when the pass ends, is cancelled or fails (the driver
+    /// then ships no ghost), and when the toggle is off.
+    #[test]
+    fn the_ghost_replaces_the_scene_while_a_pass_runs_and_the_scene_returns() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.show_cell = true;
+        let shown = v.scene.clone();
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2, "no snapshot: the scene");
+        let job = sim::GhostJob::Reference { z: 8 };
+        let atoms = vec![sim::GhostAtom { z: 8, pos: [0.0; 3] }];
+        let running = |v: &Viewer, done| ghost_snapshot(v, Some(pass_progress(done, false, false)), Some(ghost_of(job, atoms.clone(), None)));
+        let s = running(&v, 3);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        assert!(v.drawn_nuclei(&shown).is_empty(), "the scene's spheres are not drawn");
+        assert!(ghost_lines_in(&v) > 0, "the ghost's outline is");
+        let cell = v.overlay_lines(&shown).iter().filter(|p| p.colour == [0.95, 0.80, 0.35, 0.55]).count();
+        assert_eq!(cell, 24, "the cell box stays");
+        assert_eq!(v.ghost_now().map(crate::ghost::label).as_deref(), Some("reference: isolated O"));
+
+        // the toggle: off, the scene shows as before
+        v.ui.show_ghost = false;
+        assert!(v.ghost_now().is_none());
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2);
+        assert_eq!(ghost_lines_in(&v), 0);
+        v.ui.show_ghost = true;
+        assert!(v.ghost_now().is_some());
+
+        // the pass ends: no ghost, the scene is back
+        let s = ghost_snapshot(&v, Some(pass_progress(20, true, false)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none());
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2);
+        assert_eq!(ghost_lines_in(&v), 0);
+
+        // cancelled: the driver's progress says finished + cancelled, and ships no ghost
+        let s = running(&v, 5);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        let s = ghost_snapshot(&v, Some(pass_progress(5, true, true)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none() && v.drawn_nuclei(&shown).len() == 2, "cancelled");
+
+        // failed: the pass is over (finished) with an error; even a stale ghost in that snapshot is not drawn
+        let s = running(&v, 6);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        let mut s = ghost_snapshot(&v, Some(pass_progress(6, true, false)), Some(ghost_of(job, atoms.clone(), None)));
+        s.dynamics.last_error = Some("sampling: the teacher failed".into());
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none() && v.drawn_nuclei(&shown).len() == 2, "failed");
+    }
+
+    /// A finished job's flash: a new serial in a snapshot starts it (in the outcome's colour, on the
+    /// finished geometry), it fades out within the flash time, the same serial does not restart it,
+    /// and it is gone with the ghost. The labels come from the job.
+    #[test]
+    fn a_finished_sample_flashes_the_ghost_in_its_outcome_colour() {
+        use sim::GhostOutcome as O;
+        let mut v = Viewer::new("h2").unwrap();
+        let atoms = vec![sim::GhostAtom { z: 8, pos: [0.0; 3] }, sim::GhostAtom { z: 1, pos: [2.0, 0.0, 0.0] }];
+        let scan = |k, outcome| ghost_of(sim::GhostJob::Scan { i: 0, j: 1, k, of: 12, ratio: 1.1, r: 2.0 }, atoms.clone(), Some((k as u64, outcome)));
+        let colour_count = |v: &Viewer, c: [f32; 3]| {
+            let shown = v.scene.clone();
+            v.overlay_lines(&shown).iter().filter(|p| p.colour[..3] == c[..]).count()
+        };
+        let s = ghost_snapshot(&v, Some(pass_progress(2, false, false)), Some(scan(2, O::Kept)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::KEPT) > 0, "green for a kept sample");
+        assert_eq!(colour_count(&v, crate::ghost::FAILED), 0);
+        assert_eq!(v.ghost_now().map(crate::ghost::label).as_deref(), Some("O–H · 1.10 × r₀ · 2.00 Bohr"));
+        // red for a stalled one, grey for a skipped one
+        let s = ghost_snapshot(&v, Some(pass_progress(3, false, false)), Some(scan(3, O::Failed(Some(sim::activity::ScfEnd::Stalled)))));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::FAILED) > 0);
+        // the kept sample stays behind it, fainter (the last three stay on screen: user request 2026-10-18)
+        assert!(colour_count(&v, crate::ghost::KEPT) > 0);
+        let s = ghost_snapshot(&v, Some(pass_progress(4, false, false)), Some(scan(4, O::Skipped)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::SKIPPED) > 0);
+        // expiry: the tracker's flash is gone after the flash time
+        let later = Instant::now() + Duration::from_millis(600);
+        assert!(v.ghost.flash(later).is_none());
+        // ... and a repeat snapshot of the same serial does not bring it back
+        let s = ghost_snapshot(&v, Some(pass_progress(4, false, false)), Some(scan(4, O::Skipped)));
+        let before = v.ghost.flash(Instant::now()).map(|(f, _)| f.at);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert_eq!(v.ghost.flash(Instant::now()).map(|(f, _)| f.at), before);
+        // the pass ends: no ghost, no flash
+        let s = ghost_snapshot(&v, Some(pass_progress(20, true, false)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert_eq!(colour_count(&v, crate::ghost::SKIPPED), 0);
+        assert!(v.ghost.flash(Instant::now()).is_none());
+    }
+
+    /// The density cloud hides while the ghost replaces the scene: the painter is told a fade of 0.
+    #[test]
+    fn the_ghost_hides_the_cloud() {
+        let Some(hl) = Headless::new(64, 64) else { return };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2").unwrap();
+        v.set_view(&mut painter, &hl.ctx);
+        let visible = painter.renderer.volume_params.fade;
+        assert!(visible > 0.0, "the cloud is drawn when no pass runs");
+        let atoms = vec![sim::GhostAtom { z: 1, pos: [0.0; 3] }];
+        let s = ghost_snapshot(&v, Some(pass_progress(1, false, false)), Some(ghost_of(sim::GhostJob::Reference { z: 1 }, atoms, None)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        v.set_view(&mut painter, &hl.ctx);
+        assert_eq!(painter.renderer.volume_params.fade, 0.0);
+        v.ui.show_ghost = false;
+        v.set_view(&mut painter, &hl.ctx);
+        assert_eq!(painter.renderer.volume_params.fade, visible);
     }
 }

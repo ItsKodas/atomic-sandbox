@@ -21,6 +21,74 @@ pub(super) enum JobKind {
     Reference(u8),
 }
 
+/// Where a failed audit came from (the teach-around review, SHOULD-T5: the chip says which).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum AuditOrigin {
+    /// A strict-mode audit (`audit_every`), or one of before the origin was recorded.
+    #[default]
+    Audit,
+    /// A teach-around pass's held-out check (`teach`).
+    TeachCheck,
+    /// A held-out draft guess judged once strict mode reached it (`judge_held_out`).
+    HeldOutGuess,
+    /// A pass's shell check (`sampling` module doc, 3.): the interaction left beyond the scan limit
+    /// that the cutoff truncates.
+    ShellCheck,
+}
+
+impl AuditOrigin {
+    /// The sidecar's word ("audit" is written as no key at all: older files stay byte-identical).
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            AuditOrigin::Audit => "audit",
+            AuditOrigin::TeachCheck => "teach-check",
+            AuditOrigin::HeldOutGuess => "held-out-guess",
+            AuditOrigin::ShellCheck => "shell-check",
+        }
+    }
+
+    pub(super) fn from_word(w: &str) -> AuditOrigin {
+        match w {
+            "teach-check" => AuditOrigin::TeachCheck,
+            "held-out-guess" => AuditOrigin::HeldOutGuess,
+            "shell-check" => AuditOrigin::ShellCheck,
+            _ => AuditOrigin::Audit,
+        }
+    }
+}
+
+/// A failed audit's case (module doc, rule 8, "A failed audit stays failed"): the audited geometry,
+/// the teacher's labels there, the store index of the kept answer (`None`: not kept — an unfit or
+/// refused answer) and the surface's ionic tag (the force audit's floor).
+#[derive(Clone, Debug)]
+pub(super) struct FailedAudit {
+    pub(super) pos: Vec<[f64; 3]>,
+    pub(super) z: Vec<u8>,
+    pub(super) energy: f64,
+    pub(super) forces: Vec<[f64; 3]>,
+    pub(super) index: Option<usize>,
+    pub(super) ionic: String,
+    /// Refits that re-judged it and found it still failed (`AUDIT_REJUDGE_LIMIT`).
+    pub(super) rejudges: u32,
+    pub(super) origin: AuditOrigin,
+    /// The species pair (Z_a ≤ Z_b) a shell check measured: the pair its fence refuses in the
+    /// cutoff shell (`trust::shell_fence_refusal`; final review I2 — carried, never re-derived
+    /// from the case's geometry). `Some` exactly for `AuditOrigin::ShellCheck`.
+    pub(super) pair: Option<(u8, u8)>,
+}
+
+/// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
+/// (the display's atomic superposition and the references both compare it with the scene's solved density: under
+/// `CoresOnly` an oxygen atom of 6 valence electrons, never the 8-electron all-electron one — Task 9 review I1 /
+/// physics SHOULD-1). `mass`: the nucleus's mass when the caller has one (a reference), else the table's.
+pub(super) fn isolated_atom(z: u8, mass: Option<f64>, scene: &Scene) -> Scene {
+    let mut nucleus = sim::Nucleus::new(z, [0.0; 3]);
+    if let Some(m) = mass {
+        nucleus.mass = m;
+    }
+    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic }
+}
+
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
 /// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
@@ -36,6 +104,11 @@ pub(super) struct AuditJob {
     pub(super) id: u64,
     pub(super) view: OrbitalViewRequest,
     pub(super) interrupt: Option<sim::DisplayInterrupt>,
+    /// The display includes the partial core ρ_pc (M7; `SurrogateKs::display_core`).
+    pub(super) core: bool,
+    /// An audit dispatched in draft mode whose geometry the strict policy would not have answered
+    /// (fix (b), 2026-10-18): its answer is a `DraftAudit` sample, held out of the strict fit.
+    pub(super) draft_guess: bool,
 }
 
 /// What the auditor's teacher returned for an audit or a display job.
@@ -45,6 +118,8 @@ pub(super) struct Solved {
     pub(super) face: Option<f64>,
     pub(super) display: Option<Display>,
     pub(super) orbitals: Option<OrbitalDisplay>,
+    /// Why this answer must not be trained on (`EvalStats::untrainable`), if it must not.
+    pub(super) unfit: Option<&'static str>,
 }
 
 /// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
@@ -86,6 +161,7 @@ impl Auditor {
                 let mut last_atom = false;
                 // the orbital view the teacher has (module doc, "Side densities")
                 let mut view = OrbitalViewRequest::default();
+                let mut core = false;
                 while let Ok(job) = jrx.recv() {
                     // the audits are thousands of steps apart: no extrapolation through the
                     // previous one's geometry (the density is kept as a warm start) — but an
@@ -103,6 +179,10 @@ impl Auditor {
                         teacher.set_orbital_view(want.clone());
                         view = want;
                     }
+                    if job.core != core {
+                        teacher.set_display_partial_core(job.core);
+                        core = job.core;
+                    }
                     // the driver's display interrupt (re-review N1): a forced refresh's unoccupied
                     // eigensolve yields this job slot to the user's next command
                     if let Some(i) = &job.interrupt {
@@ -116,7 +196,7 @@ impl Auditor {
                         JobKind::Reference(z) => {
                             let mass = job.scene.nuclei.first().map_or(0.0, |n| n.mass);
                             done_count.store(0, Ordering::Relaxed);
-                            let r = sim::references::solve_atom_reporting(teacher.as_mut(), &job.scene.cell, job.scene.sigma, z, mass, &mut || current.load(Ordering::Relaxed) != g, &mut |k| done_count.store(k, Ordering::Relaxed));
+                            let r = sim::references::solve_atom_reporting(teacher.as_mut(), &job.scene.cell, job.scene.sigma, job.scene.ionic, z, mass, &mut || current.load(Ordering::Relaxed) != g, &mut |k| done_count.store(k, Ordering::Relaxed));
                             (Err(String::new()), Some(r))
                         }
                         _ => (
@@ -124,7 +204,7 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     scf_steps = Some(r.stats.scf_steps);
-                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, display: r.display, orbitals: r.orbitals }
+                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
@@ -214,14 +294,7 @@ impl SurrogateKs {
         if self.auditor.is_none() {
             return false;
         }
-        let atom = Scene {
-            nuclei: vec![sim::Nucleus::new(z, [0.0; 3])],
-            cell: scene.cell.clone(),
-            charge: 0,
-            multiplicity: None,
-            sigma: scene.sigma,
-            external_field: [0.0; 3],
-        };
+        let atom = isolated_atom(z, None, scene);
         let prov = self.scene_provenance(&atom);
         self.side_queue.retain(|j| j.2 != JobKind::Atom(z));
         self.side_queue.push_back((atom, prov, JobKind::Atom(z), 0));
@@ -244,9 +317,7 @@ impl SurrogateKs {
         if pending {
             return true;
         }
-        let mut nucleus = sim::Nucleus::new(z, [0.0; 3]);
-        nucleus.mass = mass;
-        let atom = Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3] };
+        let atom = isolated_atom(z, Some(mass), scene);
         let prov = self.scene_provenance(&atom);
         self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
         self.pump_side_queue();
@@ -333,7 +404,8 @@ impl SurrogateKs {
         // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
         let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone() };
+        let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -368,6 +440,9 @@ impl SurrogateKs {
         self.audit_due = false;
         self.audit_flip = false;
         self.last_audit = None;
+        self.failed_audits.clear();
+        self.audit_fences.clear();
+        self.audit_burst = 0;
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
@@ -472,11 +547,11 @@ impl SurrogateKs {
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals })) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals, unfit })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, ans.ms, ans.scf_steps);
+                self.judge_audit(ans.job, energy, forces, face, unfit, ans.ms, ans.scf_steps);
             }
         }
     }
@@ -485,9 +560,10 @@ impl SurrogateKs {
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
     /// outcome) or discarded (plan review S11).
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64, scf_steps: Option<usize>) {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
-        let AuditJob { scene, prov, .. } = job;
+        let AuditJob { scene, prov, draft_guess, .. } = job;
+        let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // the model current now is the one to judge (a refit since the dispatch is what counts)
@@ -503,22 +579,40 @@ impl SurrogateKs {
             ev.n_atoms = pos.len();
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
             return;
         };
+        // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
+        // strict mode refuses the geometry, so the answer is no judgement of the model — not
+        // judged, not kept (a draft guess's included: a band row is never fitted, now or after a
+        // later shell check lifts the fence)
+        if let Some(why) = self.shell_fence_refusal(&pos, &z) {
+            let note = format!("surrogate audit not judged: {} — not a judgement of the model; the answer is not fitted", why.text.trim_start_matches("surrogate: "));
+            let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::ShellNotKept);
+            ev.detail = note.clone();
+            ev.n_atoms = pos.len();
+            ev.solve_ms = ms;
+            ev.scf_steps = scf_steps;
+            ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
+            ev.audit_lag = Some(unaudited);
+            self.push_event(ev);
+            self.pending_notes.push(note);
+            return;
+        }
         let n = pos.len().max(1) as f64;
         let gap = energy - pred.energy;
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &prov, &mut notes);
+        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
         // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
-        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| !(d <= b));
+        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces, audit_force_floor(&prov.ionic)).filter(|(d, b)| !(d <= b));
         let verdict = if box_rho.is_some() {
             AuditVerdict::BoxAffected
         } else if !(gap.abs() / n <= thr) || force_fail.is_some() {
@@ -532,17 +626,26 @@ impl SurrogateKs {
                 "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
                 box_rho.unwrap_or(0.0)
             ),
+            // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
+            // strict fit, and not a verdict on the strict model (module doc, "Draft mode")
+            AuditVerdict::Failed if draft_guess => format!(
+                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} Ha/atom{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
+                gap.abs() / n,
+                force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
+            ),
             AuditVerdict::Failed => {
                 self.audit_failed = Some(gap);
                 self.audit_force = force_fail;
                 self.audit_atoms = n as usize;
+                let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
+                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(
-                        "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit"
+                        "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample"
                     ),
                     _ => format!(
-                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
+                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
                         gap.abs() / n
                     ),
                 }
@@ -559,9 +662,37 @@ impl SurrogateKs {
         ev.n_atoms = pos.len();
         ev.solve_ms = ms;
         ev.scf_steps = scf_steps;
+        ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
         ev.audit = Some(verdict);
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
         self.pending_notes.extend(notes);
+    }
+}
+
+#[cfg(test)]
+mod isolated_atom_tests {
+    use super::*;
+
+    /// Task 9 review I1: the isolated atom of the display's superposition and of the references is solved under the
+    /// scene's own ionic policy (never all-electron by default), on its cell and σ, neutral, with the caller's mass.
+    #[test]
+    fn the_isolated_atom_follows_the_scenes_policy() {
+        let scene = Scene {
+            nuclei: vec![sim::Nucleus::new(8, [0.0; 3]), sim::Nucleus::new(1, [1.8, 0.0, 0.0])],
+            cell: sim::Cell { n: 61, h: 0.2 },
+            charge: 1,
+            multiplicity: Some(2),
+            sigma: Some(0.3),
+            external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::CoresOnly,
+        };
+        for p in sim::IonicPolicy::ALL {
+            let atom = isolated_atom(8, None, &Scene { ionic: p, ..scene.clone() });
+            assert_eq!((atom.ionic, atom.charge, atom.multiplicity, atom.sigma, atom.cell.clone()), (p, 0, None, Some(0.3), scene.cell.clone()));
+            assert_eq!((atom.nuclei.len(), atom.nuclei[0].z, atom.nuclei[0].pos), (1, 8, [0.0; 3]));
+        }
+        assert_eq!(isolated_atom(8, Some(12345.0), &scene).nuclei[0].mass, 12345.0);
+        assert_eq!(isolated_atom(8, None, &scene).nuclei[0].mass, sim::Nucleus::new(8, [0.0; 3]).mass);
     }
 }

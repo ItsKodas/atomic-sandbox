@@ -61,6 +61,7 @@ fn synthetic_state(s: &GpuSolver, up: &[Vec<f64>], dn: &[Vec<f64>], e_up: &[f64]
         orbitals_up: fu, orbitals_dn: fd, evals_up: e_up.to_vec(), evals_dn: e_dn.to_vec(),
         rho: upload(&rt, "rho"), rho_up: upload(&ru, "rho up"), rho_dn: upload(&rd, "rho dn"),
         v_h: Field::new(c, g, "v_h"), v_nuc: Field::new(c, g, "v_nuc"),
+        ionic: None, occ_up: vec![1.0; e_up.len()], occ_dn: vec![1.0; e_dn.len()], occupations: qm::Occupations::Aufbau,
     };
     (state, raw)
 }
@@ -1121,4 +1122,57 @@ fn the_display_eigensolve_aborts_and_keeps_the_previous_vectors() {
     assert!(read(&view, &s) == before, "the previous vectors stay, bit for bit");
     let again = view.unoccupied(&mut s, &moved.nuclei, 2, &settings, &mut || false).expect("not aborted");
     assert!(again.rejected.is_none() && again.evals[0].len() == 2 + cpu::UNOCC_GUARD);
+}
+
+/// M7 × orbital viewer merge: under an ionic setup the GPU display solve runs on the SCF's full
+/// H^out (V_loc in `v_nuc`, v_xc of ρ_σ + ½ρ_pc, V_NL in every H·x via the solver's `GpuIonic`).
+/// Pseudo-O H₂O (`CoresOnly`: O with KB projectors and a partial core, H all-electron), closed
+/// shell, 33³, h = σ = 0.25, m = 2 (uncertified `from_tables`: one discrete problem). The occupied
+/// eigenvalues agree with the SCF's to τ(tol) = 1e-4 Ha (the existing bound, §8) and the solve is
+/// not rejected; rows converged on both sides agree with the f64 CPU reference
+/// (`qm::orbitals::unoccupied_cpu`, the same operator — `qm`'s `unoccupied_cpu_uses_the_pseudo_hamiltonian`
+/// shows that dropping V_NL or ρ_pc moves the occupied ε by 0.8 / 0.02 Ha) to `unoccupied_gpu_matches_cpu`'s 1e-4 Ha.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn unoccupied_uses_the_pseudo_hamiltonian() {
+    let Some(ctx) = ctx() else { return };
+    use crate::ionic::tests::filtered_at;
+    use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
+    let h = 0.25;
+    let grid = Grid::cube(33, h);
+    let nuclei = vec![nucleus([0.03, -0.02, 0.01], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)];
+    let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([
+        (8, Ionic::Pseudo(filtered_at(8, h))), (1, Ionic::AllElectron { sigma: h })])));
+    let sys = System::with_ionic(nuclei.clone(), 0, None, setup);
+    let settings = ScfSettings::for_grid(&grid);
+    let mut s = GpuSolver::new(ctx.clone(), &grid);
+    s.solve(&sys, &settings, false).expect("the SCF converges");
+    let mut view = OrbitalView::new(&s);
+    let t = std::time::Instant::now();
+    let g = view.unoccupied(&mut s, &nuclei, 2, &settings, &mut || false).expect("not aborted");
+    report("GPU pseudo H₂O 33³ m = 2", &g, t.elapsed().as_secs_f64());
+    let tau = cpu::tau(settings.tol);
+    assert!(g.rejected.is_none(), "{:?}", g.rejected);
+    for ch in 0..2 {
+        assert!(g.occupied_error[ch] <= tau, "ch {ch}: |Δε_occ| = {:.3e} > τ", g.occupied_error[ch]);
+    }
+    let (st, _) = qm::scf(&grid, &sys, &settings, None).expect("CPU SCF");
+    let t = std::time::Instant::now();
+    let (c, _) = cpu::unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || false).expect("not aborted");
+    report("CPU pseudo H₂O 33³ m = 2", &c, t.elapsed().as_secs_f64());
+    assert!(c.rejected.is_none());
+    let mut compared = 0;
+    for ch in 0..2 {
+        assert_eq!(g.evals[ch].len(), c.evals[ch].len());
+        for i in 0..g.evals[ch].len() {
+            for u in [&g, &c] { assert!(u.residuals[ch][i] <= u.tol || !u.converged[ch][i], "a residual above tol must be flagged"); }
+            if g.converged[ch][i] && c.converged[ch][i] {
+                let d = (g.evals[ch][i] - c.evals[ch][i]).abs();
+                println!("  ch {ch} #{i}: GPU {:+.7} CPU {:+.7} Δ {d:.1e}", g.evals[ch][i], c.evals[ch][i]);
+                assert!(d <= 1e-4, "ch {ch} #{i}: GPU {} CPU {}", g.evals[ch][i], c.evals[ch][i]);
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared >= 4, "at least the first two per channel converged on both sides ({compared})");
 }

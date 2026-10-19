@@ -14,11 +14,13 @@
 //!    spin state's orbitals are a poor start and could steer the SCF into the wrong state), and
 //!    the **lowest energy** is the reference. Hund's rule is not put in; it is meant to emerge:
 //!    the same scan runs for every Z (rule 1), and the note records the outcome ("reference O
-//!    (Z = 8): multiplicity 3 (E = …) chosen over 1 (…), 5 (…)"). Measured (rule 7): at the
-//!    project's h = 0.25, σ = h the teacher puts the O singlet lowest (33³: −36.565 vs triplet
-//!    −36.338 Ha) and its cold triplet SCF does not converge at 57³ — an unresolved, smeared
-//!    open-shell atom, a solver question (test `gpu_oxygen_reference_multiplicity`, ignored with
-//!    the numbers); the scan then takes the singlet, consistently with the teacher's surface. A multiplicity whose solve fails is
+//!    (Z = 8): multiplicity 3 (E = …) chosen over 1 (…), 5 (…)"). Measured (rule 7): all-electron
+//!    (`IonicPolicy::None`, h = 0.25, σ = h) the teacher puts the O singlet lowest (33³: −36.565 vs
+//!    triplet −36.338 Ha) and its cold triplet SCF does not converge at 57³ — an unresolved, smeared
+//!    open-shell atom — so the scan takes the singlet there, consistently with the teacher's surface;
+//!    under the pseudopotentials (`CoresOnly`, h_req 0.20, 71³; M7 Task 10, test
+//!    `gpu_oxygen_reference_multiplicity`) Hund's rule emerges: the triplet −16.106125 Ha below the
+//!    singlet −16.050056 (56.07 mHa; radial KB 56.06) and the quintet −15.756806. A multiplicity whose solve fails is
 //!    noted and left out; only if none succeeds does the pass end. The energy is set with
 //!    `SurrogateKs::set_reference_energy` — never a table — and cached with its multiplicity
 //!    in a [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a
@@ -38,7 +40,30 @@
 //!    `scan_range.1` times the pair's CURRENT separation r₀ (0.7 … 1.8 r₀): the ranges come from
 //!    the scene, never from an element radius table (rule 1). The lighter nucleus of the pair
 //!    (isotope mass; the higher index on a tie) moves along the pair axis, every other nucleus
-//!    stays where it is.
+//!    stays where it is. **The scan stops short of r_cut** (2026-10-18; round 3 review R3-1): no
+//!    point beyond [`SCAN_CUTOFF_FRACTION`]·r_cut (5 Bohr at r_cut = 6) is fitted. Why stop:
+//!    every feature carries the cutoff function f_c = ½(1 + cos πr/r_cut), which vanishes at r_cut
+//!    with zero slope, while the teacher's interaction there does not (the Morse stand-in:
+//!    V(6) ≈ −3.4e-3 Ha; an ion and a polarisable atom: α q²/2r⁴ ≈ 2.5e-3 Ha at 5.5 Bohr for LiH's
+//!    q ≈ 1, α ≈ 4.5); a sample in that shell is a leverage outlier or a structural one, predicted
+//!    by nothing else — the user's live water + 2 H model had its many-body class refused
+//!    everywhere by #251, a pass scan point with H–O at 5.97 and 6.03 Bohr. **5/6 is a sampling
+//!    convenience, not a derived bound**: f_c = 0.067 there, and it lies *beyond* the Morse point
+//!    measured structural (4.9 Bohr = 0.817 r_cut; 4.6 = 0.77 was represented), so it does not
+//!    claim that everything inside it is representable. What it does guarantee is that the shell is
+//!    **measured, not assumed**: per scanned pair whose points cross the limit, the first point
+//!    beyond it is solved as a **shell check** (`Job::Shell`, [`ShellCheck`]) — never fitted, judged
+//!    after the pass's refit against the audit criterion (energy tier, every atom's force bound at
+//!    1×, the pseudo floor). Pass: "the model's cutoff holds for <pair>"; fail: a named limitation
+//!    ("<pair> still interacts at r = …; the cutoff truncates it") fenced at once by the **Ruling
+//!    (shell → fence)** (`providers::surrogate` module doc): strict mode falls back for geometries
+//!    with that pair in the shell band (the answers used, never fitted) and answers everywhere
+//!    else as before; the fence is structural — it never re-earns by a refit, only a later pass's
+//!    shell check for the pair measures the shell again. A [`rescale`](Sampler::rescale) never
+//!    drops a pending shell check and never counts it as a fitted point. The pair's further
+//!    points beyond the limit are skipped ("… not solved"), counted in `skipped` and reported. A
+//!    scan of 0.7 … 1.8 r₀ crosses the limit only when r₀ > 2.78 Bohr — LiH's Li–H (≈ 3.0 Bohr),
+//!    water's H–H (2.86). A sampling-design choice, not a tolerance change: no bound moves.
 //! 4. **Hot burst**: `hot_burst_steps` teacher evaluations along a velocity-Verlet trajectory
 //!    (dt [`HOT_BURST_DT_FS`] = 0.25 fs) from the scene's positions with Maxwell–Boltzmann
 //!    velocities at `hot_burst_t` (2000 K), CSVR-thermostatted at that temperature with
@@ -51,6 +76,23 @@
 //! skipped). A teacher error on a sample geometry is counted in `failed` with a note and the
 //! pass goes on; a failed reference solve ends the pass with the error (no fit is possible
 //! without it).
+//!
+//! **A failed scan point ends its scan's stretched tail** (the SCF stall stop, `qm::scf` "The stall
+//! stop"): when a scan point on the stretched side (r > r₀) fails to converge — the stall stop or
+//! the iteration cap, `SolverError::scf_end` — the queued points of that scan at larger r are not
+//! solved: each becomes a skip row ("scan i–j: point k of m (r = 1.80 r₀) failed (stalled);
+//! further-out points skipped"), counted in `skipped`, with an activity row of its own (`NotSolved`).
+//! Why: each failing point costs two capped or stalled solves (the warm attempt and the R15 cold
+//! retry), and the bond is further broken beyond it. That the further-out points would fail too is
+//! an **assumption, not a measurement** (review S6): only 1.8 r₀ — the water scan's last point — was
+//! measured to fail (`validate/references.md` "SCF stall stop"), and for a bond the half-broken
+//! region is often the hardest while the separated limit can be easier. What is lost is bounded by
+//! (r_k, 1.8 r₀] and visible: the note names the truncated range, and geometries beyond the last
+//! converged stretched point stay unseen, so the model falls back to the teacher there (the
+//! data-driven rules 5b–5e; skip rows never become samples). Points on the compressed side, and every
+//! other scan, are unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to
+//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop and the cap trigger it
+//! (`ScfEnd::Stalled | Cap`): a non-finite Δρ, a numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
 //! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
@@ -94,7 +136,8 @@
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
 //! caller does (a partial pass refits like a full one).
 
-use sim::activity::{PassJob, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+use sim::sampling::{GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost};
 use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
@@ -112,6 +155,14 @@ use units::isotopes::symbol;
 pub const HOT_BURST_TAU_FS: f64 = 5.0;
 /// The hot burst's time step (fs).
 pub const HOT_BURST_DT_FS: f64 = 0.25;
+/// Pair scans stop at this fraction of the model's cutoff (module doc, 3., "The scan stops short
+/// of r_cut"): 5/6, i.e. 5 Bohr at r_cut = 6, where the cutoff function ½(1 + cos πr/r_cut) has
+/// fallen to 0.067. A **sampling-design** choice, not a tolerance: no trust or acceptance bound
+/// moves, the scan only stops solving where the basis is measured not to represent what the
+/// teacher has there (the physics reviewer rules on the number).
+pub const SCAN_CUTOFF_FRACTION: f64 = 5.0 / 6.0;
+/// What a scan point skipped for [`SCAN_CUTOFF_FRACTION`] carries in its note (the skip's tally).
+const SCAN_LIMIT_MARK: &str = "of the model's cutoff";
 
 /// The plan's solve count, trust floor and scaling (they need the surrogate's basis and the
 /// `Sampler`, so they live here; `use providers::PlanSolves` brings `plan.solves(scene)` and
@@ -188,7 +239,7 @@ impl PlanSolves for SamplingPlan {
 /// (ruling S9; `ReferenceCache::atom_provenance` before M6).
 pub fn atom_key(scene_provenance: &Provenance, z: u8) -> ReferenceKey {
     let p = scene_provenance;
-    ReferenceKey { grid_n: p.grid_n, h: p.h, sigma: p.sigma, tol: p.tol, teacher: p.teacher.clone(), z }
+    ReferenceKey { grid_n: p.grid_n, h: p.h, sigma: p.sigma, tol: p.tol, teacher: p.teacher.clone(), z, ionic: p.ionic.clone() }
 }
 
 /// One planned pair scan (for the progress readout and the tests).
@@ -211,9 +262,53 @@ enum Job {
     Perturbation(Scene),
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
+    /// A teach-around solve (`Sampler::targeted`; `crate::surrogate`, "Teaching around the blockers").
+    Target(TargetJob),
+    /// A pair's shell check (module doc, 3.): its first scan point beyond the scan limit, solved and
+    /// never fitted — the geometry, its pair index and point index.
+    Shell(Scene, usize, usize),
     /// A geometry the cell guard rejected, with the stage it belonged to (and its pair and
-    /// point index for a scan point: [`Sampler::rescale`] thins scans by index).
-    Skip(&'static str, Option<(usize, usize)>),
+    /// point index for a scan point: [`Sampler::rescale`] thins scans by index) — or, with a
+    /// note, a scan point beyond a failed one (module doc, "A failed scan point …").
+    Skip(&'static str, Option<(usize, usize)>, Option<String>),
+}
+
+/// One solve of a teach-around pass (`Sampler::targeted`): the geometry, the blocking sample it
+/// teaches around (store index) and whether it is a held-out check (solved, never fitted).
+#[derive(Clone, Debug)]
+pub struct TargetJob {
+    pub scene: Scene,
+    pub blocker: usize,
+    pub holdout: bool,
+}
+
+/// A pair's shell check (`Sampler::take_shell_checks`; module doc, 3.): the teacher's answer at the
+/// pair's first scan point beyond [`SCAN_CUTOFF_FRACTION`]·r_cut, never fitted, judged by the
+/// caller after the pass's refit against the audit criterion.
+#[derive(Clone, Debug)]
+pub struct ShellCheck {
+    /// The pair's species (Z of `i`, `j`) and indices in the scene.
+    pub pair: (u8, u8),
+    pub r: f64,
+    pub r_cut: f64,
+    pub scene: Scene,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub face: Option<f64>,
+    /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
+    pub unfit: bool,
+}
+
+/// A held-out check's answer (`Sampler::take_holdouts`): judged by the caller after the refit.
+#[derive(Clone, Debug)]
+pub struct Holdout {
+    pub blocker: usize,
+    pub scene: Scene,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub face: Option<f64>,
+    /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
+    pub unfit: bool,
 }
 
 /// The hot burst's trajectory state.
@@ -225,7 +320,12 @@ struct Burst {
     forces: Option<Vec<[f64; 3]>>,
     csvr: Csvr,
     dt: f64,
+    /// Positions of the last [`GHOST_TRAIL`] solved evaluations, oldest first (the ghost's trail).
+    trail: VecDeque<Vec<[f64; 3]>>,
 }
+
+/// Solved burst geometries the ghost's trail keeps (display only).
+pub const GHOST_TRAIL: usize = 6;
 
 /// The resumable pass (module doc).
 pub struct Sampler {
@@ -246,12 +346,29 @@ pub struct Sampler {
     added: usize,
     /// Samples added whose teacher answer was box-affected (module doc, "Box-affected samples").
     boxed: usize,
+    /// Geometries the cell guard skipped (the burst's tail included), and scan points skipped
+    /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
+    cell_skipped: usize,
+    tail_skipped: usize,
+    /// Scan points not solved for [`SCAN_CUTOFF_FRACTION`].
+    limit_skipped: usize,
+    /// How the last failed sample solve's SCF ended (`SolverError::scf_end`), for the scan's tail.
+    last_failure: Option<(ScfEnd, usize)>,
     /// Nucleus count of the last scene sent to the teacher.
     last_n: Option<usize>,
     /// (pair, point) of the last scan point sent to the teacher.
     last_scan: Option<(usize, usize)>,
     /// The teacher solved something else since our last solve (`teacher_used_elsewhere`).
     interrupted: bool,
+    /// The last job accounted for, for the ghost (`ghost`; display only, nothing reads it back).
+    finished: Option<GhostFinished>,
+    /// A teach-around pass (`Sampler::targeted`): the blockers it teaches around, and the held-out
+    /// checks' answers.
+    targets: Vec<usize>,
+    holdouts: Vec<Holdout>,
+    /// The pass's shell checks (module doc, 3.), and the cutoff they were planned at.
+    shell_checks: Vec<ShellCheck>,
+    r_cut: f64,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -302,7 +419,7 @@ impl Sampler {
         species.dedup();
         for &z in &species {
             let (a, mass) = base.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).expect("a species of the scene");
-            queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, z, a, mass)));
+            queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, base.ionic, z, a, mass)));
         }
 
         // 2. perturbations
@@ -314,7 +431,7 @@ impl Sampler {
                     *x += plan.perturbation_sigma * standard_normal(&mut rng);
                 }
             }
-            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations", None) });
+            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations", None, None) });
         }
 
         // 3. pair scans, ranges from the scene's own separations
@@ -342,11 +459,33 @@ impl Sampler {
                     })
                     .collect();
                 let pair = scans.len();
+                let r_limit = SCAN_CUTOFF_FRACTION * r_cut;
+                let mut shell_planned = false;
                 for (k, &rk) in r.iter().enumerate() {
+                    if rk > r_limit && !shell_planned {
+                        // the pair's shell check: its first point beyond the limit, never fitted
+                        shell_planned = true;
+                        let mut sc = base.clone();
+                        let p_fixed = sc.nuclei[fixed].pos;
+                        sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
+                        queue.push_back(if inside_cell(&sc) { Job::Shell(sc, pair, k) } else { Job::Skip("scans", Some((pair, k)), None) });
+                        continue;
+                    }
+                    if rk > r_limit {
+                        queue.push_back(Job::Skip(
+                            "scans",
+                            Some((pair, k)),
+                            Some(format!(
+                                "scan {i}–{j}: point {} of {m} (r = {rk:.2} Bohr) is beyond {r_limit:.2} Bohr, 5/6 {SCAN_LIMIT_MARK} ({r_cut:.2}) — not solved (the pair's first point beyond it is its shell check)",
+                                k + 1
+                            )),
+                        ));
+                        continue;
+                    }
                     let mut sc = base.clone();
                     let p_fixed = sc.nuclei[fixed].pos;
                     sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
-                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans", Some((pair, k))) });
+                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans", Some((pair, k)), None) });
                 }
                 scans.push(PairScan { i, j, moved, r0, r });
             }
@@ -363,6 +502,7 @@ impl Sampler {
             forces: None,
             csvr,
             dt: units::fs_to_au_time(HOT_BURST_DT_FS),
+            trail: VecDeque::new(),
         };
 
         let refs_total = species.iter().map(|&z| allowed_multiplicities(z as u32).len()).sum::<usize>();
@@ -389,14 +529,88 @@ impl Sampler {
                 skipped: 0,
                 failed: 0,
                 finished: total == 0,
+                target: None,
             },
             notes,
             added: 0,
             boxed: 0,
+            cell_skipped: 0,
+            tail_skipped: 0,
+            limit_skipped: 0,
+            last_failure: None,
             last_n: None,
             last_scan: None,
             interrupted: false,
+            finished: None,
+            targets: Vec::new(),
+            holdouts: Vec::new(),
+            shell_checks: Vec::new(),
+            r_cut,
         })
+    }
+
+    /// A **teach-around** pass (`crate::surrogate`, "Teaching around the blockers"): exactly
+    /// `jobs`, in order — no references (the model has them), no scans, no burst. Each solve is
+    /// fresh (`discontinuity`: the geometries are unrelated); a fitted one is kept as a
+    /// `SampleTag::Targeted` sample with its face density (the box rule applies as to any pass
+    /// sample), a held-out one is kept aside for the caller (`take_holdouts`). Stage "teaching",
+    /// `SamplingProgress::target` the blocker of the job in hand.
+    pub fn targeted(scene: &Scene, jobs: Vec<TargetJob>) -> Sampler {
+        let mut base = scene.clone();
+        base.external_field = [0.0; 3];
+        let mut targets: Vec<usize> = jobs.iter().map(|j| j.blocker).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let total = jobs.len();
+        let first = jobs.first().map(|j| j.blocker);
+        let queue: VecDeque<Job> = jobs.into_iter().map(|j| if inside_cell(&j.scene) { Job::Target(j) } else { Job::Skip("teaching", None, None) }).collect();
+        let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+        Sampler {
+            scene: base.clone(),
+            plan,
+            refs_total: 0,
+            queue,
+            scans: Vec::new(),
+            scan_planned: Vec::new(),
+            burst: Burst { left: 0, scene: base, forces: None, csvr: Csvr::new(300.0, HOT_BURST_TAU_FS, 0), dt: units::fs_to_au_time(HOT_BURST_DT_FS), trail: VecDeque::new() },
+            refs: ReferenceCache::default(),
+            progress: SamplingProgress { done: 0, total, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: total == 0, target: first },
+            notes: Vec::new(),
+            added: 0,
+            boxed: 0,
+            cell_skipped: 0,
+            tail_skipped: 0,
+            limit_skipped: 0,
+            last_failure: None,
+            last_n: None,
+            last_scan: None,
+            interrupted: false,
+            finished: None,
+            targets,
+            holdouts: Vec::new(),
+            shell_checks: Vec::new(),
+            r_cut: Basis::new(&[]).r_cut,
+        }
+    }
+
+    /// A teach-around pass (`targeted`).
+    pub fn is_targeted(&self) -> bool {
+        !self.targets.is_empty()
+    }
+
+    /// The blockers a teach-around pass teaches around (store indices, sorted).
+    pub fn targets(&self) -> &[usize] {
+        &self.targets
+    }
+
+    /// The held-out checks' answers so far (drained).
+    pub fn take_holdouts(&mut self) -> Vec<Holdout> {
+        std::mem::take(&mut self.holdouts)
+    }
+
+    /// The pass's shell checks so far (drained; module doc, 3.).
+    pub fn take_shell_checks(&mut self) -> Vec<ShellCheck> {
+        std::mem::take(&mut self.shell_checks)
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).
@@ -456,7 +670,8 @@ impl Sampler {
     /// (which may be a scan end). Never grows a pass (each count is capped by the current one);
     /// `SamplingProgress::total` follows. No-op on a finished pass.
     pub fn rescale(&mut self, plan: &SamplingPlan) {
-        if self.progress.finished {
+        // a teach-around pass is its own fixed job list: never re-sized
+        if self.progress.finished || self.is_targeted() {
             return;
         }
         let pairs = self.scans.len();
@@ -485,21 +700,31 @@ impl Sampler {
         let (p, m, b) = want;
 
         // perturbations: the head of the seeded sequence
-        let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", _));
+        let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", ..));
         let ran_p = cur.0 - self.queue.iter().filter(|j| is_pert(j)).count();
         let mut keep_p = p.saturating_sub(ran_p);
-        // scans: per pair, an evenly spaced subset of the queued points
+        // scans: per pair, an evenly spaced subset of the queued points; the pair's shell check
+        // (`Job::Shell`, one of its planned points) is neither thinned nor counted as run while it
+        // is queued (final review M3)
         let scan_at = |j: &Job| match j {
             Job::Scan(_, pair, k) => Some((*pair, *k)),
-            Job::Skip("scans", at) => *at,
+            Job::Skip("scans", at, _) => *at,
+            _ => None,
+        };
+        let shell_at = |j: &Job| match j {
+            Job::Shell(_, pair, _) => Some(*pair),
             _ => None,
         };
         let mut queued: Vec<Vec<usize>> = vec![Vec::new(); pairs];
         for (pair, k) in self.queue.iter().filter_map(scan_at) {
             queued[pair].push(k);
         }
-        let ran_k: Vec<usize> = (0..pairs).map(|pair| planned[pair] - queued[pair].len()).collect();
-        let keep_k: Vec<Vec<usize>> = (0..pairs).map(|pair| spread(&queued[pair], m.min(planned[pair]).saturating_sub(ran_k[pair]))).collect();
+        let mut shell_queued = vec![0usize; pairs];
+        for pair in self.queue.iter().filter_map(shell_at) {
+            shell_queued[pair] += 1;
+        }
+        let ran_k: Vec<usize> = (0..pairs).map(|pair| planned[pair] - queued[pair].len() - shell_queued[pair]).collect();
+        let keep_k: Vec<Vec<usize>> = (0..pairs).map(|pair| spread(&queued[pair], m.min(planned[pair]).saturating_sub(ran_k[pair] + shell_queued[pair]))).collect();
         self.queue.retain(|j| {
             if is_pert(j) {
                 let keep = keep_p > 0;
@@ -527,14 +752,19 @@ impl Sampler {
             self.queue.remove(i);
             excess -= 1;
         }
-        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. })) {
+        // never a pending shell check: the measurement the fence rests on (M3)
+        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. } | Job::Shell(..))) {
             self.queue.pop_back();
             excess -= 1;
         }
 
-        // the counts as they now stand (a later rescale works from them)
+        // the counts as they now stand (a later rescale works from them); a queued shell check
+        // is one of the pair's planned points, as it was at the start
         let mut now = ran_k;
         for (pair, _) in self.queue.iter().filter_map(scan_at) {
+            now[pair] += 1;
+        }
+        for pair in self.queue.iter().filter_map(shell_at) {
             now[pair] += 1;
         }
         self.plan.scan_points_per_pair = now.iter().copied().max().unwrap_or(0);
@@ -543,6 +773,80 @@ impl Sampler {
         self.plan.hot_burst_steps = ran_b + self.burst.left;
         self.progress.total = self.progress.done + Self::jobs_in(&self.queue) + self.burst.left;
         self.progress.stage = Self::stage_of(self.queue.front(), self.burst.left);
+    }
+
+    /// Notes how the job just accounted for ended, with the geometry it was (the ghost's flash).
+    fn mark(&mut self, outcome: GhostOutcome, atoms: Vec<GhostAtom>) {
+        let serial = self.finished.as_ref().map_or(1, |f| f.serial + 1);
+        self.finished = Some(GhostFinished { serial, outcome, atoms });
+    }
+
+    /// What the pass is solving now, for the viewer's ghost (display only; `None` when nothing is
+    /// left to solve — the pass is about to finish). The job is the first queued one that costs a
+    /// solve: skip rows are accounted for without one, and so is a reference found in the cache
+    /// (`surrogate` supplies the provenance of its key). For the hot burst it is the next
+    /// evaluation, computed the way [`burst_step`](Self::burst_step) does (a half-kick and a drift
+    /// from the last solved geometry; the thermostat's draws are untouched).
+    pub fn ghost(&self, surrogate: &SurrogateKs) -> Option<PassGhost> {
+        if self.progress.finished {
+            return None;
+        }
+        let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        let finished = self.finished.clone();
+        let prov = surrogate.provenance_for(&self.scene);
+        let queued_perts = self.queue.iter().filter(|j| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", ..))).count();
+        // nudges accounted for before the job in hand (the queue's head perturbations are the next ones)
+        let mut perts_before = self.plan.perturbations.saturating_sub(queued_perts);
+        for job in &self.queue {
+            match job {
+                Job::Skip("perturbations", ..) => perts_before += 1,
+                Job::Skip(..) => {}
+                Job::Reference(scan) => {
+                    if !scan.started() && self.refs.get(&atom_key(&prov, scan.z())).is_some() {
+                        continue; // a cache hit: no solve
+                    }
+                    let atom = GhostAtom { z: scan.z(), pos: [0.0; 3] };
+                    return Some(PassGhost { stage: "references", job: GhostJob::Reference { z: scan.z() }, atoms: vec![atom], base: Vec::new(), trail: Vec::new(), finished });
+                }
+                Job::Perturbation(sc) => {
+                    let job = GhostJob::Perturbation { index: perts_before + 1, of: self.plan.perturbations };
+                    return Some(PassGhost { stage: "perturbations", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+                Job::Scan(sc, pair, k) => {
+                    let s = &self.scans[*pair];
+                    let r = s.r[*k];
+                    let job = GhostJob::Scan { i: s.i, j: s.j, k: k + 1, of: s.r.len(), ratio: r / s.r0, r };
+                    return Some(PassGhost { stage: "scans", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+                // a shell check is the scan's first point beyond the limit, solved as a check,
+                // never fitted — and shown as one (final review M9)
+                Job::Shell(sc, pair, k) => {
+                    let s = &self.scans[*pair];
+                    let job = GhostJob::ShellCheck { i: s.i, j: s.j, r: s.r[*k] };
+                    return Some(PassGhost { stage: "scans", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+                Job::Target(t) => {
+                    let job = GhostJob::Teach { blocker: t.blocker, index: self.progress.done + 1, of: self.progress.total, holdout: t.holdout };
+                    // the base only draws displacement lines: keep it when it is the same nuclei
+                    let base = if base.len() == t.scene.nuclei.len() { base } else { Vec::new() };
+                    return Some(PassGhost { stage: "teaching", job, atoms: ghost_atoms(&t.scene), base, trail: Vec::new(), finished });
+                }
+            }
+        }
+        if self.burst.left == 0 {
+            return None;
+        }
+        let mut work = self.burst.scene.clone();
+        if let Some(f) = &self.burst.forces {
+            Integrator::half_kick(&mut work, f, self.burst.dt);
+            Integrator::drift(&mut work, self.burst.dt);
+        }
+        if !inside_cell(&work) {
+            return None; // the burst ends at the margin without a solve
+        }
+        let step = self.plan.hot_burst_steps.saturating_sub(self.burst.left) + 1;
+        let job = GhostJob::HotBurst { step, of: self.plan.hot_burst_steps };
+        Some(PassGhost { stage: "hot burst", job, atoms: ghost_atoms(&work), base, trail: self.burst.trail.iter().cloned().collect(), finished })
     }
 
     /// Ends the pass early: what was sampled stays in the surrogate.
@@ -587,9 +891,11 @@ impl Sampler {
     fn stage_of(job: Option<&Job>, burst_left: usize) -> &'static str {
         match job {
             Some(Job::Reference(_)) => "references",
-            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", _)) => "perturbations",
-            Some(Job::Scan(..)) | Some(Job::Skip("scans", _)) => "scans",
-            Some(Job::Skip(other, _)) => other,
+            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", ..)) => "perturbations",
+            Some(Job::Scan(..)) | Some(Job::Skip("scans", ..)) => "scans",
+            Some(Job::Target(_)) => "teaching",
+            Some(Job::Shell(..)) => "scans",
+            Some(Job::Skip(other, ..)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
         }
@@ -613,13 +919,31 @@ impl Sampler {
             };
             self.progress.stage = Self::stage_of(Some(&job), self.burst.left);
             match job {
-                Job::Skip(stage, _) => {
+                Job::Skip(stage, _, why) => {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
-                    let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
-                    ev.detail = format!("sampling: a generated geometry of the {stage} is closer than {CELL_MARGIN_H}h to a cell face — not solved");
+                    let mut ev = match why {
+                        None => {
+                            self.cell_skipped += 1;
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
+                            ev.detail = format!("sampling: a generated geometry of the {stage} is closer than {CELL_MARGIN_H}h to a cell face — not solved");
+                            ev
+                        }
+                        Some(note) => {
+                            if note.contains(SCAN_LIMIT_MARK) {
+                                self.limit_skipped += 1;
+                            } else {
+                                self.tail_skipped += 1;
+                            }
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotSolved);
+                            ev.detail = format!("sampling: {note}");
+                            ev
+                        }
+                    };
                     ev.n_atoms = self.scene.nuclei.len();
                     surrogate.push_event(ev);
+                    let atoms = ghost_atoms(&self.scene);
+                    self.mark(GhostOutcome::Skipped, atoms);
                 }
                 Job::Reference(mut scan) => {
                     let z = scan.z();
@@ -658,6 +982,11 @@ impl Sampler {
                     }
                     self.progress.done += 1;
                     let rule = TeachRule::Pass(PassJob::Reference { z, multiplicity: m });
+                    let ended = match &outcome {
+                        Ok(_) => GhostOutcome::Kept,
+                        Err(e) => GhostOutcome::Failed(e.scf_end().map(|x| x.0)),
+                    };
+                    self.mark(ended, vec![GhostAtom { z, pos: [0.0; 3] }]);
                     let failure = match outcome {
                         Ok(solved) => {
                             // `Ok(None)` (nothing left to solve) cannot happen here — `m` was taken
@@ -678,6 +1007,7 @@ impl Sampler {
                             ev.detail = note.clone();
                             ev.n_atoms = 1;
                             ev.solve_ms = solve_ms;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
                             surrogate.push_event(ev);
                             self.notes.push(note);
                             Some(e)
@@ -709,6 +1039,42 @@ impl Sampler {
                     ));
                     return Ok(Some(self.progress()));
                 }
+                Job::Target(job) => {
+                    self.progress.target = Some(job.blocker);
+                    let started = Instant::now();
+                    match self.solve(&mut teacher, surrogate, &job.scene, true, should_abort) {
+                        Err(ProviderError::Cancelled) => {
+                            self.queue.push_front(Job::Target(job));
+                            return Err(ProviderError::Cancelled);
+                        }
+                        Err(e) => {
+                            self.progress.done += 1;
+                            self.progress.failed += 1;
+                            let note = format!("teaching: a solve near #{} failed ({e}) — skipped", job.blocker);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: job.holdout }), TeachOutcome::Failed);
+                            ev.detail = note.clone();
+                            ev.n_atoms = job.scene.nuclei.len();
+                            ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            surrogate.push_event(ev);
+                            self.notes.push(note);
+                        }
+                        Ok(r) if job.holdout => {
+                            self.progress.done += 1;
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::NotOffered);
+                            ev.detail = format!("teaching: a held-out check near #{} — solved, never fitted (it tests the result after the refit)", job.blocker);
+                            ev.face_density = r.stats.face_density;
+                            ev.n_atoms = job.scene.nuclei.len();
+                            ev.solve_ms = r.stats.solve_ms as f64;
+                            ev.scf_steps = Some(r.stats.scf_steps);
+                            ev.scf_end = converged(r.stats.scf_steps);
+                            surrogate.push_event(ev);
+                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, energy: r.energy, forces: r.forces, scene: job.scene });
+                        }
+                        Ok(r) => self.record(surrogate, &job.scene, r, SampleTag::Targeted, None),
+                    }
+                    return Ok(Some(self.progress()));
+                }
                 Job::Perturbation(sc) => match self.sample(&mut teacher, surrogate, &sc, SampleTag::Perturbation, true, should_abort) {
                     Err(e) => {
                         self.queue.push_front(Job::Perturbation(sc));
@@ -716,6 +1082,45 @@ impl Sampler {
                     }
                     Ok(_) => return Ok(Some(self.progress())),
                 },
+                Job::Shell(sc, pair, k) => {
+                    let fresh = k == 0 || self.last_scan != Some((pair, k - 1));
+                    let started = Instant::now();
+                    let (i, j) = (self.scans[pair].i, self.scans[pair].j);
+                    let pair_z = (sc.nuclei[i].z, sc.nuclei[j].z);
+                    let r = self.scans[pair].r[k];
+                    match self.solve(&mut teacher, surrogate, &sc, fresh, should_abort) {
+                        Err(ProviderError::Cancelled) => {
+                            self.queue.push_front(Job::Shell(sc, pair, k));
+                            return Err(ProviderError::Cancelled);
+                        }
+                        Err(e) => {
+                            self.progress.done += 1;
+                            self.progress.failed += 1;
+                            let note = format!("sampling: the shell check of scan {i}–{j} (r = {r:.2} Bohr) failed ({e}) — the cutoff shell of this pair stays unmeasured");
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::Failed);
+                            ev.detail = note.clone();
+                            ev.n_atoms = sc.nuclei.len();
+                            ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            surrogate.push_event(ev);
+                            self.notes.push(note);
+                        }
+                        Ok(res) => {
+                            self.progress.done += 1;
+                            self.last_scan = Some((pair, k));
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotOffered);
+                            ev.detail = format!("sampling: the shell check of scan {i}–{j} at r = {r:.2} Bohr (beyond 5/6 {SCAN_LIMIT_MARK}) — solved, never fitted; judged after the refit");
+                            ev.face_density = res.stats.face_density;
+                            ev.n_atoms = sc.nuclei.len();
+                            ev.solve_ms = res.stats.solve_ms as f64;
+                            ev.scf_steps = Some(res.stats.scf_steps);
+                            ev.scf_end = converged(res.stats.scf_steps);
+                            surrogate.push_event(ev);
+                            self.shell_checks.push(ShellCheck { pair: pair_z, r, r_cut: self.r_cut, unfit: res.stats.untrainable().is_some(), face: res.stats.face_density, energy: res.energy, forces: res.forces, scene: sc });
+                        }
+                    }
+                    return Ok(Some(self.progress()));
+                }
                 Job::Scan(sc, pair, k) => {
                     let fresh = k == 0 || self.last_scan != Some((pair, k - 1));
                     match self.sample(&mut teacher, surrogate, &sc, SampleTag::Scan, fresh, should_abort) {
@@ -725,6 +1130,12 @@ impl Sampler {
                         }
                         Ok(solved) => {
                             self.last_scan = solved.then_some((pair, k));
+                            // a non-converged scan point ends its stretched tail (module doc)
+                            // only the stall stop and the cap say something about the bond; a non-finite Δρ is a
+                            // numerics fault and costs nothing further (review S5)
+                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap), _))) = (solved, self.last_failure) {
+                                self.skip_scan_tail(pair, k, end);
+                            }
                             return Ok(Some(self.progress()));
                         }
                     }
@@ -780,6 +1191,7 @@ impl Sampler {
         should_abort: &mut dyn FnMut() -> bool,
     ) -> Result<bool, ProviderError> {
         let started = Instant::now();
+        self.last_failure = None;
         match self.solve(teacher, surrogate, scene, fresh, should_abort) {
             Ok(r) => {
                 self.record(surrogate, scene, r, tag, None);
@@ -794,8 +1206,11 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = scene.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                self.last_failure = e.scf_end();
+                (ev.scf_end, ev.scf_steps) = self.last_failure.map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
+                self.mark(GhostOutcome::Failed(self.last_failure.map(|x| x.0)), ghost_atoms(scene));
                 Ok(false)
             }
         }
@@ -806,6 +1221,24 @@ impl Sampler {
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
         let face = r.stats.face_density;
+        // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
+        if let Some(why) = r.stats.untrainable() {
+            let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
+            self.progress.done += 1;
+            self.progress.skipped += 1;
+            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::UnfitNotKept);
+            ev.face_density = face;
+            ev.n_atoms = scene.nuclei.len();
+            ev.solve_ms = r.stats.solve_ms as f64;
+            ev.scf_steps = Some(r.stats.scf_steps);
+            ev.scf_end = converged(r.stats.scf_steps);
+            ev.burst_t = burst_t;
+            ev.detail = note.clone();
+            surrogate.push_event(ev);
+            self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
+            return;
+        }
         let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
         let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {
@@ -832,12 +1265,15 @@ impl Sampler {
             }
         };
         self.progress.done += 1;
-        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), outcome);
+        let job = if tag == SampleTag::Targeted { PassJob::Teach { blocker: self.progress.target.unwrap_or(0), holdout: false } } else { pass_job(tag) };
+        self.mark(if outcome == TeachOutcome::StoreRefused { GhostOutcome::Failed(None) } else { GhostOutcome::Kept }, ghost_atoms(scene));
+        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(job), outcome);
         ev.face_density = face;
         ev.box_affected = boxed;
         ev.n_atoms = scene.nuclei.len();
         ev.solve_ms = solve_ms;
         ev.scf_steps = Some(scf);
+        ev.scf_end = converged(scf);
         ev.burst_t = burst_t;
         ev.detail = detail;
         surrogate.push_event(ev);
@@ -858,12 +1294,14 @@ impl Sampler {
             let left = std::mem::take(&mut self.burst.left);
             self.progress.done += left;
             self.progress.skipped += left;
+            self.cell_skipped += left;
             let note = format!("sampling: the hot burst reached the cell margin; its last {left} evaluations were skipped");
             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
             ev.detail = note.clone();
             ev.n_atoms = work.nuclei.len();
             surrogate.push_event(ev);
             self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(&work));
             return Ok(false);
         }
         let started = Instant::now();
@@ -882,6 +1320,10 @@ impl Sampler {
                     self.burst.csvr.apply(&mut work, dt);
                 }
                 self.record(surrogate, &work, r, SampleTag::HotBurst, Some(burst_t));
+                self.burst.trail.push_back(work.nuclei.iter().map(|n| n.pos).collect());
+                if self.burst.trail.len() > GHOST_TRAIL {
+                    self.burst.trail.pop_front();
+                }
                 self.burst.scene = work;
                 self.burst.forces = Some(f_new);
                 self.burst.left -= 1;
@@ -899,10 +1341,45 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = work.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
+                self.mark(GhostOutcome::Failed(e.scf_end().map(|x| x.0)), ghost_atoms(&work));
                 Ok(true)
             }
+        }
+    }
+
+    /// Scan `pair`'s point `k` failed to converge (`end`): its queued points further out on the
+    /// stretched side become skip rows (module doc, "A failed scan point …"). Nothing for a point at
+    /// or inside r₀.
+    fn skip_scan_tail(&mut self, pair: usize, k: usize, end: ScfEnd) {
+        let scan = &self.scans[pair];
+        let (r0, rk) = (scan.r0, scan.r[k]);
+        if rk <= r0 {
+            return;
+        }
+        let note = format!(
+            "scan {}–{}: point {} of {} (r = {:.2} r₀) failed ({}); further-out points skipped",
+            scan.i,
+            scan.j,
+            k + 1,
+            scan.r.len(),
+            rk / r0,
+            end.word()
+        );
+        let r = scan.r.clone();
+        let mut n = 0;
+        for job in self.queue.iter_mut() {
+            if let Job::Scan(_, p, kk) | Job::Shell(_, p, kk) = *job {
+                if p == pair && r[kk] > rk {
+                    *job = Job::Skip("scans", Some((pair, kk)), Some(note.clone()));
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            self.notes.push(format!("sampling: {note} ({n} not solved)"));
         }
     }
 
@@ -911,10 +1388,19 @@ impl Sampler {
         if !self.progress.cancelled {
             self.progress.stage = "done";
         }
-        if self.progress.skipped > 0 {
+        if self.cell_skipped > 0 {
             self.notes.push(format!(
                 "sampling: {} generated geometries were closer than {CELL_MARGIN_H}h to a cell face and were not solved",
-                self.progress.skipped
+                self.cell_skipped
+            ));
+        }
+        if self.tail_skipped > 0 {
+            self.notes.push(format!("sampling: {} scan points beyond a failed one were not solved", self.tail_skipped));
+        }
+        if self.limit_skipped > 0 {
+            self.notes.push(format!(
+                "sampling: {} scan points beyond 5/6 of the model's cutoff were not solved (never fitted there; each pair's shell check measures what is left)",
+                self.limit_skipped
             ));
         }
         if self.boxed > 0 {
@@ -926,6 +1412,16 @@ impl Sampler {
             ));
         }
     }
+}
+
+/// A scene's nuclei as ghost atoms.
+fn ghost_atoms(scene: &Scene) -> Vec<GhostAtom> {
+    scene.nuclei.iter().map(|n| GhostAtom { z: n.z, pos: n.pos }).collect()
+}
+
+/// A converged solve's end for the log (`None` for a teacher without an SCF: 0 steps).
+fn converged(scf_steps: usize) -> Option<ScfEnd> {
+    (scf_steps > 0).then_some(ScfEnd::Converged)
 }
 
 /// The activity code of a pass sample's job (`TeachRule::Pass`).

@@ -25,8 +25,10 @@ pub enum Command {
     },
     /// Allowed while playing.
     RemoveNucleus(usize),
-    /// These four pause the run and replace the scene with the driver's current one (positions
-    /// and velocities kept) with the setting changed: time, pins and drag restart.
+    /// These five pause the run and replace the scene with the driver's current one (positions
+    /// and velocities kept) with the setting changed: time, pins, drag and the energy history
+    /// restart (M7: a policy switch moves E_KS by tens of Ha per pseudised atom — the
+    /// conserved-energy and drift readouts must not span it). The provider is reset, cold.
     SetCharge(i32),
     SetMultiplicity(Option<u32>),
     SetGrid {
@@ -34,6 +36,12 @@ pub enum Command {
         h: f64,
     },
     SetSigma(Option<f64>),
+    /// The ionic policy (M7, `sim::IonicPolicy`): all-electron, pseudopotentials for species with a
+    /// core, or for every species.
+    SetIonicPolicy(sim::IonicPolicy),
+    /// The density shown includes the pseudised species' partial core ρ_pc (M7; a display of the
+    /// generator's core model): display only — never an edit, never aborts; from the next evaluation.
+    DisplayPartialCore(bool),
     /// Time control, thermostat, field, COM correction, pins and drag springs, passed to the
     /// driver as is. Scene edits go through the variants above (the viewer mirrors those);
     /// `Dyn(ReplaceScene | MoveNucleusDiscontinuous | AddNucleus | RemoveNucleus)` is never sent.
@@ -112,6 +120,8 @@ impl Command {
                 s.grid_h = *h;
             }
             Command::SetSigma(x) => s.sigma = *x,
+            Command::SetIonicPolicy(p) => s.ionic = *p,
+            Command::DisplayPartialCore(_) => {}
             Command::Dyn(_)
             | Command::EnsureModel { .. }
             | Command::SetAudit(_)
@@ -132,13 +142,14 @@ impl Command {
         match self {
             Command::Dyn(c) => matches!(
                 c,
-                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax
+                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax
             ),
             Command::Shutdown
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
         }
@@ -154,8 +165,9 @@ impl Command {
                 | Command::SetMultiplicity(_)
                 | Command::SetGrid { .. }
                 | Command::SetSigma(_)
+                | Command::SetIonicPolicy(_)
                 | Command::EnsureModel { .. }
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax)
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax)
         )
     }
 
@@ -186,6 +198,7 @@ impl Command {
                     | DynCommand::AddNucleus(_)
                     | DynCommand::RemoveNucleus(_)
                     | DynCommand::StartSampling(_)
+                    | DynCommand::StartTeaching
                     | DynCommand::CancelSampling
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
@@ -197,6 +210,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
         }
@@ -280,9 +294,11 @@ impl Worker {
             Command::SetMultiplicity(m) => self.replace(|s| s.multiplicity = m),
             Command::SetGrid { n, h } => self.replace(|s| s.cell = sim::Cell { n, h }),
             Command::SetSigma(x) => self.replace(|s| s.sigma = x),
+            Command::SetIonicPolicy(p) => self.replace(|s| s.ionic = p),
+            Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's
-                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::LoadModel(_));
+                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
                 if takes_over {
                     self.pass_offer = None;

@@ -53,7 +53,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
     // File
-    e("Preset", "empty blank h h2 he lih h2o water hydrogen scene", Menu(M::File), "m-presets"),
+    e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", Menu(M::File), "m-presets"),
     e("Reset scene", "reload preset", Menu(M::File), "m-presets"),
     e("Scene file path", "file name", Menu(M::File), "m-scene-file"),
     e("Save scene", "write file", Menu(M::File), "m-scene-file"),
@@ -87,12 +87,17 @@ pub const ENTRIES: &[Entry] = &[
     e("Axes", "xyz display gizmo", Menu(M::View), "m-display"),
     e("Placement plane", "place grid blue", Menu(M::View), "m-display"),
     e("Grid spacing 1 Bohr / 1 Å", "angstrom display", Menu(M::View), "m-display"),
+    e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Menu(M::View), "m-density"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
+    e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Menu(M::View), "m-display"),
+    e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
     e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
+    e("Bond angles", "angle degrees geometry bonds HOH water", Menu(M::View), "m-bonds"),
     // Physics
+    e("Ionic potential", "pseudopotential all-electron cores valence nlcc ionic policy none cores only all species h_req egg-box", Menu(M::Physics), "m-ionic"),
     e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
@@ -117,7 +122,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Energy units Ha / eV", "hartree electronvolt", Dock(D::Readouts), "d-energies"),
     e("Sim time and step", "t fs", Dock(D::Readouts), "d-time"),
     e("Steps last tick, ms per step", "cost", Dock(D::Readouts), "d-time"),
-    e("Per step cost (SCF steps, readbacks)", "solve ms", Dock(D::Readouts), "d-time"),
+    e("Per step cost (SCF iterations, readbacks)", "solve ms", Dock(D::Readouts), "d-time"),
     e("Box warning", "face edge health", Dock(D::Readouts), "d-health"),
     e("dt warning", "health", Dock(D::Readouts), "d-health"),
     e("Dynamics notes", "thermostat Maxwell-Boltzmann", Dock(D::Readouts), "d-health"),
@@ -138,6 +143,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Sampling plan preset", "quick look gentle standard hot reactive use case", Dock(D::Model), "d-plan"),
     e("Start sampling / Sample more", "pass teach", Dock(D::Model), "d-sample"),
     e("Cancel sampling", "pass", Dock(D::Model), "d-sample"),
+    e("Teach around blockers", "untrusted class leave-one-out blocker targeted pass teach", Dock(D::Model), "d-model"),
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
@@ -242,10 +248,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
     match entry.place {
         Place::Toolbar => {}
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
-        Place::Dock(tab) => {
-            st.dock_open = true;
-            st.dock_tab = tab;
-        }
+        // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
+        Place::Dock(tab) => st.open_tab(tab),
     }
     st.search.reveal = Some((entry.anchor, Instant::now(), false));
     st.search.open = false;

@@ -1,0 +1,3 @@
+# the M7 generation records are compared verbatim by crates/validate/tests/pseudo_gen.rs (which also
+# normalises CRLF): keep references.md LF in every checkout (Task 4 review N8)
+crates/validate/references.md text eol=lf

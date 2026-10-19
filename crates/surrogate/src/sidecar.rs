@@ -3,10 +3,10 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1, 2 and 3)
+//! # Format (versions 1 to 5)
 //!
 //! ```text
-//! "ASMODEL1", "ASMODEL2" or "ASMODEL3"   8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL5"          8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -17,7 +17,7 @@
 //! The header is one JSON object with the keys `format` (the magic as a string), `created_by`
 //! (string), `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher;
 //! from version 3 also `masses`: [[Z, A], …], the recorded isotope set, sorted unique — a record,
-//! not a gate, `Provenance` doc}, `basis`
+//! not a gate, `Provenance` doc; from version 4 also `ionic`, the ionic-surface tag, a gate}, `basis`
 //! {n_max, l_max, r_cut, degree_cap, body3, species}, `species` (the basis's, repeated for
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
 //! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
@@ -87,6 +87,19 @@
 //! and nothing gates on it. Unreadable → ignored with a note ([`Sidecar::teacher_solves_note`]),
 //! never a refused file.
 //!
+//! **Optional, every version** (2026-10-18 trust review, round 1, SHOULD-2): the header key
+//! `failed_audits`, an array of the provider's failed audits not yet re-earned — each {index (the
+//! stored sample, or null when its answer was not kept), energy, ionic, rejudges, fenced (bool), z,
+//! pos, forces (flat number arrays), optionally origin ("teach-check", "held-out-guess",
+//! "shell-check"; absent = a strict-mode audit), and — required with origin "shell-check", absent
+//! otherwise — pair ([Z_a, Z_b], the species pair the shell check measured, Z_a ≤ Z_b: the pair its
+//! fence refuses in the cutoff shell, carried explicitly rather than re-derived from the case's
+//! geometry — final review I2)} — so a model saved while a failed audit untrusts it does not
+//! load trusted. Written only when non-empty; older readers ignore it. Unlike `teacher_solves` an
+//! unreadable record refuses the file: dropping it would loosen trust — and so does a shell-check
+//! case without its pair (a file written before version 5 by a build of the shell fence's first
+//! form; no compatibility shim: such models are to be re-sampled).
+//!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
 //! thereby pinned in the file itself, not only in this build. A version-1 file that declares
@@ -100,6 +113,18 @@
 //! `[]` when the writer recorded none). Versions 1 and 2 are still read, with an empty mass
 //! record.
 //!
+//! **Version 4** (M7 pseudopotentials): identical to version 3
+//! except that `provenance` carries the required `ionic` string (`Provenance::ionic`: `"none"` for the
+//! all-electron surface, else `"<policy>/<recipe hash>"`, at most 256 characters). Unlike `masses`,
+//! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
+//! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
+//!
+//! **Version 5** (the shell fence's species pair, final review I2; the only version this build
+//! writes): identical to version 4 except that a `failed_audits` record of origin "shell-check"
+//! carries the required `pair` key (above). The bump marks the files whose shell fences are
+//! complete; versions 1 to 4 are still read as before, and a version-4 file that holds a
+//! shell-check case is refused by the `pair` rule (it cannot have one).
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
@@ -109,7 +134,8 @@
 //! implied array lengths stay representable), integral fields must be integral and in range, and sample weights
 //! positive. Any failure is an `io::Error` of kind `InvalidData` naming the problem. Whether the
 //! model belongs to the current scene (its [`Provenance`]) is the loader's decision, not the
-//! reader's (`sim::Dynamics` refuses a mismatch).
+//! reader's (`sim::Dynamics` refuses a mismatch). [`read_provenance`] reads the header alone (no arrays, no samples) so a
+//! viewer can compare a picked file with the scene before loading it.
 
 use crate::descriptor::Basis;
 use crate::fit::{Accumulator, FitReport, Sample, SampleTag};
@@ -122,8 +148,12 @@ use std::sync::OnceLock;
 pub const MAGIC: &[u8; 8] = b"ASMODEL1";
 /// The first eight bytes of a version-2 file (a body-3 basis; module doc).
 pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
-/// The first eight bytes of a version-3 file (the mass record; what this build writes).
+/// The first eight bytes of a version-3 file (the mass record; still read).
 pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
+/// The first eight bytes of a version-4 file (the ionic tag; still read).
+pub const MAGIC_V4: &[u8; 8] = b"ASMODEL4";
+/// The first eight bytes of a version-5 file (the shell fence's species pair; what this build writes).
+pub const MAGIC_V5: &[u8; 8] = b"ASMODEL5";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -156,6 +186,30 @@ pub struct Sidecar {
     /// Why a present `teacher_solves` record was not read (plan review S17: an unreadable
     /// optional record is reported, never a refused file); `None` when it was read or absent.
     pub teacher_solves_note: Option<String>,
+    /// The failed audits the writer still held (header key "failed_audits"; empty when absent).
+    pub failed_audits: Vec<AuditCase>,
+}
+
+/// One failed audit carried by the file (header key "failed_audits"; module doc): the audited
+/// geometry and the teacher's labels there, the stored sample's index (if the answer was kept), the
+/// surface's ionic tag, how many refits re-judged it and found it still failed, and whether it was
+/// turned into a local fence. The provider (`providers::surrogate`) owns its meaning.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditCase {
+    pub pos: Vec<[f64; 3]>,
+    pub z: Vec<u8>,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub index: Option<usize>,
+    pub ionic: String,
+    pub rejudges: u32,
+    pub fenced: bool,
+    /// Where it came from ("audit", "teach-check", "held-out-guess", "shell-check"; optional key
+    /// "origin", written only when not "audit", so older files stay byte-identical; absent → "audit").
+    pub origin: String,
+    /// The species pair (Z_a ≤ Z_b) a shell check measured — the pair its fence refuses in the
+    /// cutoff shell (key "pair"; required with origin "shell-check", `None` and absent otherwise).
+    pub pair: Option<(u8, u8)>,
 }
 
 /// Lifetime teaching solves of the model (header key "teacher_solves"; optional, activity spec
@@ -211,13 +265,20 @@ pub fn write_with_flags(path: &Path, model: &Model, acc: &Accumulator, report: O
 /// `teacher_solves`, written only when `solves` is `Some`; module doc).
 #[allow(clippy::too_many_arguments)]
 pub fn write_full(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<()> {
+    write_full_with_audits(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, &[])
+}
+
+/// [`write_full`] with the provider's failed audits (header key "failed_audits", written only when
+/// `audits` is not empty; module doc).
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves)?;
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -228,6 +289,34 @@ pub fn write_full(path: &Path, model: &Model, acc: &Accumulator, report: Option<
     })
 }
 
+/// Reads only the provenance of a sidecar (magic, header length, the JSON header): no fit, no
+/// samples, no arrays are decoded — and only `16 + header_len` bytes of the file are read, so it is
+/// cheap on a multi-megabyte model. The header is validated as far as the provenance needs it (the
+/// magic, the header length against the file, the `format` string, the provenance fields and their
+/// ranges); the body is not looked at, so a file whose body is corrupt still yields its provenance
+/// here and is refused by [`read`]. Used by the viewer to compare a model with the scene before
+/// loading it (user request 2026-10-18).
+pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
+    use std::io::Read;
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).map_err(|_| invalid(format!("{file_len} bytes is too short for a sidecar")))?;
+    let header_len = u64::from_le_bytes(head[8..16].try_into().expect("8 bytes"));
+    // the same bounds `decode` applies (before anything is allocated)
+    let len = usize::try_from(header_len)
+        .ok()
+        .filter(|&l| l <= MAX_HEADER && (l as u64).saturating_add(16) <= file_len)
+        .ok_or_else(|| invalid(format!("header length {header_len} does not fit the {file_len}-byte file")))?;
+    let mut bytes = Vec::with_capacity(16 + len);
+    bytes.extend_from_slice(&head);
+    bytes.resize(16 + len, 0);
+    f.read_exact(&mut bytes[16..]).map_err(|e| invalid(format!("header unreadable: {e}")))?;
+    let (version, h) = parse_header(&bytes).map_err(invalid)?;
+    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
+}
+
 /// Reads and validates a sidecar (module doc).
 pub fn read(path: &Path) -> io::Result<Sidecar> {
     let bytes = std::fs::read(path)?;
@@ -236,13 +325,18 @@ pub fn read(path: &Path) -> io::Result<Sidecar> {
 
 // ---- encoding ----
 
-const TAGS: [SampleTag; 6] = [
+/// The tag codes (appended only: a file written before a tag existed reads unchanged; a reader
+/// older than a tag refuses a file carrying it with "tag code … is unknown").
+const TAGS: [SampleTag; 9] = [
     SampleTag::LiveStep,
     SampleTag::Perturbation,
     SampleTag::HotBurst,
     SampleTag::Scan,
     SampleTag::Fallback,
     SampleTag::Reference,
+    SampleTag::Audit,
+    SampleTag::DraftAudit,
+    SampleTag::Targeted,
 ];
 
 fn tag_code(t: SampleTag) -> f64 {
@@ -254,6 +348,8 @@ fn tag_code(t: SampleTag) -> f64 {
 const MAX_N_MAX: usize = 64;
 /// Header bytes accepted (a real header is a few kB).
 const MAX_HEADER: usize = 1 << 24;
+/// The longest `provenance.ionic` tag accepted (`"cores/"` + 16 hex digits is 22).
+const MAX_IONIC_TAG: usize = 256;
 /// JSON nesting accepted (the header nests three deep).
 const MAX_DEPTH: usize = 16;
 
@@ -262,10 +358,11 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = MAGIC_V3;
+    let magic: &[u8; 8] = MAGIC_V5;
     if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
@@ -368,6 +465,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("charge", pr.charge.to_string()),
         ("multiplicity", pr.multiplicity.map_or("null".into(), |m| m.to_string())),
         ("teacher", string(&pr.teacher)),
+        ("ionic", string(&pr.ionic)),
         ("masses", format!("[{}]", pr.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","))),
     ]);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
@@ -452,6 +550,41 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             ]),
         ));
     }
+    if !audits.is_empty() {
+        for a in audits {
+            if !(a.energy.is_finite() && a.pos.iter().chain(&a.forces).flatten().all(|x| x.is_finite())) || a.pos.len() != a.z.len() || a.forces.len() != a.z.len() {
+                return Err(invalid_input("sidecar: a failed audit with a non-finite or misshapen record".into()));
+            }
+            if (a.origin == "shell-check") != a.pair.is_some() || a.pair.is_some_and(|(p, q)| p > q) {
+                return Err(invalid_input("sidecar: a shell-check case carries its sorted species pair, and only a shell-check case does".into()));
+            }
+        }
+        let num = |x: f64| format!("{x:?}");
+        let flat = |v: &[[f64; 3]]| format!("[{}]", v.iter().flatten().map(|x| num(*x)).collect::<Vec<_>>().join(","));
+        let list: Vec<String> = audits
+            .iter()
+            .map(|a| {
+                let mut kv = vec![
+                    ("index", a.index.map_or("null".to_string(), |i| i.to_string())),
+                    ("energy", num(a.energy)),
+                    ("ionic", string(&a.ionic)),
+                    ("rejudges", a.rejudges.to_string()),
+                    ("fenced", a.fenced.to_string()),
+                    ("z", format!("[{}]", a.z.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","))),
+                    ("pos", flat(&a.pos)),
+                    ("forces", flat(&a.forces)),
+                ];
+                if a.origin != "audit" && !a.origin.is_empty() {
+                    kv.push(("origin", string(&a.origin)));
+                }
+                if let Some((p, q)) = a.pair {
+                    kv.push(("pair", format!("[{p},{q}]")));
+                }
+                obj(&kv)
+            })
+            .collect();
+        pairs.push(("failed_audits", format!("[{}]", list.join(","))));
+    }
     let header = obj(&pairs);
 
     let body: usize = arrays.iter().map(|(_, a)| 8 + 8 * a.len()).sum();
@@ -509,7 +642,10 @@ fn string(s: &str) -> String {
 
 // ---- decoding ----
 
-fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
+/// The magic's version, the header JSON (`bytes` holds at least the 16 fixed bytes and the whole
+/// header) and the `format` string checked against the magic: the front of [`decode`], shared with
+/// [`read_provenance`].
+fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
     if bytes.len() < 16 {
         return Err(format!("{} bytes is too short for a sidecar", bytes.len()));
     }
@@ -517,10 +653,12 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         m if m == MAGIC => 1,
         m if m == MAGIC_V2 => 2,
         m if m == MAGIC_V3 => 3,
+        m if m == MAGIC_V4 => 4,
+        m if m == MAGIC_V5 => 5,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1, 2 and 3)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 5)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1, ASMODEL2 or ASMODEL3)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL5)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -531,16 +669,22 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         .ok_or_else(|| format!("header length {header_len} does not fit the {}-byte file", bytes.len()))?;
     let header = std::str::from_utf8(&bytes[16..header_end]).map_err(|e| format!("header is not UTF-8: {e}"))?;
     let h = Parser::parse(header)?;
-
     let format = h.get("format")?.str()?;
     let magic_of_version: &[u8; 8] = match version {
         1 => MAGIC,
         2 => MAGIC_V2,
-        _ => MAGIC_V3,
+        3 => MAGIC_V3,
+        4 => MAGIC_V4,
+        _ => MAGIC_V5,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
     }
+    Ok((version, h))
+}
+
+fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
+    let (version, h) = parse_header(bytes)?;
     let created_by = h.get("created_by")?.str()?.to_string();
     let reference_rule = match h.get("reference_rule") {
         Err(_) | Ok(Json::Null) => None,
@@ -553,6 +697,12 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(format!("the model file's \"teacher_solves\" record is unreadable ({e}); its earlier solves count as unrecorded"))),
         },
+    };
+
+    // optional, strict (module doc): a failed audit dropped would loosen trust
+    let failed_audits = match h.get("failed_audits") {
+        Err(_) | Ok(Json::Null) => Vec::new(),
+        Ok(list) => list.arr()?.iter().map(decode_audit_case).collect::<Result<Vec<_>, String>>().map_err(|e| format!("failed_audits: {e}"))?,
     };
 
     // basis
@@ -595,26 +745,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let p = basis.n_features();
     let q = basis.n_independent_columns();
 
-    // provenance
-    let pr = h.get("provenance")?;
-    let multiplicity = match pr.get("multiplicity")? {
-        Json::Null => None,
-        m => Some(u32::try_from(m.u64()?).map_err(|_| "multiplicity out of range".to_string())?),
-    };
-    let provenance = Provenance {
-        grid_n: pr.get("grid_n")?.usize()?,
-        h: pr.get("h")?.f64()?,
-        sigma: pr.get("sigma")?.f64()?,
-        tol: pr.get("tol")?.f64()?,
-        charge: i32::try_from(pr.get("charge")?.i64()?).map_err(|_| "charge out of range".to_string())?,
-        multiplicity,
-        teacher: pr.get("teacher")?.str()?.to_string(),
-        masses: match pr.get("masses") {
-            Err(_) if version < 3 => Vec::new(),
-            Err(e) => return Err(e),
-            Ok(m) => mass_list(m)?,
-        },
-    };
+    let provenance = decode_provenance(h.get("provenance")?, version)?;
 
     let m = h.get("model")?;
     let has_cov = m.get("has_covariance")?.bool()?;
@@ -688,7 +819,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
-    let has_terms = version == 2 || (version == 3 && body3);
+    let has_terms = version == 2 || (version >= 3 && body3);
     if has_terms {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
@@ -705,6 +836,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if declared.len() != fixed.len() {
         return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
     }
+    // `parse_header` bounded the length by the file
+    let header_end = 16 + u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
     let mut at = header_end;
     let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(fixed.len());
     for ((name, len), (want_name, want_len)) in declared.iter().zip(&fixed) {
@@ -863,7 +996,93 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         }
     }
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note })
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits })
+}
+
+/// One "failed_audits" record (module doc); every field is required inside it.
+/// The header's `provenance` object (`version` decides the defaults of the fields older files lack).
+fn decode_provenance(pr: &Json, version: u8) -> Result<Provenance, String> {
+    let multiplicity = match pr.get("multiplicity")? {
+        Json::Null => None,
+        m => Some(u32::try_from(m.u64()?).map_err(|_| "multiplicity out of range".to_string())?),
+    };
+    Ok(Provenance {
+        grid_n: pr.get("grid_n")?.usize()?,
+        h: pr.get("h")?.f64()?,
+        sigma: pr.get("sigma")?.f64()?,
+        tol: pr.get("tol")?.f64()?,
+        charge: i32::try_from(pr.get("charge")?.i64()?).map_err(|_| "charge out of range".to_string())?,
+        multiplicity,
+        teacher: pr.get("teacher")?.str()?.to_string(),
+        masses: match pr.get("masses") {
+            Err(_) if version < 3 => Vec::new(),
+            Err(e) => return Err(e),
+            Ok(m) => mass_list(m)?,
+        },
+        ionic: match pr.get("ionic") {
+            Err(_) if version < 4 => "none".to_string(),
+            Err(e) => return Err(e),
+            Ok(t) => {
+                let t = t.str()?;
+                if t.is_empty() || t.chars().count() > MAX_IONIC_TAG || t.chars().any(char::is_control) {
+                    return Err(format!("provenance ionic tag of {} characters (1 to {MAX_IONIC_TAG}, no control characters)", t.chars().count()));
+                }
+                t.to_string()
+            }
+        },
+    })
+}
+
+fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
+    let z: Vec<u8> = a.get("z")?.arr()?.iter().map(|v| v.u64().and_then(|z| u8::try_from(z).map_err(|_| "Z out of range".to_string()))).collect::<Result<_, _>>()?;
+    let triples = |key: &str| -> Result<Vec<[f64; 3]>, String> {
+        let v: Vec<f64> = a.get(key)?.arr()?.iter().map(|x| x.f64()).collect::<Result<_, _>>()?;
+        if v.len() != 3 * z.len() || !v.iter().all(|x| x.is_finite()) {
+            return Err(format!("{key}: {} finite components expected", 3 * z.len()));
+        }
+        Ok(v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+    };
+    let energy = a.get("energy")?.f64()?;
+    if !energy.is_finite() || z.is_empty() {
+        return Err("a failed audit without a finite energy or atoms".into());
+    }
+    let origin = match a.get("origin") {
+        Ok(v) => v.str()?.to_string(),
+        Err(_) => "audit".to_string(),
+    };
+    // the shell fence's species pair (version 5): required with its origin, absent otherwise
+    let pair = match a.get("pair") {
+        Ok(v) => {
+            let p: Vec<u8> = v.arr()?.iter().map(|x| x.u64().and_then(|z| u8::try_from(z).map_err(|_| "pair Z out of range".to_string()))).collect::<Result<_, _>>()?;
+            match p[..] {
+                [p, q] if p >= 1 && p <= q => Some((p, q)),
+                _ => return Err("pair: two species [Z_a, Z_b] with 1 ≤ Z_a ≤ Z_b expected".into()),
+            }
+        }
+        Err(_) => None,
+    };
+    if (origin == "shell-check") != pair.is_some() {
+        return Err(if pair.is_none() {
+            "a shell-check case without its species pair (written before format version 5 — the model is to be re-sampled)".into()
+        } else {
+            format!("a {origin} case with a species pair (only a shell-check case carries one)")
+        });
+    }
+    Ok(AuditCase {
+        pos: triples("pos")?,
+        forces: triples("forces")?,
+        index: match a.get("index")? {
+            Json::Null => None,
+            v => Some(v.usize()?),
+        },
+        ionic: a.get("ionic")?.str()?.to_string(),
+        rejudges: u32::try_from(a.get("rejudges")?.u64()?).map_err(|_| "rejudges out of range".to_string())?,
+        fenced: a.get("fenced")?.bool()?,
+        origin,
+        pair,
+        energy,
+        z,
+    })
 }
 
 /// The optional "teacher_solves" record (activity spec A2); every field is required inside it.
@@ -1235,6 +1454,7 @@ mod tests {
                 multiplicity: Some(2),
                 teacher: "Kohn-Sham (GPU) \"quoted\" \\ π".into(),
                 masses: vec![(1, 1), (1, 2), (6, 12), (8, 16)],
+                ionic: "none".into(),
             },
             representatives: OnceLock::new(),
         };
@@ -1257,7 +1477,7 @@ mod tests {
             hyper_iterations: 7,
             converged: true,
         };
-        let tags = [SampleTag::LiveStep, SampleTag::Perturbation, SampleTag::HotBurst, SampleTag::Scan, SampleTag::Fallback, SampleTag::Reference];
+        let tags = [SampleTag::LiveStep, SampleTag::Perturbation, SampleTag::HotBurst, SampleTag::Scan, SampleTag::Fallback, SampleTag::Reference, SampleTag::Audit, SampleTag::DraftAudit, SampleTag::Targeted];
         let samples = (0..43)
             .map(|i| {
                 let n = 1 + i % 4;
@@ -1271,7 +1491,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new() }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.
@@ -1323,7 +1543,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
         assert_ne!(bad, header);
-        let mut v = MAGIC_V3.to_vec();
+        let mut v = MAGIC_V5.to_vec();
         v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
         v.extend_from_slice(bad.as_bytes());
         v.extend_from_slice(&bytes[16 + hl..]);
@@ -1368,7 +1588,7 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V3);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V5);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
@@ -1378,7 +1598,7 @@ mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V3);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V5);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -1510,7 +1730,7 @@ mod tests {
         let path = tmp("masses-v3.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V3);
+        assert_eq!(&bytes[..8], MAGIC_V5);
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
@@ -1535,7 +1755,7 @@ mod tests {
         let masses_key = ",\"masses\":[[1,1],[1,2]]";
         assert!(header.contains(masses_key), "{header}");
         let as_version = |magic: &[u8; 8]| {
-            let h = header.replacen("ASMODEL3", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1);
+            let h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
             let mut v = magic.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
@@ -1554,9 +1774,9 @@ mod tests {
         let p3 = tmp("masses-v3-body2.model");
         write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
         let bytes2 = std::fs::read(&p3).unwrap();
-        assert_eq!(&bytes2[..8], MAGIC_V3, "version 3 is written for a body-2 basis too");
+        assert_eq!(&bytes2[..8], MAGIC_V5, "version 5 is written for a body-2 basis too");
         let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
-        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL3", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1);
+        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL5", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
         let mut v1 = MAGIC.to_vec();
         v1.extend_from_slice(&(h1.len() as u64).to_le_bytes());
         v1.extend_from_slice(h1.as_bytes());
@@ -1575,7 +1795,7 @@ mod tests {
             ("A out of range", header.replacen(masses_key, ",\"masses\":[[1,70000]]", 1)),
             ("not a pair", header.replacen(masses_key, ",\"masses\":[[1,1,1]]", 1)),
         ] {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + header_len..]);
@@ -1590,6 +1810,188 @@ mod tests {
         }
     }
 
+    /// M7 Task 9 (spec §5.5): the version-4 header carries `provenance.ionic`, round-trips it, and the tag is
+    /// **compared** (unlike the masses): a model taught on one ionic surface is not the model of another.
+    #[test]
+    fn version_4_round_trips_the_ionic_tag() {
+        let mut orig = random_sidecar(31, true);
+        orig.model.provenance.ionic = "cores/0123456789abcdef".into();
+        let path = tmp("ionic-v4.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], b"ASMODEL5");
+        let back = read(&path).unwrap();
+        assert_eq!(back.model.provenance.ionic, "cores/0123456789abcdef");
+        assert_eq!(back.model, orig.model);
+        assert!(back.model.provenance.describe().ends_with(", ionic cores/0123456789abcdef"), "{}", back.model.provenance.describe());
+        let mut other = orig.model.provenance.clone();
+        other.ionic = "all/0123456789abcdef".into();
+        assert_ne!(other, orig.model.provenance, "the ionic tag is a gate");
+        // version 4 requires the key and validates it
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let key = ",\"ionic\":\"cores/0123456789abcdef\"";
+        assert!(header.contains(key), "{header}");
+        for (what, bad) in [
+            ("missing ionic", header.replacen(key, "", 1)),
+            ("empty ionic", header.replacen(key, ",\"ionic\":\"\"", 1)),
+            ("control character", header.replacen(key, ",\"ionic\":\"a\\u0001b\"", 1)),
+            ("not a string", header.replacen(key, ",\"ionic\":7", 1)),
+            ("too long", header.replacen(key, &format!(",\"ionic\":\"{}\"", "x".repeat(MAX_IONIC_TAG + 1)), 1)),
+        ] {
+            let mut v = MAGIC_V5.to_vec();
+            v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            v.extend_from_slice(bad.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp("ionic-bad.model");
+            std::fs::write(&p, v).unwrap();
+            let e = read(&p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// User request 2026-10-18: `read_provenance` returns exactly the provenance `read` does (masses and ionic
+    /// tag included, every version), from the header alone — a file whose body is cut off still yields it, and
+    /// `read` refuses the same file — and it refuses what is not a sidecar with an `InvalidData` error.
+    #[test]
+    fn the_header_only_reader_returns_the_provenance_of_every_version() {
+        let mut orig = random_sidecar(41, true);
+        orig.model.provenance.ionic = "cores/0123456789abcdef".into();
+        let path = tmp("prov-only.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let p = read_provenance(&path).unwrap();
+        assert_eq!(p, orig.model.provenance);
+        assert_eq!(p.masses, orig.model.provenance.masses, "the mass record (not compared by ==)");
+        assert_eq!(p.teacher, orig.model.provenance.teacher);
+        assert_eq!((p.grid_n, p.charge, p.multiplicity), (41, -1, Some(2)));
+        // the body is never looked at: cut it off and the provenance still reads, the full reader refuses
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let cut = tmp("prov-only-cut.model");
+        std::fs::write(&cut, &bytes[..16 + hl]).unwrap();
+        assert_eq!(read_provenance(&cut).unwrap(), orig.model.provenance);
+        assert_eq!(read(&cut).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        // an older version: header surgery as in `old_versions_read_as_all_electron` gives no mass record and "none"
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let v2 = header.replacen("ASMODEL5", "ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
+        let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
+        let v2 = v2.replacen(&masses, "", 1);
+        let mut v = MAGIC_V2.to_vec();
+        v.extend_from_slice(&(v2.len() as u64).to_le_bytes());
+        v.extend_from_slice(v2.as_bytes());
+        let old = tmp("prov-only-v2.model");
+        std::fs::write(&old, v).unwrap();
+        let p2 = read_provenance(&old).unwrap();
+        assert_eq!((p2.ionic.as_str(), p2.masses.len()), ("none", 0));
+        // not a sidecar, too short, a header length past the end, a missing file
+        for (what, data) in [
+            ("bad magic", [b"ASMODELX".as_slice(), &bytes[8..]].concat()),
+            ("empty", Vec::new()),
+            ("short", bytes[..12].to_vec()),
+            ("header length past the end", [&bytes[..8], &u64::MAX.to_le_bytes()[..], &bytes[16..]].concat()),
+            ("header cut", bytes[..16 + hl / 2].to_vec()),
+        ] {
+            let bad = tmp("prov-only-bad.model");
+            std::fs::write(&bad, data).unwrap();
+            let e = read_provenance(&bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            let _ = std::fs::remove_file(&bad);
+        }
+        assert_eq!(read_provenance(&tmp("prov-only-missing.model")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        for f in [path, cut, old] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// Version 5 (final review I2): a "shell-check" audit case round-trips its species pair; a
+    /// shell-check case without the pair (what a build before version 5 wrote) is refused, and so
+    /// is any other case carrying one — the reader never guesses a fence's pair.
+    #[test]
+    fn version_5_carries_the_shell_fence_pair_and_refuses_a_fence_without_it() {
+        let orig = random_sidecar(41, false);
+        let case = |origin: &str, pair: Option<(u8, u8)>| AuditCase {
+            pos: vec![[0.0; 3], [5.2, 0.0, 0.0]],
+            z: vec![1, 1],
+            energy: -1.0,
+            forces: vec![[1e-3, 0.0, 0.0], [-1e-3, 0.0, 0.0]],
+            index: None,
+            ionic: "none".into(),
+            rejudges: 3,
+            fenced: true,
+            origin: origin.into(),
+            pair,
+        };
+        let audits = [case("shell-check", Some((1, 1))), case("audit", None)];
+        let path = tmp("shell-pair-v5.model");
+        write_full_with_audits(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &audits).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V5);
+        let back = read(&path).unwrap();
+        assert_eq!(back.failed_audits, audits.to_vec());
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        assert!(header.contains(",\"origin\":\"shell-check\",\"pair\":[1,1]}"), "{header}");
+        for (what, bad, says) in [
+            ("a shell-check case without its pair", header.replacen(",\"pair\":[1,1]", "", 1), "without its species pair"),
+            ("an audit case with a pair", header.replacen("\"origin\":\"shell-check\",\"pair\":[1,1]}", "\"origin\":\"shell-check\",\"pair\":[1,1]},{\"index\":null,\"energy\":-1.0,\"ionic\":\"none\",\"rejudges\":3,\"fenced\":true,\"z\":[1,1],\"pos\":[0.0,0.0,0.0,5.2,0.0,0.0],\"forces\":[0.001,0.0,0.0,-0.001,0.0,0.0],\"pair\":[1,1]}", 1), "only a shell-check case carries one"),
+            ("an unsorted pair", header.replacen(",\"pair\":[1,1]", ",\"pair\":[2,1]", 1), "Z_a ≤ Z_b"),
+        ] {
+            assert_ne!(bad, header, "{what}");
+            let mut v = MAGIC_V5.to_vec();
+            v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            v.extend_from_slice(bad.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp("shell-pair-bad.model");
+            std::fs::write(&p, v).unwrap();
+            let e = read(&p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            assert!(e.to_string().contains(says), "{what}: {e}");
+            println!("{what}: {e}");
+            let _ = std::fs::remove_file(&p);
+        }
+        // the writer refuses the same mismatch before a file exists
+        let e = write_full_with_audits(&path, &orig.model, &orig.accumulator, None, &[], None, &[], &[], None, &[case("shell-check", None)]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// M7 Task 9: a version-1, -2, -3 or -4 file (made by header surgery from this build's own v5 output) reads
+    /// `ionic == "none"` — every model before M7 was all-electron, and version 4 carries the tag — and equals
+    /// the same model with that tag.
+    #[test]
+    fn old_versions_read_as_all_electron() {
+        let orig = random_sidecar(37, true);
+        assert_eq!(orig.model.provenance.ionic, "none");
+        let path = tmp("ionic-old-src.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
+        for (name, magic, strip_masses) in [("v4", MAGIC_V4, false), ("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
+            let mut h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1);
+            if magic != MAGIC_V4 {
+                h = h.replacen(",\"ionic\":\"none\"", "", 1);
+            }
+            if strip_masses {
+                h = h.replacen(&masses, "", 1);
+            }
+            let mut v = magic.to_vec();
+            v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            v.extend_from_slice(h.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp(&format!("ionic-old-{name}.model"));
+            std::fs::write(&p, v).unwrap();
+            let back = read(&p).unwrap();
+            assert_eq!(back.model.provenance.ionic, "none", "{name}");
+            assert_eq!(back.model.provenance, orig.model.provenance, "{name}");
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn a_corrupt_sidecar_is_an_io_error_never_a_panic() {
         let orig = random_sidecar(5, false);
@@ -1600,7 +2002,7 @@ mod tests {
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
         let with_header = |h: &str| {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(body);
@@ -1649,9 +2051,9 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL4".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL6".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 4 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 6 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)
@@ -1663,14 +2065,14 @@ mod tests {
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();
         let with_header2 = |h: &str| {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(&body2);
             v
         };
-        assert!(header2.contains("\"format\":\"ASMODEL3\"") && header2.contains("\"body3\":true"));
-        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL3", "ASMODEL1", 1))));
+        assert!(header2.contains("\"format\":\"ASMODEL5\"") && header2.contains("\"body3\":true"));
+        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL5", "ASMODEL1", 1))));
         cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
         cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
         let mut swapped = good2.clone();

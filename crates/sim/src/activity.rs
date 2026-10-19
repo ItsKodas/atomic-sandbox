@@ -7,7 +7,7 @@
 //! here decides anything: the providers fill these from decisions they already made.
 use crate::AuditVerdict;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Which solver a probe slot follows: the stepping teacher, or the background auditor.
@@ -23,6 +23,100 @@ struct SolveSlot {
     scf_step: AtomicU32,
     started_us: AtomicU64,
     solves: AtomicU64,
+    /// The running (or last) solve's per-iteration record (`ActivityProbe::scf_iteration`): written
+    /// once per SCF iteration, read by the render thread at most every 100 ms — a lock per
+    /// iteration against an iteration of milliseconds.
+    live: Mutex<Option<LiveSlot>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveSlot {
+    live: ScfLive,
+    /// When the current attempt started (µs since the probe's origin).
+    attempt_us: u64,
+    /// When the last iteration was reported.
+    last_us: u64,
+}
+
+/// Points of the Δρ sparkline ([`ScfLive::spark`]).
+pub const SPARK_POINTS: usize = 64;
+
+/// One SCF iteration as the solver reports it to the probe (`qm::ScfProgress` without the
+/// dependency): Δρ and its target, the Harris–Foulkes energy of the iteration's input density
+/// (Ha; NaN when the solver does not compute it), and the stall stop's countdown — iterations
+/// since the best Δρ last improved 2×, of `window` (0 = no stall stop) — with the best Δρ and the
+/// stall level the stop also needs it at or above (`qm::SCF_STALL_LEVEL_PER_ELECTRON`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScfIteration {
+    pub iteration: usize,
+    pub max_iter: usize,
+    pub delta_rho: f64,
+    pub tol: f64,
+    pub energy: f64,
+    pub since_gain: usize,
+    pub window: usize,
+    pub best_delta_rho: f64,
+    pub stall_level: f64,
+}
+
+/// The running solve's iterations for the Activity view (activity spec §3.3.1; the stall stop's
+/// countdown, `qm::scf` "The stall stop"). `attempt` is 2 on the providers' cold retry of a warm
+/// solve that failed (R15): its iterations count from 1 again. `ms_per_iteration` is this
+/// attempt's mean wall time per iteration; `d_energy` the change of the Harris–Foulkes energy
+/// since the previous iteration (NaN at the first). `spark` holds log10 Δρ of every
+/// `spark_stride`-th iteration (iterations `spark_stride`, 2·`spark_stride`, …): when it fills it
+/// is decimated 2:1 and the stride doubles, so it always spans the whole attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScfLive {
+    pub attempt: u32,
+    pub iteration: u32,
+    pub max_iter: u32,
+    pub delta_rho: f64,
+    pub tol: f64,
+    pub energy: f64,
+    pub d_energy: f64,
+    pub ms_per_iteration: f64,
+    pub since_gain: u32,
+    pub window: u32,
+    /// The best Δρ of this attempt and the stall level: the stop counts down only while best ≥ level.
+    pub best_delta_rho: f64,
+    pub stall_level: f64,
+    pub spark: [f32; SPARK_POINTS],
+    pub spark_len: u8,
+    pub spark_stride: u32,
+}
+
+impl ScfLive {
+    /// The sparkline's points in order.
+    pub fn spark(&self) -> &[f32] {
+        &self.spark[..self.spark_len as usize]
+    }
+
+    /// Iterations left before the stall stop ends the solve: `None` without one, and while the best Δρ is
+    /// below the stall level (the stop does not apply there: the solve converges or runs to the cap).
+    pub fn stall_left(&self) -> Option<u32> {
+        (self.window > 0 && self.best_delta_rho >= self.stall_level).then(|| self.window.saturating_sub(self.since_gain))
+    }
+
+    fn push_spark(&mut self, iteration: u32, delta_rho: f64) {
+        if iteration % self.spark_stride != 0 {
+            return;
+        }
+        let v = if delta_rho > 0.0 && delta_rho.is_finite() { delta_rho.log10() as f32 } else { f32::NAN };
+        if self.spark_len as usize == SPARK_POINTS {
+            // keep the points at even multiples of the stride (indices 1, 3, 5, …)
+            for j in 0..SPARK_POINTS / 2 {
+                self.spark[j] = self.spark[2 * j + 1];
+            }
+            self.spark_len = (SPARK_POINTS / 2) as u8;
+            self.spark_stride *= 2;
+            if iteration % self.spark_stride != 0 {
+                return;
+            }
+        }
+        self.spark[self.spark_len as usize] = v;
+        self.spark_len += 1;
+    }
 }
 
 /// Live solve state (spec §4.3 A1). Written with relaxed atomics by the solver threads, read by
@@ -57,11 +151,15 @@ impl Drop for Busy {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SlotView {
     pub running: bool,
-    /// SCF step being solved (running) or the last solve's count (idle); 0 for the CPU solver.
+    /// SCF step being solved (running) or the last solve's count (idle), counted at the solver's
+    /// per-step abort poll over every attempt; 0 for the CPU solver (it has no abort poll).
     pub scf_step: u32,
     /// Seconds since the running solve started (0 when idle).
     pub elapsed_s: f64,
     pub solves: u64,
+    /// The running (or last) solve's latest iteration, from a solver that reports them
+    /// ([`ActivityProbe::scf_iteration`]); `None` before its first iteration.
+    pub live: Option<ScfLive>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -102,8 +200,59 @@ impl ActivityProbe {
         let s = self.slot(slot);
         s.scf_step.store(0, Relaxed);
         s.started_us.store(self.now_us(), Relaxed);
+        *s.live.lock().unwrap_or_else(|e| e.into_inner()) = None;
         s.running.store(true, Relaxed);
         Busy { probe: self.clone(), slot }
+    }
+
+    /// One SCF iteration finished on `slot` (the solver's progress observer). An iteration number
+    /// not above the previous one starts a new attempt (the providers' cold retry).
+    pub fn scf_iteration(&self, slot: Slot, it: &ScfIteration) {
+        let now = self.now_us();
+        let s = self.slot(slot);
+        let mut g = s.live.lock().unwrap_or_else(|e| e.into_inner());
+        let iteration = it.iteration.min(u32::MAX as usize) as u32;
+        let fresh = |attempt: u32, attempt_us: u64| LiveSlot {
+            live: ScfLive {
+                attempt,
+                iteration: 0,
+                max_iter: 0,
+                delta_rho: f64::NAN,
+                tol: f64::NAN,
+                energy: f64::NAN,
+                d_energy: f64::NAN,
+                ms_per_iteration: f64::NAN,
+                since_gain: 0,
+                window: 0,
+                best_delta_rho: f64::NAN,
+                stall_level: f64::NAN,
+                spark: [f32::NAN; SPARK_POINTS],
+                spark_len: 0,
+                spark_stride: 1,
+            },
+            attempt_us,
+            last_us: attempt_us,
+        };
+        let mut l = match *g {
+            Some(l) if iteration > l.live.iteration => l,
+            Some(l) => fresh(l.live.attempt + 1, l.last_us),
+            None => fresh(1, s.started_us.load(Relaxed)),
+        };
+        let prev_energy = l.live.energy;
+        l.live.iteration = iteration;
+        l.live.max_iter = it.max_iter.min(u32::MAX as usize) as u32;
+        l.live.delta_rho = it.delta_rho;
+        l.live.tol = it.tol;
+        l.live.energy = it.energy;
+        l.live.d_energy = it.energy - prev_energy;
+        l.live.ms_per_iteration = now.saturating_sub(l.attempt_us) as f64 * 1e-3 / iteration.max(1) as f64;
+        l.live.since_gain = it.since_gain.min(u32::MAX as usize) as u32;
+        l.live.window = it.window.min(u32::MAX as usize) as u32;
+        l.live.best_delta_rho = it.best_delta_rho;
+        l.live.stall_level = it.stall_level;
+        l.live.push_spark(iteration, it.delta_rho);
+        l.last_us = now;
+        *g = Some(l);
     }
 
     /// One SCF step starts (called from the solver's per-step abort poll).
@@ -131,6 +280,7 @@ impl ActivityProbe {
                 scf_step: s.scf_step.load(Relaxed),
                 elapsed_s: if running { now.saturating_sub(s.started_us.load(Relaxed)) as f64 * 1e-6 } else { 0.0 },
                 solves: s.solves.load(Relaxed),
+                live: s.live.lock().unwrap_or_else(|e| e.into_inner()).map(|l| l.live),
             }
         };
         let r = self.refit_started_us.load(Relaxed);
@@ -160,6 +310,9 @@ pub enum PassJob {
     Perturbation,
     Scan,
     HotBurst,
+    /// A teach-around pass's solve around a blocking sample (`providers::surrogate`, "Teaching
+    /// around the blockers"); `holdout`: a validation solve, never fitted.
+    Teach { blocker: usize, holdout: bool },
 }
 
 /// The class-wise trust rule's classes (`providers::surrogate::ENV_CLASSES` order).
@@ -226,6 +379,15 @@ pub enum TeachOutcome {
     KeptReleased { released: u32, superseded: u32 },
     Thinned,
     BoxNotKept,
+    /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
+    /// approximation fails, spec §5.6) or its shared-shell occupation pattern changed since the previous step
+    /// (E(R) jumps there, Task 6 review A.6). M7.
+    UnfitNotKept,
+    /// A teacher answer at a geometry inside a fenced cutoff shell (the surrogate's shell fence,
+    /// 2026-10-19 final review I1): used for its step — a relax verification included — and never
+    /// fitted or judged (the model's cutoff cannot represent it; an audit landing there is not a
+    /// judgement of the model, which strict mode refuses there).
+    ShellNotKept,
     FenceDisagrees,
     WaitingForPass,
     NotOffered,
@@ -241,6 +403,27 @@ pub enum TeachOutcome {
 impl TeachOutcome {
     pub fn is_kept(self) -> bool {
         matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. })
+    }
+}
+
+/// How a teacher's SCF ended (the solve log's iteration cell): converged, the stall stop
+/// (`qm::scf` "The stall stop"), the iteration cap, or a non-finite Δρ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScfEnd {
+    Converged,
+    Stalled,
+    Cap,
+    NonFinite,
+}
+
+impl ScfEnd {
+    pub fn word(self) -> &'static str {
+        match self {
+            ScfEnd::Converged => "converged",
+            ScfEnd::Stalled => "stalled",
+            ScfEnd::Cap => "cap",
+            ScfEnd::NonFinite => "not finite",
+        }
     }
 }
 
@@ -270,8 +453,11 @@ pub struct TeachEvent {
     pub solve_ms: f64,
     /// The teacher's SCF steps for this solve; `None` when the solver did not report them (a
     /// failed solve, a reference multiplicity scan, a row with no solve) — never a stand-in 0
-    /// (Task 2 review I1: an analytic teacher really reports 0).
+    /// (Task 2 review I1: an analytic teacher really reports 0). A failed solve whose error names its
+    /// iterations (`SolverError::scf_end`) carries them, with `scf_end`.
     pub scf_steps: Option<usize>,
+    /// How the SCF ended, where known (`None`: no SCF, or a provider that does not say).
+    pub scf_end: Option<ScfEnd>,
     pub audit: Option<AuditVerdict>,
     /// A background audit: answered steps between its dispatch and its verdict.
     pub audit_lag: Option<usize>,
@@ -297,6 +483,7 @@ impl TeachEvent {
             n_atoms: 0,
             solve_ms: 0.0,
             scf_steps: None,
+            scf_end: None,
             audit: None,
             audit_lag: None,
             burst_t: None,
@@ -427,6 +614,8 @@ pub enum SampleState {
     Quarantined,
     Superseded,
     BoxExcluded,
+    /// A draft-mode audit's answer held out of the strict fit.
+    HeldOut,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).
@@ -539,6 +728,44 @@ mod tests {
         assert!(!v.main.running);
         assert_eq!(v.main.solves, 1);
         assert_eq!(v.main.scf_step, 2, "the last solve's count stays readable");
+    }
+
+    /// The per-iteration record: ΔE between iterations, the countdown, a new attempt when the
+    /// iteration number restarts, the sparkline decimated to span the whole attempt, and a new
+    /// solve clears it.
+    #[test]
+    fn the_probe_keeps_the_running_solves_iterations() {
+        let p = ActivityProbe::new();
+        let it = |i: usize, d: f64, e: f64, k: usize| ScfIteration { iteration: i, max_iter: 200, delta_rho: d, tol: 1e-6, energy: e, since_gain: k, window: 50, best_delta_rho: d, stall_level: 2e-3 };
+        let b = p.busy(Slot::Main);
+        assert_eq!(p.view().main.live, None);
+        p.scf_iteration(Slot::Main, &it(1, 1e-1, -17.0, 0));
+        p.scf_iteration(Slot::Main, &it(2, 1e-2, -17.25, 0));
+        let l = p.view().main.live.unwrap();
+        assert_eq!((l.attempt, l.iteration, l.max_iter, l.since_gain, l.window), (1, 2, 200, 0, 50));
+        assert!((l.d_energy + 0.25).abs() < 1e-12 && l.ms_per_iteration >= 0.0);
+        assert_eq!(l.spark(), &[-1.0, -2.0]);
+        assert_eq!(l.stall_left(), Some(50));
+        // 200 iterations: the sparkline keeps every 4th (stride 2 at iteration 65, 4 at 130)
+        for i in 3..=200 {
+            p.scf_iteration(Slot::Main, &it(i, 10f64.powf(-(i as f64) / 100.0), -17.0, 31));
+        }
+        let l = p.view().main.live.unwrap();
+        assert_eq!((l.spark_stride, l.spark_len), (4, 50));
+        assert!((l.spark()[0] - (-0.04)).abs() < 1e-6 && (l.spark()[49] - (-2.0)).abs() < 1e-6, "{:?}", l.spark());
+        assert_eq!(l.stall_left(), Some(19), "best Δρ 1e-2 is above the level 2e-3: the countdown runs");
+        // below the level the stop does not apply: no countdown (ruling (a))
+        p.scf_iteration(Slot::Main, &it(201, 1e-4, -17.0, 40));
+        assert_eq!(p.view().main.live.unwrap().stall_left(), None);
+        // the cold retry: iterations from 1 again
+        p.scf_iteration(Slot::Main, &it(1, 0.3, -16.9, 0));
+        let l = p.view().main.live.unwrap();
+        assert_eq!((l.attempt, l.iteration, l.spark_len), (2, 1, 1));
+        assert!(l.d_energy.is_nan(), "no previous iteration in this attempt");
+        drop(b);
+        assert!(p.view().main.live.is_some(), "the last solve's record stays readable");
+        let _c = p.busy(Slot::Main);
+        assert_eq!(p.view().main.live, None, "a new solve starts empty");
     }
 
     #[test]

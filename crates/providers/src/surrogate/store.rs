@@ -95,7 +95,18 @@ impl SurrogateKs {
         self.audit_force = None;
         self.training_residuals = None;
         self.class_loo = Vec::new();
+        self.class_worst = Vec::new();
+        self.class_blockers = Vec::new();
+        self.teach_rounds.clear();
+        self.teach_classes.clear();
+        self.teach_start = None;
+        self.teach_session = super::teach::TeachSession::default();
+        self.strict_verdict = None;
+        self.pass_start = None;
+        self.pass_coverage = None;
         self.audit_failed = None;
+        self.failed_audits.clear();
+        self.audit_fences.clear();
         self.pending_refit = false;
         self.pending_jump = None;
         self.consults = 0;
@@ -127,7 +138,8 @@ impl SurrogateKs {
         };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect();
+        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it)
+        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT).unwrap_or(Q_NONE)).collect();
         // the face densities only when one matters (a file is otherwise unchanged)
         let face: Vec<f64> = if (0..samples.len()).any(|i| self.is_box(i)) {
             (0..samples.len()).map(|i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect()
@@ -136,7 +148,21 @@ impl SurrogateKs {
         };
         let c = self.ledger.counts;
         let solves = TeacherSolves { pass: c.pass, fallback: c.fallback, audit: c.audit, verification: c.verification, kept: c.kept, complete: !c.unrecorded_before };
-        surrogate::sidecar::write_full(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves))
+        // the failed audits not yet re-earned, and the audit fences (round 1, SHOULD-2)
+        let case = |c: &FailedAudit, fenced: bool| surrogate::sidecar::AuditCase {
+            pos: c.pos.clone(),
+            z: c.z.clone(),
+            energy: c.energy,
+            forces: c.forces.clone(),
+            index: c.index,
+            ionic: c.ionic.clone(),
+            rejudges: c.rejudges,
+            fenced,
+            origin: c.origin.word().to_string(),
+            pair: c.pair,
+        };
+        let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
+        surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
     }
 
     /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
@@ -154,7 +180,7 @@ impl SurrogateKs {
     /// count starting at zero, with a note for the unreadable one), set only once the install
     /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -176,6 +202,16 @@ impl SurrogateKs {
         }
         if model.ref_energy.len() != model.basis.n_species() {
             return Err("the file's reference energies do not match its species".into());
+        }
+        // a draft guess's audit is held out of the fit (`Q_DRAFT`): restored from its tag
+        let mut quarantine = quarantine;
+        if let Some(last) = samples.iter().rposition(|s| s.tag == SampleTag::DraftAudit) {
+            quarantine.resize(quarantine.len().max(last + 1), Q_NONE);
+            for (i, s) in samples.iter().enumerate() {
+                if s.tag == SampleTag::DraftAudit && quarantine[i] == Q_NONE {
+                    quarantine[i] = Q_DRAFT;
+                }
+            }
         }
         let mut store = SampleStore::new(model.provenance.clone());
         for (i, smp) in samples.into_iter().enumerate() {
@@ -209,6 +245,8 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        self.pass_start = None;
+        self.pass_coverage = None;
         self.fence_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
@@ -226,8 +264,69 @@ impl SurrogateKs {
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
-        self.class_loo = self.compute_class_loo();
+        self.refresh_class_loo();
         self.rebuild_active_set();
+        // round 1, SHOULD-4: the reconstructed fit membership must be the fit's own — a release
+        // between a fit and a save (Q_HELD → Q_NONE) shifts the prefix and would give a non-member
+        // a leave-one-out "as if fitted". Checked against the report's row and sample counts; on a
+        // mismatch the fit is rebuilt from the stored samples (no DFT)
+        // Counts alone cannot see a shift between samples of the same size, so the accumulator's
+        // label sums are recomputed from the members too — yy_E = Σ w y_E² with y_E = E − Σ E_ref
+        // (÷ N for a per-atom fit) and yy_F = Σ w Σ_j |F_j|², no descriptor needed, Neumaier-
+        // compensated — and compared at 1e-9 relative
+        let neumaier = |acc: &mut (f64, f64), v: f64| {
+            let t = acc.0 + v;
+            acc.1 += if acc.0.abs() >= v.abs() { (acc.0 - t) + v } else { (v - t) + acc.0 };
+            acc.0 = t;
+        };
+        let (members, rows, yy_e, yy_f) = {
+            let st = self.store.as_ref().expect("installed");
+            let model = self.model.as_ref().expect("installed");
+            let (mut m, mut r, mut ye, mut yf) = (0usize, 0usize, (0.0f64, 0.0f64), (0.0f64, 0.0f64));
+            for i in (0..self.accumulated).filter(|&i| !self.excluded(i)) {
+                let smp = &st.samples[i];
+                m += 1;
+                r += 1 + 3 * smp.pos.len();
+                let refs: f64 = smp.z.iter().map(|&z| model.basis.species_index(z).map_or(f64::NAN, |k| model.ref_energy[k])).sum();
+                let y = if model.energy_per_atom { (smp.energy - refs) / smp.pos.len().max(1) as f64 } else { smp.energy - refs };
+                neumaier(&mut ye, smp.weight * y * y);
+                for x in smp.forces.iter().flatten() {
+                    neumaier(&mut yf, smp.weight * x * x);
+                }
+            }
+            (m, r, ye.0 + ye.1, yf.0 + yf.1)
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(f64::MIN_POSITIVE);
+        let (acc_ye, acc_yf) = self.accumulator.as_ref().map_or((yy_e, yy_f), |a| {
+            let s = a.sums();
+            (s.yy_e, s.yy_f)
+        });
+        let (want_n, want_rows) = self.report.as_ref().map_or((members, rows), |r| (r.n_samples, r.n_rows));
+        if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
+            self.species_dirty = true;
+            self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
+            self.user_notes.push(format!(
+                "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums — the fit was rebuilt from its stored samples (no DFT)"
+            ));
+        }
+        // round 1, SHOULD-2: the failed audits it still held, re-judged on this fit (not counted
+        // as a refit's re-judgement)
+        let n_store = self.samples();
+        for c in failed_audits {
+            let origin = AuditOrigin::from_word(&c.origin);
+            // the reader enforces this (sidecar format 5); a shell fence without its pair would
+            // refuse nothing, so it is never installed silently
+            if (origin == AuditOrigin::ShellCheck) != c.pair.is_some() {
+                return Err("the file's failed audits: a shell-check fence must carry its species pair, and only one may".into());
+            }
+            let fa = FailedAudit { pos: c.pos, z: c.z, energy: c.energy, forces: c.forces, index: c.index.filter(|&i| i < n_store), ionic: c.ionic, rejudges: c.rejudges, origin, pair: c.pair };
+            if c.fenced {
+                self.audit_fences.push(fa);
+            } else {
+                self.failed_audits.push(fa);
+            }
+        }
+        self.rejudge_failed_audits(false);
         self.consults = 0;
         self.last_variance = None;
         self.answered = 0;
@@ -251,15 +350,21 @@ impl SurrogateKs {
         let mut masses: Vec<(u8, u16)> = scene.nuclei.iter().map(|n| (n.z, n.a)).collect();
         masses.sort_unstable();
         masses.dedup();
+        // the compared tolerance is the nominal one; a pseudo surface's GPU stop rule max(tol, 2·floor(N)) (spec §7
+        // risk 6) is part of the ionic tag (the rule, not its N-dependent value — an Add or Remove must not split a
+        // model's surface), and each answer's effective tolerance is recorded in `EvalStats::scf_tol_used`
+        let ionic = crate::pseudo::provenance_tag(scene);
+        let tol = self.teacher_tol;
         Provenance {
             grid_n: scene.cell.n,
             h: scene.cell.h,
             sigma: scene.sigma.unwrap_or(scene.cell.h),
-            tol: self.teacher_tol,
+            tol,
             charge: scene.charge,
             multiplicity: scene.multiplicity,
             teacher: self.teacher.name().to_string(),
             masses,
+            ionic,
         }
     }
 
@@ -295,11 +400,18 @@ impl SurrogateKs {
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
     /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, notes: &mut Vec<String>) -> bool {
+    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
         self.since_kept = 0;
-        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag: SampleTag::Fallback, weight: 1.0 };
+        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN)) {
             Ok(()) => {
+                if tag == SampleTag::DraftAudit {
+                    // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
+                    let n = self.samples();
+                    self.quarantine.resize(n, Q_NONE);
+                    self.quarantine[n - 1] = Q_DRAFT;
+                    notes.push("surrogate: kept, held out of the strict fit — a draft-mode audit at a geometry strict mode refuses (it would otherwise judge the strict model by the guess's own excursions)".into());
+                }
                 self.pending_refit = true;
                 true
             }
@@ -327,12 +439,21 @@ impl SurrogateKs {
         near: &[usize],
         keep: bool,
         thin: bool,
+        dedup: bool,
         essential: bool,
         prov: &Provenance,
+        unfit: Option<&str>,
+        tag: SampleTag,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
-        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, essential, prov.h, notes);
-        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, notes) {
+        // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
+        // is used for its step and never kept — before `admit` can quarantine, fence or release anything on it
+        if let Some(why) = unfit {
+            notes.push(format!("surrogate: sample not kept ({why} — spec §5.6)"));
+            return TeachOutcome::UnfitNotKept;
+        }
+        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
+        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, tag, notes) {
             return TeachOutcome::StoreRefused;
         }
         a.outcome

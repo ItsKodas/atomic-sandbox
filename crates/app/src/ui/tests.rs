@@ -143,6 +143,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        pseudo_generating: None,
         probe: None,
     }
 }
@@ -152,6 +153,8 @@ pub(crate) fn model() -> ModelStatus {
         teacher: "GpuKs",
         fitted: true,
         trusted: true,
+        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
+        teach_offer: None,
         untrusted_reason: None,
         samples: 273,
         pending_refit: false,
@@ -175,7 +178,7 @@ pub(crate) fn model() -> ModelStatus {
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -276,7 +279,7 @@ fn element_chip_picks_the_element_and_switches_to_place() {
     // a Z that cannot be placed is refused, from a script or anywhere (final review app M3)
     for a in [Action::Element(26), Action::ElementIsotope(26, 56), Action::Element(0)] {
         let out = act(&mut st, &inp, a.clone());
-        assert!(out.error.as_deref().is_some_and(|e| e.contains("only Z 1–10")), "{a:?}: {:?}", out.error);
+        assert!(out.error.as_deref().is_some_and(|e| e.contains("only Z 1–18")), "{a:?}: {:?}", out.error);
         assert_eq!(st.element, 8, "{a:?}");
     }
     for words in [&["element", "26"][..], &["element", "200", "1"], &["element", "0"]] {
@@ -325,8 +328,9 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    let want = crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap();
-    assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
+    // a preset is loaded under the policy in force (M7: accepted species by default since Task 11; the preset file itself is all-electron)
+    let want = Scene { ionic: st.ionic, ..crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap() };
+    assert_eq!((want.grid_n, want.grid_h, want.ionic), (95, 0.15, DEFAULT_IONIC));
     // the scene, then the container moved to the new cell's default (walls on by default)
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(w)))] if *s == want && (w.half_width - 5.55).abs() < 1e-12), "{:?}", out.commands);
     assert_eq!((st.source.preset(), st.grid_n, st.box_len), (Some("h2o"), 95, 14.0));
@@ -422,6 +426,118 @@ fn file_menu_saves_and_loads_scene_and_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A model file that is only a header (what `surrogate::sidecar::read_provenance` reads): the magic, the header length
+/// and a version-4 JSON header with this provenance.
+fn header_only_model(name: &str, grid_n: usize, h: f64, sigma: f64, tol: f64, charge: i32, mult: &str, teacher: &str, ionic: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("atomic-ui-offer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = format!(
+        "{{\"format\":\"ASMODEL4\",\"provenance\":{{\"grid_n\":{grid_n},\"h\":{h},\"sigma\":{sigma},\"tol\":{tol:e},\"charge\":{charge},\"multiplicity\":{mult},\"teacher\":\"{teacher}\",\"masses\":[[1,2]],\"ionic\":\"{ionic}\"}}}}"
+    );
+    let mut bytes = b"ASMODEL4".to_vec();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// User request 2026-10-18: a model whose settings match the scene loads as it always did; one that differs opens the
+/// offer card (no command), Apply sends the scene edits and then the load, Cancel sends nothing.
+#[test]
+fn a_model_at_other_settings_opens_the_card_and_apply_sends_the_edits_then_the_load() {
+    let scene = Scene::preset("h2").unwrap(); // 49³ × 0.25, all-electron, charge 0
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    // matching: straight to the driver (the recorded D isotope does not matter)
+    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(same.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == same));
+    assert!(st.model_offer.is_none());
+    // another grid, σ, charge and multiplicity: a card, nothing sent
+    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(other.clone());
+    let out = act(&mut st, &inp, Action::LoadModel);
+    assert!(out.commands.is_empty() && out.error.is_none(), "{:?}", out.commands);
+    let o = st.model_offer.clone().expect("the card");
+    let names: Vec<&str> = o.rows.iter().map(|r| r.name).collect();
+    assert_eq!(names, ["grid", "σ", "charge", "multiplicity", "isotopes"]);
+    assert_eq!(o.rows[0].versus(), "model: 81³ × h 0.15 Bohr · scene: 49³ × h 0.25 Bohr");
+    assert_eq!(o.blocked(), None);
+    // Cancel: gone, nothing sent, the grid fields untouched
+    let out = act(&mut st, &inp, Action::CancelModelOffer);
+    assert!(out.commands.is_empty() && st.model_offer.is_none());
+    assert_eq!((st.grid_n, st.grid_h), (scene.grid_n, scene.grid_h));
+    // Apply: the edits in order, the isotopes (the model's single isotope of H is the deuteron), then the load
+    act(&mut st, &inp, Action::LoadModel);
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert!(
+        matches!(
+            out.commands.as_slice(),
+            [
+                Command::SetGrid { n: 81, h },
+                Command::SetSigma(Some(sg)),
+                Command::SetCharge(1),
+                Command::SetMultiplicity(Some(2)),
+                Command::Dyn(DynCommand::SetIsotope { index: 0, a: 2 }),
+                Command::Dyn(DynCommand::SetIsotope { index: 1, a: 2 }),
+                Command::Dyn(DynCommand::LoadModel(p)),
+            ] if *h == 0.15 && *sg == 0.2 && *p == other
+        ),
+        "{:?}",
+        out.commands
+    );
+    assert!(st.model_offer.is_none());
+    assert_eq!((st.grid_n, st.grid_h), (81, 0.15), "the panel's pending grid follows, as after Apply grid");
+    // a second Apply with no card does nothing
+    assert!(act(&mut st, &inp, Action::ApplyModelSettings).commands.is_empty());
+    // an unreadable header is the driver's to report, as before
+    let junk = std::env::temp_dir().join(format!("atomic-ui-offer-{}", std::process::id())).join("junk.model");
+    std::fs::write(&junk, b"x").unwrap();
+    st.model_file = Some(junk.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == junk));
+}
+
+/// A setting the app cannot change (the teacher tolerance, the teacher, another build's recipe) is named with its reason and
+/// Apply sends nothing but an error; the card stays, and draws.
+#[test]
+fn settings_that_cannot_be_applied_disable_apply() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/shared0/0/stop2x0");
+    st.model_file = Some(p);
+    assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
+    let o = st.model_offer.clone().unwrap();
+    let blocked: Vec<(&str, bool)> = o.rows.iter().map(|r| (r.name, r.blocked.is_some())).collect();
+    assert_eq!(blocked, [("grid", false), ("teacher", true), ("teacher tolerance", true), ("ionic potential", true), ("isotopes", false)]);
+    assert!(o.blocked().unwrap().contains("not a setting"), "{:?}", o.blocked());
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty(), "{:?}", out.commands);
+    assert!(out.error.as_deref().is_some_and(|e| e.starts_with("the model's settings cannot be applied")), "{:?}", out.error);
+    assert!(st.model_offer.is_some(), "the card stays up to read");
+    // the card draws over the view and, with no input, sends nothing
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert!(out.commands.is_empty());
+    // while a pass runs, Apply is refused even for an applicable offer
+    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(p);
+    act(&mut st, &inp, Action::LoadModel);
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
+    let busy = input(&scene, Some(&snap), &cam);
+    let out = act(&mut st, &busy, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("sampling pass")), "{:?} {:?}", out.commands, out.error);
+    assert!(st.model_offer.is_some());
+}
+
 /// Dock ▸ Model and File ▸ Estimated model: Forget needs two clicks; a long pass needs two
 /// clicks ("Start anyway"), a short one starts at once and advances the seed; Cancel, the offer's
 /// Start anyway, "Forget it and sample" and the audit cadence send their old commands.
@@ -443,6 +559,10 @@ fn model_actions_keep_their_two_click_confirms() {
     let plan = sim::SamplingPlan { perturbations: 7, ..Default::default() };
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::StartOffered(plan.clone()))), DynCommand::StartSampling(p) if *p == plan));
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SampleAfterRefusal)), DynCommand::StartSampling(_)));
+    // teach around the blockers: the old command path, recorded but not replayable (it solves)
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::TeachAroundBlockers)), DynCommand::StartTeaching));
+    assert!(Action::TeachAroundBlockers.describe().is_none());
+    assert_eq!(crate::replay::unreplayable_kind(&Action::TeachAroundBlockers), Some("teach-around-blockers"));
     let out = act(&mut st, &inp, Action::SetAudit(0));
     assert!(matches!(out.commands.as_slice(), [Command::SetAudit(0)]));
     assert_eq!(st.audit_every, 0);
@@ -480,6 +600,42 @@ fn the_sampling_button_names_its_state() {
     assert!(b.label.ends_with(" at the last pass's rate)"), "{}", b.label);
 }
 
+/// The teach-around offer: no button without teachable blockers, a label with the blockers, the
+/// solves and their time at the model's solve rate, the stage worded with its blocker.
+#[test]
+fn the_teach_around_button_names_its_cost() {
+    let mut m = model();
+    assert_eq!(crate::ui::dock::model::teach_label(&m), None, "no offer");
+    m.teach_offer = Some(sim::TeachOffer { blockers: Vec::new(), refused: vec![(7, "pair", 3.2, "the model cannot represent it")], refused_total: 1, solves: 0, notes: Vec::new(), prompt: None });
+    assert_eq!(crate::ui::dock::model::teach_label(&m), None, "only refused blockers: nothing to start");
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4), (438, "many-body", 10.6, 0.7)], refused: Vec::new(), refused_total: 0, solves: 20, notes: Vec::new(), prompt: None });
+    m.solve_s = Some(6.0);
+    assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 2 blockers (≈20 solves, ≈2:00)"));
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    m.solve_s = None;
+    assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 1 blocker (≈10 solves)"));
+    let p = sim::SamplingProgress { done: 1, total: 10, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: false, target: Some(345) };
+    assert_eq!(crate::ui::activity::words::pass_stage(&p), "teaching around #345");
+}
+
+/// The live case's prompt: a teach offer that carries a prompt (consecutive class-rule fallbacks
+/// blocked far away) puts "stuck on DFT: …" on the status chip; none without the prompt or while
+/// a pass runs.
+#[test]
+fn a_teach_prompt_reaches_the_status_chip() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let st = UiState::new("h2", &scene);
+    let mut m = model();
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(251, "many-body", 1.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    assert!(crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam)).iter().all(|(_, t)| !t.starts_with("stuck on DFT")));
+    m.teach_offer.as_mut().unwrap().prompt = Some("the last 5 steps fell back because three-or-more-atom environments are untrusted everywhere".into());
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let notes = crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam));
+    assert!(notes.iter().any(|(_, t)| t.starts_with("stuck on DFT: the last 5 steps fell back")), "{notes:?}");
+}
+
 /// View ▸ Density and the quick switch in the view.
 #[test]
 fn the_quick_view_switch_sets_the_volume_mode() {
@@ -502,6 +658,32 @@ fn the_control_search_finds_controls_by_fuzzy_name() {
     for e in search::ENTRIES {
         assert!(!e.anchor.is_empty() && !e.name.is_empty());
     }
+}
+
+/// Atom trails (user request 2026-10-17): off by default at 100 fs and 70 %, found by Ctrl K, and
+/// display only — drawing the sliders sends nothing to the worker.
+#[test]
+fn trail_controls_are_display_only_and_searchable() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert!(!st.show_trails);
+    assert_eq!((st.trail_fs, st.trail_opacity), (100.0, 0.7));
+    let r = search::results("trails", 3);
+    assert_eq!((r[0].name, r[0].anchor), ("Trails", "m-display"));
+    assert!(search::results("decay", 50).iter().any(|e| e.name == "Trails"));
+    let inp = input(&scene, None, &cam);
+    st.show_trails = true;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+    for w in [1400.0, 1000.0] {
+        for _ in 0..2 {
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+        }
+    }
+    egui::Popup::close_all(&ctx);
+    assert!(st.show_trails && st.trail_fs == 100.0 && st.trail_opacity == 0.7, "drawing changes nothing");
 }
 
 /// The log records a status line once per `set_status` (a repeat of the same text is a new
@@ -647,6 +829,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
         skipped: 2,
         failed: 0,
         finished: false,
+        target: None,
     });
     // a snapshot whose activity carries events of each origin and full training views, so the
     // Activity tab draws its log, its checklist and its plots
@@ -672,15 +855,15 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 ..input(&scene, snap.as_ref(), &cam)
             };
             for tab in DockTab::ALL {
-                st.dock_tab = tab;
+                st.open_tab(tab);
                 for _ in 0..2 {
                     let out = frame(&ctx, &mut st, &inp, w, vec![]);
                     assert!(out.commands.is_empty() && !out.toggle_play && !out.deselect && out.error.is_none(), "{tab:?} at {w}");
                 }
             }
-            st.dock_open = false;
+            (st.dock_open, st.left_open) = (false, false);
             frame(&ctx, &mut st, &inp, w, vec![]);
-            st.dock_open = true;
+            (st.dock_open, st.left_open) = (true, true);
             for mid in menus::MenuId::ALL {
                 egui::Popup::open_id(&ctx, menus::popup_id(mid));
                 for _ in 0..2 {
@@ -874,7 +1057,7 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
-    st.dock_tab = DockTab::Model;
+    st.open_tab(DockTab::Model);
     assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget")).is_empty(), "the first click arms");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget"));
     assert!(matches!(c.as_slice(), [DynCommand::ForgetModel]), "{c:?}");
@@ -1056,7 +1239,7 @@ fn a_loaded_scene_file_is_the_chips_source_and_reset_reloads_it() {
 /// `SetScene` (→ the worker's `ReplaceScene`) as every other preset, adopting its grid.
 #[test]
 fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
-    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o"]);
+    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o", "h2s", "hcl", "ph3", "sih4"]);
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let snap = snapshot(&scene, Backend::Gpu, None);
@@ -1071,7 +1254,7 @@ fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
     // every preset label was drawn, in order, left to right
     let xs: Vec<f32> = Scene::PRESETS.iter().map(|n| probed_rect(n).left()).collect();
     assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
-    let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
+    let want = Scene { ionic: st.ionic, ..crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap() };
     let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
     assert!(matches!(sent.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == want), "{sent:?}");
     assert_eq!((st.source.preset(), st.grid_n), (Some("empty"), 81), "the empty preset at the default quality");
@@ -1103,7 +1286,7 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
     apply_theme(&ctx);
     let mut st = UiState::new("empty", &scene);
     st.backend = Backend::Estimated;
-    st.dock_tab = DockTab::Model;
+    st.open_tab(DockTab::Model);
     let inp = input(&scene, Some(&est), &cam);
     for _ in 0..3 {
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
@@ -1113,7 +1296,7 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
     assert!(outs.iter().all(|o| o.commands.is_empty()), "an empty scene cannot be sampled");
     for snap in [None, Some(&gpu), Some(&est)] {
         for tab in DockTab::ALL {
-            st.dock_tab = tab;
+            st.open_tab(tab);
             for w in [1400.0, 1000.0] {
                 let inp = PanelInput { playing: true, ..input(&scene, snap, &cam) };
                 assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{tab:?} at {w}");
@@ -1242,6 +1425,7 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         skipped: 2,
         failed: 0,
         finished: false,
+        target: None,
     });
     let dft = snapshot(&scene, Backend::Gpu, None);
     // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
@@ -1305,7 +1489,7 @@ fn m6_actions_send_relax_isotope_and_toggle_the_view() {
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SetIsotope { index: 1, a: 2 })), DynCommand::SetIsotope { index: 1, a: 2 }));
     // a pass running: Relax is refused here (the driver refuses it too)
     let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
-    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
     let busy = input(&scene, Some(&pass), &cam);
     assert!(act(&mut st, &busy, Action::Relax).commands.is_empty());
     assert_eq!(st.status, RELAX_REFUSED_SAMPLING);
@@ -1330,8 +1514,49 @@ fn m6_actions_send_relax_isotope_and_toggle_the_view() {
     assert!(!st.show_bonds && !st.show_labels && !st.show_badge);
 }
 
+#[test]
+fn show_angles_action_round_trips_and_defaults_on() {
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2o", &scene);
+    assert!(st.show_angles, "bond angles are on by default (spec §8 row 13)");
+    for b in [true, false] {
+        let text = Action::ShowAngles(b).describe().unwrap();
+        assert_eq!(text, format!("angles {b}"));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words), Ok(Action::ShowAngles(b)));
+    }
+    assert!(act(&mut st, &inp, Action::ShowAngles(false)).commands.is_empty(), "display only: no command");
+    assert!(!st.show_angles);
+    act(&mut st, &inp, Action::ShowAngles(true));
+    assert!(st.show_angles);
+    assert!(search::results("angle", 3).iter().any(|e| e.name == "Bond angles"), "Ctrl K finds the toggle");
+}
+
+#[test]
+fn angle_note_names_the_surface() {
+    assert_eq!(angle_surface_note(&[8, 1], [8, 1, 1]), "pseudopotential surface");
+    assert!(angle_surface_note(&[8], [8, 1, 1]).contains("smeared"));
+    assert!(angle_surface_note(&[], [8, 1, 1]).contains("smeared"));
+}
+
+/// Plan review Q10: a bond point inside a pseudised atom's r_c gets a valence-density kind. O at the
+/// origin with r_c,max = 1.6, H at 1.81 Bohr: the bond point at s = 0.75 (1.36 Bohr from O) is inside;
+/// at s = 0.95 (1.72 Bohr) it is not, and nothing is inside when nothing is pseudised.
+#[test]
+fn valence_density_kind_inside_an_r_c_sphere() {
+    let pos = [[0.0; 3], [1.81, 0.0, 0.0]];
+    let o_only = |z: u8| (z == 8).then_some(1.6);
+    assert!(valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, o_only));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.95, o_only));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, |_| None), "nothing pseudised: the all-electron kind");
+    assert!(valence_density_kind(&pos, &[8, 1], 1, 0, 0.25, o_only), "the same point seen from the other end");
+    assert!(VALENCE_KIND_NOTE.starts_with("valence-density kind"));
+}
+
 /// Clicked as a user would: the toolbar's Relax (Stop while relaxing), Physics ▸ Relax, the
-/// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, Ar is greyed and
+/// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, K is greyed and
 /// does nothing) and its isotope row.
 #[test]
 fn clicking_the_m6_controls_sends_their_commands() {
@@ -1361,7 +1586,18 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
     assert!(in_menu(&mut st, &inp, menus::MenuId::View, "show-bonds").iter().all(|o| o.commands.is_empty()));
     assert!(!st.show_bonds);
-    st.dock_tab = DockTab::Selection;
+    // View ▸ Display aids ▸ show what training is solving: on by default, display only (no command,
+    // no recorded action), and found by Ctrl K
+    assert!(st.show_ghost);
+    let outs = in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
+    assert!(!st.show_ghost);
+    in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    assert!(st.show_ghost);
+    assert_eq!(search::results("training is solving", 3)[0].name, "Show what training is solving");
+    assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
+    assert!(matches!(search::results("what training", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
+    st.open_tab(DockTab::Selection);
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
     // the periodic table
@@ -1373,8 +1609,8 @@ fn clicking_the_m6_controls_sends_their_commands() {
     };
     assert!(in_table(&mut st, "ptable-8").iter().all(|o| o.commands.is_empty()));
     assert_eq!((st.element, st.isotope, st.mode), (8, None, ToolMode::Place));
-    in_table(&mut st, "ptable-18");
-    assert_eq!(st.element, 8, "Ar is greyed: needs pseudopotentials");
+    in_table(&mut st, "ptable-19");
+    assert_eq!(st.element, 8, "K is greyed: needs pseudopotentials");
     in_table(&mut st, "ptable-1");
     in_table(&mut st, "ptable-isotope-2");
     assert_eq!((st.element, st.isotope), (1, Some(2)));
@@ -1485,7 +1721,7 @@ fn the_selection_tab_lists_bonds_and_molecules() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2o", &scene);
-    st.dock_tab = DockTab::Selection;
+    st.open_tab(DockTab::Selection);
     let mut s = snapshot(&scene, Backend::Gpu, None);
     s.dynamics.bonds = Some(graph(3, &[(0, 1), (0, 2)], vec![vec![0, 1, 2]], 0.0));
     s.labels = std::sync::Arc::new(vec![crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0))]);
@@ -1621,7 +1857,7 @@ fn the_thermostat_target_is_typed_in_the_chosen_scale() {
     st.temp_units = TempUnits::C;
     st.backend = Backend::Estimated;
     for tab in DockTab::ALL {
-        st.dock_tab = tab;
+        st.open_tab(tab);
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
     }
     for mid in menus::MenuId::ALL {
@@ -1670,6 +1906,47 @@ fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck
 /// box-affected samples are still in the fit because the clean ones are below the trust floor,
 /// and only then; the advice suggests a cell from the scene's extent and the box rule
 /// (123³ × 0.15 here, next to the 121³ measured trusted), and says when the memory guard or the
+/// Fix (a), 2026-10-18 (the user's water session: "trusted" while every step fell back): a model
+/// that passes the global trust rule but that strict mode refuses reads, amber, "a class untrusted"
+/// (rule 4b: the class is untrusted everywhere, round 1 SHOULD-5) or "trusted, not here" (a
+/// geometry refusal), with the rule's words, in the chip, the Model tab and the Activity checklist
+/// (a "Strict mode answers at this geometry" line marked "this is why"); a scene whose own pass is
+/// not in the fit reads "not this scene"; one where strict mode answers stays "yes".
+#[test]
+fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
+    let (scene, st) = (Scene::preset("h2").unwrap(), UiState::new("h2", &Scene::preset("h2").unwrap()));
+    let refused = sim::Readiness {
+        answers: false,
+        rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::ManyBody)),
+        atom: None,
+        text: "this kind of environment isn't learned well enough yet (many-body: LOO force error 12.0× the bound, RMS 0.10×, 587 samples) — worst leave-one-out sample #345".into(),
+        unlearned: None,
+    };
+    let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
+    let t = trust(Some(&m), &scene, &st);
+    // a class refusal is about the class everywhere, not this geometry (round 1, SHOULD-5)
+    assert_eq!((t.kind, t.kind.short(), t.colour), (TrustKind::ClassUntrusted, "a class untrusted, see Model", AMBER));
+    assert!(t.text.starts_with("yes overall, but this kind of environment isn't learned well enough yet (many-body"), "{}", t.text);
+    // a geometry refusal reads "not here"
+    let here = sim::Readiness { rule: Some(sim::activity::TeachRule::Grade), text: "extrapolating: grade γ = 3.1 > γ_max = 2".into(), ..refused.clone() };
+    let t = trust(Some(&ModelStatus { readiness: Some(here), quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!((t.kind, t.kind.short()), (TrustKind::NotHere, "trusted, not here"));
+    assert!(t.text.starts_with("not here — extrapolating"), "{}", t.text);
+    let lines = activity::trust::lines(&m, &scene, &st);
+    let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
+    assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");
+    // the scene's own pass is not in the fit: "not this scene", even where the policy answers
+    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()) };
+    let t = trust(Some(&ModelStatus { readiness: Some(unlearned), quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!(t.kind, TrustKind::NotHere);
+    assert!(t.text.starts_with("not this scene — this scene is not learned"), "{}", t.text);
+    // strict mode answers: plain "yes"
+    let t = trust(Some(&ModelStatus { quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!((t.kind, t.text.as_str()), (TrustKind::Trusted, "yes"));
+    let lines = activity::trust::lines(&ModelStatus { quarantined: 0, ..model() }, &scene, &st);
+    assert!(lines.iter().any(|l| l.met && l.text == "Strict mode answers at this geometry"));
+}
+
 /// grid limit would refuse it.
 #[test]
 fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
@@ -1965,6 +2242,34 @@ mod orbital_viewer {
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetOrbitalView(r) if r.what == OrbitalRequest::Orbital { spin: Spin::Down, track: 5, squared: false })), "{v:?}");
     }
 
+    /// M7 Task 9 (task-9 carry item 6; Task 6 review A.6): a lone pseudo-O's list — the minority 2p shared over three
+    /// degenerate levels (f = 1/3 each), a gap witness at f = 0 above — shows the fractions, and no HOMO-LUMO gap is
+    /// quoted when a shell is partly filled (there is no gap between partly filled degenerate orbitals).
+    #[test]
+    fn a_partly_filled_shell_shows_its_fractions_and_quotes_no_gap() {
+        let third = 1.0 / 3.0;
+        let rows = vec![
+            row(Spin::Up, 0, 1, 0, -0.87, 1.0, idx(1)),
+            row(Spin::Up, 1, 2, 1, -0.33, 1.0, idx(2)),
+            row(Spin::Down, 0, 3, 0, -0.83, 1.0, idx(1)),
+            row(Spin::Down, 1, 4, 1, -0.28, third, idx(2)),
+            row(Spin::Down, 2, 5, 2, -0.28, third, idx(3)),
+            row(Spin::Down, 3, 6, 3, -0.28, third, idx(4)),
+            row(Spin::Down, 4, 7, 4, 0.05, 0.0, idx(5)),
+        ];
+        let levels = Levels::of(&rows);
+        assert!(levels.fractional && levels.gap().is_none(), "{levels:?}");
+        let line = orbitals::levels_line(&levels).expect("a HOMO line");
+        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly filled shell: no HOMO–LUMO gap"), "{line}");
+        assert!(!line.contains("Kohn–Sham gap"), "{line}");
+        let v = RowView::of(&rows[3], &levels);
+        assert_eq!(v.occupation, "0.33", "{v:?}");
+        assert!(v.occupied);
+        // an integer-occupation list is unchanged
+        let h2 = Levels::of(&h2_rows());
+        assert!(!h2.fractional && h2.gap().is_some());
+    }
+
     /// ε = −0.5 Ha reads "−0.500" and "−13.61" (units::HARTREE_IN_EV); the tags the rows carry.
     #[test]
     fn rows_format_energies_in_ha_and_ev() {
@@ -2026,8 +2331,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let outs = click_widget(&ctx, &mut st, &inp, "orbital-↓-2");
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -2265,8 +2569,7 @@ mod orbital_viewer {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let mut u = UnoccupiedStatus { requested: 4, shown: [1, 1], hidden: [3, 3], current: true, interrupted: true, held: 3, ..Default::default() };
         u.notes = vec!["a note".into()];
         let mut o = payload(h2_rows(), OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
@@ -2350,8 +2653,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let t = hover_text(&ctx, &mut st, &inp, "show-orbitals");
         assert!(t.contains("the sign of an orbital is arbitrary; only the relative sign of its lobes means anything"), "{t}");
         assert!(t.contains("an auxiliary object of DFT"), "{t}");
@@ -2373,8 +2675,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let mut rows = vec![
             row(Spin::Up, 0, 1, 0, -9.66, 1.0, OrbitalLabel::Atomic { n: 1, l: 0, m: "" }),
             row(Spin::Up, 1, 2, 1, -0.82, 1.0, OrbitalLabel::Atomic { n: 2, l: 1, m: "x" }),
@@ -2616,8 +2917,8 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
-        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3 }, ..Default::default() };
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
+        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let rows = activity::jobs::rows(&inp, inp.probe.as_ref());
         let pass = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).unwrap();
@@ -2625,7 +2926,7 @@ mod activity_tab {
         assert!(matches!(pass.control, Some((_, Action::CancelSampling))));
         let audit = rows.iter().find(|r| r.key == activity::jobs::JobKey::Audit).unwrap();
         assert!(audit.control.is_none() && audit.no_control_why.is_some());
-        assert!(audit.detail.contains("SCF step 4"));
+        assert!(audit.detail.contains("iteration 4"));
     }
 
     /// A playing run's solve pauses; a paused one only says why not; a refit, a relax and the
@@ -2636,7 +2937,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { audit_in_flight: false, ..model() }));
-        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1, ..Default::default() }, ..Default::default() };
         let playing = PanelInput { playing: true, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&playing, playing.probe.as_ref());
         let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
@@ -2735,8 +3036,7 @@ mod activity_tab {
         let cam = camera();
         let ctx = egui::Context::default();
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         let inp = input(&scene, None, &cam);
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
         st.activity.training_open = true;
@@ -2746,7 +3046,7 @@ mod activity_tab {
         st.activity.views_sent = false; // Viewer::start
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
         // closing the dock turns them off again
-        st.dock_open = false;
+        st.left_open = false;
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
     }
 }
@@ -2845,25 +3145,25 @@ mod activity_headline {
         use activity::headline::{headline, BarMode};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1, ..Default::default() }, ..Default::default() };
         // a DFT step on the GPU backend
         let mut snap = snapshot(&scene, Backend::Gpu, None);
         snap.dynamics.eval.scf_steps = 11;
         let p = running(7);
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert_eq!(h.text, "Solving · SCF step 7 (last solve 11)");
+        assert_eq!(h.text, "Solving · iteration 7 (last solve 11)");
         assert_eq!(h.bar, BarMode::Sweep);
         // estimated: a fallback
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
         let inp = PanelInput { busy: true, playing: true, probe: Some(running(3)), ..input(&scene, Some(&snap), &cam) };
-        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · SCF step 3"));
+        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · iteration 3"));
         // a pass with its ETA
         let mut snap = snapshot(&scene, Backend::Estimated, Some(crate::sim::ModelStatus { pass_eta_s: Some(100.0), ..model() }));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let inp = PanelInput { busy: true, probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert_eq!(h.text, "Sampling 41/273 · bond scan · 1:40 left");
+        assert_eq!(h.text, "Sample 42 of 273 · bond scan · 1:40 left");
         assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
         // a refit
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -2872,16 +3172,16 @@ mod activity_headline {
         // the CPU solver (no step count)
         let mut snap = snapshot(&scene, Backend::Cpu, None);
         snap.engine = Backend::Cpu;
-        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0 }, ..Default::default() };
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 12 s");
         // a background audit beside a model-answered run: a second pill
         let snap = snapshot(&scene, Backend::Estimated, Some(model())); // audit_in_flight: true
-        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2 }, ..Default::default() };
+        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, playing: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
         assert_eq!(h.text, "playing");
-        assert_eq!(h.audit.as_deref(), Some("Audit running · SCF step 4"));
+        assert_eq!(h.audit.as_deref(), Some("Audit running · iteration 4"));
         // idle: no headline (the old idle texts stay)
         let snap = snapshot(&scene, Backend::Gpu, None);
         let inp = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
@@ -2902,10 +3202,10 @@ mod activity_headline {
         let inp = PanelInput { orbital_waiting: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
         assert_eq!((h.text.as_str(), h.orbitals.as_deref()), ("Computing orbitals…", None));
-        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { orbital_waiting: true, busy: true, probe: Some(running), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert!(h.text.starts_with("Solving · SCF step 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
+        assert!(h.text.starts_with("Solving · iteration 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
         let mut refs = snapshot(&scene, Backend::Gpu, None);
         refs.dynamics.bond_reference = Some(sim::ReferenceProgress { z: 8, done: 1, total: 3, elapsed_s: 14.2 });
         let inp = PanelInput { probe: Some(idle), ..input(&scene, Some(&refs), &cam) };
@@ -2921,11 +3221,11 @@ mod activity_headline {
         use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false };
+        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None };
         let reference = |z| activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z, multiplicity: 1 }), K::Reference, None);
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
-        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let text = |s: &Snapshot, reference| {
             let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(s), &cam) };
             activity::headline::display(&inp, reference).unwrap().text
@@ -2934,7 +3234,7 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(0, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), None);
-        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 1 of 273 · reference · iteration 9");
         // H finishes: it is the last done while O is solved
         std::thread::sleep(Duration::from_millis(3));
         s.activity.events = vec![reference(1)];
@@ -2942,7 +3242,7 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(1, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), Some(1));
-        assert_eq!(text(&s, st.current_reference()), "Sampling 1/273 · reference (last done: H) · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 2 of 273 · reference (last done: H) · iteration 9");
         // O finishes: the newest of two
         std::thread::sleep(Duration::from_millis(3));
         s.activity.events = vec![reference(8)];
@@ -2951,7 +3251,7 @@ mod activity_headline {
         assert_eq!(st.current_reference(), Some(8));
         // other stages are left alone
         s.dynamics.sampling = Some(sampling(30, "scans"));
-        assert_eq!(text(&s, Some(8)), "Sampling 30/273 · bond scan · SCF step 9");
+        assert_eq!(text(&s, Some(8)), "Sample 31 of 273 · bond scan · iteration 9");
         // the pass ends, a second pass starts on another scene: the old pass's rows do not count
         s.activity.events = Vec::new();
         s.dynamics.sampling.as_mut().unwrap().finished = true;
@@ -2961,7 +3261,122 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(0, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), None, "the first pass's O row is not this pass's");
-        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 1 of 273 · reference · iteration 9");
+    }
+
+    /// The solver's own iteration record (the probe's `live`): "iteration 37 / 200" of the cap, the
+    /// cold retry named, and the pass's "Sample n of N" with it; the job row carries the record for
+    /// its detail line (Δρ → target, ΔE, ms per iteration) and the stall tag once the best Δρ has
+    /// not halved for `STALL_TAG_FROM` iterations.
+    #[test]
+    fn the_headline_and_the_job_row_show_the_solvers_iteration() {
+        use activity::headline::headline;
+        use activity::jobs::{rows, scf_lines, JobKey, STALL_TAG_FROM};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let record = |it: u32, attempt: u32, since: u32| sim::ScfLive {
+            attempt,
+            iteration: it,
+            max_iter: 200,
+            delta_rho: 3.2e-5,
+            tol: 1e-6,
+            energy: -17.4,
+            d_energy: -2.1e-4,
+            ms_per_iteration: 85.4,
+            since_gain: since,
+            window: 50,
+            best_delta_rho: 3.2e-2,
+            stall_level: 8e-3,
+            spark: [-2.0; sim::activity::SPARK_POINTS],
+            spark_len: 3,
+            spark_stride: 1,
+        };
+        let probe = |l| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 41, elapsed_s: 3.0, solves: 4, live: Some(l) }, ..Default::default() };
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
+        let inp = PanelInput { busy: true, probe: Some(probe(record(37, 1, 3))), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 37 / 200");
+        let r = rows(&inp, inp.probe.as_ref());
+        let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
+        assert_eq!(pass.detail, "bond scan · sample 42 of 158 · iteration 37 / 200");
+        let l = pass.scf.expect("the pass row carries the record");
+        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
+        // the stall countdown, from STALL_TAG_FROM on
+        assert_eq!(scf_lines(&record(80, 1, STALL_TAG_FROM - 1)).1, None);
+        assert_eq!(scf_lines(&record(80, 1, 31)).1.as_deref(), Some("no 2× gain for 31 / 50"));
+        // ruling (a): below the stall level the stop does not apply, so there is no countdown to show
+        assert_eq!(scf_lines(&sim::ScfLive { best_delta_rho: 4.8e-5, stall_level: 2e-3, ..record(80, 1, 31) }).1, None);
+        // the providers' cold retry counts from 1 again and says so
+        let inp = PanelInput { busy: true, probe: Some(probe(record(12, 2, 0))), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 12 / 200 · cold retry");
+        // outside a pass: a DFT solve's iteration, with the last solve's count
+        let mut gpu = snapshot(&scene, Backend::Gpu, None);
+        gpu.dynamics.eval.scf_steps = 11;
+        let inp = PanelInput { busy: true, probe: Some(probe(record(7, 1, 0))), ..input(&scene, Some(&gpu), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving · iteration 7 / 200 (last solve 11)");
+        let r = rows(&inp, inp.probe.as_ref());
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "iteration 7 / 200 (last solve 11)");
+        // the CPU solver reports its iterations too (its observer): no "CPU reference" fallback text then
+        let mut cpu = snapshot(&scene, Backend::Cpu, None);
+        cpu.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 9.0, solves: 0, live: Some(record(4, 1, 0)) }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&cpu), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving · iteration 4 / 200");
+    }
+
+    /// User request 2026-10-17: between two samples of a pass (the probe idle, its last solve's record still held) the
+    /// pass row keeps that record, so the iteration block stays on screen instead of blinking out; a new solve's
+    /// `busy` clears it until its first iteration (the row then reserves the block's height).
+    #[test]
+    fn the_pass_row_keeps_the_last_record_between_samples() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 7, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
+        let probe = sim::ActivityProbe::new();
+        let busy = probe.busy(sim::Slot::Main);
+        probe.scf_iteration(sim::Slot::Main, &sim::ScfIteration { iteration: 14, max_iter: 200, delta_rho: 8e-7, tol: 1e-6, energy: -17.4, since_gain: 0, window: 50, best_delta_rho: 8e-7, stall_level: 8e-3 });
+        drop(busy); // the sample finished; the next has not started
+        let idle = probe.view();
+        assert!(!idle.main.running);
+        let inp = PanelInput { busy: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
+        assert_eq!(pass.scf.map(|l| (l.iteration, l.delta_rho)), Some((14, 8e-7)), "the last sample's record stays");
+        assert!(!pass.detail.contains("iteration"), "the detail names no running iteration: {}", pass.detail);
+        // the next sample starts: the record is cleared until its first iteration
+        let _next = probe.busy(sim::Slot::Main);
+        let inp = PanelInput { busy: true, probe: Some(probe.view()), ..input(&scene, Some(&snap), &cam) };
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().scf.is_none());
+    }
+
+    /// The solve log's iteration cell: the count and how the SCF ended.
+    #[test]
+    fn the_solve_log_shows_iterations_and_the_end() {
+        use activity::log::{solve_cell, solve_hover};
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let mut e = sim::TeachEvent::new(O::Pass, R::Pass(PassJob::Scan), K::Kept);
+        e.solve_ms = 840.0;
+        e.scf_steps = Some(37);
+        e.scf_end = Some(sim::ScfEnd::Converged);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        assert_eq!(solve_hover(&e).as_deref(), Some("37 SCF iterations — converged"));
+        e.outcome = K::Failed;
+        e.solve_ms = 12_100.0;
+        e.scf_steps = Some(61);
+        e.scf_end = Some(sim::ScfEnd::Stalled);
+        assert_eq!(solve_cell(&e), "12.1 s · 61 stalled");
+        assert!(solve_hover(&e).unwrap().starts_with("61 SCF iterations — stalled"));
+        e.scf_steps = Some(200);
+        e.scf_end = Some(sim::ScfEnd::Cap);
+        assert_eq!(solve_cell(&e), "12.1 s · 200 cap");
+        // a solve without an SCF count, and a row with no solve
+        e.scf_steps = None;
+        e.scf_end = None;
+        assert_eq!((solve_cell(&e), solve_hover(&e)), ("12.1 s".to_string(), None));
+        e.outcome = K::NotSolved;
+        assert_eq!(solve_cell(&e), "—");
     }
 
     /// Spec §6: the headline is rebuilt at most every 100 ms.
@@ -2983,7 +3398,7 @@ mod activity_headline {
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Cpu, None);
         snap.engine = Backend::Cpu;
-        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0 }, ..Default::default() };
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 31 s");
         let p = sim::ProbeView::default();
@@ -2998,14 +3413,14 @@ mod activity_headline {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let snap = snapshot(&scene, Backend::Gpu, None);
-        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = false;
+        st.left_open = false;
         click_widget(&ctx, &mut st, &inp, "activity-bar");
-        assert!(st.dock_open && st.dock_tab == DockTab::Activity);
+        assert!(st.tab_shown(DockTab::Activity), "the bar opens the left dock on Activity");
         // idle: nothing is drawn, so nothing is probed
         PROBES.with(|p| p.borrow_mut().clear());
         let idle = input(&scene, Some(&snap), &cam);
@@ -3055,9 +3470,9 @@ mod activity_trust {
         );
         assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
         let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
-        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (refit to recover)");
+        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (until a refit predicts it without that sample)");
         let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
-        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (refit to recover)");
+        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (until a refit predicts it without that sample)");
         // the three states come from the status
         let m = model();
         assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
@@ -3186,8 +3601,7 @@ mod activity_trust {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         let bad = ModelStatus { trusted: false, untrusted_reason: Some("x".into()), trust_checks: checks_failing(sim::activity::TrustKey::ForceResidual), ..model() };
         for m in [model(), bad] {
             let snap = snapshot(&scene, Backend::Estimated, Some(m));
@@ -3324,8 +3738,7 @@ mod activity_plots {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         st.activity.training_open = true;
         st.activity.views_sent = true;
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -3357,8 +3770,7 @@ mod activity_plots {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         st.activity.training_open = true;
         st.activity.views_sent = true;
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -3385,7 +3797,7 @@ mod activity_plots {
             std::hint::black_box(meshes.len());
         };
         let time = |ctx: &egui::Context, st: &mut UiState, tab: DockTab| {
-            st.dock_tab = tab;
+            st.open_tab(tab);
             one(ctx, st);
             let t = std::time::Instant::now();
             for _ in 0..60 {
@@ -3427,30 +3839,31 @@ mod activity_final {
         assert_eq!(text(&ok(5)), "Box walls not blocking trust — 5 samples in the fit touch them (273 held)");
     }
 
-    /// M1: no "SCF step 0" for a CPU solve inside a pass, and a GPU solve before its first poll
+    /// M1: no "iteration 0" for a CPU solve inside a pass, and a GPU solve before its first poll
     /// is not "CPU reference".
     #[test]
     fn the_job_rows_do_not_invent_a_step() {
         use activity::jobs::{rows, JobKey};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0 }, ..Default::default() };
+        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0, ..Default::default() }, ..Default::default() };
         let mut cpu = snapshot(&scene, Backend::Cpu, None);
         cpu.engine = Backend::Cpu;
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&cpu), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
-        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no step count");
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no iteration count yet");
         let gpu = snapshot(&scene, Backend::Gpu, None);
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&gpu), &cam) };
         assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "starting");
         // a pass on the CPU teacher: the step stays out of the detail while it reads 0
         let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
-        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&pass), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
-        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step"));
+        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("iteration"));
         let inp = PanelInput { busy: true, probe: Some(on(4)), ..input(&scene, Some(&pass), &cam) };
-        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step 4"));
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("iteration 4"));
+        assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail, "bond scan · sample 4 of 273 · iteration 4");
     }
 
     /// M2: a worker switch closes an open pass as cancelled, forgets the quarantine baseline, and
@@ -3461,7 +3874,7 @@ mod activity_final {
         let scene = Scene::preset("h2").unwrap();
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 0, ..model() }));
-        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         st.absorb(&s);
         st.new_worker();
         assert!(matches!(st.timeline.last(), Some(Mark::Pass(_, Some(_), true))), "{:?}", st.timeline);
@@ -3498,4 +3911,302 @@ mod activity_final {
         st.absorb(&s);
         assert!(!st.rows[0].near_face && st.rows[1].near_face);
     }
+}
+
+// ---- M7 Task 9: the ionic policy, the partial-core display and the words about pseudopotentials ----
+
+/// The policy action replaces the scene (`Command::SetIonicPolicy`) only when it differs from the scene's, remembers it in
+/// the panel, and presets loaded next are loaded under it (a preset file itself is all-electron); the words round-trip.
+#[test]
+fn ionic_action_round_trips() {
+    for p in sim::IonicPolicy::ALL {
+        let a = Action::Ionic(p);
+        let text = a.describe().expect("a script form");
+        assert_eq!(text, format!("ionic {}", p.word()));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
+    }
+    for on in [true, false] {
+        let a = Action::ShowPartialCore(on);
+        let text = a.describe().unwrap();
+        assert_eq!(text, format!("partial-core {on}"));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words).unwrap(), a);
+    }
+    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores, accepted or all"));
+
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2o", &scene);
+    assert_eq!(st.ionic, DEFAULT_IONIC, "the app's default policy");
+    let c = act(&mut st, &inp, Action::Ionic(sim::IonicPolicy::All));
+    assert!(matches!(c.commands.as_slice(), [Command::SetIonicPolicy(sim::IonicPolicy::All)]) && st.ionic == sim::IonicPolicy::All, "{:?}", c.commands);
+    let all = Scene { ionic: sim::IonicPolicy::All, ..scene.clone() };
+    let inp_all = input(&all, None, &cam);
+    assert!(act(&mut st, &inp_all, Action::Ionic(sim::IonicPolicy::All)).commands.is_empty(), "unchanged: nothing sent");
+    let c = act(&mut st, &inp_all, Action::Preset("h2".into()));
+    assert!(matches!(c.commands.first(), Some(Command::SetScene(s)) if s.ionic == sim::IonicPolicy::All), "{:?}", c.commands);
+    let c = act(&mut st, &inp_all, Action::ShowPartialCore(true));
+    assert!(matches!(c.commands.as_slice(), [Command::DisplayPartialCore(true)]) && st.show_partial_core);
+    assert!(st.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(true))), "a new worker is told");
+    // a new worker is never told about a display that is off
+    let st2 = UiState::new("h2", &scene);
+    assert!(!st2.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(_))));
+}
+
+/// M7 Task 11 fix round (controller ruling on the default): the app's default is `Accepted` — "accepted species" — and
+/// Physics ▸ Ionic potential labels it "(default)"; while a pseudopotential is generated the status line says which and how
+/// long it takes ("≈ 1 min" for the dimer-gated H/He), never a silent wait. Rendered: the frame's text shapes are searched.
+#[test]
+fn the_default_is_accepted_species_and_generation_is_said() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    assert_eq!(DEFAULT_IONIC, sim::IonicPolicy::Accepted);
+    assert_eq!((sim::IonicPolicy::Accepted.word(), sim::IonicPolicy::parse("accepted")), ("accepted", Some(sim::IonicPolicy::Accepted)));
+    let scene = Scene { ionic: DEFAULT_IONIC, ..Scene::preset("h2").unwrap() };
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.ionic, sim::IonicPolicy::Accepted);
+    let inp = input(&scene, None, &cam);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let mut all = String::new();
+    for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+    egui::Popup::close_all(&ctx);
+    assert!(all.contains("accepted species (default)"), "the Physics menu:\n{all}");
+    assert!(!all.contains("cores only (default)") && all.contains("cores only") && all.contains("all species"));
+    // the status line while H is generated through its dimer gate, and nothing when nothing is
+    let gen = PanelInput { pseudo_generating: Some((1, 12.4, true)), ..input(&scene, None, &cam) };
+    let notes = overlays::chip_notes(&st, &gen);
+    assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s"), "{notes:?}");
+    let o = PanelInput { pseudo_generating: Some((8, 3.0, false)), ..input(&scene, None, &cam) };
+    assert!(overlays::chip_notes(&st, &o).iter().any(|(_, t)| t == "generating the O pseudopotential (seconds)… 3 s"));
+    assert!(!overlays::chip_notes(&st, &inp).iter().any(|(_, t)| t.starts_with("generating")));
+}
+
+/// The policy edit and the display setting are classified like the neighbours: the first replaces the scene (an edit
+/// that pauses and aborts), the second is display only.
+#[test]
+fn the_ionic_commands_are_classified() {
+    let c = Command::SetIonicPolicy(sim::IonicPolicy::CoresOnly);
+    assert!(c.is_edit() && c.pauses() && c.aborts());
+    let mut s = Scene::preset("h2o").unwrap();
+    c.apply(&mut s);
+    assert_eq!(s.ionic, sim::IonicPolicy::CoresOnly, "the viewer's mirror follows at once");
+    let d = Command::DisplayPartialCore(true);
+    assert!(!d.is_edit() && !d.pauses() && !d.aborts());
+}
+
+/// M7 Task 11 carry (Task 10: CH₄ at Fast, h = 0.30, egg-box G 4.98e-4 Ha/Bohr, worse than the all-electron figure;
+/// NLCC ruling 6: never refused, always said): with C's **real** generation record — certified for energies at its h_req,
+/// for the egg-box force only to min(h_eb, h_req) — a C scene at Fast shows "egg-box force not certified at this grid"
+/// in Physics ▸ Ionic potential, naming C and its certified grid; at Accurate (0.15) it does not. Rendered, not just
+/// formatted: the frame's text shapes are searched.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates C); cargo test -p app --release")]
+fn carbon_at_fast_shows_the_egg_box_line() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    // C's summary from the providers' own setup at Fast (a private cache: no other test thread generates into it)
+    let at = |h: f64| {
+        let a = 2.06 / 3f64.sqrt();
+        let nuclei = [[0.0; 3], [a, a, a], [-a, -a, a], [-a, a, -a], [a, -a, -a]].iter().enumerate()
+            .map(|(i, &pos)| crate::scene::SceneNucleus { z: if i == 0 { 6 } else { 1 }, a: None, pos, vel: [0.0; 3] }).collect();
+        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly }
+    };
+    let fast = at(crate::quality::parse("fast").expect("Fast has an h"));
+    let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
+    let setup = providers::pseudo::setup_in(&private, &fast.to_sim().unwrap(), fast.grid_h, &mut Vec::new()).expect("C is certified for energies at Fast").expect("C is pseudised");
+    let pseudised = providers::pseudo::summaries(&setup);
+    let c = pseudised.iter().find(|p| p.z == 6).expect("C's summary").clone();
+    let grid = pseudo::egg_box_grid(&c).expect("C has a certified egg-box grid");
+    eprintln!("C: h_req {:?}, h_eb {:?} → egg-box certified to {grid}; Fast h = {}", c.h_req, c.h_eb, fast.grid_h);
+    assert!(grid < fast.grid_h, "C's egg-box force must not be certified at Fast for this check to mean anything");
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    for (scene, shown) in [(fast.clone(), true), (at(0.15), false)] {
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        snap.dynamics.eval.pseudised = pseudised.clone();
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2o", &scene);
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+        let mut all = String::new();
+        for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+        egui::Popup::close_all(&ctx);
+        let line = format!("egg-box force not certified at this grid (h = {:.3} Bohr: C needs h ≤ {grid:.3})", scene.grid_h);
+        assert_eq!(all.contains(&line), shown, "h = {}: {line:?} {} in the Physics menu:\n{all}", scene.grid_h, if shown { "missing" } else { "shown" });
+    }
+}
+
+/// The words of the chrome: the egg-box line names who is not certified, the Quality marks come from the same
+/// record, and a scene refused for its grid still gets them from the cache (never generating).
+#[test]
+fn the_quality_menu_marks_levels_a_pseudised_species_forbids() {
+    use sim::PseudoSummary;
+    let o = PseudoSummary { z: 8, z_v: 6.0, f: 1.0, local: "s-local".into(), r_c_max: 1.35, h_req: Some(0.20), h_eb: Some(0.15), r_core: 0.8, record: String::new() };
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.25).as_deref(), Some("needs h ≤ 0.20 (O)"));
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.30).as_deref(), Some("needs h ≤ 0.20 (O)"));
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.15), None);
+    assert_eq!(pseudo::needs_finer(&[o], 0.20), None, "h = h_req is certified");
+    assert_eq!(pseudo::needs_finer(&[], 0.30), None);
+    // nothing pseudised and nothing generated: no marks, and no generation from the chrome
+    let scene = Scene { ionic: sim::IonicPolicy::CoresOnly, ..Scene::preset("h2o").unwrap() };
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let _ = pseudo::pseudised(&inp);
+    // the lookup the chrome uses, on a private cache (no other test thread can generate into it): nothing, and nothing generated
+    let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
+    assert!(providers::pseudo::cached_in(&private, &scene.to_sim().unwrap()).is_empty());
+    assert_eq!(private.lock().unwrap().generated(), 0, "the chrome never generates");
+}
+
+/// User request 2026-10-18: the readouts show T averaged over the last wall-clock second, one
+/// sample per step; a new nucleus count or a step going backwards starts over.
+#[test]
+fn temperature_readout_is_a_one_second_average() {
+    let mut snap = empty_snapshot(Backend::Gpu, None);
+    snap.dynamics.scene.nuclei = vec![sim::Nucleus::new(1, [0.0; 3]), sim::Nucleus::new(1, [1.4, 0.0, 0.0])];
+    let mut avg = super::TempAverage::default();
+    let mut at = |avg: &mut super::TempAverage, t: f64, step: u64, temp: f64| {
+        snap.dynamics.step = step;
+        snap.dynamics.temperature = temp;
+        avg.observe(t, &snap.dynamics);
+    };
+    at(&mut avg, 0.0, 1, 100.0);
+    at(&mut avg, 0.3, 2, 300.0);
+    at(&mut avg, 0.3, 2, 900.0); // same step: not a new sample
+    assert_eq!(avg.mean(), Some(200.0));
+    at(&mut avg, 1.2, 3, 500.0); // the t = 0 sample leaves the window
+    assert_eq!(avg.mean(), Some(400.0));
+    at(&mut avg, 1.3, 1, 50.0); // the step went backwards: a reset
+    assert_eq!(avg.mean(), Some(50.0));
+    at(&mut avg, 5.0, 1, 50.0); // paused: the newest sample is kept
+    assert_eq!(avg.mean(), Some(50.0));
+}
+
+/// User request 2026-10-18: Model ▸ Audits ▸ "audits on" switches audits off (cadence 0) and back
+/// on at the last cadence; the off state shows the unsafe note.
+#[test]
+fn audits_switch_off_and_back_on_at_the_last_cadence() {
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.audit_every = 500;
+    st.audit_every_on = 500;
+    assert!(super::dock::AUDIT_WHY.contains("spot checks") && super::dock::AUDIT_OFF_NOTE.contains("blind"));
+    // the switch's two effects, as the dock applies them
+    st.audit_every_on = st.audit_every.max(1);
+    assert_eq!(st.audit_every_on, 500);
+    st.audit_every = 0;
+    assert_eq!(st.audit_every_on.max(1), 500, "turning back on restores the cadence");
+}
+
+/// User request 2026-10-18: Model ▸ Audits ▸ auto — the cadence is the steps of 10 s of wall time at
+/// the measured speed, two significant figures, clamped; nothing while the speed is unmeasured.
+#[test]
+fn auto_audit_cadence_follows_the_play_speed() {
+    assert_eq!(super::auto_audit_every(None, 0.25), None);
+    assert_eq!(super::auto_audit_every(Some(0.0), 0.25), None);
+    assert_eq!(super::auto_audit_every(Some(15.0), 0.25), Some(600), "15 fs/s at 0.25 fs: 60 steps/s x 10 s");
+    assert_eq!(super::auto_audit_every(Some(15.7), 0.25), Some(630));
+    assert_eq!(super::auto_audit_every(Some(4000.0), 0.25), Some(160_000));
+    assert_eq!(super::auto_audit_every(Some(1.0), 0.25), Some(super::AUTO_AUDIT_MIN), "slow play: the floor");
+    assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
+}
+
+/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Orbitals,
+/// Selection and Log on the right; each side has its own open flag and selected tab, a strip button
+/// opens (or collapses) its own side only, and the search opens a control's own dock.
+#[test]
+fn the_two_docks_hold_their_own_tabs() {
+    use super::DockSide;
+    assert_eq!(DockTab::LEFT, [DockTab::Activity, DockTab::Readouts, DockTab::Graph], "the left dock's order");
+    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
+    assert!(DockTab::LEFT.iter().all(|t| t.side() == DockSide::Left) && DockTab::RIGHT.iter().all(|t| t.side() == DockSide::Right));
+    assert_eq!(DockTab::ALL.len(), DockTab::LEFT.len() + DockTab::RIGHT.len());
+    assert!(DockTab::ALL.iter().all(|t| t.side().tabs().contains(t)));
+
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    // the defaults: the stats dock open on Readouts, the configuring dock folded to its strip
+    assert!(st.left_open && st.left_tab == DockTab::Readouts && !st.dock_open);
+    // a strip button opens its tab on its own side and leaves the other side alone
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
+    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open, "Activity opens the left dock");
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
+    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity), "each side keeps its own tab");
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
+    assert!(st.tab_shown(DockTab::Graph) && st.tab_shown(DockTab::Selection) && !st.tab_shown(DockTab::Activity));
+    // the selected tab's button collapses its dock, only that one
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
+    assert!(!st.dock_open && st.left_open && st.left_tab == DockTab::Graph);
+    assert_eq!(st.dock_tab, DockTab::Selection, "the folded dock remembers its tab");
+    // the chevrons: each toggles its own dock
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Right");
+    assert!(st.dock_open && st.left_open);
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
+    assert!(st.dock_open && !st.left_open && st.left_tab == DockTab::Graph);
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
+    assert!(st.left_open);
+    // Ctrl K reveals a control in its own dock: the solve log on the left, the isotope on the right
+    st.left_open = false;
+    st.dock_open = false;
+    let log = search::results("solve log", 1)[0];
+    assert_eq!(log.place, search::Place::Dock(DockTab::Activity));
+    search::pick(&ctx, &mut st, log);
+    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open);
+    let guides = search::results("distance guides", 1)[0];
+    search::pick(&ctx, &mut st, guides);
+    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity));
+    // the chrome renders every combination without a command or an error
+    for (l, r) in [(false, false), (true, false), (false, true), (true, true)] {
+        (st.left_open, st.dock_open) = (l, r);
+        for w in [1400.0, 1000.0] {
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "left {l} right {r} at {w}");
+        }
+    }
+}
+
+/// The docks' tab choice and open flags are display state: clicking them records no action.
+#[test]
+fn the_docks_state_is_not_recorded() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let outs = [click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log"), click_widget(&ctx, &mut st, &inp, "dock-chevron-Left")];
+    assert!(outs.iter().flatten().all(|o| o.actions.is_empty() && o.commands.is_empty()), "no action, no command");
 }

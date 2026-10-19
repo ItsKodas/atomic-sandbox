@@ -25,20 +25,32 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
 /// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// activity|selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
+/// activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
+/// others on the right; the left dock starts open on Readouts, the right one collapsed), `dock=closed`
+/// collapses both, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
 /// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
 /// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would),
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
-/// `names=common|stoichiometric|hydride|formula` sets the molecule name style,
+/// `names=common|stoichiometric|hydride|formula` sets the molecule name style, `angles=on|off` the
+/// bond-angle overlay (on by default),
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
 /// O at 57³ on the GPU), `wait=model` shoots once the pass has ended and a model is fitted
 /// (trusted or not: for the trust checklist of a refused model), `training=open` opens the
 /// Activity tab's Training section and waits for the worker's first training views.
 ///
 /// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
+///
+/// `ghost=on|off` switches View ▸ Display aids ▸ show what training is solving (on by default: a
+/// `wait=sampling` shot then shows the geometry the pass is solving, not the scene);
+/// `wait=nudge|scan|burst` is `wait=sampling` until the pass is in that stage (and has finished a
+/// job, so the green / red / grey flash is up).
+///
+/// Atom trails (View ▸ Display aids ▸ Trails): `trails=on|off`, `trail_fs=<fs>` (the length in
+/// simulated femtoseconds, 5–10 000; 100 by default) and `trail_opacity=<0-100>` (percent; 70 by
+/// default). They are set before the play, so the history is collected while it runs.
 ///
 /// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
 /// the training plots and the timeline: the last three for the estimated solver).
@@ -63,6 +75,11 @@ pub struct ShotUi {
     pub thermostat: Option<f64>,
     pub opacity: Option<f32>,
     pub wait_sampling: bool,
+    /// `wait=nudge|scan|burst`: `wait=sampling`, but until the pass is in that stage (its ghost job
+    /// is a random nudge / a bond-scan point / a hot-burst step).
+    pub wait_stage: Option<&'static str>,
+    /// `ghost=on|off`: View ▸ Display aids ▸ show what training is solving (default on).
+    pub ghost: Option<bool>,
     pub drag: Option<usize>,
     pub pull: Option<f64>,
     pub ptable: Option<String>,
@@ -72,6 +89,8 @@ pub struct ShotUi {
     /// `plan=quick|gentle|standard|hot`: the sampling preset of the first pass.
     pub plan: Option<usize>,
     pub names: Option<crate::names::NameStyle>,
+    /// `angles=on|off`: the bond-angle overlay (View ▸ Bonds and molecules ▸ bond angles).
+    pub angles: Option<bool>,
     /// Camera yaw / pitch (radians) and distance
     /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
     /// `dotcolour=orbital`, `nuclei=<scale>`.
@@ -84,6 +103,10 @@ pub struct ShotUi {
     pub aids_off: bool,
     pub dots_by_orbital: Option<bool>,
     pub nucleus_scale: Option<f32>,
+    /// `trails=on|off`, `trail_fs=<fs>`, `trail_opacity=<0-100>`.
+    pub trails: Option<bool>,
+    pub trail_fs: Option<f64>,
+    pub trail_opacity: Option<f32>,
     pub show: Option<crate::ui::ShowMode>,
     pub orbital: Option<String>,
     pub unocc: Option<u8>,
@@ -113,10 +136,25 @@ impl ShotUi {
                 "opacity" => s.opacity = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "wait" => match v {
                     "sampling" => s.wait_sampling = true,
+                    "nudge" | "scan" | "burst" => {
+                        s.wait_sampling = true;
+                        s.wait_stage = Some(match v {
+                            "nudge" => "perturbations",
+                            "scan" => "scans",
+                            _ => "hot burst",
+                        });
+                    }
                     "bonds" => s.wait_bonds = true,
                     "model" => s.wait_model = true,
-                    other => return Err(format!("--ui: wait=sampling|bonds|model, got {other}")),
+                    other => return Err(format!("--ui: wait=sampling|nudge|scan|burst|bonds|model, got {other}")),
                 },
+                "ghost" => {
+                    s.ghost = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: ghost=on|off, got {other}")),
+                    })
+                }
                 "plan" => {
                     s.plan = Some(match v {
                         "quick" => 0,
@@ -139,6 +177,13 @@ impl ShotUi {
                         "hydride" => Hydride,
                         "formula" => FormulaOnly,
                         other => return Err(format!("--ui: names=common|stoichiometric|hydride|formula, got {other}")),
+                    })
+                }
+                "angles" => {
+                    s.angles = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: angles=on|off, got {other}")),
                     })
                 }
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -179,6 +224,27 @@ impl ShotUi {
                         "physical" => true,
                         other => return Err(format!("--ui: scale=peak|physical, got {other}")),
                     })
+                }
+                "trails" => {
+                    s.trails = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: trails=on|off, got {other}")),
+                    })
+                }
+                "trail_fs" => {
+                    let fs: f64 = v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?;
+                    if !(crate::trails::LENGTH_MIN_FS..=crate::trails::LENGTH_MAX_FS).contains(&fs) {
+                        return Err(format!("--ui: trail_fs is {} to {} fs, got {v}", crate::trails::LENGTH_MIN_FS, crate::trails::LENGTH_MAX_FS));
+                    }
+                    s.trail_fs = Some(fs);
+                }
+                "trail_opacity" => {
+                    let pct: f32 = v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?;
+                    if !(0.0..=100.0).contains(&pct) {
+                        return Err(format!("--ui: trail_opacity is 0 to 100 (percent), got {v}"));
+                    }
+                    s.trail_opacity = Some(pct);
                 }
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
@@ -225,6 +291,21 @@ impl ShotUi {
         }
     }
 
+    /// Atom trails as the keys ask (`trails=`, `trail_fs=`, `trail_opacity=`): set before the play,
+    /// so the history is collected while it runs.
+    fn apply_trails(&self, viewer: &mut Viewer) {
+        let ui = &mut viewer.ui;
+        if let Some(on) = self.trails {
+            ui.show_trails = on;
+        }
+        if let Some(fs) = self.trail_fs {
+            ui.trail_fs = fs;
+        }
+        if let Some(pct) = self.trail_opacity {
+            ui.trail_opacity = pct / 100.0;
+        }
+    }
+
     /// Switches the orbital view on as the keys ask (`show=`, `orbital=`) and waits for the
     /// payload that answers it — the first orbital payload, the picked orbital, and (above m = 0)
     /// the display eigensolve's rows. Not for the density.
@@ -245,7 +326,7 @@ impl ShotUi {
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
         if let Some(t) = &self.tab {
-            viewer.ui.dock_tab = match t.as_str() {
+            let tab = match t.as_str() {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
@@ -255,8 +336,13 @@ impl ShotUi {
                 "log" => DockTab::Log,
                 other => return Err(format!("--ui: unknown tab {other}")),
             };
+            // each tab opens its own dock (activity, readouts, graph: the left one)
+            viewer.ui.open_tab(tab);
         }
-        viewer.ui.dock_open = !self.dock_closed;
+        if self.dock_closed {
+            viewer.ui.dock_open = false;
+            viewer.ui.left_open = false;
+        }
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
         }
@@ -284,6 +370,9 @@ impl ShotUi {
             viewer.camera.distance = x;
         }
         viewer.ui.nucleus_scale = self.nucleus_scale;
+        if let Some(on) = self.ghost {
+            viewer.ui.show_ghost = on;
+        }
         if self.aids_off {
             viewer.ui.show_cell = false;
             viewer.ui.show_floor = false;
@@ -307,6 +396,9 @@ impl ShotUi {
         }
         if let Some(n) = self.names {
             viewer.ui.name_style = n;
+        }
+        if let Some(on) = self.angles {
+            viewer.ui.show_angles = on;
         }
         if let Some(q) = &self.ptable {
             viewer.ui.ptable_query = q.clone();
@@ -395,7 +487,7 @@ impl Shot {
             let risk = viewer.atom_risk();
             let world = World {
                 camera: &viewer.camera,
-                nuclei: &shown.nuclei,
+                nuclei: viewer.drawn_nuclei(&shown),
                 selected: viewer.tool.selected,
                 lines: &lines,
                 viewport: viewer.viewport,
@@ -448,7 +540,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     viewer.start(backend, Some(shot.hl.ctx.clone()));
     let (hl, painter) = (&shot.hl, &mut shot.painter);
     if o.ui.wait_sampling {
-        wait_for_sampling(&mut viewer, hl, painter)?;
+        wait_for_sampling(&mut viewer, hl, painter, o.ui.wait_stage)?;
     } else {
         wait_for_first_solve(&mut viewer, hl, painter)?;
     }
@@ -465,6 +557,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         viewer.ui.thermostat_t = t;
         viewer.send(Command::Dyn(sim::DynCommand::SetThermostat(Some((t, viewer.ui.thermostat_tau)))));
     }
+    o.ui.apply_trails(&mut viewer);
     if let Some(ms) = play_ms.filter(|_| !o.ui.wait_sampling) {
         if backend == Backend::Estimated {
             // the surrogate answers in microseconds: run the full steps per tick
@@ -521,8 +614,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     o.ui.apply(&mut viewer)?;
     if o.ui.training {
         // the Training section is open: its first frame tells the worker, which then builds the views
-        viewer.ui.dock_open = true;
-        viewer.ui.dock_tab = crate::ui::DockTab::Activity;
+        viewer.ui.open_tab(crate::ui::DockTab::Activity);
         viewer.ui.activity.training_open = true;
         shot.render(&mut viewer, Default::default());
         wait_for_views(&mut viewer, &shot.hl, &mut shot.painter)?;
@@ -631,10 +723,15 @@ pub fn wait_for_first_solve(
 
 /// Blocks until the estimated solver's first sampling pass is running and has done a few jobs
 /// (the sampling state of the mockup).
-fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, stage: Option<&str>) -> Result<(), String> {
     loop {
         let running = viewer.snapshot.as_ref().is_some_and(|s| {
-            crate::sim::sampling_active(&s.dynamics) && s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 8)
+            crate::sim::sampling_active(&s.dynamics)
+                && match stage {
+                    // `wait=nudge|scan|burst`: the ghost's job is in that stage, with a flash to show
+                    Some(st) => s.dynamics.ghost.as_ref().is_some_and(|g| g.stage == st && g.finished.is_some()),
+                    None => s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 8),
+                }
         });
         if running {
             return Ok(());
@@ -737,5 +834,46 @@ mod tests {
         let s = ShotUi::parse("tab=activity;wait=sampling").unwrap();
         assert_eq!(s.tab.as_deref(), Some("activity"));
         assert!(s.wait_sampling);
+    }
+
+    /// `ghost=on|off` (View ▸ Display aids ▸ show what training is solving) and the stage waits.
+    #[test]
+    fn the_ghost_key_parses() {
+        assert_eq!(ShotUi::parse("").unwrap().ghost, None);
+        assert_eq!(ShotUi::parse("ghost=on").unwrap().ghost, Some(true));
+        assert_eq!(ShotUi::parse("tab=activity; ghost=off").unwrap().ghost, Some(false));
+        assert!(ShotUi::parse("ghost=maybe").is_err());
+        assert!(ShotUi::parse("ghost").is_err());
+        let s = ShotUi::parse("wait=scan;ghost=on").unwrap();
+        assert!(s.wait_sampling);
+        assert_eq!(s.wait_stage, Some("scans"));
+        assert_eq!(ShotUi::parse("wait=burst").unwrap().wait_stage, Some("hot burst"));
+        assert_eq!(ShotUi::parse("wait=nudge").unwrap().wait_stage, Some("perturbations"));
+        assert_eq!(ShotUi::parse("wait=sampling").unwrap().wait_stage, None);
+        assert!(ShotUi::parse("wait=lunch").is_err());
+    }
+
+    #[test]
+    fn trail_keys_are_ui_values() {
+        let s = ShotUi::parse("trails=on;trail_fs=200;trail_opacity=40").unwrap();
+        assert_eq!((s.trails, s.trail_fs, s.trail_opacity), (Some(true), Some(200.0), Some(40.0)));
+        let off = ShotUi::parse("trails=off").unwrap();
+        assert_eq!((off.trails, off.trail_fs, off.trail_opacity), (Some(false), None, None));
+        let none = ShotUi::parse("tab=graph").unwrap();
+        assert_eq!((none.trails, none.trail_fs, none.trail_opacity), (None, None, None));
+        // the ends of both ranges are accepted, outside them and nonsense are refused
+        assert!(ShotUi::parse("trail_fs=5;trail_opacity=0").is_ok());
+        assert!(ShotUi::parse("trail_fs=10000;trail_opacity=100").is_ok());
+        for bad in ["trails=maybe", "trail_fs=4", "trail_fs=10001", "trail_fs=x", "trail_opacity=101", "trail_opacity=-1", "trail_opacity=half"] {
+            assert!(ShotUi::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn angles_is_an_on_off_ui_value() {
+        assert_eq!(ShotUi::parse("angles=off").unwrap().angles, Some(false));
+        assert_eq!(ShotUi::parse("angles=on;select=0").unwrap().angles, Some(true));
+        assert_eq!(ShotUi::parse("select=0").unwrap().angles, None);
+        assert!(ShotUi::parse("angles=maybe").is_err());
     }
 }

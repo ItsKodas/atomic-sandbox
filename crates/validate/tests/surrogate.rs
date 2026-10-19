@@ -153,6 +153,15 @@
 //!   trusted at the end. Measured: 31 rule-1/rule-4 fallbacks, first trusted fit before step 32
 //!   (n = 32 ≥ Q′ = 29 with dof_E 31 ≥ 30), then 5 audits; 38 DFT calls in all for 300 steps.
 //!   Total DFT calls reported.
+//! - `teaching_around_a_blocker_restores_its_class` (2026-10-18, the physics review's ruling 5):
+//!   the Morse fixture `gap_blocked(2.0, 3.6)` of `providers::surrogate::tests` on the real
+//!   teacher — a references-only pass, 40 H₂ solves on 1.1–2.0 Bohr (random orientations, seeded)
+//!   and one at 3.6 Bohr beyond the gap; the lone sample is a leverage blocker (in-sample within
+//!   its bound, the pair class's leave-one-out beyond 1×: asserted as the premise, numbers
+//!   printed). A teach-around pass (`SurrogateKs::start_teach`, ≈ 10 solves, two held out) must
+//!   be accepted under the **unchanged** class rule with the blocker kept in the fit: the pair
+//!   class trusted, the model trusted, both held-out checks within the audit criterion, the
+//!   blocker neither quarantined nor out of the fit. Solve count reported.
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (the `Locked`
 //! teacher), one evaluation at a time, so the per-solve times in the timing rows are uncontended
@@ -1305,4 +1314,105 @@ fn box_rule_on_the_default_and_accurate_grids() {
         }
     }
     println!("{out}");
+}
+
+/// Teaching around the blockers on the real teacher (module doc,
+/// `teaching_around_a_blocker_restores_its_class`).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
+fn teaching_around_a_blocker_restores_its_class() {
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut s, log) = student(&ctx, 0);
+    let mut out = String::new();
+    let start = h2(1.6);
+    let mut refs = Sampler::new(&start, &SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() }).unwrap();
+    while refs.step_own_teacher(&mut s, &mut never()).unwrap_or_else(|e| panic!("reference: {e}")).is_some() {}
+    s.reset();
+    let mut rng = StdRng::seed_from_u64(seed() ^ 0x7EAC);
+    let mut unit = || loop {
+        let v: [f64; 3] = [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)];
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if (1e-3..1.0).contains(&n) {
+            return v.map(|x| x / n);
+        }
+    };
+    let dimer = |r: f64, u: [f64; 3]| scene(N_H2, vec![Nucleus::new(1, u.map(|x| 0.5 * r * x)), Nucleus::new(1, u.map(|x| -0.5 * r * x))]);
+    const WINDOW: usize = 40;
+    const R_GAP: f64 = 3.6;
+    for i in 0..=WINDOW {
+        let r = if i < WINDOW { 1.1 + 0.9 * i as f64 / (WINDOW - 1) as f64 } else { R_GAP };
+        let sc = dimer(r, unit());
+        s.discontinuity();
+        s.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("r = {r}: {e}"));
+    }
+    s.discontinuity();
+    assert_eq!(s.samples(), WINDOW + 1, "every solve kept");
+    s.refit().unwrap_or_else(|e| panic!("refit: {e}"));
+    let blocker = WINDOW;
+    let diag = s.teach_diagnosis();
+    let _ = writeln!(out, "H₂ {N_H2}³: {WINDOW} solves on 1.1–2.0 Bohr + one at {R_GAP}; classes: {}; diagnosis {diag:?}", class_summary(&s));
+    let b = diag.iter().find(|b| b.index == blocker).unwrap_or_else(|| panic!("premise: the {R_GAP} Bohr sample blocks the pair class: {diag:?}\n{out}"));
+    assert!(b.teachable(), "premise: a leverage blocker (in-sample ≤ 1, LOO > 1): {b:?}");
+    assert!(!s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let calls0 = snapshot(&log).calls;
+    let n0 = s.samples();
+    s.start_teach(&start).unwrap_or_else(|e| panic!("start_teach: {e}"));
+    loop {
+        match sim::Trainable::pass_step(&mut s, &mut never()) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(sim::ProviderError::Cancelled) => continue,
+            Err(e) => panic!("teach pass: {e}"),
+        }
+    }
+    let solves = snapshot(&log).calls - calls0;
+    let notes = sim::Trainable::take_notes(&mut s);
+    let outcome = notes.iter().rev().find(|n| n.starts_with(&format!("teaching around #{blocker}"))).cloned().unwrap_or_else(|| panic!("no outcome note: {notes:?}"));
+    let _ = writeln!(out, "  teach-around: {solves} solves, {} kept; {outcome}\n  classes after: {}; trusted {} ({:?})", s.samples() - n0, class_summary(&s), s.trusted(), s.untrusted_reason());
+    println!("{out}");
+    assert!(outcome.contains(": accepted"), "{outcome}");
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.teach_diagnosis().iter().all(|b| b.index != blocker), "the blocker no longer blocks");
+    assert_eq!(s.quarantined(), 0, "nothing was taken out of the fit");
+    assert!(solves <= providers::TEACH_PERTURBATIONS + providers::TEACH_PATH_POINTS);
+    let l = snapshot(&log);
+    record(&ctx, timing_row("teach_around_blocker", "H₂", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("{solves} teach solves: {outcome}")));
+}
+
+/// Round 3 review R3-1 (c), the measurement of record for the scan limit (`references.md`, "pair
+/// scans stop short of r_cut"): LiH (Li–H 3.0 Bohr, the preset's separation, centred; at 57³ × 0.25,
+/// the preset's grid, and 81³ × 0.25, a 20 Bohr box; `LIH_GRIDS` overrides) — the one preset whose default scan crosses 5/6 of r_cut — sampled by the
+/// default pass through the `Trainable` face (seed 7), whose refit judges the Li–H shell check.
+/// Report-only: prints the shell check's verdict and the trust state.
+#[test]
+#[ignore = "measurement (round 3 R3-1 c): cargo test -p validate --release --test surrogate lih_shell_check -- --ignored --nocapture"]
+fn lih_shell_check_measurement() {
+    use sim::Trainable;
+    let Some(ctx) = gpu() else { return };
+    // the preset's grid (57³: the shell point's density reaches the faces) and a 20 Bohr box
+    let grids: Vec<usize> = std::env::var("LIH_GRIDS").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_else(|| vec![57, 81]);
+    for n in grids {
+        let t = Instant::now();
+        let (mut s, log) = student(&ctx, 0);
+        let scene = common::lih(n, 3.0);
+        let plan = SamplingPlan { seed: SEED, ..SamplingPlan::default() };
+        let mut refs = sim::AtomReferences::default();
+        s.start_pass(&scene, &plan, &mut refs).unwrap_or_else(|e| panic!("start_pass: {e}"));
+        loop {
+            match s.pass_step(&mut never()) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(sim::ProviderError::Cancelled) => continue,
+                Err(e) => panic!("pass: {e}"),
+            }
+        }
+        let notes = s.take_notes();
+        println!("LiH {n}³ × {H}, Li–H 3.0 Bohr, default pass seed {SEED}: {} samples, trusted {} ({:?}); classes: {}", s.samples(), s.trusted(), s.untrusted_reason(), class_summary(&s));
+        for note in notes.iter().filter(|x| x.contains("shell") || x.contains("cutoff") || x.contains("still interacts")) {
+            println!("  {note}");
+        }
+        println!("  teacher: {}; wall {:.0} s", snapshot(&log).summary(), t.elapsed().as_secs_f64());
+    }
 }

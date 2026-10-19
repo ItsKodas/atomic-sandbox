@@ -62,7 +62,7 @@
 //! such an entry as missing, so the table is solved when first needed.
 use crate::provider::{ForceProvider, ProviderError};
 use crate::sampling::allowed_multiplicities;
-use crate::scene::{neumaier, Cell, Nucleus, Scene, CELL_MARGIN_H};
+use crate::scene::{neumaier, Cell, IonicPolicy, Nucleus, Scene, CELL_MARGIN_H};
 
 /// The spherically averaged density of an isolated atom as (r, ln ρ) entries in ascending r
 /// (module doc, "Shell binning"); empty before the atom was solved or when the provider holds
@@ -183,12 +183,17 @@ pub struct ReferenceKey {
     pub tol: f64,
     pub teacher: String,
     pub z: u8,
+    /// The ionic surface the atom was solved on (M7; `ForceProvider::ionic_tag`, `providers::pseudo::provenance_tag`):
+    /// `"none"` for the all-electron surface, else `"<policy>/<recipe hash>"`. An atom solved on one surface is never
+    /// reused on another — the valence energies differ by tens of Ha.
+    pub ionic: String,
 }
 
 impl ReferenceKey {
-    /// The key of species `z` at `cell` and `sigma` (`None` = h), solved by `teacher` at `tol`.
-    pub fn new(cell: &Cell, sigma: Option<f64>, tol: Option<f64>, teacher: &str, z: u8) -> ReferenceKey {
-        ReferenceKey { grid_n: cell.n, h: cell.h, sigma: sigma.unwrap_or(cell.h), tol: tol.unwrap_or(0.0), teacher: teacher.to_string(), z }
+    /// The key of species `z` at `cell` and `sigma` (`None` = h), solved by `teacher` at `tol` on the ionic
+    /// surface `ionic` (module doc; `"none"` = all-electron).
+    pub fn new(cell: &Cell, sigma: Option<f64>, tol: Option<f64>, teacher: &str, z: u8, ionic: &str) -> ReferenceKey {
+        ReferenceKey { grid_n: cell.n, h: cell.h, sigma: sigma.unwrap_or(cell.h), tol: tol.unwrap_or(0.0), teacher: teacher.to_string(), z, ionic: ionic.to_string() }
     }
 }
 
@@ -300,6 +305,7 @@ pub struct AtomScan {
     mass: f64,
     cell: Cell,
     sigma: Option<f64>,
+    ionic: IonicPolicy,
     remaining: Vec<u32>,
     /// (multiplicity, energy, its radial density), in the order solved.
     tried: Vec<(u32, f64, RadialDensity)>,
@@ -307,9 +313,10 @@ pub struct AtomScan {
 }
 
 impl AtomScan {
-    /// The scan of species `z` (mass number `a`, mass in mₑ) on `cell` at `sigma` (`None` = h).
-    pub fn new(cell: &Cell, sigma: Option<f64>, z: u8, a: u16, mass: f64) -> AtomScan {
-        AtomScan { z, a, mass, cell: cell.clone(), sigma, remaining: allowed_multiplicities(z as u32), tried: Vec::new(), failed: Vec::new() }
+    /// The scan of species `z` (mass number `a`, mass in mₑ) on `cell` at `sigma` (`None` = h) under the ionic
+    /// policy `ionic` (the scene's: a lone O under `CoresOnly` is the pseudo-O the molecule's bonds are read against).
+    pub fn new(cell: &Cell, sigma: Option<f64>, ionic: IonicPolicy, z: u8, a: u16, mass: f64) -> AtomScan {
+        AtomScan { z, a, mass, cell: cell.clone(), sigma, ionic, remaining: allowed_multiplicities(z as u32), tried: Vec::new(), failed: Vec::new() }
     }
 
     pub fn z(&self) -> u8 {
@@ -349,6 +356,7 @@ impl AtomScan {
             multiplicity: Some(m),
             sigma: self.sigma,
             external_field: [0.0; 3],
+            ionic: self.ionic,
         }
     }
 
@@ -409,8 +417,8 @@ pub fn read_radial(provider: &mut dyn ForceProvider, cell: &Cell) -> RadialDensi
 /// state is never the atom's; `tol` and the name are recorded from it. `Err(Cancelled)` when
 /// `should_abort` ended a solve (the provider is reset); a multiplicity whose solve fails is left
 /// out, and the error is returned only when none succeeded.
-pub fn solve_atom(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool) -> Result<AtomReference, ProviderError> {
-    solve_atom_reporting(provider, cell, sigma, z, mass, should_abort, &mut |_| {})
+pub fn solve_atom(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, ionic: IonicPolicy, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool) -> Result<AtomReference, ProviderError> {
+    solve_atom_reporting(provider, cell, sigma, ionic, z, mass, should_abort, &mut |_| {})
 }
 
 /// The multiplicities [`solve_atom`] solves for species `z` (the scan's length: the "of n" of a
@@ -421,9 +429,9 @@ pub fn multiplicities(z: u8) -> usize {
 
 /// [`solve_atom`], calling `done(k)` after the k-th multiplicity's solve (solved or failed) —
 /// the progress the driver shows for a reference solving off the stepping path.
-pub fn solve_atom_reporting(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool, done: &mut dyn FnMut(usize)) -> Result<AtomReference, ProviderError> {
+pub fn solve_atom_reporting(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, ionic: IonicPolicy, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool, done: &mut dyn FnMut(usize)) -> Result<AtomReference, ProviderError> {
     let a = units::most_abundant_a(z).unwrap_or(0);
-    let mut scan = AtomScan::new(cell, sigma, z, a, mass);
+    let mut scan = AtomScan::new(cell, sigma, ionic, z, a, mass);
     let total = scan.remaining().len();
     let mut last_err: Option<ProviderError> = None;
     while !scan.is_done() {
@@ -471,7 +479,7 @@ mod tests {
         let dr = 0.125;
         let mut g = Gaussians::per_atom(a, w);
         let cell = Cell { n: 49, h: 0.25 };
-        let r = solve_atom(&mut g, &cell, None, 1, 1837.15, &mut || false).unwrap();
+        let r = solve_atom(&mut g, &cell, None, IonicPolicy::None, 1, 1837.15, &mut || false).unwrap();
         assert_eq!(r.multiplicity, Some(2));
         assert_eq!((r.tol, r.provider.as_str()), (0.0, "gaussians"));
         let t = &r.radial;
@@ -537,7 +545,7 @@ mod tests {
         }
         let mut p = ByMultiplicity { resets: 0, seen: Vec::new() };
         let cell = Cell { n: 17, h: 0.5 };
-        let r = solve_atom(&mut p, &cell, Some(0.3), 2, 7000.0, &mut || false).unwrap();
+        let r = solve_atom(&mut p, &cell, Some(0.3), IonicPolicy::None, 2, 7000.0, &mut || false).unwrap();
         assert_eq!((r.multiplicity, r.energy), (Some(3), -1.2));
         assert_eq!((r.tol, r.provider.as_str()), (1e-7, "scripted"));
         assert!(r.radial.is_empty());
@@ -560,7 +568,7 @@ mod tests {
             }
         }
         let mut c = CancelOnce(false);
-        let mut scan = AtomScan::new(&cell, None, 2, 4, 7000.0);
+        let mut scan = AtomScan::new(&cell, None, IonicPolicy::None, 2, 4, 7000.0);
         assert_eq!(scan.step(&mut c, &mut || false).unwrap(), Some((1, -1.0)));
         assert!(matches!(scan.step(&mut c, &mut || true), Err(ProviderError::Cancelled)));
         assert_eq!(scan.remaining(), &[3]);
@@ -572,7 +580,7 @@ mod tests {
     #[test]
     fn missing_counts_seeded_energies_without_a_table() {
         let cell = Cell { n: 33, h: 0.25 };
-        let key = |z: u8| ReferenceKey::new(&cell, None, Some(1e-6), "t", z);
+        let key = |z: u8| ReferenceKey::new(&cell, None, Some(1e-6), "t", z, "none");
         let mut refs = AtomReferences::default();
         assert_eq!(refs.missing(key, &[1, 8, 1]), vec![1, 8]);
         refs.seed_energy(key(1), -0.478, None, 1e-6, "t");
@@ -586,9 +594,9 @@ mod tests {
         refs.seed_energy(key(1), -0.5, None, 1e-6, "t");
         assert_eq!(refs.get(&key(1)), Some(&full));
         // another tolerance or solver is another key
-        assert_eq!(refs.missing(|z| ReferenceKey::new(&cell, None, Some(1e-5), "t", z), &[1]), vec![1]);
-        assert_eq!(refs.missing(|z| ReferenceKey::new(&cell, None, Some(1e-6), "u", z), &[1]), vec![1]);
-        assert_eq!(ReferenceKey::new(&cell, None, None, "t", 1), ReferenceKey { grid_n: 33, h: 0.25, sigma: 0.25, tol: 0.0, teacher: "t".into(), z: 1 });
+        assert_eq!(refs.missing(|z| ReferenceKey::new(&cell, None, Some(1e-5), "t", z, "none"), &[1]), vec![1]);
+        assert_eq!(refs.missing(|z| ReferenceKey::new(&cell, None, Some(1e-6), "u", z, "none"), &[1]), vec![1]);
+        assert_eq!(ReferenceKey::new(&cell, None, None, "t", 1, "none"), ReferenceKey { grid_n: 33, h: 0.25, sigma: 0.25, tol: 0.0, teacher: "t".into(), z: 1, ionic: "none".into() });
     }
 
     /// The interpolation rules: exact for an exponential tail beyond the first segment, exact for
@@ -631,5 +639,33 @@ mod tests {
         // a zero value is clamped, not a NaN
         let z = RadialDensity::from_shells(&[[0.0; 3], [1.0, 0.0, 0.0]], &[1.0, 0.0], [0.0; 3], 0.5);
         assert!(z.log_rho[1].is_finite() && z.at(1.0) > 0.0 && z.at(1.0) < 1e-200);
+    }
+}
+
+#[cfg(test)]
+mod ionic_tests {
+    use super::*;
+
+    /// M7 Task 9: an atom solved on one ionic surface is never reused on another (the valence energies differ
+    /// by tens of Ha): the surface is part of the key.
+    #[test]
+    fn a_reference_is_keyed_by_its_ionic_surface() {
+        let cell = Cell { n: 33, h: 0.25 };
+        let a = ReferenceKey::new(&cell, None, Some(1e-6), "t", 8, "none");
+        let b = ReferenceKey::new(&cell, None, Some(1e-6), "t", 8, "cores/0123456789abcdef/shared1e-3");
+        assert_ne!(a, b);
+        let mut refs = AtomReferences::default();
+        refs.seed_energy(a.clone(), -41.5, None, 1e-6, "t");
+        assert!(refs.get(&a).is_some() && refs.get(&b).is_none(), "the pseudo surface does not see the all-electron atom");
+    }
+
+    /// The atom scan solves the lone atom under the scene's policy.
+    #[test]
+    fn the_scan_scene_carries_the_policy() {
+        let cell = Cell { n: 33, h: 0.25 };
+        for p in IonicPolicy::ALL {
+            let scan = AtomScan::new(&cell, None, p, 8, 16, 29166.0);
+            assert_eq!(scan.scene(3).ionic, p);
+        }
     }
 }

@@ -13,6 +13,9 @@ use crate::sim::Backend;
 use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Vec2};
 
 pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    if let Some(s) = input.snapshot {
+        st.temp_avg.observe(ctx.input(|i| i.time), &s.dynamics);
+    }
     if view.width() < 50.0 || view.height() < 50.0 {
         return;
     }
@@ -20,7 +23,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
-            let r = crate::atom_card::show(ctx, pos2(view.right() - 12.0, right_y), n, i);
+            let pseudo = input.snapshot.and_then(|s| super::pseudo::of_species(&s.dynamics.eval.pseudised, n.z));
+            let r = crate::atom_card::show(ctx, pos2(view.right() - 12.0, right_y), n, i, pseudo);
             right_y = r.bottom() + 10.0;
         }
     }
@@ -34,6 +38,21 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
                 theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.5))).show(ui, |ui| {
                     ui.set_max_width(300.0);
                     dock::offer(ui, o, acts);
+                });
+            });
+    }
+    model_offer_card(ctx, view, st, input, acts);
+    // the teach-around prompt: one click, never run by itself
+    if let Some(m) = input.model().filter(|_| teach_prompt(input).is_some()) {
+        egui::Area::new(Id::new("teach-prompt-card"))
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(pos2(view.right() - 12.0, right_y))
+            .order(Order::Middle)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.5))).show(ui, |ui| {
+                    ui.set_max_width(300.0);
+                    dock::teach_row(ui, m, input.sampling(), acts);
                 });
             });
     }
@@ -107,7 +126,7 @@ pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     let snap = input.snapshot;
     let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics)));
     if let Some(p) = sampling {
-        (true, format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total))
+        (true, format!("sampling the teacher: {} {}/{}", crate::ui::activity::words::pass_stage(p), p.done, p.total))
     } else if input.scene.nuclei.is_empty() && !input.busy {
         // playing or not: nothing moves until an atom is placed
         (false, super::EMPTY_STATUS.into())
@@ -145,6 +164,9 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
         v.push((theme::INK_DIM, bond_reference_line(&r)));
     }
+    if let Some(g) = input.pseudo_generating {
+        v.push((theme::INK_DIM, generating_line(g)));
+    }
     if !st.status.is_empty() {
         let asks = st.status.starts_with("paused:") || st.status.contains("press ");
         v.push((if asks { super::AMBER } else { theme::INK_DIM }, st.status.clone()));
@@ -152,7 +174,23 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.last_rejection.as_ref()) {
         v.push((super::AMBER, format!("refused: {r}")));
     }
+    if let Some(p) = teach_prompt(input) {
+        v.push((super::AMBER, format!("stuck on DFT: {p}")));
+    }
     v
+}
+
+/// The teach-around prompt (`sim::TeachOffer::prompt`): consecutive class-rule fallbacks blocked by
+/// a sample far from here; `None` while a pass runs.
+pub fn teach_prompt<'a>(input: &'a PanelInput<'_>) -> Option<&'a str> {
+    input.model().and_then(|m| m.teach_offer.as_ref()).and_then(|o| o.prompt.as_deref()).filter(|_| !input.sampling())
+}
+
+/// "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s" — the first solve of a scene waits for its tables
+/// (M7 Task 11; controller's cost condition: the minute is said, never silent). Without the gate: "(seconds)".
+pub fn generating_line((z, secs, gated): (u8, f64, bool)) -> String {
+    let what = if gated { "≈ 1 min: its dimer check" } else { "seconds" };
+    format!("generating the {} pseudopotential ({what})… {secs:.0} s", units::isotopes::symbol(z))
 }
 
 /// "bond references: O 2/3… (14 s)": the species, the multiplicity being solved of the scan's
@@ -225,7 +263,8 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui.label(RichText::new(format!("t {:.2} fs", d.sim_time_fs())).monospace());
                         ui.label(RichText::new(format!("step {}", d.step)).monospace().color(theme::INK_DIM));
                         sep(ui);
-                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0, st.temp_units))).monospace());
+                        ui.label(RichText::new(format!("T {}", super::averaged_temperature_text(d, &st.temp_avg, 0, st.temp_units))).monospace())
+                            .on_hover_text(format!("kinetic temperature averaged over the last second; this step: {}", super::temperature_text(d, 1, st.temp_units)));
                         if let Some((t, tau)) = d.thermostat {
                             ui.label(RichText::new(format!("CSVR {}", st.temp_units.show(t, 0))).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
                         }
@@ -241,6 +280,62 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
         })
         .response
         .rect
+}
+
+/// The title, the Apply button and the Cancel button of [`model_offer_card`] (the tests and the docs quote them).
+pub const OFFER_TITLE: &str = "This model was taught at other settings than this scene's";
+pub const OFFER_APPLY: &str = "Apply the model's settings and load";
+pub const OFFER_CANCEL: &str = "Cancel";
+pub const OFFER_NOTE: &str = "Apply changes only the settings listed (the nuclei stay where they are), then loads the model. Cancel leaves everything as it is.";
+
+/// The card for a picked model file whose settings differ from the scene's (`ui::model_offer`): each
+/// differing setting as "model: X · scene: Y", what cannot be applied and why, and the two buttons.
+fn model_offer_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let Some(o) = st.model_offer.as_ref() else { return };
+    let sampling = input.sampling();
+    let blocked = o.blocked();
+    egui::Area::new(Id::new("model-offer-card"))
+        .pivot(Align2::CENTER_CENTER)
+        .fixed_pos(view.center())
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.6))).show(ui, |ui| {
+                ui.set_width(460.0f32.min(view.width() - 40.0));
+                ui.label(RichText::new(OFFER_TITLE).strong());
+                ui.label(RichText::new(o.path.display().to_string()).monospace().size(11.0).color(theme::INK_DIM));
+                ui.add_space(4.0);
+                for r in &o.rows {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(r.name).strong());
+                        ui.label(RichText::new(r.versus()).monospace().size(11.5));
+                    });
+                    if let Some(b) = &r.blocked {
+                        ui.add(egui::Label::new(RichText::new(format!("cannot be applied: {b}")).size(11.0).color(super::AMBER)).wrap());
+                    }
+                    if let Some(n) = &r.note {
+                        ui.add(egui::Label::new(RichText::new(n).size(11.0).color(theme::INK_DIM)).wrap());
+                    }
+                }
+                ui.add_space(4.0);
+                theme::note(ui, OFFER_NOTE);
+                ui.horizontal(|ui| {
+                    let apply = egui::Button::new(RichText::new(OFFER_APPLY).strong());
+                    let why = if sampling { Some("a sampling pass is running: cancel it first") } else { blocked.map(|_| "a setting listed above cannot be applied") };
+                    let r = ui.add_enabled(why.is_none(), apply);
+                    let r = match why {
+                        Some(w) => r.on_disabled_hover_text(w),
+                        None => r.on_hover_text("set the grid, σ, charge, multiplicity, ionic potential and isotopes listed to the model's, then load it"),
+                    };
+                    if r.clicked() {
+                        acts.push(Action::ApplyModelSettings);
+                    }
+                    if ui.button(OFFER_CANCEL).on_hover_text("close this card; nothing is changed or loaded").clicked() {
+                        acts.push(Action::CancelModelOffer);
+                    }
+                });
+            });
+        });
 }
 
 /// Returns the card's top edge when it is shown.
@@ -329,8 +424,7 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
             });
         });
     if open_log {
-        st.dock_open = true;
-        st.dock_tab = super::DockTab::Log;
+        st.open_tab(super::DockTab::Log);
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(500));
 }

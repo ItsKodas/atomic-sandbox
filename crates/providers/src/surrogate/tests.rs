@@ -37,6 +37,7 @@ fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3], z0: u8, z1: u8) -> Scene {
         multiplicity: None,
         sigma: None,
         external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
     }
 }
 
@@ -862,10 +863,12 @@ fn a_failed_audit_on_the_refresh_after_a_refit_books_the_pending_jump_too() {
     assert!(refreshed.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", refreshed.notes);
 }
 
-/// Ruling S15, fallback thinning (module doc, "Trust recovery"): fallbacks at one geometry
-/// while the model is untrusted for its residuals (not for want of data) keep one sample in
-/// [`THIN_EVERY`]; a geometry far from every stored one is kept at once; while the trust rule
-/// still needs samples (n_samples < Q′) every answer is kept.
+/// Ruling S15, fallback thinning (module doc, "Trust recovery"), with round 1 of the 2026-10-18
+/// trust review (MUST-2, `is_label_copy`): fallbacks at one geometry while the model is untrusted
+/// for its residuals keep the first answer (a new label) and none of its repetitions — copies of a
+/// stored sample, labels within the fit's noise (before: one in [`THIN_EVERY`] was kept — rows that
+/// shrink the fitted noise); a geometry far from every stored one is kept at once; while the trust
+/// rule still needs samples a new answer is kept and its repetitions are not.
 #[test]
 fn thinning_keeps_one_in_ten_near_identical_fallbacks_and_every_far_one() {
     let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
@@ -874,29 +877,28 @@ fn thinning_keeps_one_in_ten_near_identical_fallbacks_and_every_far_one() {
     s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
     assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"));
     let n0 = s.samples();
-    let mut thinned_notes = 0;
+    let mut copies = 0;
     for _ in 0..25 {
         let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
         assert_eq!(r.stats.source, Source::Fallback);
-        thinned_notes += r.stats.notes.iter().filter(|n| n.contains("sample not kept")).count();
+        copies += r.stats.notes.iter().filter(|n| n.contains("sample not kept — a copy")).count();
     }
-    println!("25 fallbacks at r = 1.6: {} kept, {thinned_notes} thinned", s.samples() - n0);
-    assert_eq!(s.samples() - n0, 3, "the 1st, 11th and 21st are kept");
-    assert_eq!(thinned_notes, 22);
-    // far from every stored geometry: kept right away (4 thinned since the last kept one)
+    println!("25 fallbacks at r = 1.6: {} kept, {copies} copies", s.samples() - n0);
+    assert_eq!((s.samples() - n0, copies), (1, 24), "the first is a new label, the rest are its copies");
+    // far from every stored geometry: kept right away
     let far = s.nearest_stored(&h2(4.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]);
     s.evaluate(&h2(4.0), &mut never()).unwrap();
     println!("r = 4.0 is {far:.1} training spreads from the nearest stored sample: kept");
     assert!(far > THIN_FRACTION * FallbackPolicy::default().max_descriptor_distance);
-    assert_eq!(s.samples() - n0, 4);
-    // a model that still needs data keeps every answer
+    assert_eq!(s.samples() - n0, 2);
+    // a model that still needs data keeps a new answer, and not its repetitions
     let (mut few, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
     assert!(few.untrusted_reason().unwrap().starts_with("n_samples"));
     let m0 = few.samples();
     for _ in 0..5 {
         few.evaluate(&h2(1.6), &mut never()).unwrap();
     }
-    assert_eq!(few.samples() - m0, 5);
+    assert_eq!(few.samples() - m0, 1);
 }
 
 /// Ruling S15, quarantine and supersession: one stray sample (the teacher's energy at an
@@ -1362,10 +1364,12 @@ fn draft_mode_audits_keep_teaching_and_never_block() {
     // the teacher drifts: the next audit fails, the model is untrusted and still answers
     h.lock().unwrap().d *= 1.1;
     step_until(&mut d, "a failed audit", |_| surrogate_of(&sh_d).last_audit().is_some_and(|a| a.verdict == AuditVerdict::Failed));
-    assert!(!surrogate_of(&sh_d).trusted());
+    // at r = 3.2 strict mode refuses: the audit judged the guess, not the strict model (fix (b),
+    // 2026-10-18) — recorded, held out of the fit, trust unchanged
+    assert!(surrogate_of(&sh_d).trusted() && surrogate_of(&sh_d).held_out() >= 1);
     d.apply(DynCommand::Step(3));
     let t = d.tick(f64::INFINITY, &mut never());
-    assert_eq!(t.source, Source::Surrogate, "untrusted, still answering in draft mode");
+    assert_eq!(t.source, Source::Surrogate, "still answering in draft mode");
     // draft off: the teacher's step, the flip booked at its positions
     let e0 = t.energy_conserved;
     let p = FallbackPolicy { never_fallback: false, ..*surrogate_of(&sh_d).policy() };
@@ -1933,7 +1937,7 @@ fn gpu_round_trip(ctx: gpu::GpuContext, n_grid: usize) -> (f64, f64, f64) {
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     // the H reference from the teacher itself (an isolated atom at the same settings)
-    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let e_h = s.evaluate(&atom, &mut never()).unwrap().energy;
     s.set_reference_energy(1, e_h);
     // 40 scan geometries on r ∈ [1.1, 2.0]: every fallback keeps its sample
@@ -1979,7 +1983,7 @@ fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
     fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3]) -> Scene {
         let p0: [f64; 3] = std::array::from_fn(|a| origin[a] - 0.5 * r * dir[a]);
         let p1: [f64; 3] = std::array::from_fn(|a| origin[a] + 0.5 * r * dir[a]);
-        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
     }
     fn bond(s: &Scene) -> f64 {
         let (a, b) = (s.nuclei[0].pos, s.nuclei[1].pos);
@@ -3325,7 +3329,25 @@ fn fnv1a(text: &str) -> u64 {
 /// test) with this one, build it with its own target dir and run this test there with
 /// `GOLDEN_TRACE=<a>`; run it here with `GOLDEN_TRACE=<b>`; `cmp <a> <b>` must report the
 /// traces identical except for the new field's own text — only then re-pin the digest.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x5b8e_8f79_b7d5_94d1;
+///
+/// **Re-pinned for M7 Task 9** (0x5b8e_8f79_b7d5_94d1 → below; again in fix round 1): `EvalStats` gained `pseudised`,
+/// `core_overlaps`, `fractional`, `occupation_changed` and `scf_tol_used` (341 occurrences of their `{:?}` text) and
+/// `Provenance::describe` the suffix ", ionic none" (2 occurrences). Removing exactly those strings from the new trace
+/// reproduces the old digest 0x5b8e_8f79_b7d5_94d1 — no decision, answer, note, sample or draw moved.
+///
+/// **Re-pinned for the 2026-10-18 trust fixes** (0x8eb6_57b6_4455_94f9 → below; the 16-line diff of
+/// the two traces, checked by hand): at the injected failed audit (+1e-2 Ha, a glitch) the rule-4
+/// fallback's answer is now kept instead of thinned (a failed audit is re-judged by samples near it:
+/// never thinned), the audit's wording names the new rule ("untrusted until a refit predicts that
+/// geometry without the audited sample"), and the refit quarantines the glitch and hands the failure
+/// to the fence exactly as before — every later line differs only by that one extra sample (sample
+/// counts +1, refit numbers in the ninth digit). No other decision moved.
+/// **Re-pinned for round 1 of that review** (→ below; the trace diff checked by hand): MUST-2's
+/// copies (`is_label_copy`) — up to step 91 only notes differ; from step 92 the many-body class's
+/// short-of-samples fallbacks that repeat a stored H₃ answer within the fit's noise (the session
+/// re-evaluates the same geometry) are not kept, one sample fewer from there on (counts and the later
+/// refits differ in consequence). No other decision moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xe1f0_ad02_992d_2504;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -3445,7 +3467,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -3633,15 +3655,17 @@ fn outcomes_name_what_admit_decided() {
     let e = drain(&mut s);
     assert_eq!((e[0].rule, e[0].outcome), (R::ForceUncertainty, K::BoxNotKept));
     assert!(e[0].box_affected && e[0].face_density == Some(1.0));
-    // thinning (the thinning test's setup: untrusted by residuals): kept, then nine thinned
+    // thinning (the thinning test's setup: untrusted by residuals): the first answer kept, its
+    // repetitions copies (round 1, MUST-2) — thinned; a far one kept
     let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
     s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
     for _ in 0..11 {
         s.evaluate(&h2(1.6), &mut never()).unwrap();
     }
+    s.evaluate(&h2(4.0), &mut never()).unwrap();
     let outcomes: Vec<K> = drain(&mut s).iter().map(|e| e.outcome).collect();
     let mut want = vec![K::Kept];
-    want.extend([K::Thinned; 9]);
+    want.extend([K::Thinned; 10]);
     want.push(K::Kept);
     assert_eq!(outcomes, want);
 }
@@ -3842,14 +3866,14 @@ fn fallback_events_carry_the_step_of_their_evaluation() {
 /// A teacher's (energy, forces, face density, display) as the auditor's answer carries it (no
 /// orbital payload: these audits run with the view off).
 fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> Result<Solved, String> {
-    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None })
+    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None, unfit: None })
 }
 
 /// A background audit job for `s` at `scene` under `prov` (the auditor's own bookkeeping
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -4046,9 +4070,9 @@ fn the_refusal_strings_are_unchanged() {
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     s.audit_failed = Some(0.5);
     s.audit_atoms = 2;
-    assert_eq!(s.untrusted_reason().unwrap(), "audit found teacher − model +5.0e-1 Ha; refit to recover");
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found teacher − model +5.0e-1 Ha; untrusted until a refit predicts that geometry without the audited sample");
     s.audit_force = Some((5e-3, 2e-3));
-    assert_eq!(s.untrusted_reason().unwrap(), "audit found forces off by 5.0e-3 > 2.0e-3 Ha/Bohr (teacher − model +5.0e-1 Ha); refit to recover");
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found forces off by 5.0e-3 > 2.0e-3 Ha/Bohr (teacher − model +5.0e-1 Ha); untrusted until a refit predicts that geometry without the audited sample");
 }
 
 /// Plan review M1: the audit check compares the failed audit's |gap|/N with the per-atom tier,
@@ -4160,8 +4184,8 @@ fn pre_task3_untrusted_check(s: &SurrogateKs) -> Option<(sim::activity::TrustKey
     }
     if let Some(gap) = s.audit_failed {
         return Some(match s.audit_force {
-            Some((d, b)) => (TrustKey::AuditForces, format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover")),
-            None => (TrustKey::Audit, format!("audit found teacher − model {gap:+.1e} Ha; refit to recover")),
+            Some((d, b)) => (TrustKey::AuditForces, format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample")),
+            None => (TrustKey::Audit, format!("audit found teacher − model {gap:+.1e} Ha; untrusted until a refit predicts that geometry without the audited sample")),
         });
     }
     None
@@ -4432,7 +4456,7 @@ fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
     assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
     s.training_residuals = Some(t);
     assert!(!s.trusted());
-    let classes = s.compute_class_loo();
+    let classes = s.compute_class_loo_full().0;
     let pair = &classes[0];
     assert!(!pair.trusted, "{pair:?}");
     assert!(matches!(pair.refusal, Some((ClassKey::Force | ClassKey::Energy, ..))), "the LOO errors refuse it, not the count: {pair:?}");
@@ -4902,7 +4926,7 @@ fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     s.model = Some(model);
     s.report = Some(report);
     s.training_residuals = s.compute_training_residuals();
-    s.class_loo = s.compute_class_loo();
+    s.class_loo = s.compute_class_loo_full().0;
     s.rebuild_active_set();
     eprintln!(
         "four-species fit (fixed hyperparameters): solve {t_solve:.1} s, null space {t_null:.1} s, all {:.1} s; Q′ {}, {} samples, trusted {} ({:?})",
@@ -5385,4 +5409,1611 @@ fn estimated_mode_has_one_orbital_producer() {
     let f = d.tick(f64::INFINITY, &mut never());
     assert_eq!(f.source, Source::Fallback);
     assert_eq!(f.orbitals_seq, seq, "no payload from a fallback step");
+}
+
+// ---- pseudopotentials (M7 Task 9) ----
+
+/// Spec §8 row 9 first failing test (spec §5.5): a model taught under one ionic policy is never
+/// consulted under another — the surfaces differ by about 38 Ha per O and a bond angle — and the
+/// teacher's answer from the other policy is not kept. The tag follows the physics, not the menu:
+/// H has no core, so H2 under CoresOnly *is* today's surface (tag "none") and is answered.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates H for the All tag); cargo test -p providers --release")]
+fn provenance_refuses_model_across_policies() {
+    // the All tag needs the dimer-gated H (M7 Task 11): ≈ 1 min on the GPU, ≈ 40 min on the CPU fallback — skip without one
+    let Some(ctx) = gpu::GpuContext::new_headless() else { eprintln!("provenance_refuses_model_across_policies: no GPU adapter for the H dimer gate — skipped"); return };
+    crate::pseudo::set_dimer_backend(crate::pseudo::DimerBackend::Gpu(ctx));
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default()); // taught under IonicPolicy::None
+    let mut cores = h2(1.6);
+    cores.ionic = sim::IonicPolicy::CoresOnly;
+    assert_eq!(s.evaluate(&cores, &mut never()).unwrap().stats.source, Source::Surrogate, "CoresOnly H2 = the all-electron surface");
+    let mut all = h2(1.6);
+    all.ionic = sim::IonicPolicy::All;
+    let r = s.evaluate(&all, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("differs from the model's") && n.contains("ionic")), "{:?}", r.stats.notes);
+    assert_eq!(calls(&h), 1);
+    assert_eq!(s.samples(), 40, "no sample from another policy is kept");
+    assert_eq!(crate::pseudo::provenance_tag(&cores), "none");
+    assert!(crate::pseudo::provenance_tag(&all).starts_with("all/"));
+}
+
+/// A Morse teacher that reports what a pseudised one would: cores in contact, or a changed shared-shell pattern.
+struct Reporting {
+    inner: Arc<Mutex<MorseDimer>>,
+    overlap: bool,
+    pattern_changed: bool,
+}
+
+impl ForceProvider for Reporting {
+    fn evaluate(&mut self, s: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.lock().unwrap().evaluate(s, a)?;
+        if self.overlap {
+            r.stats.core_overlaps = vec![(0, 1, 0.5)];
+            r.stats.warnings.push(format!("{}: 0–1 at R = 0.500 Bohr", sim::CORE_OVERLAP_WARNING));
+        }
+        r.stats.occupation_changed = self.pattern_changed;
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "reporting Morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Spec §5.5: a teacher answer with a core-overlap warning is used, never trained on; so is one whose
+/// shared-shell pattern changed since the previous step (Task 6 review A.6). An ordinary answer is kept.
+#[test]
+fn core_overlap_answers_are_never_kept() {
+    for (overlap, pattern_changed, why) in [(true, false, "cores overlap"), (false, true, "occupation pattern changed"), (false, false, "")] {
+        let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
+        let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap, pattern_changed }), FallbackPolicy::default());
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        if why.is_empty() {
+            assert_eq!(s.samples(), 1, "an ordinary answer is kept");
+            continue;
+        }
+        assert_eq!(s.samples(), 0, "{why}: never stored");
+        assert!(r.stats.notes.iter().any(|n| n.contains(why) && n.contains("sample not kept")), "{:?}", r.stats.notes);
+    }
+}
+
+/// The activity row of an unfit answer says so (the Activity tab's plain wording is `TeachOutcome::UnfitNotKept`).
+#[test]
+fn an_unfit_answer_leaves_its_own_activity_row() {
+    let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
+    let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap: true, pattern_changed: false }), FallbackPolicy::default());
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let ev = s.take_events().into_iter().last().expect("an activity row");
+    assert_eq!(ev.outcome, TeachOutcome::UnfitNotKept);
+    assert!(!ev.outcome.is_kept());
+}
+
+/// Task 8b ruling (b) and Task 8a: the labels of a pseudopotential surface carry the GPU path's scatter
+/// (about 5e-5 Ha/Bohr per component), so a model fitted on them reports at least that force noise — however clean the
+/// samples look — while the all-electron surface keeps its evidence-estimated noise (bitwise as before).
+#[test]
+fn a_pseudo_surface_floors_the_force_noise_prior() {
+    let fit_on = |ionic: &str| {
+        let teacher = Shared::new(MorseDimer::h2());
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let mut rng = StdRng::seed_from_u64(4);
+        for i in 0..40 {
+            let r = 1.2 + 1.0 * i as f64 / 39.0;
+            let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+            let mut prov = s.provenance_for(&sc);
+            prov.ionic = ionic.to_string();
+            s.add_sample_with_provenance(morse_sample(&MorseDimer::h2(), &sc), &prov).unwrap();
+        }
+        s.refit().expect("refit").sigma_f
+    };
+    let clean = fit_on("none");
+    let pseudo = fit_on("cores/0123456789abcdef/shared1e-3");
+    println!("sigma_F: all-electron {clean:.2e}, pseudo {pseudo:.2e}");
+    assert!(clean < PSEUDO_FORCE_NOISE / 10.0, "exact Morse labels: the evidence estimate is tiny, got {clean:e}");
+    assert!((pseudo - PSEUDO_FORCE_NOISE).abs() <= 1e-9, "the floor binds on the pseudo surface: {pseudo:e}");
+    assert!(PSEUDO_FORCE_NOISE >= 4.7e-5, "the measured GPU path scatter (task-8b review ruling (b))");
+}
+
+/// Task 8b ruling (b): a force audit of a pseudo-scene model is never judged against a tier tighter than
+/// 3 sigma_F of the label noise; the default tier (2e-3) is far above it, so the floor is inert there and binds
+/// only on a tightened policy. The all-electron surface has no floor.
+#[test]
+fn force_audits_do_not_judge_a_pseudo_model_below_its_label_noise() {
+    let tight = FallbackPolicy { force_std_abs: 1e-5, force_std_rel: 0.0, ..FallbackPolicy::default() };
+    let teacher = [[0.0, 0.0, 0.0]];
+    let model = [[1.0e-4, 0.0, 0.0]]; // a 1e-4 Ha/Bohr disagreement: label noise on the pseudo path
+    let none = worst_force_residual(&tight, &model, &teacher, audit_force_floor("none")).unwrap();
+    assert!(none.0 > none.1, "the tight tier fails the all-electron model: {none:?}");
+    let pseudo = worst_force_residual(&tight, &model, &teacher, audit_force_floor("cores/0123456789abcdef/shared1e-3")).unwrap();
+    assert!(pseudo.0 <= pseudo.1, "within 3 sigma_F of the noise prior: {pseudo:?}");
+    assert_eq!(pseudo.1, 3.0 * PSEUDO_FORCE_NOISE);
+    // the default policy is already far above the noise
+    let d = FallbackPolicy::default();
+    assert!(d.force_std_abs >= 40.0 * PSEUDO_FORCE_NOISE && audit_force_floor("cores/x") < d.force_std_abs);
+}
+
+/// The surrogate answers for its teacher's ionic surface and forwards the partial-core display to it.
+#[test]
+fn the_surrogate_forwards_the_ionic_tag_and_the_core_display_to_its_teacher() {
+    struct Flags(Arc<Mutex<bool>>);
+    impl ForceProvider for Flags {
+        fn evaluate(&mut self, _: &Scene, _: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+        fn name(&self) -> &'static str {
+            "flags"
+        }
+        fn reset(&mut self) {}
+        fn set_display_partial_core(&mut self, on: bool) {
+            *self.0.lock().unwrap() = on;
+        }
+        fn ionic_tag(&self, _: &Scene) -> String {
+            "teacher's surface".into()
+        }
+    }
+    let seen = Arc::new(Mutex::new(false));
+    let mut s = SurrogateKs::new(Box::new(Flags(seen.clone())), FallbackPolicy::default());
+    assert_eq!(s.ionic_tag(&h2(1.4)), "teacher's surface");
+    s.set_display_partial_core(true);
+    assert!(*seen.lock().unwrap());
+    assert!(s.display_core, "kept for the background jobs");
+}
+
+/// MUST-1 of the Task 9 physics review: the compared provenance carries the GPU stop *rule*, never its N-dependent
+/// value — two pseudo scenes of 12 (O₂) and 16 (CO₂) valence electrons get equal provenance (an Add or Remove must
+/// not split a model's surface), with the nominal tolerance, and the rule in the ionic tag; the effective stops
+/// themselves differ (1.2e-6 and 1.6e-6) and are recorded per answer, not compared.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates C and O); cargo test -p providers --release")]
+fn the_provenance_carries_the_stop_rule_not_its_value() {
+    let s = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let at = |z: &[u8]| Scene {
+        nuclei: z.iter().enumerate().map(|(i, &zi)| Nucleus::new(zi, [2.3 * i as f64 - 1.15 * (z.len() as f64 - 1.0), 0.0, 0.0])).collect(),
+        cell: Cell { n: 61, h: 0.20 },
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic: sim::IonicPolicy::CoresOnly,
+    };
+    let (o2, co2) = (at(&[8, 8]), at(&[8, 6, 8]));
+    let (a, b) = (s.provenance_for(&o2), s.provenance_for(&co2));
+    assert_eq!(a, b, "{} vs {}", a.describe(), b.describe());
+    assert_eq!((a.tol, b.tol), (1e-6, 1e-6), "the nominal tolerance");
+    assert!(a.ionic.starts_with("cores/") && a.ionic.ends_with("/stop2x5e-8"), "{}", a.ionic);
+    assert!(a.ionic.contains("/shared1e-3/1e-1/"), "τ and τ_c are in the tag: {}", a.ionic);
+    let (t12, t16) = (crate::pseudo::effective_gpu_tol(1e-6, 12), crate::pseudo::effective_gpu_tol(1e-6, 16));
+    assert!((t12 - 1.2e-6).abs() < 1e-15 && (t16 - 1.6e-6).abs() < 1e-15, "{t12} {t16}");
+}
+
+/// A teacher that is never called: only its name (the provenance's) matters (`inspect_saved_model`).
+struct NamedStub(&'static str);
+
+impl ForceProvider for NamedStub {
+    fn evaluate(&mut self, _scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        Err(ProviderError::Invalid("inspection only: the stub teacher never solves".into()))
+    }
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn reset(&mut self) {}
+}
+
+/// E0 of the 2026-10-18 water investigation: the inspection report of a saved `.model` file —
+/// `SURROGATE_INSPECT=<path> cargo test -p providers --release inspect_saved_model -- --ignored
+/// --nocapture`. Installs the sidecar under a stub teacher of the file's teacher name (no solve),
+/// then prints `SurrogateKs::inspect` with probes at each composition's lowest-energy stored
+/// sample and, for an O/H model, the preset water at the file's grid. Report-only.
+#[test]
+#[ignore = "report: SURROGATE_INSPECT=<file.model> cargo test -p providers --release inspect_saved_model -- --ignored --nocapture"]
+fn inspect_saved_model() {
+    let Ok(path) = std::env::var("SURROGATE_INSPECT") else {
+        println!("SURROGATE_INSPECT not set: nothing to inspect");
+        return;
+    };
+    let sc = surrogate::sidecar::read(std::path::Path::new(&path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let prov = sc.model.provenance.clone();
+    let name: &'static str = Box::leak(prov.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(NamedStub(name)), FallbackPolicy::default()).with_teacher_tol(prov.tol);
+    s.install_sidecar(sc).unwrap_or_else(|e| panic!("install {path}: {e}"));
+    let ionic = if prov.ionic.starts_with("cores/") {
+        sim::IonicPolicy::CoresOnly
+    } else if prov.ionic.starts_with("all/") {
+        sim::IonicPolicy::All
+    } else {
+        sim::IonicPolicy::None
+    };
+    let scene_of = |pos: &[[f64; 3]], z: &[u8]| Scene {
+        nuclei: pos.iter().zip(z).map(|(p, &zi)| Nucleus::new(zi, *p)).collect(),
+        cell: Cell { n: prov.grid_n, h: prov.h },
+        charge: prov.charge,
+        multiplicity: prov.multiplicity,
+        sigma: Some(prov.sigma),
+        external_field: [0.0; 3],
+        ionic,
+    };
+    let mut probes: Vec<(String, Scene)> = Vec::new();
+    let mut lowest: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let samples = &s.store().expect("a store").samples;
+    for (i, smp) in samples.iter().enumerate() {
+        let mut key = smp.z.clone();
+        key.sort_unstable();
+        let e = lowest.entry(key).or_insert(i);
+        if smp.energy < samples[*e].energy {
+            *e = i;
+        }
+    }
+    for (key, i) in &lowest {
+        probes.push((format!("lowest-energy stored sample #{i} ({key:?})"), scene_of(&samples[*i].pos, &samples[*i].z)));
+    }
+    // each pass's start geometry: its hot burst's first evaluation is the scene's own positions
+    let mut prev_burst = false;
+    for (i, smp) in samples.iter().enumerate() {
+        let burst = smp.tag == SampleTag::HotBurst;
+        if burst && !prev_burst {
+            probes.push((format!("a pass's start geometry (first hot-burst sample #{i}, {} atoms)", smp.z.len()), scene_of(&smp.pos, &smp.z)));
+        }
+        prev_burst = burst;
+    }
+    if s.model().is_some_and(|m| m.basis.species == vec![1, 8]) {
+        probes.push(("the preset water (O–H 1.81 Bohr, 104.5°)".into(), scene_of(&[[0.0; 3], [1.43, 1.11, 0.0], [-1.43, 1.11, 0.0]], &[8, 1, 1])));
+    }
+    let refs: Vec<(&str, &Scene)> = probes.iter().map(|(w, sc)| (w.as_str(), sc)).collect();
+    println!("{path}:\n{}", s.inspect(&refs));
+}
+
+// ---- the 2026-10-18 trust fixes (a)–(c): readiness, draft-guess audits, a failed audit's persistence ----
+
+/// A surrogate trained on `n` Morse dimers r ∈ [lo, hi] with an open background auditor (the
+/// `Gated` stand-in, face density 0), for the audit tests below.
+fn trained_with_auditor(lo: f64, hi: f64, n: usize, policy: FallbackPolicy) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let (s, h) = trained(lo, hi, n, policy);
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let auditor = Gated { inner: h.clone(), open, rho: 0.0, calls };
+    (s.with_auditor(Box::new(auditor)), h)
+}
+
+/// Fix (a): "trusted" must say whether strict mode answers *here*. A dimer model with 10 learned
+/// H₃ samples is trusted by the global rule while its many-body class is short of samples (rule
+/// 4b): at a stored H₃ geometry the readiness refuses with the class rule — the same rule the step's
+/// event carries — and names the class's worst leave-one-out sample; at a dimer it answers, as the
+/// step does. The verdict `evaluate` recorded and a fresh one agree, and `status` carries it.
+#[test]
+fn readiness_names_the_strict_verdict_where_trust_alone_says_yes() {
+    use sim::activity::{EnvClass, TeachRule as R};
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(32);
+    let h3: Vec<Scene> = (0..10).map(|_| random_h3(&mut rng)).collect();
+    for sc in &h3 {
+        s.add_sample(pair_morse_sample(sc), sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "the premise: the global rule passes ({:?})", s.untrusted_reason());
+    assert!(!s.class_loo()[1].trusted, "the premise: the many-body class is short of samples");
+    // a stored H₃ geometry where the class rule is what refuses (not the envelope)
+    let sc = h3
+        .iter()
+        .find(|sc| {
+            let (pos, z) = pos_z(sc);
+            s.first_refusal(&pos, &z, &s.provenance_for(sc)).is_some_and(|r| r.rule == R::Class(EnvClass::ManyBody))
+        })
+        .expect("a stored H₃ geometry refused by the class rule")
+        .clone();
+    let fresh = s.readiness(&sc).expect("a model");
+    println!("readiness at a stored H₃ geometry: {fresh:?}");
+    assert!(!fresh.answers && fresh.rule == Some(R::Class(EnvClass::ManyBody)), "{fresh:?}");
+    assert!(fresh.text.starts_with("three-or-more-atom (many-body) environments untrusted (everywhere) — worst sample #") && fresh.text.contains("a sampling-pass pair scan point"), "the class and its worst sample are named: {}", fresh.text);
+    let st = Trainable::status(&s, &sc, &[[0.0; 3]; 3]);
+    assert!(st.trusted && st.readiness.as_ref() == Some(&fresh), "{:?}", st.readiness);
+    // the step: a fallback under the same rule, and the recorded verdict is the fresh one
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    let ev = drain(&mut s);
+    assert_eq!(ev.last().map(|e| e.rule), Some(R::Class(EnvClass::ManyBody)), "{ev:?}");
+    assert_eq!(s.readiness(&sc).map(|x| x.rule), Some(fresh.rule), "recorded = fresh");
+    // a dimer: answered, and the readiness says so
+    let d = in_cell_65(h2(1.4));
+    let r = s.evaluate(&d, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let here = s.readiness(&d).unwrap();
+    assert!(here.answers && here.rule.is_none(), "{here:?}");
+    // draft mode does not change the strict verdict: it is what strict mode would do
+    s.set_draft(true);
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "draft mode answers");
+    assert_eq!(s.readiness(&sc).map(|x| x.rule), Some(fresh.rule), "the strict verdict under draft mode");
+}
+
+/// Fix (b): a draft-mode audit at a geometry strict mode refuses (a guess's excursion) is kept as a
+/// `DraftAudit` sample held out of the strict fit (`Q_DRAFT`: not fitted, not in the class
+/// leave-one-out), and a failed one is recorded without untrusting the strict model; a draft-mode
+/// audit where strict mode answers is an ordinary `Audit` sample and is fitted. The held-out code
+/// survives the sidecar through its tag.
+#[test]
+fn a_draft_guess_audit_is_held_out_and_never_untrusts_the_strict_model() {
+    let (mut s, h) = trained_with_auditor(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, never_fallback: true, ..FallbackPolicy::default() });
+    let loo0 = s.class_loo().to_vec();
+    // a guess: r = 3.2, outside the trained window — strict mode refuses there
+    let far = h2(3.2);
+    assert!(s.readiness(&far).is_some_and(|r| !r.answers), "the premise: strict mode refuses at 3.2");
+    let r = s.evaluate(&far, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "draft mode answers");
+    let t0 = Instant::now();
+    while s.last_audit().is_none() {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no audit verdict within 2 s");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    let last = s.store().unwrap().samples.last().unwrap().tag;
+    println!("draft guess audit: {:?}, tag {last:?}, held out {}", s.last_audit(), s.held_out());
+    assert_eq!((last, s.held_out()), (SampleTag::DraftAudit, 1));
+    s.refit().unwrap();
+    assert_eq!(s.report().unwrap().n_samples, 40, "held out of the fit");
+    assert_eq!(s.class_loo(), &loo0[..], "and of the class leave-one-out");
+    // the teacher drifts: a failed guess audit is recorded, the strict model stays trusted
+    h.lock().unwrap().d *= 1.1;
+    let n_audits = s.solve_counts().audit;
+    let t0 = Instant::now();
+    while s.solve_counts().audit == n_audits || s.last_audit().is_some_and(|a| a.verdict != AuditVerdict::Failed) {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no failed audit within 2 s");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
+    assert!(s.trusted() && s.audit_failed().is_none(), "a guess's failure is not a verdict on the strict model: {:?}", s.untrusted_reason());
+    h.lock().unwrap().d /= 1.1;
+    // inside the window strict mode answers: a draft-mode audit there is an ordinary audit, fitted
+    let near = h2(1.6);
+    let (near_pos, _) = pos_z(&near);
+    let t0 = Instant::now();
+    // (an audit still in flight from the far geometry may land first: wait for one at `near`)
+    while s.store().unwrap().samples.last().unwrap().pos != near_pos {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no audit sample at 1.6 within 2 s");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&near, &mut never()).unwrap();
+    }
+    assert_eq!(s.store().unwrap().samples.last().unwrap().tag, SampleTag::Audit);
+    let held = s.held_out();
+    s.refit().unwrap();
+    assert_eq!(s.report().unwrap().n_samples, s.samples() - held, "every sample but the held-out guesses is fitted");
+    // the sidecar: the tag carries the code
+    let path = std::env::temp_dir().join(format!("trust-fix-held-out-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), *s.policy()).with_teacher_tol(1e-6);
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((back.held_out(), back.report().unwrap().n_samples, back.trusted()), (held, s.report().unwrap().n_samples, true));
+}
+
+/// Fix (c): a failed audit is no longer erased by the refit its own kept sample triggers. A model
+/// trained on r ∈ [1.2, 1.6] is audited at a stretched bond it extrapolates to wrongly; the refit
+/// with that one sample reproduces it, but its leave-one-out prediction there is the old
+/// extrapolation, so the model stays untrusted with the reason; once samples around it arrive the
+/// leave-one-out prediction passes the audit's own criteria and trust returns.
+#[test]
+fn a_failed_audit_stays_failed_until_a_refit_predicts_it_without_its_sample() {
+    let (mut s, h) = trained_with_auditor(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert!(s.trusted());
+    let teacher = |sc: &Scene| h.lock().unwrap().clone().evaluate(sc, &mut never()).unwrap();
+    // the first stretched bond whose audit fails (the premise, printed)
+    let (r_a, sc) = [2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
+        .iter()
+        .map(|&r| (r, dimer(r, [0.6, 0.8, 0.0], [0.0; 3], 1, 1)))
+        .find(|(_, sc)| {
+            let (pos, z) = pos_z(sc);
+            let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+            (teacher(sc).energy - p.energy).abs() / 2.0 > 1e-3
+        })
+        .expect("an extrapolation beyond the energy tier");
+    let t = teacher(&sc);
+    let prov = s.provenance_for(&sc);
+    s.handle_answer(audit_answer(&s, &sc, prov, Ok((t.energy, t.forces.clone(), Some(0.0), None))));
+    println!("audit at r = {r_a}: {:?}", s.last_audit());
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
+    assert!(!s.trusted() && s.pending_refit());
+    // the refit with the audited sample: still untrusted — by its leave-one-out prediction
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    println!("after the refit with the audited sample alone: trusted {}, {:?}, quarantined {}, notes {notes:?}", s.trusted(), s.untrusted_reason(), s.quarantined());
+    assert_eq!(s.quarantined(), 0, "the premise: the fit reproduces the audited sample");
+    assert!(!s.trusted() && s.audit_failed().is_some(), "the failed audit is not erased by its own sample's refit");
+    assert!(s.untrusted_reason().unwrap().contains("untrusted until a refit predicts that geometry without the audited sample"), "{:?}", s.untrusted_reason());
+    assert!(notes.iter().any(|n| n.contains("still untrusted") && n.contains("leave-one-out")), "{notes:?}");
+    // neighbours arrive (fallback-like samples around the audited bond): trust returns
+    let mut rng = StdRng::seed_from_u64(77);
+    for k in 0..16 {
+        let r = r_a - 0.4 + 0.8 * k as f64 / 15.0;
+        let n = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &n), &n).unwrap();
+    }
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    println!("after the neighbours: trusted {}, {:?}, notes {notes:?}", s.trusted(), s.untrusted_reason());
+    assert!(s.trusted() && s.audit_failed().is_none(), "{:?}", s.untrusted_reason());
+    assert!(notes.iter().any(|n| n.contains("the failed audit is passed by the refit's model without the audited sample (leave-one-out)")), "{notes:?}");
+}
+
+/// Fix (c), the other exit: a failed audit whose answer is a glitch (an energy 10 mHa off the
+/// teacher's surface at a well-learned geometry) cannot be reproduced; the trust recovery
+/// quarantines that sample, and the failure is handed to the fence — the model is trusted again
+/// with that one geometry fenced, as for any sample it cannot represent.
+#[test]
+fn a_failed_audit_on_a_glitch_is_handed_to_the_fence() {
+    let (mut s, _h) = trained_with_auditor(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = dimer(1.7, [0.0, 0.6, 0.8], [0.0; 3], 1, 1);
+    let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let prov = s.provenance_for(&sc);
+    s.handle_answer(audit_answer(&s, &sc, prov, Ok((t.energy + 1e-2, t.forces.clone(), Some(0.0), None))));
+    assert!(!s.trusted() && s.audit_failed().is_some());
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    println!("glitch audit after the refit: trusted {}, quarantined {}, notes {notes:?}", s.trusted(), s.quarantined());
+    assert!(s.trusted() && s.audit_failed().is_none() && s.is_quarantined(40), "{:?}", s.untrusted_reason());
+    assert!(notes.iter().any(|n| n.contains("the failed audit's sample was quarantined")), "{notes:?}");
+}
+
+/// An `n`-dimer H store (pair-additive Morse teacher) plus one tight H₃ triangle.
+fn dimers_and_a_tight_triangle(n: usize) -> SurrogateKs {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(21);
+    for i in 0..n {
+        let sc = in_cell_65(dimer(1.0 + 4.1 * i as f64 / (n - 1) as f64, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    let mut sc = in_cell_65(h2(1.4));
+    sc.nuclei.push(Nucleus::new(1, [0.7, 0.7, 0.0]));
+    s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    s
+}
+
+/// The trust recovery's degree-cap retry (ruling S15, step 1) is kept only when the trust rule's
+/// counts still hold (2026-10-18, the water investigation's E1(e): one H 0.9 Bohr from O, the
+/// retry kept at n 333 < Q′ 344, every step DFT). Here: 50 samples, one tight H₃ triangle the
+/// cap-4 fit cannot reproduce. The premise, on a twin store: at cap 6 the residuals pass but the
+/// model is short of samples (50 < Q′ 51; one dimer fewer and the cap-6 residuals fail too, one more and
+/// it is trusted) — the old rule kept exactly that. Now the retry is not kept:
+/// the cap stays 4 and the model reports the residual that actually fails (the quarantine cannot
+/// take the triangle out within its 10 % cap on this small store — untrusted either way, but for
+/// the reason that is true). On the 80-dimer store, where cap 6 leaves enough samples, the retry
+/// is kept and the model trusted.
+#[test]
+fn a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery() {
+    const N_DIMERS: usize = 49;
+    let mut twin = dimers_and_a_tight_triangle(N_DIMERS);
+    twin.refit().unwrap();
+    twin.degree_cap = Some(RECOVERY_DEGREE_CAP);
+    twin.species_dirty = true;
+    twin.fit_store().unwrap();
+    println!("twin at cap 6: Q′ {}, residuals fail {}, short of samples {} ({:?})", twin.report().unwrap().q_prime, twin.recoverable_fail(), twin.trust_needs_samples(), twin.untrusted_reason());
+    assert!(!twin.recoverable_fail() && twin.trust_needs_samples(), "the premise: the old rule would keep cap 6 with too few samples");
+    let mut s = dimers_and_a_tight_triangle(N_DIMERS);
+    s.refit().unwrap();
+    println!("after the refit: cap {:?}, Q′ {}, trusted {} {:?}, quarantined {}", s.degree_cap, s.report().unwrap().q_prime, s.trusted(), s.untrusted_reason(), s.quarantined());
+    assert_eq!(s.degree_cap, None, "the cap-6 retry is not kept");
+    assert!(s.untrusted_reason().is_some_and(|r| r.contains("training energy residual")), "the reason that is true: {:?}", s.untrusted_reason());
+    // with enough samples for cap 6 the retry is kept and trusted
+    let mut big = dimer_model_three_atom_teacher();
+    let mut sc = in_cell_65(h2(1.4));
+    sc.nuclei.push(Nucleus::new(1, [0.7, 0.7, 0.0]));
+    big.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    big.refit().unwrap();
+    assert_eq!((big.degree_cap, big.trusted()), (Some(RECOVERY_DEGREE_CAP), true), "{:?} {:?}", big.recovery_note(), big.untrusted_reason());
+}
+
+/// A `SurrogateKs` holding a saved model file's contents, over a stub teacher of its teacher's
+/// name (no solve), and the provenance's ionic policy.
+fn installed_from(path: &std::path::Path) -> (SurrogateKs, sim::IonicPolicy, Provenance) {
+    let sc = surrogate::sidecar::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let prov = sc.model.provenance.clone();
+    let name: &'static str = Box::leak(prov.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(NamedStub(name)), FallbackPolicy::default()).with_teacher_tol(prov.tol);
+    s.install_sidecar(sc).unwrap_or_else(|e| panic!("install {}: {e}", path.display()));
+    let ionic = if prov.ionic.starts_with("cores/") {
+        sim::IonicPolicy::CoresOnly
+    } else if prov.ionic.starts_with("all/") {
+        sim::IonicPolicy::All
+    } else {
+        sim::IonicPolicy::None
+    };
+    (s, ionic, prov)
+}
+
+/// The coordinator's requirement (2026-10-18): a model file of the current format (ASMODEL5 since
+/// the shell fence's pair, final review I2; no new sample codes: a store of plain pass and fallback
+/// samples, as every file written before the trust
+/// fixes) is re-judged from its stored samples when it is installed — the per-atom classes, the
+/// fenced outliers and the class verdicts recomputed from the geometries and labels, no teacher
+/// call, the sample count unchanged. The store: H dimers plus H₃ triangles each with a far H₂
+/// (beyond r_cut of the triangle): per geometry (the old rule) those are many-body only; per atom
+/// their far H₂ atoms are pair environments, so after the install the pair class counts them.
+#[test]
+fn a_saved_model_is_rejudged_from_its_samples_on_load() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(32);
+    for _ in 0..30 {
+        let mut sc = random_h3(&mut rng);
+        sc.nuclei.push(Nucleus::new(1, [0.0, 0.0, 10.5]));
+        sc.nuclei.push(Nucleus::new(1, [0.0, 1.4, 10.5]));
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let rc2 = s.basis().unwrap().r_cut.powi(2);
+    let mixed = s.store().unwrap().samples.iter().filter(|x| x.z.len() == 5).count();
+    let per_geometry_pairs = s.store().unwrap().samples.iter().filter(|x| env_class(&neighbour_counts(&x.pos, rc2)) == Some(0)).count();
+    assert_eq!((mixed, per_geometry_pairs), (30, 80), "the premise: per geometry the mixed samples are many-body only");
+    let path = std::env::temp_dir().join(format!("trust-fix-rejudge-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let magic = std::fs::read(&path).unwrap();
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the current format (no new sample codes)");
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    println!("re-judged on load: {:?}", back.class_loo());
+    assert_eq!(back.samples(), s.samples(), "no sample added or dropped");
+    assert_eq!(back.class_loo()[0].samples, 80 + 30, "per atom: the far H₂ of every mixed sample is pair evidence");
+    assert_eq!(back.class_loo(), s.class_loo(), "the same verdicts as the fit that wrote the file");
+    assert!(back.trusted());
+}
+
+// ---- round 1 of the 2026-10-18 trust review ----
+
+/// Waits (≤ 2 s) until the background auditor has delivered `n` more audit verdicts than `before`.
+fn await_audits(s: &mut SurrogateKs, sc: &Scene, before: u64, n: u64) {
+    let t0 = Instant::now();
+    while s.solve_counts().audit < before + n {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no audit verdict within 2 s");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(sc, &mut never()).unwrap();
+    }
+}
+
+/// MUST-1: (a) a draft-mode audit refused only by the global trust rule (4) is an ordinary audit,
+/// fitted; (b) a held-out guess (refused for a reason of its geometry at dispatch) is a test set:
+/// once strict mode's domain reaches it (here: samples around it widen the envelope) the refit
+/// judges it by the plain prediction of the fit that never saw it, promotes it, and — the teacher's
+/// label there contradicting the model — records a failed audit, so strict mode does not answer
+/// there until the region is re-earned.
+#[test]
+fn a_held_out_guess_is_judged_when_strict_mode_reaches_it() {
+    let (mut s, h) = trained_with_auditor(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, never_fallback: true, ..FallbackPolicy::default() });
+    // (a) untrusted by a failed audit (a glitch injected at 1.7, before its refit): an in-window
+    // draft audit is refused by rule 4 only — an ordinary audit
+    let g = dimer(1.7, [0.0, 0.6, 0.8], [0.0; 3], 1, 1);
+    let t = MorseDimer::h2().evaluate(&g, &mut never()).unwrap();
+    let prov = s.provenance_for(&g);
+    s.handle_answer(audit_answer(&s, &g, prov, Ok((t.energy + 1e-2, t.forces.clone(), Some(0.0), None))));
+    assert!(!s.trusted());
+    let inside = h2(1.5);
+    let before = s.solve_counts().audit;
+    await_audits(&mut s, &inside, before, 1);
+    let tag = s.store().unwrap().samples.last().unwrap().tag;
+    assert_eq!((tag, s.held_out()), (SampleTag::Audit, 0), "refused only by the trust rule: an ordinary audit");
+    s.refit().unwrap();
+    assert!(s.trusted(), "the glitch is quarantined, trust returns: {:?}", s.untrusted_reason());
+    // (b) the teacher drifts; a guess at r = 3.0 (outside the window: a geometry refusal) is held out
+    h.lock().unwrap().d *= 1.1;
+    let far = h2(3.0);
+    assert!(s.readiness(&far).is_some_and(|r| !r.answers && r.rule.is_some_and(geometry_specific)), "the premise: a geometry refusal at 3.0");
+    let before = s.solve_counts().audit;
+    await_audits(&mut s, &far, before, 1);
+    // (an audit still in flight lands too; wait until one at 3.0 is stored)
+    let (far_pos, _) = pos_z(&far);
+    let t0 = Instant::now();
+    while !s.store().unwrap().samples.iter().any(|x| x.pos == far_pos) {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no sample at 3.0");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    let held_index = s.store().unwrap().samples.iter().position(|x| x.pos == far_pos).unwrap();
+    assert_eq!(s.store().unwrap().samples[held_index].tag, SampleTag::DraftAudit);
+    assert!(s.trusted() && s.held_out() >= 1);
+    // no further audits; the one in flight lands (with the drifted label) before the teacher is
+    // restored — else a truthful late answer would supersede the contradicting one (a race)
+    s.set_audit_every(0);
+    let t0 = Instant::now();
+    while s.audit_in_flight() || !s.auditor_idle() {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the audit in flight did not land");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    h.lock().unwrap().d /= 1.1;
+    s.set_draft(false);
+    // strict mode's domain reaches 3.0: true-Morse samples around it
+    let mut rng = StdRng::seed_from_u64(5);
+    for k in 0..30 {
+        let r = 2.2 + 1.2 * k as f64 / 29.0;
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    println!("after the domain grew: trusted {} {:?}, held out {}, quarantined {}, notes {notes:?}", s.trusted(), s.untrusted_reason(), s.held_out(), s.quarantined());
+    assert_eq!(s.store().unwrap().samples[held_index].tag, SampleTag::Audit, "promoted");
+    assert!(notes.iter().any(|n| n.contains("held-out draft-mode audit") && n.contains("a failed audit")), "{notes:?}");
+    // the contradicting label is a failed audit; fitted, the recovery quarantines it (the model
+    // cannot represent both labels) and its fence takes over — either way strict mode must not
+    // answer there
+    assert!(!s.trusted() || s.is_quarantined(held_index), "neither untrusted nor fenced");
+    s.discontinuity();
+    let r = s.evaluate(&far, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+}
+
+/// MUST-2: a molecule parked under a class refusal (4b, the many-body class short of samples:
+/// every one of its fallbacks is exempt from thinning) adds no copies of itself. 1000 teacher steps
+/// at a stored H₃ geometry and 1000 at a 0.02 Bohr displacement of it: at most one sample kept,
+/// and after a refit the fitted force noise s_F and rule 6's epistemic force std at a reference
+/// dimer stay within 5 % (the bounds asserted; the numbers printed). The counterfactual (100 copies
+/// added directly, the old behaviour at one in ten over 1000 steps) is printed: it is what the
+/// copies did to the evidence.
+#[test]
+fn a_parked_molecule_neither_floods_the_store_nor_shrinks_the_noise() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(32);
+    let h3: Vec<Scene> = (0..10).map(|_| random_h3(&mut rng)).collect();
+    for sc in &h3 {
+        s.add_sample(pair_morse_sample(sc), sc).unwrap();
+    }
+    s.refit().unwrap();
+    let parked = h3
+        .iter()
+        .find(|sc| {
+            let (pos, z) = pos_z(sc);
+            s.first_refusal(&pos, &z, &s.provenance_for(sc)).is_some_and(|r| r.rule == sim::activity::TeachRule::Class(sim::activity::EnvClass::ManyBody))
+        })
+        .expect("a stored H₃ geometry refused by the class rule")
+        .clone();
+    let reference = in_cell_65(h2(1.4));
+    let epi = |s: &SurrogateKs| {
+        let (pos, z) = pos_z(&reference);
+        let p = s.model().unwrap().predict(&pos, &z, true).unwrap();
+        p.force_std_epistemic.unwrap().iter().fold(0.0f64, |m, x| m.max(*x))
+    };
+    let (n0, sf0, epi0) = (s.samples(), s.report().unwrap().sigma_f, epi(&s));
+    let mut moved = parked.clone();
+    moved.nuclei[2].pos[0] += 0.02;
+    for sc in [&parked, &moved] {
+        for i in 0..1000 {
+            s.discontinuity();
+            let r = s.evaluate(sc, &mut never()).unwrap();
+            assert_eq!(r.stats.source, Source::Fallback, "step {i}: parked under 4b");
+            if i % 25 == 24 && s.pending_refit() {
+                s.refit().unwrap();
+            }
+        }
+    }
+    if s.pending_refit() {
+        s.refit().unwrap();
+    }
+    let (n1, sf1, epi1) = (s.samples(), s.report().unwrap().sigma_f, epi(&s));
+    println!("2000 parked teacher steps: samples {n0} → {n1}; s_F {sf0:.3e} → {sf1:.3e} (×{:.3}); rule-6 epistemic std at the reference {epi0:.3e} → {epi1:.3e} (×{:.3})", sf1 / sf0, epi1 / epi0);
+    assert!(n1 <= n0 + 1, "a parked molecule floods the store: {n0} → {n1}");
+    assert!((sf1 / sf0 - 1.0).abs() <= 0.05, "s_F moved ×{:.3}", sf1 / sf0);
+    assert!((epi1 / epi0 - 1.0).abs() <= 0.05, "rule 6's std moved ×{:.3}", epi1 / epi0);
+    // the counterfactual: 100 copies as samples (what one-in-ten thinning kept over 1000 steps)
+    let mut cf = dimer_model_three_atom_teacher();
+    for sc in &h3 {
+        cf.add_sample(pair_morse_sample(sc), sc).unwrap();
+    }
+    cf.refit().unwrap();
+    let (cf_sf0, cf_epi0) = (cf.report().unwrap().sigma_f, epi(&cf));
+    for _ in 0..100 {
+        cf.add_sample(pair_morse_sample(&parked), &parked).unwrap();
+    }
+    cf.refit().unwrap();
+    println!("counterfactual, 100 copies kept: s_F ×{:.3}, rule-6 std at the reference ×{:.3}", cf.report().unwrap().sigma_f / cf_sf0, epi(&cf) / cf_epi0);
+}
+
+/// SHOULD-1: a cleared failed audit is followed by `AUDIT_BURST` audits of the next answered steps
+/// (in the step here: no auditor), then the normal cadence.
+#[test]
+fn a_cleared_failed_audit_is_followed_by_audits_of_the_next_steps() {
+    let (mut s, _h) = trained(1.2, 1.6, 40, FallbackPolicy { audit_every: 1000, ..FallbackPolicy::default() });
+    let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
+    let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let (pos, z) = pos_z(&sc);
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
+    s.sync_audit_failed();
+    assert!(!s.trusted(), "the premise: the model is off at 2.6 ({:?})", s.audit_failed());
+    let mut rng = StdRng::seed_from_u64(77);
+    for k in 0..16 {
+        let n = dimer(2.2 + 0.8 * k as f64 / 15.0, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &n), &n).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    drain(&mut s);
+    let mut sources = Vec::new();
+    for _ in 0..AUDIT_BURST + 1 {
+        s.discontinuity();
+        let r = s.evaluate(&h2(1.4), &mut never()).unwrap();
+        // the first evaluation after an edit is the one the audit takes (a teacher step); none other refuses
+        sources.push(r.stats.source);
+    }
+    let rules: Vec<sim::activity::TeachRule> = drain(&mut s).iter().map(|e| e.rule).collect();
+    println!("after the clear: {sources:?}, {rules:?}");
+    assert_eq!(rules, vec![sim::activity::TeachRule::Audit; AUDIT_BURST]);
+    assert_eq!(*sources.last().unwrap(), Source::Surrogate);
+}
+
+/// SHOULD-2: a model saved while a failed audit untrusts it loads untrusted (the case is in the
+/// file and re-judged on load, not counted as a refit); one saved after the case cleared loads
+/// trusted.
+#[test]
+fn a_failed_audit_survives_the_model_file() {
+    let (mut s, h) = trained_with_auditor(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
+    let t = h.lock().unwrap().clone().evaluate(&sc, &mut never()).unwrap();
+    let prov = s.provenance_for(&sc);
+    s.handle_answer(audit_answer(&s, &sc, prov, Ok((t.energy, t.forces.clone(), Some(0.0), None))));
+    s.refit().unwrap();
+    assert!(!s.trusted() && s.failed_audits.len() == 1 && s.failed_audits[0].rejudges == 1);
+    let path = std::env::temp_dir().join(format!("trust-fix-failed-audit-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let sc_file = surrogate::sidecar::read(&path).unwrap();
+    assert_eq!(sc_file.failed_audits.len(), 1, "the case is in the file");
+    let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), *s.policy()).with_teacher_tol(1e-6);
+    back.install_sidecar(sc_file).unwrap();
+    let _ = std::fs::remove_file(&path);
+    println!("loaded: trusted {} {:?}", back.trusted(), back.untrusted_reason());
+    assert!(!back.trusted() && back.failed_audits.len() == 1 && back.failed_audits[0].rejudges == 1, "loaded untrusted, the count unchanged");
+    assert_eq!(back.audit_failed().map(|g| (g * 1e9).round()), s.audit_failed().map(|g| (g * 1e9).round()));
+}
+
+/// SHOULD-3: a failed audit not re-earned in `AUDIT_REJUDGE_LIMIT` refits stops untrusting the
+/// whole model and fences its own neighbourhood (the audited geometry falls back, the window is
+/// answered); the fence lifts when samples near it let a re-judge pass. A failed audit of a
+/// composition the scene does not hold is fenced at once.
+#[test]
+fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
+    let (mut s, _h) = trained(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
+    let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let (pos, z) = pos_z(&sc);
+    s.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
+    s.sync_audit_failed();
+    for k in 0..AUDIT_REJUDGE_LIMIT {
+        assert!(!s.trusted(), "refit {k}: still untrusted");
+        s.refit().unwrap();
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.trusted() && s.failed_audits.is_empty() && s.audit_fences.len() == 1, "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("an audit fence")), "{notes:?}");
+    assert_eq!(s.audit_fence_refusal(&pos, &z).map(|r| r.rule), Some(sim::activity::TeachRule::NearQuarantine));
+    assert_eq!(s.evaluate(&h2(1.4), &mut never()).unwrap().stats.source, Source::Surrogate, "the window is answered");
+    // samples near it: the fence lifts at the next refit
+    let mut rng = StdRng::seed_from_u64(77);
+    for k in 0..16 {
+        let n = dimer(2.2 + 0.8 * k as f64 / 15.0, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &n), &n).unwrap();
+    }
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.audit_fences.is_empty() && notes.iter().any(|n| n.contains("an audit fence is lifted")), "{notes:?}");
+    // another composition: fenced at the first evaluation of a scene without it
+    let mut h3 = in_big_cell(h2(1.4));
+    h3.nuclei.push(Nucleus::new(1, [0.0, 2.0, 0.0]));
+    let (p3, z3) = pos_z(&h3);
+    s.failed_audits.push(FailedAudit { pos: p3, z: z3, energy: -1.5, forces: vec![[0.0; 3]; 3], index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
+    s.sync_audit_failed();
+    assert!(!s.trusted());
+    s.discontinuity();
+    let r = s.evaluate(&h2(1.4), &mut never()).unwrap();
+    assert!(s.trusted() && s.audit_fences.len() == 1, "{:?}", r.stats.notes);
+    assert_eq!(r.stats.source, Source::Surrogate);
+    // R1-4: the composition returns — the fence (made by the composition, not the limit) is an
+    // active failed audit again (the check `evaluate` runs first; the Morse teacher solves dimers
+    // only, so it is called directly here)
+    let z3: Vec<u8> = h3.nuclei.iter().map(|n| n.z).collect();
+    assert!(s.fence_failed_audits_off_composition(&z3));
+    assert!(!s.trusted() && s.failed_audits.len() == 1 && s.audit_fences.is_empty());
+    assert!(s.pending_notes.iter().any(|n| n.contains("untrust the model again")), "{:?}", s.pending_notes);
+}
+
+/// R1-2 (round 1 re-review): a molecule parked inside an audit fence adds no copies of itself.
+#[test]
+fn a_molecule_parked_in_an_audit_fence_adds_no_copies() {
+    let (mut s, _h) = trained(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // a fenced case at an in-window geometry (fenced directly: the lifecycle is the test above)
+    let inside = h2(1.4);
+    let t = MorseDimer::h2().evaluate(&inside, &mut never()).unwrap();
+    let (pi, zi) = pos_z(&inside);
+    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    let n0 = s.samples();
+    for _ in 0..50 {
+        s.discontinuity();
+        let r = s.evaluate(&inside, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    }
+    println!("50 steps parked in an audit fence: {} kept", s.samples() - n0);
+    assert!(s.samples() - n0 <= 1, "copies kept inside an audit fence: {}", s.samples() - n0);
+}
+
+/// R1-1 (round 1 re-review): a molecule parked at a held-out draft guess still teaches strict mode.
+/// A draft-mode audit at r = 3.0 (outside the window: held out), draft off, the molecule parked
+/// there: the first rule-5 fallback is not a copy of the held-out sample (that is not the fit's
+/// data) — it is kept, the envelope grows to 3.0, and the next refit promotes the held-out sample.
+#[test]
+fn a_parked_molecule_at_a_held_out_guess_still_teaches() {
+    let (mut s, _h) = trained_with_auditor(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, never_fallback: true, ..FallbackPolicy::default() });
+    let far = h2(3.0);
+    let (far_pos, far_z) = pos_z(&far);
+    let t0 = Instant::now();
+    while !s.store().unwrap().samples.iter().any(|x| x.pos == far_pos && x.tag == SampleTag::DraftAudit) {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no held-out guess at 3.0");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    s.set_audit_every(0);
+    let t0 = Instant::now();
+    while s.audit_in_flight() || !s.auditor_idle() {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the audit in flight did not land");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    s.set_draft(false);
+    let env_before = {
+        let m = s.model().unwrap().clone();
+        s.envelope_outside(&m, &far_pos, &far_z).0.iter().fold(0.0f64, |w, x| w.max(*x))
+    };
+    let (n0, held0) = (s.samples(), s.held_out());
+    assert!(held0 >= 1 && env_before > 1.0, "the premise: held out, outside the envelope ({env_before:.2})");
+    for _ in 0..10 {
+        s.discontinuity();
+        let r = s.evaluate(&far, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+    }
+    let kept = s.samples() - n0;
+    s.refit().unwrap();
+    let env_after = {
+        let m = s.model().unwrap().clone();
+        s.envelope_outside(&m, &far_pos, &far_z).0.iter().fold(0.0f64, |w, x| w.max(*x))
+    };
+    let notes = Trainable::take_notes(&mut s);
+    println!("parked at the held-out guess: {kept} kept of 10; envelope at 3.0 {env_before:.2} → {env_after:.2}; held out {held0} → {}; notes {notes:?}", s.held_out());
+    assert_eq!(kept, 1, "the first fallback is kept (the held-out guess is not the fit's data), its repetitions are copies");
+    assert!(env_after < env_before && env_after <= 1.0, "the envelope grew to 3.0");
+    assert!(s.held_out() < held0, "the held-out guess is promoted once strict mode's domain reaches it");
+}
+
+/// SHOULD-4: the install checks the reconstructed fit membership against the file's report; a
+/// release saved between a fit and the save (Q_HELD → Q_NONE without a refit) shifts the prefix,
+/// and the fit is rebuilt from the stored samples instead of trusting the shifted membership.
+#[test]
+fn a_mismatched_fit_membership_is_rebuilt_on_load() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // a glitch, quarantined by the recovery
+    let g = dimer(1.7, [0.0, 0.6, 0.8], [0.0; 3], 1, 1);
+    let mut smp = morse_sample(&MorseDimer::h2(), &g);
+    smp.energy += 1e-2;
+    s.add_sample(smp, &g).unwrap();
+    for k in 0..3 {
+        let n = dimer(1.25 + 0.2 * k as f64, [1.0, 0.0, 0.0], [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &n), &n).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.is_quarantined(40), "the premise: the glitch is quarantined");
+    let fitted = s.report().unwrap().n_samples;
+    // a release between the fit and the save
+    s.quarantine[40] = Q_NONE;
+    let path = std::env::temp_dir().join(format!("trust-fix-membership-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), *s.policy()).with_teacher_tol(1e-6);
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let notes = Trainable::take_notes(&mut back);
+    println!("{notes:?}; report n {} (the file's fit {fitted})", back.report().unwrap().n_samples);
+    assert!(notes.iter().any(|n| n.contains("did not match its report") && n.contains("rebuilt")), "{notes:?}");
+    let members = (0..back.accumulated).filter(|&i| !back.excluded(i)).count();
+    assert_eq!(back.report().unwrap().n_samples, members, "the rebuilt fit's membership is the store's");
+}
+
+/// SHOULD-6: the readiness recorded by `evaluate` is not reused after a quarantine flip at the same
+/// fit (no model-generation bump): a fresh verdict names the fence.
+#[test]
+fn readiness_is_recomputed_after_a_quarantine_flip() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = h2(1.5);
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert!(s.readiness(&sc).unwrap().answers);
+    // quarantine the stored sample nearest to the query, without a refit
+    let (pos, z) = pos_z(&sc);
+    s.ensure_desc_cache();
+    let nearest = (0..s.samples())
+        .map(|i| {
+            let smp = &s.store().unwrap().samples[i];
+            let d = s.model().unwrap().basis.clone();
+            let a = describe_sample(&d, smp);
+            let q = describe_values(&d, &pos, &z).unwrap();
+            let env = s.envelope().unwrap();
+            let dist = q.iter().fold(0.0f64, |w, qd| w.max(a.iter().map(|(sp, b)| spread_distance(env, *sp, qd, b)).fold(f64::INFINITY, f64::min)));
+            (i, dist)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[nearest.0] = Q_HELD;
+    let r = s.readiness(&sc).unwrap();
+    println!("after the flip (nearest #{} at {:.3} spreads): {r:?}", nearest.0, nearest.1);
+    if nearest.1 <= QUARANTINE_FRACTION * s.policy().max_descriptor_distance {
+        assert_eq!(r.rule, Some(sim::activity::TeachRule::NearQuarantine), "{r:?}");
+    } else {
+        assert!(r.answers);
+    }
+}
+
+/// The `one_tail_sample_no_longer_lets_a_free_atom_in` store: 60 H₂ dimers on 1.1–2.9 Bohr plus
+/// one tail sample at 5.1 (store index 60) in the 49³ cell; the fit represents the tail sample
+/// (in-sample) but the fit without it does not (the pair class's leave-one-out, 1.05×).
+fn tail_blocked() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    gap_blocked(2.9, 5.1)
+}
+
+/// 60 dimers on 1.1–`hi` Bohr plus one sample at `r_tail` (store index 60), 49³ cell. With
+/// (2.0, 3.6) the lone sample beyond the gap is a pure leverage blocker: in-sample 2.8e-7 of its
+/// bound, the pair class's leave-one-out 5.2× (measured).
+fn gap_blocked(hi: f64, r_tail: f64) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..61 {
+        let r = if i < 60 { 1.1 + (hi - 1.1) * i as f64 / 59.0 } else { r_tail };
+        let sc = in_big_cell(dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    (s, handle)
+}
+
+fn bond(sc: &Scene) -> f64 {
+    let (a, b) = (sc.nuclei[0].pos, sc.nuclei[1].pos);
+    (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Kabsch: a rigid rotation of a point set is recovered (to rounding), and it is proper.
+#[test]
+fn kabsch_recovers_a_rotation() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let p: Vec<[f64; 3]> = (0..5).map(|_| std::array::from_fn(|_| rng.gen_range(-2.0..2.0))).collect();
+    let c = teach::tests_api::centroid(&p);
+    let p: Vec<[f64; 3]> = p.iter().map(|x| std::array::from_fn(|a| x[a] - c[a])).collect();
+    let axis = nalgebra::Unit::new_normalize(nalgebra::Vector3::new(0.3, -0.5, 0.8));
+    let rot = nalgebra::Rotation3::from_axis_angle(&axis, 1.1).into_inner();
+    let q: Vec<[f64; 3]> = p
+        .iter()
+        .map(|x| {
+            let v = rot * nalgebra::Vector3::new(x[0], x[1], x[2]);
+            [v[0], v[1], v[2]]
+        })
+        .collect();
+    let r = teach::tests_api::kabsch(&p, &q);
+    let err = (r - rot).abs().max();
+    println!("Kabsch: |R - R_true|_max = {err:.1e}, det {:.15}", r.determinant());
+    assert!(err < 1e-12, "{err:e}");
+    assert!((r.determinant() - 1.0).abs() < 1e-12);
+}
+
+/// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
+/// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
+/// follow has its blockers refused as structural ("the model cannot represent it"), and nothing
+/// is started for them.
+#[test]
+fn teach_diagnosis_separates_leverage_from_structure() {
+    let (s, _h) = tail_blocked();
+    let d = s.teach_diagnosis();
+    println!("tail store: {d:?}");
+    let tail = d.iter().find(|b| b.index == 60).expect("the tail sample blocks the pair class");
+    assert_eq!(tail.class, 0);
+    assert!(tail.loo > 1.0 && tail.in_sample <= 1.0 && tail.teachable(), "{tail:?}");
+    let o = s.teach_offer().expect("an offer");
+    assert!(o.blockers.iter().any(|b| b.0 == 60), "{o:?}");
+    assert!(o.blockers.len() <= TEACH_MAX_BLOCKERS);
+    assert_eq!(o.solves, o.blockers.len() * (TEACH_PERTURBATIONS + TEACH_PATH_POINTS));
+    for (i, _, ins, _) in &o.refused {
+        assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
+    }
+    // structure: the basis cannot follow 12 extrema on 1 Bohr
+    let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
+    let d = m.teach_diagnosis();
+    let structural = d.iter().filter(|b| !b.teachable()).count();
+    println!("Morse + sinusoid: {} blockers, {structural} structural; worst {:?}", d.len(), d.first());
+    assert!(structural > 0, "{d:?}");
+    let o = m.teach_offer().expect("an offer naming the refused blockers");
+    for (i, _, ins, why) in &o.refused {
+        if *ins > 1.0 {
+            assert!(why.contains("cannot represent"), "#{i}: {why}");
+        }
+    }
+    for b in &o.blockers {
+        assert!(b.3 <= 1.0, "an offered blocker is a leverage one: {b:?}");
+    }
+    if o.blockers.is_empty() {
+        let e = m.start_teach(&h2(1.6)).unwrap_err();
+        assert!(e.starts_with("nothing to teach"), "{e}");
+    }
+    // hand-made verdicts
+    assert!(teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 0.9 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 1.1 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 0.9, in_sample: 0.2 }.teachable(), "not a blocker");
+}
+
+/// The job generator: per blocker at most 6 nudges + 4 path points, every geometry inside the
+/// cell, farther than the thinning radius from the blocker and from each other, and no farther from
+/// the rest of the data than the blocker is (review SHOULD-T2); two held-out checks; seeded. The
+/// tail at 5.1 Bohr.
+#[test]
+fn teach_jobs_are_spread_inward_inside_the_cell_and_hold_two_out() {
+    let (mut s, _h) = tail_blocked();
+    let template = in_big_cell(h2(1.6));
+    let jobs = s.teach_jobs(60, &template, 0x7EAC);
+    let radius = THIN_FRACTION * s.policy().max_descriptor_distance;
+    let blocker = s.store().unwrap().samples[60].clone();
+    let d_blocker = s.data_distance(&blocker.pos, &blocker.z, 60);
+    let pz = |sc: &Scene| -> (Vec<[f64; 3]>, Vec<u8>) { (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect()) };
+    let lens: Vec<f64> = jobs.iter().map(|j| bond(&j.scene)).collect();
+    println!("{} jobs (radius {radius:.3}, blocker {d_blocker:.2} spreads from the rest): bonds {lens:.3?}, holdouts {:?}", jobs.len(), jobs.iter().map(|j| j.holdout).collect::<Vec<_>>());
+    assert!(jobs.len() <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert!(jobs.len() >= 3, "too few geometries survive the filters: {}", jobs.len());
+    assert_eq!(jobs.iter().filter(|j| j.holdout).count(), 2);
+    for (a, j) in jobs.iter().enumerate() {
+        assert_eq!(j.blocker, 60);
+        assert!(j.scene.check_inside_cell().is_ok());
+        let (p, z) = pz(&j.scene);
+        let d0 = s.geometry_distance((&p, &z), (&blocker.pos, &blocker.z));
+        assert!(d0 > radius, "job {a}: {d0:.3} spreads from the blocker");
+        let dd = s.data_distance(&p, &z, 60);
+        assert!(dd <= d_blocker, "job {a}: {dd:.2} spreads from the rest, farther than the blocker's {d_blocker:.2}");
+        for k in &jobs[..a] {
+            let (q, _) = pz(&k.scene);
+            assert!(s.geometry_distance((&p, &z), (&q, &z)) > radius, "job {a} too close to an earlier one");
+        }
+    }
+    // in the model's own metric the far tail is compressed (every feature → 0 at r_cut), so a nudge
+    // to 5.6 Bohr is no farther from the data than the blocker at 5.1: the inward rule is a statement
+    // in descriptor space, not in bond length (measured; the user's #664 — 11.3 spreads against its
+    // blocker's 4.5 — is the case it removes)
+    let again = s.teach_jobs(60, &template, 0x7EAC);
+    assert_eq!(again.len(), jobs.len());
+    assert!(again.iter().zip(&jobs).all(|(a, b)| a.scene.nuclei.iter().zip(&b.scene.nuclei).all(|(x, y)| x.pos == y.pos)), "seeded");
+}
+
+/// SHOULD-T1: the path's partner is matched atom to atom before the straight path is built — a
+/// rotated copy of a molecule with its identical atoms listed in another order is aligned back onto
+/// the original exactly (every atom on its own counterpart), so no path point drags two hydrogens
+/// through each other; the closest pair of a matched path never drops below the endpoints'.
+#[test]
+fn path_partners_are_matched_atom_to_atom() {
+    let p = vec![[0.0, 0.0, 0.0], [1.43, 1.11, 0.0], [-1.43, 1.11, 0.0], [0.2, -5.9, 0.3]];
+    let z = [8u8, 1, 1, 1];
+    let rot = nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::z_axis(), 0.7).into_inner();
+    let turned: Vec<[f64; 3]> = p.iter().map(|x| { let v = rot * nalgebra::Vector3::new(x[0], x[1], x[2]); [v[0] + 3.0, v[1] - 1.0, v[2]] }).collect();
+    // the hydrogens listed in another order
+    let q = vec![turned[0], turned[3], turned[1], turned[2]];
+    let aligned = teach::tests_api::matched_partner(&p, &z, &q);
+    let err = aligned.iter().zip(&p).map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f64::max)).fold(0.0, f64::max);
+    println!("matched and aligned: max |Δ| {err:.1e}");
+    assert!(err < 1e-9, "{aligned:?}");
+    // the unmatched order: the straight path's midpoint brings two atoms closer than either end
+    let mid: Vec<[f64; 3]> = p.iter().zip(&q).map(|(a, b)| std::array::from_fn(|k| 0.5 * (a[k] + b[k]))).collect();
+    let floor = teach::tests_api::closest_pair(&p);
+    println!("closest pair: endpoints {floor:.3}, an unmatched midpoint {:.3}", teach::tests_api::closest_pair(&mid));
+}
+
+/// MUST-T1: the acceptance verdict. Accepted only when every class that holds samples is trusted;
+/// a class short of samples whose leave-one-out passes is "needs samples" (not accepted), and a
+/// short class whose leave-one-out still fails reads "not accepted" — the case the old rule called
+/// accepted.
+#[test]
+fn a_short_class_is_never_an_acceptance() {
+    use teach::tests_api::{teach_verdict, TeachVerdict};
+    let class = |samples: usize, q: usize, f: f64, e: f64| {
+        let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_max: e, trusted: refusal.is_none(), refusal }
+    };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)) };
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
+    assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
+    assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 1, 0, false), TeachVerdict::NotAccepted, "a failed check");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 1, false), TeachVerdict::NotAccepted, "a blocker with no check judged near it (R3-2)");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], true, false, 0, 0, false), TeachVerdict::NotAccepted, "a target still blocks");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, true, 0, 0, false), TeachVerdict::NotAccepted, "a target left the fit");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 0, true), TeachVerdict::Cancelled);
+}
+
+/// MUST-T1 end to end: a round that leaves its class short of samples is not accepted, and the
+/// outcome says what is missing. The gap fixture's pair class with Q′ raised past its count
+/// (`class_refusal` reads the report's Q′): the targets are predicted, the class is short.
+#[test]
+fn a_round_that_leaves_its_class_short_is_not_accepted() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise: the round is accepted at Q′ {}", s.report().unwrap().q_prime);
+    // the same state judged at a higher floor: the class is short, its leave-one-out still passes
+    let n = s.class_loo()[0].samples;
+    s.report.as_mut().unwrap().q_prime = n + 10;
+    s.refresh_class_loo();
+    assert!(matches!(s.class_loo()[0].refusal, Some((sim::ClassKey::Samples, ..))), "{:?}", s.class_loo()[0]);
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let held = s.store().unwrap().samples.last().unwrap().clone();
+    let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
+    let holdout = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    s.finish_teach(&[60], vec![holdout], &progress);
+    let outcome = s.user_notes.last().unwrap().clone();
+    println!("{outcome}");
+    assert!(outcome.starts_with("teaching around #60: not accepted yet: the blockers are predicted"), "{outcome}");
+    assert!(outcome.contains(&format!("they need {} samples and have {n}", n + 10)), "{outcome}");
+}
+
+/// The targeted pass on the Morse teacher (ruling 5): a lone sample beyond a gap in the data
+/// (`gap_blocked(2.0, 3.6)`) blocks the pair class at 5.2× its leave-one-out; a
+/// teach-around pass solves its ≈ 10 geometries (the held-out two are judged after the refit, then
+/// kept for the next one), refits,
+/// and the unchanged class rule — the tail sample still in the fit — passes, the checks pass, and
+/// the outcome says "accepted"; afterwards nothing blocks and a second pass is refused.
+#[test]
+fn a_teach_around_pass_restores_the_pair_class_with_the_blocker_kept() {
+    let (mut s, h) = gap_blocked(2.0, 3.6);
+    assert!(!s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let before = s.samples();
+    let calls0 = calls(&h);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err(), "one pass at a time");
+    let mut stages = Vec::new();
+    while let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() {
+        stages.push((p.stage, p.target));
+    }
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome note").clone();
+    let solves = calls(&h) - calls0;
+    println!("{solves} solves, {} stored; stages {stages:?}\n{outcome}\npair {:?}", s.samples() - before, s.class_loo()[0]);
+    assert!(stages.iter().all(|&(st, t)| st == "teaching" && t == Some(60)), "{stages:?}");
+    assert!(solves <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert_eq!(s.samples() - before, solves, "the held-out checks are judged, then kept (SHOULD-T4)");
+    assert!(s.pending_refit(), "the kept checks wait for the next refit");
+    assert!(s.store().unwrap().samples[before..].iter().all(|x| x.tag == SampleTag::Targeted));
+    assert!(60 < s.accumulated && !s.excluded(60), "the blocker stays in the fit");
+    assert!(outcome.contains(": accepted"), "{outcome}");
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.teach_offer().is_none(), "nothing blocks any more");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err());
+}
+
+/// A cancelled teach-around round is not a round spent, and is not accepted.
+#[test]
+fn a_cancelled_teach_round_is_not_spent() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    Trainable::pass_step(&mut s, &mut never()).unwrap();
+    Trainable::cancel_pass(&mut s);
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains("cancelled"), "{outcome}");
+    assert_eq!(s.teach_rounds.get(&0).copied().unwrap_or(0), 0, "the pair class's round is returned");
+}
+
+/// The honest negative (ruling 5): the tail sample at 5.1 Bohr looks like a leverage blocker
+/// (in-sample 2.4e-7 of its bound, leave-one-out 1.05×), but it sits near the cutoff
+/// (r_cut = 6 Bohr), where the Morse teacher still binds (V(6) ≈ −3.4e-3 Ha) while every
+/// f_c-damped feature vanishes. One sample can be fitted by leverage; once its neighbourhood is
+/// sampled (out to 5.4 Bohr) the fit matches the forces and shifts every energy by the tail value
+/// (all residuals +1.9× the energy tier per atom, measured), so the pass is not accepted, both
+/// held-out checks fail (failed audits of origin "teach check", kept with their samples' indices),
+/// the outcome and the reason say so, and the next offer
+/// refuses #60 as structural ("the model cannot represent it") instead of a second round.
+#[test]
+fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains(": not accepted"), "{outcome}");
+    assert!(outcome.contains("cannot represent it"), "{outcome}");
+    assert!(outcome.contains("2 off, so the model is untrusted until it predicts those geometries"), "{outcome}");
+    assert!(!s.trusted());
+    assert!(s.failed_audits.iter().all(|c| c.origin == AuditOrigin::TeachCheck && c.index.is_some()), "failed checks keep their samples' indices");
+    assert!(outcome.contains("– the model as a whole: untrusted — max training energy residual"), "the first unmet trust condition, named: {outcome}");
+    let o = s.teach_offer().expect("the offer names the refused blocker");
+    println!("{} refused (listed {}): {:?}", o.refused_total, o.refused.len(), o.refused);
+    assert!(o.blockers.is_empty(), "no second round on a structural class: {o:?}");
+    assert!(o.refused.len() <= TEACH_MAX_BLOCKERS && o.refused_total >= o.refused.len());
+    assert!(o.refused.iter().all(|r| r.2 > 1.0 && r.3.contains("cannot represent")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+}
+
+/// `DynCommand::StartTeaching` through the driver (the app's "Teach around N blockers"): the
+/// dynamics pause, the progress reads stage "teaching" with its blocker, Play is refused while it
+/// runs, the pass runs to its end over ticks and its outcome reaches the snapshot's notes; a second
+/// request (nothing blocks) and a provider without a surrogate are rejected in words.
+#[test]
+fn teaching_commands_flow_through_dynamics() {
+    let (s, _h) = gap_blocked(2.0, 3.6);
+    let (p, hs) = driven(s);
+    let mut d = Dynamics::new(in_big_cell(h2(1.6)), p, 0.25, 1);
+    d.apply(DynCommand::StartTeaching);
+    let snap = d.snapshot();
+    assert_eq!(snap.last_rejection, None);
+    assert!(snap.paused);
+    let p = snap.sampling.clone().expect("progress");
+    assert_eq!((p.stage, p.target, p.done), ("teaching", Some(60), 0), "{p:?}");
+    d.apply(DynCommand::Play);
+    assert!(d.snapshot().last_rejection.is_some(), "Play is refused while teaching");
+    let mut notes = Vec::new();
+    for _ in 0..100 {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        notes.extend(snap.notes.iter().cloned());
+        if snap.sampling.as_ref().is_some_and(|p| p.finished) {
+            break;
+        }
+    }
+    let snap = d.snapshot();
+    notes.extend(snap.notes.iter().cloned());
+    assert!(snap.sampling.as_ref().is_some_and(|p| p.finished), "{:?}", snap.sampling);
+    println!("{:?}", notes.iter().filter(|n| n.contains("teaching")).collect::<Vec<_>>());
+    assert!(notes.iter().any(|n| n.contains("teaching around #60: accepted")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("teach-around pass finished: ")), "{notes:?}");
+    assert!(hs.lock().unwrap().class_loo()[0].trusted);
+    d.apply(DynCommand::StartTeaching);
+    let rej = d.snapshot().last_rejection.expect("nothing to teach");
+    assert!(rej.starts_with("teach around the blockers: "), "{rej}");
+    let mut plain = Dynamics::new(in_big_cell(h2(1.6)), Box::new(MorseDimer::h2()), 0.25, 1);
+    plain.apply(DynCommand::StartTeaching);
+    assert!(plain.snapshot().last_rejection.is_some_and(|r| r.contains("has no surrogate model")));
+}
+
+/// At most `TEACH_ROUNDS` rounds per environment class, whatever blocks it next: after two rounds
+/// on the pair class a new blocker of that class is refused ("two teach-around rounds on this class
+/// did not restore it") and nothing is started.
+#[test]
+fn teach_rounds_are_capped_per_class() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, TEACH_ROUNDS);
+    let o = s.teach_offer().expect("an offer naming the refused blocker");
+    println!("{o:?}");
+    assert!(o.blockers.is_empty(), "{o:?}");
+    assert!(o.refused.iter().any(|r| r.0 == 60 && r.3.contains("rounds on this class")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+    s.teach_rounds.insert(0, TEACH_ROUNDS - 1);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(TEACH_ROUNDS), "the round is counted against the class");
+}
+
+/// SHOULD-T6: the per-class round count restarts after a regular sampling pass and once the class
+/// is trusted.
+#[test]
+fn teach_rounds_restart_after_a_regular_pass_or_trust() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, TEACH_ROUNDS);
+    let plan = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut refs = sim::AtomReferences::default();
+    let scene = in_big_cell(h2(1.6));
+    let prov = s.provenance_for(&scene);
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.teach_rounds.is_empty(), "a regular pass restarts the count: {:?}", s.teach_rounds);
+    let (mut t, _h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    assert!(t.class_loo()[0].trusted);
+    t.teach_rounds.insert(0, 1);
+    t.refit().unwrap();
+    assert!(!t.teach_rounds.contains_key(&0), "a trusted class restarts its count");
+}
+
+/// SHOULD-T3/T5: the offer's words — the cost with its stall caveat and the risk sentence, and a
+/// pair blocker's pair against r_cut.
+#[test]
+fn the_offer_states_its_cost_risk_and_the_pair_against_the_cutoff() {
+    let (s, _h) = gap_blocked(2.0, 3.6);
+    let o = s.teach_offer().unwrap();
+    println!("{:#?}", o.notes);
+    assert!(o.notes.iter().any(|n| n.contains("may stall") && n.contains("untrusted until it predicts that geometry")), "{:?}", o.notes);
+    assert!(o.notes.iter().any(|n| n.starts_with("#60: H 3.60 Bohr from H (the model sees out to r_cut = ")), "{:?}", o.notes);
+}
+
+/// SHOULD-T4/T5: a failed teaching check is a failed audit with its sample's index and origin; the
+/// reason names it ("a teaching check failed …") and a saved file keeps the origin.
+#[test]
+fn a_failed_teaching_check_is_named_and_persisted() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = h2(1.7);
+    let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let (pos, z) = pos_z(&sc);
+    let mut f = t.forces.clone();
+    f[0][0] += 0.1;
+    f[1][0] -= 0.1;
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: f, index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
+    s.sync_audit_failed();
+    let why = s.untrusted_reason().unwrap();
+    println!("{why}");
+    assert!(why.starts_with("a teaching check failed (forces "), "{why}");
+    let path = std::env::temp_dir().join(format!("teach-check-origin-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(back.failed_audits.first().map(|c| c.origin), Some(AuditOrigin::TeachCheck));
+    assert!(back.untrusted_reason().unwrap().starts_with("a teaching check failed"), "{:?}", back.untrusted_reason());
+}
+
+/// The live case's prompt (2026-10-18): class-rule fallbacks far from the class's worst blocker
+/// cannot cure it, so after `TEACH_PROMPT_STREAK` of them the offer carries a prompt; near the
+/// blocker, or after a model answer, it does not.
+#[test]
+fn consecutive_class_fallbacks_far_from_the_blocker_prompt_the_teach_offer() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    assert!(!s.class_loo()[0].trusted, "premise");
+    assert!(s.teach_offer().unwrap().prompt.is_none());
+    let here = in_big_cell(h2(1.5));
+    for k in 1..=teach::TEACH_PROMPT_STREAK {
+        s.discontinuity();
+        let r = s.evaluate(&here, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        let p = s.teach_offer().unwrap().prompt;
+        assert_eq!(p.is_some(), k >= teach::TEACH_PROMPT_STREAK, "after {k}: {p:?}");
+    }
+    let p = s.teach_offer().unwrap().prompt.unwrap();
+    println!("{p}");
+    assert!(p.contains("two-atom environments are untrusted everywhere — the worst is #60"), "{p}");
+    // near the blocker: the same streak prompts nothing (fallbacks there teach its region)
+    let (mut t, _h) = gap_blocked(2.0, 3.6);
+    let near = in_big_cell(h2(3.6));
+    for _ in 0..teach::TEACH_PROMPT_STREAK {
+        t.discontinuity();
+        let _ = t.evaluate(&near, &mut never()).unwrap();
+    }
+    let streak = t.class_streak;
+    println!("near the blocker: streak {streak}, offer {:?}", t.teach_offer().map(|o| o.prompt));
+    assert!(t.teach_offer().is_none_or(|o| o.prompt.is_none()));
+}
+
+/// R3-1: a pass's shell check judged after its refit. The Morse window model (1.2–2.2 Bohr) asked
+/// at 5.2 Bohr: the teacher still binds there (V ≈ −7e-3 Ha) and the cutoff-damped model does not,
+/// so the check fails — a named limitation and a failed audit of origin "shell check" (no sample),
+/// whose reason says so; a check the model reproduces says "the model's cutoff holds".
+#[test]
+fn a_shell_check_names_the_truncation_or_says_the_cutoff_holds() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let n0 = s.samples();
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    let check = |energy: f64, forces: Vec<[f64; 3]>| crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far.clone(), energy, forces, face: None, unfit: false };
+    s.judge_shell_checks(vec![check(t.energy, t.forces.clone())]);
+    let note = s.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: H–H still interacts at r = 5.20 Bohr"), "{note}");
+    assert_eq!(s.samples(), n0, "never a sample");
+    // Ruling (shell → fence): fenced at once, never a global untrust
+    assert!(s.failed_audits.is_empty(), "no global failed audit");
+    assert_eq!(s.audit_fences.last().map(|c| (c.origin, c.index)), Some((AuditOrigin::ShellCheck, None)));
+    assert!(s.trusted(), "the model stays trusted: {:?}", s.untrusted_reason());
+    assert_eq!(AuditOrigin::from_word(AuditOrigin::ShellCheck.word()), AuditOrigin::ShellCheck);
+    // inside 5/6 of r_cut: answered as before; in the band: refused, the limitation named
+    let inside = h2(1.7); // the fixture's own 33³ cell (its provenance)
+    let r = s.evaluate(&inside, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    let why = s.shell_fence_refusal(&pos, &z).expect("the pair in the shell band is refused");
+    println!("{}", why.text);
+    assert!(why.text.contains("H–H at 5.50 Bohr is in the cutoff shell (5.00–6.00 Bohr)"), "{}", why.text);
+    let (pos, z) = pos_z(&in_big_cell(h2(4.8)));
+    assert!(s.shell_fence_refusal(&pos, &z).is_none(), "below the band: not the shell fence");
+    // a saved file restores the fence
+    let path = std::env::temp_dir().join(format!("shell-fence-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    assert!(back.shell_fence_refusal(&pos, &z).is_some() && back.trusted());
+    // a check the model reproduces: the cutoff holds
+    let (mut u, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let (pos, z) = pos_z(&far);
+    let p = u.model().unwrap().predict(&pos, &z, false).unwrap();
+    u.judge_shell_checks(vec![check(p.energy, p.forces.clone())]);
+    let note = u.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: the model's cutoff holds for H–H: at r = 5.20 Bohr"), "{note}");
+    assert!(u.failed_audits.is_empty() && u.trusted());
+}
+
+/// Final review C1: a shell fence is structural — never lifted by a refit's or an install's
+/// one-point re-judgement. A shell fence whose labels the model reproduces exactly (so the
+/// re-judgement at its geometry passes) stays through an install-style re-judgement, a refit with
+/// new samples and a save/load, and the band is still refused; an ordinary audit fence with the
+/// same passing labels is lifted by the same re-judgement (the exemption is the shell's alone).
+#[test]
+fn a_shell_fence_is_never_lifted_by_a_refit_or_an_install() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let (pos, z) = pos_z(&in_big_cell(h2(5.2)));
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    let case = |origin, pair| FailedAudit { pos: pos.clone(), z: z.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin, pair };
+    s.audit_fences.push(case(AuditOrigin::ShellCheck, Some((1, 1))));
+    s.audit_fences.push(case(AuditOrigin::Audit, None));
+    let shell_fences = |s: &SurrogateKs| s.audit_fences.iter().filter(|c| c.origin == AuditOrigin::ShellCheck).count();
+    let band = pos_z(&in_big_cell(h2(5.5)));
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some(), "premise: the band is refused");
+    // an install's re-judgement (not counted): the audit fence passes and is lifted, the shell fence stands
+    s.rejudge_failed_audits(false);
+    assert_eq!((shell_fences(&s), s.audit_fences.len()), (1, 1), "{:?}", s.user_notes);
+    assert!(s.user_notes.iter().any(|n| n.contains("an audit fence is lifted")), "{:?}", s.user_notes);
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some());
+    // a refit with new samples (its counted re-judgement)
+    let mut rng = StdRng::seed_from_u64(9);
+    for r in [1.5, 1.7, 1.9, 2.1] {
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert_eq!(shell_fences(&s), 1, "{:?}", s.user_notes);
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some(), "the band is refused after the refit");
+    assert!(s.trusted() && s.failed_audits.is_empty(), "the fence never untrusts: {:?}", s.untrusted_reason());
+    // a save/load (the install's re-judgement again, on the file's fit)
+    let path = std::env::temp_dir().join(format!("shell-fence-stands-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let magic = std::fs::read(&path).unwrap();
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the fence's pair needs format 5");
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(shell_fences(&back), 1);
+    assert_eq!(back.audit_fences.iter().find(|c| c.origin == AuditOrigin::ShellCheck).and_then(|c| c.pair), Some((1, 1)));
+    assert!(back.shell_fence_refusal(&band.0, &band.1).is_some() && back.trusted());
+}
+
+/// Final review I1: a strict run stepping through a fenced band is answered by the teacher at
+/// every step — the answer drives the step and **none is fitted**: no row is added, the class
+/// trust verdicts are unchanged and the model stays trusted; the note says why. The band's ends
+/// (M4): 5/6·r_cut is in, r_cut is out.
+#[test]
+fn a_shell_fence_fallback_drives_the_step_and_is_never_fitted() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: t.energy, forces: t.forces, face: None, unfit: false }]);
+    assert!(s.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "premise: fenced");
+    let (n0, loo0, calls0) = (s.samples(), s.class_loo().to_vec(), calls(&h));
+    // the fixture's own 33³ cell: a dimer of r ≤ 6 Bohr centred on the origin is inside its margin
+    for r in [5.0, 5.2, 5.4, 5.6, 5.8, 5.99] {
+        let res = s.evaluate(&h2(r), &mut never()).unwrap();
+        assert_eq!(res.stats.source, Source::Fallback, "r = {r}: {:?}", res.stats.notes);
+        assert!(res.stats.notes.iter().any(|n| n.contains("shell fence") && n.contains("not fitted")), "r = {r}: {:?}", res.stats.notes);
+        assert_eq!(s.samples(), n0, "no row at r = {r}");
+    }
+    assert_eq!(calls(&h) - calls0, 6, "the teacher answered every step");
+    assert!(!s.pending_refit, "nothing to refit");
+    assert_eq!(s.class_loo(), &loo0[..], "class trust unchanged");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let ev: Vec<_> = s.ledger.events.iter().rev().take(6).map(|e| e.outcome).collect();
+    assert!(ev.iter().all(|o| !o.is_kept()), "{ev:?}");
+    // the band's ends, as the fence computes them
+    let lo = crate::sampling::SCAN_CUTOFF_FRACTION * 6.0;
+    for (r, inside) in [(lo, true), (lo - 1e-9, false), (6.0 - 1e-9, true), (6.0, false)] {
+        let (pos, z) = pos_z(&in_big_cell(h2(r)));
+        assert_eq!(s.shell_fence_refusal(&pos, &z).is_some(), inside, "r = {r}");
+    }
+}
+
+/// The coordinator's ruling on I1 (2026-10-19): never a fitted band row — the relax verification
+/// and an audit included. A relax verification at a fenced-band geometry is answered by the
+/// teacher (the verification has its answer), not fitted (`ShellNotKept`) and leaves no failed
+/// audit; a background audit whose geometry lies in the band is neither judged nor kept — no
+/// failed audit, the model's trust untouched — even when its answer is far off the model.
+#[test]
+fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: t.energy, forces: t.forces.clone(), face: None, unfit: false }]);
+    assert!(s.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "premise: fenced");
+    let n0 = s.samples();
+    // the relax verification at a band geometry (the fixture's own cell: its provenance)
+    s.force_teacher_next();
+    let calls0 = calls(&h);
+    let res = s.evaluate(&h2(5.5), &mut never()).unwrap();
+    println!("{:?}", res.stats.notes);
+    assert_eq!((res.stats.source, calls(&h)), (Source::Fallback, calls0 + 1), "the teacher answered the verification");
+    assert!(res.stats.notes.iter().any(|n| n.contains("relax verification")), "{:?}", res.stats.notes);
+    assert!(res.stats.notes.iter().any(|n| n.contains("shell fence") && n.contains("not fitted")), "{:?}", res.stats.notes);
+    assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::ShellNotKept));
+    assert_eq!(s.samples(), n0, "not fitted");
+    assert!(s.failed_audits.is_empty() && s.audit_failed.is_none() && s.trusted(), "{:?}", s.untrusted_reason());
+    // a background audit landing in the band, its answer 0.5 Ha off the model
+    let scene = h2(5.5);
+    let prov = s.provenance_for(&scene);
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, 1.0, Some(10));
+    let note = s.pending_notes.last().cloned().unwrap_or_default();
+    println!("{note}");
+    assert!(note.starts_with("surrogate audit not judged: H–H at 5.50 Bohr is in the cutoff shell") && note.ends_with("the answer is not fitted"), "{note}");
+    assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::ShellNotKept));
+    assert_eq!(s.samples(), n0, "not kept");
+    assert!(s.failed_audits.is_empty() && s.audit_failed.is_none() && s.trusted(), "an audit in the band is no judgement: {:?}", s.untrusted_reason());
+}
+
+/// Final review I2: the fenced pair is the check's own. (a) A check whose point lies at or beyond
+/// r_cut (a short user plan's first point past 5/6·r_cut) still fences the band for its pair —
+/// the case geometry has no pair in the band, the fence's pair does. (b) A bystander pair of the
+/// check's geometry that lies in the band is never fenced: a check of the pair H–He whose geometry
+/// is an H–H dimer at 5.5 Bohr refuses H–He in the band and leaves H–H answered.
+#[test]
+fn the_shell_fence_names_the_checks_pair_not_the_case_geometry() {
+    let policy = FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() };
+    // (a) a check at 6.59 ≥ r_cut
+    let (mut s, _h) = trained(1.2, 2.2, 40, policy.clone());
+    let beyond = in_big_cell(h2(6.59));
+    let (pos, z) = pos_z(&beyond);
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 6.59, r_cut: 6.0, scene: beyond, energy: p.energy - 0.05, forces: p.forces, face: None, unfit: false }]);
+    let note = s.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: H–H still interacts at r = 6.59 Bohr"), "{note}");
+    assert_eq!(s.audit_fences.last().map(|c| (c.origin, c.pair)), Some((AuditOrigin::ShellCheck, Some((1, 1)))));
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    let why = s.shell_fence_refusal(&pos, &z).expect("the band is fenced although the check lay beyond r_cut");
+    assert!(why.text.contains("H–H at 5.50 Bohr is in the cutoff shell"), "{}", why.text);
+    let (pos, z) = pos_z(&in_big_cell(h2(6.59)));
+    assert!(s.shell_fence_refusal(&pos, &z).is_none(), "beyond r_cut nothing is in the band");
+    // (b) a bystander pair
+    let (mut u, _h) = trained(1.2, 2.2, 40, policy);
+    let band = in_big_cell(h2(5.5));
+    let (pos, z) = pos_z(&band);
+    let p = u.model().unwrap().predict(&pos, &z, false).unwrap();
+    u.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (2, 1), r: 5.5, r_cut: 6.0, scene: band, energy: p.energy - 0.05, forces: p.forces, face: None, unfit: false }]);
+    assert_eq!(u.audit_fences.last().map(|c| (c.origin, c.pair)), Some((AuditOrigin::ShellCheck, Some((1, 2)))), "sorted");
+    assert!(u.shell_fence_refusal(&pos, &z).is_none(), "the case's own H–H pair in the band is a bystander: not fenced");
+    let why = u.shell_fence_refusal(&pos, &[1, 2]).expect("the check's pair is fenced");
+    assert!(why.text.contains("H–He at 5.50 Bohr is in the cutoff shell"), "{}", why.text);
+    assert!(u.shell_fence_refusal(&pos, &[2, 2]).is_none(), "He–He is not fenced");
+}
+
+/// R3-1 end to end: a pass through the `Trainable` face on a dimer at r₀ = 3.3 Bohr (its scan
+/// crosses 5/6 of r_cut) solves one shell check, never stores it, and reports its verdict after the
+/// pass's refit.
+#[test]
+fn a_pass_reports_its_shell_check_after_the_refit() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    let scene = in_big_cell(h2(3.3));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 3, ..SamplingPlan::default() };
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    let shell: Vec<&String> = notes.iter().filter(|n| n.contains("still interacts at r =") || n.contains("cutoff holds for")).collect();
+    println!("{shell:?}");
+    assert_eq!(shell.len(), 1, "{notes:?}");
+    assert!(s.store().unwrap().samples.iter().all(|x| x.pos.len() != 2 || {
+        let r = (0..3).map(|k| (x.pos[0][k] - x.pos[1][k]).powi(2)).sum::<f64>().sqrt();
+        r <= crate::sampling::SCAN_CUTOFF_FRACTION * 6.0 + 1.0 // nudges may stray a little; no scan point beyond
+    }));
+}
+
+/// R3-2: a round over two blockers where one had no check judged near it is not accepted, and the
+/// outcome names it.
+#[test]
+fn every_blocker_needs_a_judged_check() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise");
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let held = s.store().unwrap().samples[30].clone();
+    let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
+    let near_60 = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    s.finish_teach(&[59, 60], vec![near_60], &progress);
+    let outcome = s.user_notes.last().unwrap().clone();
+    println!("{outcome}");
+    assert!(outcome.starts_with("teaching around #59, #60: not accepted"), "{outcome}");
+    assert!(outcome.contains("no check near #59 could be judged"), "{outcome}");
+    assert!(outcome.contains("1 of 1 check geometries judged"), "{outcome}");
 }

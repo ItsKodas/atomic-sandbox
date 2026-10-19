@@ -438,7 +438,7 @@ mod tests {
     }
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
     }
 
     fn h2(r: f64) -> Scene {

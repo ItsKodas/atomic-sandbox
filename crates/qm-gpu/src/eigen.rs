@@ -154,6 +154,7 @@
 //! window's extra iterations.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
+use crate::ionic::GpuNonlocal;
 use crate::kernels::{workgroups_for, Kernels};
 use crate::pointwise::{check, lincomb_in, Params};
 use crate::reduce::Reducer;
@@ -165,13 +166,16 @@ use qm::eigen::jacobi_omega;
 use qm::stencil::COEFF;
 use qm::QmError;
 
-/// H = −½∇² + V for a local potential `v` on the grid (a padded field with zero ghosts).
-pub struct GpuHamiltonian<'a> { pub v: &'a Field }
+/// H = −½∇² + V (+ V_NL) for a local potential `v` on the grid (a padded field with zero ghosts) and, under an ionic
+/// setup with projectors, the Kleinman–Bylander operator `nl` (M7 Task 8a; `qm::nonlocal::PseudoHamiltonian`). The
+/// preconditioner uses the local part only (spec §5.5: "the preconditioner is unchanged").
+pub struct GpuHamiltonian<'a> { pub v: &'a Field, pub nl: Option<&'a GpuNonlocal> }
 
 impl GpuHamiltonian<'_> {
-    /// out = −½∇²x + V·x on the interior (recorded): one fused dispatch.
+    /// out = −½∇²x + V·x on the interior (recorded): one fused dispatch; then out += V_NL x when `nl` is set.
     pub fn apply_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, x: &Field, out: &Field) {
         hamiltonian_in(b, k, g, x, self.v, out);
+        if let Some(nl) = self.nl { nl.apply_in(b, k, g, x, out); }
     }
 }
 
@@ -799,7 +803,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         let t = std::time::Instant::now();
         let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-6, 500, None).unwrap();
         let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -825,7 +829,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         let tol = 2.0 * residual_floor_estimate(&rig.g);
         let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
         let m = gram(&rig, &x);
@@ -860,7 +864,7 @@ mod tests {
             let ratio = cg.dot(&diff, &diff).sqrt() / cg.dot(&x0, &x0).sqrt();
             let mut e = vec![0.0; k];
             let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-            let h = GpuHamiltonian { v: &rig.v };
+            let h = GpuHamiltonian { v: &rig.v, nl: None };
             let floor = residual_floor_estimate(&rig.g);
             let tol = 2.0 * floor;
             let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
@@ -908,7 +912,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         // Like the CPU test (1e-8 then 1e-6), with the f32 floor in place of 1e-8: the first
         // solve runs to the floor, the second asks for a tolerance above it (2× the model).
         let tol2 = 2.0 * residual_floor_estimate(&rig.g);
@@ -941,7 +945,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         let max_iter = 500;
         let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-10, max_iter, None).unwrap();
         let floor = residual_floor_estimate(&rig.g);
@@ -980,7 +984,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         let tol = 2.0 * residual_floor_estimate(&rig.g);
         let stats = lobpcg_with(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, tol, 500, 0.0, 0.0, None).unwrap();
         let m = gram(&rig, &x);
@@ -1018,7 +1022,7 @@ mod tests {
             let mut x = upload(rg, &random_guess(&cg, k));
             let mut e = vec![0.0; k];
             let mut work = LobpcgWork::new(&rg.ctx, &rg.g, k);
-            let h = GpuHamiltonian { v: &rg.v };
+            let h = GpuHamiltonian { v: &rg.v, nl: None };
             let samples: Vec<f64> = (0..8).map(|_| {
                 let s = lobpcg(&rg.ctx, &rg.k, &rg.g, &rg.r, &h, &mut x, &mut e, &mut work, 1e-10, 500, None).unwrap();
                 assert_eq!(s.stop, Stop::Floor, "{s:?}");
@@ -1050,7 +1054,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
-        let h = GpuHamiltonian { v: &v_nan };
+        let h = GpuHamiltonian { v: &v_nan, nl: None };
         match lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-5, 200, None) {
             Err(QmError::Numerical(msg)) => println!("NaN in V: Err(Numerical(\"{msg}\"))"),
             other => panic!("expected Err(Numerical), got {other:?}"),
@@ -1065,7 +1069,7 @@ mod tests {
         assert!(matches!(rayleigh_ritz(&DMatrix::identity(2, 2), &dependent, 2), Err(QmError::Numerical(_))));
         // the same LobpcgWork, a finite V: converges
         let mut x = upload(&rig, &random_guess(&cg, k));
-        let h = GpuHamiltonian { v: &rig.v };
+        let h = GpuHamiltonian { v: &rig.v, nl: None };
         let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 2.0 * residual_floor_estimate(&rig.g), 500, None).unwrap();
         assert_eq!(stats.stop, Stop::Converged, "{stats:?}");
     }
@@ -1130,7 +1134,7 @@ mod tests {
             let r = Reducer::new(&ctx, &k, &g);
             let fv = Field::new(&ctx, &g, "v");
             fv.upload_interior(&ctx, &g, &v);
-            let ham = GpuHamiltonian { v: &fv };
+            let ham = GpuHamiltonian { v: &fv, nl: None };
             let mut work = LobpcgWork::new(&ctx, &g, nk);
             let guess = random_guess(&cg, nk);
             let mut e = vec![0.0; nk];

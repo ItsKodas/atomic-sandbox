@@ -155,6 +155,7 @@ fn with_orbitals(ctx: &GpuContext, g: &GpuGrid, st: &GpuState, up: Vec<Field>, d
     GpuState {
         grid: st.grid.clone(), sigma: st.sigma, orbitals_up: up, orbitals_dn: dn, evals_up: st.evals_up.clone(), evals_dn: st.evals_dn.clone(),
         rho: copy(ctx, g, &st.rho), rho_up: copy(ctx, g, &st.rho_up), rho_dn: copy(ctx, g, &st.rho_dn), v_h: copy(ctx, g, &st.v_h), v_nuc: copy(ctx, g, &st.v_nuc),
+        ionic: st.ionic.clone(), occ_up: st.occ_up.clone(), occ_dn: st.occ_dn.clone(), occupations: st.occupations,
     }
 }
 

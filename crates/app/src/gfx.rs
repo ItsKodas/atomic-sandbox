@@ -32,6 +32,14 @@ const DOTS_PER_FRAME: u32 = 200_000;
 /// The spheres' size factor while an orbital layer is drawn: at full size they hide the orbital.
 const ORBITAL_NUCLEUS_SCALE: f32 = 0.3;
 
+/// The scale the nuclei's spheres are drawn at: the `--ui nuclei=` override, else
+/// [`ORBITAL_NUCLEUS_SCALE`] while an orbital layer is drawn (the spheres must not hide the lobes),
+/// else 1. `Painter::set_view` uses it, and so do the overlays that must clear a sphere (the
+/// bond-angle arcs: `Viewer::drawn_radius`).
+pub fn nucleus_scale(ui: &UiState, orbital_layer: bool) -> f32 {
+    ui.nucleus_scale.unwrap_or(if orbital_layer { ORBITAL_NUCLEUS_SCALE } else { 1.0 })
+}
+
 /// Background colour (linear).
 const CLEAR: wgpu::Color = wgpu::Color {
     r: 0.012,
@@ -107,15 +115,21 @@ struct OrbitalLayer {
     field: LayerField,
 }
 
+/// The `show` mode an orbital request belongs to (the painter draws an orbital layer only while it
+/// equals `ui.show`; `Viewer::sphere_scale` asks the same question of the newest payload).
+pub fn mode_of_request(what: &OrbitalRequest) -> ShowMode {
+    match what {
+        OrbitalRequest::Orbital { .. } => ShowMode::Orbitals,
+        OrbitalRequest::AllColoured { .. } => ShowMode::Coloured,
+        OrbitalRequest::SpinDensity => ShowMode::Spin,
+        OrbitalRequest::Off | OrbitalRequest::List => ShowMode::Density,
+    }
+}
+
 impl OrbitalLayer {
     /// The `show` mode this layer's payload belongs to.
     fn mode(&self) -> ShowMode {
-        match self.what {
-            OrbitalRequest::Orbital { .. } => ShowMode::Orbitals,
-            OrbitalRequest::AllColoured { .. } => ShowMode::Coloured,
-            OrbitalRequest::SpinDensity => ShowMode::Spin,
-            OrbitalRequest::Off | OrbitalRequest::List => ShowMode::Density,
-        }
+        mode_of_request(&self.what)
     }
 
     fn has_previous(&self) -> bool {
@@ -570,7 +584,7 @@ impl Painter {
         let drawn = self.drawn(ui);
         self.refresh(ctx);
         self.shimmer = ui.shimmer;
-        self.nucleus_scale = ui.nucleus_scale.unwrap_or(if drawn == Drawn::Orbital { ORBITAL_NUCLEUS_SCALE } else { 1.0 });
+        self.nucleus_scale = nucleus_scale(ui, drawn == Drawn::Orbital);
         let dots = ui.volume_mode == VOLUME_DOTS;
         let scalar_mode = |dots: bool| if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_ISO } else { MODE_VOLUME };
         let mut u = VolumeUniform {

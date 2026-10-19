@@ -2020,7 +2020,7 @@ mod tests {
         assert_eq!(gridded.sample(&[[9.0, 0.0, 0.0]])[0], 0.0);
         // through the trait: the exact provider answers after an evaluation
         use crate::provider::ForceProvider;
-        let scene = crate::scene::Scene { nuclei: vec![], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+        let scene = crate::scene::Scene { nuclei: vec![], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None };
         exact.evaluate(&scene, &mut || false).unwrap();
         assert_eq!(exact.sample_density(&[p]).unwrap()[0], terms[0].at(p));
     }

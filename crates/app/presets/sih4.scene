@@ -1,0 +1,15 @@
+# atomic sandbox scene v1
+# Silane: Si-H 1.480 Angstrom (2.7968 Bohr), tetrahedral (H-Si-H 109.47 degrees). NIST CCCBDB, experimental geometry
+# (rSiH, aHSiH; Boyd, J. Chem. Phys. 23, 922 (1955)), converted at 1 Angstrom = 1.8897261 Bohr; each H at
+# (+-1,+-1,+-1) x 1.6147 Bohr, alternating signs.
+# The file carries no `ionic` line (the presets are the files as written): the app starts it under its default
+# policy, cores only, where the Z > 10 atom is a generated pseudopotential on its valence grid. Under
+# `--ionic none` the heavy nucleus is a Gaussian at sigma = h (Z sigma ~ 2.1 at h = 0.15): qualitatively wrong, not a
+# useful run. 14 Bohr box at 57 x 0.25 as written (the Accurate default re-grids it to 95^3 x 0.15, same box).
+grid 57 0.25
+charge 0
+nucleus 14  0       0       0
+nucleus 1   1.6147  1.6147  1.6147
+nucleus 1   1.6147 -1.6147 -1.6147
+nucleus 1  -1.6147  1.6147 -1.6147
+nucleus 1  -1.6147 -1.6147  1.6147

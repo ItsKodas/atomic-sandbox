@@ -117,6 +117,7 @@ fn pair(z0: u8, z1: u8, r: f64, c: Cell) -> Scene {
         multiplicity: None,
         sigma: None,
         external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
     }
 }
 
@@ -140,6 +141,9 @@ fn tag_counts(s: &SurrogateKs) -> [usize; 6] {
             SampleTag::Scan => 3,
             SampleTag::Fallback => 4,
             SampleTag::Reference => 5,
+            SampleTag::Audit => 6,
+            SampleTag::DraftAudit => 7,
+            SampleTag::Targeted => 8,
         };
         c[k] += 1;
     }
@@ -256,12 +260,13 @@ fn scan_ranges_come_from_the_scene_not_a_table() {
     let lih = Sampler::new(&pair(1, 3, 1.4, cell(49)), &plan).unwrap();
     assert_eq!(lih.scans()[0].moved, 0, "H–Li: the H (index 0)");
     // and the geometries the teacher sees realise those separations
-    for (sc, sampler_scene) in [(a, pair(1, 1, 1.4, cell(49))), (b, pair(1, 1, 2.8, cell(49)))] {
+    // (r₀ 2.8: its last point, 1.8 r₀ = 5.04 Bohr, is beyond 5/6 of r_cut and not solved)
+    for (sc, sampler_scene, want) in [(a, pair(1, 1, 1.4, cell(49)), 12), (b, pair(1, 1, 2.8, cell(49)), 11)] {
         let mut teacher = Shared::new(PairMorse::h2());
         let h = teacher.handle();
         let mut s = surrogate_over(&teacher);
         let n = run_sampling(&sampler_scene, &plan, &mut teacher, &mut s, &mut |_| {}, &mut never()).unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, want);
         let t = h.lock().unwrap();
         let seen: Vec<f64> = t.seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1)).collect();
         for (got, want) in seen.iter().zip(&sc.r) {
@@ -784,43 +789,132 @@ fn references_from_a_file_without_the_reference_rule_are_re_solved() {
     assert_eq!(surrogate::sidecar::read(&resaved).unwrap().reference_rule.as_deref(), Some(surrogate::sidecar::REFERENCE_RULE));
 }
 
-/// Ruling S9 on the real teacher: an isolated O atom solved at multiplicities 1, 3, 5 — Hund's
-/// rule should emerge as the triplet. **Ignored: documented finding (fix round 1).** With the
-/// project's h = 0.25, σ = h (the `h2o` preset's settings) it does not: at 33³ (26 s for the
-/// three cold solves) the singlet is lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha),
-/// the quintet −35.5761; at 57³ the singlet is −36.5787 Ha and the triplet and quintet do not
-/// converge cold in 200 SCF iterations (Δρ 1.4e-4 / 1.8e-3). LSDA puts the O triplet below the
-/// singlet by tens of mHa, and E ≈ −36.6 Ha is half the resolved LSDA atom (≈ −74.5): the
-/// smeared O core is far from resolved, and an open-shell atom with integer occupations over the
-/// degenerate 2p levels is a solver question (Fable), not a sampling one. The S9 scan itself does
-/// what it should — it picks the lowest-energy multiplicity the teacher converges — so on this
-/// surface a scene with O gets the singlet reference, consistently with the teacher's own
-/// molecular energies. Run with `--ignored` after a solver change.
+/// The teacher of `gpu_oxygen_reference_multiplicity`, recording every evaluation it answers (multiplicity, energy or
+/// error, the solve's stats) and forwarding everything else, the ionic tag included.
+struct Recording {
+    inner: crate::ks::GpuKs,
+    seen: Arc<Mutex<Vec<(Option<u32>, Result<(f64, EvalStats), String>)>>>,
+}
+
+impl ForceProvider for Recording {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, ProviderError> {
+        let r = self.inner.evaluate(scene, should_abort);
+        let entry = match &r {
+            Ok(r) => Ok((r.energy, r.stats.clone())),
+            Err(e) => Err(e.to_string()),
+        };
+        self.seen.lock().unwrap().push((scene.multiplicity, entry));
+        r
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn reset(&mut self) {
+        self.inner.reset()
+    }
+    fn discontinuity(&mut self) {
+        self.inner.discontinuity()
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        self.inner.ionic_tag(scene)
+    }
+}
+
+/// Ruling S9 on the real teacher, under the pseudopotentials (M7 Task 10; spec §6.4's O row, Task 6 review A.7): an
+/// isolated O atom solved by the sampling pass's reference scan at multiplicities 1, 3, 5 under `CoresOnly` (pseudo-O,
+/// `DegenerateShells`: both multiplicities are the spherical ensemble), h = O's h_req (0.20), a 14 Bohr box (71³; the
+/// 12 Bohr wall bias of a −0.27 Ha level is 0.3 mHa, Task 6 review V1), the atom at the cell centre (the scan's
+/// placement), GPU, tol 1e-6, each multiplicity cold. Asserted (A.7): M = 1 and M = 3 converged (an unconverged solve is
+/// the scan's failure), every shared cluster's spread < τ/10, each within 2 mHa of the radial KB atom on the same filtered
+/// table in the same configuration (M = 1: the spin-restricted reference configuration; M = 3: T3's Hund configuration),
+/// E(3) < E(1) − 20 mHa, and the scan's reference is the triplet — Hund's rule emerges (rule 1: the same scan for every
+/// Z). The same A.7 form is asserted for the atom off a grid point (A.7's placement; Task 10 fix round), solved directly
+/// on a fresh teacher at M = 1, 3, 5 cold. Reported: the splitting against the radial value and the all-electron
+/// spherical 54.14 mHa (references.md "M7 radial atom"), M = 5, and the on- vs off-grid energy differences. The 56.07
+/// against 54.14 mHa is the c = ¼ table's documented T3 Hund error (−1.931 mHa, NLCC ruling "Cost"), not a
+/// non-spherical atom: these solves are the spherical ensemble (physics review SHOULD-3).
+///
+/// **What it replaces (M6, all-electron, `IonicPolicy::None`, h = σ = 0.25; the test was ignored with these):** at 33³
+/// (26 s for the three cold solves) the singlet was lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha), the
+/// quintet −35.5761; at 57³ the singlet was −36.5787 Ha and the triplet and quintet did not converge cold in 200 SCF
+/// iterations (Δρ 1.4e-4 / 1.8e-3) — the smeared open-shell atom with integer occupations, a solver question that M7's
+/// pseudopotential and spherical occupations answer.
 #[test]
-#[ignore = "documented finding: at h = 0.25 the O atom's singlet is lowest / the triplet does not converge (see doc)"]
+#[cfg_attr(debug_assertions, ignore = "release-only (GPU, 71³): cargo test -p providers --release gpu_oxygen_reference_multiplicity")]
 fn gpu_oxygen_reference_multiplicity() {
     let Some(ctx) = gpu::GpuContext::new_headless() else {
         eprintln!("sim: no GPU adapter — skipped");
         return;
     };
-    let mut teacher = crate::ks::GpuKs::new(ctx, 1e-6);
-    teacher.set_display(false);
+    let table = crate::pseudo::table_for(8).expect("O is accepted");
+    let h = table.record.h_req.expect("O has h_req").min(0.25);
+    let n = 2 * (14.0 / (2.0 * h)).round() as usize + 1;
+    let mut inner = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+    inner.set_display(false);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let teacher = Recording { inner, seen: seen.clone() };
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
-    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly };
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
     while sampler.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
     let notes = sampler.take_notes();
-    println!("O atom at 33³, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
+    println!("O atom (CoresOnly) at {n}³ × {h}, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
     let key = atom_key(&s.provenance_for(&scene), 8);
     let refs = sampler.take_references();
     let r = refs.get(&key).expect("a reference");
-    let (e, m) = (r.energy, r.multiplicity);
-    println!("O radial table: {} entries, {:.3} electrons", r.radial.r.len(), r.radial.electrons());
-    println!("O reference: multiplicity {m:?}, E = {e:.6} Ha");
-    assert_eq!(sampler.progress().failed, 0, "{notes:?}");
-    assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
+    // the radial references on the table the solves used, filtered at h (qm::radial::kb, as `validate::pseudo`'s CPU gate)
+    let ft = qm::radial::filtered(&table, h);
+    let hund_ae = qm::radial::ground_state(8, qm::radial::SpinMode::Polarised).expect("the AE O ground state");
+    let hund = qm::radial::transfer_configs(&table, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("T3's Hund configuration");
+    let r1 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &qm::radial::kb::reference_config(&table.partition), qm::radial::SpinMode::Restricted).unwrap().energy;
+    let r3 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, qm::radial::SpinMode::Polarised).unwrap().energy;
+    // A.7's form for one placement: (multiplicity, energy or error, stats) per solve
+    let a7 = |label: &str, seen: &[(Option<u32>, Result<(f64, EvalStats), String>)]| -> (f64, f64) {
+        let solved = |m: u32| -> Option<(f64, &EvalStats)> { seen.iter().find(|(mm, _)| *mm == Some(m)).and_then(|(_, r)| r.as_ref().ok()).map(|(e, st)| (*e, st)) };
+        for (m, r) in seen.iter() {
+            match r {
+                Ok((e, st)) => println!("  {label} M = {m:?}: E = {e:.6} Ha, {} SCF steps, tol used {:?}, shared {:?}, warnings {:?}", st.scf_steps, st.scf_tol_used, st.fractional, st.warnings),
+                Err(e) => println!("  {label} M = {m:?}: failed: {e}"),
+            }
+        }
+        let (e1, st1) = solved(1).unwrap_or_else(|| panic!("{label}: the singlet did not converge"));
+        let (e3, st3) = solved(3).unwrap_or_else(|| panic!("{label}: the triplet did not converge"));
+        println!("{label}: M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa); splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.14); M = 5: {:?}",
+                 (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
+        for (m, st) in [(1, st1), (3, st3)] {
+            for c in &st.fractional {
+                assert!(c.spread < qm::DEGENERACY_TAU / 10.0, "{label} M = {m}: shared cluster {c:?}");
+            }
+        }
+        assert!((e1 - r1).abs() < 2e-3, "{label} M = 1: {e1:.6} vs radial {r1:.6}");
+        assert!((e3 - r3).abs() < 2e-3, "{label} M = 3: {e3:.6} vs radial {r3:.6}");
+        assert!(e3 < e1 - 0.020, "{label}: triplet {e3:.6} vs singlet {e1:.6}: Hund's splitting > 20 mHa");
+        (e1, e3)
+    };
+    let (on1, on3) = a7("on-grid (the scan)", &seen.lock().unwrap()[..]);
+    println!("O reference: multiplicity {:?}, E = {:.6} Ha", r.multiplicity, r.energy);
+    assert_eq!(r.multiplicity, Some(3), "Hund's rule emerges for O: {notes:?}");
+    // A.7 asks for the atom off a grid point (Task 10 fix round): the same solves, cold, at a low-symmetry offset
+    // (`validate::pseudo`'s CPU gate position), straight on a fresh teacher
+    let mut off = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+    off.set_display(false);
+    let mut off_seen = Vec::new();
+    for m in [1u32, 3, 5] {
+        off.reset();
+        let sc = Scene { nuclei: vec![Nucleus::new(8, [0.013, -0.0091, 0.0052])], multiplicity: Some(m), ..scene.clone() };
+        let res = off.evaluate(&sc, &mut never());
+        off_seen.push((Some(m), res.map(|r| (r.energy, r.stats)).map_err(|e| e.to_string())));
+    }
+    let (off1, off3) = a7("off-grid (0.013, −0.0091, 0.0052)", &off_seen);
+    println!("on- vs off-grid: ΔE(M = 1) {:+.2e} Ha, ΔE(M = 3) {:+.2e} Ha (the egg-box energy of one atom)", off1 - on1, off3 - on3);
 }
 
 /// Task 9 item 4: `scaled_to` shrinks the plan by one factor to fit a solve budget, never below
@@ -1009,6 +1103,56 @@ fn the_trim_to_the_trust_floor_keeps_both_scan_ends() {
     assert!((scan_r[0] - 0.7 * 1.6).abs() < 1e-12 && (scan_r[scan_r.len() - 1] - 1.8 * 1.6).abs() < 1e-12, "{scan_r:?}");
 }
 
+/// Final review M3: a rescale knows the shell check. (i) Shrinking a crossing pair's scan (a plan
+/// above the trust floor, so the scan is really thinned) keeps its one pending shell check —
+/// neither thinned as a scan point nor counted as run — and the pair's new count is the kept
+/// points plus the check. (ii) The exact trim to the floor never pops a pending shell check from
+/// the queue's tail: three H atoms whose last pair (2.85 Bohr) crosses 5/6·r_cut only at its last
+/// point, so that pair's shell check is the queue's last job; a scans-only plan re-sized under the
+/// floor (59) is raised by the common factor to 3 × 20 = 60 and must be trimmed by one — the
+/// trim stops at the shell check (the pass stays one over the floor) and the pass solves it.
+#[test]
+fn a_rescale_keeps_the_pending_shell_check() {
+    let r_cut = 6.0;
+    let shells = |s: &Sampler| s.queue.iter().filter(|j| matches!(j, Job::Shell(..))).count();
+    let scan_jobs = |s: &Sampler, pair: usize| s.queue.iter().filter(|j| matches!(j, Job::Scan(_, p, _) | Job::Skip("scans", Some((p, _)), _) if *p == pair)).count();
+    // (i) thinning
+    let dimer = pair(1, 1, 3.3, cell(65));
+    let floor = SamplingPlan::min_samples_for_trust(&dimer);
+    let plan = SamplingPlan { perturbations: floor, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let mut s = Sampler::with_cutoff(&dimer, &plan, r_cut).unwrap();
+    assert_eq!((shells(&s), s.scan_planned[0], scan_jobs(&s, 0)), (1, 12, 11), "premise: one shell check among the 12 planned points");
+    s.rescale(&SamplingPlan { scan_points_per_pair: 4, ..plan.clone() });
+    println!("(i) scan jobs 11 → {}, shell checks {}, planned {}", scan_jobs(&s, 0), shells(&s), s.scan_planned[0]);
+    assert_eq!(shells(&s), 1, "the shell check survives the thinning");
+    assert_eq!((scan_jobs(&s, 0), s.scan_planned[0], s.plan.scan_points_per_pair), (3, 4, 4), "the kept points plus the check");
+    assert_eq!(s.progress().total, 1 + floor + 4, "the reference, the perturbations, 3 points + the check");
+    // (ii) the tail trim
+    let three = Scene {
+        nuclei: vec![Nucleus::new(1, [0.0, 0.0, 0.0]), Nucleus::new(1, [1.5, 0.0, 0.0]), Nucleus::new(1, [1.5, 2.85, 0.0])],
+        ..pair(1, 1, 1.0, cell(65))
+    };
+    assert_eq!(SamplingPlan::min_samples_for_trust(&three), 59, "the premise's floor");
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 24, ..SamplingPlan::default() };
+    let mut t = Sampler::with_cutoff(&three, &plan, r_cut).unwrap();
+    assert_eq!(t.scans.len(), 3);
+    assert!(matches!(t.queue.back(), Some(Job::Shell(_, 2, 23))), "premise: the last pair's shell check is its last point and the queue's tail");
+    let shells_before = shells(&t);
+    t.rescale(&SamplingPlan { scan_points_per_pair: 1, ..plan.clone() });
+    println!("(ii) shell checks {shells_before} → {}, planned per pair {:?}, total {}", shells(&t), t.scan_planned, t.progress().total);
+    assert_eq!(t.scan_planned, vec![20, 20, 20], "raised to the floor by the common factor");
+    assert_eq!(shells(&t), shells_before, "the trim never pops a pending shell check");
+    assert!(matches!(t.queue.back(), Some(Job::Shell(_, 2, 23))), "the shell check is still the tail");
+    assert_eq!(t.progress().total, 1 + 60, "one over the floor: the shell check is not trimmed");
+    let teacher = Shared::new(PairMorse::h2());
+    let mut sur = surrogate_over(&teacher);
+    while t.step_own_teacher(&mut sur, &mut never()).unwrap().is_some() {}
+    let checks = t.take_shell_checks();
+    assert_eq!(checks.len(), shells_before, "the pass solved its shell checks");
+    let last = checks.last().unwrap();
+    assert!((last.r - 1.8 * 2.85).abs() < 1e-9 && last.pair == (1, 1), "{:?}", (last.r, last.pair));
+}
+
 /// Review I2 and M1: the re-sizing goes through the driver (`Dynamics::rescale_sampling`) and the
 /// `SharedTrainable` wrapper forwards `rescale_pass`. The published total is the new one at once
 /// and stays so through ticks that run no pass step — an aborted tick and an edit's
@@ -1053,7 +1197,7 @@ fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
 /// An empty scene has no species: a pass over it is refused with the message the app shows.
 #[test]
 fn a_pass_over_an_empty_scene_is_refused() {
-    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let plan = SamplingPlan::default();
     assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
     assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
@@ -1067,7 +1211,7 @@ fn a_pass_over_an_empty_scene_is_refused() {
 fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let teacher = Shared::new(PairMorse::h2());
     let h = teacher.handle();
-    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let (p, sh) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(empty.clone(), p, 0.25, 1);
     let s0 = d.snapshot();
@@ -1087,4 +1231,742 @@ fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let mut sur = surrogate_of(&sh);
     assert_eq!(sur.samples(), 0, "nothing was kept as a sample");
     assert!(!sur.request_display(&empty), "no display refresh of an empty scene");
+}
+
+/// A teacher whose answers at pair separations below `r_overlap` carry a core-overlap report (what a pseudised
+/// teacher would say with the cores in contact), and — when `pattern_change_after` is Some(k) — flags the first
+/// non-overlapping pair answer after its k-th answer as an occupation-pattern change (once).
+struct Overlapping {
+    inner: PairMorse,
+    r_overlap: f64,
+    answers: usize,
+    pattern_change_after: Option<usize>,
+    flagged: bool,
+}
+
+impl ForceProvider for Overlapping {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        self.answers += 1;
+        let pair = scene.nuclei.len() == 2;
+        if pair && dist(scene, 0, 1) < self.r_overlap {
+            r.stats.core_overlaps = vec![(0, 1, dist(scene, 0, 1))];
+            r.stats.warnings.push(format!("{}: 0–1 at R = {:.3} Bohr", sim::CORE_OVERLAP_WARNING, dist(scene, 0, 1)));
+        } else if pair && !self.flagged && self.pattern_change_after.is_some_and(|k| self.answers > k) {
+            self.flagged = true;
+            r.stats.occupation_changed = true;
+        }
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "pair morse" // the surrogate's own teacher by name (the pass refuses another)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// M7 Task 9 (spec §5.6; Task 6 review A.6): a sampling pass never stores a geometry whose cores overlap or whose
+/// shared-shell pattern changed — they are counted as skipped, noted, and leave an activity row of their own;
+/// every other geometry of the pass is stored as before.
+#[test]
+fn a_pass_never_stores_core_overlapping_or_pattern_changing_answers() {
+    let mut teacher = Overlapping { inner: PairMorse::h2(), r_overlap: 1.2, answers: 0, pattern_change_after: Some(5), flagged: false };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 10, hot_burst_steps: 0, scan_points_per_pair: 6, seed: 3, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let fin = sampler.progress();
+    let notes = sampler.take_notes();
+    println!("progress {fin:?}; notes {notes:?}");
+    let overlapping = notes.iter().filter(|n| n.contains("cores overlap")).count();
+    let changed = notes.iter().filter(|n| n.contains("occupation pattern changed")).count();
+    assert!(overlapping >= 1, "a perturbation or scan geometry closer than 1.2 Bohr: {notes:?}");
+    assert_eq!(changed, 1, "{notes:?}");
+    assert!(fin.skipped >= overlapping + changed, "{fin:?}");
+    assert_eq!(s.samples(), sampler.samples_added());
+    // every geometry that was stored is neither an overlapping one (< 1.2 Bohr) nor the answer flagged as a pattern change
+    assert!(s.store().unwrap().samples.iter().all(|x| dist_of(&x.pos) >= 1.2), "an overlapping geometry was stored");
+    let events = Trainable::take_teach_events(&mut s);
+    assert_eq!(events.iter().filter(|e| e.outcome == sim::activity::TeachOutcome::UnfitNotKept).count(), overlapping + changed);
+}
+
+fn dist_of(pos: &[[f64; 3]]) -> f64 {
+    (0..3).map(|a| (pos[1][a] - pos[0][a]).powi(2)).sum::<f64>().sqrt()
+}
+
+/// A teacher that fails to converge on the two-nucleus geometries a predicate picks (the pair
+/// separation), with a scripted SCF error; everything else is `PairMorse`.
+struct FailsAt {
+    inner: PairMorse,
+    fails: fn(f64) -> bool,
+    error: sim::SolverError,
+}
+
+impl ForceProvider for FailsAt {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 2 && (self.fails)(dist(scene, 0, 1)) {
+            self.inner.seen.push(scene.clone());
+            return Err(ProviderError::Solver(self.error.clone()));
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+    fn reset(&mut self) {}
+    fn discontinuity(&mut self) {}
+}
+
+/// A failed scan point on the stretched side ends its scan there (module doc, "A failed scan point
+/// …"): H₂ at r₀ = 1.4, 12 points 0.7 … 1.8 r₀, every point beyond 1.45 r₀ fails. Point 9 (1.50 r₀)
+/// is solved and fails (stalled); points 10–12 are never sent to the teacher, each a skip row with
+/// the note; the earlier points are samples. Then: the cap's error names "cap"; a failure on the
+/// compressed side skips nothing; a numerical failure skips nothing.
+#[test]
+fn a_failed_scan_point_skips_the_rest_of_its_stretched_tail() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    use sim::SolverError;
+    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, level: 2e-4 };
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |fails: fn(f64) -> bool, error: SolverError| {
+        let mut teacher = FailsAt { inner: PairMorse::h2(), fails, error };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap();
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+        let seen: Vec<f64> = teacher.inner.seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1) / 1.4).collect();
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), seen)
+    };
+    // the stall at 1.50 r₀
+    let (p, notes, events, added, seen) = run(|r| r > 1.45 * 1.4, stalled.clone());
+    println!("stalled: {p:?}\n  notes {notes:?}\n  solved r/r₀ {seen:?}");
+    assert_eq!((p.done, p.total, p.failed, p.skipped), (13, 13, 1, 3));
+    assert!(p.finished);
+    assert_eq!(added, 8, "points 1–8 (0.7 … 1.4 r₀) are samples");
+    assert_eq!(seen.len(), 9, "points 10–12 are never solved");
+    assert!(seen.iter().all(|&f| f < 1.55), "{seen:?}");
+    let note = "scan 0–1: point 9 of 12 (r = 1.50 r₀) failed (stalled); further-out points skipped";
+    assert!(notes.iter().any(|n| n.contains(note) && n.contains("(3 not solved)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("3 scan points beyond a failed one were not solved")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("cell face")), "no cell-guard note: {notes:?}");
+    let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::Stalled), Some(61)));
+    assert!(failed[0].detail.contains("SCF stalled: Δρ best 3.1e-4 not improved 2× in 50 iterations"), "{}", failed[0].detail);
+    let skips: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::NotSolved).collect();
+    assert_eq!(skips.len(), 3);
+    assert!(skips.iter().all(|e| e.detail.contains(note) && e.rule == sim::activity::TeachRule::Pass(PassJob::Scan)), "{skips:?}");
+    // the iteration cap: the same skip, named "cap"
+    let (p, notes, events, _, _) = run(|r| r > 1.45 * 1.4, SolverError::ScfNotConverged(200, 2e-4));
+    assert_eq!((p.failed, p.skipped), (1, 3));
+    assert!(notes.iter().any(|n| n.contains("point 9 of 12 (r = 1.50 r₀) failed (cap)")), "{notes:?}");
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::Cap) && e.scf_steps == Some(200)));
+    // the compressed side: points 1–2 (0.7, 0.8 r₀) fail, nothing is skipped, the rest are samples
+    let (p, notes, _, added, seen) = run(|r| r < 0.85 * 1.4, stalled.clone());
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (2, 0, 10, 12), "{p:?} {notes:?}");
+    // another kind of failure skips nothing — a numerical failure, and a non-finite Δρ (review S5)
+    let (p, _, _, added, seen) = run(|r| r > 1.45 * 1.4, SolverError::Numerical("test".into()));
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (4, 0, 8, 12));
+    let (p, _, events, added, seen) = run(|r| r > 1.45 * 1.4, SolverError::ScfNotConverged(7, f64::NAN));
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (4, 0, 8, 12));
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::NonFinite) && e.scf_steps == Some(7)));
+    // converged samples carry their end in the log (an analytic teacher has no SCF: none)
+    let (_, _, events, _, _) = run(|_| false, stalled);
+    assert!(events.iter().filter(|e| e.outcome.is_kept()).all(|e| e.scf_end.is_none() && e.scf_steps == Some(0)));
+}
+
+/// Report-only measurement behind `qm::SCF_STALL_WINDOW` (`qm::scf` "The stall stop";
+/// `validate/references.md` "SCF stall stop"): the GPU SCF's Δρ per iteration with the stall stop
+/// off (`stall_window` 0, the cap 200 alone) on what the sampling pass of the app's water solves —
+/// the H₂O preset at the Accurate grid (95³ × 0.15) under `CoresOnly` (pseudo-O, all-electron H),
+/// at the pass's teacher tolerance (1e-6, floor-aware) — and on the all-electron presets: cold
+/// solves of converging cases (the preset, five pass perturbations, the pseudo-O atom at M = 1
+/// and 3, O–H scan points), all-electron H₂ (49³) and H₂O (57³) at h = 0.25, then one O–H scan run
+/// warm point after point as the pass runs it (density extrapolation on, reset at the scan's first
+/// point; a warm failure retried cold, R15). For every solve: the longest run of iterations without
+/// a 2× gain of the best Δρ — the stall rule's own counter (`ScfProgress::since_gain`, restarted at
+/// a shell release) — and, per window W, the smallest gain b(i−W)/b(i) of the best Δρ over any W
+/// iterations. Prints; asserts nothing.
+#[test]
+#[ignore = "report-only measurement (GPU, minutes): cargo test -p providers --release scf_stall_measurement -- --ignored --nocapture"]
+fn scf_stall_measurement() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("scf_stall_measurement: no GPU adapter — skipped");
+        return;
+    };
+    struct Run {
+        label: String,
+        converged: bool,
+        hist: Vec<f64>,
+        /// the stall watch's counter per iteration (restarted at a shell release)
+        since: Vec<usize>,
+        outcome: String,
+        ms: f64,
+    }
+    // the smallest best-Δρ gain over any W consecutive iterations (None: shorter than W)
+    fn min_gain(h: &[f64], win: usize) -> Option<f64> {
+        let best: Vec<f64> = h
+            .iter()
+            .scan(f64::INFINITY, |b, &d| {
+                *b = b.min(d);
+                Some(*b)
+            })
+            .collect();
+        (win < best.len()).then(|| (win..best.len()).map(|i| best[i - win] / best[i]).fold(f64::INFINITY, f64::min))
+    }
+    fn fmt_hist(h: &[f64]) -> String {
+        h.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>().join(" ")
+    }
+    fn longest(r: &Run) -> usize {
+        r.since.iter().copied().max().unwrap_or(0)
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut solve = |solver: &mut qm_gpu::GpuSolver, label: String, scene: &Scene, warm: bool| -> bool {
+        let mut notes = Vec::new();
+        let (_, system, mut settings) = crate::ks::problem(scene, 1e-6, &mut notes).expect("a valid scene");
+        if system.ionic.is_some() {
+            settings.tol = crate::pseudo::effective_gpu_tol(settings.tol, (system.n_up + system.n_dn) as i64);
+        }
+        settings.stall_window = 0; // measure: the cap alone
+        let t = Instant::now();
+        let mut seen: Vec<qm::ScfProgress> = Vec::new();
+        let r = solver
+            .solve_observed(&system, &settings, warm, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p)))
+            .map(|o| o.expect("never aborted").1);
+        let released = r.as_ref().map(|st| st.released.clone()).unwrap_or_default();
+        let r = r.map(|st| st.iterations);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let hist = solver.profile().delta_rho_steps.clone();
+        let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+        let (converged, outcome) = match &r {
+            Ok(n) => (true, format!("converged in {n}")),
+            Err(e) => (false, e.to_string()),
+        };
+        let run = Run { label, converged, hist, since, outcome, ms };
+        let g = |w: usize| min_gain(&run.hist, w).map_or("—".to_string(), |g| format!("{g:.2}"));
+        println!(
+            "{:<46} {:>4} it {:>7.0} ms  {}  longest no-2×-gain run {:>3}  min gain over W = 10: {:>6}, 20: {:>6}, 30: {:>6}, 50: {:>6}",
+            run.label,
+            run.hist.len(),
+            run.ms,
+            if run.converged { "conv" } else { "FAIL" },
+            longest(&run),
+            g(10),
+            g(20),
+            g(30),
+            g(50),
+        );
+        if !run.converged {
+            println!("    {}", run.outcome);
+        }
+        if !released.is_empty() {
+            println!("    released (DegenerateShells phase 2): {released:?}");
+        }
+        runs.push(run);
+        converged
+    };
+    let nuc = |z: u8, p: [f64; 3]| Nucleus::new(z, p);
+    let water = |c: Cell, ionic: sim::IonicPolicy| Scene {
+        nuclei: vec![nuc(8, [0.0, 0.0, 0.0]), nuc(1, [1.43, 1.11, 0.0]), nuc(1, [-1.43, 1.11, 0.0])],
+        cell: c,
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic,
+    };
+
+    // 1. the all-electron presets at h = 0.25 (cold)
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(49, 0.25));
+    solve(&mut s, "AE H2 49^3 R 1.45 cold".into(), &pair(1, 1, 1.45, Cell { n: 49, h: 0.25 }), false);
+    drop(s);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(57, 0.25));
+    solve(&mut s, "AE H2O 57^3 preset cold".into(), &water(Cell { n: 57, h: 0.25 }, sim::IonicPolicy::None), false);
+    drop(s);
+
+    // 2. the app's pseudo water at 95³ × 0.15 (CoresOnly), cold
+    let scene = water(Cell { n: 95, h: 0.15 }, sim::IonicPolicy::CoresOnly);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(95, 0.15));
+    solve(&mut s, "pseudo H2O 95^3 preset cold".into(), &scene, false);
+    for m in [1, 3] {
+        let atom = Scene { nuclei: vec![nuc(8, [0.0; 3])], multiplicity: Some(m), ..scene.clone() };
+        solve(&mut s, format!("pseudo O atom 95^3 M = {m} cold"), &atom, false);
+    }
+    let sampler = Sampler::new(&scene, &SamplingPlan::default()).unwrap();
+    let perts: Vec<Scene> = sampler
+        .queue
+        .iter()
+        .filter_map(|j| if let Job::Perturbation(sc) = j { Some(sc.clone()) } else { None })
+        .take(5)
+        .collect();
+    for (i, sc) in perts.iter().enumerate() {
+        solve(&mut s, format!("pseudo H2O perturbation {} cold", i + 1), sc, false);
+    }
+    let oh = sampler.scans().iter().position(|p| scene.nuclei[p.i].z == 8 || scene.nuclei[p.j].z == 8).expect("an O–H pair");
+    let points: Vec<(usize, Scene)> = sampler
+        .queue
+        .iter()
+        .filter_map(|j| match j {
+            Job::Scan(sc, p, k) if *p == oh => Some((*k, sc.clone())),
+            _ => None,
+        })
+        .collect();
+    let ps = sampler.scans()[oh].clone();
+    println!("O–H scan: nuclei {}–{}, r0 {:.3} Bohr, {} points", ps.i, ps.j, ps.r0, ps.r.len());
+    for (k, sc) in points.iter().filter(|(k, _)| [0, 3, 8, 11].contains(k)) {
+        solve(&mut s, format!("pseudo O-H scan {:.2} r0 cold", ps.r[*k] / ps.r0), sc, false);
+    }
+
+    // 3. the same scan warm, point after point, as the pass runs it (after the preset)
+    solve(&mut s, "pseudo H2O 95^3 preset (start of the warm scan)".into(), &scene, false);
+    s.set_density_extrapolation(true);
+    for (k, sc) in &points {
+        if *k == 0 {
+            // `discontinuity` at the scan's first point: no extrapolation across the jump
+            s.set_density_extrapolation(false);
+            s.set_density_extrapolation(true);
+        }
+        let f = ps.r[*k] / ps.r0;
+        if !solve(&mut s, format!("pseudo O-H scan {f:.2} r0 warm"), sc, true) {
+            // R15: retried once cold, extrapolation off for that solve
+            s.set_density_extrapolation(false);
+            solve(&mut s, format!("pseudo O-H scan {f:.2} r0 cold retry"), sc, false);
+            s.set_density_extrapolation(true);
+        }
+    }
+
+    // 4. review S4: the regimes the first measurement did not cover — the GPU LiH, He and H₃⁺ (equilateral, 1.65 Bohr,
+    // charge +1) all-electron presets at 49³ × 0.25; pseudo O–H at 2.5 / 3.5 / 5.0 Bohr (doublet, CoresOnly, 95³ × 0.15:
+    // candidates for a DegenerateShells release — `released` is printed); and, after the GPU runs, the CPU at the
+    // σ → 0 oracles' tight tolerance (H₂ 33³, tol 1e-9, eig_tol 1e-8)
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(49, 0.25));
+    let c49 = Cell { n: 49, h: 0.25 };
+    let lih = Scene { nuclei: vec![nuc(3, [-0.8, 0.0, 0.0]), nuc(1, [2.2, 0.0, 0.0])], ..pair(1, 1, 1.4, c49.clone()) };
+    solve(&mut s, "AE LiH 49^3 preset cold".into(), &lih, false);
+    let he = Scene { nuclei: vec![nuc(2, [0.0; 3])], ..pair(1, 1, 1.4, c49.clone()) };
+    solve(&mut s, "AE He 49^3 cold".into(), &he, false);
+    let a = 1.65;
+    let h3 = Scene {
+        nuclei: vec![nuc(1, [a / 2.0, -a / (2.0 * 3f64.sqrt()), 0.0]), nuc(1, [-a / 2.0, -a / (2.0 * 3f64.sqrt()), 0.0]), nuc(1, [0.0, a / 3f64.sqrt(), 0.0])],
+        charge: 1,
+        ..pair(1, 1, 1.4, c49.clone())
+    };
+    solve(&mut s, "AE H3+ 49^3 cold".into(), &h3, false);
+    drop(s);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(95, 0.15));
+    for d in [2.5, 3.5, 5.0] {
+        let oh = Scene { nuclei: vec![nuc(8, [0.0; 3]), nuc(1, [d, 0.0, 0.0])], multiplicity: Some(2), ..scene.clone() };
+        solve(&mut s, format!("pseudo O-H {d} Bohr M = 2 cold"), &oh, false);
+    }
+    drop(s);
+    {
+        let g = qm::Grid::cube(33, 0.25);
+        let mut st = qm::ScfSettings::for_grid(&g);
+        (st.tol, st.eig_tol, st.stall_window) = (1e-9, 1e-8, 0);
+        let sys = qm::System::new(vec![qm::Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, qm::Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let mut seen: Vec<qm::ScfProgress> = Vec::new();
+        let t = Instant::now();
+        let r = qm::scf_observed(&g, &sys, &st, None, Some(&mut |p: &qm::ScfProgress| seen.push(*p)));
+        let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+        let hist: Vec<f64> = seen.iter().map(|p| p.delta_rho).collect();
+        println!(
+            "{:<46} {:>4} it {:>7.0} ms  {}  longest no-2×-gain run {:>3}; Δρ: {}",
+            "CPU H2 33^3 tol 1e-9 eig_tol 1e-8 cold",
+            hist.len(),
+            t.elapsed().as_secs_f64() * 1e3,
+            if r.is_ok() { "conv" } else { "FAIL" },
+            since.iter().copied().max().unwrap_or(0),
+            fmt_hist(&hist)
+        );
+        runs.push(Run { label: "CPU H2 33^3 tol 1e-9".into(), converged: r.is_ok(), hist, since, outcome: String::new(), ms: t.elapsed().as_secs_f64() * 1e3 });
+    }
+
+    // the summary
+    let conv: Vec<&Run> = runs.iter().filter(|r| r.converged).collect();
+    let slowest = conv.iter().max_by_key(|r| r.hist.len()).expect("something converged");
+    let plateau = conv.iter().max_by_key(|r| longest(r)).expect("something converged");
+    println!();
+    println!("slowest converged: {} — {} iterations; Δρ: {}", slowest.label, slowest.hist.len(), fmt_hist(&slowest.hist));
+    println!("  its no-gain counter: {:?}", slowest.since);
+    println!("longest no-2×-gain run in a converged solve: {} iterations ({}); Δρ: {}", longest(plateau), plateau.label, fmt_hist(&plateau.hist));
+    println!("  its no-gain counter: {:?}", plateau.since);
+    for win in [10, 20, 30, 50] {
+        let worst = conv.iter().filter_map(|r| min_gain(&r.hist, win).map(|g| (g, r.label.clone()))).min_by(|a, b| a.0.total_cmp(&b.0));
+        println!(
+            "smallest best-Δρ gain over {win} iterations in a converged solve: {}",
+            worst.map_or("— (none that long)".to_string(), |(g, l)| format!("{g:.2} ({l})"))
+        );
+    }
+    for r in runs.iter().filter(|r| !r.converged) {
+        let stop = r.since.iter().position(|&k| k >= qm::SCF_STALL_WINDOW).map(|i| i + 1);
+        let best = stop.map(|n| r.hist[..n].iter().copied().fold(f64::INFINITY, f64::min));
+        println!();
+        println!(
+            "failed: {} — {} ({:.0} ms); the rule at W = {} stops it at iteration {:?} (best Δρ then {:?}); Δρ: {}",
+            r.label,
+            r.outcome,
+            r.ms,
+            qm::SCF_STALL_WINDOW,
+            stop,
+            best,
+            fmt_hist(&r.hist)
+        );
+        println!("  its no-gain counter: {:?}", r.since);
+    }
+}
+
+/// Report-only (review M1 follow-up): stretched H₂ (`IonicPolicy::None`, multiplicity None — the spin-symmetric
+/// solution, as the app and `validate`'s tools suite pose it), cold GPU solves with the stall stop off, at the tools
+/// suite's grids: 65³ × 0.25 (R 1.8, 2.5, 3.5, 5.0, 6.0) and 107³ × 0.15 (R 1.45, 2.0 … 6.0 by 0.25). Prints each
+/// solve's iterations and its longest run without a 2× gain of the best Δρ (the stall rule's counter), and the Δρ
+/// trace of the longest.
+#[test]
+#[ignore = "report-only measurement (GPU, minutes): cargo test -p providers --release scf_stall_stretched_h2 -- --ignored --nocapture"]
+fn scf_stall_stretched_h2() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("no GPU adapter — skipped");
+        return;
+    };
+    let mut worst: (usize, String, Vec<f64>, Vec<usize>) = (0, String::new(), Vec::new(), Vec::new());
+    for (n, h, rs) in [(65usize, 0.25, vec![1.8, 2.5, 3.5, 5.0, 6.0]), (107, 0.15, std::iter::once(1.45).chain((0..17).map(|k| 2.0 + 0.25 * k as f64)).collect::<Vec<f64>>())] {
+        let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(n, h));
+        for r in rs {
+            let scene = pair(1, 1, r, Cell { n, h });
+            let (_, system, mut settings) = crate::ks::problem(&scene, 1e-6, &mut Vec::new()).expect("H2");
+            settings.stall_window = 0;
+            let mut seen: Vec<qm::ScfProgress> = Vec::new();
+            let t = Instant::now();
+            let res = s.solve_observed(&system, &settings, false, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p))).map(|o| o.expect("never aborted").1.iterations);
+            let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+            let longest = since.iter().copied().max().unwrap_or(0);
+            println!("H2 {n}^3 h {h} R {r:.2}: {:?} in {:.0} ms; longest no-2×-gain run {longest}", res.as_ref().map_err(|e| e.to_string()), t.elapsed().as_secs_f64() * 1e3);
+            if longest > worst.0 && res.is_ok() {
+                worst = (longest, format!("{n}^3 R {r:.2}"), seen.iter().map(|p| p.delta_rho).collect(), since);
+            }
+        }
+    }
+    println!("longest converged plateau: {} iterations ({}); Δρ: {}", worst.0, worst.1, worst.2.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>().join(" "));
+    println!("  its no-gain counter: {:?}", worst.3);
+}
+
+// ---- the ghost: what the pass is solving now (display only; `Sampler::ghost`, `Trainable::pass_ghost`) ----
+
+fn positions(g: &PassGhost) -> Vec<[f64; 3]> {
+    g.atoms.iter().map(|a| a.pos).collect()
+}
+
+fn stalled_error() -> sim::SolverError {
+    sim::SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, level: 8e-3 }
+}
+
+/// At every step the ghost's geometry is exactly the one the teacher is asked about next — a
+/// reference atom, a nudge, a scan point, a burst evaluation — with the stage's labels: the
+/// reference's Z, the nudge's index, the scan's pair, point, r/r₀ and r, the burst's step and trail;
+/// the base positions are the pass's; the last finished job's serial advances by one per job.
+#[test]
+fn the_ghost_is_the_geometry_the_teacher_is_asked_about_next() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 3, hot_burst_steps: 4, scan_points_per_pair: 5, seed: 3, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let base: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    let mut serial = 0;
+    let mut stages: Vec<&str> = Vec::new();
+    while let Some(g) = sampler.ghost(&s) {
+        assert_eq!(g.finished.as_ref().map_or(0, |f| f.serial), serial, "one finished job per solve so far");
+        if let Some(f) = &g.finished {
+            assert_eq!(f.outcome, GhostOutcome::Kept, "an exact pair potential: every job is kept");
+        }
+        let n_before = h.lock().unwrap().seen.len();
+        assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some());
+        serial += 1;
+        let t = h.lock().unwrap();
+        assert_eq!(t.seen.len(), n_before + 1);
+        let asked: Vec<[f64; 3]> = t.seen.last().unwrap().nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(positions(&g), asked, "the ghost of {:?} is what the teacher solved", g.job);
+        let done_in_stage = stages.iter().filter(|x| **x == g.stage).count();
+        match g.job {
+            GhostJob::Reference { z } => {
+                assert_eq!((g.stage, z), ("references", 1));
+                assert_eq!(g.atoms, vec![GhostAtom { z: 1, pos: [0.0; 3] }], "the lone atom at the cell centre, as solved");
+                assert!(g.base.is_empty() && g.trail.is_empty());
+            }
+            GhostJob::Perturbation { index, of } => {
+                assert_eq!((g.stage, of, index), ("perturbations", 3, done_in_stage + 1));
+                assert_eq!(g.base, base, "the unperturbed positions are the pass base");
+                assert_ne!(positions(&g), base);
+            }
+            GhostJob::Scan { i, j, k, of, ratio, r } => {
+                assert_eq!((g.stage, i, j, of, k), ("scans", 0, 1, 5, done_in_stage + 1));
+                let want = 0.7 + 1.1 * (k - 1) as f64 / 4.0;
+                assert!((ratio - want).abs() < 1e-12 && (r - 1.4 * want).abs() < 1e-12, "k {k}: ratio {ratio} r {r}");
+                assert!((dist_of(&positions(&g)) - r).abs() < 1e-12);
+                assert_eq!(g.base, base);
+            }
+            GhostJob::Teach { .. } => unreachable!("a default pass teaches nothing around"),
+            GhostJob::ShellCheck { .. } => unreachable!("a 1.4 Bohr scan never crosses 5/6 r_cut"),
+            GhostJob::HotBurst { step, of } => {
+                assert_eq!((g.stage, of, step), ("hot burst", 4, done_in_stage + 1));
+                assert_eq!(g.trail.len(), (step - 1).min(GHOST_TRAIL), "the solved evaluations before this one");
+                if step == 1 {
+                    assert_eq!(positions(&g), base, "the burst starts at the scene's geometry");
+                }
+            }
+        }
+        stages.push(g.stage);
+    }
+    assert_eq!(stages.len(), 1 + 3 + 5 + 4, "one ghost per solve");
+    assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_none());
+    assert!(sampler.ghost(&s).is_none(), "finished: nothing is being solved");
+}
+
+/// A trail never holds more than `GHOST_TRAIL` evaluations.
+#[test]
+fn the_burst_trail_is_capped() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: GHOST_TRAIL + 4, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let mut longest = 0;
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+        if let Some(g) = sampler.ghost(&s) {
+            longest = longest.max(g.trail.len());
+        }
+    }
+    assert_eq!(longest, GHOST_TRAIL);
+}
+
+/// A cached reference costs no solve, so it is never the ghost: a second pass at the same settings
+/// starts at its first nudge.
+#[test]
+fn a_cached_reference_is_not_the_ghost() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut first = Sampler::new(&scene, &plan).unwrap();
+    assert!(matches!(first.ghost(&s).unwrap().job, GhostJob::Reference { z: 1 }));
+    while first.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let again = Sampler::new(&scene, &plan).unwrap().with_references(first.take_references());
+    let g = again.ghost(&s).unwrap();
+    assert!(matches!(g.job, GhostJob::Perturbation { index: 1, of: 2 }), "{:?}", g.job);
+    assert!(g.finished.is_none());
+}
+
+/// The outcome of the job just finished, in the solve log's words: a scan point that stalls is
+/// `Failed(Stalled)` ("stalled"), its skipped tail "skipped", the points before it kept; a numerical
+/// failure is plain "failed".
+#[test]
+fn the_ghost_reports_how_the_last_job_ended() {
+    use sim::activity::ScfEnd;
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |error: sim::SolverError| {
+        let mut teacher = FailsAt { inner: PairMorse::h2(), fails: |r| r > 1.45 * 1.4, error };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap();
+        let mut marks = Vec::new();
+        let mut ghost_after_failure = None;
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+            let m = sampler.finished.clone().unwrap();
+            if matches!(m.outcome, GhostOutcome::Failed(_)) && ghost_after_failure.is_none() {
+                ghost_after_failure = Some(sampler.ghost(&s));
+            }
+            marks.push(m.outcome);
+        }
+        marks.push(sampler.finished.clone().unwrap().outcome); // the skipped tail, accounted for by the last call
+        (marks, ghost_after_failure)
+    };
+    let (marks, after) = run(stalled_error());
+    // the reference, scan points 1-8 kept, point 9 stalls, then the three skip rows
+    assert_eq!(marks.len(), 1 + 8 + 1 + 1, "{marks:?}");
+    assert!(marks[..9].iter().all(|m| *m == GhostOutcome::Kept));
+    assert_eq!(marks[9], GhostOutcome::Failed(Some(ScfEnd::Stalled)));
+    assert_eq!(marks[10], GhostOutcome::Skipped);
+    assert!(after.unwrap().is_none(), "only skip rows are left after the failed point: nothing is being solved");
+    let (marks, _) = run(sim::SolverError::Numerical("test".into()));
+    assert!(marks.contains(&GhostOutcome::Failed(None)), "{marks:?}");
+    assert_eq!(GhostOutcome::Failed(Some(ScfEnd::Stalled)).word(), "stalled");
+    assert_eq!(GhostOutcome::Failed(Some(ScfEnd::Cap)).word(), "cap");
+    assert_eq!(GhostOutcome::Failed(None).word(), "failed");
+    assert_eq!(GhostOutcome::Kept.word(), "kept");
+    assert_eq!(GhostOutcome::Skipped.word(), "skipped");
+}
+
+/// Geometries whose cores overlap are solved and not kept: the ghost marks them skipped.
+#[test]
+fn an_unfit_geometry_is_marked_skipped() {
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let mut teacher = Overlapping { inner: PairMorse::h2(), r_overlap: 1.2, answers: 0, pattern_change_after: None, flagged: false };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let mut marks = Vec::new();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+        marks.push(sampler.finished.clone().unwrap().outcome);
+    }
+    assert!(marks.contains(&GhostOutcome::Skipped) && marks.contains(&GhostOutcome::Kept), "{marks:?}");
+}
+
+/// The ghost through the `Trainable` boundary and the driver: present while a pass runs, and gone
+/// — the viewer shows the scene again — when it is cancelled, when it ends, and when it fails.
+#[test]
+fn the_ghost_ends_with_the_pass_cancelled_finished_or_failed() {
+    let teacher = Shared::new(PairMorse::h2());
+    let (p, _h) = driven(surrogate_over(&teacher));
+    let scene = pair(1, 1, 1.45, cell(41));
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
+    let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 3, scan_points_per_pair: 3, seed: 5, ..SamplingPlan::default() };
+    assert!(d.snapshot().ghost.is_none(), "no pass, no ghost");
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    let g = d.snapshot().ghost.expect("the pass's first job at once");
+    assert_eq!(g.stage, "references");
+    // one solve per tick: the ghost follows
+    let snap = d.tick(0.0, &mut never());
+    assert_eq!(snap.ghost.as_ref().map(|g| g.stage), Some("perturbations"));
+    assert_eq!(snap.ghost.as_ref().and_then(|g| g.finished.as_ref()).map(|f| f.serial), Some(1));
+    // cancelled
+    d.apply(DynCommand::CancelSampling);
+    assert!(d.snapshot().ghost.is_none(), "cancelled");
+    assert!(d.snapshot().sampling.unwrap().cancelled);
+    // run to the end
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    let (mut ticks, mut with_ghost) = (0, 0);
+    loop {
+        let snap = d.tick(0.0, &mut never());
+        with_ghost += usize::from(snap.ghost.is_some());
+        if snap.sampling.as_ref().unwrap().finished {
+            assert!(snap.ghost.is_none(), "finished");
+            break;
+        }
+        ticks += 1;
+        assert!(ticks < 200);
+    }
+    assert!(with_ghost >= 8, "a ghost on the way: {with_ghost}");
+    // failed: the reference solve fails, the pass ends with the error
+    struct NoAtoms(PairMorse);
+    impl ForceProvider for NoAtoms {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            if scene.nuclei.len() == 1 {
+                return Err(ProviderError::Invalid("no isolated atoms here".into()));
+            }
+            self.0.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "pair morse"
+        }
+        fn reset(&mut self) {}
+    }
+    let s = SurrogateKs::new(Box::new(NoAtoms(PairMorse::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let (p, _h) = driven(s);
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
+    d.apply(DynCommand::StartSampling(plan));
+    assert!(d.snapshot().ghost.is_some());
+    let snap = d.tick(f64::INFINITY, &mut never());
+    assert!(snap.last_error.as_deref().is_some_and(|e| e.contains("sampling")), "{:?}", snap.last_error);
+    assert!(snap.ghost.is_none(), "failed: the scene returns");
+    // a provider without a model has none
+    let plain = Dynamics::new(pair(1, 1, 1.4, cell(41)), Box::new(MorseDimer::h2()), 0.25, 1);
+    assert!(plain.snapshot().ghost.is_none());
+}
+
+/// The scan stops short of r_cut (module doc, 3.; `SCAN_CUTOFF_FRACTION`; round 3 review R3-1): a
+/// pair whose 0.7 … 1.8 r₀ scan crosses 5/6 of the model's cutoff (r₀ 3.3 Bohr: 2.31 … 5.94) has
+/// its first point beyond the limit solved as a **shell check** — never fitted, handed over by
+/// `take_shell_checks` — and its further points planned as skips (never solved, counted in
+/// `skipped`, each with its note and the pass's tally); the total is unchanged. The same scan with
+/// a larger cutoff solves every point and has no shell check.
+#[test]
+fn pair_scans_stop_short_of_the_cutoff() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let scene = pair(1, 1, 3.3, cell(65));
+    let r_cut = 6.0;
+    let limit = SCAN_CUTOFF_FRACTION * r_cut;
+    let sampler = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
+    let want = sampler.scans()[0].r.iter().filter(|&&r| r > limit).count();
+    println!("r = {:.3?}; beyond {limit:.2}: {want}", sampler.scans()[0].r);
+    assert!(want > 0 && want < 12, "premise: the scan crosses the limit");
+    let limited = sampler.queue.iter().filter(|j| matches!(j, Job::Skip("scans", Some(_), Some(n)) if n.contains(SCAN_LIMIT_MARK))).count();
+    let shells = sampler.queue.iter().filter(|j| matches!(j, Job::Shell(..))).count();
+    assert_eq!((shells, limited), (1, want - 1), "one shell check, the rest skipped");
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let mut sm = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
+    while sm.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
+    let p = sm.progress();
+    let notes = sm.take_notes();
+    println!("{p:?}\n{notes:?}");
+    assert_eq!(sm.samples_added(), 12 - want, "the shell check is never a sample");
+    assert_eq!((p.total, p.skipped), (1 + 12, want - 1), "the total keeps the skipped points");
+    let beyond: Vec<f64> = h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1)).filter(|&r| r > limit).collect();
+    let first = sm.scans()[0].r.iter().copied().find(|&r| r > limit).unwrap();
+    assert_eq!(beyond.len(), 1, "only the shell check is solved beyond the limit: {beyond:?}");
+    assert!((beyond[0] - first).abs() < 1e-12);
+    let checks = sm.take_shell_checks();
+    assert_eq!(checks.len(), 1);
+    assert_eq!((checks[0].pair, checks[0].r, checks[0].r_cut), ((1, 1), first, r_cut));
+    assert!(notes.iter().any(|n| n.starts_with(&format!("sampling: {} scan points beyond 5/6 of the model's cutoff were not solved", want - 1))), "{notes:?}");
+    // a model with a larger cutoff scans the whole range
+    let wide = Sampler::with_cutoff(&scene, &plan, 8.0).unwrap();
+    assert!(wide.queue.iter().all(|j| !matches!(j, Job::Skip(..))));
+}
+
+/// The ghost skips the scan points planned as cutoff skips like any other skip (they cost no
+/// solve): at every step it is the geometry the teacher is asked about. The one point beyond the
+/// limit it shows is the pair's shell check (solved, never fitted), labelled as a check — never
+/// as a fitted scan point (final review M9).
+#[test]
+fn the_ghost_skips_the_cutoff_skipped_scan_points() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let scene = pair(1, 1, 3.3, cell(65));
+    let r_cut = 6.0;
+    let limit = SCAN_CUTOFF_FRACTION * r_cut;
+    let mut teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let mut sampler = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
+    let (mut scans, mut shell) = (0, 0);
+    while let Some(g) = sampler.ghost(&s) {
+        match g.job {
+            GhostJob::Scan { r, .. } => {
+                assert!(r <= limit, "a fitted scan point beyond the limit: {r}");
+                scans += 1;
+            }
+            GhostJob::ShellCheck { i, j, r } => {
+                assert!(r > limit && (i, j) == (0, 1), "{:?}", g.job);
+                shell += 1;
+            }
+            _ => {}
+        }
+        assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some());
+        let t = h.lock().unwrap();
+        let asked: Vec<[f64; 3]> = t.seen.last().unwrap().nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(positions(&g), asked);
+    }
+    assert!(scans > 0 && scans < 12, "{scans}");
+    assert_eq!(shell, 1, "beyond the limit the ghost shows only the shell check");
+}
+
+/// A teach-around pass has a ghost too: stage "teaching", the blocker and the solve in hand.
+#[test]
+fn the_ghost_describes_a_teach_around_pass() {
+    let teacher = Shared::new(PairMorse::h2());
+    let s = surrogate_over(&teacher);
+    let jobs = vec![
+        TargetJob { scene: pair(1, 1, 1.5, cell(41)), blocker: 7, holdout: false },
+        TargetJob { scene: pair(1, 1, 1.6, cell(41)), blocker: 7, holdout: true },
+    ];
+    let sampler = Sampler::targeted(&pair(1, 1, 1.4, cell(41)), jobs);
+    let g = sampler.ghost(&s).expect("the first teach solve");
+    assert_eq!(g.stage, "teaching");
+    assert_eq!(g.job, GhostJob::Teach { blocker: 7, index: 1, of: 2, holdout: false });
+    assert_eq!(g.atoms.len(), 2);
 }

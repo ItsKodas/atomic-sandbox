@@ -851,6 +851,7 @@ mod tests {
                     multiplicity: None,
                     teacher: String::new(),
                     masses: Vec::new(),
+                    ionic: "none".into(),
                 },
                 representatives: std::sync::OnceLock::new(),
             };

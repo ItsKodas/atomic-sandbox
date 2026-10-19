@@ -5,6 +5,7 @@
 use super::*;
 use crate::grid::Grid;
 use crate::poisson::{lm_index, solid_harmonics, N_MOMENTS};
+use crate::xc::lsda_pw92;
 use nalgebra::DMatrix;
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -1257,4 +1258,75 @@ fn unoccupied_cpu_aborts_when_asked() {
     let r = unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || { polls += 1; polls > 3 });
     eprintln!("aborted after {polls} polls");
     assert!(r.is_none() && polls == 4, "inside LOBPCG, after a few iterations ({polls} polls)");
+}
+
+/// Pseudo-O H₂O (`CoresOnly`: O pseudised with KB projectors and a partial core, H all-electron),
+/// closed shell, 33³, h = σ = 0.25 (uncertified `from_tables`: a solver-consistency check on one
+/// discrete problem). The SCF and the display solve share one operator.
+fn pseudo_h2o(h: f64) -> (Grid, Vec<Nucleus>, crate::scf::System) {
+    use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+    use crate::radial::test_cache::filtered_at;
+    let g = Grid::cube(33, h);
+    let nuclei = vec![Nucleus { pos: [0.03, -0.02, 0.01], z: 8 }, Nucleus { pos: [1.43, 1.11, 0.0], z: 1 }, Nucleus { pos: [-1.43, 1.11, 0.0], z: 1 }];
+    let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([
+        (8, Ionic::Pseudo(filtered_at(8, h))), (1, Ionic::AllElectron { sigma: h })])));
+    let sys = crate::scf::System::with_ionic(nuclei.clone(), 0, None, setup);
+    (g, nuclei, sys)
+}
+
+/// M7 × orbital viewer merge: under an ionic setup `unoccupied_cpu` diagonalises the SCF's full
+/// H^out — V_loc (the state's `v_nuc`), v_xc of (ρ_σ + ½ρ_pc) and V_NL — so its occupied
+/// eigenvalues agree with the SCF's to the existing bound τ(tol) = 1e-4 Ha (§8) and it is not
+/// rejected. Discrimination (measured, printed): the SCF orbitals' Rayleigh quotients on the
+/// operator without V_NL, or with v_xc of ρ_σ alone (no partial core), miss the SCF's eigenvalues
+/// by more than τ, so a display solve that dropped either term would be rejected by the guard.
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn unoccupied_cpu_uses_the_pseudo_hamiltonian() {
+    use crate::nonlocal::PseudoHamiltonian;
+    use crate::nuclear::has_partial_core;
+    use crate::scf::{scf, ScfSettings};
+    let (g, nuclei, sys) = pseudo_h2o(0.25);
+    let settings = ScfSettings::for_grid(&g);
+    let t = std::time::Instant::now();
+    let (st, stats) = scf(&g, &sys, &settings, None).unwrap();
+    eprintln!("pseudo H₂O 33³ SCF: {} steps, {:.1} s, E {:+.8}, ε↑ {:?}", stats.iterations, t.elapsed().as_secs_f64(), stats.energy.total, st.evals_up);
+    let setup = st.ionic.clone().expect("a pseudo state");
+    let nl = output_nonlocal(&st, &nuclei).expect("O carries KB projectors");
+    assert!(has_partial_core(&nuclei, &setup), "O carries a partial core (else the test is vacuous for ρ_pc)");
+    let tau_scf = tau(settings.tol);
+    // the discrimination: Rayleigh quotients of the SCF's own orbitals on the incomplete operators
+    let full = output_potentials(&st, &nuclei);
+    let plain_xc = lsda_pw92(&st.rho_up, &st.rho_dn);
+    let no_core: Vec<f64> = (0..g.len()).map(|i| st.v_nuc[i] + st.v_h[i] + plain_xc.v_up[i]).collect();
+    let rq = |op: &dyn Operator, psi: &[f64]| { let mut hp = vec![0.0; g.len()]; op.apply(psi, &mut hp); g.dot(psi, &hp) };
+    let miss = |op: &dyn Operator| st.orbitals_up.iter().zip(&st.evals_up).map(|(psi, e)| (rq(op, psi) - e).abs()).fold(0.0, f64::max);
+    let d_full = miss(&PseudoHamiltonian { grid: &g, v: &full[0], nl: &nl });
+    let d_no_nl = miss(&LocalHamiltonian { grid: &g, v: &full[0] });
+    let d_no_core = miss(&PseudoHamiltonian { grid: &g, v: &no_core, nl: &nl });
+    eprintln!("max |⟨ψ|H|ψ⟩ − ε_SCF| ↑: full H^out {d_full:.2e}, without V_NL {d_no_nl:.2e}, without ρ_pc {d_no_core:.2e} (τ {tau_scf:.0e})");
+    assert!(d_full <= tau_scf, "the full operator reproduces the SCF's eigenvalues: {d_full:.2e}");
+    assert!(d_no_nl > tau_scf && d_no_core > tau_scf, "each pseudo term moves the occupied ε by more than τ");
+    // the display solve
+    let t = std::time::Instant::now();
+    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || false).expect("not aborted");
+    eprintln!("pseudo H₂O 33³ CPU m = 2: {:.2} s, iterations {:?}, at cap {:?}, |Δε_occ| {:?}, evals {:?}, residuals {:?}",
+              t.elapsed().as_secs_f64(), u.iterations, u.at_cap, u.occupied_error, u.evals, u.residuals);
+    assert!(u.rejected.is_none(), "{:?}", u.rejected);
+    for ch in 0..2 {
+        assert!(u.occupied_error[ch] <= tau_scf, "ch {ch}: |Δε_occ| {:.3e} > τ", u.occupied_error[ch]);
+        let occ = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn };
+        let op = PseudoHamiltonian { grid: &g, v: &full[ch], nl: &nl };
+        assert!(u.evals[ch][0] > *st_evals(&st, ch).last().unwrap(), "above the HOMO");
+        let mut hphi = vec![0.0; g.len()];
+        for (i, phi) in vecs[ch].iter().enumerate() {
+            for psi in occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
+            // the reported ε and residual are those of the full operator
+            op.apply(phi, &mut hphi);
+            let e = g.dot(phi, &hphi);
+            let r: Vec<f64> = (0..g.len()).map(|p| hphi[p] - e * phi[p]).collect();
+            let res = g.dot(&r, &r).sqrt();
+            assert!((e - u.evals[ch][i]).abs() <= 1e-12 && (res - u.residuals[ch][i]).abs() <= 1e-12 * (1.0 + res), "re-measured ε, residual");
+        }
+    }
 }

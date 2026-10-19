@@ -2,6 +2,7 @@
 //! with the work rows; time and cost; a small E total / T sparkline; health (box, dt and
 //! evaluation warnings, the newest dynamics notes); and the collapsible energy breakdown and
 //! solver diagnostics (rows 51–72 and 111–127 of the mapping).
+use super::super::pseudo;
 use super::super::{
     box_warning, drift_colour, energy_cells, search, theme, GraphSeries, PanelInput, UiState, AMBER, BOX_MARGIN_WARN, GREEN,
     SPARK_WINDOW,
@@ -39,14 +40,15 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     let d = &s.dynamics;
     let estimated = s.backend == Backend::Estimated;
     let tu = st.temp_units;
+    let t_shown = super::super::averaged_temperature_text(d, &st.temp_avg, 1, tu);
     super::group(ui, st, "d-tiles", |ui, _| {
         ui.columns(3, |c| {
             tile(
                 &mut c[0],
                 "T",
-                RichText::new(super::super::temperature_text(d, 1, tu)),
-                "3N − 3 dof",
-                "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame)",
+                RichText::new(t_shown.clone()),
+                "1 s average",
+                "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame), averaged over the last second of steps — a few nuclei's instantaneous T swings with every vibration",
             );
             let (v, unit) = match d.drift_per_ps {
                 Some(x) => {
@@ -85,7 +87,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls.");
         });
         let units = st.energy_units;
-        egui::Grid::new("energies").num_columns(3).striped(true).show(ui, |ui| {
+        super::wide_grid(ui, "energies", 3).striped(true).show(ui, |ui| {
             let mut row = |name: &str, x: f64, strong: bool, tip: &str| {
                 let n = if strong { RichText::new(name).strong() } else { RichText::new(name) };
                 ui.label(n).on_hover_text(tip);
@@ -93,7 +95,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 ui.end_row();
             };
             row("KE (nuclei)", d.kinetic, false, "Σ ½ m v² of the nuclei (lab frame)");
-            row("E_KS", d.energy_ks, false, "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)");
+            let e_ks_label = pseudo::energy_label(&d.eval.pseudised);
+            let e_ks_tip = if d.eval.pseudised.is_empty() {
+                "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)".to_string()
+            } else {
+                format!("Kohn-Sham energy at the current positions (valence electrons + the ions' repulsion). {}", pseudo::VALENCE_NOTE)
+            };
+            row(e_ks_label, d.energy_ks, false, &e_ks_tip);
             row("E total", d.total, true, "KE + E_KS: conserved in NVE without tools");
             row(
                 "E conserved",
@@ -138,10 +146,14 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         if estimated {
             theme::note(ui, "The three work rows add up to E total − E conserved.");
         }
+        // M7 (Task 6 review A.6): a partly filled degenerate shell is shared equally, the spherical-atom ensemble
+        for line in pseudo::occupation_lines(&d.eval.fractional) {
+            theme::note(ui, line);
+        }
     });
     super::group(ui, st, "d-time", |ui, _| {
         theme::section(ui, "Time and cost");
-        egui::Grid::new("time-cost").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
+        super::wide_grid(ui, "time-cost", 2).striped(true).show(ui, |ui| {
             // long values wrap in the dock instead of widening it
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label("sim time");
@@ -167,8 +179,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 ));
             } else {
                 let cost = match d.eval.readbacks {
-                    Some(r) => format!("{} SCF steps, {r} readbacks", d.eval.scf_steps),
-                    None => format!("{} SCF steps", d.eval.scf_steps),
+                    Some(r) => format!("{} SCF iterations, {r} readbacks", d.eval.scf_steps),
+                    None => format!("{} SCF iterations", d.eval.scf_steps),
                 };
                 ui.monospace(format!("{cost} · {} ms", d.eval.solve_ms));
             }
@@ -183,7 +195,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     ui.horizontal(|ui| {
         theme::section(ui, "E total and T");
         if ui.add(egui::Button::new(RichText::new("Graph tab ›").size(10.5).color(theme::ACCENT_INK)).frame(false)).clicked() {
-            st.dock_tab = super::super::DockTab::Graph;
+            st.open_tab(super::super::DockTab::Graph);
         }
     });
     sparkline(ui, &d.history, &d.history_source, &d.history_guess, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false, st.temp_units);
@@ -228,13 +240,13 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
         .default_open(false)
         .open(search::opens(st, "d-breakdown"))
         .show(ui, |ui| {
-            egui::Grid::new("energy").num_columns(3).striped(true).show(ui, |ui| {
+            super::wide_grid(ui, "energy", 3).striped(true).show(ui, |ui| {
                 let mut row = |name: &str, x: f64| {
                     ui.label(name);
                     energy_cells(ui, x, units, false);
                     ui.end_row();
                 };
-                row("E_KS", e.total);
+                row(pseudo::energy_label(&d.eval.pseudised), e.total);
                 row("kinetic (electrons)", e.kinetic);
                 row("external", e.external);
                 row("Hartree", e.hartree);
@@ -242,7 +254,11 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
                 row("nuclear", e.nuclear);
             });
             let sigma = s.scene.sigma.unwrap_or(s.scene.grid_h);
-            ui.weak(format!("smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"));
+            if d.eval.pseudised.is_empty() {
+                ui.weak(format!("smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"));
+            } else {
+                ui.weak(format!("{} — all-electron species are smeared nuclei (σ = {sigma} Bohr)", pseudo::VALENCE_NOTE));
+            }
             if d.source == Source::Surrogate {
                 ui.weak("surrogate step: only the total is the model's (it has no electrons); the parts above are 0");
             } else if d.source == Source::Fallback {
@@ -251,13 +267,13 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
             if s.engine == Backend::Gpu {
                 ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
             }
-            egui::Grid::new("scf").num_columns(2).striped(true).show(ui, |ui| {
+            super::wide_grid(ui, "scf", 2).striped(true).show(ui, |ui| {
                 let mut row = |name: &str, v: String| {
                     ui.label(name);
                     ui.monospace(v);
                     ui.end_row();
                 };
-                row("SCF steps", d.eval.scf_steps.to_string());
+                row("SCF iterations", d.eval.scf_steps.to_string());
                 // the worst LOBPCG residual among the solves the converged state rests on (the
                 // GPU's deliberately loosened early SCF steps excluded)
                 row("eigen residual (final)", format!("{:.1e}", d.eval.max_eigen_residual));

@@ -1,8 +1,8 @@
 //! The periodic-table picker (M6 Task 10, user request 2026-10-14): a popover from the toolbar's
 //! element group with the standard 18-column layout and the two f-block rows below it, searchable
-//! by symbol, name (where `units::elements::name` has one) or Z. Z ≤ 10 can be placed (the solver
-//! is all-electron on the grid); heavier elements are shown greyed, "needs pseudopotentials
-//! (planned)". Picking an enabled element places its most abundant isotope and offers the listed
+//! by symbol, name (where `units::elements::name` has one) or Z. Z ≤ 18 can be placed (M7 Task 12: Z ≤ 10
+//! all-electron or pseudised, Z 11–18 on a pseudopotential generated on first use — or refused with its
+//! reason, see [`tip`]); heavier elements are shown greyed, "needs pseudopotentials (planned)". Picking an enabled element places its most abundant isotope and offers the listed
 //! isotopes of that Z (`units::isotopes`) with their masses.
 //!
 //! Display data only (rule 1): the cell positions are computed from Z and the period boundaries
@@ -13,8 +13,10 @@ use units::elements::{name, symbol, Z_MAX};
 
 /// The last Z of each period (the noble gases): the only input of the layout.
 pub const PERIOD_ENDS: [u8; 7] = [2, 10, 18, 36, 54, 86, 118];
-/// The heaviest element the solver handles today: all-electron on this grid.
-pub const Z_ENABLED: u8 = 10;
+/// The heaviest element that can be placed today: the isotope table's range (`units::isotopes`), whose
+/// pseudopotentials the generator makes on first use (a refused species is placeable but runs all-electron
+/// under Cores only and is an error under All — [`tip`] says so).
+pub const Z_ENABLED: u8 = 18;
 /// Why the rest are greyed.
 pub const GREYED_TIP: &str = "needs pseudopotentials (planned)";
 /// Rows of the two f-block rows (row 8 is the gap between them and the main table).
@@ -69,16 +71,93 @@ pub fn search(query: &str) -> Vec<u8> {
     (1..=Z_MAX).filter(|&z| matches(query, z)).collect()
 }
 
-/// A cell's tooltip: what clicking does, or why it is greyed.
+/// The partition rule's verdict on Z (`qm::radial::has_core`: the radial all-electron atom and §4.2, a few
+/// tens of milliseconds), memoised per Z. Refusals that only the full generation can reach (Al's T5) are read from
+/// the providers' cache instead, once something has generated them.
+fn partition_memo() -> &'static std::sync::Mutex<std::collections::HashMap<u8, Result<bool, qm::radial::Refusal>>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u8, Result<bool, qm::radial::Refusal>>>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// Computes the partition verdicts of Z 11..=Z_ENABLED into the memo (idempotent). The popover primes it on a
+/// thread when it opens ([`prime`]), so the render thread never waits for it; the tests call it directly.
+pub fn prime_partition() {
+    for z in 11..=Z_ENABLED {
+        if partition_memo().lock().is_ok_and(|m| m.contains_key(&z)) {
+            continue;
+        }
+        let verdict = qm::radial::has_core(z);
+        if let Ok(mut m) = partition_memo().lock() {
+            m.insert(z, verdict);
+        }
+    }
+}
+
+/// Starts [`prime_partition`] on a background thread, once per process.
+fn prime() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("ptable-partition".into()).spawn(prime_partition);
+    });
+}
+
+/// The recipe's refusal of Z when one is known without generating anything: the providers' cache (a table the
+/// process generated, or its refusal) first, then the partition memo.
+fn known_refusal(z: u8) -> Option<qm::radial::Refusal> {
+    if let Some(Err(r)) = providers::pseudo::cached_outcome(z) {
+        return Some(r);
+    }
+    match partition_memo().try_lock().ok()?.get(&z)? {
+        Err(r) => Some(r.clone()),
+        Ok(_) => None,
+    }
+}
+
+/// The refusal in one clause: the reason, then where it leaves the user (display words only).
+fn refusal_reason(r: &qm::radial::Refusal) -> String {
+    use qm::radial::Refusal;
+    match r {
+        Refusal::TwoStatesSameL { l, .. } => {
+            format!("two valence {} states — needs the ONCV stage", ["s", "p", "d", "f"].get(*l as usize).copied().unwrap_or("?"))
+        }
+        Refusal::NoLadderEntryPasses { .. } => {
+            "no entry of the recipe's softness ladder passes its transferability gates (T5) — needs the ONCV stage".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Zσ at the default grid (h = σ = [`crate::quality::DEFAULT_H`]) as "1.7": computed as z·h in hundredths of a
+/// Bohr, rounded half up, so 11 × 0.15 reads 1.7 and not the float's 1.6.
+fn z_sigma(z: u8) -> String {
+    let hundredths = (crate::quality::DEFAULT_H * 100.0).round() as u32;
+    let tenths = (z as u32 * hundredths + 5) / 10;
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// A cell's tooltip: what clicking does, or why it is greyed. For Z > 10 it states what the species gets from
+/// the pseudopotential recipe — a refusal (known from the partition rule or from a generation the process
+/// already ran) with what the all-electron fallback costs, else "pseudopotential (generated on first use)".
 pub fn tip(z: u8) -> String {
     let who = match name(z) {
         Some(n) => format!("{n} ({}, Z = {z})", symbol(z)),
         None => format!("{} (Z = {z})", symbol(z)),
     };
-    if enabled(z) {
-        format!("{who}: click to place it (its most abundant isotope; the isotopes are listed below)")
-    } else {
-        format!("{who}: {GREYED_TIP}")
+    if !enabled(z) {
+        return format!("{who}: {GREYED_TIP}");
+    }
+    let place = "click to place it (its most abundant isotope; the isotopes are listed below)";
+    if z <= 10 {
+        return format!("{who}: {place}");
+    }
+    match known_refusal(z) {
+        Some(r) => format!(
+            "{who}: {place}. refused: {}; under Cores only it falls back to all-electron at σ = h, where Zσ ≈ {} even at h = {}: qualitatively wrong, as O was before M7; under All species it is an error",
+            refusal_reason(&r),
+            z_sigma(z),
+            crate::quality::DEFAULT_H
+        ),
+        None => format!("{who}: {place}. pseudopotential (generated on first use)"),
     }
 }
 
@@ -105,6 +184,7 @@ pub fn contents(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         }
     });
+    prime();
     let query = st.ptable_query.clone();
     let cols = 18.0;
     let size = Vec2::new(cols * CELL.x + (cols - 1.0) * GAP, 9.0 * (CELL.y + GAP) + ROW_GAP);
@@ -132,7 +212,7 @@ pub fn contents(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         }
     }
     isotope_row(ui, st, acts);
-    theme::note(ui, format!("Z 1–{Z_ENABLED} are solved all-electron on the grid. Greyed (Z > {Z_ENABLED}): {GREYED_TIP}."));
+    theme::note(ui, format!("Z 1–{Z_ENABLED} can be placed; heavier elements need the next pseudopotential stage (ONCV, semicore). Greyed (Z > {Z_ENABLED}): {GREYED_TIP}."));
 }
 
 /// One painted cell: symbol, Z, the display colour as a stripe for the enabled ones.
@@ -237,18 +317,48 @@ mod tests {
         }
     }
 
-    /// Z ≤ 10 enabled; the rest greyed with the planned-pseudopotentials tooltip.
+    /// Z ≤ 18 enabled; the rest greyed with the planned-pseudopotentials tooltip (M7 Task 12). Na and Mg tell their
+    /// refusal and what the all-electron fallback costs; the species the recipe may accept say they are generated
+    /// on first use.
     #[test]
-    fn light_elements_are_enabled_and_the_rest_greyed() {
+    fn z_up_to_18_are_enabled_and_the_rest_greyed() {
+        prime_partition();
         let on: Vec<u8> = (1..=Z_MAX).filter(|&z| enabled(z)).collect();
-        assert_eq!(on, (1..=10).collect::<Vec<u8>>());
-        assert!(!enabled(0) && !enabled(11) && !enabled(118));
-        assert!(tip(11).ends_with("needs pseudopotentials (planned)"), "{}", tip(11));
+        assert_eq!(on, (1..=18).collect::<Vec<u8>>());
+        assert!(enabled(18) && !enabled(0) && !enabled(19) && !enabled(118));
+        assert!(tip(19).ends_with("needs pseudopotentials (planned)"), "{}", tip(19));
         assert!(tip(92).ends_with("needs pseudopotentials (planned)"), "{}", tip(92));
         assert!(tip(8).starts_with("oxygen (O, Z = 8): click to place it"), "{}", tip(8));
         assert!(!tip(8).contains("pseudopotentials"));
         // beyond the name table: the symbol and Z
         assert!(tip(79).starts_with("Au (Z = 79)"), "{}", tip(79));
+        // Na and Mg: refused by the partition (two valence s states), the fallback's Zσ at h = 0.15 stated
+        let na = tip(11);
+        assert!(na.starts_with("sodium (Na, Z = 11): click to place it"), "{na}");
+        assert!(na.contains("refused: two valence s states — needs the ONCV stage"), "{na}");
+        assert!(na.contains("falls back to all-electron at σ = h, where Zσ ≈ 1.7 even at h = 0.15: qualitatively wrong, as O was before M7"), "{na}");
+        let mg = tip(12);
+        assert!(mg.contains("refused: two valence s states") && mg.contains("Zσ ≈ 1.8"), "{mg}");
+        // the species whose refusal (Al: T5) or acceptance only a generation can tell
+        for z in 14..=18 {
+            assert!(tip(z).ends_with("pseudopotential (generated on first use)"), "{}", tip(z));
+        }
+        assert!(tip(16).starts_with("sulfur (S, Z = 16): click to place it"), "{}", tip(16));
+    }
+
+    /// Zσ at h = 0.15 is computed as z · h and rounded half up (not tabulated; a float would print 11 × 0.15 as 1.6).
+    #[test]
+    fn z_sigma_rounds_half_up_from_z_times_h() {
+        assert_eq!([11, 12, 13, 14, 18].map(z_sigma), ["1.7", "1.8", "2.0", "2.1", "2.7"]);
+    }
+
+    /// A refusal the process already generated (the providers' cache) is told by the tip, not "generated on first use".
+    #[test]
+    fn a_cached_refusal_is_read_from_the_providers() {
+        let reason = refusal_reason(&qm::radial::Refusal::NoLadderEntryPasses { z: 13, tried: vec![] });
+        assert!(reason.contains("T5") && reason.contains("ONCV"), "{reason}");
+        let two = refusal_reason(&qm::radial::Refusal::TwoStatesSameL { z: 11, l: 0, states: vec![] });
+        assert_eq!(two, "two valence s states — needs the ONCV stage");
     }
 
     /// Search by symbol, name prefix or Z, case-insensitively.

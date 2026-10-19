@@ -10,6 +10,7 @@ use super::*;
 /// `FallbackPolicy::max_descriptor_distance` (`surrogate` module doc, "Trust recovery").
 pub const THIN_FRACTION: f64 = 0.25;
 
+
 /// One in this many thinned candidates (fallback answers close to a stored sample) is kept
 /// anyway (`surrogate` module doc, "Fallback thinning"; also the no-model cap's keep rate).
 pub const THIN_EVERY: usize = 10;
@@ -46,6 +47,12 @@ pub(super) const Q_SUPERSEDED: u8 = 2;
 /// being built, excluded from the fit once the trust floor is met without it (Task 9 fix round
 /// 1, S1): never a quarantine candidate, never fencing.
 pub(super) const Q_BOX: u8 = 3;
+
+/// A draft-mode audit's answer at a geometry the strict policy refused (fix (b), 2026-10-18;
+/// `SampleTag::DraftAudit`): held out of the strict fit — not fitted, not in the envelope, the
+/// grade or the leave-one-out, never fencing. Not written to the sidecar's quarantine array (the
+/// tag carries it; `install_sidecar` restores the code from the tag).
+pub(super) const Q_DRAFT: u8 = 4;
 
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
@@ -118,6 +125,12 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_BOX).count()
     }
 
+    /// Draft-mode audit answers held out of the strict fit (`Q_DRAFT`; `surrogate` module doc,
+    /// "Draft mode").
+    pub fn held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_DRAFT).count()
+    }
+
     /// Stored samples kept since the last refit (not in the fit yet; M6 Task 11's reconciliation,
     /// `sim::TrainableStatus::unfitted`).
     pub fn unfitted(&self) -> usize {
@@ -169,7 +182,8 @@ impl SurrogateKs {
         true
     }
 
-    /// Whether stored sample `i` is left out of the fit (quarantined, superseded or box-excluded).
+    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded or a
+    /// held-out draft guess).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -190,8 +204,12 @@ impl SurrogateKs {
                 let saved = self.save_state();
                 self.degree_cap = Some(RECOVERY_DEGREE_CAP);
                 self.species_dirty = true;
+                // kept only if the trust rule's counts then hold too: a retry that trades a residual
+                // failure for a sample shortfall (Q′ grows with the cap: 176 → 344 for H/O) is not a
+                // recovery — the 2026-10-18 water session's E1(e): one H 0.9 Bohr from O took the
+                // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample
                 match self.fit_store() {
-                    Ok(r) if !self.recoverable_fail() => {
+                    Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
                     }
@@ -423,8 +441,10 @@ impl SurrogateKs {
     }
 
     /// The distance (training-spread units, L∞ over features; the worst query atom's nearest
-    /// stored atom of its species) from the geometry to the nearest stored sample (thinning).
-    /// ∞ without a model, an envelope or a candidate.
+    /// stored atom of its species) from the geometry to the nearest stored sample (thinning),
+    /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
+    /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
+    /// strict mode the region (round 1 re-review, R1-1). ∞ without a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -432,7 +452,10 @@ impl SurrogateKs {
         let mut worst_atom = 0.0f64;
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
-            for atoms in &self.desc_cache {
+            for (i, atoms) in self.desc_cache.iter().enumerate() {
+                if self.quarantine.get(i) == Some(&Q_DRAFT) {
+                    continue;
+                }
                 for (s, b) in atoms {
                     if s == qs {
                         best = best.min(spread_distance(env, *s, qd, b));
@@ -462,6 +485,7 @@ impl SurrogateKs {
         near: &[usize],
         keep: bool,
         thin: bool,
+        dedup: bool,
         essential: bool,
         h: f64,
         notes: &mut Vec<String>,
@@ -550,11 +574,19 @@ impl SurrogateKs {
             ));
             return yes(TeachOutcome::KeptReleased { released, superseded });
         }
-        // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are kept
-        if thin && self.since_kept + 1 < THIN_EVERY {
+        // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are
+        // kept — but never a copy where copies could satisfy the rule (`is_label_copy`; round 1 of
+        // the 2026-10-18 review, MUST-2)
+        if thin || dedup {
             let d = self.nearest_stored(pos, z);
             let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
-            if d <= limit {
+            if dedup && d <= limit {
+                if let Some(i) = self.is_label_copy(pos, z, energy, forces) {
+                    notes.push(format!("surrogate: sample not kept — a copy of stored sample #{i} (its labels within the fit's own noise)"));
+                    return no(TeachOutcome::Thinned);
+                }
+            }
+            if thin && self.since_kept + 1 < THIN_EVERY && d <= limit {
                 self.since_kept += 1;
                 notes.push(format!(
                     "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
@@ -565,6 +597,59 @@ impl SurrogateKs {
         // past the box rule above only below it, or as an essential answer (the exemption): the
         // latter is kept box-affected
         yes(if face.is_some_and(|rho| rho > rule) { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept })
+    }
+
+    /// A **copy** (round 1 of the 2026-10-18 trust review, MUST-2): the fitted (or pending) sample — not
+    /// an excluded one: held out, quarantined, superseded, box-excluded (R1-1) — of the same atom
+    /// sequence, inside the thinning radius and the nearest by the per-sample descriptor distance (the quarantine fence's: the
+    /// worst atom's distance to its counterpart's species in that sample, training-spread units),
+    /// whose labels this answer repeats within the fit's own noise — |E − E_s| ≤ N·s_E (s_E per atom
+    /// for a per-atom fit) and every atom's force magnitude within s_F of its counterpart's (the
+    /// magnitudes: rotation-invariant, so a rotating molecule's repeats are seen). Such a row tells
+    /// the fit nothing it does not know to within its noise; fitted, a run of them shrinks the
+    /// two-noise evidence's s_F (rows that add no residual) and with it rule 6's bound everywhere,
+    /// and meets the count conditions by repetition — a molecule parked under rule 4, 4b or 5. A
+    /// vibrating one is not a copy: its labels move by k·Δr per step, far above s_F (the active
+    /// learning run: 6e-4 against 4.5e-5 Ha/Bohr). No constant beyond the fit's own noise levels.
+    /// `None` without a fit.
+    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<usize> {
+        let (model, env, store, report) = (self.model.as_ref()?, self.envelope.as_ref()?, self.store.as_ref()?, self.report.as_ref()?);
+        let basis = &model.basis;
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        let (mut best, mut best_d) = (None, f64::INFINITY);
+        for (i, s) in store.samples.iter().enumerate() {
+            // only a sample that is (or will be) fitted: the rationale — fitted copies shrink s_F,
+            // copies meet the counts — concerns the fit (round 1 re-review, R1-1: a held-out guess
+            // compared against would refuse the very fallbacks that let strict mode reach it)
+            if s.z != z || self.excluded(i) {
+                continue;
+            }
+            let owned;
+            let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
+                Some(a) => a,
+                None => {
+                    owned = describe_sample(basis, s);
+                    &owned
+                }
+            };
+            let d = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
+                worst.max(atoms.iter().filter(|(t, _)| t == qs).map(|(t, b)| spread_distance(env, *t, qd, b)).fold(f64::INFINITY, f64::min))
+            });
+            if d < best_d {
+                (best, best_d) = (Some(i), d);
+            }
+        }
+        let i = best?;
+        if !(best_d <= THIN_FRACTION * self.policy.max_descriptor_distance) {
+            return None;
+        }
+        let s = &store.samples[i];
+        let n = z.len().max(1) as f64;
+        let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
+        let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+        let same = (energy - s.energy).abs() <= s_e && forces.iter().zip(&s.forces).all(|(a, b)| (mag(a) - mag(b)).abs() <= report.sigma_f);
+        same.then_some(i)
     }
 
     /// The no-model cap (`surrogate` module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the

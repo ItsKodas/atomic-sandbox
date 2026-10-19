@@ -76,12 +76,13 @@ pub fn hill_formula(z: &[u8], charge: Option<i32>) -> String {
     write_formula(&comp, charge)
 }
 
-/// The IUPAC Red Book 2005 Table VI sequence for Z ≤ 10, from the ELECTROPOSITIVE end (display data):
-/// Ne, He, Li, Be, B, C, N, H, O, F — position 0 for Ne. Beyond the table (Z = 0 or Z > 10) the position
-/// is 10 + Z, after every listed element, so the order stays total.
+/// The IUPAC Red Book 2005 Table VI sequence for Z ≤ 18, from the ELECTROPOSITIVE end (display data): the
+/// groups in order, heavier first within a group, hydrogen between groups 15 and 16 —
+/// Ar, Ne, He, Na, Li, Mg, Be, Al, B, Si, C, P, N, H, S, O, Cl, F — position 0 for Ar. Beyond the table
+/// (Z = 0 or Z > 18) the position is 18 + Z, after every listed element, so the order stays total.
 pub fn iupac_order(z: u8) -> usize {
-    const SEQUENCE: [u8; 10] = [10, 2, 3, 4, 5, 6, 7, 1, 8, 9];
-    SEQUENCE.iter().position(|&s| s == z).unwrap_or(10 + z as usize)
+    const SEQUENCE: [u8; 18] = [18, 10, 2, 11, 3, 12, 4, 13, 5, 14, 6, 15, 7, 1, 16, 8, 17, 9];
+    SEQUENCE.iter().position(|&s| s == z).unwrap_or(18 + z as usize)
 }
 
 /// The DISPLAYED formula (spec §4.1, P9): Hill order when carbon is present, `iupac_order` otherwise;
@@ -101,9 +102,9 @@ pub fn element_name(z: u8) -> &'static str {
     units::elements::name(z).unwrap_or("?")
 }
 
-/// The "-ide" stem for binary names (spec §4.2): "hydr" → hydride, "ox" → oxide, …; "?" beyond Ne.
+/// The "-ide" stem for binary names (spec §4.2): "hydr" → hydride, "ox" → oxide, …; "?" beyond Ar.
 pub fn ide_stem(z: u8) -> &'static str {
-    ["?", "hydr", "hel", "lith", "beryll", "bor", "carb", "nitr", "ox", "fluor", "neon"]
+    ["?", "hydr", "hel", "lith", "beryll", "bor", "carb", "nitr", "ox", "fluor", "neon", "sod", "magnes", "alumin", "silic", "phosph", "sulf", "chlor", "argon"]
         .get(z as usize)
         .copied()
         .unwrap_or("?")
@@ -286,7 +287,8 @@ pub fn binary_name(za: u8, m: u8, zb: u8, n: u8) -> String {
 }
 
 /// IR-6 parent hydrides of the compositions in range (Red Book 2005 Table IR-6.1; their onium and
-/// "-ide" ions, IR-6.4): mononuclear BH₃ borane, CH₄ methane, NH₃ azane, H₂O oxidane, HF fluorane;
+/// "-ide" ions, IR-6.4): mononuclear BH₃ borane, CH₄ methane, NH₃ azane, H₂O oxidane, HF fluorane,
+/// SiH₄ silane, PH₃ phosphane, H₂S sulfane, HCl chlorane (M7 Task 12);
 /// the chains H₂O₂ dioxidane, N₂H₄ diazane, C₂H₆ ethane; NH₄⁺ azanium, H₃O⁺ oxidanium, HO⁻ oxidanide.
 /// A chain name asserts its backbone, so the graph must have one — the checks the Common style uses:
 /// dioxidane the peroxide signature (an O–O bond, both O further bonded), ethane the carbons
@@ -304,6 +306,10 @@ fn hydride_of(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)], charge: i32) -> O
         ([(1, 3), (7, 1)], 0) => "azane",
         ([(1, 2), (8, 1)], 0) => "oxidane",
         ([(1, 1), (9, 1)], 0) => "fluorane",
+        ([(1, 3), (15, 1)], 0) => "phosphane",
+        ([(1, 4), (14, 1)], 0) => "silane",
+        ([(1, 2), (16, 1)], 0) => "sulfane",
+        ([(1, 1), (17, 1)], 0) => "chlorane",
         ([(1, 2), (8, 2)], 0) if has_peroxide(z, adj) => "dioxidane",
         ([(1, 4), (7, 2)], 0) if connected_among(adj, |i| z[i] == 7) => "diazane",
         ([(1, 6), (6, 2)], 0) if carbons_connected(z, adj) => "ethane",
@@ -586,7 +592,8 @@ mod tests {
         assert_eq!(formula(&[6, 6, 1, 1, 1, 1, 1, 1, 8], None), "C₂H₆O");
         assert_eq!(formula(&[6, 1, 7], None), "CHN");
         assert_eq!(formula(&[6, 8, 8], None), "CO₂");
-        assert_eq!(iupac_order(10), 0);
+        assert_eq!(iupac_order(18), 0);
+        assert_eq!(iupac_order(10), 1);
         assert!(iupac_order(2) < iupac_order(1) && iupac_order(1) < iupac_order(8) && iupac_order(7) < iupac_order(1));
     }
 
@@ -598,6 +605,29 @@ mod tests {
             z
         };
         assert_eq!(seq, vec![10, 2, 3, 4, 5, 6, 7, 1, 8, 9]); // Ne He Li Be B C N H O F
+        let seq18: Vec<u8> = {
+            let mut z: Vec<u8> = (1..=18).collect();
+            z.sort_by_key(|&z| iupac_order(z));
+            z
+        };
+        // Ar Ne He Na Li Mg Be Al B Si C P N H S O Cl F: groups in order, heavier first, H between 15 and 16
+        assert_eq!(seq18, vec![18, 10, 2, 11, 3, 12, 4, 13, 5, 14, 6, 15, 7, 1, 16, 8, 17, 9]);
+        assert!((1..=18).all(|z| iupac_order(z) < iupac_order(19)), "the elements beyond the table sort after the listed ones");
+        // M7 Task 12: the third-row hydrides read in the Table VI order and get a structural name
+        assert_eq!(formula(&[16, 1, 1], Some(0)), "H₂S");
+        assert_eq!(formula(&[1, 17], Some(0)), "HCl");
+        assert_eq!(formula(&[15, 1, 1, 1], Some(0)), "PH₃");
+        assert_eq!(formula(&[1, 14, 1, 1, 1], Some(0)), "SiH₄");
+        let h2s = classify(&[16, 1, 1], &[(0, 1), (0, 2)], Some(0));
+        assert_eq!((h2s.text.as_deref(), h2s.kind, h2s.hydride.as_deref()), (Some("hydrogen sulfide"), NameKind::Structural, Some("sulfane")));
+        assert_eq!(classify(&[1, 17], &[(0, 1)], Some(0)).text.as_deref(), Some("hydrogen chloride"));
+        assert_eq!(classify(&[15, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)).text.as_deref(), Some("phosphorus trihydride"));
+        let sih4 = classify(&[14, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4)], Some(0));
+        assert_eq!((sih4.text.as_deref(), sih4.hydride.as_deref()), (Some("silicon tetrahydride"), Some("silane")));
+        assert_eq!(sih4.label_in(NameStyle::Hydride), "SiH₄ — silane");
+        assert_eq!(classify(&[15, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)).label_in(NameStyle::Hydride), "PH₃ — phosphane");
+        assert_eq!(classify(&[1, 17], &[(0, 1)], Some(0)).label_in(NameStyle::Hydride), "HCl — chlorane");
+        assert!((1..=18).all(|z| ide_stem(z) != "?"));
         assert_eq!(formula(&[9, 3], Some(0)), "LiF");
         assert_eq!(formula(&[8, 1, 1, 1], Some(1)), "H₃O⁺");
         assert_eq!(formula(&[9, 8, 9], Some(0)), "OF₂"); // O before F: the easy one to get backwards

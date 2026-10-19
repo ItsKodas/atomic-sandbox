@@ -4,7 +4,7 @@ use surrogate::{Accumulator, Basis, FitOptions, NullSpace, Provenance, Sample, S
 
 fn dimer_fit() -> (Accumulator, surrogate::Model) {
     let basis = Basis::new(&[1]);
-    let prov = Provenance { grid_n: 49, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "morse".into(), masses: vec![] };
+    let prov = Provenance { grid_n: 49, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "morse".into(), masses: vec![], ionic: "none".into() };
     let mut acc = Accumulator::new(&basis);
     let opts = FitOptions::default();
     let mut seed = 12345u64;
@@ -63,7 +63,7 @@ fn novelty_flags_a_third_atom_and_not_a_dimer() {
 /// A dimer store of `n` samples (r 1.0–5.125, random orientations, noise-free Morse).
 fn dimer_store_fit(n: usize) -> (Accumulator, Result<surrogate::Model, surrogate::FitError>) {
     let basis = Basis::new(&[1]);
-    let prov = Provenance { grid_n: 49, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "morse".into(), masses: vec![] };
+    let prov = Provenance { grid_n: 49, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "morse".into(), masses: vec![], ionic: "none".into() };
     let mut acc = Accumulator::new(&basis);
     let opts = FitOptions::default();
     let mut seed = 777u64;

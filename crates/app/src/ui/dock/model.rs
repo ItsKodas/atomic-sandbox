@@ -36,6 +36,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         warnbox(ui, &super::super::box_advice(input.scene, st));
     }
     if let Some(m) = m {
+        teach_row(ui, m, sampling, acts);
+    }
+    if let Some(m) = m {
         // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
         // set recorded with it — recorded, never compared (ruling P2)
         if let Some(p) = &m.provenance {
@@ -75,6 +78,19 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     super::group(ui, st, "d-audits", |ui, st| {
         theme::section(ui, "Audits");
+        // an on/off switch beside the cadence (user request 2026-10-18), with why they matter
+        let mut on = st.audit_every > 0;
+        if super::super::probed("audits-on", ui.checkbox(&mut on, "audits on"))
+            .on_hover_text(AUDIT_WHY)
+            .changed()
+        {
+            if on {
+                acts.push(Action::SetAudit(st.audit_every_on.max(1)));
+            } else {
+                st.audit_every_on = st.audit_every.max(1);
+                acts.push(Action::SetAudit(0));
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("DFT audit every");
             let mut n = st.audit_every;
@@ -86,6 +102,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 acts.push(Action::SetAudit(n));
             }
             ui.label("answered steps");
+            super::super::probed("audit-auto", ui.checkbox(&mut st.audit_auto, "auto"))
+                .on_hover_text(format!(
+                    "set the cadence from the play speed so an audit comes about every {:.0} s of wall time at any speed (e.g. ≈ 15 fs/s at dt 0.25 fs → every ≈ 600 steps; ≈ 4000 fs/s → every ≈ 160 000). Faster play checks a smaller share of steps but keeps the same steady load on the GPU; the cadence stays between {} and {} steps",
+                    super::super::AUTO_AUDIT_WALL_S, super::super::AUTO_AUDIT_MIN, super::super::AUTO_AUDIT_MAX
+                ));
             // what the worker runs (after a panic recovery it re-applies this value)
             if let Some(m) = m.filter(|m| m.audit_every != st.audit_every) {
                 ui.colored_label(AMBER, format!("(solver: {})", m.audit_every));
@@ -93,6 +114,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         });
         if st.audit_every == 0 {
             ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
+            ui.label(RichText::new(AUDIT_OFF_NOTE).size(11.0).color(theme::INK_DIM));
         }
     });
     let fitted = m.is_some_and(|m| m.fitted);
@@ -144,7 +166,7 @@ fn warnbox(ui: &mut Ui, text: &str) {
 pub fn progress(ui: &mut Ui, p: &sim::SamplingProgress, m: Option<&ModelStatus>) {
     let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
     let eta = m.and_then(|m| m.pass_eta_s).map_or(String::new(), |t| format!(" — about {} left", duration_label(t)));
-    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", p.stage, p.done, p.total)));
+    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", crate::ui::activity::words::pass_stage(p), p.done, p.total)));
     let e = if p.last_energy.is_finite() { format!("{:+.6} Ha", p.last_energy) } else { "—".into() };
     ui.weak(format!(
         "last teacher energy {e} · skipped {} · failed {} — the dynamics are paused; edits are allowed",
@@ -167,6 +189,49 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
     );
     if ui.button(RichText::new(format!("Start anyway (≈ {} at the first solve)", duration_label(o.eta_s))).color(AMBER)).clicked() {
         acts.push(Action::StartOffered(o.plan.clone()));
+    }
+}
+
+/// The teach-around button's label, "Teach around N blockers (≈M solves, ≈T)", T at the model's
+/// solve time; `None` when nothing is teachable (`ModelStatus::teach_offer`).
+pub fn teach_label(m: &ModelStatus) -> Option<String> {
+    let o = m.teach_offer.as_ref().filter(|o| !o.blockers.is_empty())?;
+    let eta = m.solve_s.map(|s| format!(", ≈{}", super::super::activity::headline::clock(s * o.solves as f64))).unwrap_or_default();
+    Some(format!("Teach around {} blocker{} (≈{} solves{eta})", o.blockers.len(), if o.blockers.len() == 1 { "" } else { "s" }, o.solves))
+}
+
+/// "Teach around N blockers (≈M solves, ≈T)" when an environment class is blocked by training
+/// samples the rest of the data cannot predict (`ModelStatus::teach_offer`), with the blockers the
+/// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
+pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(o) = &m.teach_offer else { return };
+    if let Some(p) = &o.prompt {
+        ui.colored_label(AMBER, p);
+    }
+    if let Some(label) = teach_label(m) {
+        let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
+        if ui
+            .add_enabled(!sampling, egui::Button::new(RichText::new(label).strong()))
+            .on_disabled_hover_text("a pass is running")
+            .on_hover_text(format!(
+                "a targeted pass around the training samples that keep a class untrusted: {}. About 10 DFT solves each — random nudges each clearly apart from the sample and from each other, and steps toward its nearest learned neighbour — of which 2 are held out to check the result. Accepted only if the unchanged class rule then passes with the sample still in the fit and the checks pass; at most two rounds. Pauses the dynamics.",
+                names.join(", ")
+            ))
+            .clicked()
+        {
+            acts.push(Action::TeachAroundBlockers);
+        }
+    }
+    for (i, c, ins, why) in &o.refused {
+        ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
+    }
+    if o.refused_total > o.refused.len() {
+        ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
+    }
+    if !o.blockers.is_empty() {
+        for n in &o.notes {
+            ui.weak(n);
+        }
     }
 }
 
@@ -203,30 +268,60 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
 
 /// Save model / Load model / Forget model (two clicks within 4 s): File ▸ Estimated model and
 /// the Model tab.
+/// Why audits matter, for the "audits on" switch's hover (user request 2026-10-18).
+pub const AUDIT_WHY: &str = "Audits are the model's spot checks: every n-th answered step a real DFT solve is run at the same geometry and compared with the model's answer. They are how the app notices that the model has wandered somewhere it was never taught and is quietly answering wrong — a failed audit makes the model untrusted and hands the steps back to DFT, and the audit's answer becomes a training sample. Turning them off can make playback smoother (on the GPU the background audit competes with the display for the card, which can show as a stutter every so often), but nothing then checks the model while it answers: a wrong answer looks exactly like a right one. Keep them on unless you are only watching a geometry the model has seen many times.";
+
+/// Shown under the cadence while audits are off.
+pub const AUDIT_OFF_NOTE: &str = "Smoother, but blind: the model's answers are no longer checked, so errors outside what it learned go unnoticed. Turn audits back on before trusting what you see (the last cadence is restored).";
+
+/// The native Save/Open dialog for model files, starting in `last`'s folder with its name
+/// (user request 2026-10-18: pick the save location and the file to load).
+fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
+    let mut d = rfd::FileDialog::new().add_filter("Atomic Sandbox model", &["model"]).add_filter("All files", &["*"]);
+    let dir = last.parent().filter(|p| !p.as_os_str().is_empty()).map(std::path::Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    if let Some(dir) = dir {
+        d = d.set_directory(dir);
+    }
+    if let Some(name) = last.file_name() {
+        d = d.set_file_name(name.to_string_lossy());
+    }
+    d
+}
+
+/// A save name without an extension gains `.model` (as `scene::model_path` does).
+fn with_model_extension(p: std::path::PathBuf) -> std::path::PathBuf {
+    if p.extension().is_none() { p.with_extension("model") } else { p }
+}
+
 pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     expire_arming(st);
     let estimated = st.backend == Backend::Estimated;
     let m = input.model();
     let sampling = input.sampling();
     let fitted = m.is_some_and(|m| m.fitted);
-    let path = model_path(&st.scene_path);
+    let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(estimated && fitted, egui::Button::new("Save model"))
-            .on_hover_text(format!("write the model, its fit and its samples to {} (next to the scene file)", path.display()))
+            .add_enabled(estimated && fitted, egui::Button::new("Save model…"))
+            .on_hover_text(format!("choose where to write the model, its fit and its samples (last: {})", path.display()))
             .clicked()
         {
-            acts.push(Action::SaveModel);
+            if let Some(p) = model_dialog(&path).save_file() {
+                st.model_file = Some(with_model_extension(p));
+                acts.push(Action::SaveModel);
+            }
         }
         if ui
-            .add_enabled(estimated && !sampling, egui::Button::new("Load model"))
-            .on_hover_text(format!(
-                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
-                path.display()
-            ))
+            .add_enabled(estimated && !sampling, egui::Button::new("Load model…"))
+            .on_hover_text(
+                "choose a .model file to read — it only runs on the grid, σ, charge, multiplicity, ionic potential, teacher and teacher tolerance it was trained at; if the scene differs, a card lists the differences and offers to apply the model's settings",
+            )
             .clicked()
         {
-            acts.push(Action::LoadModel);
+            if let Some(p) = model_dialog(&path).pick_file() {
+                st.model_file = Some(p);
+                acts.push(Action::LoadModel);
+            }
         }
         let armed = forget_armed(st);
         let samples = m.map_or(0, |m| m.samples);
@@ -272,7 +367,7 @@ fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
 /// preset row.
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
     preset_row(ui, plan);
-    egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
+    super::wide_grid(ui, "plan", 2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
             .on_hover_text("random displacements of the scene, one teacher solve each");
@@ -335,7 +430,7 @@ mod tests {
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
 fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
-    egui::Grid::new("model").num_columns(2).striped(true).max_col_width(230.0).show(ui, |ui| {
+    super::wide_grid(ui, "model", 2).striped(true).show(ui, |ui| {
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label("this step");
@@ -381,6 +476,17 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();
+        if let Some(r) = &m.readiness {
+            ui.label("strict here");
+            let text = if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) };
+            ui.colored_label(if r.answers { GREEN } else { AMBER }, text).on_hover_text("the fallback policy's verdict at this geometry with draft mode off: whether the model would answer a step here, else the rule that sends it to DFT");
+            ui.end_row();
+            if let Some(u) = &r.unlearned {
+                ui.label("this scene");
+                ui.colored_label(AMBER, u);
+                ui.end_row();
+            }
+        }
         if let Some(text) = &m.fit_vs_held {
             ui.label("fit vs held");
             ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
@@ -409,7 +515,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         ui.label("fallbacks");
         ui.vertical(|ui| {
             let f = d.fallback_fraction_100 as f32;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(200.0), 6.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 3.0, theme::PANEL_3);
             let mut fill = rect;
             fill.set_width(rect.width() * f.clamp(0.0, 1.0));
@@ -459,7 +565,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
 /// The uncertainty against its bound: the bound sits at the middle of the bar, the value's dot
 /// on a scale to twice the bound.
 fn uncertainty_bar(ui: &mut Ui, u: f64, bound: f64, c: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(200.0), 10.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
     let p = ui.painter();
     let mid = rect.left() + rect.width() / 2.0;
     let left = egui::Rect::from_min_max(rect.left_top(), egui::pos2(mid, rect.bottom()));

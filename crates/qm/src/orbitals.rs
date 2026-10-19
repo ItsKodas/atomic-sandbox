@@ -242,6 +242,12 @@
 //!
 //!   H_σ^out = −½∇² + V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out↑, ρ_out↓].
 //!
+//! Under an ionic setup (M7, `crate::scf` "Ionic species") it is the SCF's full operator:
+//! V_nuc is the state's V_loc, v_xc is of (ρ_out,σ + ½ρ_pc) when an ion has a partial core, and V_NL
+//! is added ([`output_potentials`], [`output_nonlocal`]; `PseudoHamiltonian`). Dropping either term
+//! moves pseudo-O H₂O's occupied ε by 0.82 Ha (V_NL) or 0.019 Ha (ρ_pc), far beyond τ, so the
+//! occupied-agreement guard would reject such a solve (`unoccupied_cpu_uses_the_pseudo_hamiltonian`).
+//!
 //! `KsState::v_h` is already V_H[ρ_out] (the energy's final Poisson solve), so no Poisson solve is
 //! needed; v_xc is re-evaluated from `rho_up`/`rho_dn` (LSDA PW92, `crate::xc`). LOBPCG finds the
 //! lowest n_σ + m + `UNOCC_GUARD` eigenpairs from the guess [copies of the SCF's occupied
@@ -336,9 +342,9 @@
 
 use crate::eigen::{jacobi_precond, lobpcg, LocalHamiltonian, Operator};
 use crate::grid::Grid;
-use crate::nuclear::Nucleus;
-use crate::scf::{initial_orbitals, KsState, ScfSettings};
-use crate::xc::lsda_pw92;
+use crate::nonlocal::{NonlocalOp, PseudoHamiltonian};
+use crate::nuclear::{has_partial_core, partial_core_field, Nucleus};
+use crate::scf::{initial_orbitals, xc_with_core, KsState, ScfSettings};
 use crate::poisson::{solid_harmonics, N_MOMENTS};
 use nalgebra::DMatrix;
 use std::f64::consts::PI;
@@ -1447,12 +1453,22 @@ pub fn occupied_disagreement(error: [f64; 2], tau: f64) -> Option<String> {
     })
 }
 
-/// v_σ = V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out↑, ρ_out↓] of a converged state, both channels (§8):
-/// `v_h` is the state's own V_H[ρ_out]; v_xc is LSDA PW92 of the output densities.
-pub fn output_potentials(state: &KsState) -> [Vec<f64>; 2] {
-    let xc = lsda_pw92(&state.rho_up, &state.rho_dn);
+/// v_σ = V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out↑, ρ_out↓] of a converged state solved at `nuclei`, both
+/// channels (§8): `v_h` is the state's own V_H[ρ_out]; v_xc is LSDA PW92 of the output densities.
+/// Under an ionic setup (M7, `scf` "Ionic species") `v_nuc` is already the state's V_loc and v_xc is
+/// of (ρ_σ + ½ρ_pc) when an ion has a partial core (`scf::xc_with_core`, the SCF's formula).
+pub fn output_potentials(state: &KsState, nuclei: &[Nucleus]) -> [Vec<f64>; 2] {
+    let rho_pc = state.ionic.as_deref().filter(|s| has_partial_core(nuclei, s)).map(|s| partial_core_field(&state.grid, nuclei, s));
+    let xc = xc_with_core(&state.rho_up, &state.rho_dn, rho_pc.as_deref());
     let v = |x: &[f64]| (0..state.grid.len()).map(|i| state.v_nuc[i] + state.v_h[i] + x[i]).collect::<Vec<f64>>();
     [v(&xc.v_up), v(&xc.v_dn)]
+}
+
+/// V_NL of a state solved at `nuclei` under an ionic setup with projectors (the SCF's
+/// `NonlocalOp`); `None` for an all-electron state or a setup without projectors.
+pub fn output_nonlocal(state: &KsState, nuclei: &[Nucleus]) -> Option<NonlocalOp> {
+    let op = NonlocalOp::build(&state.grid, nuclei, state.ionic.as_deref()?);
+    (!op.is_empty()).then_some(op)
 }
 
 /// x ← x − c·y.
@@ -1482,7 +1498,8 @@ fn independent_guess(grid: &Grid, x: &mut [Vec<f64>], nuclei: &[Nucleus], mut se
 }
 
 /// §8 on the CPU in f64 (the reference of `qm_gpu::orbitals::OrbitalView::unoccupied`): the lowest
-/// n_σ + m + `UNOCC_GUARD` eigenpairs of H_σ^out per channel by LOBPCG at `settings.eig_tol`
+/// n_σ + m + `UNOCC_GUARD` eigenpairs of H_σ^out (under an ionic setup the SCF's full operator:
+/// [`output_potentials`] with the partial core, plus V_NL from [`output_nonlocal`]) per channel by LOBPCG at `settings.eig_tol`
 /// (cap [`DISPLAY_EIGEN_MAX_ITER`]), from [copies of the occupied orbitals, `previous`' vectors,
 /// `initial_orbitals(…, seed 3 ↑ / 4 ↓)` for the rest]; the occupied pairs checked against the
 /// SCF's (τ(`settings.tol`)) and discarded; the unoccupied ones projected onto the complement of
@@ -1497,7 +1514,9 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
     let tol = settings.eig_tol;
     let tau_scf = tau(settings.tol);
     let k = m + UNOCC_GUARD;
-    let pots = output_potentials(state);
+    // H_σ^out is the SCF's own operator: V_loc, the partial core and V_NL under an ionic setup
+    let pots = output_potentials(state, nuclei);
+    let nl = output_nonlocal(state, nuclei);
     let mut out = Unoccupied::empty(tol);
     let mut vecs: [Vec<Vec<f64>>; 2] = [Vec::new(), Vec::new()];
     for ch in 0..2 {
@@ -1511,10 +1530,14 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
         let fresh = initial_orbitals(grid, nuclei, k, 3 + ch as u64);
         let mut x: Vec<Vec<f64>> = occ.iter().cloned().chain(prev[..kept].iter().cloned()).chain(fresh.into_iter().skip(kept)).collect();
         independent_guess(grid, &mut x, nuclei, 1000 + 100 * ch as u64);
-        let op = LocalHamiltonian { grid, v: &pots[ch] };
+        let op: Box<dyn Operator + '_> = match &nl {
+            None => Box::new(LocalHamiltonian { grid, v: &pots[ch] }),
+            Some(nl) => Box::new(PseudoHamiltonian { grid, v: &pots[ch], nl }),
+        };
+        let op = op.as_ref();
         let pc = jacobi_precond(grid, &pots[ch], ev_scf.first().copied().unwrap_or(-1.0));
         let mut ev = vec![0.0; n + k];
-        let stats = lobpcg(grid, &op, &mut x, &mut ev, Some(&pc), tol, DISPLAY_EIGEN_MAX_ITER, Some(&mut *should_abort));
+        let stats = lobpcg(grid, op, &mut x, &mut ev, Some(&pc), tol, DISPLAY_EIGEN_MAX_ITER, Some(&mut *should_abort));
         if stats.aborted {
             return None;
         }

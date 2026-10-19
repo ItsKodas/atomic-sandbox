@@ -227,7 +227,7 @@ const INTERACTIVE_TOL: f64 = 1e-5;
 /// threshold of N × 1e-3 Ha). Cost: none measurable per solve on the GPU (the wall time is flat
 /// in tol, above); the H₂ 49³ pass, `references.md` "Surrogate (M5)". The provenance records it,
 /// so a model taught at 1e-5 is refused with both tolerances named.
-const SAMPLE_TOL: f64 = 1e-6;
+pub(crate) const SAMPLE_TOL: f64 = 1e-6;
 
 /// After the first command of a paused burst, keep collecting commands for this long before
 /// ticking. A sender pushing a burst races the worker's wake-up; without the window the worker
@@ -601,7 +601,7 @@ struct Worker {
     cloud_refresh: Option<Duration>,
     last_refresh: Option<Instant>,
     profiles: Arc<Vec<AtomProfile>>,
-    atom_pending: Option<(u8, usize, f64, Option<f64>)>,
+    atom_pending: Option<(u8, usize, f64, Option<f64>, sim::IonicPolicy)>,
     /// The device a GPU atom density is read back from.
     gpu: Option<GpuContext>,
     /// The batch being applied, its commands not yet applied, and the display interrupt built on
@@ -737,7 +737,7 @@ fn worker(
         .retain(|n| units::isotope_mass_amu(n.z).is_some());
     if initial.nuclei.len() != before {
         let _ = tx.send(Event::Error(format!(
-            "dropped {} nuclei without an isotope mass (Z outside 1..=10)",
+            "dropped {} nuclei without an isotope mass (Z outside 1..=18)",
             before - initial.nuclei.len()
         )));
     }
@@ -963,7 +963,7 @@ impl Worker {
             return;
         }
         let cell = &snap.scene.cell;
-        let key = (cell.n, cell.h, snap.scene.sigma);
+        let key = (cell.n, cell.h, snap.scene.sigma, snap.scene.ionic);
         for (z, d) in s.take_atom_densities() {
             let pending = self.atom_pending.take();
             let (values, n, h, origin) = match &d {
@@ -978,18 +978,18 @@ impl Worker {
                 },
             };
             // asked for on another grid (the scene changed since): dropped, asked again below
-            let Some((pz, pn, ph, psigma)) = pending else { continue };
-            if pz != z || (pn, ph, psigma) != key || (n, h) != (pn, ph) {
+            let Some((pz, pn, ph, psigma, pionic)) = pending else { continue };
+            if pz != z || (pn, ph, psigma, pionic) != key || (n, h) != (pn, ph) {
                 continue;
             }
-            let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma);
+            let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma, pionic);
             let mut all: Vec<AtomProfile> = self.profiles.iter().filter(|p| p.z != z).cloned().collect();
             all.push(profile);
             self.profiles = Arc::new(all);
         }
-        // profiles of another grid or σ are dropped (and asked for again below)
-        if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2)) {
-            self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2)).cloned().collect());
+        // profiles of another grid, σ or ionic policy are dropped (and asked for again below)
+        if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2, key.3)) {
+            self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2, key.3)).cloned().collect());
         }
         if self.cloud_superposition && self.atom_pending.is_none() {
             let mut species: Vec<u8> = snap.scene.nuclei.iter().map(|n| n.z).collect();
@@ -997,7 +997,7 @@ impl Worker {
             species.dedup();
             if let Some(&z) = species.iter().find(|&&z| !self.profiles.iter().any(|p| p.z == z)) {
                 if s.request_atom_density(z, &snap.scene) {
-                    self.atom_pending = Some((z, key.0, key.1, key.2));
+                    self.atom_pending = Some((z, key.0, key.1, key.2, key.3));
                 }
             }
         }
@@ -1120,6 +1120,9 @@ impl Worker {
             }
             if let Some(path) = carried {
                 d.apply(DynCommand::LoadModel(path));
+            }
+            if last.display_partial_core {
+                d.apply(DynCommand::SetDisplayPartialCore(true));
             }
             // the orbital view too (orbital-viewer plan Task 3)
             if !last.orbital_view.what.is_off() {

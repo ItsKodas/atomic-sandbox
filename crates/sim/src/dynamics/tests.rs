@@ -10,7 +10,7 @@ use std::sync::Arc;
 const DT_FS: f64 = 0.25;
 
 fn scene(nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+    Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
 }
 
 fn never() -> impl FnMut() -> bool {
@@ -2741,4 +2741,57 @@ fn an_interrupted_unoccupied_solve_is_retried_when_idle() {
     d.apply(DynCommand::Play);
     let _ = d.tick(f64::INFINITY, &mut never());
     assert_eq!(log.lock().unwrap().now_calls, calls, "in play: no retry");
+}
+
+// ---- M7 Task 9: the ionic policy and the partial-core display through the driver ----
+
+/// A provider that records `set_display_partial_core` and the scenes' policies it is asked about, and answers a
+/// scene of policy p with the tag `ionic:<word>` (the references' key).
+struct IonicProbe {
+    core: Arc<AtomicUsize>,
+    policies: Arc<std::sync::Mutex<Vec<crate::scene::IonicPolicy>>>,
+}
+
+impl ForceProvider for IonicProbe {
+    fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.policies.lock().unwrap().push(scene.ionic);
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
+    }
+    fn name(&self) -> &'static str {
+        "ionic probe"
+    }
+    fn reset(&mut self) {}
+    fn set_display_partial_core(&mut self, on: bool) {
+        self.core.store(1 + on as usize, Ordering::SeqCst);
+    }
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        format!("ionic:{}", scene.ionic.word())
+    }
+}
+
+/// `SetDisplayPartialCore` reaches the provider, is kept in the snapshot (a rebuilt driver re-applies it) and
+/// is no edit: the dynamics are untouched. A replaced scene keeps its policy for the provider to see.
+#[test]
+fn the_partial_core_display_reaches_the_provider_and_the_policy_the_scene_carries() {
+    let core = Arc::new(AtomicUsize::new(0));
+    let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = scene(vec![Nucleus::new(1, [0.5, 0.0, 0.0]), Nucleus::new(1, [-0.5, 0.0, 0.0])]);
+    s.ionic = crate::scene::IonicPolicy::CoresOnly;
+    let mut d = Dynamics::new(s.clone(), Box::new(IonicProbe { core: core.clone(), policies: policies.clone() }), DT_FS, 1);
+    assert!(!d.snapshot().display_partial_core);
+    d.apply(DynCommand::SetDisplayPartialCore(true));
+    assert_eq!(core.load(Ordering::SeqCst), 2, "set_display_partial_core(true) was called");
+    assert!(d.snapshot().display_partial_core);
+    d.apply(DynCommand::SetDisplayPartialCore(false));
+    assert_eq!(core.load(Ordering::SeqCst), 1);
+    assert!(!d.snapshot().display_partial_core && d.snapshot().last_rejection.is_none());
+    // a policy switch is a scene replacement: the provider is asked about the new policy
+    let mut all = s.clone();
+    all.ionic = crate::scene::IonicPolicy::All;
+    d.apply(DynCommand::ReplaceScene(all));
+    d.apply(DynCommand::Step(1));
+    d.tick(f64::INFINITY, &mut never());
+    let seen = policies.lock().unwrap().clone();
+    assert_eq!(seen.first(), Some(&crate::scene::IonicPolicy::CoresOnly));
+    assert_eq!(seen.last(), Some(&crate::scene::IonicPolicy::All), "{seen:?}");
 }
