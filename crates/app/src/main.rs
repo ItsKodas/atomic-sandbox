@@ -16,6 +16,7 @@ mod names;
 mod overlay;
 mod progress;
 mod quality;
+mod reference;
 mod replay;
 mod scene;
 mod screenshot;

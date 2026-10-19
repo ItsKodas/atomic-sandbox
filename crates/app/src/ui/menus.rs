@@ -1054,6 +1054,16 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     ui.separator();
     // Q8 of Appendix B (M6): relax (FIRE); also in the toolbar's Time group
     anchored(ui, st, "m-relax", |ui, _| relax_controls(ui, input, acts));
+    ui.separator();
+    // the reference comparison (PySCF out of process; Readouts ▸ Compare with reference)
+    anchored(ui, st, "m-compare", |ui, st| {
+        if ui.button("Compare with reference…").on_hover_text("opens Readouts ▸ Compare with reference: PySCF answers the current geometry in its own process (optional; never drives the dynamics)").clicked() {
+            st.open_tab(super::DockTab::Readouts);
+            st.compare.open_request = true;
+            ui.close();
+        }
+        theme::note(ui, "forces, dipole and relaxed geometry vs PySCF (LDA, PBE, B3LYP, CCSD(T)) — needs Python with PySCF");
+    });
 }
 
 /// Physics ▸ Relax geometry: the button (Stop while running), the readout and the note.
