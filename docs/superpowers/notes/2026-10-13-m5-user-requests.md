@@ -580,3 +580,4 @@ User: "some quick calculation assist with creating your own molecules, when I go
 - Raise the speed cap (`sim::dynamics::MAX_SPEED` = 1000 steps per tick) to ~10 000: the 16 ms tick budget already stops a tick early.
 
 - Activity tab: show when the orbitals are being computed (the display eigensolve after a DFT step) as a job line with its time in the solve log; display only (user request 2026-10-19).
+- Dots mode, "glowing cloud" look (user reference: a Quantum-Atom simulator screenshot): additive blending (dense regions burn to white), many more soft sprite points with varied size/brightness, a bloom pass (downsample, blur, add back; shareable with the Camera view), a hot colour ramp with a filmic curve, optional decorative background stars; View sliders for glow, point count and size. Display only: the points still sample the real density/orbitals.
