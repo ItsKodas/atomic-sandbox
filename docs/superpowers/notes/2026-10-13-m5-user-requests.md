@@ -581,3 +581,4 @@ User: "some quick calculation assist with creating your own molecules, when I go
 
 - Activity tab: show when the orbitals are being computed (the display eigensolve after a DFT step) as a job line with its time in the solve log; display only (user request 2026-10-19).
 - Dots mode, "glowing cloud" look (user reference: a Quantum-Atom simulator screenshot): additive blending (dense regions burn to white), many more soft sprite points with varied size/brightness, a bloom pass (downsample, blur, add back; shareable with the Camera view), a hot colour ramp with a filmic curve, optional decorative background stars; View sliders for glow, point count and size. Display only: the points still sample the real density/orbitals.
+  Reference to read first: https://nazat02.github.io/Quantum-Atom/simulator_dark.html (its GitHub project: the point sampling, blending, glow and colour ramp); check the licence before reusing code (ideas only if not permissive).
