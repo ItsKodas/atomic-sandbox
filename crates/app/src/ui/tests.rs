@@ -4134,8 +4134,8 @@ fn audits_switch_off_and_back_on_at_the_last_cadence() {
 fn auto_audit_cadence_follows_the_play_speed() {
     assert_eq!(super::auto_audit_every(None, 0.25), None);
     assert_eq!(super::auto_audit_every(Some(0.0), 0.25), None);
-    assert_eq!(super::auto_audit_every(Some(15.0), 0.25), Some(600), "15 fs/s at 0.25 fs: 60 steps/s x 10 s");
-    assert_eq!(super::auto_audit_every(Some(15.7), 0.25), Some(630));
+    assert_eq!(super::auto_audit_every(Some(15.0), 0.25), Some(super::AUTO_AUDIT_MIN), "15 fs/s at 0.25 fs: 600 steps in 10 s, under the floor");
+    assert_eq!(super::auto_audit_every(Some(157.0), 0.25), Some(6300));
     assert_eq!(super::auto_audit_every(Some(4000.0), 0.25), Some(160_000));
     assert_eq!(super::auto_audit_every(Some(1.0), 0.25), Some(super::AUTO_AUDIT_MIN), "slow play: the floor");
     assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
