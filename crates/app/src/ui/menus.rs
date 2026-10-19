@@ -65,6 +65,21 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                 } else {
                     for m in MenuId::ALL {
                         let open = Popup::is_id_open(ui.ctx(), popup_id(m));
+                        if m == MenuId::File {
+                            // File opens the File window (`files`); a request for its menu (the
+                            // control search, `--ui menu=file`) opens the window too
+                            let r = ui.add(Button::selectable(st.files.open, m.title()).frame_when_inactive(false));
+                            hot.push(r.rect);
+                            if open {
+                                Popup::close_id(ui.ctx(), popup_id(m));
+                            }
+                            if r.clicked() && st.files.open {
+                                st.files.open = false;
+                            } else if r.clicked() || open {
+                                super::files::open(st);
+                            }
+                            continue;
+                        }
                         let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
                         hot.push(r.rect);
                         menu_popup(&r, popup_id(m)).show(|ui| {
@@ -293,6 +308,11 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
 }
 
 fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    // the compact layout's File submenu: the File window is one click away
+    if ui.button("Browse scenes and models…").clicked() {
+        super::files::open(st);
+    }
+    ui.separator();
     anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts));
     ui.separator();
     anchored(ui, st, "m-scene-file", |ui, st| {

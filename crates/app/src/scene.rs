@@ -300,6 +300,13 @@ pub fn models_dir() -> Option<std::path::PathBuf> {
     [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
 }
 
+/// The `scenes` folder, found like [`models_dir`] (the dist folder's has the presets as files).
+pub fn scenes_dir() -> Option<std::path::PathBuf> {
+    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("scenes")));
+    let in_cwd = std::env::current_dir().ok().map(|d| d.join("scenes"));
+    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+}
+
 /// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).
 pub const MAX_GRID_N: usize = 201;
 

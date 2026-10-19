@@ -277,7 +277,7 @@ pub const AUDIT_OFF_NOTE: &str = "Smoother, but blind: the model's answers are n
 /// The native Save/Open dialog for model files, starting in `last`'s folder with its name
 /// (user request 2026-10-18: pick the save location and the file to load); a bare name (nothing
 /// chosen yet) starts in the dist folder's `models` (`scene::models_dir`) when there is one.
-fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
+pub(in crate::ui) fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
     let mut d = rfd::FileDialog::new().add_filter("Atomic Sandbox model", &["model"]).add_filter("All files", &["*"]);
     let dir = last.parent().filter(|p| !p.as_os_str().is_empty()).map(std::path::Path::to_path_buf).or_else(crate::scene::models_dir).or_else(|| std::env::current_dir().ok());
     if let Some(dir) = dir {
@@ -290,7 +290,7 @@ fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
 }
 
 /// A save name without an extension gains `.model` (as `scene::model_path` does).
-fn with_model_extension(p: std::path::PathBuf) -> std::path::PathBuf {
+pub(in crate::ui) fn with_model_extension(p: std::path::PathBuf) -> std::path::PathBuf {
     if p.extension().is_none() { p.with_extension("model") } else { p }
 }
 
@@ -307,10 +307,8 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
             .on_hover_text(format!("choose where to write the model, its fit and its samples (last: {})", path.display()))
             .clicked()
         {
-            if let Some(p) = model_dialog(&path).save_file() {
-                st.model_file = Some(with_model_extension(p));
-                acts.push(Action::SaveModel);
-            }
+            // the File window (`ui::files`): the models folder, with the native dialog one click away there
+            super::super::files::open(st);
         }
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model…"))
@@ -319,10 +317,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
             )
             .clicked()
         {
-            if let Some(p) = model_dialog(&path).pick_file() {
-                st.model_file = Some(p);
-                acts.push(Action::LoadModel);
-            }
+            super::super::files::open(st);
         }
         let armed = forget_armed(st);
         let samples = m.map_or(0, |m| m.samples);

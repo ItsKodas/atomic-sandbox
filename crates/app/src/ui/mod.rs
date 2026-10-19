@@ -23,6 +23,7 @@
 pub mod actions;
 pub mod activity;
 mod dock;
+mod files;
 mod icons;
 pub mod logbook;
 mod menus;
@@ -505,6 +506,8 @@ pub struct UiState {
     /// Screenshots: the spheres' size factor instead of the automatic one (the automatic one
     /// shrinks them while an orbital product is drawn, so they do not hide it).
     pub nucleus_scale: Option<f32>,
+    /// The File window (`files`): the scenes and models folders.
+    pub files: files::Browser,
     pub scene_path: String,
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
@@ -685,6 +688,7 @@ impl UiState {
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
+            files: Default::default(),
             model_file: None,
             model_offer: None,
             status: String::new(),
@@ -1024,6 +1028,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
+    files::show(root.ctx(), st, input, &mut acts);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
