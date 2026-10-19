@@ -11,7 +11,17 @@ fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let s = textureLoad(accum, vec2<i32>(pos.xy), 0);
+    // the atoms were drawn at 2× (glow::SS): a 4 × 4 tent around this pixel's 2 × 2 block — smooth,
+    // slightly soft outlines and intersection lines
+    let base = vec2<i32>(pos.xy) * 2 - vec2(1, 1);
+    var wt = array<f32, 4>(1.0, 3.0, 3.0, 1.0);
+    var s = vec4(0.0);
+    for (var j = 0; j < 4; j++) {
+        for (var i = 0; i < 4; i++) {
+            let at = clamp(base + vec2(i, j), vec2(0, 0), vec2<i32>(textureDimensions(accum)) - vec2(1, 1));
+            s += textureLoad(accum, at, 0) * (wt[i] * wt[j] / 64.0);
+        }
+    }
     let h = look.y;
     let filmic = vec3(1.0) - exp(-s.rgb * look.x * 1.6);
     let plain = clamp(s.rgb * look.x, vec3(0.0), vec3(1.0));

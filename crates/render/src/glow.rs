@@ -4,11 +4,15 @@
 //! with an exposure (`shaders/camera.wgsl`, `shaders/camera_composite.wgsl`). With any solidity,
 //! each instant first lays its balls' depth so a ball hides what is behind it at that instant.
 //! Display only.
+use crate::camera::Viewport;
 use crate::spheres::{CameraUniform, SphereInstance};
 use gpu::{GpuContext, UniformBuffer};
 
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Supersampling: the atoms are drawn at this many times the view's resolution and filtered down
+/// (smooth outlines and intersection lines; a solid ball's edge cannot be blended in place).
+pub const SS: u32 = 2;
 
 pub struct GlowPass {
     glow: wgpu::RenderPipeline,
@@ -18,6 +22,8 @@ pub struct GlowPass {
     composite: wgpu::RenderPipeline,
     composite_bgl: wgpu::BindGroupLayout,
     look: UniformBuffer<[f32; 4]>,
+    /// The camera at the supersampled resolution (the viewport and origin × [`SS`]).
+    cam: UniformBuffer<CameraUniform>,
     /// The float target, its composite bind group, its size and the depth target.
     accum: Option<(wgpu::TextureView, wgpu::BindGroup, [u32; 2], wgpu::TextureView)>,
     instances: wgpu::Buffer,
@@ -34,8 +40,9 @@ fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 impl GlowPass {
-    pub fn new(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>) -> GlowPass {
+    pub fn new(ctx: &GpuContext, colour_format: wgpu::TextureFormat, _camera: &UniformBuffer<CameraUniform>) -> GlowPass {
         let dev = &ctx.device;
+        let cam = UniformBuffer::<CameraUniform>::new(ctx, "glow camera");
         let glow_src = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("glow"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/camera.wgsl").into()) });
         let comp_src = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("glow composite"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/camera_composite.wgsl").into()) });
         let uniform = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -54,7 +61,7 @@ impl GlowPass {
             label: Some("glow camera"),
             layout: &cam_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: camera.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: cam.buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: look.buffer.as_entire_binding() },
             ],
         });
@@ -122,7 +129,7 @@ impl GlowPass {
             cache: None,
         });
         let instances = Self::make_buffer(ctx, 64);
-        GlowPass { glow, prepass, glow_bg, composite, composite_bgl, look, accum: None, instances, capacity: 64, count: 0, per_instant: 0, solidity: 0.0 }
+        GlowPass { glow, prepass, glow_bg, composite, composite_bgl, look, cam, accum: None, instances, capacity: 64, count: 0, per_instant: 0, solidity: 0.0 }
     }
 
     fn make_buffer(ctx: &GpuContext, capacity: usize) -> wgpu::Buffer {
@@ -150,12 +157,20 @@ impl GlowPass {
         self.look.write(ctx, &[2f32.powf(exposure_ev), solidity, 0.0, 0.0]);
     }
 
-    /// The float and depth targets at the colour target's size (made or remade on a resize).
+    /// The camera of this frame (`Renderer::update_camera_in`), scaled to the supersampled targets.
+    pub fn set_camera(&self, ctx: &GpuContext, mut u: CameraUniform) {
+        let s = SS as f32;
+        u.viewport = [u.viewport[0] * s, u.viewport[1] * s];
+        u.origin = [u.origin[0] * s, u.origin[1] * s];
+        self.cam.write(ctx, &u);
+    }
+
+    /// The float and depth targets at [`SS`] × the colour target's size (made or remade on a resize).
     pub fn ensure(&mut self, ctx: &GpuContext, size: [u32; 2]) {
         if self.accum.as_ref().is_some_and(|a| a.2 == size) || size[0] == 0 || size[1] == 0 {
             return;
         }
-        let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
+        let extent = wgpu::Extent3d { width: size[0] * SS, height: size[1] * SS, depth_or_array_layers: 1 };
         let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glow accum"),
             size: extent,
@@ -193,8 +208,20 @@ impl GlowPass {
 
     /// The atoms into the float target, then over `colour`; `confine` sets each pass's viewport and
     /// scissor (false: nothing to draw).
-    pub fn render(&self, enc: &mut wgpu::CommandEncoder, colour: &wgpu::TextureView, confine: &dyn Fn(&mut wgpu::RenderPass<'_>) -> bool) {
-        let Some((view, bg, _, depth)) = &self.accum else { return };
+    pub fn render(&self, enc: &mut wgpu::CommandEncoder, colour: &wgpu::TextureView, vp: Option<(Viewport, [u32; 2])>, confine: &dyn Fn(&mut wgpu::RenderPass<'_>) -> bool) {
+        let Some((view, bg, size, depth)) = &self.accum else { return };
+        // the supersampled passes' viewport and scissor: the view's, × SS
+        let s = SS as f32;
+        let hi = |pass: &mut wgpu::RenderPass<'_>| -> bool {
+            let (v, target) = match vp {
+                Some((v, t)) => (Viewport { origin: [v.origin[0] * s, v.origin[1] * s], size: [v.size[0] * s, v.size[1] * s] }, [t[0] * SS, t[1] * SS]),
+                None => (Viewport::full((size[0] * SS) as f32, (size[1] * SS) as f32), [size[0] * SS, size[1] * SS]),
+            };
+            let Some([x, y, w, h]) = v.scissor(target) else { return false };
+            pass.set_viewport(v.origin[0], v.origin[1], v.size[0], v.size[1], 0.0, 1.0);
+            pass.set_scissor_rect(x, y, w, h);
+            true
+        };
         let colour_pass = |enc: &mut wgpu::CommandEncoder, clear: bool| -> wgpu::RenderPass<'static> {
             let load = if clear { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load };
             let dload = if clear { wgpu::LoadOp::Clear(1.0) } else { wgpu::LoadOp::Load };
@@ -217,7 +244,7 @@ impl GlowPass {
         if self.solidity <= 0.0 || self.count == 0 {
             // glows only: no instant hides another — one pass for all of them
             let mut pass = colour_pass(enc, true);
-            if self.count > 0 && confine(&mut pass) {
+            if self.count > 0 && hi(&mut pass) {
                 draw(&mut pass, &self.glow, 0..self.count);
             }
         } else {
@@ -238,12 +265,12 @@ impl GlowPass {
                             multiview_mask: None,
                         })
                         .forget_lifetime();
-                    if confine(&mut pass) {
+                    if hi(&mut pass) {
                         draw(&mut pass, &self.prepass, range.clone());
                     }
                 }
                 let mut pass = colour_pass(enc, false);
-                if confine(&mut pass) {
+                if hi(&mut pass) {
                     draw(&mut pass, &self.glow, range);
                 }
                 start += per;

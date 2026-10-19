@@ -56,7 +56,9 @@ impl Renderer {
     /// The camera for a scene drawn into `vp` (aspect and pixel → NDC from its rect); pair with
     /// [`Renderer::render_in`] and the same `vp`.
     pub fn update_camera_in(&self, ctx: &GpuContext, cam: &OrbitCamera, vp: Viewport) {
-        self.camera_uniform.write(ctx, &CameraUniform::in_viewport(cam, vp));
+        let u = CameraUniform::in_viewport(cam, vp);
+        self.camera_uniform.write(ctx, &u);
+        self.glow.set_camera(ctx, u);
     }
 
     /// Uploads `volume_params` (call after changing it).
@@ -103,7 +105,7 @@ impl Renderer {
         // `MODE_DOTS` = probability dots (`dots`) instead of the raymarch
         if !self.draw_cloud {
             if self.glow_on {
-                self.glow.render(enc, colour, &confine);
+                self.glow.render(enc, colour, vp, &confine);
             }
             return;
         }
@@ -124,7 +126,7 @@ impl Renderer {
         }
         drop(pass);
         if self.glow_on {
-            self.glow.render(enc, colour, &confine);
+            self.glow.render(enc, colour, vp, &confine);
         }
     }
 }
