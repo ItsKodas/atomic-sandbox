@@ -39,6 +39,13 @@ pub struct Browser {
     save_kind: SaveKind,
     save_name: String,
     save_elsewhere: bool,
+    /// A Load in flight: the file, the model's (samples, epoch) when it was clicked, and since when
+    /// (kept fresh while the settings card is up). Cleared when the model changes, or after
+    /// [`LOAD_GIVE_UP`] with nothing loaded (refused, or the card cancelled).
+    loading: Option<(PathBuf, (usize, u64), std::time::Instant)>,
+    /// The file the model in force came from, and its (samples, epoch) then: its Load button stays
+    /// disabled until the model changes (training, another load, Forget).
+    loaded: Option<(PathBuf, (usize, u64))>,
     /// A save was sent: read the folders again at this time.
     refresh_at: Option<std::time::Instant>,
 }
@@ -200,6 +207,34 @@ fn symbols(zs: &[u8]) -> String {
         .map(|&z| units::elements::symbol(z))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A Load that changed nothing in this long is over (refused, or its settings card cancelled).
+const LOAD_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The model in force, as (samples, epoch); `None` without a fitted one.
+fn model_sig(input: &PanelInput<'_>) -> Option<(usize, u64)> {
+    input.model().filter(|m| m.fitted).map(|m| (m.samples, m.epoch))
+}
+
+/// Follows a Load in flight to its end, and forgets the loaded file once the model moves on.
+fn track_loads(st: &mut UiState, input: &PanelInput<'_>) {
+    let now = model_sig(input);
+    let card = st.model_offer.is_some();
+    let b = &mut st.files;
+    if let Some((path, before, since)) = b.loading.clone() {
+        if now.is_some() && now != Some(before) {
+            b.loading = None;
+            b.loaded = now.map(|sig| (path, sig));
+        } else if card {
+            b.loading = Some((path, before, std::time::Instant::now()));
+        } else if since.elapsed() > LOAD_GIVE_UP {
+            b.loading = None;
+        }
+    }
+    if b.loaded.as_ref().is_some_and(|(_, sig)| Some(*sig) != now) {
+        b.loaded = None;
+    }
 }
 
 /// A scene card's width, in points.
@@ -483,6 +518,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .get(st.files.selected)
         .and_then(|e| e.scene.as_ref().ok())
         .cloned();
+    track_loads(st, input);
     let rest = (ui.available_height() - 40.0).max(120.0);
     egui::ScrollArea::vertical().id_salt("files-models").auto_shrink([false, false]).max_height(rest).show(ui, |ui| {
         if st.files.models.is_empty() {
@@ -524,8 +560,14 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     })
                     .response
                     .rect;
-                let can = estimated && sel_current && !input.sampling() && matches!(f, Fit::Ready | Fit::Settings(_));
-                let hover = if !estimated {
+                let busy = st.files.loading.as_ref().is_some_and(|(p, _, _)| *p == m.path);
+                let in_force = st.files.loaded.as_ref().is_some_and(|(p, _)| *p == m.path);
+                let can = estimated && sel_current && !input.sampling() && !busy && !in_force && st.files.loading.is_none() && matches!(f, Fit::Ready | Fit::Settings(_));
+                let hover = if busy {
+                    "loading…"
+                } else if in_force {
+                    "this model is the one in force (Load again once it has changed)"
+                } else if !estimated {
                     "switch to the Estimated solver first"
                 } else if !sel_current {
                     "open the selected scene first"
@@ -533,16 +575,28 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     "load this model (a settings card appears when the scene must change)"
                 };
                 let at = egui::Rect::from_center_size(egui::pos2(ui.max_rect().right() - LOAD_W / 2.0, text.center().y), Vec2::new(LOAD_W, 36.0));
-                let button = egui::Button::new(RichText::new("Load").size(15.0).strong().color(if can { Color32::WHITE } else { theme::INK_FAINT }))
-                    .fill(if can { theme::GLOW } else { theme::PANEL_3 })
+                let word = if busy {
+                    "      Loading…"
+                } else if in_force {
+                    "Loaded"
+                } else {
+                    "Load"
+                };
+                let button = egui::Button::new(RichText::new(word).size(15.0).strong().color(if can || busy { Color32::WHITE } else if in_force { theme::ACCENT_INK } else { theme::INK_FAINT }))
+                    .fill(if can || busy { theme::GLOW } else if in_force { theme::ACCENT_BG } else { theme::PANEL_3 })
                     .stroke(Stroke::new(1.0, if can { theme::ACCENT } else { theme::LINE }))
                     .corner_radius(8);
                 if ui.put(at, button.sense(if can { Sense::click() } else { Sense::hover() })).on_hover_text(hover).clicked() && can {
                     load = Some(m.path.clone());
                 }
+                if busy {
+                    let spin = egui::Rect::from_center_size(egui::pos2(at.left() + 22.0, at.center().y), Vec2::splat(16.0));
+                    ui.put(spin, egui::Spinner::new().size(16.0).color(Color32::WHITE));
+                }
             });
         }
         if let Some(p) = load {
+            st.files.loading = model_sig(input).map_or(Some((p.clone(), (usize::MAX, u64::MAX), std::time::Instant::now())), |sig| Some((p.clone(), sig, std::time::Instant::now())));
             st.model_file = Some(p);
             acts.push(Action::LoadModel);
         }
