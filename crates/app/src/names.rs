@@ -128,6 +128,10 @@ pub enum Signature {
     /// the trihydrogen cation is the three-centre ring, so three H⁺-charged hydrogens bonded as an
     /// ordinary triangle or chain are not given its name (M6 Task 4 ruling).
     MultiCentre,
+    /// The carbons' C–C bonds close a ring (cyclopropane).
+    CarbonRing,
+    /// The carbons' C–C bonds form no ring (propene, the chain isomer of C₃H₆).
+    CarbonChain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,6 +342,8 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
     (&[(1, 4), (6, 1)], 0, Signature::Any, "methane"),
     (&[(1, 6), (6, 2)], 0, Signature::Any, "ethane"),
     (&[(1, 8), (6, 3)], 0, Signature::Any, "propane"),
+    (&[(1, 6), (6, 3)], 0, Signature::CarbonChain, "propene"),
+    (&[(1, 6), (6, 3)], 0, Signature::CarbonRing, "cyclopropane"),
     (&[(1, 4), (6, 2)], 0, Signature::Any, "ethene"),
     (&[(1, 2), (6, 2)], 0, Signature::Any, "ethyne"),
     (&[(1, 1), (9, 1)], 0, Signature::Any, "hydrogen fluoride"),
@@ -368,7 +374,8 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
 ];
 
 /// The common name of a composition (each element's count, any order) and charge, from
-/// [`TRIVIAL`] alone — no bonds needed (the File window names a scene before it is solved).
+/// [`TRIVIAL`] alone — no bonds needed (the File window names a scene before it is solved); `None` when
+/// the composition has more than one entry (isomers told apart by their bonds).
 pub fn common_name(z: &[u8], charge: i32) -> Option<&'static str> {
     let mut counts: Vec<(u8, u8)> = Vec::new();
     for &zz in z {
@@ -378,7 +385,12 @@ pub fn common_name(z: &[u8], charge: i32) -> Option<&'static str> {
         }
     }
     counts.sort_unstable();
-    TRIVIAL.iter().find(|(c, q, _, _)| *c == counts.as_slice() && *q == charge).map(|t| t.3)
+    // a composition the table names by structure (C₃H₆: propene or cyclopropane) has no name without bonds
+    let mut hits = TRIVIAL.iter().filter(|(c, q, _, _)| *c == counts.as_slice() && *q == charge);
+    match (hits.next(), hits.next()) {
+        (Some(t), None) => Some(t.3),
+        _ => None,
+    }
 }
 
 /// Adjacency lists for `n` nuclei from local-index bonds (out-of-range, self and repeated bonds ignored).
@@ -431,7 +443,17 @@ fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8
         Signature::MultiCentre => ring,
         Signature::Peroxide => has_peroxide(z, adj),
         Signature::CarbonOxygenBond => (0..z.len()).any(|i| z[i] == 6 && adj[i].iter().any(|&j| z[j] == 8)),
+        Signature::CarbonRing => carbon_ring(z, adj),
+        Signature::CarbonChain => !carbon_ring(z, adj),
     }
+}
+
+/// The C–C bonds close a ring: as many of them as carbons or more (the carbons connected, so a
+/// tree would have one fewer).
+fn carbon_ring(z: &[u8], adj: &[Vec<usize>]) -> bool {
+    let carbons = (0..z.len()).filter(|&i| z[i] == 6).count();
+    let cc = (0..z.len()).filter(|&i| z[i] == 6).map(|i| adj[i].iter().filter(|&&j| j > i && z[j] == 6).count()).sum::<usize>();
+    carbons >= 3 && cc >= carbons
 }
 
 /// Only C and H, at least one C.
@@ -696,7 +718,7 @@ mod tests {
                 assert!(!(ea.0 == eb.0 && ea.1 == eb.1 && ea.2 == eb.2), "{} / {}", ea.3, eb.3);
             }
         }
-        assert_eq!(TRIVIAL.len(), 38); // spec §4.3's list and the 2026-10-20 additions (phosphine … dichlorine, propane)
+        assert_eq!(TRIVIAL.len(), 40); // spec §4.3's list and the 2026-10-20 additions (phosphine … dichlorine, propane)
     }
 
     #[test]
@@ -763,6 +785,14 @@ mod tests {
             Some(0),
         );
         assert_eq!(n.text.as_deref(), Some("propane"));
+        // C₃H₆: the chain is propene, the ring cyclopropane
+        let chain = classify(&[6, 6, 6, 1, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (1, 5), (2, 6), (2, 7), (2, 8)], Some(0));
+        assert_eq!(chain.text.as_deref(), Some("propene"));
+        let ring = classify(&[6, 6, 6, 1, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 2), (0, 3), (0, 4), (1, 5), (1, 6), (2, 7), (2, 8)], Some(0));
+        assert_eq!(ring.text.as_deref(), Some("cyclopropane"));
+        // without bonds (the File window): propane by its composition, C₃H₆ is either isomer — no name
+        assert_eq!(common_name(&[6, 6, 6, 1, 1, 1, 1, 1, 1, 1, 1], 0), Some("propane"));
+        assert_eq!(common_name(&[6, 1, 6, 1, 6, 1, 1, 1, 1], 0), None);
         // a C₃ chain whose H count has no name here
         let n = classify(&[6, 6, 6, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6)], Some(0));
         assert_eq!((n.text.as_deref(), n.kind), (Some("C₃ hydrocarbon"), NameKind::Structural));
