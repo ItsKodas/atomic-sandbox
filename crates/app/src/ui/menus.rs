@@ -603,6 +603,14 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
 
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
+    let mut warp = st.warp_fields;
+    if ui
+        .checkbox(&mut warp, "fields follow the atoms")
+        .on_hover_text("the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)")
+        .changed()
+    {
+        acts.push(Action::WarpFields(warp));
+    }
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
     let mut changed = false;
     ui.add_enabled_ui(estimated, |ui| {

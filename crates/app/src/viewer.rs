@@ -1908,6 +1908,20 @@ impl Viewer {
         s.dynamics.ghost.as_ref()
     }
 
+    /// Where the shown field was solved (the display warp, `render::warp`; View ▸ fields follow the
+    /// atoms): the density's geometry (`real_at`) — not while the atomic superposition is blended
+    /// in, which is built at the current positions — or the orbital payload's; `None` with the
+    /// toggle off or while the training ghost replaces the scene.
+    pub fn warp_source(&self) -> Option<Vec<[f64; 3]>> {
+        if !self.ui.warp_fields || self.ghost_now().is_some() {
+            return None;
+        }
+        match self.ui.show {
+            ui::ShowMode::Density => self.real_at.clone().filter(|_| self.density.superposition.is_none()),
+            _ => self.snapshot.as_ref()?.dynamics.orbitals.as_ref().map(|o| o.positions.clone()),
+        }
+    }
+
     /// The nuclei the sphere pass draws: the scene's, or none while the ghost replaces them.
     pub fn drawn_nuclei<'a>(&self, shown: &'a Scene) -> &'a [crate::scene::SceneNucleus] {
         if self.ghost_now().is_some() { &[] } else { &shown.nuclei }

@@ -621,6 +621,9 @@ pub struct UiState {
     /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
     /// superposition between DFT densities (default on), and a display refresh every N s.
     pub cloud_superposition: bool,
+    /// The display warp (`render::warp`, user request 2026-10-20): the shown density or orbitals
+    /// follow the atoms from the geometry they were solved at to where they are drawn now. Display only.
+    pub warp_fields: bool,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
@@ -880,6 +883,7 @@ right {}
             edit_group: Vec::new(),
             smooth_motion: true,
             cloud_superposition: true,
+            warp_fields: true,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
             dock_tab: DockTab::Model,

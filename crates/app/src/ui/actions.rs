@@ -164,6 +164,8 @@ pub enum Action {
     /// All orbitals coloured: boundary surfaces (enclosed %, shell or filled) or the density, and
     /// whether the core orbitals are left out (`sim::ColourLook`).
     ColourLook(sim::ColourLook),
+    /// View: the shown fields follow the atoms (`UiState::warp_fields`; display only).
+    WarpFields(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -544,6 +546,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 send_orbital_view(st, out);
             }
         }
+        Action::WarpFields(on) => st.warp_fields = on,
         Action::ColourLook(look) => {
             st.colour_look = look;
             if st.show == ShowMode::Coloured {
@@ -643,6 +646,7 @@ impl Action {
             IncludeAllOccupied => "orbital-include-reset".into(),
             ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
+            WarpFields(on) => format!("warp-fields {on}"),
             ColourLook(l) => format!(
                 "colour-look {} {} {}",
                 match l.enclose {
@@ -885,6 +889,14 @@ impl Action {
                         w => return Err(format!("action colour-scale: peak or physical, got '{w}'")),
                     },
                 }
+            }
+            "warp-fields" => {
+                want(1)?;
+                WarpFields(match args[0] {
+                    "true" => true,
+                    "false" => false,
+                    w => return Err(format!("action warp-fields: true or false, got '{w}'")),
+                })
             }
             "colour-look" => {
                 want(3)?;

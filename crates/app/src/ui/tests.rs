@@ -2221,6 +2221,7 @@ mod orbital_viewer {
             Action::ColourScale { physical: true },
             Action::ColourLook(sim::ColourLook { enclose: Some(75), shell: false, hide_core: true }),
             Action::ColourLook(sim::ColourLook { enclose: Some(90), shell: true, hide_core: false }),
+            Action::WarpFields(false),
         ] {
             let text = a.describe().expect("a script form");
             let words: Vec<&str> = text.split(' ').collect();

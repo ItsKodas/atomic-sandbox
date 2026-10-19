@@ -6,6 +6,7 @@ pub mod headless;
 pub mod lines;
 pub mod spheres;
 pub mod volume;
+pub mod warp;
 
 use camera::{OrbitCamera, Viewport};
 use lines::LinePass;
@@ -29,6 +30,8 @@ pub struct Renderer {
     pub draw_colour: bool,
     /// Draw the electron cloud at all (the density / orbitals / dots); false = View ▸ show ▸ None.
     pub draw_cloud: bool,
+    /// The display warp the raymarches and the dots read (`warp`): fields follow the atoms.
+    pub warp: warp::Warp,
 }
 
 impl Renderer {
@@ -39,13 +42,17 @@ impl Renderer {
         let lines = LinePass::new(ctx, colour_format, &camera_uniform);
         let ghosts = SpherePass::with_blend(ctx, colour_format, &camera_uniform, true);
         let glow = glow::GlowPass::new(ctx, colour_format, &camera_uniform);
-        let volume = VolumePass::new(ctx, colour_format, &camera_uniform);
-        let colour = ColourVolumePass::new(ctx, colour_format, &camera_uniform);
+        let warp = warp::Warp::new(ctx);
+        let mut volume = VolumePass::new(ctx, colour_format, &camera_uniform);
+        let mut colour = ColourVolumePass::new(ctx, colour_format, &camera_uniform);
+        volume.set_warp(warp.bind_group());
+        colour.set_warp(warp.bind_group());
         let volume_params = VolumeUniform::default();
         volume.set_params(ctx, &volume_params);
         colour.set_params(ctx, &volume_params);
-        let dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
-        Renderer { camera_uniform, spheres, lines, ghosts, glow, glow_on: false, volume, colour, volume_params, dots, draw_colour: false, draw_cloud: true }
+        let mut dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
+        dots.set_warp(warp.bind_group());
+        Renderer { camera_uniform, spheres, lines, ghosts, glow, glow_on: false, volume, colour, volume_params, dots, draw_colour: false, draw_cloud: true, warp }
     }
 
     /// The camera for a scene filling the whole `width × height` target.

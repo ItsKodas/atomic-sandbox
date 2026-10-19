@@ -74,6 +74,9 @@ pub struct World<'a> {
     pub risk: &'a [f32],
     /// Motion blur (`Viewer::blur_ghosts`): (nucleus, position, alpha) of each translucent copy.
     pub blur: &'a [(usize, [f64; 3], f32)],
+    /// The positions the shown field was solved at (`Viewer::warp_source`): it is warped to
+    /// `nuclei` (`render::warp`); `None` draws it as solved.
+    pub warp_from: Option<&'a [[f64; 3]]>,
     /// The Camera view (`Viewer::camera_frames`): each shutter instant's positions, and the exposure
     /// (EV); `None` = the diagram view.
     /// (instants, exposure EV, solidity 0–1, size × the diagram radius)
@@ -714,6 +717,16 @@ impl Painter {
         let vp = world.viewport;
         let vp = if vp.size[0] < 1.0 || vp.size[1] < 1.0 { Viewport::full(w as f32, h as f32) } else { vp };
         self.renderer.update_camera_in(ctx, world.camera, vp);
+        match world.warp_from {
+            Some(from) => {
+                let f32s = |p: &[f64; 3]| p.map(|x| x as f32);
+                let solved: Vec<[f32; 3]> = from.iter().map(f32s).collect();
+                let now: Vec<[f32; 3]> = world.nuclei.iter().map(|n| f32s(&n.pos)).collect();
+                let (lo, hi) = (self.renderer.volume_params.box_min, self.renderer.volume_params.box_max);
+                self.renderer.warp.set(ctx, lo, hi, &solved, &now);
+            }
+            None => self.renderer.warp.off(ctx),
+        }
         self.renderer
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));

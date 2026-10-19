@@ -487,6 +487,7 @@ impl Shot {
             let lines = viewer.overlay_lines(&shown);
             let risk = viewer.atom_risk();
             let selected = viewer.tool.set(shown.nuclei.len());
+            let warp_from = viewer.warp_source();
             let world = World {
                 camera: &viewer.camera,
                 nuclei: viewer.drawn_nuclei(&shown),
@@ -496,6 +497,7 @@ impl Shot {
                 risk: &risk,
                 blur: &[],
                 glow: None,
+                warp_from: warp_from.as_deref(),
             };
             self.painter.paint(&self.hl.ctx, target, world, &viewer.egui_ctx, out);
         }
