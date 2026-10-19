@@ -1,6 +1,12 @@
 @echo off
-rem Atomic Sandbox — build the release app without launching it (incremental).
-rem Use start.bat to build and launch.
+rem Atomic Sandbox — build the release app (incremental) and lay out a runnable copy in dist\
+rem without launching it. Use start.bat to build and launch from target\.
+rem
+rem   dist\AtomicSandbox-<version>-windows-x64\        the folder to run or hand out
+rem       AtomicSandbox.exe                            everything the app needs is inside it
+rem       README.md, docs\images\                      the readme and its pictures
+rem       scenes\*.scene                               the presets as files (--scene scenes\h2o.scene)
+rem   dist\AtomicSandbox-<version>-windows-x64.zip     the same folder zipped, for a GitHub release
 setlocal
 cd /d "%~dp0"
 
@@ -21,4 +27,43 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Built: target\release\app.exe
+
+rem the workspace version, from the root Cargo.toml's  version = "x.y.z"
+set "VERSION="
+for /f tokens^=2^ delims^=^" %%v in ('findstr /b /c:"version = " Cargo.toml') do set "VERSION=%%v"
+if not defined VERSION set "VERSION=dev"
+set "NAME=AtomicSandbox-%VERSION%-windows-x64"
+set "OUT=dist\%NAME%"
+
+if exist "%OUT%" rmdir /s /q "%OUT%" 2>nul
+if exist "%OUT%\AtomicSandbox.exe" (
+    echo.
+    echo Could not replace %OUT%: close the Atomic Sandbox started from dist\ and run this again.
+    pause
+    exit /b 1
+)
+if exist "dist\%NAME%.zip" del /q "dist\%NAME%.zip"
+
+mkdir "%OUT%\scenes" "%OUT%\docs\images" >nul
+copy /y "target\release\app.exe" "%OUT%\AtomicSandbox.exe" >nul || goto :copyfail
+copy /y "README.md" "%OUT%\" >nul || goto :copyfail
+if exist "LICENSE" copy /y "LICENSE" "%OUT%\" >nul
+copy /y "crates\app\presets\*.scene" "%OUT%\scenes\" >nul || goto :copyfail
+xcopy /e /i /q /y "docs\images" "%OUT%\docs\images" >nul || goto :copyfail
+
+powershell -NoProfile -Command "Compress-Archive -Path '%OUT%' -DestinationPath 'dist\%NAME%.zip' -Force"
+if errorlevel 1 (
+    echo The folder is ready but zipping it failed: %OUT%
+    pause
+    exit /b 1
+)
+echo Dist:   %OUT%\AtomicSandbox.exe
+echo Zip:    dist\%NAME%.zip
 endlocal
+exit /b 0
+
+:copyfail
+echo.
+echo Copying into %OUT% failed ^(the error is above^).
+pause
+exit /b 1

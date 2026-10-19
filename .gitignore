@@ -17,3 +17,5 @@ target-shot/
 /*.scene
 # agent working files (reports, reviews): never committed
 .superpowers/
+# build.bat output: the runnable folder and its zip
+/dist
