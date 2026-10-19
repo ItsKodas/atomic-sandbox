@@ -102,7 +102,7 @@ pub struct View {
     pub recording: Option<RecordingView>,
     /// A recording being finished (writing, encoding).
     pub finishing: Option<String>,
-    /// The last thing the capture did (saved, finished, an error) and when.
+    /// The last thing the capture did (saved, finished, an error; short: file names, not paths) and when.
     pub last: Option<(Instant, String, bool)>,
     /// The window's surface can be copied (a capture with the UI shown).
     pub surface_copyable: bool,
@@ -500,28 +500,30 @@ impl Capture {
         if self.closing.as_ref().is_some_and(|s| !self.pool.pending_for(s.id)) {
             self.finish_closing();
         }
-        let mut lines = Vec::new();
+        // (status line text, its short form under the buttons, is an error)
+        let mut lines: Vec<(String, String, bool)> = Vec::new();
         while let Ok(n) = self.notes_rx.try_recv() {
             match n {
-                Note::Saved(p) => lines.push((format!("screenshot saved: {}", p.display()), false)),
+                Note::Saved(p) => lines.push((format!("screenshot saved: {}", p.display()), format!("saved {}", writer::file_name(&p)), false)),
                 Note::Finishing(t) => {
                     self.view.finishing = Some(t);
                     continue;
                 }
-                Note::Finished(t) => {
+                Note::Finished { text, short } => {
                     self.view.finishing = None;
-                    lines.push((t, false));
+                    lines.push((text, short, false));
                 }
-                Note::Error(e) => lines.push((e, true)),
+                Note::Error(e) => lines.push((e.clone(), e, true)),
                 Note::Ffmpeg(found) => {
                     self.view.ffmpeg = Some(found);
                     continue;
                 }
             }
         }
-        if let Some((text, err)) = lines.last() {
-            self.view.last = Some((Instant::now(), text.clone(), *err));
+        if let Some((_, short, err)) = lines.last() {
+            self.view.last = Some((Instant::now(), short.clone(), *err));
         }
+        let lines = lines.into_iter().map(|(text, _, err)| (text, err)).collect();
         self.view.recording = self.session.as_ref().map(|s| recording_view(s));
         lines
     }

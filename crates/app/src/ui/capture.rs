@@ -63,33 +63,53 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, acts: &mut Vec<Ac
                         st.capture.open = !st.capture.open;
                     }
                 });
-                if let Some(r) = &cv.recording {
-                    for n in &r.notes {
-                        ui.label(RichText::new(n).size(11.0).color(super::AMBER));
-                    }
-                }
-                if let Some(f) = &cv.finishing {
-                    ui.label(RichText::new(f).size(11.0).color(theme::INK_DIM));
-                    ui.ctx().request_repaint_after(Duration::from_millis(200));
-                } else if let Some((_, text, err)) = cv.last.as_ref().filter(|l| l.0.elapsed() < NOTE_FOR) {
-                    ui.set_max_width(360.0);
-                    ui.add(egui::Label::new(RichText::new(text).size(11.0).color(if *err { RED } else { theme::INK_DIM })).wrap());
-                    ui.ctx().request_repaint_after(Duration::from_millis(500));
-                }
             });
             let rect = ui.min_rect();
             super::search::mark(ui, st, "v-capture", rect);
         });
     let rect = area.response.rect;
+    // the notes in their own box under the buttons (a long one wraps there instead of widening
+    // the button card): the recording's warnings, the finish's state, the last result
+    let mut notes: Vec<(String, egui::Color32)> = cv.recording.iter().flat_map(|r| r.notes.iter().map(|n| (n.clone(), super::AMBER))).collect();
+    if let Some(f) = &cv.finishing {
+        notes.push((f.clone(), theme::INK_DIM));
+        ctx.request_repaint_after(Duration::from_millis(200));
+    } else if let Some((_, text, err)) = cv.last.as_ref().filter(|l| l.0.elapsed() < NOTE_FOR) {
+        notes.push((text.clone(), if *err { RED } else { theme::INK_DIM }));
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
     let mut bottom = rect.bottom();
+    if !notes.is_empty() {
+        let r = egui::Area::new(Id::new("capture-notes"))
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(pos2(rect.right(), rect.bottom() + 6.0))
+            .order(Order::Middle)
+            .interactable(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                theme::card().inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+                    ui.set_max_width(NOTES_WIDTH);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    for (text, colour) in &notes {
+                        ui.add(egui::Label::new(RichText::new(text).size(11.0).color(*colour)).wrap());
+                    }
+                });
+            });
+        bottom = r.response.rect.bottom();
+    }
     if st.capture.open {
-        bottom = settings(ctx, rect, st, &cv).max(bottom);
+        let anchor = Rect::from_min_max(rect.min, pos2(rect.right(), bottom));
+        bottom = settings(ctx, anchor, rect, st, &cv).max(bottom);
     }
     bottom
 }
 
-/// The quick settings popover under the buttons; returns its bottom.
-fn settings(ctx: &egui::Context, anchor: Rect, st: &mut UiState, cv: &crate::capture::View) -> f32 {
+/// The notes box's width at most (points).
+const NOTES_WIDTH: f32 = 260.0;
+
+/// The quick settings popover under `anchor` (the buttons and their notes); `buttons` is the
+/// button card (a click there is not "elsewhere"). Returns its bottom.
+fn settings(ctx: &egui::Context, anchor: Rect, buttons: Rect, st: &mut UiState, cv: &crate::capture::View) -> f32 {
     let recording = cv.recording.is_some();
     let r = egui::Area::new(Id::new("capture-settings"))
         .pivot(Align2::RIGHT_TOP)
@@ -163,7 +183,7 @@ fn settings(ctx: &egui::Context, anchor: Rect, st: &mut UiState, cv: &crate::cap
         });
     // a click outside the popover and its buttons closes it
     let clicked_elsewhere = ctx.input(|i| i.pointer.any_click())
-        && ctx.pointer_interact_pos().is_some_and(|p| !r.response.rect.contains(p) && !anchor.contains(p));
+        && ctx.pointer_interact_pos().is_some_and(|p| !r.response.rect.contains(p) && !buttons.contains(p));
     if clicked_elsewhere {
         st.capture.open = false;
     }

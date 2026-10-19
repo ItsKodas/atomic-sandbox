@@ -22,8 +22,9 @@ pub enum Note {
     Saved(PathBuf),
     /// A recording is being finished (filling, encoding).
     Finishing(String),
-    /// A recording is done: what was kept, in words.
-    Finished(String),
+    /// A recording is done: what was kept, in words (`text`, for the status line and the Log) and
+    /// in a few (`short`, under the buttons).
+    Finished { text: String, short: String },
     Error(String),
     /// Whether `ffmpeg` is on PATH (the probe's answer).
     Ffmpeg(bool),
@@ -38,6 +39,11 @@ pub fn write_png(path: &Path, img: &Image) -> Result<(), String> {
     enc.set_compression(png::Compression::Fast);
     let mut w = enc.write_header().map_err(|e| format!("{}: {e}", path.display()))?;
     w.write_image_data(&img.rgba).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A path's last component (what the note under the buttons shows).
+pub fn file_name(p: &Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// The frame file of index `i` in a recording's folder (ffmpeg's `frame_%06d.png`).
@@ -129,30 +135,29 @@ pub fn finish(f: Finish, notes: Sender<Note>) {
                 }
             };
             if filled == f.frames {
-                note(Note::Finished("no frames were recorded".into()));
+                let text = "no frames were recorded (sim-time mode records only while playing)".to_string();
+                note(Note::Finished { short: text.clone(), text });
                 std::fs::remove_dir(&f.dir).ok();
                 return;
             }
             let pngs = format!("{} frames in {}", f.frames, f.dir.display());
+            let kept = format!("kept {} PNG frames in {} — the Log has the ffmpeg command", f.frames, file_name(&f.dir));
             if !ffmpeg_available() {
-                note(Note::Finished(format!(
-                    "{} — kept as PNGs ({pngs}; ffmpeg is not on PATH). To encode: {}",
-                    f.summary,
-                    encode_command(&f.dir, &f.video)
-                )));
+                let text = format!("{} — kept as PNGs ({pngs}; ffmpeg is not on PATH). To encode: {}", f.summary, encode_command(&f.dir, &f.video));
+                note(Note::Finished { text, short: kept });
                 return;
             }
             note(Note::Finishing(format!("encoding {} frames with ffmpeg…", f.frames)));
             match encode(&f.dir, &f.video) {
                 Ok(()) => {
                     std::fs::remove_dir_all(&f.dir).ok();
-                    note(Note::Finished(format!("{} — saved {}", f.summary, f.video.display())));
+                    let text = format!("{} — saved {}", f.summary, f.video.display());
+                    note(Note::Finished { text, short: format!("saved {}", file_name(&f.video)) });
                 }
-                Err(e) => note(Note::Finished(format!(
-                    "{} — ffmpeg failed ({e}); kept as PNGs ({pngs}). To encode: {}",
-                    f.summary,
-                    encode_command(&f.dir, &f.video)
-                ))),
+                Err(e) => {
+                    let text = format!("{} — ffmpeg failed ({e}); kept as PNGs ({pngs}). To encode: {}", f.summary, encode_command(&f.dir, &f.video));
+                    note(Note::Finished { text, short: format!("ffmpeg failed: {kept}") });
+                }
             }
         })
         .expect("spawn the capture finisher");
