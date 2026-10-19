@@ -1015,6 +1015,31 @@ impl Viewer {
     /// View ▸ Display aids ▸ Trails is on and the snapshot holds every edit sent (one taken before a
     /// teleport must not extend the trail it broke); with Trails off, forgets the history (nothing
     /// is collected, and turning it on starts from now).
+    /// Motion blur (View ▸ Display aids, `UiState::motion_blur`; user request 2026-10-19): while
+    /// playing, a translucent copy of each atom at the positions the last tick's steps passed
+    /// through (`DynSnapshot::tick_path`), fainter the older. A tick of one step (DFT play) has no
+    /// path, so this shows when many steps run per frame (the estimated solver). Display only.
+    pub fn blur_ghosts(&self, shown: &Scene) -> Vec<(usize, [f64; 3], f32)> {
+        let s = self.ui.motion_blur;
+        if s <= 0.0 || !self.playing {
+            return Vec::new();
+        }
+        let Some(snap) = self.snapshot.as_ref() else { return Vec::new() };
+        let path = &snap.dynamics.tick_path;
+        let n = shown.nuclei.len();
+        if path.len() < 2 || path.iter().any(|p| p.len() != n) {
+            return Vec::new();
+        }
+        let k = path.len() as f32;
+        path.iter()
+            .enumerate()
+            .flat_map(|(j, p)| {
+                let a = s * 0.45 * (j as f32 + 1.0) / k;
+                p.iter().enumerate().map(move |(i, pos)| (i, *pos, a))
+            })
+            .collect()
+    }
+
     fn record_trails(&mut self) {
         if !self.ui.show_trails {
             self.trails.clear();

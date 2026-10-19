@@ -540,6 +540,8 @@ pub struct UiState {
     /// default; how long a point stays, in simulated fs ([`trails::LENGTH_MIN_FS`]…
     /// [`trails::LENGTH_MAX_FS`], logarithmic slider), and the alpha of the newest end (0–1).
     pub show_trails: bool,
+    /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
+    pub motion_blur: f32,
     pub trail_fs: f64,
     pub trail_opacity: f32,
     /// Run settings as last sent (re-sent to a new worker, `run_settings`): time step (fs),
@@ -783,6 +785,7 @@ right {}
             show_place_grid: true,
             grid_in_angstrom: false,
             show_trails: false,
+            motion_blur: 0.5,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
             trail_opacity: crate::trails::OPACITY_DEFAULT,
             dt_fs: DEFAULT_DT_FS,

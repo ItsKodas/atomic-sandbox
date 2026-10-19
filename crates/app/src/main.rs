@@ -785,6 +785,7 @@ impl App {
         let shown = v.shown_scene(Instant::now());
         let lines = v.overlay_lines(&shown);
         let risk = v.atom_risk();
+        let blur = v.blur_ghosts(&shown);
         let world = World {
             camera: &v.camera,
             nuclei: v.drawn_nuclei(&shown),
@@ -792,6 +793,7 @@ impl App {
             lines: &lines,
             viewport: v.viewport,
             risk: &risk,
+            blur: &blur,
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

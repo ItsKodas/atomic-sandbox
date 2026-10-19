@@ -708,6 +708,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             acts.push(Action::SmoothMotion(smooth));
         }
         trail_controls(ui, st);
+        ui.horizontal(|ui| {
+            ui.label("motion blur");
+            ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false))
+                .on_hover_text("while playing, faint copies of each atom along the path its last steps took — a fast vibration smears instead of jittering. Shows when many steps run per frame (the estimated solver); 0 turns it off. Display only");
+            ui.label(format!("{:.0} %", st.motion_blur * 100.0));
+        });
     });
     ui.separator();
     // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge

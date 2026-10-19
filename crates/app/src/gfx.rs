@@ -71,6 +71,8 @@ pub struct World<'a> {
     /// `viewer::Viewer::atom_risk`; empty = no tint): the sphere is mixed toward red by
     /// [`risk_tint`] of it.
     pub risk: &'a [f32],
+    /// Motion blur (`Viewer::blur_ghosts`): (nucleus, position, alpha) of each translucent copy.
+    pub blur: &'a [(usize, [f64; 3], f32)],
 }
 
 /// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
@@ -677,6 +679,15 @@ impl Painter {
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));
         self.renderer.lines.set_lines(ctx, world.lines);
+        let ghosts: Vec<SphereInstance> = world
+            .blur
+            .iter()
+            .filter_map(|&(i, pos, alpha)| {
+                let n = world.nuclei.get(i)?;
+                Some(SphereInstance { centre: pos.map(|x| x as f32), radius: elements::radius(n.z) * self.nucleus_scale, colour: elements::colour(n.z), selected: -alpha })
+            })
+            .collect();
+        self.renderer.ghosts.set_instances(ctx, &ghosts);
         self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {

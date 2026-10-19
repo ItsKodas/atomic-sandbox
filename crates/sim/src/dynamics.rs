@@ -669,11 +669,18 @@ pub enum DynCommand {
     SetDisplayPartialCore(bool),
 }
 
+/// At most this many positions per tick go to the viewer's motion blur ([`DynSnapshot::tick_path`]).
+pub const TICK_PATH_SAMPLES: usize = 12;
+
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
 /// empty, paused placeholder for before the first snapshot (it describes no real scene).
 #[derive(Clone, Debug)]
 pub struct DynSnapshot {
     pub scene: Scene,
+    /// The nuclei's positions sampled during the last tick's steps, oldest first (at most
+    /// [`TICK_PATH_SAMPLES`]; empty when it ran fewer than two steps). Display only: the viewer's
+    /// motion blur (user request 2026-10-19); nothing reads it back.
+    pub tick_path: Vec<Vec<[f64; 3]>>,
     /// RAW provider forces at `scene`'s positions (Hartree/Bohr); empty when `forces_stale`.
     pub forces: Vec<[f64; 3]>,
     /// True after a discontinuous edit until the next tick re-evaluates (then `energy_ks`,
@@ -841,6 +848,7 @@ impl Default for DynSnapshot {
             drift_per_ps: None,
             steps_last_tick: 0,
             pending_steps: 0,
+            tick_path: Vec::new(),
             wall_ratio: 0.0,
             paused: true,
             speed: 1,
@@ -990,6 +998,8 @@ pub struct Dynamics {
     /// The part of W that is surface jumps (`refit_jump`).
     work_refit: f64,
     steps_last_tick: usize,
+    /// Positions sampled during the current tick ([`DynSnapshot::tick_path`]).
+    tick_path: Vec<Vec<[f64; 3]>>,
     wall_ratio: f64,
     /// Step-cost moving averages (ms) of model and DFT steps, and the latest step's kind.
     ms_model: f64,
@@ -1096,6 +1106,7 @@ impl Dynamics {
             work_mismatch: 0.0,
             work_refit: 0.0,
             steps_last_tick: 0,
+            tick_path: Vec::new(),
             wall_ratio: 0.0,
             ms_model: 0.0,
             ms_dft: 0.0,
@@ -1568,6 +1579,8 @@ impl Dynamics {
             return self.snapshot();
         }
         let mut done = 0usize;
+        self.tick_path.clear();
+        let stride = (want / TICK_PATH_SAMPLES).max(1);
         while done < want && self.forces.is_some() {
             if should_abort() {
                 break;
@@ -1581,6 +1594,9 @@ impl Dynamics {
             match self.step_once(should_abort) {
                 Ok(()) => {
                     done += 1;
+                    if want > 1 && done % stride == 0 && self.tick_path.len() < TICK_PATH_SAMPLES {
+                        self.tick_path.push(self.scene.nuclei.iter().map(|n| n.pos).collect());
+                    }
                     if self.paused {
                         self.pending_steps -= 1;
                     }
@@ -1680,6 +1696,7 @@ impl Dynamics {
             dt: self.integrator.dt,
             drift_per_ps: self.history.drift_per_ps(),
             steps_last_tick: self.steps_last_tick,
+            tick_path: self.tick_path.clone(),
             pending_steps: self.pending_steps,
             wall_ratio: self.wall_ratio,
             paused: self.paused,

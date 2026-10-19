@@ -35,6 +35,12 @@ pub struct SpherePass { pipeline: wgpu::RenderPipeline, bind_group: wgpu::BindGr
 
 impl SpherePass {
     pub fn new(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>) -> SpherePass {
+        Self::with_blend(ctx, colour_format, camera, false)
+    }
+
+    /// `blended`: translucent spheres (motion-blur ghosts, `selected` = −alpha), alpha-blended over
+    /// the scene and depth-tested without writing depth.
+    pub fn with_blend(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>, blended: bool) -> SpherePass {
         let shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("spheres"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/spheres.wgsl").into()) });
         let bgl = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("camera bgl"), entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -46,9 +52,9 @@ impl SpherePass {
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<SphereInstance>() as u64, step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32] })] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(colour_format.into())] }),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: colour_format, blend: blended.then_some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(!blended), depth_compare: Some(wgpu::CompareFunction::Less), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(), multiview_mask: None, cache: None,
         });
         let instances = Self::make_buffer(ctx, 16);
