@@ -13,10 +13,13 @@
 // enclosure.wgsl as ψ̃²/peak) and 0 outside, softened over the last 30 % of the level; with bit 3
 // (shell) only a band just inside the boundary, ψ̃²/peak in [lo, SHELL·lo], is kept (the hollow
 // textbook look). m[t] = (1/peak, the orbital's index in `levels`, 0, 0).
-// A boundary point takes the pure colour of the one orbital most present there (the largest
-// mask × ψ̃²/level, how far inside its own boundary it is), not the mix (user 2026-10-20: the mix
-// averaged overlapping lobes to grey): rgb = that colour × a, a = Σ f·mask. Chained chunks keep
-// (colour, best score) and (a, 0, 0, 0) in two vec4s per point (`acc` is sized for two).
+// A boundary point takes the pure colour of ONE of the orbitals there, drawn at random with
+// probability f·mask / Σ f·mask (weighted reservoir sampling over the chunks, a hash of the point
+// and the orbital as the random number): an overlap becomes a speckle of both colours and every
+// lobe keeps its whole outline (user 2026-10-20: the mix averaged overlaps to grey, and taking the
+// most present orbital cut overlapping lobes off where they met). rgb = that colour × a,
+// a = Σ f·mask. Chained chunks keep (colour, 0) and (a, 0, 0, 0) in two vec4s per point (`acc` is
+// sized for two).
 
 struct ColourParams {
     n: u32, p: u32,
@@ -40,16 +43,25 @@ fn mask(s: f32, t: u32) -> f32 {
     return m;
 }
 
-// boundary: (the orbital's pure colour, its score) and its a, folded into the running best
-fn boundary_term(s: f32, t: u32, best: ptr<function, vec4<f32>>, a: ptr<function, f32>) {
+// a uniform number in [0, 1) from the point and the orbital (PCG hash)
+fn hash01(idx: u32, term: u32) -> f32 {
+    var x = idx * 747796405u + term * 2891336453u + 1u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    x = (x >> 22u) ^ x;
+    return f32(x >> 8u) / 16777216.0;
+}
+
+// boundary: the orbital joins the reservoir with weight f·mask — it replaces the chosen colour
+// with probability (its weight) / (the running total), which leaves each orbital chosen with
+// probability weight / total at the end
+fn boundary_term(s: f32, t: u32, idx: u32, chosen: ptr<function, vec4<f32>>, a: ptr<function, f32>) {
     let m = mask(s, t);
     if (m <= 0.0) { return; }
     let w = C.w[t];
-    *a = *a + w.w * m;
-    let lo = max(levels[u32(C.m[t].y)], 1e-30);
-    let score = m * s * s * C.m[t].x / lo;
-    if (score > (*best).w) {
-        *best = vec4<f32>(w.rgb / max(w.w, 1e-12), score);
+    let wt = w.w * m;
+    *a = *a + wt;
+    if (hash01(idx, u32(C.m[t].y)) * (*a) < wt) {
+        *chosen = vec4<f32>(w.rgb / max(w.w, 1e-12), 0.0);
     }
 }
 
@@ -79,12 +91,12 @@ fn colour_accumulate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
             var best = vec4<f32>(0.0);
             var a = 0.0;
             if ((C.flags & 1u) == 0u) { best = acc[2u * idx]; a = acc[2u * idx + 1u].x; }
-            if (C.count > 0u) { boundary_term(o0[q], 0u, &best, &a); }
-            if (C.count > 1u) { boundary_term(o1[q], 1u, &best, &a); }
-            if (C.count > 2u) { boundary_term(o2[q], 2u, &best, &a); }
-            if (C.count > 3u) { boundary_term(o3[q], 3u, &best, &a); }
-            if (C.count > 4u) { boundary_term(o4[q], 4u, &best, &a); }
-            if (C.count > 5u) { boundary_term(o5[q], 5u, &best, &a); }
+            if (C.count > 0u) { boundary_term(o0[q], 0u, idx, &best, &a); }
+            if (C.count > 1u) { boundary_term(o1[q], 1u, idx, &best, &a); }
+            if (C.count > 2u) { boundary_term(o2[q], 2u, idx, &best, &a); }
+            if (C.count > 3u) { boundary_term(o3[q], 3u, idx, &best, &a); }
+            if (C.count > 4u) { boundary_term(o4[q], 4u, idx, &best, &a); }
+            if (C.count > 5u) { boundary_term(o5[q], 5u, idx, &best, &a); }
             if ((C.flags & 2u) != 0u) {
                 textureStore(out, at, vec4<f32>(best.rgb * a, a));
             } else {
