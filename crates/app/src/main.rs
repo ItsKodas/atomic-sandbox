@@ -4,6 +4,7 @@ mod atom_card;
 mod badge;
 mod cloud;
 mod frame;
+mod icon;
 mod gfx;
 mod ghost;
 mod names;
@@ -516,7 +517,13 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Atomic Sandbox")
-            .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
+            .with_window_icon(winit::window::Icon::from_rgba(icon::rgba(64), 64, 64).ok());
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(winit::window::Icon::from_rgba(icon::rgba(256), 256, 256).ok())
+        };
         // the custom frame (`frame.rs`): the top bar is the title bar
         #[cfg(windows)]
         let attrs = if frame::native_requested() {
