@@ -223,15 +223,15 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    /// Every tab, the left dock's first (the tests' sweep).
-    #[cfg(test)]
+    /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser).
     pub const ALL: [DockTab; 7] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
     /// The left dock's tabs, in strip order: stats and what is going on.
     pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
     /// The right dock's tabs, in strip order: configuring things.
     pub const RIGHT: [DockTab; 4] = [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
-    /// The dock this tab lives in.
+    /// The dock this tab starts in (the tests; the layout can move it: `UiState::side_of`).
+    #[cfg(test)]
     pub fn side(self) -> DockSide {
         match self {
             DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
@@ -253,7 +253,8 @@ impl DockTab {
 }
 
 impl DockSide {
-    /// The tabs of this dock, in strip order.
+    /// The tabs this dock starts with, in strip order (the tests; the layout: `UiState::tabs`).
+    #[cfg(test)]
     pub fn tabs(self) -> &'static [DockTab] {
         match self {
             DockSide::Left => &DockTab::LEFT,
@@ -594,6 +595,16 @@ pub struct UiState {
     /// of its own (user request 2026-10-19). Display state: not recorded.
     pub left_tab: DockTab,
     pub left_open: bool,
+    /// Each dock's tabs in strip order (user request 2026-10-19: drag a strip icon up or down, or
+    /// across to the other dock). Starts as [`DockTab::LEFT`] / [`DockTab::RIGHT`]; the window
+    /// keeps it in `layout_file`. Every tab is in exactly one of them.
+    pub left_tabs: Vec<DockTab>,
+    pub right_tabs: Vec<DockTab>,
+    /// The strip icon being dragged, and each strip's rect and button rects this frame (left, right).
+    pub drag_tab: Option<DockTab>,
+    pub strip_geom: [Option<(egui::Rect, Vec<(DockTab, egui::Rect)>)>; 2],
+    /// Where the window saves the tab layout (`None`: headless, never saved).
+    pub layout_file: Option<std::path::PathBuf>,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
     /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
@@ -620,7 +631,7 @@ impl UiState {
     /// Opens `tab`'s dock on it (a dock is only ever asked for its own tabs): the search, the
     /// Activity bar, a view mode that needs the Orbitals tab. Display state, never recorded.
     pub fn open_tab(&mut self, tab: DockTab) {
-        match tab.side() {
+        match self.side_of(tab) {
             DockSide::Left => (self.left_open, self.left_tab) = (true, tab),
             DockSide::Right => (self.dock_open, self.dock_tab) = (true, tab),
         }
@@ -628,10 +639,96 @@ impl UiState {
 
     /// Whether `tab` is on screen: its dock is open and showing it.
     pub fn tab_shown(&self, tab: DockTab) -> bool {
-        match tab.side() {
+        match self.side_of(tab) {
             DockSide::Left => self.left_open && self.left_tab == tab,
             DockSide::Right => self.dock_open && self.dock_tab == tab,
         }
+    }
+
+    /// The dock `tab` is in now (the layout can move it).
+    pub fn side_of(&self, tab: DockTab) -> DockSide {
+        if self.left_tabs.contains(&tab) { DockSide::Left } else { DockSide::Right }
+    }
+
+    /// A dock's tabs in strip order.
+    pub fn tabs(&self, side: DockSide) -> &[DockTab] {
+        match side {
+            DockSide::Left => &self.left_tabs,
+            DockSide::Right => &self.right_tabs,
+        }
+    }
+
+    /// Moves `tab` to `side` at `index` (clamped) and opens it there; the dock it left shows its
+    /// first remaining tab, or folds when it has none. Saves the layout.
+    pub fn move_tab(&mut self, tab: DockTab, side: DockSide, index: usize) {
+        let from = self.side_of(tab);
+        let was_shown = self.tab_shown(tab);
+        self.left_tabs.retain(|&t| t != tab);
+        self.right_tabs.retain(|&t| t != tab);
+        let list = match side {
+            DockSide::Left => &mut self.left_tabs,
+            DockSide::Right => &mut self.right_tabs,
+        };
+        list.insert(index.min(list.len()), tab);
+        self.fix_selection(from);
+        if from != side || was_shown {
+            self.open_tab(tab);
+        }
+        self.save_layout();
+    }
+
+    /// A dock whose selected tab left it shows its first tab, or folds when it has none.
+    fn fix_selection(&mut self, side: DockSide) {
+        let tabs = self.tabs(side).to_vec();
+        let (open, sel) = self.dock_mut(side);
+        match tabs.first() {
+            None => *open = false,
+            Some(&f) => {
+                if !tabs.contains(sel) {
+                    *sel = f;
+                }
+            }
+        }
+    }
+
+    /// The default tab layout back.
+    pub fn reset_layout(&mut self) {
+        self.left_tabs = DockTab::LEFT.to_vec();
+        self.right_tabs = DockTab::RIGHT.to_vec();
+        self.fix_selection(DockSide::Left);
+        self.fix_selection(DockSide::Right);
+        self.save_layout();
+    }
+
+    /// Reads the tab layout from `layout_file` (two lines, `left …` and `right …`, tab names);
+    /// a file that does not name every tab exactly once is ignored.
+    pub fn load_layout(&mut self) {
+        let Some(text) = self.layout_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return };
+        let parse = |key: &str| -> Option<Vec<DockTab>> {
+            let line = text.lines().find(|l| l.split_whitespace().next() == Some(key))?;
+            line.split_whitespace().skip(1).map(|w| DockTab::ALL.iter().copied().find(|t| format!("{t:?}") == w)).collect()
+        };
+        let (Some(l), Some(r)) = (parse("left"), parse("right")) else { return };
+        let mut all: Vec<DockTab> = l.iter().chain(&r).copied().collect();
+        all.sort_by_key(|t| *t as u8);
+        all.dedup();
+        if all.len() != DockTab::ALL.len() || l.len() + r.len() != DockTab::ALL.len() {
+            return;
+        }
+        (self.left_tabs, self.right_tabs) = (l, r);
+        self.fix_selection(DockSide::Left);
+        self.fix_selection(DockSide::Right);
+    }
+
+    fn save_layout(&self) {
+        let Some(p) = &self.layout_file else { return };
+        let names = |v: &[DockTab]| v.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, format!("left {}
+right {}
+", names(&self.left_tabs), names(&self.right_tabs)));
     }
 
     /// A dock's open flag and tab, to read or change.
@@ -727,6 +824,11 @@ impl UiState {
             dock_open: true,
             left_tab: DockTab::Activity,
             left_open: true,
+            left_tabs: DockTab::LEFT.to_vec(),
+            right_tabs: DockTab::RIGHT.to_vec(),
+            drag_tab: None,
+            strip_geom: [None, None],
+            layout_file: None,
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
             temp_avg: TempAverage::default(),

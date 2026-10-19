@@ -28,6 +28,7 @@ use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     side(root, st, input, acts, DockSide::Left);
     side(root, st, input, acts, DockSide::Right);
+    drag_tabs(root.ctx(), st);
     if st.tab_shown(DockTab::Log) {
         st.log.unread = 0;
     }
@@ -155,12 +156,34 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
 }
 
 fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, side: DockSide) {
+    let mut geom = Vec::new();
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        for &tab in side.tabs() {
+        for tab in st.tabs(side).to_vec() {
             let selected = st.tab_shown(tab);
             let tip = peek(st, input, tab);
-            let r = icons::strip_button(ui, icon(tab), selected);
+            // a click opens the tab; a drag moves it (up or down, or onto the other strip)
+            let r = icons::strip_button(ui, icon(tab), selected).interact(egui::Sense::click_and_drag());
+            geom.push((tab, r.rect));
+            if r.drag_started() {
+                st.drag_tab = Some(tab);
+            }
+            r.context_menu(|ui| {
+                let other = match st.side_of(tab) {
+                    DockSide::Left => DockSide::Right,
+                    DockSide::Right => DockSide::Left,
+                };
+                let name = if other == DockSide::Left { "Move to the left dock" } else { "Move to the right dock" };
+                if ui.button(name).clicked() {
+                    let n = st.tabs(other).len();
+                    st.move_tab(tab, other, n);
+                    ui.close();
+                }
+                if ui.button("Reset the tab layout").clicked() {
+                    st.reset_layout();
+                    ui.close();
+                }
+            });
             super::probe(&format!("dock-tab-{tab:?}"), &r);
             let p = ui.painter();
             let dot = match tab {
@@ -181,7 +204,7 @@ fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, side: DockSide) 
                 p.circle_filled(at, 7.5, super::RED);
                 p.text(at, egui::Align2::CENTER_CENTER, st.log.unread.min(99).to_string(), egui::FontId::monospace(9.0), Color32::WHITE);
             }
-            let hint = if selected { "\n(click to collapse the dock)" } else { "" };
+            let hint = if selected { "\n(click to collapse the dock; drag to move the tab, right-click for more)" } else { "\n(drag to move the tab, right-click for more)" };
             if r.on_hover_text(format!("{tip}{hint}")).clicked() {
                 if selected {
                     *st.dock_mut(side).0 = false;
@@ -202,6 +225,54 @@ fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, side: DockSide) 
             }
         });
     });
+    st.strip_geom[side as usize] = Some((ui.max_rect(), geom));
+}
+
+/// Where a dragged tab would land: the strip under the pointer (a little wider than drawn) and
+/// the index among its other tabs, by the buttons' centres.
+fn drop_target(st: &UiState, tab: DockTab, at: egui::Pos2) -> Option<(DockSide, usize, f32, egui::Rect)> {
+    for side in [DockSide::Left, DockSide::Right] {
+        let Some((rect, buttons)) = &st.strip_geom[side as usize] else { continue };
+        if !rect.expand2(Vec2::new(24.0, 0.0)).contains(at) {
+            continue;
+        }
+        let others: Vec<&(DockTab, egui::Rect)> = buttons.iter().filter(|(t, _)| *t != tab).collect();
+        let index = others.iter().filter(|(_, r)| r.center().y < at.y).count();
+        let y = match (index.checked_sub(1).and_then(|i| others.get(i)), others.get(index)) {
+            (_, Some((_, r))) => r.top() - 2.0,
+            (Some((_, r)), None) => r.bottom() + 2.0,
+            (None, None) => rect.top() + 6.0,
+        };
+        return Some((side, index, y, *rect));
+    }
+    None
+}
+
+/// The tab being dragged: its icon under the pointer, the line where it would land, and the move
+/// on release (nowhere near a strip: nothing moves).
+fn drag_tabs(ctx: &egui::Context, st: &mut UiState) {
+    let Some(tab) = st.drag_tab else { return };
+    // released outside the window: the drag is over without a drop
+    if !ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+        st.drag_tab = None;
+        return;
+    }
+    let Some(at) = ctx.pointer_interact_pos() else { return };
+    let target = drop_target(st, tab, at);
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dock-drag")));
+    if let Some((_, _, y, rect)) = target {
+        p.line_segment([egui::pos2(rect.left() + 4.0, y), egui::pos2(rect.right() - 4.0, y)], Stroke::new(2.0, theme::ACCENT));
+    }
+    let r = egui::Rect::from_center_size(at, Vec2::splat(30.0));
+    p.rect_filled(r, 6.0, theme::ACCENT_BG.gamma_multiply(0.9));
+    icons::paint(&p, r.shrink(7.0), icon(tab), theme::ACCENT_INK);
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    if ctx.input(|i| i.pointer.any_released()) {
+        st.drag_tab = None;
+        if let Some((side, index, _, _)) = target {
+            st.move_tab(tab, side, index);
+        }
+    }
 }
 
 fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, side: DockSide) {
