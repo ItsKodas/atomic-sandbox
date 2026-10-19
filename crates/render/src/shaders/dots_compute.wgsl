@@ -35,6 +35,8 @@ struct Params {
 // [0, n_rows): row sums → row CDF; [n_rows, 2 n_rows): row maxima; [2 n_rows]: global maximum
 @group(0) @binding(3) var<storage, read_write> rows: array<f32>;
 @group(0) @binding(4) var<storage, read_write> pts: array<vec4<f32>>;
+// the floating dots' velocities (world units per frame)
+@group(0) @binding(5) var<storage, read_write> vel: array<vec4<f32>>;
 
 fn field(c: vec3<i32>) -> f32 {
     if (prm.use_colour != 0u) { return max(textureLoad(col, c, 0).a, 0.0); }
@@ -182,20 +184,41 @@ fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
         // a dot where the field is zero (a new scene, a moved box) is drawn fresh instead
         let rp = select(0.0, field_at(old.xyz), alive);
         if (alive && rp > 0.0 && unit(hw) >= prm.refresh) {
-            let cell_size = (prm.box_max - prm.box_min) / (vec3<f32>(prm.dims) - vec3(1.0));
+            // smooth drift (user request: no jumping): underdamped Langevin motion on U = −ln ρ —
+            // each dot keeps a velocity that turns slowly (friction GAMMA per frame), pushed up
+            // the density's slope and nudged by a little noise; its stationary distribution is ρ
+            // (temperature T = s², s = the drift in world units per frame)
+            let cs = (prm.box_max - prm.box_min) / (vec3<f32>(prm.dims) - vec3(1.0));
+            let cmin = min(cs.x, min(cs.y, cs.z));
+            let sp = prm.walk * cmin;
+            let p0 = old.xyz;
+            let e = 0.5 * cmin;
+            let lf = log(max(rp, 1e-30));
+            let grad = vec3(
+                log(max(field_at(p0 + vec3(e, 0.0, 0.0)), 1e-30)) - log(max(field_at(p0 - vec3(e, 0.0, 0.0)), 1e-30)),
+                log(max(field_at(p0 + vec3(0.0, e, 0.0)), 1e-30)) - log(max(field_at(p0 - vec3(0.0, e, 0.0)), 1e-30)),
+                log(max(field_at(p0 + vec3(0.0, 0.0, e)), 1e-30)) - log(max(field_at(p0 - vec3(0.0, 0.0, e)), 1e-30)),
+            ) / (2.0 * e);
+            var push = grad * sp * sp;
+            let pl = length(push);
+            if (pl > sp) { push = push * (sp / pl); }
             hw = pcg(hw); let u1 = max(unit(hw), 1e-7);
             hw = pcg(hw); let u2 = unit(hw);
             hw = pcg(hw); let u3 = max(unit(hw), 1e-7);
             hw = pcg(hw); let u4 = unit(hw);
             let r1 = sqrt(-2.0 * log(u1)); let r2 = sqrt(-2.0 * log(u3));
             let gauss = vec3(r1 * cos(6.2831853 * u2), r1 * sin(6.2831853 * u2), r2 * cos(6.2831853 * u4));
-            let q = old.xyz + gauss * prm.walk * cell_size;
-            let rq = field_at(q);
-            hw = pcg(hw);
-            var p = old.xyz;
-            if (unit(hw) * rp < rq) { p = q; }
-            pts[i] = vec4(p, bitcast<f32>(pack4x8unorm(vec4(colour_at(p), 1.0))));
-            return;
+            let gamma = 0.06;
+            var v = vel[i].xyz * (1.0 - gamma) + push + gauss * sp * sqrt(2.0 * gamma);
+            let vl = length(v);
+            if (vl > 4.0 * sp) { v = v * (4.0 * sp / vl); }
+            let q = p0 + v;
+            if (field_at(q) > 0.0) {
+                vel[i] = vec4(v, 0.0);
+                pts[i] = vec4(q, bitcast<f32>(pack4x8unorm(vec4(colour_at(q), 1.0))));
+                return;
+            }
+            // stepped off the field: drawn fresh below
         }
     }
     let n_rows = nc.y * nc.z;
@@ -267,4 +290,13 @@ fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = ramp(0.1 + 0.9 * s);
     }
     pts[i] = vec4(p, bitcast<f32>(pack4x8unorm(vec4(c, 1.0))));
+    if (prm.walk > 0.0) {
+        let cs = (prm.box_max - prm.box_min) / (vec3<f32>(prm.dims) - vec3(1.0));
+        let sp = prm.walk * min(cs.x, min(cs.y, cs.z));
+        h = pcg(h); let a1 = max(unit(h), 1e-7);
+        h = pcg(h); let a2 = unit(h);
+        h = pcg(h); let a3 = unit(h);
+        let rr = sqrt(-2.0 * log(a1));
+        vel[i] = vec4(vec3(rr * cos(6.2831853 * a2), rr * sin(6.2831853 * a2), (a3 - 0.5) * 2.0) * sp, 0.0);
+    }
 }

@@ -70,6 +70,8 @@ pub struct DotsPass {
     camera_bg: wgpu::BindGroup,
     params: UniformBuffer<DotsUniform>,
     points: wgpu::Buffer,
+    /// The floating dots' velocities (one vec4 per dot).
+    velocities: wgpu::Buffer,
     rows: Option<(wgpu::Buffer, u64)>,
     dummy_scalar: Volume3D,
     dummy_colour: ColourVolume3D,
@@ -87,7 +89,7 @@ impl DotsPass {
         // r32float (unfilterable) and rgba16float both bind as unfilterable float for textureLoad
         let tex3 = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None };
         let c = wgpu::ShaderStages::COMPUTE;
-        let compute_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("dots compute bgl"), entries: &[uniform(0, c), tex3(1), tex3(2), storage(3, c, false), storage(4, c, false)] });
+        let compute_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("dots compute bgl"), entries: &[uniform(0, c), tex3(1), tex3(2), storage(3, c, false), storage(4, c, false), storage(5, c, false)] });
         let cl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&compute_bgl)], immediate_size: 0 });
         let pipe = |entry: &str| dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: Some(&cl), module: &cs, entry_point: Some(entry), compilation_options: Default::default(), cache: None });
         let (row_sums, row_scan, gen_points) = (pipe("row_sums"), pipe("row_scan"), pipe("gen_points"));
@@ -125,10 +127,11 @@ impl DotsPass {
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
+        let velocities = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("dots velocities"), size: MAX_DOTS as u64 * 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
         let points = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("dots points"), size: MAX_DOTS as u64 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         DotsPass {
             row_sums, row_scan, gen_points, draw, draw_glow, glow: false, compute_bgl, draw_bgl, camera_bg,
-            params: UniformBuffer::new(ctx, "dots params"), points, rows: None,
+            params: UniformBuffer::new(ctx, "dots params"), points, velocities, rows: None,
             dummy_scalar: Volume3D::new(ctx, [1; 3]), dummy_colour: ColourVolume3D::new(ctx, [1; 3]),
             bound: None, count: 0,
         }
@@ -157,6 +160,7 @@ impl DotsPass {
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&colour.view) },
             wgpu::BindGroupEntry { binding: 3, resource: rows.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: self.points.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: self.velocities.as_entire_binding() },
         ] });
         let draw_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("dots draw bg"), layout: &self.draw_bgl, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: self.params.buffer.as_entire_binding() },
