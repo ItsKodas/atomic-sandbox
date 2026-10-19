@@ -174,7 +174,7 @@ pub fn no_model_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec
             let b = egui::Button::new(RichText::new("Retry").strong().color(Color32::from_rgb(0x1c, 0x14, 0x05))).fill(AMBER);
             if super::super::probed("retry-fit", ui.add_enabled(!sampling && m.retry_fit, b))
                 .on_disabled_hover_text("a pass is running")
-                .on_hover_text("solve the missing isolated-atom reference again — every allowed multiplicity, each from a cold start, with one more cold attempt each if none converges — then fit the samples held (a short pass: pauses the dynamics). With every reference known it fits at once.")
+                .on_hover_text("solve the missing isolated-atom reference — every allowed multiplicity, each from a cold start (a solve lost to a busy GPU is tried once more) — then fit the samples held (a short pass: pauses the dynamics). With every reference known it fits at once. Not offered when the atom's SCF itself failed: a cold solve is deterministic and would fail the same way.")
                 .clicked()
             {
                 acts.push(Action::RetryFit);

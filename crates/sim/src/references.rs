@@ -13,15 +13,17 @@
 //! must not steer the SCF); the lowest energy wins and its density is the reference's.
 //!
 //! **The retry round** (2026-10-20, the PH₃ session whose P reference did not solve, so its model
-//! never formed): when the first round converges **no** multiplicity, each multiplicity whose solve
-//! failed in the solver (`ProviderError::Solver`: the SCF stalled or hit its cap, a device
-//! readback lost — not an `Invalid` scene, which a retry cannot change) is solved once more, cold,
-//! in the same ascending order, before the scan gives up. The rule is unchanged: the lowest energy
-//! of the multiplicities that converged — in either round — is the reference; the retry only adds
-//! attempts, never another state or a table. It is a fresh cold start, so it recovers a transient
-//! failure (a busy shared device, a solve the GPU's reduction order tipped over its stall stop);
-//! an SCF that genuinely does not converge for that atom on this grid fails again, and the scan
-//! then ends as before (every attempt recorded in [`AtomScan::failed`]).
+//! never formed; physics review of the fix): a multiplicity whose solve was lost to the **device**
+//! (`SolverError::Device`: a GPU readback the shared device did not deliver, after the provider's
+//! own retries) is solved once more, cold, after the first round — in the same ascending order,
+//! **whether or not another multiplicity converged**, so the rule still sees every allowed
+//! multiplicity and the reference does not depend on a transient. Nothing else is retried: a cold
+//! solve is deterministic (fixed-order GPU reductions, a seeded CPU start — a cold GPU solve is
+//! bit-reproducible, `providers::ks` tests), so an SCF that stalled, hit its cap or failed
+//! numerically fails the same way again, and an `Invalid` scene cannot change. The rule is
+//! unchanged: the lowest energy of the multiplicities that converged — in either round — is the
+//! reference; the retry only adds attempts, never another state or a table. Every attempt is
+//! recorded ([`AtomScan::failed`]; [`AtomScan::device_fault`] says whether one was the device's).
 //!
 //! **Shell binning (MUST-1).** After a solve the provider is asked for ρ = ρ↑ + ρ↓ at every grid
 //! node within r_max = half-extent − 3h of the origin ([`shell_nodes`]; node values are exact —
@@ -71,7 +73,7 @@
 //! the surrogate's cache from the driver's (`Trainable::start_pass`). A loaded sidecar seeds an
 //! energy without a table ([`AtomReferences::seed_energy`]); [`AtomReferences::missing`] counts
 //! such an entry as missing, so the table is solved when first needed.
-use crate::provider::{ForceProvider, ProviderError};
+use crate::provider::{ForceProvider, ProviderError, SolverError};
 use crate::sampling::allowed_multiplicities;
 use crate::scene::{neumaier, Cell, IonicPolicy, Nucleus, Scene, CELL_MARGIN_H};
 
@@ -321,18 +323,21 @@ pub struct AtomScan {
     /// (multiplicity, energy, its radial density), in the order solved.
     tried: Vec<(u32, f64, RadialDensity)>,
     failed: Vec<(u32, String)>,
-    /// The multiplicities whose first-round solve failed in the solver (retried once when none
-    /// converged: module doc, "The retry round").
+    /// The multiplicities whose first-round solve the device lost (retried once after the first
+    /// round: module doc, "The retry round").
     retryable: Vec<u32>,
     /// The retry round has begun.
     retrying: bool,
+    /// A solve of this scan failed on the device (a later Retry may succeed; a deterministic
+    /// failure would not).
+    device_fault: bool,
 }
 
 impl AtomScan {
     /// The scan of species `z` (mass number `a`, mass in mₑ) on `cell` at `sigma` (`None` = h) under the ionic
     /// policy `ionic` (the scene's: a lone O under `CoresOnly` is the pseudo-O the molecule's bonds are read against).
     pub fn new(cell: &Cell, sigma: Option<f64>, ionic: IonicPolicy, z: u8, a: u16, mass: f64) -> AtomScan {
-        AtomScan { z, a, mass, cell: cell.clone(), sigma, ionic, remaining: allowed_multiplicities(z as u32), tried: Vec::new(), failed: Vec::new(), retryable: Vec::new(), retrying: false }
+        AtomScan { z, a, mass, cell: cell.clone(), sigma, ionic, remaining: allowed_multiplicities(z as u32), tried: Vec::new(), failed: Vec::new(), retryable: Vec::new(), retrying: false, device_fault: false }
     }
 
     pub fn z(&self) -> u8 {
@@ -359,6 +364,12 @@ impl AtomScan {
     /// second, cold attempts.
     pub fn retrying(&self) -> bool {
         self.retrying
+    }
+
+    /// A solve of this scan failed on the device (`SolverError::Device`): transient, unlike a
+    /// stalled or capped SCF, which a cold solve reproduces exactly.
+    pub fn device_fault(&self) -> bool {
+        self.device_fault
     }
 
     /// Solves attempted and not cancelled (both rounds).
@@ -405,18 +416,16 @@ impl AtomScan {
             }
             Ok(r.energy)
         });
-        match outcome {
-            Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
+        let r = match outcome {
+            Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
             Err(e) => {
                 self.remaining.remove(0);
                 self.failed.push((m, e.to_string()));
-                if !self.retrying && matches!(e, ProviderError::Solver(_)) {
-                    self.retryable.push(m);
-                }
-                // nothing converged in the first round: the retry round (module doc)
-                if self.remaining.is_empty() && self.tried.is_empty() && !self.retrying && !self.retryable.is_empty() {
-                    self.retrying = true;
-                    self.remaining = std::mem::take(&mut self.retryable);
+                if matches!(e, ProviderError::Solver(SolverError::Device(_))) {
+                    self.device_fault = true;
+                    if !self.retrying {
+                        self.retryable.push(m);
+                    }
                 }
                 Err(e)
             }
@@ -426,7 +435,13 @@ impl AtomScan {
                 self.tried.push((m, e, radial));
                 Ok(Some((m, e)))
             }
+        };
+        // the first round is over: the device's losses once more (module doc, "The retry round")
+        if self.remaining.is_empty() && !self.retrying && !self.retryable.is_empty() {
+            self.retrying = true;
+            self.remaining = std::mem::take(&mut self.retryable);
         }
+        r
     }
 
     /// The entry: the lowest energy of the solved multiplicities (ruling S9) with its density;
@@ -613,17 +628,15 @@ mod tests {
         assert_eq!(scan.finish(0.0, "x").unwrap().multiplicity, Some(3));
     }
 
-    /// The retry round (module doc): P (Z = 15, multiplicities 2 and 4) whose first round converges
-    /// nothing is solved again, cold, in the same order — 2, 4, 2, 4, each after its own reset —
-    /// and the lowest converged energy still wins; an `Invalid` failure is not retried; a first
-    /// round that converged anything starts no retry.
+    /// The retry round (module doc): P (Z = 15, multiplicities 2 and 4). A multiplicity the device
+    /// lost is solved once more, cold, after the first round in the same order — also when the other
+    /// converged — and the lowest converged energy still wins; a stalled SCF (deterministic) and an
+    /// `Invalid` scene are not retried.
     #[test]
-    fn a_reference_that_converges_nothing_is_retried_once_in_order() {
-        use crate::provider::SolverError;
-        /// Fails each multiplicity's first `fail[m]` solves (a stall), else E = −m (scripted).
+    fn a_reference_lost_to_the_device_is_retried_once_in_order() {
+        /// Fails each multiplicity's first `fails` solves with `kind`, else E = −m (scripted).
         struct Flaky {
-            fails: Vec<(u32, usize)>,
-            invalid: Vec<u32>,
+            fails: Vec<(u32, usize, &'static str)>,
             seen: Vec<(u32, usize)>,
             resets: usize,
         }
@@ -631,12 +644,13 @@ mod tests {
             fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
                 let m = scene.multiplicity.unwrap();
                 self.seen.push((m, self.resets));
-                if self.invalid.contains(&m) {
-                    return Err(ProviderError::Invalid(format!("multiplicity {m} cannot be posed")));
-                }
                 if let Some(f) = self.fails.iter_mut().find(|f| f.0 == m && f.1 > 0) {
                     f.1 -= 1;
-                    return Err(ProviderError::Solver(SolverError::ScfStalled { iterations: 60, best_delta_rho: 0.1, tol: 1e-6, window: 50, level: 5e-3 }));
+                    return Err(match f.2 {
+                        "device" => ProviderError::Solver(SolverError::Device("readback lost".into())),
+                        "stall" => ProviderError::Solver(SolverError::ScfStalled { iterations: 60, best_delta_rho: 0.1, tol: 1e-6, window: 50, level: 5e-3 }),
+                        _ => ProviderError::Invalid(format!("multiplicity {m} cannot be posed")),
+                    });
                 }
                 Ok(ForceResult { energy: -(m as f64), forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None, orbitals: None })
             }
@@ -648,14 +662,15 @@ mod tests {
             }
         }
         let cell = Cell { n: 17, h: 0.5 };
+        let ms = |p: &Flaky| p.seen.iter().map(|s| s.0).collect::<Vec<_>>();
         assert_eq!(allowed_multiplicities(15), vec![2, 4]);
-        // both fail once: the retry round converges both, the quartet (lower) wins
-        let mut p = Flaky { fails: vec![(2, 1), (4, 1)], invalid: Vec::new(), seen: Vec::new(), resets: 0 };
+        // both lost to the device once: the retry round converges both, the quartet (lower) wins
+        let mut p = Flaky { fails: vec![(2, 1, "device"), (4, 1, "device")], seen: Vec::new(), resets: 0 };
         let mut scan = AtomScan::new(&cell, None, IonicPolicy::None, 15, 31, 56000.0);
         assert!(scan.step(&mut p, &mut || false).is_err());
         assert!(!scan.retrying());
         assert!(scan.step(&mut p, &mut || false).is_err());
-        assert!(scan.retrying(), "nothing converged: the retry round begins");
+        assert!(scan.retrying() && scan.device_fault(), "the first round is over: the retry round begins");
         assert_eq!(scan.remaining(), &[2, 4], "the same ascending order");
         assert_eq!(scan.step(&mut p, &mut || false).unwrap(), Some((2, -2.0)));
         assert_eq!(scan.step(&mut p, &mut || false).unwrap(), Some((4, -4.0)));
@@ -664,25 +679,27 @@ mod tests {
         assert_eq!(scan.failed().iter().map(|f| f.0).collect::<Vec<_>>(), vec![2, 4]);
         assert_eq!(scan.finish(0.0, "flaky").unwrap().multiplicity, Some(4));
         assert_eq!(p.seen, vec![(2, 1), (4, 2), (2, 3), (4, 4)], "each attempt cold, after its own reset");
-        // the doublet always fails, the quartet once: the retry gives the quartet; reported solves
-        let mut p = Flaky { fails: vec![(2, usize::MAX), (4, 1)], invalid: Vec::new(), seen: Vec::new(), resets: 0 };
+        // the quartet lost once while the doublet converged: still retried, and the quartet wins —
+        // the rule sees every allowed multiplicity, not the ones a transient left
+        let mut p = Flaky { fails: vec![(4, 1, "device")], seen: Vec::new(), resets: 0 };
         let mut done = Vec::new();
         let r = solve_atom_reporting(&mut p, &cell, None, IonicPolicy::None, 15, 56000.0, &mut || false, &mut |k| done.push(k)).unwrap();
         assert_eq!(r.multiplicity, Some(4));
-        assert_eq!(done, vec![1, 2, 3, 4], "solves so far, past multiplicities(15) = 2 without wrapping");
-        // nothing ever converges: one retry each, then the error
-        let mut p = Flaky { fails: vec![(2, usize::MAX), (4, usize::MAX)], invalid: Vec::new(), seen: Vec::new(), resets: 0 };
+        assert_eq!(ms(&p), vec![2, 4, 4]);
+        assert_eq!(done, vec![1, 2, 3], "solves so far, past multiplicities(15) = 2 without wrapping");
+        // lost every time: one retry each, then the error
+        let mut p = Flaky { fails: vec![(2, usize::MAX, "device"), (4, usize::MAX, "device")], seen: Vec::new(), resets: 0 };
         assert!(matches!(solve_atom(&mut p, &cell, None, IonicPolicy::None, 15, 56000.0, &mut || false), Err(ProviderError::Solver(_))));
-        assert_eq!(p.seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![2, 4, 2, 4], "exactly one retry round");
-        // an Invalid scene is not retried, a solver failure is
-        let mut p = Flaky { fails: vec![(4, usize::MAX)], invalid: vec![2], seen: Vec::new(), resets: 0 };
-        assert!(solve_atom(&mut p, &cell, None, IonicPolicy::None, 15, 56000.0, &mut || false).is_err());
-        assert_eq!(p.seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![2, 4, 4]);
-        // a first round that converged one: no retry (the rule takes the converged one)
-        let mut p = Flaky { fails: vec![(2, 1)], invalid: Vec::new(), seen: Vec::new(), resets: 0 };
-        let r = solve_atom(&mut p, &cell, None, IonicPolicy::None, 15, 56000.0, &mut || false).unwrap();
-        assert_eq!(r.multiplicity, Some(4));
-        assert_eq!(p.seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![2, 4], "no retry once anything converged");
+        assert_eq!(ms(&p), vec![2, 4, 2, 4], "exactly one retry round");
+        // a stall is deterministic and an Invalid scene cannot change: neither is retried
+        let mut p = Flaky { fails: vec![(2, usize::MAX, "invalid"), (4, usize::MAX, "stall")], seen: Vec::new(), resets: 0 };
+        let mut scan = AtomScan::new(&cell, None, IonicPolicy::None, 15, 31, 56000.0);
+        while !scan.is_done() {
+            let _ = scan.step(&mut p, &mut || false);
+        }
+        assert!(!scan.retrying() && !scan.device_fault());
+        assert_eq!(ms(&p), vec![2, 4]);
+        assert!(scan.finish(0.0, "flaky").is_none());
     }
 
     #[test]

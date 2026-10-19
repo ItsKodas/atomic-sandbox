@@ -659,13 +659,19 @@
 //!   SCF stalled …)" — the failed scan is remembered per species until an energy arrives), too
 //!   few usable samples for Q′, the last fit error, a fit not made yet; `TrainableStatus::no_model`
 //!   carries the words to the Model and Activity tabs.
-//! - **Retried.** The reference scan itself retries once, cold, when no multiplicity converged
-//!   (`sim::references`, "The retry round"), each attempt an Activity event. The Model tab's
-//!   Retry ([`retry_fit`](SurrogateKs::retry_fit)) starts a references-only pass for the missing
-//!   species (`Sampler::references_only`, on the scene — refused when the scene's surface is not
-//!   the samples') whose end refits like any pass; with every reference known it refits at once;
-//!   with too few samples it is not offered (sample more). The reference rule is untouched:
-//!   the lowest-energy converged multiplicity is the reference (ruling S9).
+//! - **Retried where that can help** (physics review of the fix). A cold solve is deterministic, so
+//!   the reference scan retries only a multiplicity lost to the device, once, cold, after its first
+//!   round (`sim::references`, "The retry round"; each attempt an Activity event). A reference whose
+//!   SCF itself failed (stalled, capped) is said to be reproducible and gets no Retry: this surface
+//!   cannot have a model until the solver converges that atom there. A reference not solved yet
+//!   (samples loaded from a file, a pass cancelled) or lost to the device gets the Model tab's
+//!   Retry ([`retry_fit`](SurrogateKs::retry_fit)): a references-only pass for the missing species
+//!   (`Sampler::references_only`, on the scene — refused when the scene's surface is not the
+//!   samples', and under an ionic policy when the scene lacks the species, whose lone atom could
+//!   otherwise be solved on another surface) whose end refits like any pass; with every reference
+//!   known it refits at once; with too few samples it is not offered (sample more). A samples-only
+//!   file's references of another rule than S9 are not fitted on (they count as missing). The
+//!   reference rule is untouched: the lowest-energy converged multiplicity is the reference.
 //!
 //! # One-surface energy accounting (spec §5)
 //!
@@ -1051,7 +1057,7 @@ pub struct SurrogateKs {
     user_notes: Vec<String>,
     /// Species whose isolated-atom reference scan converged nothing in a pass, with how it failed
     /// (module doc, "No model yet"); cleared by a reference energy for the species.
-    failed_refs: BTreeMap<u8, String>,
+    failed_refs: BTreeMap<u8, crate::sampling::FailedReference>,
     /// The last refit's error while no model formed (module doc, "No model yet"); cleared by a fit.
     last_fit_error: Option<String>,
     /// The store length when the running (or last) sampling pass started: its samples are the
@@ -1883,8 +1889,8 @@ impl SurrogateKs {
         let shells = sampler.take_shell_checks();
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
-        if let Some((z, why)) = sampler.take_failed_reference() {
-            self.failed_refs.insert(z, why);
+        if let Some(f) = sampler.take_failed_reference() {
+            self.failed_refs.insert(f.z, f);
         }
         self.last_pass = Some(progress.clone());
         let added = sampler.samples_added();
@@ -2358,11 +2364,25 @@ impl SurrogateKs {
         let missing: Vec<u8> = species.iter().copied().filter(|z| !self.refs.get(z).is_some_and(|e| e.is_finite())).collect();
         let (fittable, q_prime) = self.fittable_and_q_prime();
         let n = self.samples();
+        // a reference whose SCF itself fails: a cold solve is deterministic (`sim::references`,
+        // "The retry round"), so neither Retry nor another pass on this surface can change it
+        let stuck: Vec<&crate::sampling::FailedReference> = missing.iter().filter_map(|z| self.failed_refs.get(z)).filter(|f| !f.transient).collect();
+        if !stuck.is_empty() {
+            let parts: Vec<String> = stuck.iter().map(|f| format!("the {} atom reference did not solve ({})", symbol(f.z), f.why)).collect();
+            return Some(NoModel {
+                words: format!(
+                    "no model yet: {}. A cold solve is deterministic, so retrying here fails the same way: this solver does not converge that isolated atom at this grid and ionic potential, and a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept — Save model… writes them — but they belong to this surface (another grid or ionic potential is another one)",
+                    parts.join("; ")
+                ),
+                retry: false,
+                missing,
+            });
+        }
         if !missing.is_empty() {
             let parts: Vec<String> = missing
                 .iter()
                 .map(|&z| match self.failed_refs.get(&z) {
-                    Some(why) => format!("the {} atom reference did not solve ({why})", symbol(z)),
+                    Some(f) => format!("the {} atom reference was lost to the device ({}; GPU busy — a retry may succeed)", symbol(z), f.why),
                     None => format!("the {} atom reference is not solved yet", symbol(z)),
                 })
                 .collect();
@@ -2380,7 +2400,7 @@ impl SurrogateKs {
             }
             return Some(NoModel {
                 words: format!(
-                    "no model yet: {} — a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept (Save keeps them too); Retry solves the reference again (every allowed multiplicity, cold) and fits",
+                    "no model yet: {} — a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept (Save model… writes them); Retry solves the reference (every allowed multiplicity, cold) and fits",
                     parts.join("; ")
                 ),
                 retry: true,
@@ -2404,7 +2424,11 @@ impl SurrogateKs {
     /// The Retry (`Trainable::retry_fit`; module doc, "No model yet"): a references-only pass over
     /// the missing species on `scene` (whose settings must be the samples' — another grid's
     /// reference would be another surface's), started like any pass; else a refit at once. `Err`
-    /// while a pass runs, with nothing to retry, for another surface, and with too few samples.
+    /// while a pass runs, with nothing to retry, for another surface, with too few samples, for a
+    /// reference whose SCF itself failed (deterministic), and — under an ionic policy — for a
+    /// missing species with no nucleus in the scene: the provenance tag says nothing about a
+    /// species the scene lacks, so its lone atom could be solved on another surface (pseudised
+    /// against all-electron samples) and cached under the samples' key (physics review of the fix).
     pub fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
         if self.pass.is_some() {
             return Err("a pass is already running (cancel it first)".into());
@@ -2426,6 +2450,14 @@ impl SurrogateKs {
                     ));
                 }
             }
+            if scene.ionic != sim::IonicPolicy::None {
+                if let Some(&z) = nm.missing.iter().find(|&&z| !scene.nuclei.iter().any(|n| n.z == z)) {
+                    return Err(format!(
+                        "the scene has no {} atom: under an ionic potential its reference must be solved with one in the scene, so that the scene's settings are the samples' for it too (put one back, or set Physics ▸ Ionic potential to none if the samples are all-electron)",
+                        symbol(z)
+                    ));
+                }
+            }
             let sampler = Sampler::references_only(scene, &nm.missing)?;
             for (key, r) in refs.iter() {
                 if self.ref_cache.get(key).is_none() {
@@ -2433,9 +2465,6 @@ impl SurrogateKs {
                 }
             }
             let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
-            for &z in &nm.missing {
-                self.failed_refs.remove(&z);
-            }
             self.pass_start = Some(self.samples());
             let names: Vec<&str> = nm.missing.iter().map(|&z| symbol(z)).collect();
             self.user_notes.push(format!(

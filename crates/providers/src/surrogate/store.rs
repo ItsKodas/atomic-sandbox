@@ -216,12 +216,15 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        // references of another rule are not fitted on (a new fit would bake them in — the model has
+        // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
         let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
-        for &(z, e) in &references {
-            self.refs.insert(z, e);
-            if !s9 {
-                self.legacy_refs.insert(z);
+        if s9 {
+            for &(z, e) in &references {
+                self.refs.insert(z, e);
             }
+        } else if !references.is_empty() {
+            self.user_notes.push("samples file: its reference energies predate ruling S9 (lowest-energy multiplicity) — not used; Retry or a sampling pass re-solves them".into());
         }
         self.refs_dirty = true;
         self.pending_refit = true;

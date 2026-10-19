@@ -311,6 +311,17 @@ pub struct Holdout {
     pub unfit: bool,
 }
 
+/// A reference scan that converged no multiplicity (`Sampler::take_failed_reference`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailedReference {
+    pub z: u8,
+    /// The multiplicities, the attempts and the last error, for the user.
+    pub why: String,
+    /// A solve was lost to the device (`AtomScan::device_fault`): a later attempt may succeed.
+    /// Otherwise the failure is the SCF's own and a cold solve reproduces it exactly.
+    pub transient: bool,
+}
+
 /// The hot burst's trajectory state.
 struct Burst {
     /// Evaluations still to do.
@@ -371,7 +382,7 @@ pub struct Sampler {
     r_cut: f64,
     /// The species whose reference scan converged nothing, and how it failed (the pass ended
     /// there; `take_failed_reference`).
-    failed_reference: Option<(u8, String)>,
+    failed_reference: Option<FailedReference>,
     /// A references-only pass (`references_only`).
     references_only: bool,
 }
@@ -635,7 +646,7 @@ impl Sampler {
 
     /// The species whose reference scan converged nothing in this pass, with how it failed (the
     /// pass ended there); drained.
-    pub fn take_failed_reference(&mut self) -> Option<(u8, String)> {
+    pub fn take_failed_reference(&mut self) -> Option<FailedReference> {
         self.failed_reference.take()
     }
 
@@ -1067,13 +1078,13 @@ impl Sampler {
                         }
                     };
                     if !retry && scan.retrying() {
-                        // nothing converged: the scan's retry round (`sim::references`, "The retry round")
+                        // a solve lost to the device: the scan's retry round (`sim::references`, "The retry round")
                         let again = scan.remaining().to_vec();
                         self.progress.total += again.len();
                         self.refs_total += again.len();
                         let ms: Vec<String> = again.iter().map(u32::to_string).collect();
                         self.notes.push(format!(
-                            "sampling: no multiplicity of {} (Z = {z}) converged — multiplicit{} {} solved once more, cold, before giving up",
+                            "sampling: reference {} (Z = {z}): multiplicit{} {} lost to the device (GPU busy) — solved once more, cold",
                             symbol(z),
                             if again.len() == 1 { "y" } else { "ies" },
                             ms.join(", ")
@@ -1086,10 +1097,14 @@ impl Sampler {
                     // the scan is complete: the lowest energy wins (ruling S9)
                     let tried: Vec<(u32, f64)> = scan.tried().collect();
                     let attempts = scan.attempts();
+                    let transient = scan.device_fault();
                     let Some(r) = scan.finish(prov.tol, &prov.teacher) else {
                         let why = failure.as_ref().map_or_else(String::new, |e| format!(": {e}"));
                         self.notes.push(format!("sampling: no multiplicity of {} (Z = {z}) could be solved in {attempts} attempts — the pass ends (no fit without a reference)", symbol(z)));
-                        self.failed_reference = Some((z, format!("{attempts} cold attempts{why}")));
+                        let all = allowed_multiplicities(z as u32);
+                        let ms = all.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+                        let (mw, aw) = (if all.len() == 1 { "multiplicity" } else { "multiplicities" }, if attempts == 1 { "attempt" } else { "attempts" });
+                        self.failed_reference = Some(FailedReference { z, why: format!("{mw} {ms}; {attempts} cold {aw}{why}"), transient });
                         self.finish();
                         return Err(failure.expect("no success means the last solve failed"));
                     };

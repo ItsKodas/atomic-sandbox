@@ -28,15 +28,17 @@ struct PairMorse {
     /// than `x_max` off-centre along any axis is reported with face density `rho` and its energy
     /// raised by `bias` (the box's confinement); every other one with a face density of 1e-7.
     confine: Option<(f64, f64, f64)>,
-    /// Lone-atom solves that fail with an SCF stall before one succeeds (the 2026-10-20 PH₃ case:
-    /// an isolated atom whose reference does not solve); `usize::MAX` never succeeds.
+    /// Lone-atom solves that fail before one succeeds (the 2026-10-20 PH₃ case: an isolated atom
+    /// whose reference does not solve) — an SCF stall, or with `atom_device` a lost device readback;
+    /// `usize::MAX` never succeeds.
     atom_failures: usize,
+    atom_device: bool,
 }
 
 impl PairMorse {
     fn h2() -> PairMorse {
         let m = MorseDimer::h2();
-        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None, atom_failures: 0 }
+        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None, atom_failures: 0, atom_device: false }
     }
 
     /// Whether the scripted box confines this geometry.
@@ -77,7 +79,11 @@ impl ForceProvider for PairMorse {
         self.solves.fetch_add(1, Ordering::SeqCst);
         if scene.nuclei.len() == 1 && self.atom_failures > 0 {
             self.atom_failures -= 1;
-            return Err(ProviderError::Solver(sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }));
+            return Err(ProviderError::Solver(if self.atom_device {
+                sim::SolverError::Device("callback dropped".into())
+            } else {
+                sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }
+            }));
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let (mut energy, forces) = self.energy_forces(&pos);
@@ -624,12 +630,13 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     let _ = std::fs::remove_file(bad);
 }
 
-/// The 2026-10-20 PH₃ data loss, on the analytic teacher: a pass whose isolated-atom reference
-/// never solves ends with its first-round failure, its retry round (each attempt an Activity
-/// event), no model and the reason in plain words. The samples taught without a model (live DFT
-/// steps) are saved as a samples-only file and loaded back unfitted; the Retry then re-solves the
-/// reference (references-only pass) and the model forms — and a file that already knew every
-/// reference fits at load.
+/// The 2026-10-20 PH₃ data loss, on the analytic teacher. A pass whose isolated-atom reference
+/// stalls (deterministic) ends without a retry, no model, the reason in plain words and no Retry
+/// offer; the samples taught without a model (live DFT steps) are saved as a samples-only file and
+/// loaded back unfitted; there the reference is "not solved yet" and the Retry re-solves it
+/// (references-only pass) and the model forms. A reference lost to the device is retried in the
+/// pass itself, cold (an Activity event "(retry, cold)"), and the model forms. A file that already
+/// knew every reference fits at load.
 #[test]
 fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
     let teacher = Shared::new(PairMorse::h2());
@@ -638,24 +645,19 @@ fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
     let scene = pair(1, 1, 1.45, cell(41));
     let (p, sh) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
-    // the pass: H's one multiplicity fails, is retried once cold, fails again — the pass ends
-    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
-    for _ in 0..10 {
-        if d.tick(f64::INFINITY, &mut never()).sampling.is_none_or(|p| p.finished) {
-            break;
+    let run_pass = |d: &mut Dynamics, plan: SamplingPlan| {
+        d.apply(DynCommand::StartSampling(plan));
+        for _ in 0..1000 {
+            if d.tick(f64::INFINITY, &mut never()).sampling.is_none_or(|p| p.finished) {
+                break;
+            }
         }
-    }
-    let lone: Vec<u32> = h.lock().unwrap().seen.iter().filter(|s| s.nuclei.len() == 1).map(|s| s.multiplicity.unwrap()).collect();
-    assert_eq!(lone, vec![2, 2], "the H scan (multiplicity 2) and its one cold retry");
-    {
-        let mut s = surrogate_of(&sh);
-        assert!(s.model().is_none());
-        let events = Trainable::take_teach_events(&mut *s);
-        let refs: Vec<&TeachEvent> = events.iter().filter(|e| matches!(e.rule, TeachRule::Pass(PassJob::Reference { .. }))).collect();
-        assert_eq!(refs.len(), 2, "both attempts are Activity events");
-        assert!(refs.iter().all(|e| e.outcome == TeachOutcome::Failed));
-        assert!(!refs[0].detail.contains("retry") && refs[1].detail.contains("(retry, cold)"), "{:?}", refs.iter().map(|e| &e.detail).collect::<Vec<_>>());
-    }
+    };
+    let plan = SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    // the pass: H's one multiplicity stalls — deterministic, not retried — and the pass ends
+    run_pass(&mut d, plan.clone());
+    let lone = |h: &Arc<Mutex<PairMorse>>| -> Vec<u32> { h.lock().unwrap().seen.iter().filter(|s| s.nuclei.len() == 1).map(|s| s.multiplicity.unwrap()).collect() };
+    assert_eq!(lone(&h), vec![2], "the H scan (multiplicity 2), no retry of a stall");
     // play: rule 1 keeps the DFT answers as samples (no model to answer)
     d.apply(DynCommand::Play);
     for _ in 0..40 {
@@ -667,10 +669,12 @@ fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
     let status = surrogate_of(&sh).status(&scene, &[[0.0; 3]; 2]);
     let words = status.no_model.clone().expect("no model: the reason is given");
     println!("{words}");
-    assert!(words.contains("the H atom reference did not solve") && words.contains("2 cold attempts") && words.contains("SCF stalled"), "{words}");
-    assert!(status.retry_fit && !status.fitted);
+    assert!(words.contains("the H atom reference did not solve") && words.contains("SCF stalled") && words.contains("deterministic"), "{words}");
+    assert!(!status.retry_fit && !status.fitted, "a stall is reproduced exactly: no Retry offered");
+    d.apply(DynCommand::RetryFit);
+    assert!(d.snapshot().last_rejection.expect("refused").contains("deterministic"));
 
-    // Save works without a fit: a samples-only file; it loads back unfitted, with the same reason
+    // Save works without a fit: a samples-only file; it loads back unfitted
     let path = tmp("unfitted.model");
     d.apply(DynCommand::SaveModel(path.clone()));
     assert_eq!(d.snapshot().last_rejection, None);
@@ -685,8 +689,9 @@ fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
         let s = surrogate_of(&sh2);
         assert_eq!(s.samples(), n, "every sample came back");
         assert!(s.model().is_none() && s.reference_energy(1).is_none());
-        let w = s.status(&scene, &[[0.0; 3]; 2]).no_model.unwrap();
-        assert!(w.contains("the H atom reference is not solved yet"), "{w}");
+        let st = s.status(&scene, &[[0.0; 3]; 2]);
+        assert!(st.no_model.as_deref().is_some_and(|w| w.contains("the H atom reference is not solved yet")), "{:?}", st.no_model);
+        assert!(st.retry_fit);
     }
     // another grid refuses the file
     let (p3, sh3) = driven(surrogate_over(&Shared::new(PairMorse::h2())));
@@ -714,22 +719,39 @@ fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
     }
     assert!(d2.snapshot().notes.iter().any(|m| m.contains("reference retry")), "{:?}", d2.snapshot().notes);
 
-    // a samples-only file that knew every reference (an untrusted-too-few save, say) fits at load
+    // a samples-only file that knew every reference fits at load; one of another rule does not
     d2.apply(DynCommand::ForgetModel);
-    {
-        let mut s = surrogate_of(&sh2);
-        s.set_reference_energy(1, MorseDimer::h2().e_atom);
-        let prov = s.provenance_for(&scene);
-        let set = surrogate::sidecar::read_any(&path).unwrap();
-        let surrogate::sidecar::Contents::Samples(mut set) = set else { panic!("a samples-only file") };
-        set.references = vec![(1, MorseDimer::h2().e_atom)];
-        set.reference_rule = Some(surrogate::sidecar::REFERENCE_RULE.into());
-        assert_eq!(set.provenance, prov);
-        surrogate::sidecar::write_samples(&path, &set).unwrap();
-    }
+    let surrogate::sidecar::Contents::Samples(mut set) = surrogate::sidecar::read_any(&path).unwrap() else { panic!("a samples-only file") };
+    set.references = vec![(1, MorseDimer::h2().e_atom)];
+    set.reference_rule = None;
+    surrogate::sidecar::write_samples(&path, &set).unwrap();
+    d2.apply(DynCommand::LoadModel(path.clone()));
+    assert!(surrogate_of(&sh2).model().is_none() && surrogate_of(&sh2).reference_energy(1).is_none(), "pre-S9 references are not fitted on");
+    set.reference_rule = Some(surrogate::sidecar::REFERENCE_RULE.into());
+    surrogate::sidecar::write_samples(&path, &set).unwrap();
     d2.apply(DynCommand::LoadModel(path.clone()));
     assert!(surrogate_of(&sh2).model().is_some(), "every reference known: fitted at load");
     let _ = std::fs::remove_file(path);
+
+    // a reference lost to the device: retried once, cold, in the pass itself; the model forms
+    let teacher4 = Shared::new(PairMorse::h2());
+    let h4 = teacher4.handle();
+    {
+        let mut t = h4.lock().unwrap();
+        t.atom_failures = 1;
+        t.atom_device = true;
+    }
+    let (p4, sh4) = driven(surrogate_over(&teacher4));
+    let mut d4 = Dynamics::new(scene.clone(), p4, 0.25, 1);
+    run_pass(&mut d4, plan);
+    assert_eq!(lone(&h4), vec![2, 2], "the lost solve and its one cold retry");
+    let mut s = surrogate_of(&sh4);
+    assert!(s.model().is_some());
+    let events = Trainable::take_teach_events(&mut *s);
+    let refs: Vec<&TeachEvent> = events.iter().filter(|e| matches!(e.rule, TeachRule::Pass(PassJob::Reference { .. }))).collect();
+    assert_eq!(refs.len(), 2, "both attempts are Activity events");
+    assert_eq!((refs[0].outcome, refs[1].outcome), (TeachOutcome::Failed, TeachOutcome::Reference));
+    assert!(!refs[0].detail.contains("retry") && refs[1].detail.contains("(retry, cold)"), "{:?}", refs.iter().map(|e| &e.detail).collect::<Vec<_>>());
 }
 
 /// Optional GPU smoke test (release; skips without an adapter): a tiny real pass on H₂ at 33³.
