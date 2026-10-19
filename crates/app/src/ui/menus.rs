@@ -315,6 +315,13 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                     acts.push(Action::LoadScene { sidecar: true });
                 }
             }
+            super::SceneSource::Built(_) => {
+                if let Some(h) = st.builder.last_replace.clone() {
+                    if probed("reset", ui.button("Reset")).on_hover_text("the molecule builder's geometry again, unrelaxed (pauses; time restarts)").clicked() {
+                        acts.push(Action::Builder(crate::builder::Handoff { relax: false, ..h }));
+                    }
+                }
+            }
         }
     });
 }
@@ -332,6 +339,10 @@ fn file_windows(ui: &mut Ui, st: &mut UiState) {
     }
     if ui.add(Button::new(RichText::new("Save…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("save the scene, the model, or both").clicked() {
         super::files::open_save(st);
+        ui.close();
+    }
+    if ui.add(Button::new(RichText::new("Builder…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("the molecule builder: sketch a structural formula and put it into the scene (Replace or Insert)").clicked() {
+        crate::builder::ui::open(st);
         ui.close();
     }
     ui.separator();
@@ -1065,6 +1076,16 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     ui.separator();
     // Q8 of Appendix B (M6): relax (FIRE); also in the toolbar's Time group
     anchored(ui, st, "m-relax", |ui, _| relax_controls(ui, input, acts));
+    ui.separator();
+    // the reference comparison (PySCF out of process; Readouts ▸ Compare with reference)
+    anchored(ui, st, "m-compare", |ui, st| {
+        if ui.button("Compare with reference…").on_hover_text("opens Readouts ▸ Compare with reference: PySCF answers the current geometry in its own process (optional; never drives the dynamics)").clicked() {
+            st.open_tab(super::DockTab::Readouts);
+            st.compare.open_request = true;
+            ui.close();
+        }
+        theme::note(ui, "forces, dipole and relaxed geometry vs PySCF (LDA, PBE, B3LYP, CCSD(T)) — needs Python with PySCF");
+    });
 }
 
 /// Physics ▸ Relax geometry: the button (Stop while running), the readout and the note.

@@ -303,6 +303,42 @@ About 42 h 39 m from the plan commit so far, with 25 commits on the branch.
   - Task 8a: GPU energy kernels.
 - **Still to do:** Tasks 7 and 8b to 13 (see What's next).
 
+
+### 2D molecule builder (spec Oct 20 07:43, last commit 08:46, about 1 h 3 m)
+
+File ▸ **Builder…**: a window where a molecule is sketched as a 2D structural formula and handed to the
+scene as a 3D starting geometry, which the solver then relaxes. One Opus session, no subagents, four parts
+with the user hand-testing each one in the app before the next (the testing split: Claude ran only the
+builder's CPU unit tests, seconds; `cargo test -p app --release --bin app` once on the merged tree).
+
+- **Rule 1, signed off.** The builder needs a valence table and covalent radii, which is per-element data
+  beyond Z and mass. The user signed off on them in the spec (§3) under conditions: they live only in
+  `crates/app/src/builder/chem.rs`, they only decide where atoms are first put and which atoms the window
+  marks, and nothing from them reaches `sim`, `qm`, `providers`, the forces, the bond detector or the
+  names. The Relax after the hand-off (on by default) moves the guess to the solver's own geometry.
+- **Parts:** the canvas (atoms, bond orders, charges, undo); the assist (Fill hydrogens, valence warnings,
+  group stamps; a charged atom's valence is the octet count of its v − q electrons, which gives NH₄⁺,
+  H₃O⁺, OH⁻ and BH₄⁻ without a second table); the 2D → 3D embedding (bond and VSEPR 1–3 springs, a soft
+  repulsion, a triple-product planarity term, gradient descent); the hand-off (Replace / Insert, a fit
+  check with an "enlarge the box" offer that shows the GPU memory need first, Relax after).
+- **The user's hand-tests changed the design three times, all within the hour:** the Atom tool became
+  select-then-click (drag moves an atom; a click near the selected atom places a bonded one, with a ghost
+  preview; right-click deselects); bonded atoms then snapped to a fixed length and 30° steps; and then,
+  on the user's next two messages, to rough real geometry instead — lengths from the radii, VSEPR angles
+  imposed only once there is a bond to measure from. A faded controls cheat sheet went into the canvas
+  corner on request.
+- **`names` gained display-only entries** for ethanol, acetic acid and benzene, with C–C signatures so
+  dimethyl ether and methyl formate are told apart: the spec's success test is that a drawn ethanol is
+  named ethanol by the bond detector after a Relax.
+- **Failures worth remembering:** a PowerShell `Get-Content | Set-Content` edit read a UTF-8 file as ANSI
+  and wrote it back garbled (`·` became `Â·`) plus a BOM, and the garbled file was committed before the
+  next edit noticed it; the repair reversed the mis-decoding run by run so later, correct text was not
+  touched. Edits since go through Python or the editor tool, never a PowerShell round trip. The first
+  benzene embedding failed its equal-C–C test honestly: a Kekulé ring has alternating single and double
+  bond lengths, so a six-ring drawn alternating is now treated as aromatic (the mean of the two factors).
+  The first build waited behind other sessions' suites; the user chose a low-priority `-j 4` build
+  instead, which took 30 s.
+
 ---
 
 ## Failures and dead ends

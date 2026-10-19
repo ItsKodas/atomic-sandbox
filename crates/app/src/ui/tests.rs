@@ -1773,6 +1773,7 @@ fn partial_charges_are_shown_balanced_and_labelled_when_earlier() {
         step: 4,
         source: sim::ChargeSource::Step,
         ionic: "none".into(),
+        dipole: [0.0; 3],
     };
     s.dynamics.charges = Some(std::sync::Arc::new(c.clone()));
     let (shown, current) = shown_charges(&s.dynamics).expect("balanced, these nuclei");

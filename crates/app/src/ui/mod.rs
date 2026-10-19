@@ -170,11 +170,13 @@ const SPARK_WINDOW: usize = 400;
 
 /// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
 /// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
-/// line — all through [`UiState::adopt_file`]).
+/// line — all through [`UiState::adopt_file`]), or the molecule builder's Replace (its formula;
+/// Reset sends the built geometry again, `builder::Builder::last_replace`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneSource {
     Preset(String),
     File(String),
+    Built(String),
 }
 
 impl SceneSource {
@@ -182,7 +184,7 @@ impl SceneSource {
     pub fn preset(&self) -> Option<&str> {
         match self {
             SceneSource::Preset(p) => Some(p),
-            SceneSource::File(_) => None,
+            SceneSource::File(_) | SceneSource::Built(_) => None,
         }
     }
 
@@ -191,6 +193,7 @@ impl SceneSource {
         match self {
             SceneSource::Preset(p) => p.clone(),
             SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
+            SceneSource::Built(formula) => format!("built {formula}"),
         }
     }
 }
@@ -528,6 +531,8 @@ pub struct UiState {
     pub nucleus_scale: Option<f32>,
     /// The File window (`files`): the scenes and models folders.
     pub files: files::Browser,
+    /// The molecule builder's window and drawing (File ▸ Builder…, `crate::builder`; display state, kept while closed).
+    pub builder: crate::builder::Builder,
     pub scene_path: String,
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
@@ -701,6 +706,8 @@ pub struct UiState {
     /// The Play snapshots, newest first (at most `rewind::KEPT`): the toolbar's Rewind returns to
     /// one (`ui::rewind`).
     pub play_snapshots: std::collections::VecDeque<rewind::PlaySnapshot>,
+    /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
+    pub compare: crate::reference::Compare,
 }
 
 impl UiState {
@@ -844,6 +851,7 @@ right {}
             nucleus_scale: None,
             scene_path: "my.scene".into(),
             files: Default::default(),
+            builder: Default::default(),
             model_file: None,
             model_offer: None,
             status: String::new(),
@@ -929,6 +937,7 @@ right {}
             help: None,
             activity: activity::ActivityState::new(),
             play_snapshots: std::collections::VecDeque::new(),
+            compare: Default::default(),
         }
     }
 
@@ -1195,6 +1204,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
     let queued = acts.len();
     st.log.record(&st.status, st.status_seq, input);
+    // the reference comparison's results (a helper process on its own thread; never blocks)
+    st.compare.poll(input.snapshot);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
@@ -1221,6 +1232,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
     files::show_save(root.ctx(), st, input, &mut acts);
+    crate::builder::ui::show(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
     profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
@@ -1529,6 +1541,7 @@ fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
         st.search.toggle();
     }
     if !st.search.open
+        && !st.builder.open
         && !ctx.egui_wants_keyboard_input()
         && !egui::Popup::is_any_open(ctx)
         && ctx.input(|i| i.key_pressed(egui::Key::Escape))
