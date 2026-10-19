@@ -2877,10 +2877,9 @@ mod orbital_viewer {
         st.show = ShowMode::Orbitals;
         assert!(orbitals::dots_note(&st).starts_with("dots are samples of where an electron is likely to be"));
         st.show = ShowMode::Coloured;
-        // boundary surfaces (the default since the boundary-orbitals merge): the region enclosing a share
-        let enclosed = orbitals::dots_note(&st);
-        assert!(st.colour_look.enclose.is_some() && enclosed.contains("boundary surface") && enclosed.contains("not the density"), "{enclosed}");
-        // by density, as before
+        // the default look is the boundary surfaces: the dots fill each orbital's region
+        let boundary = orbitals::dots_note(&st);
+        assert!(boundary.contains("boundary surface") && boundary.contains("not the density"), "{boundary}");
         st.colour_look.enclose = None;
         let peak = orbitals::dots_note(&st);
         assert!(peak.contains("own peak") && peak.contains("not the electron density"), "{peak}");
