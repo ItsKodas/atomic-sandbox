@@ -708,6 +708,32 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             acts.push(Action::SmoothMotion(smooth));
         }
         trail_controls(ui, st);
+        // the Camera view's settings (it is picked in the view's bottom-left switch)
+        ui.separator();
+        theme::section(ui, "Camera");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut st.camera_view, "camera view").on_hover_text("the atoms as they look rather than as markers: from a soft electron glow to solid balls, blurred over the shutter (also the view switch, bottom left)");
+        });
+        ui.add_enabled_ui(st.camera_view, |ui| {
+            let row = |ui: &mut Ui, name: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: String, tip: &str| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([72.0, 18.0], egui::Label::new(name));
+                    ui.add(egui::Slider::new(v, range).show_value(false)).on_hover_text(tip);
+                    ui.label(text);
+                });
+            };
+            let t = format!("{:+.1} EV", st.exposure_ev);
+            row(ui, "exposure", &mut st.exposure_ev, -3.0..=3.0, t, "brightness, in stops (EV)");
+            let t = format!("{:.0} %", st.shutter * 100.0);
+            row(ui, "shutter", &mut st.shutter, 0.0..=1.0, t, "how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
+            let t = format!("{:.0}°", st.fov_deg);
+            row(ui, "field of view", &mut st.fov_deg, 15.0..=100.0, t, "the lens: narrow (telephoto, flat) to wide (close, strong perspective)");
+            let t = if st.camera_solidity <= 0.0 { "glow".into() } else if st.camera_solidity >= 1.0 { "solid".into() } else { format!("{:.0} %", st.camera_solidity * 100.0) };
+            row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
+            let t = format!("{:.1}×", st.camera_size);
+            row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
+        });
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("motion blur");
             ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false))

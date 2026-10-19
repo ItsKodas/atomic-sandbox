@@ -550,6 +550,11 @@ pub struct UiState {
     pub camera_view: bool,
     pub shutter: f32,
     pub exposure_ev: f32,
+    /// Camera: 0 = soft electron glow … 1 = solid shaded ball; the atoms' size × the diagram radius;
+    /// the field of view (degrees, Camera only).
+    pub camera_solidity: f32,
+    pub camera_size: f32,
+    pub fov_deg: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -803,6 +808,9 @@ right {}
             camera_view: false,
             shutter: 0.5,
             exposure_ev: 0.0,
+            camera_solidity: 0.0,
+            camera_size: 1.6,
+            fov_deg: 50.0,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,

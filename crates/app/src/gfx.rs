@@ -75,7 +75,8 @@ pub struct World<'a> {
     pub blur: &'a [(usize, [f64; 3], f32)],
     /// The Camera view (`Viewer::camera_frames`): each shutter instant's positions, and the exposure
     /// (EV); `None` = the diagram view.
-    pub glow: Option<(&'a [Vec<[f64; 3]>], f32)>,
+    /// (instants, exposure EV, solidity 0–1, size × the diagram radius)
+    pub glow: Option<(&'a [Vec<[f64; 3]>], f32, f32, f32)>,
 }
 
 /// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
@@ -694,7 +695,13 @@ impl Painter {
             .collect();
         self.renderer.ghosts.set_instances(ctx, &ghosts);
         self.renderer.glow_on = world.glow.is_some();
-        if let Some((frames, ev)) = world.glow {
+        if let Some((all, ev, solidity, size)) = world.glow {
+            // with any solidity each instant is two passes: at most 16 instants, evenly spread
+            let frames: Vec<&Vec<[f64; 3]>> = if solidity > 0.0 && all.len() > 16 {
+                (0..16).map(|k| &all[k * (all.len() - 1) / 15]).collect()
+            } else {
+                all.iter().collect()
+            };
             let w = 1.0 / frames.len().max(1) as f32;
             let scale = self.nucleus_scale;
             let glow: Vec<SphereInstance> = frames
@@ -702,14 +709,15 @@ impl Painter {
                 .flat_map(|f| {
                     f.iter().zip(world.nuclei).map(move |(p, n)| SphereInstance {
                         centre: p.map(|x| x as f32),
-                        radius: elements::radius(n.z) * scale * 1.6,
+                        radius: elements::radius(n.z) * scale * size,
                         colour: elements::colour(n.z),
                         selected: w,
                     })
                 })
                 .collect();
             self.renderer.glow.ensure(ctx, [w_px, h_px]);
-            self.renderer.glow.set(ctx, &glow, ev);
+            let per = world.nuclei.len().min(frames.first().map_or(0, |f| f.len()));
+            self.renderer.glow.set(ctx, &glow, per, ev, solidity);
         }
         self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {

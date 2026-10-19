@@ -1,7 +1,7 @@
-// The Camera view's composite (camera.wgsl): the accumulated glow over the scene.
-// ---- the composite: the accumulated glow over the scene, exposed and tone-mapped
+// The Camera view's composite (camera.wgsl): the accumulated atoms over the scene, exposed and
+// tone-mapped — a filmic curve for the glow (overlaps saturate toward white), plain for the balls.
 @group(0) @binding(0) var accum: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> look: vec4<f32>;   // x = exposure (linear gain)
+@group(0) @binding(1) var<uniform> look: vec4<f32>;   // x = exposure gain, y = solidity 0–1
 
 @vertex
 fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -12,8 +12,10 @@ fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let s = textureLoad(accum, vec2<i32>(pos.xy), 0);
-    // filmic: overlapping glows saturate toward white instead of clipping
-    let rgb = vec3(1.0) - exp(-s.rgb * look.x * 1.6);
-    let a = 1.0 - exp(-s.a * 1.8);
+    let h = look.y;
+    let filmic = vec3(1.0) - exp(-s.rgb * look.x * 1.6);
+    let plain = clamp(s.rgb * look.x, vec3(0.0), vec3(1.0));
+    let rgb = mix(filmic, plain, h);
+    let a = mix(1.0 - exp(-s.a * 1.8), clamp(s.a, 0.0, 1.0), h);
     return vec4(rgb, a);   // premultiplied over the scene (One, OneMinusSrcAlpha)
 }

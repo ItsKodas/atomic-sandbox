@@ -797,7 +797,7 @@ impl App {
             viewport: v.viewport,
             risk: &risk,
             blur: &blur,
-            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev)),
+            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size)),
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

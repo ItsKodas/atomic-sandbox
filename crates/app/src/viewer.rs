@@ -1862,6 +1862,8 @@ impl Viewer {
         if !self.ui.show_trails || self.trails.is_empty() {
             self.record_trails();
         }
+        // the Camera view's field of view (the diagram keeps 50°)
+        self.camera.fov_y = if self.ui.camera_view { self.ui.fov_deg.clamp(10.0, 120.0).to_radians() } else { 50f32.to_radians() };
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         self.auto_audit(measured_fs_per_s);
