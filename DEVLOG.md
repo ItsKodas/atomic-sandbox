@@ -55,8 +55,8 @@ All measured on the repository, unless marked as an estimate.
 | Markdown | about 15,000 lines (specs, plans, notes, README, `references.md` at 1,864 lines) | `git ls-files '*.md'` |
 | `#[test]` functions on `main` | 803 (the oracles are release-only by design) | `git grep` |
 | Suite sizes at the orbital-viewer merge | app 210 (2 ignored), providers 106, render 35, sim 102 | orbital ledger |
-| Milestones merged to `main` | M1, M2, M3, M4, M5, M5b (viewer extras), UI redesign, M6, orbital viewer | git |
-| In flight, not merged | M7 pseudopotentials, Activity tab | branches |
+| Milestones merged to `main` | M1, M2, M3, M4, M5, M5b (viewer extras), UI redesign, M6, orbital viewer, Activity tab, M7 | git |
+| In flight, not merged | none (next: M8) | branches |
 | Commit trailers on `main` | Opus 5.5: 167 · Fable 5.1: 110 · Sonnet 5.5: 1 | `git log` |
 
 Notes on the table:
@@ -265,7 +265,27 @@ DMC teachers; spec at 19:37).
 - **State:** the final fix wave committed at 23:15 on Oct 16. Before it merges, the surrogate, dynamics and
   gpu_vs_cpu suites still have to run on the merged tree.
 
-### M7: self-generated pseudopotentials (spec Oct 14 08:49, plan Oct 15 04:23, latest commit Oct 16 23:02, in progress)
+### M7: self-generated pseudopotentials (spec Oct 14 08:49, plan Oct 15 04:23, merged Oct 19 ~10:20 local)
+
+**Merged 2026-10-19.** Tasks 1–13 plus the preview branch's work landed together: Task 10's
+oracles (H₂O under *all species* 104.97° against SVWN 104.99°, O–H +0.0097 Å; NH₃ 107.6°, CH₄
+tetrahedral), Task 11's hydrogen dimer gate and the new default *accepted species* (H₂ Richardson
+ω 4024 cm⁻¹, −3.7 % against the all-electron curve, bound 5 %, noise ≈ 0.55 %), a checksummed
+disk cache of gate verdicts (first launch ≈ 80 s, then ≈ 25 s), the level-gated SCF stall stop,
+the estimated mode's trust fixes (teach-around passes, shell checks and structural shell fences,
+the "stuck on DFT" prompt), and the user's preview requests (left dock, model file dialogs,
+load-settings card, bond lengths, steady labels, follow, audit switch + auto cadence, the
+training ghost with its last three samples). The final scoped physics review found one critical
+(a shell fence lifted by a refit) and three important issues, all fixed with pinning tests
+before the single final run: units+qm 212, qm-gpu+render 162, sim+surrogate 192, providers
+239, validate all binaries green (oracles 1414 s, pseudo 3016 s, pseudo_oracles 5294 s,
+surrogate 620 s), app 345 — 3 h 43 m serial. Testing split agreed with the user: Claude runs
+the physics suites once; the user hand-tests UI in previews (they found most of the workflow
+bugs this way). Failures worth remembering: a helper killed a test process it had not verified
+as its own; an interim report was misread as "your model is trusted"; the user's playing
+window was closed once by a relaunch.
+
+The history below is the in-progress record as it stood before the merge.
 
 About 42 h 39 m from the plan commit so far, with 25 commits on the branch.
 
