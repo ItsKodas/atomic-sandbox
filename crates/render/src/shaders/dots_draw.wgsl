@@ -11,7 +11,7 @@ struct Params {
     size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
     // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
     // re-drawn fresh each frame, glow (additive soft sprites) on/off
-    walk: f32, refresh: f32, glow: u32, _pad: u32,
+    walk: f32, refresh: f32, glow: u32, cut: f32,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
@@ -51,7 +51,8 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     }
     o.pos = clip;
     o.uv = q;
-    o.colour = vec4(c.rgb * fade, 1.0);
+    // the feather's opacity rides in the packed alpha
+    o.colour = vec4(c.rgb * fade, c.a);
     return o;
 }
 
@@ -63,5 +64,6 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     var w = (1.0 - d2 * d2) * prm.intensity;
     // glow: a soft Gaussian sprite, added (dense regions burn toward white)
     if (prm.glow != 0u) { w = exp(-4.0 * d2) * prm.intensity; }
+    w = w * in.colour.a;
     return vec4(in.colour.rgb * w, w);
 }

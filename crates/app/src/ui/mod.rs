@@ -573,6 +573,8 @@ pub struct UiState {
     pub dots_amount: f32,
     pub dots_size: f32,
     pub dots_brightness: f32,
+    /// The dots' feather: the faint outskirts fade out (0 = every dot; up to 0.8 of √(field / max)).
+    pub dots_feather: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -839,6 +841,7 @@ right {}
             dots_amount: 2.0,
             dots_size: 1.0,
             dots_brightness: 1.0,
+            dots_feather: 0.0,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,

@@ -174,6 +174,7 @@ pub struct Painter {
     dots_amount: f32,
     dots_size: f32,
     dots_brightness: f32,
+    dots_feather: f32,
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
     /// one bound): created by the painter, never handed out (so uploading into them cannot touch
@@ -243,6 +244,7 @@ impl Painter {
             dots_amount: 1.0,
             dots_size: 1.0,
             dots_brightness: 1.0,
+            dots_feather: 0.0,
             renderer: Renderer::new(ctx, format),
             uploads: [None, None],
             uploaded: None,
@@ -607,7 +609,7 @@ impl Painter {
         self.shimmer = ui.shimmer;
         // the dots' look (View ▸ Density ▸ dots)
         self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
-        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness);
+        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
             let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
@@ -692,7 +694,7 @@ impl Painter {
             intensity: if glow { 0.18 * self.dots_brightness } else { 0.35 } * p.fade,
             colour_by: look.colour_by, signed: u32::from(look.signed),
             // the fresh re-draws (which keep the walk honest) slow with the drift, so slow dots do not pop
-            walk: self.dots_float, refresh: 0.01 * (self.dots_float / 0.35).clamp(0.02, 1.0), glow: u32::from(glow), _pad: 0,
+            walk: self.dots_float, refresh: 0.01 * (self.dots_float / 0.35).clamp(0.02, 1.0), glow: u32::from(glow), cut: self.dots_feather,
         });
     }
 

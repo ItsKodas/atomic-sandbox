@@ -27,7 +27,7 @@ struct Params {
     size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
     // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
     // re-drawn fresh each frame, glow (additive soft sprites) on/off
-    walk: f32, refresh: f32, glow: u32, _pad: u32,
+    walk: f32, refresh: f32, glow: u32, cut: f32,
 };
 @group(0) @binding(0) var<uniform> prm: Params;
 @group(0) @binding(1) var scal: texture_3d<f32>;
@@ -148,6 +148,16 @@ fn field_at(p: vec3<f32>) -> f32 {
     return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
 }
 
+// a dot's opacity under the feather: faded where √(field / max) is under `cut` (soft, over
+// 0.4 cut … cut), never quite 0 (a 0 alpha marks an empty slot)
+fn fade_at(p: vec3<f32>) -> f32 {
+    if (prm.cut <= 0.0) { return 1.0; }
+    let nc = cells();
+    let gmax = rows[2u * nc.y * nc.z];
+    let s = sqrt(clamp(field_at(p) / max(gmax, 1e-30), 0.0, 1.0));
+    return max(smoothstep(0.4 * prm.cut, prm.cut, s), 0.004);
+}
+
 // a dot's colour at a world position (as the fresh draw colours it)
 fn colour_at(p: vec3<f32>) -> vec3<f32> {
     let dims = vec3<f32>(prm.dims);
@@ -215,7 +225,7 @@ fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
             let q = p0 + v;
             if (field_at(q) > 0.0) {
                 vel[i] = vec4(v, 0.0);
-                pts[i] = vec4(q, bitcast<f32>(pack4x8unorm(vec4(colour_at(q), 1.0))));
+                pts[i] = vec4(q, bitcast<f32>(pack4x8unorm(vec4(colour_at(q), fade_at(q)))));
                 return;
             }
             // stepped off the field: drawn fresh below
@@ -289,7 +299,7 @@ fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s = sqrt(clamp(val / max(gmax, 1e-30), 0.0, 1.0));
         c = ramp(0.1 + 0.9 * s);
     }
-    pts[i] = vec4(p, bitcast<f32>(pack4x8unorm(vec4(c, 1.0))));
+    pts[i] = vec4(p, bitcast<f32>(pack4x8unorm(vec4(c, fade_at(p)))));
     if (prm.walk > 0.0) {
         let cs = (prm.box_max - prm.box_min) / (vec3<f32>(prm.dims) - vec3(1.0));
         let sp = prm.walk * min(cs.x, min(cs.y, cs.z));

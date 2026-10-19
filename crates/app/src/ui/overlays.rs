@@ -461,6 +461,10 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                             ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
                                 .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
                             ui.add_space(8.0);
+                            ui.label("feather");
+                            ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).show_value(false))
+                                .on_hover_text("fade out the faint outskirts: the dots where the field is low disappear softly, leaving the main lobes (0 = every dot)");
+                            ui.add_space(8.0);
                             ui.label("size");
                             ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
                         });
