@@ -3019,6 +3019,42 @@ mod activity_tab {
         assert_eq!(items(&st), vec![Item::Row(0), Item::Row(1), Item::Divider, Item::Row(2)]);
     }
 
+    /// The display eigensolve (user request 2026-10-19): a job row while it runs, and a log row
+    /// with its time merged by time among the teaching rows; the "orbitals" chip hides them; it
+    /// counts as no teaching solve.
+    #[test]
+    fn the_display_eigensolve_has_a_job_row_and_log_rows() {
+        use activity::jobs::{rows, JobKey};
+        use activity::log::{display_solve_cell, items, Item};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let probe = sim::ProbeView { display: Some((0.3, 4)), display_solves: 2, ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let job = r.iter().find(|r| r.key == JobKey::Orbitals).expect("the eigensolve's job row");
+        assert!(job.detail.contains("4 unoccupied orbitals") && job.elapsed_s == Some(0.3));
+        assert!(job.control.is_none() && job.no_control_why.is_some());
+        let idle = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        assert!(rows(&idle, idle.probe.as_ref()).iter().all(|r| r.key != JobKey::Orbitals));
+
+        let mut st = activity::ActivityState::new();
+        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, unoccupied: 4, interrupted };
+        st.absorb_display(vec![solve(120.0, false)]);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![event(TeachOrigin::Fallback, TeachRule::Grade, TeachOutcome::Kept, Some(1))];
+        st.absorb(&s);
+        std::thread::sleep(Duration::from_millis(2));
+        st.absorb_display(vec![solve(12_345.0, true)]);
+        assert_eq!(st.session_solves, 1, "a display eigensolve is not a teaching solve");
+        assert_eq!(items(&st), vec![Item::Display(0), Item::Row(0), Item::Display(1)]);
+        assert_eq!(display_solve_cell(&st.display_rows[0].solve), "120 ms");
+        assert_eq!(display_solve_cell(&st.display_rows[1].solve), "12.3 s · stopped");
+        st.filter.orbitals = false;
+        assert_eq!(items(&st), vec![Item::Row(0)]);
+    }
+
     /// The chips filter by origin and by kept / not kept.
     #[test]
     fn the_chips_filter_the_log() {

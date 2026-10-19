@@ -49,7 +49,9 @@
 //! `sample_density` (the latest evaluation succeeded, and no `reset` or `discontinuity` since).
 //! Unoccupied orbitals (plan Task 4) come from the producer's display eigensolve on that same
 //! converged state, paused in practice (`crate::orbitals`, "Unoccupied orbitals"); its SCF wall
-//! accounting is the evaluation's solve and forces.
+//! accounting is the evaluation's solve and forces. A solver with a probe (`with_probe`) reports
+//! each such eigensolve to it (`ActivityProbe::display_solve`: the Activity tab's job line and
+//! log row; display only, not a teaching solve).
 //!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
@@ -550,10 +552,18 @@ impl CpuKs {
         let now = Instant::now();
         self.unocc.revalidate(&positions);
         match self.unocc.plan(m, now, self.orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => match view.unoccupied(state, nuclei, m, settings, should_abort) {
-                Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
-                None => self.unocc.interrupted(),
-            },
+            UnoccupiedPlan::Solve => {
+                // the Activity tab's job line and log row (display only)
+                let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let solved = view.unoccupied(state, nuclei, m, settings, should_abort);
+                if let Some(b) = busy {
+                    b.finish(solved.is_none());
+                }
+                match solved {
+                    Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
+                    None => self.unocc.interrupted(),
+                }
+            }
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 view.clear_unoccupied();
@@ -812,7 +822,7 @@ impl GpuKs {
         if !self.density_current {
             return None;
         }
-        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, vram_budget, unocc, .. } = self;
+        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, vram_budget, unocc, probe, .. } = self;
         let solver = solver.as_mut()?;
         let (cell, nuclei, settings) = last.as_ref()?;
         let positions: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
@@ -857,10 +867,18 @@ impl GpuKs {
         let now = Instant::now();
         unocc.revalidate(&positions);
         match unocc.plan(m, now, orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => match view.unoccupied(solver, nuclei, m, settings, should_abort) {
-                Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
-                None => unocc.interrupted(),
-            },
+            UnoccupiedPlan::Solve => {
+                // the Activity tab's job line and log row (display only)
+                let busy = probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let solved = view.unoccupied(solver, nuclei, m, settings, should_abort);
+                if let Some(b) = busy {
+                    b.finish(solved.is_none());
+                }
+                match solved {
+                    Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
+                    None => unocc.interrupted(),
+                }
+            }
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 if unocc.held() {

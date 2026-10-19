@@ -1217,6 +1217,9 @@ impl Viewer {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
                 self.ui.activity.absorb(&s);
+                if let Some(w) = &self.sim {
+                    self.ui.activity.absorb_display(w.probe().take_display_solves());
+                }
                 if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
                     // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
                     // cloud — not the last molecule's, faded or not

@@ -18,6 +18,8 @@ pub enum JobKey {
     /// A density refresh or an isolated-atom density on the background teacher (spec A8).
     Background,
     BondReferences,
+    /// The display eigensolve of unoccupied orbitals after a DFT step (display only).
+    Orbitals,
     Relax,
     PassOffer,
 }
@@ -113,6 +115,19 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: input.playing.then(|| ("Pause".into(), Action::Pause)),
             no_control_why: (!input.playing).then_some("a paused step finishes; edits abandon it at the next SCF iteration (CPU: after the solve)"),
             scf: pv.main.live,
+        });
+    }
+    if let Some((s, m)) = probe.and_then(|p| p.display) {
+        v.push(JobRow {
+            key: JobKey::Orbitals,
+            title: "Computing orbitals".into(),
+            detail: format!("{m} unoccupied orbital{} per spin for the Orbitals view, on the last DFT step's converged state · display only", if m == 1 { "" } else { "s" }),
+            progress: JobProgress::Indeterminate,
+            elapsed_s: Some(s),
+            eta_s: None,
+            control: None,
+            no_control_why: Some("display only: it never feeds the solve, and any command (an edit, Play, a slider) interrupts it at once; 0 unoccupied orbitals in the Orbitals tab turns it off"),
+            scf: None,
         });
     }
     if let Some((s, n)) = probe.and_then(|p| p.refit) {
@@ -250,6 +265,7 @@ fn mmss(s: f64) -> String {
 fn colour_of(key: JobKey) -> Color32 {
     match key {
         JobKey::Audit | JobKey::Background => GREEN,
+        JobKey::Orbitals => theme::INK_DIM,
         JobKey::PassOffer => AMBER,
         _ => theme::ACCENT,
     }
