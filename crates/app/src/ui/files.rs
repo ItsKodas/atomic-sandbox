@@ -243,6 +243,7 @@ fn track_loads(st: &mut UiState, input: &PanelInput<'_>) {
     let b = &mut st.files;
     if let Some((path, before, since)) = b.loading.clone() {
         if now.is_some() && now != Some(before) {
+            // the first change after the click: the model came in (samples or epoch moved)
             b.loading = None;
             b.loaded = now.map(|sig| (path, sig));
         } else if card {
@@ -251,7 +252,9 @@ fn track_loads(st: &mut UiState, input: &PanelInput<'_>) {
             b.loading = None;
         }
     }
-    if b.loaded.as_ref().is_some_and(|(_, sig)| Some(*sig) != now) {
+    // the loaded file stays "Loaded" until the model's samples change (training, another load,
+    // Forget); a refit (the epoch) is not a change — loading is followed by one
+    if b.loaded.as_ref().is_some_and(|(_, sig)| now.is_none_or(|n| n.0 != sig.0)) {
         b.loaded = None;
     }
 }
