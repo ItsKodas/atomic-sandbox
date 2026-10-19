@@ -1851,7 +1851,11 @@ impl Viewer {
             let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(170));
             let main = painter.layout_no_wrap(crate::ghost::label(g), egui::FontId::proportional(14.5), egui::Color32::WHITE);
             let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
-            let rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
+            let mut rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
+            // below the status chip when they would overlap (a narrow view)
+            if let Some(chip) = self.ui.chip_rect.filter(|c| c.intersects(rect.expand(4.0))) {
+                rect = rect.translate(egui::vec2(0.0, chip.bottom() + 10.0 - rect.top()));
+            }
             painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(175));
             let cx = rect.center().x;
             painter.galley(egui::pos2(cx - galley.size().x / 2.0, rect.top() + 6.0), galley.clone(), egui::Color32::WHITE);

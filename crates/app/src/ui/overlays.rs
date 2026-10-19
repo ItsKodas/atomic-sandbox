@@ -20,6 +20,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
         return;
     }
     let chip = status_chip(ctx, view, st, input);
+    st.chip_rect = Some(chip);
     bonds_now(ctx, view, st, input, acts);
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {

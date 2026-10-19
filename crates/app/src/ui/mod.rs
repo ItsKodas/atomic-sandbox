@@ -565,6 +565,8 @@ pub struct UiState {
     pub background: Option<[u8; 3]>,
     /// The labels in the 3D view (molecule names, bond lengths, angles): opacity 0–1.
     pub label_opacity: f32,
+    /// The status chip's rect last frame (points): the view's top-centre labels keep clear of it.
+    pub chip_rect: Option<egui::Rect>,
     /// The dots' look (View ▸ Density): floating (a Metropolis walk, `dots_drift` grid cells per
     /// frame), glowing (soft additive sprites), the amount (× the default count), size and brightness.
     pub dots_float: bool,
@@ -833,6 +835,7 @@ right {}
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
+            chip_rect: None,
             loading: None,
             timings: Default::default(),
             dots_float: true,
