@@ -122,6 +122,38 @@ fn stem(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The scene's elements against what a model was taught.
+struct Species {
+    /// Each element of the scene and whether the model was taught it.
+    scene: Vec<(u8, bool)>,
+    /// The model was taught exactly the scene's elements, no more.
+    exact: bool,
+}
+
+impl Species {
+    fn covers(&self) -> bool {
+        self.scene.iter().all(|&(_, t)| t)
+    }
+}
+
+/// The model to recommend for a scene: one that knows every element and can run here — ready
+/// before needing settings, then taught exactly these elements; the first such on a tie.
+fn recommended(fits: &[(Fit, Option<Species>)]) -> Option<usize> {
+    fits.iter()
+        .enumerate()
+        .filter_map(|(i, (f, sp))| {
+            let sp = sp.as_ref().filter(|sp| sp.covers())?;
+            let ready = match f {
+                Fit::Ready => 1,
+                Fit::Settings(_) => 0,
+                _ => return None,
+            };
+            Some((ready, sp.exact as u8, std::cmp::Reverse(i)))
+        })
+        .max()
+        .map(|(_, _, std::cmp::Reverse(i))| i)
+}
+
 /// Where the model stands against a scene.
 enum Fit {
     Ready,
@@ -136,31 +168,22 @@ fn fit(
     input: &PanelInput<'_>,
     m: &ModelEntry,
     scene: &Scene,
-) -> (Fit, Option<String>) {
+) -> (Fit, Option<Species>) {
     let prov = match &m.prov {
         Ok(p) => p,
         Err(e) => return (Fit::Unreadable(e.clone()), None),
     };
     // the elements: the model answers only the species it was taught (the rest fall back to DFT)
     let taught: Vec<u8> = prov.masses.iter().map(|&(z, _)| z).collect();
-    let mut missing: Vec<u8> = scene
-        .nuclei
-        .iter()
-        .map(|n| n.z)
-        .filter(|z| !taught.contains(z))
-        .collect();
-    missing.sort_unstable();
-    missing.dedup();
-    let species = if taught.is_empty() {
-        None
-    } else if missing.is_empty() {
-        Some(format!("taught {}", symbols(&taught)))
-    } else {
-        Some(format!(
-            "never saw {} (those steps go to DFT)",
-            symbols(&missing)
-        ))
-    };
+    let mut elements: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+    elements.sort_unstable();
+    elements.dedup();
+    let species = (!taught.is_empty()).then(|| {
+        let mut t = taught.clone();
+        t.sort_unstable();
+        t.dedup();
+        Species { scene: elements.iter().map(|&z| (z, taught.contains(&z))).collect(), exact: t == elements }
+    });
     let teacher = input.model().map_or(
         if st.gpu_available {
             "Kohn-Sham (GPU)"
@@ -197,16 +220,6 @@ fn fit(
         },
     };
     (f, species)
-}
-
-fn symbols(zs: &[u8]) -> String {
-    let mut zs = zs.to_vec();
-    zs.sort_unstable();
-    zs.dedup();
-    zs.iter()
-        .map(|&z| units::elements::symbol(z))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// A Load that changed nothing in this long is over (refused, or its settings card cancelled).
@@ -525,11 +538,18 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             theme::note(ui, "No models yet: train one in the Estimated solver, then File ▸ Save ▸ Model.");
         }
         let mut load: Option<PathBuf> = None;
-        for m in &st.files.models {
-            let (f, species) = match &scene {
+        let mut settings_only: Option<PathBuf> = None;
+        let fits: Vec<(Fit, Option<Species>)> = st
+            .files
+            .models
+            .iter()
+            .map(|m| match &scene {
                 Some(s) => fit(st, input, m, s),
                 None => (Fit::Unreadable("no scene selected".into()), None),
-            };
+            })
+            .collect();
+        let best = recommended(&fits);
+        for (mi, (m, (f, species))) in st.files.models.iter().zip(&fits).enumerate() {
             let (chip, colour, detail) = match &f {
                 Fit::Ready => ("ready", Color32::from_rgb(0x7d, 0xd3, 0x8f), String::new()),
                 Fit::Settings(s) => ("needs settings", Color32::from_rgb(0xf0, 0xb4, 0x5a), format!("loading applies: {s}")),
@@ -540,17 +560,43 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 ui.set_width(ui.available_width());
                 // the text on the left, the Load button on the right, centred on the text's height
                 const LOAD_W: f32 = 120.0;
-                let text_w = (ui.available_width() - LOAD_W - 16.0).max(120.0);
+                let text_w = (ui.available_width() - 2.0 * LOAD_W - 24.0).max(120.0);
                 let text = ui
                     .allocate_ui(Vec2::new(text_w, 0.0), |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&m.name).strong().size(15.0));
                             theme::pill(ui, chip, colour);
+                            if best == Some(mi) {
+                                theme::pill(ui, "recommended", Color32::from_rgb(0x7d, 0xd3, 0x8f)).on_hover_text(
+                                    "the best fit for the selected scene: it knows every element here and can run on it",
+                                );
+                            }
                         });
-                        let mut lines = Vec::new();
-                        if let Some(s) = &species {
-                            lines.push(s.clone());
+                        // the scene's elements: green = taught, red = never seen (those steps go to DFT)
+                        if let Some(sp) = species {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &(z, taught) in &sp.scene {
+                                    let sym = units::elements::symbol(z);
+                                    let (bg, ink, tip) = if taught {
+                                        (Color32::from_rgb(0x1f, 0x3d, 0x2a), Color32::from_rgb(0x9b, 0xe8, 0xae), format!("{sym}: taught"))
+                                    } else {
+                                        (Color32::from_rgb(0x45, 0x1d, 0x22), theme::DANGER_INK, format!("{sym}: never seen; its steps go to DFT"))
+                                    };
+                                    egui::Frame::new()
+                                        .fill(bg)
+                                        .corner_radius(4)
+                                        .inner_margin(egui::Margin::symmetric(6, 1))
+                                        .show(ui, |ui| ui.label(RichText::new(sym).size(12.5).strong().color(ink)))
+                                        .response
+                                        .on_hover_text(tip);
+                                }
+                                if !sp.covers() {
+                                    ui.label(RichText::new("partly: the red ones fall back to DFT").size(12.0).color(theme::INK_FAINT));
+                                }
+                            });
                         }
+                        let mut lines = Vec::new();
                         if !detail.is_empty() {
                             lines.push(detail);
                         }
@@ -589,11 +635,22 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 if ui.put(at, button.sense(if can { Sense::click() } else { Sense::hover() })).on_hover_text(hover).clicked() && can {
                     load = Some(m.path.clone());
                 }
+                // the model's settings without the model (to train one of your own at them)
+                if matches!(f, Fit::Settings(_)) && estimated && !input.sampling() {
+                    let at2 = at.translate(Vec2::new(-(LOAD_W + 8.0), 0.0));
+                    let b2 = egui::Button::new(RichText::new("Use its settings").size(13.0)).corner_radius(8);
+                    if ui.put(at2, b2).on_hover_text("switch the scene to this model's settings (grid, σ, charge, multiplicity, ionic potential) without loading the model").clicked() {
+                        settings_only = Some(m.path.clone());
+                    }
+                }
                 if busy {
                     let spin = egui::Rect::from_center_size(egui::pos2(at.left() + 22.0, at.center().y), Vec2::splat(16.0));
                     ui.put(spin, egui::Spinner::new().size(16.0).color(Color32::WHITE));
                 }
             });
+        }
+        if let Some(p) = settings_only {
+            acts.push(Action::ApplyModelSettingsOnly(p));
         }
         if let Some(p) = load {
             st.files.loading = model_sig(input).map_or(Some((p.clone(), (usize::MAX, u64::MAX), std::time::Instant::now())), |sig| Some((p.clone(), sig, std::time::Instant::now())));

@@ -85,6 +85,9 @@ pub enum Action {
     /// `SetMultiplicity`, `SetIonicPolicy`, `SetIsotope`) that make the scene match the model's provenance, then
     /// `DynCommand::LoadModel`. Refused (an error, nothing sent) when a setting cannot be applied.
     ApplyModelSettings,
+    /// The File window's "Use its settings": the model file's settings applied to the scene (as
+    /// the card's Apply does), the model itself not loaded.
+    ApplyModelSettingsOnly(std::path::PathBuf),
     /// The offer card's "Cancel": closes it; nothing is sent, nothing changes.
     CancelModelOffer,
     /// "Forget model": the first click arms, a second within 4 s forgets.
@@ -371,28 +374,26 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                         st.model_offer = Some(offer);
                         return;
                     }
-                    for e in &offer.edits {
-                        use super::model_offer::Edit;
-                        match e {
-                            Edit::Grid { n, h } => {
-                                // as Apply grid: the new box is the one later quality changes keep
-                                (st.grid_n, st.grid_h) = (*n, *h);
-                                st.box_len = (*n as f64 - 1.0) * *h;
-                                out.commands.push(Command::SetGrid { n: *n, h: *h });
-                            }
-                            Edit::Sigma(x) => out.commands.push(Command::SetSigma(*x)),
-                            Edit::Charge(c) => out.commands.push(Command::SetCharge(*c)),
-                            Edit::Multiplicity(m) => out.commands.push(Command::SetMultiplicity(*m)),
-                            Edit::Ionic(p) => {
-                                st.ionic = *p;
-                                out.commands.push(Command::SetIonicPolicy(*p));
-                            }
-                            Edit::Isotope { index, a } => out.commands.push(dyn_(DynCommand::SetIsotope { index: *index, a: *a })),
-                        }
-                    }
+                    apply_edits(st, &offer, out);
                     st.set_status(format!("applied the settings of {} and loading it", offer.path.display()));
                     out.commands.push(dyn_(DynCommand::LoadModel(offer.path)));
                 }
+            }
+        }
+        Action::ApplyModelSettingsOnly(path) => {
+            if input.sampling() {
+                out.error = Some("a sampling pass is running: cancel it first".into());
+                return;
+            }
+            match model_offer_for(st, input, &path) {
+                None => st.set_status(format!("the scene already has the settings of {}", path.display())),
+                Some(offer) => match offer.blocked() {
+                    Some(why) => out.error = Some(format!("the model's settings cannot be applied: {why}")),
+                    None => {
+                        apply_edits(st, &offer, out);
+                        st.set_status(format!("applied the settings of {} (the model is not loaded)", path.display()));
+                    }
+                },
             }
         }
         Action::Forget => {
@@ -624,7 +625,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
         })
     }
 
@@ -985,4 +986,27 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
 /// backend's solver count and the budget): refused before the worker allocates anything.
 fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
     crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
+}
+
+/// The settings edits of a model offer (`model_offer::Edit`), sent as the ordinary commands.
+fn apply_edits(st: &mut UiState, offer: &super::model_offer::ModelOffer, out: &mut PanelOutput) {
+        for e in &offer.edits {
+            use super::model_offer::Edit;
+            match e {
+                Edit::Grid { n, h } => {
+                    // as Apply grid: the new box is the one later quality changes keep
+                    (st.grid_n, st.grid_h) = (*n, *h);
+                    st.box_len = (*n as f64 - 1.0) * *h;
+                    out.commands.push(Command::SetGrid { n: *n, h: *h });
+                }
+                Edit::Sigma(x) => out.commands.push(Command::SetSigma(*x)),
+                Edit::Charge(c) => out.commands.push(Command::SetCharge(*c)),
+                Edit::Multiplicity(m) => out.commands.push(Command::SetMultiplicity(*m)),
+                Edit::Ionic(p) => {
+                    st.ionic = *p;
+                    out.commands.push(Command::SetIonicPolicy(*p));
+                }
+                Edit::Isotope { index, a } => out.commands.push(Command::Dyn(DynCommand::SetIsotope { index: *index, a: *a })),
+            }
+        }
 }
