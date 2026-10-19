@@ -132,6 +132,9 @@ pub enum Action {
     /// Relax the geometry (FIRE, M6 spec §6): `DynCommand::Relax` — refused while a sampling pass
     /// runs (the driver refuses it too).
     Relax,
+    /// The estimated view's "Bonds now" (`DynCommand::RefreshBonds`): a teacher solve between
+    /// steps for the bond graph, and the bonds, lengths and angles shown.
+    RefreshBonds,
     /// End the relax now: `DynCommand::StopRelax`.
     StopRelax,
     /// View ▸ Density ▸ smooth motion: draw the nuclei between the last two snapshots (display
@@ -454,6 +457,12 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::ShowBadge(on) => st.show_badge = on,
         Action::ShowAngles(on) => st.show_angles = on,
         Action::NameStyle(s) => st.name_style = s,
+        Action::RefreshBonds => {
+            out.commands.push(dyn_(DynCommand::RefreshBonds));
+            (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+            st.bonds_refresh = Some(Instant::now());
+            st.set_status("solving the density once for the bonds and angles");
+        }
         Action::Relax => {
             if input.sampling() {
                 st.set_status(super::RELAX_REFUSED_SAMPLING);
@@ -606,6 +615,7 @@ impl Action {
             ShowAngles(b) => format!("angles {b}"),
             NameStyle(s) => format!("names {}", style_word(*s)),
             Relax => "relax".into(),
+            RefreshBonds => "refresh-bonds".into(),
             StopRelax => "stop-relax".into(),
             SmoothMotion(b) => format!("smooth-motion {b}"),
             Show(m) => format!("show {}", m.word()),
@@ -662,6 +672,7 @@ impl Action {
                     "forget" => Forget,
                     "cancel-sampling" => CancelSampling,
                     "relax" => Relax,
+                    "refresh-bonds" => RefreshBonds,
                     "orbital-include-reset" => IncludeAllOccupied,
                     _ => StopRelax,
                 }

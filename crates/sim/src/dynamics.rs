@@ -593,6 +593,12 @@ impl Walls {
 /// commands should abort a running step: module doc, "What should abort a running step".
 #[derive(Clone, Debug)]
 pub enum DynCommand {
+    /// The bond graph now (user request 2026-10-19, the estimated view's "Bonds now"): at the
+    /// next tick, between steps, one teacher solve at the current positions (`force_teacher_next`
+    /// + `refresh_density`: its density and graph only — the forces and energy are kept, so
+    /// nothing unbooked enters E_conserved; the answer is kept as a sample like any teacher
+    /// solve); a run carries on after it. Never aborts a solve.
+    RefreshBonds,
     Play,
     Pause,
     /// Pause and queue n steps.
@@ -1044,6 +1050,8 @@ pub struct Dynamics {
     /// The last reference landed while the stepping provider held no density at fresh forces:
     /// re-solve it at the current positions (`refresh_density`).
     density_refresh: bool,
+    /// `RefreshBonds` asked for a graph at the current positions (done at the next tick).
+    bonds_requested: bool,
     /// The references' solver as (its SCF tolerance, its name) — the key's provenance — read
     /// once from the provider (`reference_solver`).
     ref_solver: (Option<f64>, &'static str),
@@ -1132,6 +1140,7 @@ impl Dynamics {
             ref_job: None,
             ref_failed: Vec::new(),
             density_refresh: false,
+            bonds_requested: false,
             ref_solver: (None, ""),
             bonds: None,
             bonds_stale: false,
@@ -1176,6 +1185,7 @@ impl Dynamics {
             }
             DynCommand::Relax => self.start_relax(),
             DynCommand::StopRelax => self.finish_relax(None, &mut || false),
+            DynCommand::RefreshBonds => self.bonds_requested = true,
             DynCommand::Step(n) => {
                 self.paused = true;
                 self.pending_steps = self.pending_steps.saturating_add(n);
@@ -2582,6 +2592,15 @@ impl Dynamics {
         if self.density_refresh && self.paused && self.pending_steps == 0 && self.fire.is_none() {
             self.refresh_density(should_abort);
         }
+        // "Bonds now": one teacher solve between steps (the surrogate answers without a density)
+        if self.bonds_requested && self.forces.is_some() && self.fire.is_none() && !self.pass_active() {
+            if let Some(t) = self.provider.as_trainable() {
+                t.force_teacher_next();
+            }
+            if self.refresh_density(should_abort) {
+                self.bonds_requested = false;
+            }
+        }
         if self.ref_job.is_none() && !self.pass_active() {
             if let Some(&z) = self.ref_queue.front() {
                 self.start_reference(z);
@@ -2595,10 +2614,11 @@ impl Dynamics {
     /// replacing them would put an unbooked jump into E_conserved) — only its density, display
     /// and the graph. Abandoned by a command like any solve and tried again at the next tick
     /// (after the command); dropped when the forces go stale (that re-evaluation reads it).
-    fn refresh_density(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+    /// False when the solve was abandoned (tried again at the next tick).
+    fn refresh_density(&mut self, should_abort: &mut dyn FnMut() -> bool) -> bool {
         if self.forces.is_none() || should_abort() {
             self.density_refresh = self.forces.is_some();
-            return;
+            return self.forces.is_none();
         }
         let r = self.provider.evaluate(&self.scene, should_abort);
         Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
@@ -2611,11 +2631,13 @@ impl Dynamics {
                 }
                 self.seq += 1;
                 self.refresh_bonds();
+                true
             }
-            Err(ProviderError::Cancelled) => {}
+            Err(ProviderError::Cancelled) => false,
             Err(e) => {
                 self.density_refresh = false;
                 self.note(format!("the density for the bond graph could not be re-solved ({e}): the graph waits for the next evaluation"));
+                true
             }
         }
     }

@@ -20,6 +20,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
         return;
     }
     let chip = status_chip(ctx, view, st, input);
+    bonds_now(ctx, view, st, input, acts);
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
@@ -402,7 +403,9 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
     let (pivot, at) = if refused {
         (Align2::CENTER_BOTTOM, pos2(view.center().x, bottom))
     } else {
-        (Align2::RIGHT_BOTTOM, view.max - Vec2::splat(14.0))
+        // above the estimated view's "Bonds now" button
+        let lift = if st.backend == crate::sim::Backend::Estimated { 52.0 } else { 0.0 };
+        (Align2::RIGHT_BOTTOM, view.max - Vec2::new(14.0, 14.0 + lift))
     };
     egui::Area::new(Id::new("toast"))
         .pivot(pivot)
@@ -564,4 +567,45 @@ fn gizmo(ui: &mut egui::Ui, input: &PanelInput<'_>) {
         p.text(c + Vec2::new(v.x, -v.y) * 19.0, Align2::CENTER_CENTER, l, egui::FontId::monospace(8.5), col);
     }
     r.on_hover_text("the world axes as the camera sees them: x red, y green (up), z blue (View › Display aids › axes)");
+}
+
+/// The estimated view's "Bonds now" (bottom right; user request 2026-10-19): the surrogate's steps
+/// carry no density, so the bonds and angles are an earlier DFT step's; this asks for one teacher
+/// solve between steps (`Action::RefreshBonds`) and shows the bonds, lengths and angles. It spins
+/// until the graph is fresh (at most 20 s).
+fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    if st.backend != crate::sim::Backend::Estimated {
+        return;
+    }
+    let Some(s) = input.snapshot else { return };
+    if s.scene.nuclei.len() < 2 {
+        return;
+    }
+    let stale = s.dynamics.bonds_stale || s.dynamics.bonds.is_none();
+    let busy = st.bonds_refresh.is_some_and(|t| t.elapsed().as_secs_f64() < 20.0) && (stale || st.bonds_refresh.is_some_and(|t| t.elapsed().as_secs_f64() < 0.6));
+    if !busy {
+        st.bonds_refresh = None;
+    }
+    egui::Area::new(Id::new("bonds-now"))
+        .pivot(Align2::RIGHT_BOTTOM)
+        .fixed_pos(view.max - Vec2::splat(14.0))
+        .order(Order::Middle)
+        .show(ctx, |ui| {
+            let word = if busy { "      Solving…" } else if stale { "Bonds & angles now" } else { "Bonds & angles: current" };
+            let b = egui::Button::new(egui::RichText::new(word).strong().size(14.0).color(egui::Color32::WHITE))
+                .fill(if busy || stale { theme::GLOW } else { theme::PANEL_3 })
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                .corner_radius(8)
+                .min_size(Vec2::new(200.0, 36.0));
+            let r = ui.add_enabled(!busy && !input.sampling(), b).on_hover_text(
+                "the model's steps carry no density, so the bonds and angles shown are from the last DFT step: this solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
+            );
+            if busy {
+                let spin = egui::Rect::from_center_size(egui::pos2(r.rect.left() + 22.0, r.rect.center().y), Vec2::splat(16.0));
+                ui.put(spin, egui::Spinner::new().size(16.0).color(egui::Color32::WHITE));
+            }
+            if r.clicked() {
+                acts.push(Action::RefreshBonds);
+            }
+        });
 }
