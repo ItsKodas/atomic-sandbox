@@ -90,20 +90,18 @@ fn sdf(p: vec3<f32>, span: vec2<u32>) -> f32 {
     return d;
 }
 
-// the first point of the union surface along the ray near this atom (w = 0: none here) — traced
-// from where the ray enters this atom's reach; already inside the union there means the surface
-// is nearer, in another atom's quad
+// the first point of the union surface along the ray (w = 0: none before this atom's far side).
+// Every quad traces from the eye with the same steps, so all of them find bitwise the same point:
+// a quad-dependent start put neighbouring quads' hits a hair apart and the depth test flickered
+// between them in rings (user 2026-10-20)
 fn union_hit(r: Ray, centre: vec3<f32>, radius: f32, span: vec2<u32>) -> vec4<f32> {
-    let along = dot(centre - r.o, r.d);
-    let reach = radius * REACH + look.w;
-    var t = max(along - reach, 0.0);
-    let t_end = along + reach;
-    if (sdf(r.o + r.d * t, span) < 0.0) { return vec4(0.0); }
-    for (var s = 0; s < 64; s = s + 1) {
+    let t_end = dot(centre - r.o, r.d) + radius * REACH + look.w;
+    var t = 0.0;
+    for (var s = 0; s < 160; s = s + 1) {
         let p = r.o + r.d * t;
         let d = sdf(p, span);
-        if (d < 1e-3) { return vec4(p, 1.0); }
-        t = t + max(d, 1e-3);
+        if (d < 1e-4 * (1.0 + t)) { return vec4(p, 1.0); }
+        t = t + d;
         if (t > t_end) { break; }
     }
     return vec4(0.0);
