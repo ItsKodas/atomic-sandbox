@@ -749,6 +749,8 @@ impl Viewer {
     /// snapshot mirror `self.scene`, never the interpolated `shown_scene` (S5: display only).
     pub fn input(&mut self, e: &replay::Event, consumed: bool) {
         use replay::{Button, Event, KeyName};
+        // the molecule builder's window has the mouse and the keys (Space, Delete, Esc are its own)
+        let consumed = consumed || self.ui.builder.open;
         let vp = self.viewport;
         // the Edit tool's group is its own: another tool selects one nucleus
         if self.ui.mode != ui::ToolMode::Edit {
@@ -2036,7 +2038,7 @@ impl Viewer {
     /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
     fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
         // nor over the File window (they are drawn on the foreground layer)
-        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open || self.ui.loading.is_some() {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open || self.ui.builder.open || self.ui.loading.is_some() {
             return;
         }
         let ppp = root.pixels_per_point();
@@ -2226,7 +2228,7 @@ impl Viewer {
             outs.push(out);
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             // the guides, not over the File window (they share its foreground layer)
-            let guide_vp = if self.ui.files.open { Viewport { size: [0.0, 0.0], ..viewport } } else { viewport };
+            let guide_vp = if self.ui.files.open || self.ui.builder.open { Viewport { size: [0.0, 0.0], ..viewport } } else { viewport };
             Self::distance_overlay(
                 root,
                 &self.camera,

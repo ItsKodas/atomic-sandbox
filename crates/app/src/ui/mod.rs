@@ -520,6 +520,8 @@ pub struct UiState {
     pub nucleus_scale: Option<f32>,
     /// The File window (`files`): the scenes and models folders.
     pub files: files::Browser,
+    /// The molecule builder's window and drawing (File ▸ Builder…, `crate::builder`; display state, kept while closed).
+    pub builder: crate::builder::Builder,
     pub scene_path: String,
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
@@ -822,6 +824,7 @@ right {}
             nucleus_scale: None,
             scene_path: "my.scene".into(),
             files: Default::default(),
+            builder: Default::default(),
             model_file: None,
             model_offer: None,
             status: String::new(),
@@ -1194,6 +1197,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
     files::show_save(root.ctx(), st, input, &mut acts);
+    crate::builder::ui::show(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
     profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
@@ -1458,6 +1462,7 @@ fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
         st.search.toggle();
     }
     if !st.search.open
+        && !st.builder.open
         && !ctx.egui_wants_keyboard_input()
         && !egui::Popup::is_any_open(ctx)
         && ctx.input(|i| i.key_pressed(egui::Key::Escape))

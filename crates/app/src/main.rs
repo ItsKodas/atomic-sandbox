@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 mod atom_card;
 mod badge;
+mod builder;
 mod cloud;
 mod frame;
 mod icon;
