@@ -261,10 +261,27 @@ impl ActivityState {
 /// training views and the timeline. Each group is marked with its search anchor.
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
+    let loading = st.loading;
     dock::group(ui, st, "d-jobs", |ui, _| {
         theme::section(ui, "Jobs");
+        // a new scene loading (its first solve): a spinner, a bar and the ETA
+        if let Some((t, eta)) = loading {
+            let el = t.elapsed().as_secs_f64();
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(egui::RichText::new("Loading the new scene").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let left = eta - el;
+                    let words = if left > 0.5 { format!("≈ {left:.0} s left") } else { "almost done".into() };
+                    ui.label(egui::RichText::new(words).size(11.5).color(theme::INK_DIM));
+                });
+            });
+            ui.add(egui::ProgressBar::new((el / eta.max(0.1)).min(0.97) as f32).desired_height(5.0).fill(theme::ACCENT));
+            theme::note(ui, "its first solve: the electrons, then the bonds and labels");
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let rows = jobs::rows(input, input.probe.as_ref());
-        if rows.is_empty() {
+        if rows.is_empty() && loading.is_none() {
             theme::note(ui, "nothing running");
         } else {
             jobs::show(ui, &rows, acts);

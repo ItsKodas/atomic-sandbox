@@ -452,6 +452,7 @@ impl Viewer {
     /// pseudo-He are generated with a 3-D dimer check, ≈ 1 min on the GPU) runs on it — whichever solver backend is
     /// chosen; without one it is the CPU fallback (≈ 40 min per element, said by `ui::pseudo::IONIC_TIP`).
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
+        self.begin_loading(self.scene.grid_n);
         if let Some(ctx) = &gpu {
             providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
         }
@@ -598,6 +599,16 @@ impl Viewer {
     /// commands invalidate the selection.
     pub fn send(&mut self, cmd: Command) {
         self.trails.on_command(&cmd);
+        // a new scene to solve: the old picture hides until its first solve lands
+        let new_n = match &cmd {
+            Command::SetScene(s) => Some(s.grid_n),
+            Command::SetGrid { n, .. } => Some(*n),
+            Command::SetIonicPolicy(_) => Some(self.scene.grid_n),
+            _ => None,
+        };
+        if let Some(n) = new_n {
+            self.begin_loading(n);
+        }
         if matches!(cmd, Command::SetScene(_) | Command::RemoveNucleus(_)) {
             self.tool = ToolState::default();
             self.drag_target = None;
@@ -881,6 +892,25 @@ impl Viewer {
             DynCommand::Play
         };
         self.send(Command::Dyn(c));
+    }
+
+    /// A new scene is loading: its ETA from the last solve's time scaled by the grid's points (n³).
+    fn begin_loading(&mut self, n: usize) {
+        if self.scene.nuclei.is_empty() && n == self.scene.grid_n {
+            return;
+        }
+        let eta = self.ui.last_solve.map_or(2.0, |(n0, t0)| t0 * (n as f64 / n0.max(1) as f64).powi(3)) + 0.3;
+        self.ui.loading = Some((Instant::now(), eta));
+    }
+
+    /// The loading ends with the first solve of the new scene (the snapshot has seen every edit and
+    /// its forces are fresh), or after two minutes.
+    fn finish_loading(&mut self) {
+        let Some((t, _)) = self.ui.loading else { return };
+        let done = self.snapshot.as_ref().is_some_and(|s| s.edits == self.edits_sent && !s.dynamics.forces_stale);
+        if done || t.elapsed().as_secs() > 120 {
+            self.ui.loading = None;
+        }
     }
 
     /// The floating dots are on screen (Dots mode, floating on, the cloud shown): the window keeps
@@ -1630,7 +1660,7 @@ impl Viewer {
         if self.ui.show_trails {
             lines.extend(self.trails.lines(&shown.nuclei, self.ui.trail_fs, self.ui.trail_opacity));
         }
-        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
+        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds && self.ui.loading.is_none()) {
             if let Some(g) = &d.bonds {
                 let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
                 lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
@@ -1782,7 +1812,7 @@ impl Viewer {
     /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
     fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
         // nor over the File window (they are drawn on the foreground layer)
-        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open || self.ui.loading.is_some() {
             return;
         }
         let ppp = root.pixels_per_point();
@@ -1912,6 +1942,7 @@ impl Viewer {
         let measured_fs_per_s = self.measured_fs_per_s();
         self.auto_audit(measured_fs_per_s);
         self.guard_estimated();
+        self.finish_loading();
         let shown = self.shown_scene(Instant::now());
         self.follow_selected(&shown);
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);

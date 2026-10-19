@@ -468,6 +468,10 @@ pub struct UiState {
     pub box_len: f64,
     /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
     pub last_solve: Option<(usize, f64)>,
+    /// A new scene is loading (a scene or preset, a grid or ionic change, a solver switch; user
+    /// request 2026-10-19): since when, and the estimated seconds. The old cloud, dots, labels and
+    /// bonds hide until its first solve lands; the Activity tab shows the job.
+    pub loading: Option<(Instant, f64)>,
     /// [`VOLUME_VOLUME`], [`VOLUME_ISO`] or [`VOLUME_DOTS`].
     pub volume_mode: u32,
     pub gamma: f32,
@@ -825,6 +829,7 @@ right {}
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
+            loading: None,
             dots_float: true,
             dots_drift: 0.35,
             dots_glow: true,

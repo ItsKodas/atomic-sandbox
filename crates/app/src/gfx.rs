@@ -613,7 +613,8 @@ impl Painter {
             let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
             wgpu::Color { r: lin(c[0]), g: lin(c[1]), b: lin(c[2]), a: 1.0 }
         });
-        self.renderer.draw_cloud = !ui.hide_cloud;
+        // nothing of the old scene's electrons while a new one loads
+        self.renderer.draw_cloud = !ui.hide_cloud && ui.loading.is_none();
         self.nucleus_scale = nucleus_scale(ui, drawn == Drawn::Orbital);
         let dots = ui.volume_mode == VOLUME_DOTS;
         let scalar_mode = |dots: bool| if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_ISO } else { MODE_VOLUME };
