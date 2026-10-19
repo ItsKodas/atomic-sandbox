@@ -369,6 +369,11 @@ pub struct Sampler {
     /// The pass's shell checks (module doc, 3.), and the cutoff they were planned at.
     shell_checks: Vec<ShellCheck>,
     r_cut: f64,
+    /// The species whose reference scan converged nothing, and how it failed (the pass ended
+    /// there; `take_failed_reference`).
+    failed_reference: Option<(u8, String)>,
+    /// A references-only pass (`references_only`).
+    references_only: bool,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -546,6 +551,8 @@ impl Sampler {
             holdouts: Vec::new(),
             shell_checks: Vec::new(),
             r_cut,
+            failed_reference: None,
+            references_only: false,
         })
     }
 
@@ -590,7 +597,51 @@ impl Sampler {
             holdouts: Vec::new(),
             shell_checks: Vec::new(),
             r_cut: Basis::new(&[]).r_cut,
+            failed_reference: None,
+            references_only: false,
         }
+    }
+
+    /// A **references-only** pass (the Model tab's Retry, `SurrogateKs::retry_fit`): the
+    /// multiplicity scan of each species in `species` (sorted, deduplicated) on `scene`'s cell, σ
+    /// and ionic policy — the same jobs as a regular pass's step 1, and nothing else: no
+    /// perturbations, scans or burst. Species found in the cache cost no solve. A species without
+    /// a nucleus in `scene` is scanned at its most abundant isotope (an isolated atom's energy does
+    /// not depend on its mass). Err for an empty list.
+    pub fn references_only(scene: &Scene, species: &[u8]) -> Result<Sampler, String> {
+        let mut species = species.to_vec();
+        species.sort_unstable();
+        species.dedup();
+        if species.is_empty() {
+            return Err("no reference to solve".into());
+        }
+        let mut sampler = Sampler::targeted(scene, Vec::new());
+        let base = sampler.scene.clone();
+        for &z in &species {
+            let (a, mass) = base.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).unwrap_or_else(|| {
+                let a = units::most_abundant_a(z).unwrap_or(0);
+                (a, sim::Nucleus::new(z, [0.0; 3]).mass)
+            });
+            sampler.queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, base.ionic, z, a, mass)));
+        }
+        sampler.refs_total = Self::jobs_in(&sampler.queue);
+        sampler.progress.total = sampler.refs_total;
+        sampler.progress.finished = false;
+        sampler.progress.stage = "references";
+        sampler.progress.target = None;
+        sampler.references_only = true;
+        Ok(sampler)
+    }
+
+    /// The species whose reference scan converged nothing in this pass, with how it failed (the
+    /// pass ended there); drained.
+    pub fn take_failed_reference(&mut self) -> Option<(u8, String)> {
+        self.failed_reference.take()
+    }
+
+    /// A references-only pass (`references_only`).
+    pub fn is_references_only(&self) -> bool {
+        self.references_only
     }
 
     /// A teach-around pass (`targeted`).
@@ -974,8 +1025,10 @@ impl Sampler {
                     // the time includes the scan's density binning after the solve (small, but
                     // not pure teacher time); `AtomScan::step` reports no SCF steps (None)
                     let started = Instant::now();
+                    let retry = scan.retrying();
                     let outcome = scan.step(t, should_abort);
                     let solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                    let again = if retry { " (retry, cold)" } else { "" };
                     if let Err(ProviderError::Cancelled) = outcome {
                         self.queue.push_front(Job::Reference(scan));
                         return Err(ProviderError::Cancelled);
@@ -993,7 +1046,7 @@ impl Sampler {
                             // from `remaining()` above — and would be no solve: no event (review M6)
                             if let Some((_, e)) = solved {
                                 let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Reference);
-                                ev.detail = format!("sampling: reference {} (Z = {z}) at multiplicity {m}: E = {e:.6} Ha", symbol(z));
+                                ev.detail = format!("sampling: reference {} (Z = {z}) at multiplicity {m}{again}: E = {e:.6} Ha", symbol(z));
                                 ev.n_atoms = 1;
                                 ev.solve_ms = solve_ms;
                                 surrogate.push_event(ev);
@@ -1002,7 +1055,7 @@ impl Sampler {
                         }
                         Err(e) => {
                             self.progress.failed += 1;
-                            let note = format!("sampling: reference {} (Z = {z}) at multiplicity {m} failed ({e}) — left out of the scan", symbol(z));
+                            let note = format!("sampling: reference {} (Z = {z}) at multiplicity {m}{again} failed ({e}) — left out of the scan", symbol(z));
                             let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Failed);
                             ev.detail = note.clone();
                             ev.n_atoms = 1;
@@ -1013,14 +1066,30 @@ impl Sampler {
                             Some(e)
                         }
                     };
+                    if !retry && scan.retrying() {
+                        // nothing converged: the scan's retry round (`sim::references`, "The retry round")
+                        let again = scan.remaining().to_vec();
+                        self.progress.total += again.len();
+                        self.refs_total += again.len();
+                        let ms: Vec<String> = again.iter().map(u32::to_string).collect();
+                        self.notes.push(format!(
+                            "sampling: no multiplicity of {} (Z = {z}) converged — multiplicit{} {} solved once more, cold, before giving up",
+                            symbol(z),
+                            if again.len() == 1 { "y" } else { "ies" },
+                            ms.join(", ")
+                        ));
+                    }
                     if !scan.is_done() {
                         self.queue.push_front(Job::Reference(scan));
                         return Ok(Some(self.progress()));
                     }
                     // the scan is complete: the lowest energy wins (ruling S9)
                     let tried: Vec<(u32, f64)> = scan.tried().collect();
+                    let attempts = scan.attempts();
                     let Some(r) = scan.finish(prov.tol, &prov.teacher) else {
-                        self.notes.push(format!("sampling: no multiplicity of {} (Z = {z}) could be solved — the pass ends (no fit without a reference)", symbol(z)));
+                        let why = failure.as_ref().map_or_else(String::new, |e| format!(": {e}"));
+                        self.notes.push(format!("sampling: no multiplicity of {} (Z = {z}) could be solved in {attempts} attempts — the pass ends (no fit without a reference)", symbol(z)));
+                        self.failed_reference = Some((z, format!("{attempts} cold attempts{why}")));
                         self.finish();
                         return Err(failure.expect("no success means the last solve failed"));
                     };

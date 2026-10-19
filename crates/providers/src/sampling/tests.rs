@@ -28,12 +28,15 @@ struct PairMorse {
     /// than `x_max` off-centre along any axis is reported with face density `rho` and its energy
     /// raised by `bias` (the box's confinement); every other one with a face density of 1e-7.
     confine: Option<(f64, f64, f64)>,
+    /// Lone-atom solves that fail with an SCF stall before one succeeds (the 2026-10-20 PH₃ case:
+    /// an isolated atom whose reference does not solve); `usize::MAX` never succeeds.
+    atom_failures: usize,
 }
 
 impl PairMorse {
     fn h2() -> PairMorse {
         let m = MorseDimer::h2();
-        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None }
+        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None, atom_failures: 0 }
     }
 
     /// Whether the scripted box confines this geometry.
@@ -72,6 +75,10 @@ impl ForceProvider for PairMorse {
         }
         self.seen.push(scene.clone());
         self.solves.fetch_add(1, Ordering::SeqCst);
+        if scene.nuclei.len() == 1 && self.atom_failures > 0 {
+            self.atom_failures -= 1;
+            return Err(ProviderError::Solver(sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }));
+        }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let (mut energy, forces) = self.energy_forces(&pos);
         if let ([n], Some(m)) = (scene.nuclei.as_slice(), scene.multiplicity) {
@@ -532,8 +539,11 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     let (p, sh_d) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
     let path = tmp("h2.model");
+    // nothing fitted yet: the construction's rule-1 answer is kept as a sample, and a save keeps it
+    // (a samples-only file since 2026-10-20 — before, an unfitted state could not be saved)
     d.apply(DynCommand::SaveModel(path.clone()));
-    assert!(d.snapshot().last_rejection.expect("nothing fitted yet").contains("no fitted model"));
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert_eq!(&std::fs::read(&path).unwrap()[..8], surrogate::sidecar::MAGIC_V6);
     d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
     while !d.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
     d.apply(DynCommand::SaveModel(path.clone()));
@@ -612,6 +622,114 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     assert!(surrogate_of(&sh_d3).model().is_none());
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(bad);
+}
+
+/// The 2026-10-20 PH₃ data loss, on the analytic teacher: a pass whose isolated-atom reference
+/// never solves ends with its first-round failure, its retry round (each attempt an Activity
+/// event), no model and the reason in plain words. The samples taught without a model (live DFT
+/// steps) are saved as a samples-only file and loaded back unfitted; the Retry then re-solves the
+/// reference (references-only pass) and the model forms — and a file that already knew every
+/// reference fits at load.
+#[test]
+fn an_unfitted_sample_set_survives_save_load_and_the_retry_fits_it() {
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    h.lock().unwrap().atom_failures = usize::MAX;
+    let scene = pair(1, 1, 1.45, cell(41));
+    let (p, sh) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
+    // the pass: H's one multiplicity fails, is retried once cold, fails again — the pass ends
+    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
+    for _ in 0..10 {
+        if d.tick(f64::INFINITY, &mut never()).sampling.is_none_or(|p| p.finished) {
+            break;
+        }
+    }
+    let lone: Vec<u32> = h.lock().unwrap().seen.iter().filter(|s| s.nuclei.len() == 1).map(|s| s.multiplicity.unwrap()).collect();
+    assert_eq!(lone, vec![2, 2], "the H scan (multiplicity 2) and its one cold retry");
+    {
+        let mut s = surrogate_of(&sh);
+        assert!(s.model().is_none());
+        let events = Trainable::take_teach_events(&mut *s);
+        let refs: Vec<&TeachEvent> = events.iter().filter(|e| matches!(e.rule, TeachRule::Pass(PassJob::Reference { .. }))).collect();
+        assert_eq!(refs.len(), 2, "both attempts are Activity events");
+        assert!(refs.iter().all(|e| e.outcome == TeachOutcome::Failed));
+        assert!(!refs[0].detail.contains("retry") && refs[1].detail.contains("(retry, cold)"), "{:?}", refs.iter().map(|e| &e.detail).collect::<Vec<_>>());
+    }
+    // play: rule 1 keeps the DFT answers as samples (no model to answer)
+    d.apply(DynCommand::Play);
+    for _ in 0..40 {
+        d.tick(f64::INFINITY, &mut never());
+    }
+    d.apply(DynCommand::Pause);
+    let n = surrogate_of(&sh).samples();
+    assert!(n >= 30, "{n} samples kept without a model");
+    let status = surrogate_of(&sh).status(&scene, &[[0.0; 3]; 2]);
+    let words = status.no_model.clone().expect("no model: the reason is given");
+    println!("{words}");
+    assert!(words.contains("the H atom reference did not solve") && words.contains("2 cold attempts") && words.contains("SCF stalled"), "{words}");
+    assert!(status.retry_fit && !status.fitted);
+
+    // Save works without a fit: a samples-only file; it loads back unfitted, with the same reason
+    let path = tmp("unfitted.model");
+    d.apply(DynCommand::SaveModel(path.clone()));
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert!(d.snapshot().notes.iter().any(|m| m.contains("no model yet")), "{:?}", d.snapshot().notes);
+    let teacher2 = Shared::new(PairMorse::h2());
+    let h2 = teacher2.handle();
+    let (p2, sh2) = driven(surrogate_over(&teacher2));
+    let mut d2 = Dynamics::new(scene.clone(), p2, 0.25, 1);
+    d2.apply(DynCommand::LoadModel(path.clone()));
+    assert_eq!(d2.snapshot().last_rejection, None, "{:?}", d2.snapshot().notes);
+    {
+        let s = surrogate_of(&sh2);
+        assert_eq!(s.samples(), n, "every sample came back");
+        assert!(s.model().is_none() && s.reference_energy(1).is_none());
+        let w = s.status(&scene, &[[0.0; 3]; 2]).no_model.unwrap();
+        assert!(w.contains("the H atom reference is not solved yet"), "{w}");
+    }
+    // another grid refuses the file
+    let (p3, sh3) = driven(surrogate_over(&Shared::new(PairMorse::h2())));
+    let mut d3 = Dynamics::new(pair(1, 1, 1.45, cell(49)), p3, 0.25, 1);
+    d3.apply(DynCommand::LoadModel(path.clone()));
+    assert!(d3.snapshot().last_rejection.expect("another surface").contains("refused"));
+    assert!(surrogate_of(&sh3).samples() <= 1);
+
+    // the Retry: a references-only pass (just the atom: one solve), then the fit
+    let before = h2.lock().unwrap().seen.len();
+    d2.apply(DynCommand::RetryFit);
+    assert_eq!(d2.snapshot().last_rejection, None, "{:?}", d2.snapshot().notes);
+    for _ in 0..10 {
+        if d2.tick(f64::INFINITY, &mut never()).sampling.is_none_or(|p| p.finished) {
+            break;
+        }
+    }
+    let solved: Vec<usize> = h2.lock().unwrap().seen[before..].iter().map(|s| s.nuclei.len()).collect();
+    assert_eq!(&solved[..1], &[1], "the retry solved the lone atom first");
+    {
+        let s = surrogate_of(&sh2);
+        assert!(s.model().is_some(), "the retry fitted the model");
+        assert_eq!(s.reference_energy(1), Some(MorseDimer::h2().e_atom));
+        assert!(s.status(&scene, &[[0.0; 3]; 2]).no_model.is_none());
+    }
+    assert!(d2.snapshot().notes.iter().any(|m| m.contains("reference retry")), "{:?}", d2.snapshot().notes);
+
+    // a samples-only file that knew every reference (an untrusted-too-few save, say) fits at load
+    d2.apply(DynCommand::ForgetModel);
+    {
+        let mut s = surrogate_of(&sh2);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let prov = s.provenance_for(&scene);
+        let set = surrogate::sidecar::read_any(&path).unwrap();
+        let surrogate::sidecar::Contents::Samples(mut set) = set else { panic!("a samples-only file") };
+        set.references = vec![(1, MorseDimer::h2().e_atom)];
+        set.reference_rule = Some(surrogate::sidecar::REFERENCE_RULE.into());
+        assert_eq!(set.provenance, prov);
+        surrogate::sidecar::write_samples(&path, &set).unwrap();
+    }
+    d2.apply(DynCommand::LoadModel(path.clone()));
+    assert!(surrogate_of(&sh2).model().is_some(), "every reference known: fitted at load");
+    let _ = std::fs::remove_file(path);
 }
 
 /// Optional GPU smoke test (release; skips without an adapter): a tiny real pass on H₂ at 33³.

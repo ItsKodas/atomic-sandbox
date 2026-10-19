@@ -672,6 +672,10 @@ pub enum DynCommand {
     /// Start a teach-around pass (`Trainable::start_teach`): like `StartSampling`, a pass that
     /// pauses the dynamics until it ends. Surrogate only.
     StartTeaching,
+    /// The Retry of a model whose fit did not form (`Trainable::retry_fit`;
+    /// `TrainableStatus::no_model`): a pass that re-solves the missing isolated-atom references
+    /// (pausing the dynamics like `StartSampling`), or a refit at once. Surrogate only.
+    RetryFit,
     /// End the running pass early (no-op without one); the samples so far are refitted.
     CancelSampling,
     /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
@@ -1207,7 +1211,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Rewind if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
@@ -1428,6 +1432,7 @@ impl Dynamics {
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
             DynCommand::StartTeaching => self.start_teaching(),
+            DynCommand::RetryFit => self.retry_fit(),
             DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
@@ -1935,6 +1940,33 @@ impl Dynamics {
         self.sampling = p;
     }
 
+    /// The Retry of a model whose fit did not form (`DynCommand::RetryFit`): a references-only pass
+    /// gets `start_sampling`'s bookkeeping (paused, its progress shown); a refit at once only its
+    /// notes.
+    fn retry_fit(&mut self) {
+        let Some(t) = self.provider.as_trainable() else {
+            return self.no_surrogate("retry the fit");
+        };
+        if t.pass_active() {
+            return self.reject("retry the fit: a pass is already running (cancel it first)".into());
+        }
+        match t.retry_fit(&self.scene, &mut self.refs) {
+            Ok(true) => {
+                let p = t.progress();
+                self.paused = true;
+                self.pending_steps = 0;
+                self.take_provider_notes();
+                self.sampling = p;
+                self.refresh_ghost();
+            }
+            Ok(false) => self.take_provider_notes(),
+            Err(e) => {
+                self.take_provider_notes();
+                self.reject(format!("retry the fit: {e}"));
+            }
+        }
+    }
+
     /// Spends the tick's remaining budget on the pass (module doc).
     fn advance_sampling(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
         let mut solves = 0usize;
@@ -2014,8 +2046,9 @@ impl Dynamics {
 
     fn save_model(&mut self, path: PathBuf) {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("save model") };
-        let (n, pending) = (t.samples(), t.pending_refit());
+        let (n, pending, fitted) = (t.samples(), t.pending_refit(), t.fitted());
         match t.save(&path) {
+            Ok(()) if !fitted => self.note(format!("samples saved to {} ({n} samples, no model yet: they are fitted when the file is loaded and a fit can form)", path.display())),
             Ok(()) => self.note(format!(
                 "model saved to {} ({n} samples{})",
                 path.display(),
