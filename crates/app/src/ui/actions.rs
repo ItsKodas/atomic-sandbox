@@ -99,6 +99,9 @@ pub enum Action {
     /// "Teach around N blockers": a teach-around pass (`DynCommand::StartTeaching`; the surrogate's
     /// "Teaching around the blockers"). Recorded like Sample, not replayable (it solves).
     TeachAroundBlockers,
+    /// The Model tab's Retry when no model formed (`DynCommand::RetryFit`: re-solves a missing
+    /// isolated-atom reference, or refits). Recorded like Sample, not replayable (it solves).
+    RetryFit,
     /// The automatic first pass's "Start anyway" with the plan it offered.
     StartOffered(SamplingPlan),
     /// "Forget it and sample this scene" (after a refused autoload).
@@ -431,6 +434,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::CancelSampling => out.commands.push(dyn_(DynCommand::CancelSampling)),
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
+        Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
         Action::SampleAfterRefusal => {
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
@@ -666,7 +670,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit => return None,
         })
     }
 

@@ -2366,6 +2366,18 @@ impl SurrogateKs {
                     None => format!("the {} atom reference is not solved yet", symbol(z)),
                 })
                 .collect();
+            if fittable < q_prime {
+                // a pass solves the references first: sampling more is the remedy for both
+                return Some(NoModel {
+                    words: format!(
+                        "no model yet: {} usable samples, a fit needs Q′ = {q_prime}, and {} — sample more (a pass solves the references first; the {n} samples so far are kept)",
+                        fittable,
+                        parts.join("; ")
+                    ),
+                    retry: false,
+                    missing,
+                });
+            }
             return Some(NoModel {
                 words: format!(
                     "no model yet: {} — a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept (Save keeps them too); Retry solves the reference again (every allowed multiplicity, cold) and fits",

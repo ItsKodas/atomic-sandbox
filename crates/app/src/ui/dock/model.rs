@@ -36,6 +36,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         warnbox(ui, &super::super::box_advice(input.scene, st));
     }
     if let Some(m) = m {
+        no_model_row(ui, m, sampling, acts);
         teach_row(ui, m, sampling, acts);
     }
     if let Some(m) = m {
@@ -160,6 +161,27 @@ fn warnbox(ui: &mut Ui, text: &str) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.5).color(AMBER));
         });
+}
+
+/// Samples held but no model formed (`ModelStatus::no_model`; the 2026-10-20 PH₃ session): the
+/// reason in plain words and, when it can help, **Retry** (re-solves a missing isolated-atom
+/// reference, or refits — `Action::RetryFit`). Also in the Activity tab.
+pub fn no_model_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(why) = &m.no_model else { return };
+    warnbox(ui, why);
+    if m.retry_fit || sampling {
+        ui.horizontal_wrapped(|ui| {
+            let b = egui::Button::new(RichText::new("Retry").strong().color(Color32::from_rgb(0x1c, 0x14, 0x05))).fill(AMBER);
+            if super::super::probed("retry-fit", ui.add_enabled(!sampling && m.retry_fit, b))
+                .on_disabled_hover_text("a pass is running")
+                .on_hover_text("solve the missing isolated-atom reference again — every allowed multiplicity, each from a cold start, with one more cold attempt each if none converges — then fit the samples held (a short pass: pauses the dynamics). With every reference known it fits at once.")
+                .clicked()
+            {
+                acts.push(Action::RetryFit);
+            }
+            ui.weak("the samples are kept either way: Save model… writes them");
+        });
+    }
 }
 
 /// The running pass's progress bar and counts (also on the sampling card in the 3D view).
@@ -316,11 +338,20 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
     let m = input.model();
     let sampling = input.sampling();
     let fitted = m.is_some_and(|m| m.fitted);
+    // samples without a fit are saved too (a samples-only file): a fit that did not form must not
+    // lose the DFT taught so far
+    let savable = fitted || m.is_some_and(|m| m.samples > 0);
     let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
     ui.horizontal_wrapped(|ui| {
+        let tip = if fitted {
+            format!("choose where to write the model, its fit and its samples (last: {})", path.display())
+        } else {
+            format!("no model yet: choose where to write the samples taught so far — loading the file fits them once a fit can form (last: {})", path.display())
+        };
         if ui
-            .add_enabled(estimated && fitted, egui::Button::new("Save model…"))
-            .on_hover_text(format!("choose where to write the model, its fit and its samples (last: {})", path.display()))
+            .add_enabled(estimated && savable, egui::Button::new("Save model…"))
+            .on_disabled_hover_text("nothing to save yet: no samples")
+            .on_hover_text(tip)
             .clicked()
         {
             // the File window (`ui::files`): the models folder, with the native dialog one click away there
