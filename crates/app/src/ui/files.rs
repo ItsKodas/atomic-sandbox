@@ -359,6 +359,8 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             let cols = (((ui.available_width() - 24.0 + 12.0) / (card_outer + 12.0)).floor()
                 as usize)
                 .max(1);
+            // the cards share the row's width: no gap at the right edge
+            let card_w = ((ui.available_width() - 24.0 + 12.0) / cols as f32 - 12.0 - 20.0).max(CARD_W);
             let n = st.files.scenes.len();
             for row in (0..n).step_by(cols) {
                 ui.horizontal(|ui| {
@@ -374,13 +376,13 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                             .corner_radius(8)
                             .inner_margin(8)
                             .show(ui, |ui| {
-                                ui.set_width(CARD_W);
+                                ui.set_width(card_w);
                                 ui.vertical_centered(|ui| {
                                     let e = &st.files.scenes[i];
                                     preview(
                                         ui,
                                         e.scene.as_ref().ok(),
-                                        Vec2::new(CARD_W, CARD_W * 0.72),
+                                        Vec2::new(card_w, CARD_W * 0.72),
                                     );
                                     let mut name = RichText::new(&e.name).size(15.0);
                                     if current {
