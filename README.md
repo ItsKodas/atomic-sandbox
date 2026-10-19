@@ -255,7 +255,7 @@ Nuclear physics (decay, transmutation) is planned as a **nuclear-events layer**,
 
 ## License
 
-Copyright © 2026 Dakoda Lancelot. Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — source-available, not open source:
+Copyright © 2026 Dakoda Lancelot (ItsKodas). Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — source-available, not open source:
 
 - **Allowed:** using, copying, forking and modifying the project, and sharing your versions, for any noncommercial purpose — personal use, hobby projects, study, research, education, and use by charities, schools and public bodies.
 - **Not allowed:** any commercial use — selling it or anything built from it, or using it to make money.
