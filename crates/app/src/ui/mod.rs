@@ -135,9 +135,9 @@ pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decima
 
 /// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
 pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
-/// The auto cadence's bounds (answered steps): never more often than every 1500 steps (user request 2026-10-19; was 200), never
+/// The auto cadence's bounds (answered steps): never more often than every 2000 steps (user request 2026-10-19; was 200), never
 /// rarer than every 1 000 000.
-pub const AUTO_AUDIT_MIN: usize = 1500;
+pub const AUTO_AUDIT_MIN: usize = 2000;
 pub const AUTO_AUDIT_MAX: usize = 1_000_000;
 
 /// The auto audit cadence for a measured play speed: the steps that pass in
