@@ -12,6 +12,7 @@
 //! window's state ([`Builder`], kept in `UiState` while the window is closed: reopening shows the
 //! last drawing). The window is [`ui`].
 pub mod chem;
+pub mod embed;
 pub mod ui;
 
 use std::collections::BTreeSet;
