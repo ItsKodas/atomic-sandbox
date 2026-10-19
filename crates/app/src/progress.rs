@@ -25,8 +25,9 @@ pub const BACKSTOP: Duration = Duration::from_secs(3600);
 
 /// The solvers' counters that change whenever one of them does work: the worker's identity (a new
 /// worker has a new probe), SCF steps and finished solves of the main and side slots, and the
-/// refits. Never a clock (`SlotView::elapsed_s` grows even in a hung solve).
-pub fn probe_token(probe: &Arc<ActivityProbe>) -> [u64; 8] {
+/// refits, and the display eigensolves of unoccupied orbitals. Never a clock (`SlotView::elapsed_s`
+/// grows even in a hung solve).
+pub fn probe_token(probe: &Arc<ActivityProbe>) -> [u64; 9] {
     let v = probe.view();
     [
         Arc::as_ptr(probe) as usize as u64,
@@ -36,7 +37,8 @@ pub fn probe_token(probe: &Arc<ActivityProbe>) -> [u64; 8] {
         v.side.solves,
         v.refits,
         v.refit.is_some() as u64,
-        v.main.running as u64 | (v.side.running as u64) << 1,
+        v.main.running as u64 | (v.side.running as u64) << 1 | (v.display.is_some() as u64) << 2,
+        v.display_solves,
     ]
 }
 
@@ -103,6 +105,13 @@ mod tests {
         assert_ne!(stepped, started, "an SCF step");
         drop(busy);
         assert_ne!(probe_token(&probe), stepped, "the solve finished");
+        // a display eigensolve starting and ending is work too
+        let before = probe_token(&probe);
+        let d = probe.display_solve(4);
+        let running = probe_token(&probe);
+        assert_ne!(running, before, "a display eigensolve started");
+        d.finish(false);
+        assert_ne!(probe_token(&probe), running, "it ended");
         // another worker (a backend switch) is a change too
         assert_ne!(probe_token(&ActivityProbe::new()), idle);
     }

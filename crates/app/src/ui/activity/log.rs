@@ -2,7 +2,7 @@
 //! row per teaching solve, newest first, with the rule that asked for it in words and what became
 //! of the answer. Drawn with `show_rows`, so only the visible rows are laid out.
 use super::words::{self, RowCtx};
-use super::{ActivityState, LogFilter, LogRow};
+use super::{ActivityState, DisplayRow, LogFilter, LogRow};
 use crate::ui::logbook::clock;
 use crate::ui::{theme, AMBER, GREEN, RED};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -145,29 +145,44 @@ pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Row(usize),
+    /// A display eigensolve: an index into `display_rows`.
+    Display(usize),
     /// A new run began between the neighbouring rows: steps restart at 0.
     Divider,
 }
 
-/// The displayed items, oldest first: the rows the chips admit, with a divider before the first
-/// row of each new run (by event time; none before the first row of the session).
+/// The displayed items, oldest first: the rows the chips admit and the display eigensolves
+/// (the "orbitals" chip), merged by time, with a divider before the first row of each new run
+/// (by event time; none before the first row of the session).
 pub fn items(st: &ActivityState) -> Vec<Item> {
+    let teach = st.rows.iter().enumerate().filter(|(_, r)| admits(&st.filter, &r.event)).map(|(i, r)| (r.at, Item::Row(i)));
+    let display = st.display_rows.iter().enumerate().filter(|_| st.filter.orbitals).map(|(i, r)| (r.at, Item::Display(i)));
+    // both are oldest first: a stable sort by time keeps each one's order
+    let mut merged: Vec<(std::time::Duration, Item)> = teach.chain(display).collect();
+    merged.sort_by_key(|&(at, _)| at);
     let mut v = Vec::new();
     let mut prev: Option<std::time::Duration> = None;
-    for (i, r) in st.rows.iter().enumerate() {
-        if !admits(&st.filter, &r.event) {
-            continue;
-        }
+    for (at, item) in merged {
         if let Some(p) = prev {
             let k = st.runs.partition_point(|&t| t <= p);
-            if st.runs.get(k).is_some_and(|&t| t <= r.at) {
+            if st.runs.get(k).is_some_and(|&t| t <= at) {
                 v.push(Item::Divider);
             }
         }
-        prev = Some(r.at);
-        v.push(Item::Row(i));
+        prev = Some(at);
+        v.push(item);
     }
     v
+}
+
+/// A display eigensolve's solve cell: its wall time, and "stopped" when a command interrupted it.
+pub fn display_solve_cell(d: &sim::DisplaySolve) -> String {
+    let t = if d.ms >= 10_000.0 { format!("{:.1} s", d.ms / 1e3) } else { format!("{:.0} ms", d.ms) };
+    if d.interrupted {
+        format!("{t} · stopped")
+    } else {
+        t
+    }
 }
 
 const ROW_H: f32 = 17.0;
@@ -207,8 +222,13 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
                 *on = !*on;
             }
         }
+        ui.separator();
+        let f = &mut st.filter.orbitals;
+        if ui.add(egui::Button::selectable(*f, "orbitals")).on_hover_text("the display eigensolve of unoccupied orbitals after a DFT step (Orbitals tab): display only, not a teaching solve").clicked() {
+            *f = !*f;
+        }
     });
-    if st.rows.is_empty() {
+    if st.rows.is_empty() && st.display_rows.is_empty() {
         theme::note(
             ui,
             if estimated {
@@ -258,10 +278,45 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
                     let id = ui.id().with(("solve-row", i));
                     row(ui, id, rect, &st.rows[i], &widths, &mono, &prop);
                 }
+                Item::Display(i) => {
+                    let id = ui.id().with(("display-row", i));
+                    display_row(ui, id, rect, &st.display_rows[i], &widths, &mono, &prop);
+                }
             }
         }
         });
     });
+}
+
+/// A display eigensolve's row: "orbitals" in the origin column, the orbitals it solved for, and
+/// its wall time in the solve column; no step, outcome or |ΔE| (it is not a teaching solve).
+fn display_row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &DisplayRow, widths: &[f32; 7], mono: &FontId, prop: &FontId) {
+    let d = &r.solve;
+    let mut x = rect.left();
+    let mut col = |ui: &mut Ui, k: usize, text: &str, font: &FontId, colour: Color32, hover: Option<String>| {
+        let cr = Rect::from_min_size(pos2(x, rect.top()), vec2(widths[k], ROW_H));
+        x += widths[k];
+        cell(ui, cr, text, font.clone(), colour);
+        if let Some(h) = hover {
+            ui.interact(cr, id.with(k), Sense::hover()).on_hover_ui(|ui| {
+                ui.set_max_width(380.0);
+                ui.label(h);
+            });
+        }
+    };
+    col(ui, 0, &clock(r.at), mono, theme::INK_DIM, Some(format!("{:.1} s into the session (when it ended)", r.at.as_secs_f64())));
+    col(ui, 1, "—", mono, theme::INK_DIM, Some("display work after a DFT step, not a step's solve".into()));
+    col(ui, 2, "orbitals", prop, theme::INK_DIM, None);
+    let what = format!("{} unoccupied per spin", d.unoccupied);
+    col(ui, 3, &what, prop, theme::INK, Some("the display eigensolve: the lowest unoccupied orbitals on the converged state of the last DFT step, for the Orbitals view only — it never feeds the solve, so it is not a teaching solve and no counter counts it".into()));
+    let (outcome, colour, why) = if d.interrupted {
+        ("stopped", AMBER, "a command arrived (an edit, Play, a slider) and the eigensolve yielded to it; it runs again later")
+    } else {
+        ("shown", theme::INK_DIM, "the orbitals went to the Orbitals view")
+    };
+    col(ui, 4, outcome, prop, colour, Some(why.into()));
+    col(ui, 5, "—", mono, theme::INK_DIM, None);
+    col(ui, 6, &display_solve_cell(d), mono, theme::INK_DIM, Some(format!("{:.0} ms of wall time", d.ms)));
 }
 
 fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mono: &FontId, prop: &FontId) {

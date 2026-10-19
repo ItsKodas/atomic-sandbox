@@ -83,6 +83,18 @@ impl GpuContext {
         let (first, vulkan) = preferred_instance();
         Self::request(first, None).or_else(|| if vulkan { Self::request(instance(wgpu::Backends::PRIMARY), None) } else { None })
     }
+    /// The adapter's largest device-local memory heap (bytes) — the card's VRAM on a discrete GPU,
+    /// the shared carve-out on an integrated one — or `None` when the backend does not say. wgpu
+    /// reports no memory size itself, so this asks Vulkan through wgpu-hal
+    /// (`vkGetPhysicalDeviceMemoryProperties`: a read-only query, nothing is created); any other
+    /// backend (the DX12 fallback) answers `None`.
+    pub fn device_local_memory_bytes(&self) -> Option<u64> {
+        if self.adapter.get_info().backend != wgpu::Backend::Vulkan {
+            return None;
+        }
+        vulkan_device_local_bytes(&self.adapter)
+    }
+
     /// For a window: creates the surface first so the adapter is compatible with it (on the
     /// [`preferred_instance`]).
     pub fn new_for_surface(target: wgpu::SurfaceTarget<'static>) -> Option<(GpuContext, wgpu::Surface<'static>)> {
@@ -91,6 +103,25 @@ impl GpuContext {
         let ctx = Self::request(instance, Some(&surface))?;
         Some((ctx, surface))
     }
+}
+
+/// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT` (named here rather than through a direct `ash` dependency).
+#[cfg(any(windows, all(unix, not(target_vendor = "apple"))))]
+const VK_MEMORY_HEAP_DEVICE_LOCAL: u32 = 0x1;
+
+#[cfg(any(windows, all(unix, not(target_vendor = "apple"))))]
+fn vulkan_device_local_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
+    // SAFETY: the hal adapter is only read (its physical device and instance handles, which live
+    // as long as the guard), and the query creates and destroys nothing.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let props = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
+    let n = (props.memory_heap_count as usize).min(props.memory_heaps.len());
+    props.memory_heaps[..n].iter().filter(|h| h.flags.as_raw() & VK_MEMORY_HEAP_DEVICE_LOCAL != 0).map(|h| h.size).max().filter(|&b| b > 0)
+}
+
+#[cfg(not(any(windows, all(unix, not(target_vendor = "apple")))))]
+fn vulkan_device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
 }
 
 pub struct SurfaceState { pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub depth: wgpu::TextureView }

@@ -35,6 +35,14 @@ pub struct LogRow {
     pub near_face: bool,
 }
 
+/// A display eigensolve in the solve log (user request 2026-10-19): not a teaching solve, so it
+/// is kept apart from [`LogRow`] and counted nowhere.
+pub struct DisplayRow {
+    /// Session time it ended.
+    pub at: Duration,
+    pub solve: sim::DisplaySolve,
+}
+
 /// One mark of the timeline (spec §3.3.6).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mark {
@@ -58,11 +66,15 @@ pub struct LogFilter {
     pub check: bool,
     pub kept: bool,
     pub not_kept: bool,
+    /// The display eigensolves of unoccupied orbitals ([`DisplayRow`]).
+    pub orbitals: bool,
 }
 
 pub struct ActivityState {
     start: Instant,
     pub rows: VecDeque<LogRow>,
+    /// The display eigensolves, oldest first (at most [`LOG_ROWS`]).
+    pub display_rows: VecDeque<DisplayRow>,
     pub session_solves: u64,
     /// Events absorbed over the session, kept or dropped from the ring (a replay's `solve-log`
     /// baseline: the ring's length stops growing at [`LOG_ROWS`]).
@@ -110,13 +122,14 @@ impl ActivityState {
         ActivityState {
             start: Instant::now(),
             rows: VecDeque::new(),
+            display_rows: VecDeque::new(),
             session_solves: 0,
             rows_seen: 0,
             fit_points: Vec::new(),
             views: None,
             views_at: None,
             timeline: Vec::new(),
-            filter: LogFilter { pass: true, fallback: true, audit: true, check: true, kept: true, not_kept: true },
+            filter: LogFilter { pass: true, fallback: true, audit: true, check: true, kept: true, not_kept: true, orbitals: true },
             training_open: false,
             views_sent: false,
             parity_forces: false,
@@ -220,6 +233,18 @@ impl ActivityState {
         }
     }
 
+    /// The display eigensolves that ended since the last call (the live worker's probe,
+    /// `ActivityProbe::take_display_solves`).
+    pub fn absorb_display(&mut self, solves: Vec<sim::DisplaySolve>) {
+        for solve in solves {
+            let at = self.since(solve.at);
+            self.display_rows.push_back(DisplayRow { at, solve });
+            if self.display_rows.len() > LOG_ROWS {
+                self.display_rows.pop_front();
+            }
+        }
+    }
+
     /// A new worker is starting (`Viewer::start`): a pass the old one was running is closed as
     /// cancelled (the new worker's snapshots have no pass to say so), and the quarantine count is
     /// the new model's own, not a change (activity final review M2).
@@ -296,7 +321,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         log::show_log(ui, &mut st.activity, estimated);
     });
     if !estimated {
-        theme::note(ui, "The trust checklist, the training views and the timeline are for the estimated solver. A plain DFT step is not a teaching solve, so it adds no log row and does not tick the counter.");
+        theme::note(ui, "The trust checklist, the training views and the timeline are for the estimated solver. A plain DFT step is not a teaching solve, so it adds no log row and does not tick the counter; the display eigensolve of unoccupied orbitals (Orbitals tab) is listed as an orbitals row with its time.");
         return;
     }
     dock::group(ui, st, "d-trust", |ui, st| {

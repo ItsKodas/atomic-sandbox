@@ -1638,11 +1638,11 @@ const BOX_TRUST_TIP: &str = "a box-affected sample is a teacher answer whose den
 /// reached farther than the scene now does), the cell grows by d_box on every side. The GPU
 /// memory guard's verdict on the suggestion is part of the advice.
 pub fn box_advice(scene: &Scene, st: &UiState) -> String {
-    box_advice_with(scene, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
+    box_advice_with(scene, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget())
 }
 
-/// [`box_advice`] for `solvers` GPU solvers under a memory budget of `budget` bytes.
-fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
+/// [`box_advice`] for `solvers` GPU solvers under a memory budget of `budget`.
+fn box_advice_with(scene: &Scene, solvers: u64, budget: crate::quality::VramBudget) -> String {
     let h = scene.grid_h;
     // The H 1s tail e^(−2r)/π for every species: it undersizes the cell for diffuse atoms — Li's
     // valence tail decays as e^(−2√(2I) r) with I ≈ 0.198 Ha, which puts d_box near 8.5 Bohr, not

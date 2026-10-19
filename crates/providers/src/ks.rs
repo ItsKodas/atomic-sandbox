@@ -49,7 +49,9 @@
 //! `sample_density` (the latest evaluation succeeded, and no `reset` or `discontinuity` since).
 //! Unoccupied orbitals (plan Task 4) come from the producer's display eigensolve on that same
 //! converged state, paused in practice (`crate::orbitals`, "Unoccupied orbitals"); its SCF wall
-//! accounting is the evaluation's solve and forces.
+//! accounting is the evaluation's solve and forces. A solver with a probe (`with_probe`) reports
+//! each such eigensolve to it (`ActivityProbe::display_solve`: the Activity tab's job line and
+//! log row; display only, not a teaching solve).
 //!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
@@ -134,7 +136,9 @@
 //! plus the display texture pool and the extrapolation history (4); each field padded with
 //! `qm_gpu::grid::GHOST` = 4 ghost layers per side, (n + 2·GHOST)³ f32;
 //! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
-//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget_bytes`). The
+//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget` — half the card's
+//! memory when the adapter reports it, `gpu::GpuContext::device_local_memory_bytes`) and may say
+//! where it came from (`with_vram_budget_note`, printed with the budget in a refusal).
 //! **The orbital view** (orbital-viewer plan Task 4, Task 3 review ruling 4) is not charged to the
 //! scene — that would refuse scenes that fit without it. It is checked when a payload is made:
 //! the solve's footprint plus [`orbital_view_footprint_bytes`] (the view's display fields — the
@@ -550,10 +554,18 @@ impl CpuKs {
         let now = Instant::now();
         self.unocc.revalidate(&positions);
         match self.unocc.plan(m, now, self.orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => match view.unoccupied(state, nuclei, m, settings, should_abort) {
-                Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
-                None => self.unocc.interrupted(),
-            },
+            UnoccupiedPlan::Solve => {
+                // the Activity tab's job line and log row (display only)
+                let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let solved = view.unoccupied(state, nuclei, m, settings, should_abort);
+                if let Some(b) = busy {
+                    b.finish(solved.is_none());
+                }
+                match solved {
+                    Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
+                    None => self.unocc.interrupted(),
+                }
+            }
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 view.clear_unoccupied();
@@ -750,6 +762,8 @@ pub struct GpuKs {
     density_current: bool,
     /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
     vram_budget: Option<u64>,
+    /// Where the budget came from, for the refusals (`with_vram_budget_note`).
+    vram_note: Option<String>,
     /// The Activity view's live probe and the slot this solver reports on (`with_probe`).
     probe: Option<(Arc<ActivityProbe>, Slot)>,
     /// The orbital view (module doc, "Orbital display"): its state, the producer (for the
@@ -783,6 +797,7 @@ impl GpuKs {
             textures: TexturePool::default(),
             density_current: false,
             vram_budget: None,
+            vram_note: None,
             probe: None,
             orb: ViewState::default(),
             orbital: None,
@@ -812,7 +827,7 @@ impl GpuKs {
         if !self.density_current {
             return None;
         }
-        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, vram_budget, unocc, .. } = self;
+        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, vram_budget, vram_note, unocc, probe, .. } = self;
         let solver = solver.as_mut()?;
         let (cell, nuclei, settings) = last.as_ref()?;
         let positions: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
@@ -832,8 +847,8 @@ impl GpuKs {
             if need(m) > budget {
                 if m > 0 && need(0) <= budget {
                     guard.push(format!(
-                        "{requested} unoccupied orbitals refused: with them this scene needs ≈ {:.2} GB of GPU memory at {n}³, over the {:.1} GB budget — fewer unoccupied orbitals or a coarser quality (Scene ▸ Quality) fits",
-                        gb(need(m)), gb(budget)));
+                        "{requested} unoccupied orbitals refused: with them this scene needs ≈ {:.2} GB of GPU memory at {n}³, over {} — fewer unoccupied orbitals or a coarser quality (Scene ▸ Quality) fits",
+                        gb(need(m)), GpuKs::budget_words(budget, vram_note.as_deref())));
                     m = 0;
                 } else {
                     if let Some(v) = orbital.take() {
@@ -843,8 +858,8 @@ impl GpuKs {
                     orb_colour.clear();
                     unocc.dropped();
                     return Some(orb.refused(cell.clone(), origin, positions, format!(
-                        "the orbital view needs ≈ {:.2} GB of GPU memory at {n}³ with this scene, over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality)",
-                        gb(need(0)), gb(budget))));
+                        "the orbital view needs ≈ {:.2} GB of GPU memory at {n}³ with this scene, over {}: choose a coarser quality (Scene ▸ Quality)",
+                        gb(need(0)), GpuKs::budget_words(budget, vram_note.as_deref()))));
                 }
             }
         }
@@ -857,10 +872,18 @@ impl GpuKs {
         let now = Instant::now();
         unocc.revalidate(&positions);
         match unocc.plan(m, now, orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => match view.unoccupied(solver, nuclei, m, settings, should_abort) {
-                Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
-                None => unocc.interrupted(),
-            },
+            UnoccupiedPlan::Solve => {
+                // the Activity tab's job line and log row (display only)
+                let busy = probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let solved = view.unoccupied(solver, nuclei, m, settings, should_abort);
+                if let Some(b) = busy {
+                    b.finish(solved.is_none());
+                }
+                match solved {
+                    Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
+                    None => unocc.interrupted(),
+                }
+            }
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 if unocc.held() {
@@ -921,6 +944,21 @@ impl GpuKs {
         self
     }
 
+    /// Where the budget came from (the app: the card's memory, `ATOMIC_SANDBOX_VRAM_GB` or the
+    /// default), said in brackets after the budget in a refusal.
+    pub fn with_vram_budget_note(mut self, note: String) -> GpuKs {
+        self.vram_note = Some(note);
+        self
+    }
+
+    /// "the 12.9 GB budget (…note…)" for a refusal.
+    fn budget_words(budget: u64, note: Option<&str>) -> String {
+        match note {
+            Some(n) => format!("the {:.1} GB budget ({n})", budget as f64 / 1e9),
+            None => format!("the {:.1} GB budget", budget as f64 / 1e9),
+        }
+    }
+
     /// The budget check of `evaluate` (module doc, "GPU memory").
     fn check_vram(&self, scene: &Scene) -> Result<(), ProviderError> {
         let limits = self.ctx.device.limits();
@@ -939,12 +977,12 @@ impl GpuKs {
             if need > budget {
                 let fp = crate::pseudo::footprint_inputs(scene);
                 return Err(ProviderError::Invalid(format!(
-                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} {}electrons), over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
+                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} {}electrons), over {}: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
                     need as f64 / 1e9,
                     scene.cell.n,
                     fp.n_valence.max(0),
                     if fp.pseudised { "valence " } else { "" },
-                    budget as f64 / 1e9
+                    GpuKs::budget_words(budget, self.vram_note.as_deref())
                 )));
             }
         }
@@ -1200,6 +1238,7 @@ impl ForceProvider for GpuKs {
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         let mut g = GpuKs::new(self.ctx.clone(), self.tol);
         g.vram_budget = self.vram_budget;
+        g.vram_note = self.vram_note.clone();
         g.set_display(false);
         Some(Box::new(g))
     }

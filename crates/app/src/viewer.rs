@@ -531,6 +531,8 @@ impl Viewer {
         self.begin_loading(self.scene.grid_n);
         if let Some(ctx) = &gpu {
             providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+            // the GPU memory budget follows the card when it reports its memory (`quality::vram_budget`)
+            crate::quality::set_adapter_memory(ctx.device_local_memory_bytes());
         }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
@@ -1217,6 +1219,9 @@ impl Viewer {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
                 self.ui.activity.absorb(&s);
+                if let Some(w) = &self.sim {
+                    self.ui.activity.absorb_display(w.probe().take_display_solves());
+                }
                 if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
                     // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
                     // cloud — not the last molecule's, faded or not
