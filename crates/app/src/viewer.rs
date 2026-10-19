@@ -1489,7 +1489,7 @@ impl Viewer {
         // clipped to the 3D view: a guide to a nucleus behind the dock stops at its edge
         let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
         let painter = root
-            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("distance-guides")))
+            .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("distance-guides")))
             .with_clip_rect(clip);
         let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
         // pins: a small square around each pinned nucleus
@@ -1750,9 +1750,12 @@ impl Viewer {
         let ppp = root.pixels_per_point();
         let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
         let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
-        let painter = root
-            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("molecule-labels")))
+        // under every chrome element (the background order: the overlays, menus and windows draw
+        // over them), clipped to the 3D view, at View ▸ Bonds and molecules ▸ label opacity
+        let mut painter = root
+            .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("molecule-labels")))
             .with_clip_rect(clip);
+        painter.set_opacity(self.ui.label_opacity);
         let pill = |at: egui::Pos2, anchor: egui::Align2, text: &str, colour: egui::Color32, bg: u8| {
             let galley = painter.layout_job(ui::rich(text, 12.5, colour));
             let rect = anchor.anchor_size(at, galley.size()).expand(3.0);

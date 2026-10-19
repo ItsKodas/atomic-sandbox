@@ -800,6 +800,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             );
         });
         ui.horizontal(|ui| {
+            ui.label("label opacity");
+            ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
+                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths and angles (display only)");
+            ui.label(format!("{:.0} %", st.label_opacity * 100.0));
+        });
+        ui.horizontal(|ui| {
             ui.label("name style").on_hover_text(NAME_STYLE_TIP);
             let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
             if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
