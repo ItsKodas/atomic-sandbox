@@ -483,7 +483,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .get(st.files.selected)
         .and_then(|e| e.scene.as_ref().ok())
         .cloned();
-    let rest = (ui.available_height() - 80.0).max(120.0);
+    let rest = (ui.available_height() - 40.0).max(120.0);
     egui::ScrollArea::vertical().id_salt("files-models").auto_shrink([false, false]).max_height(rest).show(ui, |ui| {
         if st.files.models.is_empty() {
             theme::note(ui, "No models yet: train one in the Estimated solver, then File ▸ Save ▸ Model.");
