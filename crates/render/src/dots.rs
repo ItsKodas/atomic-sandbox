@@ -60,6 +60,8 @@ const _: () = assert!(std::mem::size_of::<DotsUniform>() == 112);
 struct Bound { compute_bg: wgpu::BindGroup, draw_bg: wgpu::BindGroup, n_rows: u32, dims: [u32; 3], colour: bool }
 
 pub struct DotsPass {
+    /// Group 2 of the sprites: the display warp (`crate::warp`).
+    warp_bg: wgpu::BindGroup,
     row_sums: wgpu::ComputePipeline,
     row_scan: wgpu::ComputePipeline,
     gen_points: wgpu::ComputePipeline,
@@ -85,7 +87,7 @@ impl DotsPass {
     pub fn new(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>) -> DotsPass {
         let dev = &ctx.device;
         let cs = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("dots compute"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/dots_compute.wgsl").into()) });
-        let ds = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("dots draw"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/dots_draw.wgsl").into()) });
+        let ds = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("dots draw"), source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("shaders/dots_draw.wgsl"), crate::warp::WGSL).into()) });
         let uniform = |binding, visibility| wgpu::BindGroupLayoutEntry { binding, visibility, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let storage = |binding, visibility, read_only| wgpu::BindGroupLayoutEntry { binding, visibility, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None }, count: None };
         // r32float (unfilterable) and rgba16float both bind as unfilterable float for textureLoad
@@ -103,7 +105,8 @@ impl DotsPass {
             storage(1, wgpu::ShaderStages::VERTEX, true),
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
         ] });
-        let dl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&draw_bgl)], immediate_size: 0 });
+        let warp_bgl = crate::warp::layout(dev);
+        let dl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&draw_bgl), Some(&warp_bgl)], immediate_size: 0 });
         // premultiplied "over" for the colour (a dense region saturates to the dots' own colour,
         // so the orbitals' hues survive where additive blending would go white); the target's
         // alpha is kept
@@ -135,8 +138,13 @@ impl DotsPass {
             row_sums, row_scan, gen_points, draw, draw_glow, glow: false, compute_bgl, draw_bgl, camera_bg,
             params: UniformBuffer::new(ctx, "dots params"), points, velocities, rows: None,
             dummy_scalar: Volume3D::new(ctx, [1; 3]), dummy_colour: ColourVolume3D::new(ctx, [1; 3]),
-            bound: None, count: 0,
+            bound: None, count: 0, warp_bg: crate::warp::Warp::new(ctx).bind_group().clone(),
         }
+    }
+
+    /// Draws the sprites through the display warp `bg` (`crate::warp::Warp::bind_group`).
+    pub fn set_warp(&mut self, bg: &wgpu::BindGroup) {
+        self.warp_bg = bg.clone();
     }
 
     /// Binds the field to sample (`colour`, when given, is sampled by its a and coloured by it
@@ -221,6 +229,7 @@ impl DotsPass {
         pass.set_pipeline(if self.glow { &self.draw_glow } else { &self.draw });
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, &b.draw_bg, &[]);
+        pass.set_bind_group(2, &self.warp_bg, &[]);
         pass.draw(0..6, 0..self.count);
     }
 }

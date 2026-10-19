@@ -790,7 +790,9 @@ fn set_dt_validates_and_warns_and_speed_clamps() {
     d.apply(DynCommand::SetSpeed(0));
     assert_eq!(d.snapshot().speed, 1);
     d.apply(DynCommand::SetSpeed(5000));
-    assert_eq!(d.snapshot().speed, 1000);
+    assert_eq!(d.snapshot().speed, 5000);
+    d.apply(DynCommand::SetSpeed(50_000));
+    assert_eq!(d.snapshot().speed, MAX_SPEED);
 }
 
 /// Zero forces, but each evaluation busy-waits `ms` (a stand-in for a DFT solve's cost).

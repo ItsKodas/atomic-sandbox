@@ -180,7 +180,7 @@
 //! teacher (`fallback_fraction_100`; 0 under a Kohn-Sham provider).
 //!
 //! # Time control (ruling R2)
-//! `SetSpeed(n)`: n steps attempted per tick, clamped to 1..=1000 (default 1). A playing
+//! `SetSpeed(n)`: n steps attempted per tick, clamped to 1..=[`MAX_SPEED`] = 10 000 (default 1). A playing
 //! [`Dynamics::tick`] runs min(n, the steps that fit `budget_ms` by the running mean cost per
 //! step), and at least one unless the tick already spent a solve re-evaluating stale forces;
 //! `wall_ratio` is the measured fs simulated per wall second over the tick (0 when paused or
@@ -512,8 +512,10 @@ use std::time::Instant;
 pub const K_DRAG: f64 = 0.5;
 /// `SetDt` above this (fs) leaves a warning in the snapshot (spec §7: H–X stretches ~10 fs).
 pub const DT_WARN_FS: f64 = 0.5;
-/// `SetSpeed` range: steps attempted per tick.
-pub const MAX_SPEED: u32 = 1000;
+/// `SetSpeed` range: steps attempted per tick. 10 000 since 2026-10-20 (user request; it was
+/// 1000): the tick's budget already stops a tick early, so the cap only bounds how many cheap
+/// (surrogate) steps one tick may attempt — it never changes dt (rule 8).
+pub const MAX_SPEED: u32 = 10_000;
 /// Cap on the drag spring's force (Hartree/Bohr, R12; module doc, "Tool forces"): the default of
 /// the user's setting (`SetDragForce`).
 pub const F_DRAG_MAX: f64 = 0.1;
@@ -3051,7 +3053,7 @@ fn answers_view(view: &OrbitalViewRequest, o: &OrbitalDisplay) -> bool {
         (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
             squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
         }
-        (R::AllColoured { physical, .. }, R::AllColoured { physical: p2, .. }) => physical == p2,
+        (R::AllColoured { physical, look, .. }, R::AllColoured { physical: p2, look: l2, .. }) => physical == p2 && look == l2,
         _ => false,
     }
 }

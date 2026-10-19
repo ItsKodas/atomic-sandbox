@@ -12,17 +12,82 @@
 //!   σ = h (`crates/validate/references.md`, "Quality presets") against 0.741 Å (experiment).
 use crate::scene::Scene;
 
-/// The GPU memory budget (GB) when `ATOMIC_SANDBOX_VRAM_GB` is not set: wgpu reports no total
-/// VRAM, so this is a documented constant — half the project's 24 GB RX 7900 XTX, which leaves room
-/// for the renderer, the driver and other applications (`providers::ks`, "GPU memory"). Set the
-/// variable on a smaller (or larger) card.
+/// The GPU memory budget (GB) when neither `ATOMIC_SANDBOX_VRAM_GB` is set nor the adapter
+/// reports its memory ([`set_adapter_memory`]): half the project's 24 GB RX 7900 XTX
+/// (`providers::ks`, "GPU memory"). Set the variable on such a card.
 pub const VRAM_BUDGET_GB: f64 = 12.0;
 
-/// The GPU memory budget in bytes: `ATOMIC_SANDBOX_VRAM_GB` (a positive number of GB) or
-/// [`VRAM_BUDGET_GB`].
-pub fn vram_budget_bytes() -> u64 {
-    let gb = std::env::var("ATOMIC_SANDBOX_VRAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0);
-    (gb.unwrap_or(VRAM_BUDGET_GB) * 1e9) as u64
+/// The share of the card's memory the budget takes when the adapter reports it (user request
+/// 2026-10-19): half, as [`VRAM_BUDGET_GB`] is of the project's card — the rest is the
+/// renderer's, the driver's and other applications'.
+pub const ADAPTER_SHARE: f64 = 0.5;
+
+/// The card's device-local memory (bytes; 0 = not reported), set once a device exists
+/// (`Viewer::start`, from `GpuContext::device_local_memory_bytes`).
+static ADAPTER_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records the card's memory for [`vram_budget`] (`None`: the backend did not report it).
+pub fn set_adapter_memory(bytes: Option<u64>) {
+    ADAPTER_MEMORY.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where the GPU memory budget came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BudgetSource {
+    /// `ATOMIC_SANDBOX_VRAM_GB`.
+    Env,
+    /// [`ADAPTER_SHARE`] of the card's reported memory (bytes).
+    Adapter { card_bytes: u64 },
+    /// [`VRAM_BUDGET_GB`]: the card's memory is not known.
+    Default,
+}
+
+/// The GPU memory budget and its source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VramBudget {
+    pub bytes: u64,
+    pub source: BudgetSource,
+}
+
+impl VramBudget {
+    /// A budget of `bytes` with no stated source (the tests).
+    #[cfg(test)]
+    pub fn fixed(bytes: u64) -> VramBudget {
+        VramBudget { bytes, source: BudgetSource::Default }
+    }
+
+    /// "12.9 GB" — the budget as the refusals print it.
+    pub fn gb(&self) -> String {
+        format!("{:.1} GB", self.bytes as f64 / 1e9)
+    }
+
+    /// Where it came from, for a refusal: "half of this GPU's 25.8 GB; ATOMIC_SANDBOX_VRAM_GB
+    /// overrides it".
+    pub fn why(&self) -> String {
+        match self.source {
+            BudgetSource::Env => "set by ATOMIC_SANDBOX_VRAM_GB".into(),
+            BudgetSource::Adapter { card_bytes } => {
+                format!("{:.0} % of this GPU's {:.1} GB; ATOMIC_SANDBOX_VRAM_GB overrides it", 100.0 * ADAPTER_SHARE, card_bytes as f64 / 1e9)
+            }
+            BudgetSource::Default => "the default: this GPU did not report its memory; set ATOMIC_SANDBOX_VRAM_GB".into(),
+        }
+    }
+}
+
+/// The GPU memory budget: `ATOMIC_SANDBOX_VRAM_GB` (a positive number of GB), else
+/// [`ADAPTER_SHARE`] of the card's memory when the adapter reported it, else [`VRAM_BUDGET_GB`].
+pub fn vram_budget() -> VramBudget {
+    let env = std::env::var("ATOMIC_SANDBOX_VRAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0);
+    budget_from(env, ADAPTER_MEMORY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`vram_budget`] from its inputs: the variable's GB and the card's bytes (0 = unknown).
+pub fn budget_from(env_gb: Option<f64>, card_bytes: u64) -> VramBudget {
+    match env_gb {
+        Some(gb) => VramBudget { bytes: (gb * 1e9) as u64, source: BudgetSource::Env },
+        None if card_bytes > 0 => VramBudget { bytes: (card_bytes as f64 * ADAPTER_SHARE) as u64, source: BudgetSource::Adapter { card_bytes } },
+        None => VramBudget { bytes: (VRAM_BUDGET_GB * 1e9) as u64, source: BudgetSource::Default },
+    }
 }
 
 /// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
@@ -35,15 +100,16 @@ pub fn gpu_solvers(backend: crate::sim::Backend, gpu_available: bool) -> u64 {
     }
 }
 
-/// `Err(message)` when `scene` on `solvers` GPU solvers would exceed `budget` bytes (or has an
-/// element without a mass, which the worker refuses anyway: no estimate then).
-pub fn vram_check(scene: &Scene, solvers: u64, budget: u64) -> Result<(), String> {
+/// `Err(message)` when `scene` on `solvers` GPU solvers would exceed `budget` (or has an element
+/// without a mass, which the worker refuses anyway: no estimate then). The message names the
+/// budget and where it came from.
+pub fn vram_check(scene: &Scene, solvers: u64, budget: VramBudget) -> Result<(), String> {
     let Ok(s) = scene.to_sim() else { return Ok(()) };
     let need = solvers * providers::gpu_footprint_bytes(&s);
     let fp = providers::pseudo::footprint_inputs(&s);
-    if solvers > 0 && need > budget {
+    if solvers > 0 && need > budget.bytes {
         return Err(format!(
-            "refused: {}³ × {:.3} Bohr needs ≈ {:.1} GB of GPU memory ({} solver{}, {} {}electrons), over the {:.1} GB budget (ATOMIC_SANDBOX_VRAM_GB) — choose a coarser quality or fewer atoms",
+            "refused: {}³ × {:.3} Bohr needs ≈ {:.1} GB of GPU memory ({} solver{}, {} {}electrons), over the {} budget ({}) — choose a coarser quality or fewer atoms",
             scene.grid_n,
             scene.grid_h,
             need as f64 / 1e9,
@@ -51,7 +117,8 @@ pub fn vram_check(scene: &Scene, solvers: u64, budget: u64) -> Result<(), String
             if solvers == 1 { "" } else { "s: teacher + auditor" },
             fp.n_valence.max(0),
             if fp.pseudised { "valence " } else { "" },
-            budget as f64 / 1e9
+            budget.gb(),
+            budget.why()
         ));
     }
     Ok(())
@@ -148,6 +215,24 @@ const H2_PRECISE: &str = "H₂ bond 0.807 Å (1.524 Bohr) at σ = h = 0.10; exac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The budget's order (user request 2026-10-19): the variable, else half the card's reported
+    /// memory, else 12 GB; the refusal names the budget and its source.
+    #[test]
+    fn the_vram_budget_follows_the_variable_then_the_card_then_the_default() {
+        let card = 25_753_026_560; // 24 GiB, as the RX 7900 XTX's Vulkan heap reports it
+        assert_eq!(budget_from(Some(8.0), card), VramBudget { bytes: 8_000_000_000, source: BudgetSource::Env });
+        let b = budget_from(None, card);
+        assert_eq!(b, VramBudget { bytes: card / 2, source: BudgetSource::Adapter { card_bytes: card } });
+        assert_eq!((b.gb(), b.why()), ("12.9 GB".into(), "50 % of this GPU's 25.8 GB; ATOMIC_SANDBOX_VRAM_GB overrides it".into()));
+        let d = budget_from(None, 0);
+        assert_eq!((d.bytes, d.source), (12_000_000_000, BudgetSource::Default));
+        assert!(d.why().contains("did not report"));
+        let mut big = Scene::preset("h2").unwrap();
+        big.grid_n = 201;
+        let e = vram_check(&big, 2, budget_from(None, 4_000_000_000)).unwrap_err();
+        assert!(e.contains("over the 2.0 GB budget (50 % of this GPU's 4.0 GB; ATOMIC_SANDBOX_VRAM_GB overrides it)"), "{e}");
+    }
 
     /// The presets' 12 Bohr box at every level: 41³, 49³, 81³, 121³ — never smaller than 12;
     /// h2o's 14 Bohr box keeps its extent too.

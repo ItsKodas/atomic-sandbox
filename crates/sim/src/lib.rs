@@ -17,13 +17,13 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
-pub use activity::{ActivityProbe, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
+pub use activity::{ActivityProbe, DisplaySolve, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
     AuditRecord, AuditVerdict, ClassKey, ClassLoo, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
-    LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, ProviderError, SideDisplay, SideKind,
+    ColourLook, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
     SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
 pub use charges::{ChargeSource, PartialCharges};

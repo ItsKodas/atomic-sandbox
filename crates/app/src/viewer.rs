@@ -531,6 +531,8 @@ impl Viewer {
         self.begin_loading(self.scene.grid_n);
         if let Some(ctx) = &gpu {
             providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+            // the GPU memory budget follows the card when it reports its memory (`quality::vram_budget`)
+            crate::quality::set_adapter_memory(ctx.device_local_memory_bytes());
         }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
@@ -1217,6 +1219,9 @@ impl Viewer {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
                 self.ui.activity.absorb(&s);
+                if let Some(w) = &self.sim {
+                    self.ui.activity.absorb_display(w.probe().take_display_solves());
+                }
                 if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
                     // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
                     // cloud — not the last molecule's, faded or not
@@ -1906,6 +1911,20 @@ impl Viewer {
     pub fn ghost_now(&self) -> Option<&sim::PassGhost> {
         let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics))?;
         s.dynamics.ghost.as_ref()
+    }
+
+    /// Where the shown field was solved (the display warp, `render::warp`; View ▸ fields follow the
+    /// atoms): the density's geometry (`real_at`) — not while the atomic superposition is blended
+    /// in, which is built at the current positions — or the orbital payload's; `None` with the
+    /// toggle off or while the training ghost replaces the scene.
+    pub fn warp_source(&self) -> Option<Vec<[f64; 3]>> {
+        if !self.ui.warp_fields || self.ghost_now().is_some() {
+            return None;
+        }
+        match self.ui.show {
+            ui::ShowMode::Density => self.real_at.clone().filter(|_| self.density.superposition.is_none()),
+            _ => self.snapshot.as_ref()?.dynamics.orbitals.as_ref().map(|o| o.positions.clone()),
+        }
     }
 
     /// The nuclei the sphere pass draws: the scene's, or none while the ghost replaces them.

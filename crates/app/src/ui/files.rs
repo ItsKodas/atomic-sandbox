@@ -204,7 +204,7 @@ fn fit(
         crate::quality::vram_check(
             s,
             crate::quality::gpu_solvers(st.backend, st.gpu_available),
-            crate::quality::vram_budget_bytes(),
+            crate::quality::vram_budget(),
         )
     };
     let ctx = model_offer::Context {

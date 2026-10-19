@@ -44,7 +44,9 @@ fn grid_coord(p: vec3<f32>, dims: vec3<f32>) -> vec3<f32> {
 // `VolumeUniform::mix`). Sampling is linear in the data, so this is the sample of the blended grid —
 // which is also right for a signed field (an orbital or the spin density), because the sign rule keeps
 // consecutive fields in phase.
-fn sample_rho(p: vec3<f32>) -> f32 {
+fn sample_rho(p_now: vec3<f32>) -> f32 {
+    // the display warp (warp.wgsl): the field as solved, at where this point was then
+    let p = warp_back(p_now);
     if (prm.mix_w >= 1.0) { return sample_one(vol, p); }
     if (prm.mix_w <= 0.0) { return sample_one(vol_prev, p); }
     return mix(sample_one(vol_prev, p), sample_one(vol, p), prm.mix_w);

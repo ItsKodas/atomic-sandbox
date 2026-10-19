@@ -61,10 +61,7 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                     hot.push(r.rect);
                     menu_popup(&r, egui::Id::new("menu-all")).show(|ui| {
                         for m in MenuId::ALL {
-                            egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| {
-                                ui.set_min_width(340.0);
-                                contents(ui, st, input, m, acts)
-                            });
+                            egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| scrolled(ui, 340.0, |ui| contents(ui, st, input, m, acts)));
                         }
                     });
                 } else {
@@ -74,18 +71,12 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                             // File: Open… (the File window) and Save… (the Save window), `files`
                             let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
                             hot.push(r.rect);
-                            menu_popup(&r, popup_id(m)).show(|ui| {
-                                ui.set_min_width(200.0);
-                                file_items(ui, st);
-                            });
+                            menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 200.0, |ui| file_items(ui, st)));
                             continue;
                         }
                         let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
                         hot.push(r.rect);
-                        menu_popup(&r, popup_id(m)).show(|ui| {
-                            ui.set_min_width(350.0);
-                            contents(ui, st, input, m, acts)
-                        });
+                        menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 350.0, |ui| contents(ui, st, input, m, acts)));
                     }
                 }
                 ui.add_space(12.0);
@@ -175,7 +166,7 @@ fn window_buttons(ui: &mut Ui, full: egui::Rect) -> (egui::Rect, egui::Rect) {
 }
 
 /// A menu's popup: toggled by its button, kept open while its own widgets are used (sliders,
-/// fields), closed by a click elsewhere or Esc.
+/// fields), closed by a click elsewhere or Esc. Its contents go through `scrolled`.
 fn menu_popup(r: &egui::Response, id: egui::Id) -> Popup<'static> {
     Popup::from_toggle_button_response(r)
         .id(id)
@@ -183,6 +174,27 @@ fn menu_popup(r: &egui::Response, id: egui::Id) -> Popup<'static> {
         .layout(egui::Layout::top_down(egui::Align::Min))
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .gap(4.0)
+}
+
+/// Space kept below a menu's scroll area: the popup frame's bottom margin and a little air.
+const POPUP_FOOT: f32 = 12.0;
+
+/// A menu popup's contents, at least `min_width` wide, in a vertical scroll area capped at the
+/// window's height left below the popup's top: past that the menu scrolls instead of running off
+/// the window (the View menu measured 1011 pt in a 900 pt window, 2026-10-20). A Ctrl K reveal
+/// scrolls it to the marked group (`search::mark`).
+fn scrolled<R>(ui: &mut Ui, min_width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let max_h = (ui.ctx().content_rect().bottom() - ui.next_widget_position().y - POPUP_FOOT).max(120.0);
+    // the area's own default height (`Style::spacing.default_area_size`, 400 pt) would cap it
+    // sooner: the minimum makes the cap the window, and a shorter menu still shrinks to fit
+    egui::ScrollArea::vertical()
+        .max_height(max_h)
+        .min_scrolled_height(max_h)
+        .show(ui, |ui| {
+            ui.set_min_width(min_width);
+            add(ui)
+        })
+        .inner
 }
 
 fn brand(ui: &mut Ui, compact: bool) {
@@ -237,7 +249,7 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     let r = ui
         .add(Button::new(job).fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)))
         .on_hover_text("the scene: click to switch preset or reset it");
-    menu_popup(&r, id).show(|ui| anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts)));
+    menu_popup(&r, id).show(|ui| scrolled(ui, 0.0, |ui| anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts))));
     r
 }
 
@@ -596,7 +608,7 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
         .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
     if ui
         .add(length)
-        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 1000 steps per tick. Type a value like 250 or 2 ps")
+        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 10 000 steps per tick. Type a value like 250 or 2 ps")
         .changed()
     {
         st.trail_fs = trails::slider_to_length(x);
@@ -613,6 +625,14 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
 
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
+    let mut warp = st.warp_fields;
+    if ui
+        .checkbox(&mut warp, "fields follow the atoms")
+        .on_hover_text("the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)")
+        .changed()
+    {
+        acts.push(Action::WarpFields(warp));
+    }
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
     let mut changed = false;
     ui.add_enabled_ui(estimated, |ui| {
@@ -672,12 +692,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.add_enabled(volume, egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"));
         ui.add_enabled(volume, egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"));
         ui.add_enabled(st.volume_mode == super::VOLUME_ISO, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
-        ui.horizontal(|ui| {
-            ui.add_enabled(st.volume_mode == super::VOLUME_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
-        });
-        // the dots' look: floating (each dot wanders by a Metropolis walk on the field, so the cloud
-        // stays a true sample of it) and glowing (soft sprites added: dense regions burn to white)
-        ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS, |ui| {
+        // the dots' look, shown only while rendering as dots (like the trails' rows; the menu
+        // outgrew a 900 pt window, 2026-10-20): floating (each dot wanders by a Metropolis walk on
+        // the field, so the cloud stays a true sample of it) and glowing (soft sprites added:
+        // dense regions burn to white)
+        if st.volume_mode == super::VOLUME_DOTS {
+            ui.checkbox(&mut st.shimmer, "shimmer (new dots every frame)");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut st.dots_float, "floating").on_hover_text("each dot wanders: a random step each frame, kept or refused by the density there (a Metropolis walk) — the cloud stays a true sample of the field while the dots drift");
                 ui.checkbox(&mut st.dots_glow, "glow").on_hover_text("soft dots whose light adds up: dense regions burn toward white");
@@ -690,7 +710,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             if st.dots_glow {
                 ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness"));
             }
-        });
+        }
         // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
         let mut core = st.show_partial_core;
         if probed("show-partial-core", ui.checkbox(&mut core, "with partial core")).on_hover_text(super::pseudo::PARTIAL_CORE_TIP).changed() {
@@ -756,13 +776,27 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 }
             });
         });
+        // bloom: the bright parts glow (display only)
+        ui.horizontal(|ui| {
+            ui.label("bloom");
+            ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2))
+                .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
+        });
+        ui.add_enabled_ui(st.bloom > 0.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("bloom from");
+                ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2))
+                    .on_hover_text("how bright a part must be to glow (1 = only full white)");
+            });
+        });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
         theme::section(ui, "Camera");
         ui.horizontal(|ui| {
             ui.checkbox(&mut st.camera_view, "camera view").on_hover_text("the atoms as they look rather than as markers: from a soft electron glow to solid balls, blurred over the shutter (also the view switch, bottom left)");
         });
-        ui.add_enabled_ui(st.camera_view, |ui| {
+        // its sliders only while it is on (as the dots' look above)
+        if st.camera_view {
             let row = |ui: &mut Ui, name: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: String, tip: &str| {
                 ui.horizontal(|ui| {
                     ui.add_sized([72.0, 18.0], egui::Label::new(name));
@@ -780,7 +814,9 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
             let t = format!("{:.1}×", st.camera_size);
             row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
-        });
+            let t = if st.camera_smooth <= 0.0 { "balls".into() } else { format!("{:.2} Bohr", st.camera_smooth) };
+            row(ui, "smooth", &mut st.camera_smooth, 0.0..=2.0, t, "with any solidity: one smooth surface instead of separate balls — atoms close together flow into each other through a soft neck this wide (0 = separate balls, the hard crease)");
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("motion blur");
@@ -1160,7 +1196,7 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         ),
         HelpTopic::FastPlay => (
             "Fast play: shimmer, not swing",
-            "Speed is time steps attempted per ≈16 ms tick; it never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 1000 (as fast as possible). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset (one ~10 fs H–X vibration in ≈ 0.5 s of wall time) to see motion.".into(),
+            "Speed is time steps attempted per ≈16 ms tick; it never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 10 000, the top (as fast as possible: a tick then stops at its 16 ms budget instead). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset (one ~10 fs H–X vibration in ≈ 0.5 s of wall time) to see motion.".into(),
         ),
     }
 }

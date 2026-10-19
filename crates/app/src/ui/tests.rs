@@ -686,6 +686,67 @@ fn trail_controls_are_display_only_and_searchable() {
     assert!(st.show_trails && st.trail_fs == 100.0 && st.trail_opacity == 0.7, "drawing changes nothing");
 }
 
+/// Every menu popup (and the scene chip's) fits inside the default 1400 × 900 window, at the
+/// start and with every conditional row shown (dots look, Camera, trails, the estimated solver's
+/// draft line): the View menu once measured 1011 pt tall (2026-10-20), its last rows out of reach.
+/// Past the space below the top bar a menu scrolls (`menus::menu_popup`).
+#[test]
+fn every_menu_popup_fits_the_default_window() {
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    let ids: Vec<(&str, egui::Id)> =
+        menus::MenuId::ALL.iter().map(|&m| (m.title(), menus::popup_id(m))).chain([("scene chip", menus::scene_chip_id())]).collect();
+    for worst in [false, true] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.gpu_available = true;
+        if worst {
+            st.backend = Backend::Estimated;
+            st.draft = true;
+            st.volume_mode = VOLUME_DOTS;
+            st.show = ShowMode::Coloured;
+            st.camera_view = true;
+            st.show_trails = true;
+        }
+        for &(name, id) in &ids {
+            egui::Popup::open_id(&ctx, id);
+            for _ in 0..3 {
+                frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            }
+            let r = ctx.memory(|m| m.area_rect(id)).unwrap_or_else(|| panic!("{name}: no popup area"));
+            egui::Popup::close_all(&ctx);
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            assert!(screen.contains_rect(r), "{name} (worst {worst}): {r:?} is not inside {screen:?}");
+            if !worst {
+                // at the start nothing needs the scroll: the capped View menu would end at 900
+                assert!(r.max.y < 899.0, "{name} scrolls at the start: {r:?}");
+                eprintln!("{name}: {:.0} pt tall", r.height());
+            }
+        }
+        if worst {
+            // with every row shown the View menu scrolls, and Ctrl K still reveals its last group
+            let bonds = search::results("bond lines", 1)[0];
+            assert_eq!(bonds.anchor, "m-bonds");
+            search::pick(&ctx, &mut st, bonds);
+            // the scroll is animated: these frames carry a clock (`frame`'s do not)
+            for i in 0..20 {
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(100.0 + 0.05 * i as f64), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+            }
+            let b = probed_rect("show-bonds");
+            assert!(screen.contains_rect(b), "the revealed Bonds checkbox {b:?} is scrolled into view");
+            egui::Popup::close_all(&ctx);
+        }
+    }
+}
+
 /// The log records a status line once per `set_status` (a repeat of the same text is a new
 /// message: fresh toast), counts an error as unread, logs new dynamics notes by `notes_total`, the
 /// box warning once per nucleus, each evaluation note once per run, and a repeated refusal of the
@@ -1829,8 +1890,8 @@ fn superscripts_are_drawn_raised() {
 /// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
-    use crate::quality::{gpu_solvers, vram_check, VRAM_BUDGET_GB};
-    let budget = (VRAM_BUDGET_GB * 1e9) as u64;
+    use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
+    let budget = VramBudget::fixed((VRAM_BUDGET_GB * 1e9) as u64);
     let cam = camera();
     let mut big = Scene::preset("empty").unwrap();
     big.grid_n = 65; // 16 Bohr at 0.25
@@ -1841,7 +1902,7 @@ fn a_change_over_the_vram_budget_is_refused() {
     let fine = crate::quality::regrid(&big, 16.0, 0.08);
     assert_eq!(fine.grid_n, 201);
     let e = vram_check(&fine, 1, budget).unwrap_err();
-    assert!(e.contains("GPU memory") && e.contains("budget") && e.contains("201³"), "{e}");
+    assert!(e.contains("GPU memory") && e.contains("the 12.0 GB budget") && e.contains("201³"), "{e}");
     assert!(vram_check(&fine, 0, budget).is_ok(), "the CPU backend allocates no GPU memory");
     let mut st = UiState::new("empty", &big);
     (st.backend, st.gpu_available) = (Backend::Gpu, true);
@@ -2050,15 +2111,16 @@ fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
     let mut third = scene.nuclei[0].clone();
     third.pos = [3.725, 0.0, 0.0];
     scene.nuclei.push(third);
-    let a = box_advice_with(&scene, 0, u64::MAX);
+    use crate::quality::VramBudget;
+    let a = box_advice_with(&scene, 0, VramBudget::fixed(u64::MAX));
     assert!(a.starts_with("Enlarge the cell (Scene ▸ Grid: 123³ at 0.15 Bohr, a 18.3 Bohr box — every nucleus ≥ 5.3 Bohr from a face"), "{a}");
     assert!(!a.contains("refuse") && !a.contains("beyond"), "{a}");
-    assert!(box_advice_with(&scene, 2, 1).contains("The GPU memory guard would refuse that cell"));
+    assert!(box_advice_with(&scene, 2, VramBudget::fixed(1)).contains("The GPU memory guard would refuse that cell"));
     // already inside that box (the samples reached farther than the scene does now): grow by
     // d_box on every side; past the largest grid: say so
     let mut far = scene.clone();
     far.nuclei[2].pos = [20.0, 0.0, 0.0];
-    assert!(box_advice_with(&far, 0, u64::MAX).contains("beyond the largest grid (201³)"));
+    assert!(box_advice_with(&far, 0, VramBudget::fixed(u64::MAX)).contains("beyond the largest grid (201³)"));
 }
 
 /// The sampling-plan presets (user request 2026-10-15): every one is a valid plan, Standard is
@@ -2203,7 +2265,7 @@ mod orbital_viewer {
         assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
         // the other modes
         for (mode, want) in [
-            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false }),
+            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() }),
             (ShowMode::Spin, OrbitalRequest::SpinDensity),
             (ShowMode::Density, OrbitalRequest::Off),
         ] {
@@ -2255,15 +2317,15 @@ mod orbital_viewer {
         // all coloured: the include boxes start from the occupied tracks
         st.show = ShowMode::Coloured;
         let r = one(act(&mut st, &inp, Action::Include { track: 1, on: false }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false, look: Default::default() });
         let r = one(act(&mut st, &inp, Action::Include { track: 3, on: true }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false, look: Default::default() });
         assert!(act(&mut st, &inp, Action::ColourBlend { additive: false }).commands.is_empty(), "the blend is a render setting");
         assert!(!st.colour_additive);
         let r = one(act(&mut st, &inp, Action::ColourScale { physical: true }));
         assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, .. }), "{:?}", r.what);
         let r = one(act(&mut st, &inp, Action::IncludeAllOccupied));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true, look: Default::default() });
         // the words
         for a in [
             Action::Show(ShowMode::Coloured),
@@ -2274,6 +2336,9 @@ mod orbital_viewer {
             Action::IncludeAllOccupied,
             Action::ColourBlend { additive: false },
             Action::ColourScale { physical: true },
+            Action::ColourLook(sim::ColourLook { enclose: Some(75), shell: false, hide_core: true }),
+            Action::ColourLook(sim::ColourLook { enclose: Some(90), shell: true, hide_core: false }),
+            Action::WarpFields(false),
         ] {
             let text = a.describe().expect("a script form");
             let words: Vec<&str> = text.split(' ').collect();
@@ -2606,7 +2671,7 @@ mod orbital_viewer {
         assert!(l.tip.contains("Spin is intrinsic (↑/↓), not a rotation."));
         // coloured: one swatch per colour slot (↓ shares ↑'s), the scale in the text
         st.show = ShowMode::Coloured;
-        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false });
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() });
         o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
         let snap = with_payload(&scene, Backend::Gpu, o);
         let inp = input(&scene, Some(&snap), &cam);
@@ -3059,6 +3124,42 @@ mod activity_tab {
         // the divider sits between the old run's last row and the new run's first, and none
         // before the session's first row
         assert_eq!(items(&st), vec![Item::Row(0), Item::Row(1), Item::Divider, Item::Row(2)]);
+    }
+
+    /// The display eigensolve (user request 2026-10-19): a job row while it runs, and a log row
+    /// with its time merged by time among the teaching rows; the "orbitals" chip hides them; it
+    /// counts as no teaching solve.
+    #[test]
+    fn the_display_eigensolve_has_a_job_row_and_log_rows() {
+        use activity::jobs::{rows, JobKey};
+        use activity::log::{display_solve_cell, items, Item};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let probe = sim::ProbeView { display: Some((0.3, 4)), display_solves: 2, ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let job = r.iter().find(|r| r.key == JobKey::Orbitals).expect("the eigensolve's job row");
+        assert!(job.detail.contains("4 unoccupied orbitals") && job.elapsed_s == Some(0.3));
+        assert!(job.control.is_none() && job.no_control_why.is_some());
+        let idle = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        assert!(rows(&idle, idle.probe.as_ref()).iter().all(|r| r.key != JobKey::Orbitals));
+
+        let mut st = activity::ActivityState::new();
+        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, unoccupied: 4, interrupted };
+        st.absorb_display(vec![solve(120.0, false)]);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![event(TeachOrigin::Fallback, TeachRule::Grade, TeachOutcome::Kept, Some(1))];
+        st.absorb(&s);
+        std::thread::sleep(Duration::from_millis(2));
+        st.absorb_display(vec![solve(12_345.0, true)]);
+        assert_eq!(st.session_solves, 1, "a display eigensolve is not a teaching solve");
+        assert_eq!(items(&st), vec![Item::Display(0), Item::Row(0), Item::Display(1)]);
+        assert_eq!(display_solve_cell(&st.display_rows[0].solve), "120 ms");
+        assert_eq!(display_solve_cell(&st.display_rows[1].solve), "12.3 s · stopped");
+        st.filter.orbitals = false;
+        assert_eq!(items(&st), vec![Item::Row(0)]);
     }
 
     /// The chips filter by origin and by kept / not kept.

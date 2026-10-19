@@ -3,9 +3,12 @@
 //! between the solver threads and the render thread), one [`TeachEvent`] per teaching solve with
 //! the rule that caused it and what happened to the answer, lifetime [`SolveCounts`], the trust
 //! rule's conditions ([`TrustCheck`]), a stuck model's reason ([`StuckInfo`]) and the training
-//! views' data ([`TrainingViews`]). Atomic units (Hartree, Bohr), kelvin, milliseconds. Nothing
+//! views' data ([`TrainingViews`]), and the display eigensolve of unoccupied orbitals
+//! ([`DisplaySolve`], [`ActivityProbe::display_solve`]: display only, never a teaching solve).
+//! Atomic units (Hartree, Bohr), kelvin, milliseconds. Nothing
 //! here decides anything: the providers fill these from decisions they already made.
 use crate::AuditVerdict;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -131,6 +134,74 @@ pub struct ActivityProbe {
     refit_samples: AtomicU32,
     /// Refits ended so far (`end_refit`).
     refits: AtomicU64,
+    /// Start of the display eigensolve in flight (µs since `origin`), `u64::MAX` when none, and
+    /// the unoccupied orbitals it solves for (user request 2026-10-19: the Activity tab shows it).
+    display_started_us: AtomicU64,
+    display_unoccupied: AtomicU32,
+    /// Display eigensolves ended so far (finished or interrupted).
+    display_solves: AtomicU64,
+    /// Ended display eigensolves not yet taken by [`ActivityProbe::take_display_solves`]
+    /// (oldest first, at most [`DISPLAY_SOLVES_KEPT`]).
+    display_done: Mutex<VecDeque<DisplaySolve>>,
+}
+
+/// Ended display eigensolves the probe holds between two takes (the worker takes them at every
+/// publish, so this only bounds a worker that stopped publishing).
+pub const DISPLAY_SOLVES_KEPT: usize = 256;
+
+/// One display eigensolve (the unoccupied orbitals of the Orbitals view, computed on the
+/// converged state after a DFT step): display only — it never feeds the solve, so it is not a
+/// [`TeachEvent`] and no counter counts it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplaySolve {
+    /// When it ended.
+    pub at: Instant,
+    /// Wall time (ms).
+    pub ms: f64,
+    /// Unoccupied orbitals per spin channel it solved for.
+    pub unoccupied: u32,
+    /// A scene edit or Pause (the driver's display interrupt) stopped it before the end.
+    pub interrupted: bool,
+}
+
+/// Marks a display eigensolve running until [`DisplayBusy::finish`] (or a drop, which records it
+/// as interrupted: an error or a panic ends it too).
+#[must_use]
+pub struct DisplayBusy {
+    probe: Arc<ActivityProbe>,
+    started: Instant,
+    unoccupied: u32,
+    done: bool,
+}
+
+impl DisplayBusy {
+    /// The eigensolve ended; `interrupted` when it did not finish.
+    pub fn finish(mut self, interrupted: bool) {
+        self.end(interrupted);
+    }
+
+    fn end(&mut self, interrupted: bool) {
+        if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        let p = &self.probe;
+        let rec = DisplaySolve { at: Instant::now(), ms: self.started.elapsed().as_secs_f64() * 1e3, unoccupied: self.unoccupied, interrupted };
+        {
+            let mut q = p.display_done.lock().unwrap_or_else(|e| e.into_inner());
+            if q.len() == DISPLAY_SOLVES_KEPT {
+                q.pop_front();
+            }
+            q.push_back(rec);
+        }
+        p.display_started_us.store(u64::MAX, Relaxed);
+        p.display_solves.fetch_add(1, Relaxed);
+    }
+}
+
+impl Drop for DisplayBusy {
+    fn drop(&mut self) {
+        self.end(true);
+    }
 }
 
 /// Marks a slot running until dropped (an error, a cancel or a panic clears it too).
@@ -170,6 +241,10 @@ pub struct ProbeView {
     pub refit: Option<(f64, u32)>,
     /// Refits ended so far (successful or not).
     pub refits: u64,
+    /// (seconds since it started, unoccupied orbitals) while a display eigensolve runs.
+    pub display: Option<(f64, u32)>,
+    /// Display eigensolves ended so far.
+    pub display_solves: u64,
 }
 
 impl ActivityProbe {
@@ -181,6 +256,10 @@ impl ActivityProbe {
             refit_started_us: AtomicU64::new(u64::MAX),
             refit_samples: AtomicU32::new(0),
             refits: AtomicU64::new(0),
+            display_started_us: AtomicU64::new(u64::MAX),
+            display_unoccupied: AtomicU32::new(0),
+            display_solves: AtomicU64::new(0),
+            display_done: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -271,6 +350,19 @@ impl ActivityProbe {
         self.refits.fetch_add(1, Relaxed);
     }
 
+    /// A display eigensolve of `unoccupied` orbitals starts; it ends with the guard's `finish`.
+    pub fn display_solve(self: &Arc<Self>, unoccupied: usize) -> DisplayBusy {
+        let unoccupied = unoccupied.min(u32::MAX as usize) as u32;
+        self.display_unoccupied.store(unoccupied, Relaxed);
+        self.display_started_us.store(self.now_us(), Relaxed);
+        DisplayBusy { probe: self.clone(), started: Instant::now(), unoccupied, done: false }
+    }
+
+    /// The display eigensolves that ended since the last take, oldest first.
+    pub fn take_display_solves(&self) -> Vec<DisplaySolve> {
+        self.display_done.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
+    }
+
     pub fn view(&self) -> ProbeView {
         let now = self.now_us();
         let slot = |s: &SolveSlot| {
@@ -289,6 +381,11 @@ impl ActivityProbe {
             side: slot(&self.side),
             refit: (r != u64::MAX).then(|| (now.saturating_sub(r) as f64 * 1e-6, self.refit_samples.load(Relaxed))),
             refits: self.refits.load(Relaxed),
+            display: {
+                let d = self.display_started_us.load(Relaxed);
+                (d != u64::MAX).then(|| (now.saturating_sub(d) as f64 * 1e-6, self.display_unoccupied.load(Relaxed)))
+            },
+            display_solves: self.display_solves.load(Relaxed),
         }
     }
 }
@@ -786,6 +883,28 @@ mod tests {
         assert_eq!(p.view().refits, 0, "counted when it ends");
         p.end_refit();
         assert_eq!((p.view().refit, p.view().refits), (None, 1));
+    }
+
+    /// The display eigensolve: running while the guard lives, recorded once with its time when it
+    /// ends (a dropped guard is an interruption), taken once.
+    #[test]
+    fn the_display_eigensolve_is_reported_and_taken_once() {
+        let p = ActivityProbe::new();
+        assert_eq!((p.view().display, p.view().display_solves), (None, 0));
+        let b = p.display_solve(4);
+        assert!(matches!(p.view().display, Some((t, 4)) if t >= 0.0));
+        b.finish(false);
+        assert_eq!((p.view().display, p.view().display_solves), (None, 1));
+        drop(p.display_solve(2));
+        let v = p.take_display_solves();
+        assert_eq!(v.iter().map(|d| (d.unoccupied, d.interrupted)).collect::<Vec<_>>(), vec![(4, false), (2, true)]);
+        assert!(v.iter().all(|d| d.ms >= 0.0));
+        assert!(p.take_display_solves().is_empty(), "a take drains them");
+        assert_eq!(p.view().display_solves, 2);
+        for _ in 0..DISPLAY_SOLVES_KEPT + 3 {
+            p.display_solve(1).finish(false);
+        }
+        assert_eq!(p.take_display_solves().len(), DISPLAY_SOLVES_KEPT, "bounded: the oldest go first");
     }
 
     #[test]
