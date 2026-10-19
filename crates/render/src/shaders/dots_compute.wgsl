@@ -154,7 +154,11 @@ fn fade_at(p: vec3<f32>) -> f32 {
     if (prm.cut <= 0.0) { return 1.0; }
     let nc = cells();
     let gmax = rows[2u * nc.y * nc.z];
-    let s = sqrt(clamp(field_at(p) / max(gmax, 1e-30), 0.0, 1.0));
+    // the coloured orbitals: each is scaled to its own peak in the mix (`a` = Σ ψ_k² / max ψ_k²), so
+    // `a` itself is the local orbital's share of its own peak — each orbital feathers on its own
+    // (against the mix's maximum, where orbitals overlap near a nucleus, the big ones set the cut)
+    let v = field_at(p);
+    let s = select(sqrt(clamp(v / max(gmax, 1e-30), 0.0, 1.0)), sqrt(clamp(v, 0.0, 1.0)), prm.use_colour != 0u);
     return max(smoothstep(0.4 * prm.cut, prm.cut, s), 0.004);
 }
 
