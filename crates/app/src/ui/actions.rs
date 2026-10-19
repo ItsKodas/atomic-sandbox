@@ -166,6 +166,18 @@ pub enum Action {
     ColourLook(sim::ColourLook),
     /// View: the shown fields follow the atoms (`UiState::warp_fields`; display only).
     WarpFields(bool),
+    /// Readouts ▸ Compare with reference: the current geometry answered by PySCF in a separate
+    /// process (`crate::reference`), compared on the comparable quantities; with `relax`, our relax
+    /// (`DynCommand::Relax`) and theirs from the same start. Never feeds the dynamics. Recorded,
+    /// not replayable (it runs an external program).
+    CompareReference { method: crate::reference::Method, relax: bool },
+    /// Kill the reference process in flight (script word `cancel-compare`).
+    CancelCompare,
+    /// "Set up PySCF" (`reference::setup`): the first press shows the plan, the second installs.
+    /// Recorded, not replayable (it installs software); a replay skips it.
+    SetupPyscf,
+    /// Stop the setup at its current step.
+    CancelSetup,
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -484,6 +496,14 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
+        Action::CompareReference { method, relax } => compare_reference(st, input, method, relax, out),
+        Action::CancelCompare => st.compare.cancel(),
+        Action::SetupPyscf => st.compare.setup_pressed(),
+        Action::CancelSetup => {
+            if let Some(x) = &st.compare.setup {
+                x.cancel();
+            }
+        }
         Action::SmoothMotion(on) => st.smooth_motion = on,
         Action::Show(mode) => {
             let was = st.show;
@@ -585,6 +605,60 @@ fn homo_of(input: &PanelInput<'_>) -> Option<(sim::Spin, u32)> {
         .map(|r| (r.spin, r.track))
 }
 
+/// Compare: captures our side from the snapshot and starts the helper (and our relax with
+/// `relax`); refuses, with the reason on the status line, when there is nothing comparable yet.
+fn compare_reference(st: &mut UiState, input: &PanelInput<'_>, method: crate::reference::Method, relax: bool, out: &mut PanelOutput) {
+    let refuse = |st: &mut UiState, why: &str| st.set_status(&format!("compare: {why}"));
+    let Some(s) = input.snapshot else { return refuse(st, "no solution yet") };
+    let d = &s.dynamics;
+    if d.scene.nuclei.is_empty() {
+        return refuse(st, "the scene is empty");
+    }
+    if d.forces_stale || d.forces.len() != d.scene.nuclei.len() {
+        return refuse(st, "the forces at this geometry are not in yet — try again after the next solve");
+    }
+    if relax && input.sampling() {
+        return refuse(st, "a sampling pass is running — let it finish (or Cancel it) first");
+    }
+    let positions: Vec<[f64; 3]> = d.scene.nuclei.iter().map(|n| n.pos).collect();
+    let (bonds, bonds_from_graph) = crate::reference::pairs_for(positions.len(), d.bonds.as_deref());
+    let ours = crate::reference::Ours {
+        z: d.scene.nuclei.iter().map(|n| n.z).collect(),
+        dipole: d.charges.as_ref().filter(|c| c.balanced() && c.positions == positions).map(|c| c.dipole),
+        positions,
+        forces: d.forces.clone(),
+        energy: d.energy_ks,
+        pseudised: !d.eval.pseudised.is_empty(),
+        estimated: s.backend == Backend::Estimated,
+        engine: s.engine.label().to_string(),
+        sigma: s.scene.sigma.unwrap_or(s.scene.grid_h),
+        grid: (s.scene.grid_n, s.scene.grid_h),
+        charge: d.scene.charge,
+        relaxed: None,
+        relax_note: None,
+        bonds,
+        bonds_from_graph,
+        constraints: [
+            (d.walls.is_some(), "container walls"),
+            (d.pins.iter().any(|&p| p), "pinned atoms"),
+            (d.scene.external_field != [0.0; 3], "an external field"),
+        ]
+        .into_iter()
+        .filter_map(|(on, what)| on.then_some(what))
+        .collect(),
+    };
+    match st.compare.start(ours, method, relax, d.scene.multiplicity, d.relax.clone()) {
+        Ok(()) => {
+            st.compare.method = method;
+            if relax {
+                out.commands.push(Command::Dyn(DynCommand::Relax));
+            }
+            st.set_status(&format!("comparing with PySCF {} / {}{}", method.short(), crate::reference::DEFAULT_BASIS, if relax { ", relaxing both" } else { "" }));
+        }
+        Err(why) => refuse(st, &why),
+    }
+}
+
 impl Action {
     /// The action as a replay script's words (`action <words>`, `crate::replay`), the inverse of
     /// [`Action::parse`]. `None` for the actions whose meaning lives in panel state a script does
@@ -647,6 +721,7 @@ impl Action {
             ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
             WarpFields(on) => format!("warp-fields {on}"),
+            CancelCompare => "cancel-compare".into(),
             ColourLook(l) => format!(
                 "colour-look {} {} {}",
                 match l.enclose {
@@ -666,7 +741,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | CompareReference { .. } | SetupPyscf | CancelSetup => return None,
         })
     }
 
@@ -690,7 +765,7 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" => {
+            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
@@ -705,6 +780,7 @@ impl Action {
                     "relax" => Relax,
                     "refresh-bonds" => RefreshBonds,
                     "orbital-include-reset" => IncludeAllOccupied,
+                    "cancel-compare" => CancelCompare,
                     _ => StopRelax,
                 }
             }

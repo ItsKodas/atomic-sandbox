@@ -1,7 +1,8 @@
 //! The Readouts tab: T, drift and the measured rate as tiles; the energies (Ha, eV or both)
 //! with the work rows; time and cost; a small E total / T sparkline; health (box, dt and
 //! evaluation warnings, the newest dynamics notes); and the collapsible energy breakdown and
-//! solver diagnostics (rows 51–72 and 111–127 of the mapping).
+//! solver diagnostics (rows 51–72 and 111–127 of the mapping); and the reference comparison
+//! (`super::compare`).
 use super::super::pseudo;
 use super::super::{
     box_warning, drift_colour, energy_cells, search, theme, GraphSeries, PanelInput, UiState, AMBER, BOX_MARGIN_WARN, GREEN,
@@ -32,7 +33,7 @@ fn tile(ui: &mut Ui, key: &str, value: RichText, unit: &str, tip: &str) {
         .on_hover_text(tip);
 }
 
-pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<super::super::Action>) {
     let Some(s) = input.snapshot else {
         ui.weak("no solution yet");
         return;
@@ -220,6 +221,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         }
     });
     breakdown(ui, st, s);
+    super::compare::show(ui, st, input, acts);
 }
 
 fn health(ui: &mut Ui, c: Color32, text: &str) {

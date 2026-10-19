@@ -2851,6 +2851,7 @@ impl Dynamics {
         };
         let Some(rho) = self.provider.sample_density(&nodes).filter(|r| r.len() == nodes.len()) else { return };
         let (q, electrons) = crate::charges::hirshfeld(pro.tables(), &pos, &counted, &cell, &rho);
+        let dipole = crate::charges::dipole(&pos, &counted, &cell, &rho);
         self.charges = Some(Arc::new(PartialCharges {
             q,
             counted,
@@ -2862,6 +2863,7 @@ impl Dynamics {
             step: self.step,
             source: ChargeSource::Step,
             ionic,
+            dipole,
         }));
     }
 
@@ -2890,6 +2892,7 @@ impl Dynamics {
         let pro = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(cell, sigma, tol, name, zz, &ionic), cell, positions, &z)
             .map_err(|missing| format!("{} atom reference(s) missing", missing.len()))?;
         let (q, electrons) = crate::charges::hirshfeld(pro.tables(), positions, &counted, cell, rho);
+        let dipole = crate::charges::dipole(positions, &counted, cell, rho);
         self.charges = Some(Arc::new(PartialCharges {
             q,
             counted,
@@ -2901,6 +2904,7 @@ impl Dynamics {
             step: self.step,
             source: ChargeSource::Side(kind),
             ionic,
+            dipole,
         }));
         self.seq += 1;
         Ok(())

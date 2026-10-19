@@ -7,6 +7,7 @@
 //! its own open flag, selected tab and ONE width shared by its tabs (`UiState::left_*` / `dock_*`);
 //! the panel sits at the window's edge and the strip next to the 3D view, mirrored on the left.
 //! All of it is display state: none of it is an `Action`, so nothing here is recorded.
+mod compare;
 mod graph;
 mod log;
 pub mod model;
@@ -303,7 +304,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             match tab {
-                DockTab::Readouts => readouts::show(ui, st, input),
+                DockTab::Readouts => readouts::show(ui, st, input, acts),
                 DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
                 DockTab::Activity => super::activity::show(ui, st, input, acts),
