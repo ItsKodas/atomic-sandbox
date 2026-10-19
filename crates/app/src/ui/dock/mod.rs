@@ -49,7 +49,7 @@ fn side(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<
         };
         panel
             .resizable(true)
-            .default_size(420.0)
+            .default_size(336.0) // 420 − 20 % (user request 2026-10-19)
             .size_range(280.0..=720.0)
             .frame(Frame::new().fill(theme::PANEL).inner_margin(margin))
             .show(root, |ui| body(ui, st, input, acts, side));
