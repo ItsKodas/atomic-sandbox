@@ -482,7 +482,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                                 .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
                             ui.add_space(8.0);
                             ui.label("size");
-                            ui.add(egui::Slider::new(&mut st.dots_size, 0.5..=3.0).show_value(false)).on_hover_text("the dots' size");
+                            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
                         });
                     });
                 }
