@@ -624,6 +624,10 @@ pub struct UiState {
     /// The display warp (`render::warp`, user request 2026-10-20): the shown density or orbitals
     /// follow the atoms from the geometry they were solved at to where they are drawn now. Display only.
     pub warp_fields: bool,
+    /// Bloom (`render::bloom`, display only): the glow strength (0 = off) and the brightness it
+    /// starts at (0–1 of full white).
+    pub bloom: f32,
+    pub bloom_threshold: f32,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
@@ -884,6 +888,8 @@ right {}
             smooth_motion: true,
             cloud_superposition: true,
             warp_fields: true,
+            bloom: 0.35,
+            bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
             dock_tab: DockTab::Model,

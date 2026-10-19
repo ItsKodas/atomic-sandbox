@@ -795,6 +795,7 @@ impl App {
             colour: &view,
             depth: &g.surface.depth,
             size: [g.surface.config.width, g.surface.config.height],
+            sampleable: g.surface.sampleable,
         };
         let shown = v.shown_scene(Instant::now());
         let lines = v.overlay_lines(&shown);

@@ -482,6 +482,7 @@ impl Shot {
                 colour: &self.hl.colour_view,
                 depth: &self.hl.depth,
                 size: [w, h],
+                sampleable: false,
             };
             let shown = viewer.shown_scene(Instant::now());
             let lines = viewer.overlay_lines(&shown);

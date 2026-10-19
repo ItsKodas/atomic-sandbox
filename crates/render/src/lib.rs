@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod camera;
 pub mod dots;
 pub mod elements;

@@ -93,14 +93,18 @@ impl GpuContext {
     }
 }
 
-pub struct SurfaceState { pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub depth: wgpu::TextureView }
+/// `sampleable`: the frames can also be read as textures (`TEXTURE_BINDING`, when the surface offers it): the
+/// viewer's bloom reads the finished 3D frame.
+pub struct SurfaceState { pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub depth: wgpu::TextureView, pub sampleable: bool }
 
 impl SurfaceState {
     pub fn new(ctx: &GpuContext, surface: wgpu::Surface<'static>, width: u32, height: u32) -> SurfaceState {
         let caps = surface.get_capabilities(&ctx.adapter);
         let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let sampleable = caps.usages.contains(wgpu::TextureUsages::TEXTURE_BINDING);
+        let usage = if sampleable { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING } else { wgpu::TextureUsages::RENDER_ATTACHMENT };
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format,
+            usage, format,
             width: width.max(1), height: height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync, alpha_mode: caps.alpha_modes[0],
             view_formats: vec![], desired_maximum_frame_latency: 2,
@@ -108,7 +112,7 @@ impl SurfaceState {
         };
         surface.configure(&ctx.device, &config);
         let depth = Self::make_depth(ctx, config.width, config.height);
-        SurfaceState { surface, config, depth }
+        SurfaceState { surface, config, depth, sampleable }
     }
     fn make_depth(ctx: &GpuContext, w: u32, h: u32) -> wgpu::TextureView {
         ctx.device.create_texture(&wgpu::TextureDescriptor {

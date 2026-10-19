@@ -55,6 +55,8 @@ pub struct Target<'a> {
     pub depth: &'a wgpu::TextureView,
     /// Physical pixels.
     pub size: [u32; 2],
+    /// `colour` can be sampled (the target has `TEXTURE_BINDING`): bloom is drawn.
+    pub sampleable: bool,
 }
 
 /// What the 3D part of a frame shows.
@@ -179,6 +181,10 @@ pub struct Painter {
     dots_size: f32,
     dots_brightness: f32,
     dots_feather: f32,
+    /// Bloom (`render::bloom`): its strength (0 = off) and threshold, from View.
+    bloom: render::bloom::Bloom,
+    bloom_intensity: f32,
+    bloom_threshold: f32,
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
     /// one bound): created by the painter, never handed out (so uploading into them cannot touch
@@ -249,6 +255,9 @@ impl Painter {
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            bloom: render::bloom::Bloom::new(ctx, format),
+            bloom_intensity: 0.0,
+            bloom_threshold: 0.7,
             renderer: Renderer::new(ctx, format),
             uploads: [None, None],
             uploaded: None,
@@ -614,6 +623,7 @@ impl Painter {
         // the dots' look (View ▸ Density ▸ dots)
         self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
         (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather);
+        (self.bloom_intensity, self.bloom_threshold) = (ui.bloom, ui.bloom_threshold);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
             let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
@@ -784,6 +794,10 @@ impl Painter {
             });
         self.renderer
             .render_in(&mut enc, target.colour, target.depth, self.clear, Some((vp, target.size)));
+        // the glow of the bright parts, over the 3D frame and under the UI
+        if target.sampleable {
+            self.bloom.apply(ctx, &mut enc, target.colour, target.colour, target.size, self.bloom_intensity, self.bloom_threshold);
+        }
         let extra = self
             .egui
             .update_buffers(&ctx.device, &ctx.queue, &mut enc, &jobs, &screen);

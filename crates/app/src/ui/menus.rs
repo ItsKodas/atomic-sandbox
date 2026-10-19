@@ -754,6 +754,19 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 }
             });
         });
+        // bloom: the bright parts glow (display only)
+        ui.horizontal(|ui| {
+            ui.label("bloom");
+            ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2))
+                .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
+        });
+        ui.add_enabled_ui(st.bloom > 0.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("bloom from");
+                ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2))
+                    .on_hover_text("how bright a part must be to glow (1 = only full white)");
+            });
+        });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
         theme::section(ui, "Camera");
