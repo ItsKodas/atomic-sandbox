@@ -1680,7 +1680,8 @@ impl Viewer {
     /// at its centroid as drawn now, faded with the bonds when the graph is an earlier step's;
     /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
     fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
-        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
+        // nor over the File window (they are drawn on the foreground layer)
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open {
             return;
         }
         let ppp = root.pixels_per_point();
@@ -1846,6 +1847,8 @@ impl Viewer {
             }
             outs.push(out);
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
+            // the guides, not over the File window (they share its foreground layer)
+            let guide_vp = if self.ui.files.open { Viewport { size: [0.0, 0.0], ..viewport } } else { viewport };
             Self::distance_overlay(
                 root,
                 &self.camera,
@@ -1854,7 +1857,7 @@ impl Viewer {
                 self.ui.mode,
                 self.drag_target,
                 pins,
-                viewport,
+                guide_vp,
                 self.tool.dragging.then(|| {
                     let mut l = ui::pull_label(self.ui.drag_force);
                     if !self.playing {

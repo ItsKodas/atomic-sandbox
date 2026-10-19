@@ -148,13 +148,16 @@ fn symbols(zs: &[u8]) -> String {
     zs.iter().map(|&z| units::elements::symbol(z)).collect::<Vec<_>>().join(", ")
 }
 
+/// A scene card's width, in points.
+const CARD_W: f32 = 168.0;
+
 /// A quick drawing of the nuclei: tilted, sorted back to front, coloured by element.
 fn preview(ui: &mut Ui, scene: Option<&Scene>, size: Vec2) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, theme::APP);
     let Some(s) = scene.filter(|s| !s.nuclei.is_empty()) else {
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, "empty", egui::FontId::proportional(11.0), theme::INK_FAINT);
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, "empty", egui::FontId::proportional(14.0), theme::INK_FAINT);
         return;
     };
     let (ca, sa) = (0.5f64.cos(), 0.5f64.sin()); // about y
@@ -176,7 +179,7 @@ fn preview(ui: &mut Ui, scene: Option<&Scene>, size: Vec2) {
     pts.sort_by(|a, b| a.2.total_cmp(&b.2));
     for (x, y, _, z) in pts {
         let centre = rect.center() + Vec2::new((x * scale) as f32, (-y * scale) as f32);
-        let r = (render::elements::radius(z) as f64 * scale * 0.9).clamp(3.0, 18.0) as f32;
+        let r = (render::elements::radius(z) as f64 * scale * 0.9).clamp(5.0, 30.0) as f32;
         let [cr, cg, cb] = render::elements::colour_srgb(z);
         p.circle_filled(centre, r, Color32::from_rgb(cr, cg, cb));
         p.circle_filled(centre - Vec2::splat(r * 0.3), r * 0.28, Color32::from_white_alpha(150));
@@ -189,12 +192,16 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
         return;
     }
     let mut open = true;
+    // most of the app window: 80 % of it, at most 1280 × 900 points
+    let screen = ctx.content_rect();
+    let size = Vec2::new((screen.width() * 0.8).min(1280.0), (screen.height() * 0.8).min(900.0));
     egui::Window::new("Files")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size([740.0, 0.0])
+        .fixed_size(size)
         .frame(egui::Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(10).inner_margin(14).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) }))
         .show(ctx, |ui| body(ui, st, input, acts));
     if !open {
@@ -214,9 +221,11 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             }
         });
     });
-    egui::ScrollArea::vertical().id_salt("files-scenes").max_height(290.0).show(ui, |ui| {
+    // the scenes take a little over half the height, the models the rest
+    let total = ui.available_height();
+    egui::ScrollArea::vertical().id_salt("files-scenes").auto_shrink([false, false]).max_height(total * 0.5).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+            ui.spacing_mut().item_spacing = Vec2::splat(12.0);
             for i in 0..st.files.scenes.len() {
                 let on = i == st.files.selected;
                 let current = st.files.scenes[i].source == st.source;
@@ -224,13 +233,13 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     .fill(if on { theme::ACCENT_BG } else { theme::PANEL_2 })
                     .stroke(Stroke::new(1.0, if on { theme::ACCENT } else { theme::LINE }))
                     .corner_radius(8)
-                    .inner_margin(6)
+                    .inner_margin(8)
                     .show(ui, |ui| {
-                        ui.set_width(98.0);
+                        ui.set_width(CARD_W);
                         ui.vertical_centered(|ui| {
                             let e = &st.files.scenes[i];
-                            preview(ui, e.scene.as_ref().ok(), Vec2::new(98.0, 70.0));
-                            let mut name = RichText::new(&e.name).size(12.5);
+                            preview(ui, e.scene.as_ref().ok(), Vec2::new(CARD_W, CARD_W * 0.72));
+                            let mut name = RichText::new(&e.name).size(15.0);
                             if current {
                                 name = name.color(theme::ACCENT_INK).strong();
                             }
@@ -302,7 +311,8 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         });
     }
     let scene = st.files.scenes.get(st.files.selected).and_then(|e| e.scene.as_ref().ok()).cloned();
-    egui::ScrollArea::vertical().id_salt("files-models").max_height(200.0).show(ui, |ui| {
+    let rest = (ui.available_height() - 80.0).max(120.0);
+    egui::ScrollArea::vertical().id_salt("files-models").auto_shrink([false, false]).max_height(rest).show(ui, |ui| {
         if st.files.models.is_empty() {
             theme::note(ui, "No models yet: train one in the Estimated solver, then save it below.");
         }
@@ -321,7 +331,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             egui::Frame::new().fill(theme::PANEL_2).corner_radius(6).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&m.name).strong().size(13.0));
+                    ui.label(RichText::new(&m.name).strong().size(15.0));
                     theme::pill(ui, chip, colour);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can = estimated && sel_current && !input.sampling() && matches!(f, Fit::Ready | Fit::Settings(_));
@@ -345,7 +355,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     lines.push(detail);
                 }
                 if !lines.is_empty() {
-                    ui.label(RichText::new(lines.join(" · ")).size(11.5).color(theme::INK_DIM));
+                    ui.label(RichText::new(lines.join(" · ")).size(13.0).color(theme::INK_DIM));
                 }
             });
         }
