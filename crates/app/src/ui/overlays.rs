@@ -591,19 +591,33 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
         .fixed_pos(view.max - Vec2::splat(14.0))
         .order(Order::Middle)
         .show(ctx, |ui| {
-            let word = if busy { "      Solving…" } else if stale { "Bonds & angles now" } else { "Bonds & angles: current" };
+            if busy {
+                // a spinner beside the word (not over it), in the button's place
+                egui::Frame::new()
+                    .fill(theme::GLOW)
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.set_min_width(172.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(16.0).color(egui::Color32::WHITE));
+                            ui.label(egui::RichText::new("Solving…").strong().size(14.0).color(egui::Color32::WHITE));
+                        });
+                    })
+                    .response
+                    .on_hover_text("one DFT solve at the current positions, then the bonds and angles");
+                return;
+            }
+            let word = if stale { "Bonds & angles now" } else { "Bonds & angles: current" };
             let b = egui::Button::new(egui::RichText::new(word).strong().size(14.0).color(egui::Color32::WHITE))
-                .fill(if busy || stale { theme::GLOW } else { theme::PANEL_3 })
+                .fill(if stale { theme::GLOW } else { theme::PANEL_3 })
                 .stroke(egui::Stroke::new(1.0, theme::ACCENT))
                 .corner_radius(8)
                 .min_size(Vec2::new(200.0, 36.0));
-            let r = ui.add_enabled(!busy && !input.sampling(), b).on_hover_text(
+            let r = ui.add_enabled(!input.sampling(), b).on_hover_text(
                 "the model's steps carry no density, so the bonds and angles shown are from the last DFT step: this solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
             );
-            if busy {
-                let spin = egui::Rect::from_center_size(egui::pos2(r.rect.left() + 22.0, r.rect.center().y), Vec2::splat(16.0));
-                ui.put(spin, egui::Spinner::new().size(16.0).color(egui::Color32::WHITE));
-            }
             if r.clicked() {
                 acts.push(Action::RefreshBonds);
             }
