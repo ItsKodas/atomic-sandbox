@@ -500,32 +500,43 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             };
             egui::Frame::new().fill(theme::PANEL_2).corner_radius(6).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&m.name).strong().size(15.0));
-                    theme::pill(ui, chip, colour);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can = estimated && sel_current && !input.sampling() && matches!(f, Fit::Ready | Fit::Settings(_));
-                        let hover = if !estimated {
-                            "switch to the Estimated solver first"
-                        } else if !sel_current {
-                            "open the selected scene first"
-                        } else {
-                            "load this model (a settings card appears when the scene must change)"
-                        };
-                        if ui.add_enabled(can, egui::Button::new("Load")).on_hover_text(hover).on_disabled_hover_text(hover).clicked() {
-                            load = Some(m.path.clone());
+                // the text on the left, the Load button on the right, centred on the text's height
+                const LOAD_W: f32 = 120.0;
+                let text_w = (ui.available_width() - LOAD_W - 16.0).max(120.0);
+                let text = ui
+                    .allocate_ui(Vec2::new(text_w, 0.0), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&m.name).strong().size(15.0));
+                            theme::pill(ui, chip, colour);
+                        });
+                        let mut lines = Vec::new();
+                        if let Some(s) = &species {
+                            lines.push(s.clone());
                         }
-                    });
-                });
-                let mut lines = Vec::new();
-                if let Some(s) = &species {
-                    lines.push(s.clone());
-                }
-                if !detail.is_empty() {
-                    lines.push(detail);
-                }
-                if !lines.is_empty() {
-                    ui.label(RichText::new(lines.join(" · ")).size(13.0).color(theme::INK_DIM));
+                        if !detail.is_empty() {
+                            lines.push(detail);
+                        }
+                        if !lines.is_empty() {
+                            ui.label(RichText::new(lines.join(" · ")).size(13.0).color(theme::INK_DIM));
+                        }
+                    })
+                    .response
+                    .rect;
+                let can = estimated && sel_current && !input.sampling() && matches!(f, Fit::Ready | Fit::Settings(_));
+                let hover = if !estimated {
+                    "switch to the Estimated solver first"
+                } else if !sel_current {
+                    "open the selected scene first"
+                } else {
+                    "load this model (a settings card appears when the scene must change)"
+                };
+                let at = egui::Rect::from_center_size(egui::pos2(ui.max_rect().right() - LOAD_W / 2.0, text.center().y), Vec2::new(LOAD_W, 36.0));
+                let button = egui::Button::new(RichText::new("Load").size(15.0).strong().color(if can { Color32::WHITE } else { theme::INK_FAINT }))
+                    .fill(if can { theme::GLOW } else { theme::PANEL_3 })
+                    .stroke(Stroke::new(1.0, if can { theme::ACCENT } else { theme::LINE }))
+                    .corner_radius(8);
+                if ui.put(at, button.sense(if can { Sense::click() } else { Sense::hover() })).on_hover_text(hover).clicked() && can {
+                    load = Some(m.path.clone());
                 }
             });
         }
