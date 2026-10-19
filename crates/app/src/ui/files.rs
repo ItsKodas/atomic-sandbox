@@ -451,7 +451,16 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                                         Vec2::new(card_w, CARD_W * 0.72),
                                     );
                                     }
-                                    let mut name = RichText::new(&e.name).size(15.0);
+                                    // the molecule's common name in brackets, from its atoms (`names::common_name`)
+                                    let common = e.scene.as_ref().ok().and_then(|s| {
+                                        let z: Vec<u8> = s.nuclei.iter().map(|n| n.z).collect();
+                                        crate::names::common_name(&z, s.charge)
+                                    });
+                                    let label = match common {
+                                        Some(c) => format!("{} ({c})", e.name),
+                                        None => e.name.clone(),
+                                    };
+                                    let mut name = RichText::new(label).size(15.0);
                                     if current {
                                         name = name.color(theme::ACCENT_INK).strong();
                                     }
