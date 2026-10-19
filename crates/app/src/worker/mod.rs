@@ -530,6 +530,11 @@ fn has_work(s: &DynSnapshot) -> bool {
         || sampling_active(s)
 }
 
+/// The shortest wall time between two side densities partitioned into charges
+/// (`Worker::side_charges`): an n³ readback and partition (≈ 20 ms at 81³) about once a second,
+/// whatever the audit rate.
+const SIDE_CHARGES_EVERY: Duration = Duration::from_secs(1);
+
 /// Idle but for a bond reference to poll (`bonds_pending`): the worker ticks once per
 /// [`TICK_BUDGET_MS`] (paced, never a spin, never a block) and publishes only when the
 /// reference's progress changes or it lands (`reference_key`); a command still lands at once
@@ -622,6 +627,10 @@ struct Worker {
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
     /// The Activity view's worker state (`activity` module doc).
     activity: ActivityWork,
+    /// The side density last partitioned into charges (its `SideDensity::seq`) and when
+    /// ([`Worker::side_charges`]).
+    side_charges_seq: u64,
+    side_charges_at: Option<Instant>,
 }
 
 /// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
@@ -792,6 +801,8 @@ fn worker(
         last_refresh: None,
         profiles: Arc::new(Vec::new()),
         labels: None,
+        side_charges_seq: 0,
+        side_charges_at: None,
         atom_pending: None,
         gpu: gpu_readback,
         activity: ActivityWork::starting_at(run_start),
@@ -913,6 +924,7 @@ impl Worker {
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
         self.cloud_jobs(&snap);
+        self.side_charges(&mut snap);
         self.orbital_retry(&snap);
         // paused with a background job in flight (an orbital refresh asked for by a changed view or
         // the retry above): poll it once a budget, like a bond reference — else its answer waits in
@@ -1006,6 +1018,35 @@ impl Worker {
             if !snap.paused && due && s.request_display(&snap.scene) {
                 self.last_refresh = Some(Instant::now());
             }
+        }
+    }
+
+    /// Estimated mode's partial charges between teacher steps (`sim::charges`; display only): a
+    /// new side density — an audit's or a display refresh's, already on its way to the viewer —
+    /// is read back (a GPU texture: one n³ readback, as for the cloud's atom densities) and
+    /// partitioned by the driver against its bond references (`Dynamics::measure_side_charges`),
+    /// at most once per [`SIDE_CHARGES_EVERY`]. Skipped while the partial core is shown (the side
+    /// texture then holds ρ + ρ_pc, not the solve's electrons).
+    fn side_charges(&mut self, snap: &mut DynSnapshot) {
+        let Some(sd) = snap.side_display.as_ref() else { return };
+        if sd.seq == self.side_charges_seq || snap.display_partial_core || self.side_charges_at.is_some_and(|t| t.elapsed() < SIDE_CHARGES_EVERY) {
+            return;
+        }
+        // the partition's nodes are the centred cell's (`qm::Grid::cube`)
+        let centred = |cell: &sim::Cell, origin: &[f64; 3]| *cell == snap.scene.cell && origin.iter().all(|&o| (o + cell.half_extent()).abs() < 1e-9);
+        let values: Vec<f64> = match &sd.display {
+            sim::Display::Cpu { rho, cell, origin, .. } if centred(cell, origin) => rho.iter().map(|&v| v as f64).collect(),
+            sim::Display::Gpu { volume, cell, origin, .. } if centred(cell, origin) && volume.len() == cell.n.pow(3) => match self.gpu.as_ref().map(|ctx| volume.read_back(ctx)) {
+                Some(Ok(v)) => v.into_iter().map(f64::from).collect(),
+                _ => return, // the device was busy: the next side density
+            },
+            _ => return,
+        };
+        self.side_charges_seq = sd.seq;
+        self.side_charges_at = Some(Instant::now());
+        let (cell, positions, t, kind) = (snap.scene.cell.clone(), sd.positions.clone(), sd.t, sd.kind);
+        if self.dy.measure_side_charges(&values, &cell, &positions, t, kind).is_ok() {
+            snap.charges = self.dy.charges();
         }
     }
 

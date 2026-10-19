@@ -418,6 +418,21 @@
 //! the last graph and sets `bonds_stale`; a nucleus count change drops the graph (`bonds =
 //! None`) until the next evaluation with a density, so a graph with wrong indices is never
 //! published. The driver never sees a grid: it hands the detector numbers at points.
+//! # Partial charges (`crate::charges`; display only)
+//! Right after the graph, from the same density: the provider is asked for ρ at every node of
+//! the cell (one `sample_density` of n³ points — a node returns its stored value to rounding — the node list
+//! kept per grid) and for its counted charges (`ForceProvider::valence_charges`: Z, or Z_v for a
+//! pseudised species), and the Hirshfeld partition against the same reference tables as the
+//! detector's promolecule gives one charge per nucleus (`DynSnapshot::charges`, stamped with the
+//! step, its simulated time and positions). Nothing reads them back: no force, no energy, no
+//! solve depends on them. No density, a pending reference or a busy pseudopotential cache leave
+//! the last ones (the viewer fades them when their positions are not the scene's); a nucleus
+//! count change drops them with the graph. In estimated mode the app's worker also hands in the
+//! side densities it reads back ([`Dynamics::measure_side_charges`]), kept when not older than
+//! what is held: stamped with the side solve's time and positions, and the driver's step when
+//! they arrived (the side job's own step is not tracked). Costs, measured
+//! (`charges::tests::partition_cost_is_reported`): the partition is 12 ms for water at 81³ and
+//! 97 ms for 21 atoms at 95³ — against a DFT step of 0.3 s and seconds.
 //! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
 //! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
 //! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
@@ -477,6 +492,7 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
+use crate::charges::{ChargeSource, PartialCharges};
 use crate::integrator::Integrator;
 use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideKind, Source};
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
@@ -832,6 +848,10 @@ pub struct DynSnapshot {
     pub bond_reference: Option<ReferenceProgress>,
     /// Every pair of the latest graph, bonded or not, with the numbers behind its verdict.
     pub pair_reports: Vec<PairReport>,
+    /// The newest Hirshfeld partial charges (module doc, "Partial charges"; display only):
+    /// `None` before the first density with the references in, and after a nucleus count change.
+    /// Measured at `charges.positions` — compare with the scene (`PartialCharges::is_current`).
+    pub charges: Option<Arc<PartialCharges>>,
 }
 
 impl DynSnapshot {
@@ -909,6 +929,7 @@ impl Default for DynSnapshot {
             bonds_pending: Vec::new(),
             bond_reference: None,
             pair_reports: Vec::new(),
+            charges: None,
         }
     }
 }
@@ -1070,6 +1091,10 @@ pub struct Dynamics {
     bonds: Option<Arc<BondGraph>>,
     bonds_stale: bool,
     pair_reports: Vec<PairReport>,
+    /// The newest partial charges and the cell nodes they are sampled at (module doc, "Partial
+    /// charges"; the nodes rebuilt on a grid change).
+    charges: Option<Arc<PartialCharges>>,
+    charge_nodes: Option<(Cell, Arc<Vec<[f64; 3]>>)>,
     /// The provider's teaching events since the worker's last drain, stamped with their step
     /// (`crate::activity::TeachBuffer`, plan review M6).
     teach: crate::activity::TeachBuffer,
@@ -1157,6 +1182,8 @@ impl Dynamics {
             bonds: None,
             bonds_stale: false,
             pair_reports: Vec::new(),
+            charges: None,
+            charge_nodes: None,
             teach: Default::default(),
         };
         d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
@@ -1810,6 +1837,7 @@ impl Dynamics {
             bonds_pending: self.ref_queue.iter().copied().collect(),
             bond_reference: self.ref_job.as_ref().map(|j| ReferenceProgress { z: j.z, done: j.done, total: j.total, elapsed_s: j.started.elapsed().as_secs_f64() }),
             pair_reports: self.pair_reports.clone(),
+            charges: self.charges.clone(),
         }
     }
 
@@ -2572,6 +2600,7 @@ impl Dynamics {
         self.bonds = None;
         self.bonds_stale = false;
         self.pair_reports.clear();
+        self.charges = None;
     }
 
     /// The reference jobs (module doc): takes a finished job's answer, then starts the next
@@ -2808,6 +2837,71 @@ impl Dynamics {
         self.pair_reports = det.reports().to_vec();
         self.bonds_stale = false;
         self.density_refresh = false;
+        // the partial charges from the same density (module doc, "Partial charges")
+        let Some(counted) = self.provider.valence_charges(&self.scene) else { return };
+        let nodes = match &self.charge_nodes {
+            Some((c, nodes)) if *c == cell => nodes.clone(),
+            _ => {
+                let nodes = Arc::new(crate::references::shell_nodes(&cell, f64::INFINITY));
+                self.charge_nodes = Some((cell.clone(), nodes.clone()));
+                nodes
+            }
+        };
+        let Some(rho) = self.provider.sample_density(&nodes).filter(|r| r.len() == nodes.len()) else { return };
+        let (q, electrons) = crate::charges::hirshfeld(pro.tables(), &pos, &counted, &cell, &rho);
+        self.charges = Some(Arc::new(PartialCharges {
+            q,
+            counted,
+            z,
+            positions: pos,
+            electrons,
+            system_charge: self.scene.charge,
+            t: self.sim_time,
+            step: self.step,
+            source: ChargeSource::Step,
+            ionic,
+        }));
+    }
+
+    /// The newest partial charges (module doc, "Partial charges"), as the next snapshot will carry them.
+    pub fn charges(&self) -> Option<Arc<PartialCharges>> {
+        self.charges.clone()
+    }
+
+    /// Partial charges from a density solved off the stepping path (estimated mode's side
+    /// densities, read back by the app's worker; module doc, "Partial charges"): `rho` at the n³
+    /// nodes of `cell` in `qm::Grid` order, solved at `positions` at simulated time `t` (a.u.).
+    /// Kept as the snapshot's `charges` when the scene still has those nuclei, the references are
+    /// in and nothing newer is held; `Err` says why not (nothing is changed then).
+    pub fn measure_side_charges(&mut self, rho: &[f64], cell: &Cell, positions: &[[f64; 3]], t: f64, kind: SideKind) -> Result<(), String> {
+        if *cell != self.scene.cell || positions.len() != self.scene.nuclei.len() || rho.len() != cell.n * cell.n * cell.n {
+            return Err("the side density is not this scene's grid or nuclei".into());
+        }
+        if self.charges.as_ref().is_some_and(|c| c.t > t) {
+            return Err("newer charges are held".into());
+        }
+        let counted = self.provider.valence_charges(&self.scene).ok_or("the valence counts are not available now")?;
+        let (tol, name) = self.reference_solver();
+        let ionic = self.provider.ionic_tag(&self.scene);
+        let sigma = self.scene.sigma;
+        let z: Vec<u8> = self.scene.nuclei.iter().map(|x| x.z).collect();
+        let pro = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(cell, sigma, tol, name, zz, &ionic), cell, positions, &z)
+            .map_err(|missing| format!("{} atom reference(s) missing", missing.len()))?;
+        let (q, electrons) = crate::charges::hirshfeld(pro.tables(), positions, &counted, cell, rho);
+        self.charges = Some(Arc::new(PartialCharges {
+            q,
+            counted,
+            z,
+            positions: positions.to_vec(),
+            electrons,
+            system_charge: self.scene.charge,
+            t,
+            step: self.step,
+            source: ChargeSource::Side(kind),
+            ionic,
+        }));
+        self.seq += 1;
+        Ok(())
     }
 
     fn fail(&mut self, e: ProviderError) {

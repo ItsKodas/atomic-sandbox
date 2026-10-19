@@ -1800,6 +1800,11 @@ impl ForceProvider for SurrogateKs {
         self.teacher.ionic_tag(scene)
     }
 
+    /// The teacher's: its densities (stepping and background) are the ones partitioned.
+    fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
+        self.teacher.valence_charges(scene)
+    }
+
     /// Kept, sent with every background job (the auditor's teacher is the one producer of the shown density in
     /// estimated mode) and applied to the stepping teacher.
     fn set_display_partial_core(&mut self, on: bool) {

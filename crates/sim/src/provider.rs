@@ -781,6 +781,15 @@ pub trait ForceProvider: Send {
     fn ionic_tag(&self, scene: &Scene) -> String {
         scene.ionic.word().to_string()
     }
+    /// The charge each nucleus's electrons are counted against in the density this provider
+    /// solves `scene` with, in scene order: Z for an all-electron nucleus, the valence charge Z_v
+    /// for a pseudised one (`providers::pseudo::valence_charges`) — the Z_A of the Hirshfeld
+    /// charges (`crate::charges`, display only). `None` when it cannot be told now (the
+    /// pseudopotential cache is busy generating a table); the charges then wait. The default —
+    /// the analytic providers, which have no pseudopotentials — is Z.
+    fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
+        Some(scene.nuclei.iter().map(|n| n.z as f64).collect())
+    }
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task

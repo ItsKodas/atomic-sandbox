@@ -826,9 +826,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             );
         });
         ui.horizontal(|ui| {
+            probed("show-charges", ui.checkbox(&mut st.show_charges, "partial charges")).on_hover_text(super::CHARGES_TIP);
+        });
+        ui.horizontal(|ui| {
             ui.label("label opacity");
             ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
-                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths and angles (display only)");
+                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths, angles and partial charges (display only)");
             ui.label(format!("{:.0} %", st.label_opacity * 100.0));
         });
         ui.horizontal(|ui| {
@@ -1093,6 +1096,7 @@ fn help_menu(ui: &mut Ui, st: &mut UiState) {
             (HelpTopic::Gravity, "Gravity is invisible at atomic scale, by design"),
             (HelpTopic::AtomCard, "The atom card is a schematic"),
             (HelpTopic::FastPlay, "Fast play: shimmer, not swing"),
+            (HelpTopic::Charges, "Partial charges are one partition of many"),
         ] {
             if ui.add(Button::new(format!("{label}  ›")).frame_when_inactive(false)).clicked() {
                 st.help = Some(topic);
@@ -1147,6 +1151,12 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         HelpTopic::AtomCard => (
             "The atom card is a schematic",
             "The atom card is a labelled 2D Bohr-style schematic, not the simulation: the sandbox never resolves nucleons (the nucleus is a point of charge +Z and a mass), and in a molecule the electrons are shared — the density cloud in the 3D view is the real picture. Everything on it derives from Z and the isotope mass table: N = A − Z with A the mass number of the most abundant isotope, and the shell occupation is the textbook 2 / 8 / 8 / 18 filling of a neutral atom.".into(),
+        ),
+        HelpTopic::Charges => (
+            "Partial charges are one partition of many",
+            "The small +/− labels on the atoms (View ▸ Bonds and molecules ▸ partial charges; also Dock ▸ Selection and the hover badge) are Hirshfeld charges: q_A = Z_A − ∫ w_A ρ, where ρ is the solved electron density and w_A = ρ_A⁰ / Σ_B ρ_B⁰ shares every point between the atoms in proportion to their free-atom densities — this solver's own isolated neutral atoms, the same ones the bond detector compares with. Z_A is the nuclear charge, or the valence charge for a pseudopotential atom (its density is the valence density). Because the weights add up to one everywhere, the charges add up exactly to the scene's charge (Scene ▸ Charge); the viewer checks that and hides charges that do not.\n\n\
+             An atom's charge in a molecule is not an observable: it depends on how space is divided between the atoms. Hirshfeld is one parameter-free choice among several (Mulliken, Bader's QTAIM basins, fits to the electrostatic potential, iterative Hirshfeld-I) and is known to give small magnitudes — the free-atom weights pull the partition toward neutral atoms — so read the sign and the trend, not the size. They are measured from this LSDA density at this grid and smearing, so they carry its approximations too.\n\n\
+             Display only: computed after a converged DFT density and never fed back into the forces. Under the estimated solver a model step has no electrons, so the charges are the last DFT density's (a fallback, an audit or a display refresh), drawn faded with their time.".into(),
         ),
         HelpTopic::FastPlay => (
             "Fast play: shimmer, not swing",

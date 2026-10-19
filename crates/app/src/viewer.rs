@@ -1960,6 +1960,30 @@ impl Viewer {
             .collect()
     }
 
+    /// The partial-charge labels of this frame (`sim::charges`; View ▸ Bonds and molecules ▸ partial
+    /// charges): (nucleus, its charge, alpha, background alpha) for the charges that can be drawn
+    /// on `shown` (`ui::shown_charges`), faded like stale bonds when they were measured at another
+    /// geometry. With more than [`CHARGE_DECLUTTER`] atoms only the selected or hovered atom and its
+    /// bonded neighbours.
+    pub fn charge_labels(&self, shown: &Scene) -> Vec<(usize, f64, u8, u8)> {
+        if !self.ui.show_charges {
+            return Vec::new();
+        }
+        let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics) else { return Vec::new() };
+        let Some((c, current)) = ui::shown_charges(d).filter(|(c, _)| c.q.len() == shown.nuclei.len()) else { return Vec::new() };
+        let (alpha, bg) = if current { (235, 150) } else { (110, 70) };
+        let mut keep: Vec<usize> = (0..c.q.len()).collect();
+        if c.q.len() > CHARGE_DECLUTTER {
+            let focus: Vec<usize> = self.tool.selected.filter(|&i| i < shown.nuclei.len()).into_iter().chain(self.hovered_nucleus(shown)).collect();
+            let near = |i: usize| {
+                focus.contains(&i)
+                    || d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()).is_some_and(|g| g.bonds.iter().any(|b| (b.i == i && focus.contains(&b.j)) || (b.j == i && focus.contains(&b.i))))
+            };
+            keep.retain(|&i| near(i));
+        }
+        keep.into_iter().map(|i| (i, c.q[i], alpha, bg)).collect()
+    }
+
     /// The bond-length labels of this frame (user request 2026-10-18): each drawn bond's length in Å at
     /// its midpoint, from the nuclei as drawn now, faded with the bonds when the graph is an earlier
     /// step's. With more than [`BOND_LENGTH_DECLUTTER`] bonds only the selected or hovered atom's.
@@ -1985,9 +2009,16 @@ impl Viewer {
     }
 
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
-    /// step's).
+    /// step's), and under it the faded charges' ("charges from t = … fs", `ui::charges_label`).
     pub fn bonds_label(&self) -> Option<String> {
-        self.snapshot.as_ref().filter(|_| self.ui.show_bonds).and_then(|s| ui::bonds_label(&s.dynamics))
+        let s = self.snapshot.as_ref()?;
+        let bonds = self.ui.show_bonds.then(|| ui::bonds_label(&s.dynamics)).flatten();
+        // the faded charges' time (estimated mode between DFT densities), under the bonds'
+        let charges = self.ui.show_charges.then(|| ui::charges_label(&s.dynamics)).flatten();
+        match (bonds, charges) {
+            (Some(b), Some(c)) => Some(format!("{b}\n{c}")),
+            (b, c) => b.or(c),
+        }
     }
 
     /// The composition badge (spec §7) and where it goes (physical pixels): the nucleus under the
@@ -2022,6 +2053,12 @@ impl Viewer {
         // a pseudised species says so: its valence charge, its radius and the grid it needs (M7; the latest solve's record)
         if let Some(p) = self.snapshot.as_ref().and_then(|s| ui::pseudo::of_species(&s.dynamics.eval.pseudised, n.z)) {
             text.push_str(&format!(" · {}", ui::pseudo::badge_tail(p)));
+        }
+        // its partial charge (View ▸ Bonds and molecules ▸ partial charges; `sim::charges`)
+        if let Some((c, current)) = self.snapshot.as_ref().filter(|_| self.ui.show_charges).and_then(|s| ui::shown_charges(&s.dynamics)) {
+            if let Some(&q) = c.q.get(i) {
+                text.push_str(&format!(" · q {} e{}", ui::charge_text(q), if current { "" } else { " (earlier)" }));
+            }
         }
         Some((text, at))
     }
@@ -2152,6 +2189,17 @@ impl Viewer {
                 pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
             }
         }
+        // the partial charges, just below each atom's sphere (the camera's down), the value averaged
+        // over the last second like the bond lengths; the label follows the atom
+        let up = self.camera.view().inverse().y_axis.truncate();
+        for (i, q, alpha, bg) in self.charge_labels(shown) {
+            let n = &shown.nuclei[i];
+            let (_, q) = smooth.update((3, i, 0, 0), n.pos, q);
+            let below = tools::v3(n.pos) - up * render::elements::radius(n.z);
+            if let Some(px) = tools::project(&self.camera, below, vp) {
+                pill(to_pos(px) + egui::vec2(0.0, 4.0), egui::Align2::CENTER_TOP, &ui::charge_text(q), ui::charge_colour(q, alpha), bg);
+            }
+        }
         drop(smooth);
         if let Some((text, at)) = self.badge(shown) {
             pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
@@ -2259,6 +2307,10 @@ impl Viewer {
 
 /// More drawn bonds than this: only the selected or hovered atom's bonds get a length label.
 pub const BOND_LENGTH_DECLUTTER: usize = 12;
+
+/// More atoms than this: only the selected or hovered atom and its bonded neighbours get a
+/// partial-charge label.
+pub const CHARGE_DECLUTTER: usize = 12;
 
 /// "0.97 Å" for a length in Bohr (display; `units` converts).
 pub fn bond_length_text(r_bohr: f64) -> String {

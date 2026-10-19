@@ -3640,3 +3640,19 @@ output, not a per-element list (rule 1) — so `lih` keeps working; say the ≈ 
 generated. The accuracy gain is an order of magnitude on every X–H bond (0.07–0.10 Å → 0.003–0.010 Å) and makes H₂'s bond and
 frequency σ-free. A plain `All` default (spec §4.7 as written) would break the `lih` preset and the `he` preset at Fast/Balanced;
 staying `CoresOnly` keeps the 0.07–0.10 Å smeared-H error in every molecule with hydrogen.
+
+## Partial charges (Hirshfeld; branch `partial-charges`, 2026-10-20; `tests/charges.rs`, `sim::charges`; display only)
+
+Hirshfeld (stockholder) charges q_A = Z_A − h³ Σ_nodes w_A ρ with w_A = ρ_A⁰/Σ_B ρ_B⁰ against this solver's own free atoms (the bond references), all-electron, CPU solver (`CpuKs`, tol 1e-6), σ = h = 0.25 Bohr, release, Ryzen 7 9800X3D. No literature magnitude is pinned (the scheme, LSDA and the smeared nuclei all move it); the suite asserts what the partition guarantees and the signs:
+
+| scene | grid | q | Σq − charge | N = h³Σρ |
+|---|---|---|---|---|
+| H₂, R = 1.45 Bohr | 41³ | H −0.0000, H +0.0000 | −3.3e-16 | 2.000000 |
+| LiH, R = 3.015 Bohr | 49³ (12 Bohr) | Li +0.4025, H −0.4025 | −1.1e-15 | 4.000000 |
+| HeH⁺, R = 1.46 Bohr, charge +1 | 41³ | He +0.5040, H +0.4960 | < 1e-3 (asserted; the report printed Σq = +1.00) | 2.000000 |
+
+- **The sum rule** holds to rounding on the CPU (orbitals normalised through `Grid::dot`'s compensated sum). `charges::SUM_TOL` = 1e-3 e is the display gate (charges whose sum misses the scene's charge are hidden); the GPU's f32 ρ has not been measured against it here — its storage rounding (~6e-8 relative per value) bounds the sum's error far below 1e-3 e for ≤ 18 electrons, and the smallest wrong density the gate exists for (a partial core added) is ≥ 2 e.
+- **LiH** at 49³ sits in a 12 Bohr box whose wall pinches Li's 2s (physics review); literature Hirshfeld values for LiH are of order +0.4–0.5 on Li at other levels of theory — consistent, not compared.
+- **HeH⁺**: the +1 is shared about equally by neutral-atom weights — the reference-state problem of Hirshfeld for ions (Bultinck et al., J. Chem. Phys. 126, 144111 (2007)); only the sum is asserted.
+- **Cost** (`sim` `charges::tests::partition_cost_is_reported`, ignored): 11.9 ms for 3 atoms at 81³, 96.5 ms for 21 atoms at 95³, plus one n³ `sample_density` per DFT density.
+- Physics review (2026-10-20): approve; SHOULD-1–4 and NIT-1–5 folded into the `sim::charges` module doc, `providers::pseudo::valence_charges` and this entry.

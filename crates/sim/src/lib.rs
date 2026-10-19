@@ -6,6 +6,7 @@
 //! against are M6 Task 3.
 pub mod activity;
 pub mod bonds;
+pub mod charges;
 pub mod dynamics;
 pub mod integrator;
 pub mod provider;
@@ -25,6 +26,7 @@ pub use provider::{
     LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, ProviderError, SideDisplay, SideKind,
     SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
+pub use charges::{ChargeSource, PartialCharges};
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};
 pub use sampling::{allowed_multiplicities, GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost, ReferenceCache, SamplingPlan, SamplingProgress};

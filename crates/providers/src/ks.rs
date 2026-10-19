@@ -704,6 +704,10 @@ impl ForceProvider for CpuKs {
         crate::pseudo::provenance_tag(scene)
     }
 
+    fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
+        crate::pseudo::valence_charges(scene)
+    }
+
     fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
         if self.orb.set(request) == ViewChange::Off {
             self.view = None;
@@ -1192,6 +1196,10 @@ impl ForceProvider for GpuKs {
 
     fn ionic_tag(&self, scene: &Scene) -> String {
         crate::pseudo::provenance_tag(scene)
+    }
+
+    fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
+        crate::pseudo::valence_charges(scene)
     }
 
     /// A second `GpuKs` on the same context at the same tolerance, display off — its own

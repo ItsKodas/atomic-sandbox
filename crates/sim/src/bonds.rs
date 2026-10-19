@@ -710,6 +710,12 @@ impl<'a> Promolecule<'a> {
         Ok(Promolecule { tables, pos: pos.to_vec(), grid: Some(cell.clone()) })
     }
 
+    /// The free-atom table of every nucleus, in scene order (the Hirshfeld partition's ρ_A⁰,
+    /// `crate::charges`).
+    pub fn tables(&self) -> &[&'a RadialDensity] {
+        &self.tables
+    }
+
     /// ρ_pro(p) = Σ_C ρ̄_{Z_C}(|p − R_C|).
     pub fn exact(&self, p: [f64; 3]) -> f64 {
         self.tables.iter().zip(&self.pos).map(|(t, &r)| t.at(dist(p, r))).sum()
