@@ -291,6 +291,15 @@ pub fn model_path(scene_path: &str) -> std::path::PathBuf {
     std::path::Path::new(scene_path).with_extension("model")
 }
 
+/// The `models` folder: next to the running executable (`build.bat`'s dist folder), else in the
+/// working directory (the repository's `models/` when run from the root, as `start.bat` does).
+/// The model Save/Open dialogs start there unless a model file was already chosen.
+pub fn models_dir() -> Option<std::path::PathBuf> {
+    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("models")));
+    let in_cwd = std::env::current_dir().ok().map(|d| d.join("models"));
+    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+}
+
 /// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).
 pub const MAX_GRID_N: usize = 201;
 

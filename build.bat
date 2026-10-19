@@ -6,6 +6,7 @@ rem   dist\AtomicSandbox-<version>-windows-x64\        the folder to run or hand
 rem       AtomicSandbox.exe                            everything the app needs is inside it
 rem       README.md, docs\images\                      the readme and its pictures
 rem       scenes\*.scene                               the presets as files (--scene scenes\h2o.scene)
+rem       models\                                     the repo's models\ (trained models, pre-downloaded); Save/Load model start there
 rem   dist\AtomicSandbox-<version>-windows-x64.zip     the same folder zipped, for a GitHub release
 setlocal
 cd /d "%~dp0"
@@ -44,7 +45,8 @@ if exist "%OUT%\AtomicSandbox.exe" (
 )
 if exist "dist\%NAME%.zip" del /q "dist\%NAME%.zip"
 
-mkdir "%OUT%\scenes" "%OUT%\docs\images" >nul
+mkdir "%OUT%\scenes" "%OUT%\models" "%OUT%\docs\images" >nul
+xcopy /e /i /q /y "models" "%OUT%\models" >nul || goto :copyfail
 copy /y "target\release\app.exe" "%OUT%\AtomicSandbox.exe" >nul || goto :copyfail
 copy /y "README.md" "%OUT%\" >nul || goto :copyfail
 if exist "LICENSE" copy /y "LICENSE" "%OUT%\" >nul

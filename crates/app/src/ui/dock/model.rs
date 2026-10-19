@@ -275,10 +275,11 @@ pub const AUDIT_WHY: &str = "Audits are the model's spot checks: every n-th answ
 pub const AUDIT_OFF_NOTE: &str = "Smoother, but blind: the model's answers are no longer checked, so errors outside what it learned go unnoticed. Turn audits back on before trusting what you see (the last cadence is restored).";
 
 /// The native Save/Open dialog for model files, starting in `last`'s folder with its name
-/// (user request 2026-10-18: pick the save location and the file to load).
+/// (user request 2026-10-18: pick the save location and the file to load); a bare name (nothing
+/// chosen yet) starts in the dist folder's `models` (`scene::models_dir`) when there is one.
 fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
     let mut d = rfd::FileDialog::new().add_filter("Atomic Sandbox model", &["model"]).add_filter("All files", &["*"]);
-    let dir = last.parent().filter(|p| !p.as_os_str().is_empty()).map(std::path::Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    let dir = last.parent().filter(|p| !p.as_os_str().is_empty()).map(std::path::Path::to_path_buf).or_else(crate::scene::models_dir).or_else(|| std::env::current_dir().ok());
     if let Some(dir) = dir {
         d = d.set_directory(dir);
     }
