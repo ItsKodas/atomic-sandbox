@@ -307,6 +307,11 @@ pub fn lone_atom_line(l: LoneAtomLabels) -> Option<String> {
 pub fn dots_note(st: &UiState) -> String {
     match st.show {
         ShowMode::Spin => "dots sample |ρ↑ − ρ↓|, coloured by sign: where the spins are unbalanced — not electrons".into(),
+        ShowMode::Coloured if st.colour_look.enclose.is_some() => format!(
+            "dots fill each orbital's boundary surface (the region holding {} % of its probability{}) evenly, in its colour — a picture of the orbital's extent, not the density, not electrons",
+            st.colour_look.enclose.unwrap_or(90),
+            if st.colour_look.shell { ", only a shell just inside it" } else { "" }
+        ),
         ShowMode::Coloured if st.colour_physical && st.included.is_none() => "dots sample the density summed over the occupied orbitals, coloured by the dominant orbital — where an electron is likely to be, not electrons".into(),
         ShowMode::Coloured if st.colour_physical => "dots sample the density of the included orbitals, coloured by the dominant one — not the whole electron density, not electrons".into(),
         ShowMode::Coloured => "dots sample each orbital scaled to its own peak — not the electron density, not electrons".into(),
@@ -531,18 +536,56 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, wai
     });
     super::group(ui, st, "d-orb-colour", |ui, st| {
         ui.add_enabled_ui(st.show == ShowMode::Coloured, |ui| {
+            // boundary surfaces (user request 2026-10-19): each orbital as the region enclosing a
+            // share of its probability, a shell just inside it (the default) or filled; or the density
+            let mut look = st.colour_look;
+            ui.horizontal(|ui| {
+                ui.label("draw");
+                let now = match look.enclose {
+                    None => 2,
+                    Some(_) if look.shell => 0,
+                    Some(_) => 1,
+                };
+                if let Some(m) = theme::segmented(ui, now, &[
+                    (0, "shell", "each orbital's boundary surface: a thin shell just inside the surface that encloses the chosen share of its probability — the textbook picture, hollow inside"),
+                    (1, "filled", "each orbital's whole region inside that surface, evenly filled"),
+                    (2, "density", "each orbital by its density, fading out smoothly (no boundary)"),
+                ]) {
+                    let pct = look.enclose.unwrap_or(90);
+                    (look.enclose, look.shell) = match m {
+                        0 => (Some(pct), true),
+                        1 => (Some(pct), false),
+                        _ => (None, look.shell),
+                    };
+                }
+            });
+            if let Some(mut pct) = look.enclose {
+                let r = ui.add(egui::Slider::new(&mut pct, 50..=99).suffix(" %").text("enclosed"))
+                    .on_hover_text("the share of each orbital's probability inside its surface (textbooks use 90 %): higher draws bigger, fuzzier-edged lobes");
+                // one request when the slider is let go (or clicked), not one per step of a drag
+                if pct != look.enclose.unwrap_or(90) && (r.drag_stopped() || !r.dragged()) {
+                    look.enclose = Some(pct);
+                }
+            }
+            ui.checkbox(&mut look.hide_core, "hide core orbitals").on_hover_text(format!(
+                "leave out the inner-shell orbitals (more than {} Ha below the highest occupied one, e.g. Li's 1s) so the valence lobes show; a pseudised atom has none",
+                sim::CORE_GAP
+            ));
+            if look != st.colour_look {
+                acts.push(Action::ColourLook(look));
+            }
             ui.horizontal(|ui| {
                 ui.label("blend");
                 if let Some(a) = theme::segmented(ui, st.colour_additive, &[(true, "additive", "emission only: inner shells shine through the outer ones"), (false, "weighted", "emission–absorption: the front shell hides what is behind it")]) {
                     acts.push(Action::ColourBlend { additive: a });
                 }
             });
-            ui.horizontal(|ui| {
+            ui.add_enabled_ui(st.colour_look.enclose.is_none(), |ui| ui.horizontal(|ui| {
                 ui.label("scale");
                 if let Some(p) = theme::segmented(ui, st.colour_physical, &[(false, "each to its peak", "each orbital scaled to its own peak: every shell equally visible"), (true, "physical", "scaled by the total density's maximum: summed over the orbitals the opacity is the density, and the hue is which orbital dominates locally")]) {
                     acts.push(Action::ColourScale { physical: p });
                 }
-            });
+            }));
             let note = if st.colour_physical { "physical scale: hue = which orbital dominates; opacity = the density" } else { "each orbital scaled to its own peak" };
             theme::note(ui, note);
             if st.included.is_some() && super::super::probed("include-reset", ui.small_button("include every occupied orbital")).clicked() {

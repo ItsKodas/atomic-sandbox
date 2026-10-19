@@ -1059,7 +1059,7 @@ mod tests {
         ui.show = ShowMode::Coloured;
         let rgba: Arc<Vec<[f32; 4]>> = Arc::new(values.iter().map(|&v| { let s = v * v / 0.3679; [0.9 * s, 0.4 * s, 0.1 * s, s] }).collect());
         let cf = OrbitalField::CpuColour { rgba: rgba.clone(), scale: 1.0 };
-        let what = OrbitalRequest::AllColoured { include: None, physical: false };
+        let what = OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() };
         assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, what.clone(), Some(cf)), &hl.depth), Ok(Shown::Snapped));
         ui.volume_mode = crate::ui::VOLUME_VOLUME;
         ui.colour_additive = true;

@@ -168,7 +168,9 @@ pub enum Product<'a> {
     Orbital { spin: Spin, track: u32, squared: bool, out: &'a Volume3D },
     /// The colour volume over the included tracks: rgb = Σ f c ψ̃²/P, a = Σ f ψ̃²/P with
     /// P = (max|ψ| over the orbital's set)² or, `physical`, max ρ (spec §5.6).
-    Colour { include: &'a [u32], physical: bool, out: &'a ColourVolume3D },
+    /// With `boundary`, each orbital is drawn as the region (or shell) inside its enclosure level
+    /// instead of by its density ([`Boundary`]; `physical` then has no effect).
+    Colour { include: &'a [u32], physical: bool, boundary: Option<Boundary>, out: &'a ColourVolume3D },
     /// m = ρ↑ − ρ↓ (signed) into `out`.
     Spin { out: &'a Volume3D },
     /// The list only (scalars, rotations, display fields), no texture.
@@ -179,12 +181,35 @@ impl std::fmt::Debug for Product<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Product::Orbital { spin, track, squared, .. } => write!(f, "Orbital {{ {spin:?}, track {track}, squared {squared} }}"),
-            Product::Colour { include, physical, .. } => write!(f, "Colour {{ {} tracks, physical {physical} }}", include.len()),
+            Product::Colour { include, physical, boundary, .. } => write!(f, "Colour {{ {} tracks, physical {physical}, boundary {boundary:?} }}", include.len()),
             Product::Spin { .. } => write!(f, "Spin"),
             Product::None => write!(f, "None"),
         }
     }
 }
+
+/// Boundary surfaces in the colour product (user request 2026-10-19; display only): each orbital
+/// is drawn as the region where ψ̃² is above the level that encloses `share` (0–1) of its
+/// probability — uniformly filled, or with `shell` only a band just inside that boundary
+/// (`shaders/enclosure.wgsl` finds the levels on the GPU, `colour_accumulate.wgsl` masks).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Boundary {
+    pub share: f32,
+    pub shell: bool,
+}
+
+/// Uniform of `enclosure_hist`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct HistParams { n: u32, p: u32, term: u32, inv_peak: f32 }
+
+/// Uniform of `enclosure_level`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct LevelParams { count: u32, share: f32, pad: [u32; 2] }
+
+/// Histogram bins per orbital (`shaders/enclosure.wgsl`'s BINS).
+const ENCLOSURE_BINS: usize = 256;
 
 /// The result of one update. `scale` is what 1.0 means in the written texture (spec §3):
 /// max|ψ| over the orbital's set (phase), its square (|ψ|²), `SpinSummary::scale` (spin), 1
@@ -219,7 +244,7 @@ struct MomParams { cell: [i32; 4], frac: [f32; 4], n: u32, p: u32, mom_wg: u32, 
 /// Uniform of `colour_accumulate`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ColourParams { n: u32, p: u32, count: u32, flags: u32, w: [[f32; 4]; COLOUR_MAX_TERMS] }
+struct ColourParams { n: u32, p: u32, count: u32, flags: u32, w: [[f32; 4]; COLOUR_MAX_TERMS], m: [[f32; 4]; COLOUR_MAX_TERMS] }
 
 /// The display products of one producer (spec §4.3: one per provider; its `Tracker` holds the
 /// tracks, slots and signs). Built for the solver's grid and device; `Send`.
@@ -246,6 +271,11 @@ pub struct OrbitalView {
     colour_acc: Option<wgpu::Buffer>,
     /// Bound in place of the accumulator when a single chunk does not use it.
     dummy: wgpu::Buffer,
+    /// Bound in place of the boundary levels when the colour product has no boundary (a second
+    /// buffer: one buffer cannot be both the read-write accumulator and the read-only levels).
+    dummy_levels: wgpu::Buffer,
+    /// The boundary surfaces' histograms and levels, for this many orbitals (grow-only).
+    enclosure: Option<(wgpu::Buffer, wgpu::Buffer, usize)>,
     /// The display eigensolve's unoccupied vectors per channel (ascending ε; module doc
     /// "Unoccupied orbitals") and its result; `unocc[ch].len()` = `unocc_info`'s count always.
     unocc: [Vec<Field>; 2],
@@ -268,10 +298,13 @@ impl OrbitalView {
         let dummy = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orbital view dummy"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
         });
+        let dummy_levels = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orbital view dummy levels"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        });
         OrbitalView {
             reducer: Reducer::new(&ctx, &solver.k, &g), grid: solver.grid().clone(), g, tracker: Tracker::new(),
             prev: [Vec::new(), Vec::new()], pool: Vec::new(), scratch: None, rows, row_stride, nuclei,
-            moments_out: None, colour_acc: None, dummy, ctx,
+            moments_out: None, colour_acc: None, dummy, dummy_levels, enclosure: None, ctx,
             unocc: [Vec::new(), Vec::new()], unocc_info: None, face_limit: f64::INFINITY,
         }
     }
@@ -606,15 +639,49 @@ impl OrbitalView {
                 self.copy_to_volume(&mut b, k, scratch, vol);
                 sc.spin.scale() as f32
             }
-            Product::Colour { include, physical, out: cv } => {
-                let terms: Vec<(&Field, [f32; 4])> = out.rows.iter().filter(|r| include.contains(&r.track)).filter_map(|r| {
+            Product::Colour { include, physical, boundary, out: cv } => {
+                // (field, weight, 1 / its own peak ψ̃²): the weight is f c / P by density, f c inside a boundary
+                let terms: Vec<(&Field, [f32; 4], f32)> = out.rows.iter().filter(|r| include.contains(&r.track)).filter_map(|r| {
                     let ch = r.spin.index();
-                    let pk = if physical { sc.spin.rho_max } else { out.scale[ch][r.index].powi(2) };
-                    if pk <= 0.0 || r.occupation == 0.0 { return None; }
+                    let own = out.scale[ch][r.index].powi(2);
+                    let pk = if physical { sc.spin.rho_max } else { own };
+                    if pk <= 0.0 || own <= 0.0 || r.occupation == 0.0 { return None; }
                     let c = ORBITAL_PALETTE[r.slot as usize % ORBITAL_PALETTE.len()];
-                    let w = r.occupation / pk;
-                    Some((&self.prev[ch][r.index], [(c[0] as f64 * w) as f32, (c[1] as f64 * w) as f32, (c[2] as f64 * w) as f32, w as f32]))
+                    let w = if boundary.is_some() { r.occupation } else { r.occupation / pk };
+                    Some((&self.prev[ch][r.index], [(c[0] as f64 * w) as f32, (c[1] as f64 * w) as f32, (c[2] as f64 * w) as f32, w as f32], (1.0 / own) as f32))
                 }).collect();
+                // the boundary levels: a histogram per orbital, then the level enclosing `share` of it
+                if let Some(bd) = boundary.filter(|_| !terms.is_empty()) {
+                    if self.enclosure.as_ref().is_none_or(|e| e.2 < terms.len()) {
+                        let cap = terms.len().next_power_of_two().max(8);
+                        let make = |label: &str, size: usize, extra: wgpu::BufferUsages| self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(label), size: size as u64, usage: wgpu::BufferUsages::STORAGE | extra, mapped_at_creation: false,
+                        });
+                        let hist = make("enclosure histograms", cap * ENCLOSURE_BINS * 4, wgpu::BufferUsages::COPY_DST);
+                        let levels = make("enclosure levels", cap * 4, wgpu::BufferUsages::empty());
+                        self.enclosure = Some((hist, levels, cap));
+                    }
+                    let (hist, levels, _) = self.enclosure.as_ref().expect("made above");
+                    b.encoder().clear_buffer(hist, 0, Some((terms.len() * ENCLOSURE_BINS * 4) as u64));
+                    for (t, (f, _, inv_peak)) in terms.iter().enumerate() {
+                        let params = HistParams { n: g.n as u32, p: g.p as u32, term: t as u32, inv_peak: *inv_peak };
+                        let u = b.uniform(ctx, k, "enclosure_hist", &params);
+                        let bg = k.bind_group(ctx, "enclosure_hist", &[u.binding(), f.buffer.as_entire_binding(), hist.as_entire_binding()]);
+                        b.dispatch(k, "enclosure_hist", &bg, [workgroups_for(g.interior_len()), 1, 1]);
+                    }
+                    let params = LevelParams { count: terms.len() as u32, share: bd.share.clamp(0.01, 0.999), pad: [0; 2] };
+                    let u = b.uniform(ctx, k, "enclosure_level", &params);
+                    let bg = k.bind_group(ctx, "enclosure_level", &[u.binding(), hist.as_entire_binding(), levels.as_entire_binding()]);
+                    b.dispatch(k, "enclosure_level", &bg, [(terms.len() as u32).div_ceil(64), 1, 1]);
+                }
+                let levels = match (&boundary, &self.enclosure) {
+                    (Some(_), Some(e)) if !terms.is_empty() => &e.1,
+                    _ => &self.dummy_levels,
+                };
+                let mode = match boundary {
+                    Some(bd) => 4 | if bd.shell { 8 } else { 0 },
+                    None => 0,
+                };
                 let chunks = terms.len().div_ceil(COLOUR_MAX_TERMS).max(1);
                 if chunks > 1 && self.colour_acc.is_none() {
                     self.colour_acc = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -627,9 +694,13 @@ impl OrbitalView {
                 for ci in 0..chunks {
                     let chunk = &terms[(ci * COLOUR_MAX_TERMS).min(terms.len())..((ci + 1) * COLOUR_MAX_TERMS).min(terms.len())];
                     let mut w = [[0.0f32; 4]; COLOUR_MAX_TERMS];
-                    for (slot, (_, t)) in w.iter_mut().zip(chunk) { *slot = *t; }
-                    let flags = u32::from(ci == 0) | (u32::from(ci + 1 == chunks) << 1);
-                    let params = ColourParams { n: g.n as u32, p: g.p as u32, count: chunk.len() as u32, flags, w };
+                    let mut m = [[0.0f32; 4]; COLOUR_MAX_TERMS];
+                    for (j, (_, t, inv_peak)) in chunk.iter().enumerate() {
+                        w[j] = *t;
+                        m[j] = [*inv_peak, (ci * COLOUR_MAX_TERMS + j) as f32, 0.0, 0.0];
+                    }
+                    let flags = u32::from(ci == 0) | (u32::from(ci + 1 == chunks) << 1) | mode;
+                    let params = ColourParams { n: g.n as u32, p: g.p as u32, count: chunk.len() as u32, flags, w, m };
                     let u = b.uniform(ctx, k, "colour_accumulate", &params);
                     let first = chunk.first().map_or(scratch, |t| t.0);
                     let mut res = vec![u.binding()];
@@ -637,6 +708,7 @@ impl OrbitalView {
                     res.extend((0..COLOUR_MAX_TERMS).map(|t| chunk.get(t).map_or(first, |c| c.0).buffer.as_entire_binding()));
                     res.push(acc.as_entire_binding());
                     res.push(wgpu::BindingResource::TextureView(&cv.view));
+                    res.push(levels.as_entire_binding());
                     let bg = k.bind_group(ctx, "colour_accumulate", &res);
                     b.dispatch(k, "colour_accumulate", &bg, [workgroups_for(g.interior_len()), 1, 1]);
                 }

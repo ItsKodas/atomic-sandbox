@@ -2148,7 +2148,7 @@ mod orbital_viewer {
         assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
         // the other modes
         for (mode, want) in [
-            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false }),
+            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() }),
             (ShowMode::Spin, OrbitalRequest::SpinDensity),
             (ShowMode::Density, OrbitalRequest::Off),
         ] {
@@ -2200,15 +2200,15 @@ mod orbital_viewer {
         // all coloured: the include boxes start from the occupied tracks
         st.show = ShowMode::Coloured;
         let r = one(act(&mut st, &inp, Action::Include { track: 1, on: false }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false, look: Default::default() });
         let r = one(act(&mut st, &inp, Action::Include { track: 3, on: true }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false, look: Default::default() });
         assert!(act(&mut st, &inp, Action::ColourBlend { additive: false }).commands.is_empty(), "the blend is a render setting");
         assert!(!st.colour_additive);
         let r = one(act(&mut st, &inp, Action::ColourScale { physical: true }));
         assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, .. }), "{:?}", r.what);
         let r = one(act(&mut st, &inp, Action::IncludeAllOccupied));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true, look: Default::default() });
         // the words
         for a in [
             Action::Show(ShowMode::Coloured),
@@ -2219,6 +2219,8 @@ mod orbital_viewer {
             Action::IncludeAllOccupied,
             Action::ColourBlend { additive: false },
             Action::ColourScale { physical: true },
+            Action::ColourLook(sim::ColourLook { enclose: Some(75), shell: false, hide_core: true }),
+            Action::ColourLook(sim::ColourLook { enclose: Some(90), shell: true, hide_core: false }),
         ] {
             let text = a.describe().expect("a script form");
             let words: Vec<&str> = text.split(' ').collect();
@@ -2551,7 +2553,7 @@ mod orbital_viewer {
         assert!(l.tip.contains("Spin is intrinsic (↑/↓), not a rotation."));
         // coloured: one swatch per colour slot (↓ shares ↑'s), the scale in the text
         st.show = ShowMode::Coloured;
-        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false });
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() });
         o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
         let snap = with_payload(&scene, Backend::Gpu, o);
         let inp = input(&scene, Some(&snap), &cam);

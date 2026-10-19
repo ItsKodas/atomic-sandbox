@@ -513,6 +513,8 @@ pub struct UiState {
     /// peak or to the physical ρ max.
     pub colour_additive: bool,
     pub colour_physical: bool,
+    /// All orbitals coloured: boundary surfaces (shell by default) or the density (`sim::ColourLook`).
+    pub colour_look: sim::ColourLook,
     /// All orbitals coloured: the tracks included (`None` = every occupied orbital).
     pub included: Option<std::collections::BTreeSet<u32>>,
     /// Screenshots: the spheres' size factor instead of the automatic one (the automatic one
@@ -818,6 +820,7 @@ right {}
             spin_iso: SPIN_ISO_DEFAULT,
             colour_additive: true,
             colour_physical: false,
+            colour_look: sim::ColourLook::default(),
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
@@ -1064,7 +1067,7 @@ impl UiState {
             ShowMode::Coloured => (
                 // (the blend is a render setting, `Painter::set_view`, not part of the request: a toggle
                 // would otherwise be a view change, and in estimated mode a background solve)
-                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical },
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, look: self.colour_look },
                 self.unoccupied,
             ),
             ShowMode::Spin => (R::SpinDensity, 0),
