@@ -1,5 +1,9 @@
 //! Atomic Sandbox viewer: a winit window with the egui chrome (top menus, bottom toolbar, right
 //! dock: `ui`) around the sphere + density renderer, driven by the simulation worker thread.
+// A windowed program on Windows: no console window beside it, and the taskbar shows its icon (a
+// console program's window got the generic one). Started from a terminal it attaches to that
+// terminal's console (`attach_console`), so the stderr lines and `--screenshot` messages still show.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 mod atom_card;
 mod badge;
 mod cloud;
@@ -306,7 +310,29 @@ nucleus 1 0 0 0
     }
 }
 
+/// Windows: print into the terminal that started us, when there is one and stderr is not already
+/// redirected (a pipe or file stays as it is).
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE};
+    unsafe {
+        let h = GetStdHandle(STD_ERROR_HANDLE);
+        if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    attach_console();
+    // our own taskbar identity: Windows then takes the button's icon from the window (`frame::exe_icon`)
+    // instead of resolving one for the exe path (it showed the generic icon)
+    #[cfg(windows)]
+    unsafe {
+        let id: Vec<u16> = "ItsKodas.AtomicSandbox".encode_utf16().chain(std::iter::once(0)).collect();
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
     // the dimer gate's derived verdicts are kept per species identity in the cache directory, so pseudo-H/He cost their
     // minute once per recipe, not per launch (M7 Task 11 fix round; `providers::pseudo` "The disk cache")
     providers::pseudo::set_disk_cache(providers::pseudo::default_disk_cache_dir());
@@ -518,6 +544,8 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("Atomic Sandbox")
             .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
+            // shown after the first frame (end of `resumed`), so it never flashes white while loading
+            .with_visible(false)
             .with_window_icon(winit::window::Icon::from_rgba(icon::rgba(64), 64, 64).ok());
         // the custom frame (`frame.rs`): the top bar is the title bar
         #[cfg(windows)]
@@ -583,7 +611,9 @@ impl ApplicationHandler for App {
             surface,
             painter,
         });
-        self.window = Some(window);
+        self.window = Some(window.clone());
+        self.redraw(&window);
+        window.set_visible(true);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
