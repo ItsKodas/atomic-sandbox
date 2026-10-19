@@ -708,17 +708,27 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             acts.push(Action::SmoothMotion(smooth));
         }
         trail_controls(ui, st);
-        // the 3D view's background (a reset to the default dark blue)
-        ui.horizontal(|ui| {
-            ui.label("background");
-            // the default as sRGB (gfx::CLEAR is linear 0.012 / 0.014 / 0.022)
-            let mut c = st.background.unwrap_or([29, 31, 41]);
-            if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
-                st.background = Some(c);
+        // the 3D view's background: an inline picker (a popup picker would close the menu), presets,
+        // and a reset to the default dark blue
+        egui::CollapsingHeader::new("background colour").id_salt("bg-colour").show(ui, |ui| {
+            let [r, g, b] = st.background.unwrap_or([29, 31, 41]);
+            let mut c = egui::Color32::from_rgb(r, g, b);
+            if egui::widgets::color_picker::color_picker_color32(ui, &mut c, egui::widgets::color_picker::Alpha::Opaque) {
+                st.background = Some([c.r(), c.g(), c.b()]);
             }
-            if ui.add_enabled(st.background.is_some(), egui::Button::new("Reset")).on_hover_text("the default dark blue").clicked() {
-                st.background = None;
-            }
+            ui.horizontal(|ui| {
+                for (name, rgb) in [("black", [0, 0, 0]), ("charcoal", [24, 24, 28]), ("slate", [46, 52, 64]), ("grey", [128, 128, 132]), ("white", [245, 245, 245])] {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                    ui.painter().rect(rect, 4.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]), egui::Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+                    if resp.on_hover_text(name).clicked() {
+                        st.background = Some(rgb);
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.add_enabled(st.background.is_some(), egui::Button::new("Reset")).on_hover_text("the default dark blue").clicked() {
+                    st.background = None;
+                }
+            });
         });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
