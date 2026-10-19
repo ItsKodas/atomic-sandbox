@@ -4159,8 +4159,11 @@ fn the_two_docks_hold_their_own_tabs() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    // the defaults: the stats dock open on Readouts, the configuring dock folded to its strip
-    assert!(st.left_open && st.left_tab == DockTab::Readouts && !st.dock_open);
+    // the defaults (user request 2026-10-19): the left dock open on Activity, the right on Model
+    assert!(st.left_open && st.left_tab == DockTab::Activity && st.dock_open && st.dock_tab == DockTab::Model);
+    // the rest starts from the left on Readouts and the right folded to its strip
+    st.left_tab = DockTab::Readouts;
+    st.dock_open = false;
     // a strip button opens its tab on its own side and leaves the other side alone
     click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
     assert!(st.tab_shown(DockTab::Activity) && !st.dock_open, "Activity opens the left dock");
