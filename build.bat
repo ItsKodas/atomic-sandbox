@@ -51,7 +51,7 @@ if exist "profiles" xcopy /e /i /q /y "profiles" "%OUT%\profiles" >nul
 if exist "timings" xcopy /e /i /q /y "timings" "%OUT%	imings" >nul
 copy /y "target\release\app.exe" "%OUT%\AtomicSandbox.exe" >nul || goto :copyfail
 copy /y "README.md" "%OUT%\" >nul || goto :copyfail
-if exist "LICENSE" copy /y "LICENSE" "%OUT%\" >nul
+if exist "LICENSE.md" copy /y "LICENSE.md" "%OUT%\" >nul
 copy /y "crates\app\presets\*.scene" "%OUT%\scenes\" >nul || goto :copyfail
 xcopy /e /i /q /y "docs\images" "%OUT%\docs\images" >nul || goto :copyfail
 
