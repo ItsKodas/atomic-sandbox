@@ -22,6 +22,172 @@ pub struct ToolState {
     /// Last cursor position over the 3D view (window physical pixels); `None` while it is over the
     /// chrome or outside the viewport.
     pub cursor: Option<(f32, f32)>,
+    /// The Edit tool's selection (user request 2026-10-20): every selected nucleus, `selected` the
+    /// last one clicked. Read through [`ToolState::set`].
+    pub group: Vec<usize>,
+    /// The Edit tool's handle being held.
+    pub gizmo: Option<GizmoDrag>,
+    /// The Edit tool's box selection: where the left button went down on empty space.
+    pub boxing: Option<(f32, f32)>,
+}
+
+impl ToolState {
+    /// The selected nuclei: the Edit tool's group while it still holds the primary selection (a
+    /// click with another tool replaces it), else the one selected nucleus; indices below `n`.
+    pub fn set(&self, n: usize) -> Vec<usize> {
+        let group_ok = !self.group.is_empty() && self.selected.is_none_or(|s| self.group.contains(&s));
+        let v: Vec<usize> = if group_ok { self.group.clone() } else { self.selected.into_iter().collect() };
+        v.into_iter().filter(|&i| i < n).collect()
+    }
+
+    /// Clears the selection (Esc, empty-space clicks).
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+        self.group.clear();
+    }
+}
+
+/// An Edit-tool handle: an axis arrow (0 = x, 1 = y, 2 = z), or the square of the plane normal to
+/// that axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    Axis(usize),
+    Plane(usize),
+}
+
+/// A held Edit handle: the selection's positions when it was grabbed, the point on the handle's
+/// line or plane under the cursor then, and whether the run was playing (it resumes on release).
+#[derive(Clone, Debug)]
+pub struct GizmoDrag {
+    pub handle: Handle,
+    pub base: Vec<(usize, [f64; 3])>,
+    pub centre: Vec3,
+    pub start: Vec3,
+    pub resume: bool,
+    /// The offset applied so far (Bohr).
+    pub delta: [f64; 3],
+}
+
+/// The handles' arrow length on screen (window physical pixels).
+pub const GIZMO_PX: f32 = 110.0;
+/// The plane squares span this fraction of the arrow length from the centre.
+pub const PLANE_SPAN: (f32, f32) = (0.22, 0.48);
+
+pub fn axis(k: usize) -> Vec3 {
+    [Vec3::X, Vec3::Y, Vec3::Z][k]
+}
+
+/// The world length that projects to [`GIZMO_PX`] at `c` (an arrow's length).
+pub fn gizmo_length(cam: &OrbitCamera, c: Vec3, vp: Viewport) -> Option<f32> {
+    let v = (c - cam.eye()).normalize_or_zero();
+    let mut u = v.cross(Vec3::Y);
+    if u.length_squared() < 1e-6 {
+        u = v.cross(Vec3::X);
+    }
+    let (a, b) = (project(cam, c, vp)?, project(cam, c + u.normalize(), vp)?);
+    let ppu = (b.0 - a.0).hypot(b.1 - a.1);
+    (ppu > 1e-3).then(|| GIZMO_PX / ppu)
+}
+
+/// The corners of plane `k`'s square (world), around the centre `c` with arrow length `l`.
+pub fn plane_quad(c: Vec3, l: f32, k: usize) -> [Vec3; 4] {
+    let (a, b) = (axis((k + 1) % 3), axis((k + 2) % 3));
+    let (s1, s2) = (PLANE_SPAN.0 * l, PLANE_SPAN.1 * l);
+    [c + a * s1 + b * s1, c + a * s2 + b * s1, c + a * s2 + b * s2, c + a * s1 + b * s2]
+}
+
+fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+fn in_quad(p: (f32, f32), q: &[(f32, f32); 4]) -> bool {
+    let side = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let s: Vec<f32> = (0..4).map(|i| side(q[i], q[(i + 1) % 4])).collect();
+    s.iter().all(|&x| x >= 0.0) || s.iter().all(|&x| x <= 0.0)
+}
+
+/// The handle under the pixel: an arrow within 8 px of its shaft (the nearest), else a plane square.
+pub fn gizmo_hit(cam: &OrbitCamera, vp: Viewport, c: Vec3, px: f32, py: f32) -> Option<Handle> {
+    let l = gizmo_length(cam, c, vp)?;
+    let c_px = project(cam, c, vp)?;
+    let axis_hit = (0..3)
+        .filter_map(|k| {
+            let tip = project(cam, c + axis(k) * l, vp)?;
+            let from = (c_px.0 + 0.15 * (tip.0 - c_px.0), c_px.1 + 0.15 * (tip.1 - c_px.1));
+            let d = seg_dist((px, py), from, tip);
+            (d < 8.0).then_some((d, k))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, k)) = axis_hit {
+        return Some(Handle::Axis(k));
+    }
+    (0..3).find_map(|k| {
+        let q = plane_quad(c, l, k);
+        let q_px = [project(cam, q[0], vp)?, project(cam, q[1], vp)?, project(cam, q[2], vp)?, project(cam, q[3], vp)?];
+        in_quad((px, py), &q_px).then_some(Handle::Plane(k))
+    })
+}
+
+/// The point under the pixel on the handle's line (the closest point of the axis through `c` to
+/// the pixel ray) or plane (through `c`); `None` when the ray runs along the axis or in the plane.
+pub fn handle_point(cam: &OrbitCamera, vp: Viewport, px: f32, py: f32, h: Handle, c: Vec3) -> Option<Vec3> {
+    let (o, d) = vp.ray(cam, px, py);
+    match h {
+        Handle::Axis(k) => {
+            let e = axis(k);
+            let w0 = c - o;
+            let b = e.dot(d);
+            let denom = 1.0 - b * b;
+            if denom < 1e-4 {
+                return None;
+            }
+            let t = (b * d.dot(w0) - e.dot(w0)) / denom;
+            Some(c + e * t)
+        }
+        Handle::Plane(k) => {
+            let n = axis(k);
+            if d.dot(n).abs() < 0.03 {
+                return None;
+            }
+            ray_plane(o, d, c, n)
+        }
+    }
+}
+
+/// The handle's offset from `start` to `now`, kept to its axis or plane.
+pub fn handle_delta(h: Handle, start: Vec3, now: Vec3) -> [f64; 3] {
+    let mut d = a3(now - start);
+    match h {
+        Handle::Axis(k) => (0..3).filter(|&j| j != k).for_each(|j| d[j] = 0.0),
+        Handle::Plane(k) => d[k] = 0.0,
+    }
+    d
+}
+
+/// A rigid offset limited so every nucleus of `base` stays inside the cell's margin
+/// ([`clamp_into_cell`]'s limit), per axis: the group keeps its shape at the wall.
+pub fn clamp_delta(base: &[(usize, [f64; 3])], delta: [f64; 3], scene: &Scene) -> [f64; 3] {
+    let cell = sim::Cell { n: scene.grid_n, h: scene.grid_h };
+    let lim = (cell.max_coord() - 0.5 * cell.h).max(0.0);
+    std::array::from_fn(|k| {
+        let lo = base.iter().map(|(_, p)| -lim - p[k]).fold(f64::NEG_INFINITY, f64::max);
+        let hi = base.iter().map(|(_, p)| lim - p[k]).fold(f64::INFINITY, f64::min);
+        delta[k].max(lo.min(0.0)).min(hi.max(0.0))
+    })
+}
+
+/// The nuclei whose centres project inside the screen rectangle with corners `a` and `b`.
+pub fn box_select(cam: &OrbitCamera, vp: Viewport, nuclei: &[SceneNucleus], a: (f32, f32), b: (f32, f32)) -> Vec<usize> {
+    let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
+    let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
+    nuclei
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| project(cam, v3(n.pos), vp).filter(|p| (x0..=x1).contains(&p.0) && (y0..=y1).contains(&p.1)).map(|_| i))
+        .collect()
 }
 
 /// Clamps a drag target, teleport or placement into the cell minus the providers' margin
@@ -305,6 +471,32 @@ mod tests {
         let s = Scene::preset("h2").unwrap();
         assert_eq!(clamp_into_cell([10.0, -7.0, 1.0], &s), [5.125, -5.125, 1.0]);
         assert_eq!(clamp_into_cell([0.8, 0.0, 0.0], &s), [0.8, 0.0, 0.0]);
+    }
+
+    /// The Edit tool: an arrow is hit along its shaft, the axis drag follows the cursor along
+    /// its axis only, and the group's offset stops at the cell's margin without changing its shape.
+    #[test]
+    fn edit_handles_hit_follow_and_clamp() {
+        let cam = OrbitCamera::new(Vec3::new(0.3, 0.2, 0.1), 10.0);
+        let vp = Viewport::full(800.0, 600.0);
+        let c = Vec3::ZERO;
+        let l = gizmo_length(&cam, c, vp).unwrap();
+        for k in 0..3 {
+            let mid = project(&cam, c + axis(k) * 0.7 * l, vp).unwrap();
+            assert_eq!(gizmo_hit(&cam, vp, c, mid.0, mid.1), Some(Handle::Axis(k)), "axis {k}");
+        }
+        let c_px = project(&cam, c, vp).unwrap();
+        let start = handle_point(&cam, vp, c_px.0, c_px.1, Handle::Axis(0), c).unwrap();
+        let tip = project(&cam, c + Vec3::X * 2.0, vp).unwrap();
+        let now = handle_point(&cam, vp, tip.0, tip.1, Handle::Axis(0), c).unwrap();
+        let d = handle_delta(Handle::Axis(0), start, now);
+        assert!((d[0] - 2.0).abs() < 1e-3 && d[1] == 0.0 && d[2] == 0.0, "{d:?}");
+        // 49³ × 0.25: limit 5.125 Bohr; the group's right-most nucleus stops there
+        let s = Scene::preset("h2").unwrap();
+        let base = vec![(0, [4.0, 0.0, 0.0]), (1, [3.0, 1.0, 0.0])];
+        assert_eq!(clamp_delta(&base, [3.0, -0.5, 0.0], &s), [1.125, -0.5, 0.0]);
+        let one = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
+        assert_eq!(box_select(&cam, vp, &one, (c_px.0 - 10.0, c_px.1 - 10.0), (c_px.0 + 10.0, c_px.1 + 10.0)), vec![0]);
     }
 
     #[test]

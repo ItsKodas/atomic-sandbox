@@ -199,6 +199,10 @@ pub enum ToolMode {
     Orbit,
     Place,
     Select,
+    /// The Edit tool (user request 2026-10-20): select one atom or a group (click, Shift-click, a box
+    /// on empty space) and move it rigidly with the XYZ handles — velocities kept, the run paused
+    /// while a handle is held (`Viewer`'s "The Edit tool").
+    Edit,
 }
 
 /// Which edge a dock sits on (user request 2026-10-19: the left dock is what is going on — stats —
@@ -629,6 +633,9 @@ pub struct UiState {
     /// Actions from outside the chrome (the 3D view's wheel during a drag, `Viewer::wheel`),
     /// applied at the start of the next frame like a click's.
     pub queued: Vec<Action>,
+    /// The Edit tool's selected group, mirrored by the viewer each frame for the Selection tab
+    /// (display only; empty outside the Edit tool).
+    pub edit_group: Vec<usize>,
     // ---- the chrome's own view state (M6 redesign) ----
     /// The RIGHT dock's tab (one of [`DockTab::RIGHT`]), and whether it is open (else only its icon
     /// strip shows). Display state: not recorded.
@@ -867,6 +874,7 @@ right {}
             draft: false,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),
+            edit_group: Vec::new(),
             smooth_motion: true,
             cloud_superposition: true,
             cloud_refresh: false,

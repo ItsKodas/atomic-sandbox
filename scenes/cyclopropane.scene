@@ -1,0 +1,17 @@
+# atomic sandbox scene v1
+# Cyclopropane (CH2)3: C-C 1.510 A, C-H 1.083 A, H-C-H 114.5 degrees (a ring of three carbons, D3h).
+# Geometry: NIST CCCBDB experimental, rounded (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 14 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 95 0.15
+charge 0
+ionic accepted
+nucleus 6 0.0000 0.9588 0.0000
+nucleus 6 -1.4267 -1.5124 0.0000
+nucleus 6 1.4267 -1.5124 0.0000
+nucleus 1 0.0000 2.0660 1.7212
+nucleus 1 0.0000 2.0660 -1.7212
+nucleus 1 -2.3856 -2.0660 1.7212
+nucleus 1 -2.3856 -2.0660 -1.7212
+nucleus 1 2.3856 -2.0660 1.7212
+nucleus 1 2.3856 -2.0660 -1.7212

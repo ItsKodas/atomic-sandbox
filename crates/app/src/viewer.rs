@@ -283,6 +283,73 @@ fn autosave_path() -> PathBuf {
     ))
 }
 
+/// The centroid of the listed nuclei (the Edit tool's handles), `None` for none.
+pub fn centroid(set: &[usize], nuclei: &[crate::scene::SceneNucleus]) -> Option<Vec3> {
+    let ps: Vec<Vec3> = set.iter().filter_map(|&i| nuclei.get(i)).map(|n| tools::v3(n.pos)).collect();
+    (!ps.is_empty()).then(|| ps.iter().copied().sum::<Vec3>() / ps.len() as f32)
+}
+
+/// The Edit tool's overlay (screen space, the guides' painter): the box being dragged, the
+/// handles at the selection's centroid (X red, Y green, Z blue; the plane squares in the colour of
+/// their normal; the hovered or held one yellow) and, while a handle is held, its offset in Å.
+fn edit_overlay(painter: &egui::Painter, camera: &OrbitCamera, scene: &Scene, tool: &ToolState, vp: Viewport, ppp: f32) {
+    use egui::{Color32, Stroke};
+    let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+    if let (Some(a), Some(b)) = (tool.boxing, tool.cursor) {
+        let r = egui::Rect::from_two_pos(to_pos(a), to_pos(b));
+        painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(120, 170, 255, 30));
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(120, 170, 255)), egui::StrokeKind::Middle);
+    }
+    let Some(c) = centroid(&tool.set(scene.nuclei.len()), &scene.nuclei) else { return };
+    let (Some(l), Some(c_px)) = (tools::gizmo_length(camera, c, vp), tools::project(camera, c, vp)) else { return };
+    let active = tool.gizmo.as_ref().map(|g| g.handle);
+    let hover = if active.is_none() { tool.cursor.and_then(|(x, y)| tools::gizmo_hit(camera, vp, c, x, y)) } else { None };
+    let lit = |h: tools::Handle| active == Some(h) || hover == Some(h);
+    let colours = [Color32::from_rgb(235, 85, 85), Color32::from_rgb(120, 205, 90), Color32::from_rgb(90, 145, 255)];
+    let yellow = Color32::from_rgb(255, 215, 90);
+    for k in 0..3 {
+        let pts: Option<Vec<egui::Pos2>> = tools::plane_quad(c, l, k).iter().map(|p| tools::project(camera, *p, vp).map(to_pos)).collect();
+        let Some(pts) = pts else { continue };
+        let h = tools::Handle::Plane(k);
+        let (col, fill) = if lit(h) { (yellow, 0.45) } else { (colours[k], 0.2) };
+        painter.add(egui::Shape::convex_polygon(pts, col.gamma_multiply(fill), Stroke::new(1.0, col)));
+    }
+    let o = to_pos(c_px);
+    for k in 0..3 {
+        let Some(tip) = tools::project(camera, c + tools::axis(k) * l, vp) else { continue };
+        let h = tools::Handle::Axis(k);
+        let (col, w) = if lit(h) { (yellow, 3.5) } else { (colours[k], 2.5) };
+        let b = to_pos(tip);
+        painter.line_segment([o, b], Stroke::new(w, col));
+        let v = b - o;
+        if v.length() > 2.0 {
+            let dir = v / v.length();
+            let perp = egui::vec2(-dir.y, dir.x);
+            painter.add(egui::Shape::convex_polygon(vec![b + dir * 11.0, b + perp * 5.0, b - perp * 5.0], col, Stroke::NONE));
+            painter.text(b + dir * 21.0, egui::Align2::CENTER_CENTER, ["X", "Y", "Z"][k], egui::FontId::proportional(12.0), col);
+        }
+    }
+    painter.circle_filled(o, 3.0, Color32::WHITE);
+    if let (Some(g), Some(at)) = (&tool.gizmo, tool.cursor) {
+        let d = g.delta.map(units::bohr_to_angstrom);
+        let names = ["x", "y", "z"];
+        let mut text = match g.handle {
+            tools::Handle::Axis(k) => format!("Δ{} {:+.3} Å", names[k], d[k]),
+            tools::Handle::Plane(k) => {
+                let (a, b) = (((k + 1) % 3).min((k + 2) % 3), ((k + 1) % 3).max((k + 2) % 3));
+                format!("Δ{} {:+.3}  Δ{} {:+.3} Å", names[a], d[a], names[b], d[b])
+            }
+        };
+        if g.resume {
+            text += "  · paused while held";
+        }
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), yellow);
+        let rect = egui::Align2::LEFT_TOP.anchor_size(to_pos(at) + egui::vec2(16.0, 14.0), galley.size()).expand(3.0);
+        painter.rect_filled(rect, 3.0, Color32::from_black_alpha(170));
+        painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, Color32::WHITE);
+    }
+}
+
 /// The mouse as the 3D view sees it: the cursor (window physical pixels) and the buttons whose
 /// press landed in the view (not on the chrome); only these drive the tools.
 #[derive(Default)]
@@ -291,6 +358,8 @@ pub struct Mouse {
     /// that selects the nucleus under it (a drag orbits).
     pub press_at: Option<(f32, f32)>,
     pub pos: (f32, f32),
+    /// Shift is held (the Edit tool adds to its selection).
+    pub shift: bool,
     pub left: bool,
     pub right: bool,
     pub middle: bool,
@@ -679,6 +748,10 @@ impl Viewer {
     pub fn input(&mut self, e: &replay::Event, consumed: bool) {
         use replay::{Button, Event, KeyName};
         let vp = self.viewport;
+        // the Edit tool's group is its own: another tool selects one nucleus
+        if self.ui.mode != ui::ToolMode::Edit {
+            self.tool.group.clear();
+        }
         match *e {
             Event::Cursor { x, y } => {
                 let p = replay::to_pixels((x, y), vp);
@@ -694,7 +767,10 @@ impl Viewer {
                 self.tool.cursor = None;
                 self.release_all();
             }
-            Event::FocusLost => self.release_all(),
+            Event::FocusLost => {
+                self.mouse.shift = false;
+                self.release_all();
+            }
             Event::Button { ref which, down } => {
                 // a press over the chrome (egui's) or outside the 3D view does nothing here
                 if down && (consumed || !vp.contains(self.mouse.pos.0, self.mouse.pos.1)) {
@@ -706,7 +782,9 @@ impl Viewer {
                         if down {
                             self.on_left_press();
                         } else {
+                            self.inspect_click();
                             self.end_drag();
+                            self.end_edit();
                         }
                     }
                     Button::Right => self.mouse.right = down,
@@ -716,10 +794,15 @@ impl Viewer {
             // zoom, or during a Select-drag the drag's pull (`Viewer::wheel`)
             Event::Wheel { lines } if !consumed => self.wheel(lines),
             Event::Key { key: KeyName::Delete, down: true } if !consumed => {
-                if let Some(i) = self.tool.selected {
+                // every selected nucleus, the highest index first (a removal shifts the later ones)
+                let mut set = self.tool.set(self.scene.nuclei.len());
+                set.sort_unstable();
+                for i in set.into_iter().rev() {
                     self.apply(ui::Action::Delete(i));
                 }
             }
+            Event::Key { key: KeyName::Shift, down } => self.mouse.shift = down,
+            Event::Key { key: KeyName::Escape, down: true } if !consumed => self.tool.clear_selection(),
             Event::Key { key: KeyName::Space, down: true } if !consumed => self.apply(ui::Action::TogglePlay),
             Event::Resize { w, h } => self.resize_viewport(w as f32, h as f32),
             _ => {}
@@ -757,6 +840,7 @@ impl Viewer {
                     });
                 }
             }
+            ui::ToolMode::Edit => self.edit_press(px, py),
             ui::ToolMode::Select => {
                 let hit = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei);
                 self.tool.selected = hit;
@@ -770,24 +854,132 @@ impl Viewer {
 
     /// Every button up: ends a Select-drag ([`Viewer::end_drag`]) and stops orbit / pan.
     fn release_all(&mut self) {
-        // Inspect: a click (the press and release within a few pixels) selects the nucleus under the
-        // cursor, or clears the selection on empty space — nothing moves
-        if let Some((x0, y0)) = self.mouse.press_at.take() {
-            let (px, py) = self.mouse.pos;
-            if self.mouse.left && self.ui.mode == ui::ToolMode::Orbit && (px - x0).hypot(py - y0) < 5.0 {
-                self.tool.selected = tools::pick(&self.camera, px, py, self.viewport, &self.scene.nuclei);
-            }
-        }
+        self.mouse.press_at = None;
         self.mouse.left = false;
         self.mouse.right = false;
         self.mouse.middle = false;
         self.end_drag();
+        self.end_edit();
     }
+
+    /// Inspect: the left button came up — a click (press and release within a few pixels) selects
+    /// the nucleus under the cursor, or clears the selection on empty space; nothing moves.
+    fn inspect_click(&mut self) {
+        let Some((x0, y0)) = self.mouse.press_at.take() else { return };
+        let (px, py) = self.mouse.pos;
+        if self.ui.mode == ui::ToolMode::Orbit && (px - x0).hypot(py - y0) < 5.0 {
+            self.tool.selected = tools::pick(&self.camera, px, py, self.viewport, &self.scene.nuclei);
+        }
+    }
+
+    // ---- The Edit tool (user request 2026-10-20) ----
+    //
+    // Select one nucleus (click), add or remove one (Shift-click) or a group (a box dragged on
+    // empty space; Shift adds), clear (Esc, or a click on empty space). The handles sit at the
+    // selection's centroid: an arrow moves it along its axis, a square in that plane. Holding a
+    // handle pauses a running simulation and releasing it resumes Play; each motion sends one
+    // `Command::MoveNuclei` with the group's grab-time positions plus the offset (a rigid move,
+    // velocities kept, clamped as a whole into the cell). After a Pause the grab-time positions
+    // are read once the worker's snapshot has seen it, so the group starts from where the run
+    // actually stopped.
+
+    fn edit_press(&mut self, px: f32, py: f32) {
+        let vp = self.viewport;
+        let set = self.tool.set(self.scene.nuclei.len());
+        let handle = centroid(&set, &self.scene.nuclei).and_then(|c| tools::gizmo_hit(&self.camera, vp, c, px, py).map(|h| (h, c)));
+        if let Some((h, c)) = handle {
+            let Some(start) = tools::handle_point(&self.camera, vp, px, py, h, c) else { return };
+            let resume = self.playing;
+            if resume {
+                self.send(Command::Dyn(DynCommand::Pause));
+            }
+            // paused already: the mirror is the driver's state; playing: read after the Pause lands
+            let base = if resume { Vec::new() } else { set.iter().map(|&i| (i, self.scene.nuclei[i].pos)).collect() };
+            self.tool.gizmo = Some(tools::GizmoDrag { handle: h, base, centre: c, start, resume, delta: [0.0; 3] });
+        } else if let Some(i) = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei) {
+            if self.mouse.shift {
+                let mut g = set;
+                match g.iter().position(|&j| j == i) {
+                    Some(k) => {
+                        g.remove(k);
+                    }
+                    None => g.push(i),
+                }
+                self.tool.selected = g.last().copied();
+                self.tool.group = g;
+            } else {
+                self.tool.group = vec![i];
+                self.tool.selected = Some(i);
+            }
+        } else {
+            self.tool.boxing = Some((px, py));
+        }
+    }
+
+    /// One motion while an Edit handle is held: the group to its grab-time positions plus the
+    /// handle's offset, clamped as a whole into the cell.
+    fn edit_motion(&mut self) {
+        let Some(handle) = self.tool.gizmo.as_ref().map(|g| g.handle) else { return };
+        if self.tool.gizmo.as_ref().is_some_and(|g| g.base.is_empty()) {
+            if !self.snapshot.as_ref().is_some_and(|s| s.edits == self.edits_sent) {
+                return; // the Pause has not landed yet
+            }
+            let base: Vec<(usize, [f64; 3])> = self.tool.set(self.scene.nuclei.len()).into_iter().map(|i| (i, self.scene.nuclei[i].pos)).collect();
+            match self.tool.gizmo.as_mut() {
+                Some(g) if !base.is_empty() => g.base = base,
+                _ => return,
+            }
+        }
+        let (px, py) = self.mouse.pos;
+        let Some(g) = self.tool.gizmo.as_ref() else { return };
+        let Some(now) = tools::handle_point(&self.camera, self.viewport, px, py, handle, g.centre) else { return };
+        let d = tools::clamp_delta(&g.base, tools::handle_delta(handle, g.start, now), &self.scene);
+        if d == g.delta {
+            return;
+        }
+        let moves = g.base.iter().map(|&(i, p)| (i, [p[0] + d[0], p[1] + d[1], p[2] + d[2]])).collect();
+        if let Some(g) = self.tool.gizmo.as_mut() {
+            g.delta = d;
+        }
+        self.send(Command::MoveNuclei { moves });
+    }
+
+    /// The left button is up: a held handle lets go (Play resumes if the press paused it), a box
+    /// selects what it covers (Shift adds), a click on empty space clears the selection.
+    fn end_edit(&mut self) {
+        if let Some(g) = self.tool.gizmo.take() {
+            if g.resume && !self.playing {
+                self.send(Command::Dyn(DynCommand::Play));
+            }
+        }
+        if let Some(a) = self.tool.boxing.take() {
+            let b = self.mouse.pos;
+            if (b.0 - a.0).hypot(b.1 - a.1) < 5.0 {
+                if !self.mouse.shift {
+                    self.tool.clear_selection();
+                }
+            } else {
+                let hits = tools::box_select(&self.camera, self.viewport, &self.scene.nuclei, a, b);
+                let mut g = if self.mouse.shift { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
+                for i in hits {
+                    if !g.contains(&i) {
+                        g.push(i);
+                    }
+                }
+                self.tool.selected = g.last().copied();
+                self.tool.group = g;
+            }
+        }
+    }
+
 
     fn on_motion(&mut self, (dx, dy): (f32, f32)) {
         let vp = self.viewport;
         let (px, py) = self.mouse.pos;
-        if self.mouse.left {
+        if self.mouse.left && self.ui.mode == ui::ToolMode::Edit {
+            // a held handle moves the group; a box follows the cursor (drawn by the overlay)
+            self.edit_motion();
+        } else if self.mouse.left {
             match (self.tool.selected, self.tool.drag_plane) {
                 (Some(_), Some(plane)) if self.tool.dragging => {
                     if let Some(pos) = tools::drag_point(&self.camera, px, py, vp, plane) {
@@ -840,7 +1032,10 @@ impl Viewer {
             self.last_error = Some(e);
         }
         if out.deselect && !self.tool.dragging {
-            self.tool.selected = None;
+            self.tool.clear_selection();
+        }
+        if self.ui.mode != ui::ToolMode::Edit {
+            self.tool.group.clear();
         }
         if out.focus_selected {
             if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
@@ -1622,6 +1817,9 @@ impl Viewer {
                 painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, egui::Color32::WHITE);
             }
         }
+        if mode == ui::ToolMode::Edit {
+            edit_overlay(&painter, camera, scene, tool, vp, ppp);
+        }
         let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
             (true, Some(i), _, _) if i < scene.nuclei.len() => (scene.nuclei[i].pos, Some(i)),
             (false, _, ui::ToolMode::Place, Some((px, py))) => {
@@ -1718,7 +1916,7 @@ impl Viewer {
     /// The nucleus under the cursor with the Select tool (the badge's and the angles' hover).
     fn hovered_nucleus(&self, shown: &Scene) -> Option<usize> {
         match (self.ui.mode, self.tool.cursor) {
-            (ui::ToolMode::Select | ui::ToolMode::Orbit, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
+            (ui::ToolMode::Select | ui::ToolMode::Orbit | ui::ToolMode::Edit, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
             _ => None,
         }
     }
@@ -1990,6 +2188,7 @@ impl Viewer {
         }
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
+        self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
         let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;

@@ -699,7 +699,8 @@ impl Action {
                     "orbit" => ToolMode::Orbit,
                     "place" => ToolMode::Place,
                     "select" => ToolMode::Select,
-                    w => return Err(format!("action tool: orbit, place or select, got '{w}'")),
+                    "edit" => ToolMode::Edit,
+                    w => return Err(format!("action tool: orbit, place, select or edit, got '{w}'")),
                 })
             }
             "element" => {
@@ -897,6 +898,7 @@ fn tool_word(m: ToolMode) -> &'static str {
         ToolMode::Orbit => "orbit",
         ToolMode::Place => "place",
         ToolMode::Select => "select",
+        ToolMode::Edit => "edit",
     }
 }
 

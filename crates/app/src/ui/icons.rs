@@ -13,6 +13,8 @@ pub enum Icon {
     Place,
     /// An open hand (the Grab tool).
     Grab,
+    /// Four arrows from a centre (the Edit tool's move).
+    Move,
     Readouts,
     Graph,
     Model,
@@ -84,6 +86,15 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 line(&[(x, 13.0), (x, top)]);
             }
             line(&[(8.0, 13.0), (5.5, 11.0), (4.5, 12.0), (7.5, 17.0), (10.0, 20.0), (15.5, 20.0), (17.0, 17.0), (17.0, 13.0)]);
+        }
+        Icon::Move => {
+            // a cross with an arrow head on each end
+            line(&[(12.0, 3.5), (12.0, 20.5)]);
+            line(&[(3.5, 12.0), (20.5, 12.0)]);
+            line(&[(9.5, 6.0), (12.0, 3.5), (14.5, 6.0)]);
+            line(&[(9.5, 18.0), (12.0, 20.5), (14.5, 18.0)]);
+            line(&[(6.0, 9.5), (3.5, 12.0), (6.0, 14.5)]);
+            line(&[(18.0, 9.5), (20.5, 12.0), (18.0, 14.5)]);
         }
         Icon::Readouts => {
             line(&[(4.0, 6.0), (20.0, 6.0)]);

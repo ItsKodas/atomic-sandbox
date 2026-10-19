@@ -644,6 +644,58 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(d.snapshot().step, 1);
 }
 
+/// The Edit tool's group move (user request 2026-10-20): paused only, every listed nucleus moves,
+/// velocities are kept (unlike `MoveNucleusDiscontinuous`), the provider is told `discontinuity`
+/// (warm start kept), forces go stale and the history restarts; a bad list changes nothing.
+#[test]
+fn move_nuclei_keeps_velocities_and_is_paused_only() {
+    let evals = Arc::new(AtomicUsize::new(0));
+    let resets = Arc::new(AtomicUsize::new(0));
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone(), discontinuities: discontinuities.clone() };
+    let s = scene(vec![
+        Nucleus::new(1, [0.0; 3]).with_vel([1e-4, 0.0, 0.0]),
+        Nucleus::new(1, [1.4, 0.0, 0.0]).with_vel([0.0, 1e-4, 0.0]),
+        Nucleus::new(8, [0.0, 2.0, 0.0]).with_vel([0.0, 0.0, 1e-5]),
+    ]);
+    let mut d = Dynamics::new(s, Box::new(provider), DT_FS, 1);
+    resets.store(0, Ordering::SeqCst);
+    let moves = vec![(0, [0.5, 0.5, 0.0]), (1, [1.9, 0.5, 0.0])];
+
+    d.apply(DynCommand::Play);
+    let before = d.snapshot();
+    d.apply(DynCommand::MoveNuclei { moves: moves.clone() });
+    let a = d.snapshot();
+    assert!(a.last_rejection.as_deref().is_some_and(|e| e.contains("pause")), "{:?}", a.last_rejection);
+    assert!(a.scene == before.scene);
+    d.apply(DynCommand::Pause);
+
+    // a repeated index, an out-of-range one or a non-finite position: refused, nothing moves
+    for bad in [vec![(0, [0.1; 3]), (0, [0.2; 3])], vec![(0, [0.1; 3]), (3, [0.2; 3])], vec![(1, [f64::NAN, 0.0, 0.0])]] {
+        let b = d.snapshot();
+        d.apply(DynCommand::MoveNuclei { moves: bad });
+        let r = d.snapshot();
+        assert!(r.last_rejection.is_some());
+        assert!(r.scene == b.scene);
+    }
+
+    d.apply(DynCommand::MoveNuclei { moves });
+    let m = d.snapshot();
+    assert!(m.last_rejection.is_none(), "{:?}", m.last_rejection);
+    assert_eq!(m.scene.nuclei[0].pos, [0.5, 0.5, 0.0]);
+    assert_eq!(m.scene.nuclei[1].pos, [1.9, 0.5, 0.0]);
+    assert_eq!(m.scene.nuclei[2].pos, [0.0, 2.0, 0.0], "an unlisted nucleus stays");
+    assert_eq!(m.scene.nuclei[0].vel, [1e-4, 0.0, 0.0], "velocities kept");
+    assert_eq!(m.scene.nuclei[1].vel, [0.0, 1e-4, 0.0]);
+    assert_eq!(m.scene.nuclei[2].vel, [0.0, 0.0, 1e-5]);
+    assert!(m.forces_stale && m.forces.is_empty());
+    assert_eq!(resets.load(Ordering::SeqCst), 0, "a move keeps the warm state (R13)");
+    assert_eq!(discontinuities.load(Ordering::SeqCst), 1);
+    let e = d.tick(f64::INFINITY, &mut never());
+    assert!(!e.forces_stale && e.forces.len() == 3);
+    assert_eq!(e.scene.nuclei[0].vel, [1e-4, 0.0, 0.0], "a paused re-evaluation does not touch velocities");
+}
+
 /// Spec §5.3: `SetIsotope` is accepted at any time — the mass changes at fixed velocity, so K
 /// jumps by ΔK = ½(m′ − m)|v|², booked into W like a thermostat rescale (E_conserved flat to
 /// rounding); an unlisted A is refused naming the listed ones; the provider is neither reset nor

@@ -127,6 +127,7 @@ impl Trails {
     pub fn on_command(&mut self, cmd: &Command) {
         match cmd {
             Command::MoveNucleus { index, .. } => self.break_atom(*index),
+            Command::MoveNuclei { moves } => moves.iter().for_each(|(i, _)| self.break_atom(*i)),
             Command::SetScene(_)
             | Command::AddNucleus { .. }
             | Command::RemoveNucleus(_)

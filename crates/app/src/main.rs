@@ -801,10 +801,11 @@ impl App {
         let risk = v.atom_risk();
         let blur = if v.ui.camera_view { Vec::new() } else { v.blur_ghosts(&shown) };
         let frames = if v.ui.camera_view { v.camera_frames(&shown) } else { Vec::new() };
+        let selected = v.tool.set(shown.nuclei.len());
         let world = World {
             camera: &v.camera,
             nuclei: v.drawn_nuclei(&shown),
-            selected: v.tool.selected,
+            selected: &selected,
             lines: &lines,
             viewport: v.viewport,
             risk: &risk,
