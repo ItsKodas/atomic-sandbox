@@ -35,8 +35,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, camera: &render::
                         let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
                         ui.painter().circle_filled(rect.center(), 5.0, if on { RED } else { RED.gamma_multiply(0.35) });
                         let what = match r.mode {
-                            RecordMode::SimTime => format!("{} · {} frames · {:.1} s video", fs_words(r.sim_fs), r.frames, r.playback_s),
-                            RecordMode::AsSeen => format!("{} frames · {:.1} s", r.frames, r.playback_s),
+                            RecordMode::SimTime => format!("{} · {} frames · {}", fs_words(r.sim_fs), r.frames, video_len(r)),
+                            RecordMode::AsSeen => format!("{} frames · {}", r.frames, video_len(r)),
                         };
                         ui.label(RichText::new(what).monospace().size(11.5).color(theme::INK));
                         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -106,6 +106,14 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, camera: &render::
     }
     guide(ctx, view, st, &cv);
     bottom
+}
+
+/// "4.1 s video", or "4.1 / 10.0 s video" with a set length.
+fn video_len(r: &crate::capture::RecordingView) -> String {
+    match r.limit_s {
+        Some(l) => format!("{:.1} / {l:.1} s video", r.playback_s),
+        None => format!("{:.1} s video", r.playback_s),
+    }
 }
 
 /// The notes box's width at most (points).
@@ -245,6 +253,14 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                         let per_ps = 1000.0 / s.fs_per_frame.max(1e-3) / crate::capture::clock::FPS;
                         theme::note(ui, format!("1 ps of simulation → {per_ps:.1} s of video; an O–H stretch (≈ 9 fs) gets {:.0} frames", 9.0 / s.fs_per_frame.max(1e-3)));
                         theme::note(ui, "sim-time frames show the 3D view only (the UI would show wall-clock state)");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.stop_on, "stop at")
+                            .on_hover_text("Stop by itself once the video is this long, however long the run takes to get there (a paused run records nothing in simulated time)");
+                        ui.add_enabled(s.stop_on, egui::DragValue::new(&mut s.stop_after_s).range(0.5..=3600.0).speed(0.5).max_decimals(1).suffix(" s of video"));
+                    });
+                    if s.stop_on && s.mode == RecordMode::SimTime {
+                        theme::note(ui, format!("{:.0} frames = {} of simulation at {} per frame", (s.stop_after_s * crate::capture::clock::FPS).round(), crate::capture::fs_words(s.stop_after_s * crate::capture::clock::FPS * s.fs_per_frame), fs_words(s.fs_per_frame)));
                     }
                     if recording {
                         theme::note(ui, "the frame and the record mode apply to the next recording; the camera and the labels change now");

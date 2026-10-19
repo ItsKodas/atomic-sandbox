@@ -104,6 +104,9 @@ pub struct Settings {
     pub camera: camera::CameraSettings,
     pub mode: RecordMode,
     pub fs_per_frame: f64,
+    /// Stop by itself once the video is `stop_after_s` long (whatever the run's speed).
+    pub stop_on: bool,
+    pub stop_after_s: f64,
     /// The popover is open.
     pub open: bool,
 }
@@ -118,6 +121,8 @@ impl Default for Settings {
             camera: camera::CameraSettings::default(),
             mode: RecordMode::SimTime,
             fs_per_frame: clock::DEFAULT_FS_PER_FRAME,
+            stop_on: false,
+            stop_after_s: 10.0,
             open: false,
         }
     }
@@ -169,6 +174,8 @@ pub struct RecordingView {
     /// Why the video is not what the settings asked for (fell behind, coarse snapshots).
     pub notes: Vec<String>,
     pub started: Instant,
+    /// The length it stops at (s of video), when set.
+    pub limit_s: Option<f64>,
 }
 
 /// A recording in progress.
@@ -188,6 +195,8 @@ struct Session {
     /// Frames the readback pool or the writers refused (filled with the previous frame).
     dropped: u64,
     started: Instant,
+    /// Frames it stops at (`Settings::stop_after_s` × 30), when set.
+    limit: Option<u64>,
     /// The playing state the clock last saw (a pause breaks the interpolation).
     playing: bool,
 }
@@ -408,6 +417,7 @@ impl Capture {
                     size: None,
                     dropped: 0,
                     started: Instant::now(),
+                    limit: settings.stop_on.then(|| (settings.stop_after_s * FPS).round().max(1.0) as u64),
                     playing: false,
                 });
                 Ok(match settings.mode {
@@ -415,24 +425,24 @@ impl Capture {
                     RecordMode::AsSeen => "recording as seen (30 frames per second of wall time)".into(),
                 })
             }
-            Request::StopRecording => {
-                let Some(s) = self.session.take() else { return Ok("not recording".into()) };
-                // the frames still on the GPU land first (`tick`), then the finish starts
-                self.finish_closing();
-                self.closing = Some(s);
-                self.view.finishing = Some("waiting for the last frames…".into());
-                Ok("recording stopped: finishing the video…".into())
-            }
+            Request::StopRecording => Ok(if self.stop() { "recording stopped: finishing the video…" } else { "not recording" }.into()),
         }
+    }
+
+    /// Stops the recording (false: none runs): the frames still on the GPU land first (`tick`),
+    /// then the finish starts.
+    fn stop(&mut self) -> bool {
+        let Some(s) = self.session.take() else { return false };
+        self.finish_closing();
+        self.closing = Some(s);
+        self.view.finishing = Some("waiting for the last frames…".into());
+        true
     }
 
     /// Hands the stopped recording to its finish thread.
     fn finish_closing(&mut self) {
         let Some(s) = self.closing.take() else { return };
-        let frames = match s.mode {
-            RecordMode::SimTime => s.sim.frames(),
-            RecordMode::AsSeen => s.wall.frames(),
-        };
+        let frames = s.frames();
         let summary = summary(&s, frames);
         writer::finish(writer::Finish { writer: s.writer, dir: s.dir, video: s.video, frames, summary }, self.notes_tx.clone());
     }
@@ -480,7 +490,9 @@ impl Capture {
                 if s.sim.backlog() {
                     s.sim.fell_behind();
                 }
-                for (k, f) in s.sim.due(PER_FRAME).into_iter().enumerate() {
+                // never past the set length
+                let left = s.limit.map_or(usize::MAX, |l| l.saturating_sub(s.sim.frames()) as usize);
+                for (k, f) in s.sim.due(PER_FRAME.min(left)).into_iter().enumerate() {
                     if k >= room {
                         s.dropped += 1; // its slot is filled with the previous frame at the finish
                         continue;
@@ -490,7 +502,7 @@ impl Capture {
                 }
             }
             RecordMode::AsSeen => {
-                if let Some(slot) = s.wall.due(now) {
+                if let Some(slot) = s.wall.due(now).filter(|&slot| s.limit.is_none_or(|l| slot < l)) {
                     let tag = Tag::Frame { session: s.id, index: slot };
                     if room == 0 {
                         s.dropped += 1;
@@ -563,12 +575,19 @@ impl Capture {
                 self.deliver(tag, img);
             }
         }
+        // a recording that reached its set length stops by itself
+        let reached = self.session.as_ref().filter(|s| s.reached()).map(|s| s.limit.unwrap_or(0) as f64 / FPS);
+        let mut auto: Option<String> = None;
+        if let Some(len) = reached {
+            self.stop();
+            auto = Some(format!("the recording reached {len:.1} s of video and stopped: finishing it…"));
+        }
         // a stopped recording is finished once its last frames are off the GPU
         if self.closing.as_ref().is_some_and(|s| !self.pool.pending_for(s.id)) {
             self.finish_closing();
         }
         // (status line text, its short form under the buttons, is an error)
-        let mut lines: Vec<(String, String, bool)> = Vec::new();
+        let mut lines: Vec<(String, String, bool)> = auto.map(|a| (a.clone(), a, false)).into_iter().collect();
         while let Ok(n) = self.notes_rx.try_recv() {
             match n {
                 Note::Saved(p) => lines.push((format!("screenshot saved: {}", p.display()), format!("saved {}", writer::file_name(&p)), false)),
@@ -819,11 +838,24 @@ impl crate::viewer::Viewer {
     }
 }
 
+impl Session {
+    /// The video's frames so far (at most the set length).
+    fn frames(&self) -> u64 {
+        let n = match self.mode {
+            RecordMode::SimTime => self.sim.frames(),
+            RecordMode::AsSeen => self.wall.frames(),
+        };
+        self.limit.map_or(n, |l| n.min(l))
+    }
+
+    /// It has the frames of its set length.
+    fn reached(&self) -> bool {
+        self.limit.is_some_and(|l| self.frames() >= l)
+    }
+}
+
 fn recording_view(s: &Session) -> RecordingView {
-    let frames = match s.mode {
-        RecordMode::SimTime => s.sim.frames(),
-        RecordMode::AsSeen => s.wall.frames(),
-    };
+    let frames = s.frames();
     let mut notes = Vec::new();
     if s.mode == RecordMode::SimTime {
         if s.sim.coarsened > 0 {
@@ -847,6 +879,7 @@ fn recording_view(s: &Session) -> RecordingView {
         hide_ui: s.hide_ui,
         notes,
         started: s.started,
+        limit_s: s.limit.map(|l| l as f64 / FPS),
     }
 }
 
@@ -861,6 +894,31 @@ fn summary(s: &Session, frames: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_set_length_stops_the_recording_by_itself() {
+        let mut c = Capture::default();
+        let dir = std::env::temp_dir().join(format!("atomic-sandbox-capture-stop-{}", std::process::id()));
+        let s = Settings { stop_on: true, stop_after_s: 0.1, fs_per_frame: 0.5, ..Settings::default() };
+        // three frames (0.1 s at 30 fps); the session is made by hand so no folder is needed
+        c.sessions = 1;
+        c.session = Some(Session {
+            id: 1, mode: RecordMode::SimTime, hide_ui: true, resolution: s.resolution, aspect: s.aspect,
+            dir: dir.clone(), video: dir.join("x.mp4"), writer: Writer::new(dir.clone()),
+            sim: SimClock::new(s.fs_per_frame), wall: WallClock::default(), size: None, dropped: 0,
+            started: Instant::now(), limit: Some(3), playing: false,
+        });
+        for k in 0..20u64 {
+            c.on_snapshot(k as f64 * 0.5, k, vec![[0.0; 3]], true);
+        }
+        let p = c.plan(Instant::now(), (800, 600), (800, 600), 8192);
+        assert_eq!(p.offscreen.len(), 3, "never past the set length, though 20 are due");
+        assert!(c.session.as_ref().is_some_and(|s| s.reached()));
+        let lines = c.tick(None, true);
+        assert!(c.session.is_none() && c.closing.is_none(), "stopped and handed to the finish");
+        assert!(lines.iter().any(|(t, _)| t.contains("reached 0.1 s")), "{lines:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn resolutions_and_names() {
