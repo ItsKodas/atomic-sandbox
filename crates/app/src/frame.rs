@@ -133,6 +133,8 @@ mod win {
     const HTBOTTOM: usize = 15;
     const HTBOTTOMLEFT: usize = 16;
     const HTBOTTOMRIGHT: usize = 17;
+    /// Around each control of the bar, this much (points) never drags the window.
+    const SAFE_PT: f32 = 8.0;
     /// The resize border inside the window's edge, in points.
     const BORDER_PT: f32 = 6.0;
 
@@ -224,7 +226,10 @@ mod win {
         if s.max_button.contains(pt) {
             return HTMAXBUTTON;
         }
-        if s.bar.contains(pt) && !s.hot.iter().any(|r| r.contains(pt)) {
+        // each control's safe zone: its full bar height and SAFE_PT either side, so a click a little
+        // off a menu (or between two) never grabs the window
+        let safe = |r: &egui::Rect| r.expand2(egui::vec2(SAFE_PT, 0.0)).with_min_y(s.bar.min.y).with_max_y(s.bar.max.y);
+        if s.bar.contains(pt) && !s.hot.iter().any(|r| safe(r).contains(pt)) {
             return HTCAPTION;
         }
         HTCLIENT
