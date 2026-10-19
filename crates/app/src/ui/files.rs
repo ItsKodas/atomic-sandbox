@@ -505,6 +505,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         let what = match &e.source {
             SceneSource::Preset(_) => "preset",
             SceneSource::File(_) => "scene file",
+            SceneSource::Built(_) => "built",
         };
         let detail = match &e.scene {
             Ok(s) => format!("{what} · {} nuclei · {}³ × {:.3} Bohr", s.nuclei.len(), s.grid_n, s.grid_h),
@@ -791,6 +792,7 @@ fn load_entry(st: &mut UiState, source: SceneSource, name: &str, acts: &mut Vec<
             st.scene_path = f;
             acts.push(Action::LoadScene { sidecar: true });
         }
+        SceneSource::Built(_) => {}
     }
     st.files.scene_name = name.to_string();
 }
@@ -876,6 +878,7 @@ pub fn open_save(st: &mut UiState) {
     let name = match &st.source {
         SceneSource::Preset(p) => p.clone(),
         SceneSource::File(f) => stem(Path::new(f)),
+        SceneSource::Built(_) => "built".to_string(),
     };
     let b = &mut st.files;
     b.save_open = true;

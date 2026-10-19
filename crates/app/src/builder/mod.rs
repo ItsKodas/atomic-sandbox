@@ -15,10 +15,78 @@ pub mod chem;
 pub mod embed;
 pub mod ui;
 
+use crate::scene::{Scene, SceneNucleus};
+use crate::sim::Command;
 use std::collections::BTreeSet;
 
 /// How many drawings undo keeps (spec §9: at least 50).
 pub const UNDO_DEPTH: usize = 100;
+
+/// What the window hands to the scene (`ui::Action::Builder`, spec §6): the nuclei in Bohr (an
+/// Insert's already placed beside the scene's atoms), the drawing's net formal charge, Relax after,
+/// and the enlarged grid when the user accepted one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handoff {
+    pub replace: bool,
+    pub nuclei: Vec<(u8, [f64; 3])>,
+    pub charge: i32,
+    pub relax: bool,
+    pub grid: Option<(usize, f64)>,
+    /// The scene chip's formula after a Replace ("C₂H₆O": "built C₂H₆O").
+    pub label: String,
+}
+
+/// The margin "enlarge the box" leaves between the farthest nucleus and the cell's face (Bohr,
+/// spec §6).
+pub const ENLARGE_MARGIN: f64 = 4.0;
+
+/// The largest |coordinate| a hand-off may put a nucleus at: the cell less the providers' margin
+/// (`tools::clamp_into_cell`'s limit) and, with the walls on, inside their soft layer.
+pub fn fit_limit(n: usize, h: f64, walls: Option<f64>) -> f64 {
+    let cell = sim::Cell { n, h };
+    let lim = (cell.max_coord() - 0.5 * cell.h).max(0.0);
+    walls.map_or(lim, |w| lim.min(w - sim::dynamics::WALL_LAYER))
+}
+
+/// The largest |coordinate| of `x` (0 for none).
+pub fn max_abs(x: &[[f64; 3]]) -> f64 {
+    x.iter().flat_map(|p| p.iter().map(|c| c.abs())).fold(0.0, f64::max)
+}
+
+/// The smallest odd n ≥ `from` at spacing h whose half-box holds `max_abs` with
+/// [`ENLARGE_MARGIN`] to spare (spec §6's "enlarge the box").
+pub fn enlarge_n(max_abs: f64, h: f64, from: usize) -> usize {
+    let mut n = from.max(3) | 1;
+    while (n as f64 - 1.0) * h / 2.0 < max_abs + ENLARGE_MARGIN {
+        n += 2;
+    }
+    n
+}
+
+/// Replace's scene (spec §6): the built nuclei at rest with their default isotopes, the drawing's
+/// charge, multiplicity auto; σ and the ionic policy kept, the grid kept unless enlarged.
+pub fn replace_scene(now: &Scene, h: &Handoff) -> Scene {
+    let (grid_n, grid_h) = h.grid.unwrap_or((now.grid_n, now.grid_h));
+    Scene {
+        nuclei: h.nuclei.iter().map(|&(z, pos)| SceneNucleus { z, a: None, pos, vel: [0.0; 3] }).collect(),
+        charge: h.charge,
+        multiplicity: None,
+        grid_n,
+        grid_h,
+        sigma: now.sigma,
+        ionic: now.ionic,
+    }
+}
+
+/// Insert's commands after any grid change (spec §6): one `AddNucleus` per atom (as Place does),
+/// then one `SetCharge` with the new total when the drawing carries a net charge.
+pub fn insert_commands(now: &Scene, h: &Handoff) -> Vec<Command> {
+    let mut v: Vec<Command> = h.nuclei.iter().map(|&(z, pos)| Command::AddNucleus { z, a: None, pos }).collect();
+    if h.charge != 0 {
+        v.push(Command::SetCharge(now.charge + h.charge));
+    }
+    v
+}
 
 /// One drawn atom: its element, its place on the canvas (canvas units: a drawn bond is about 1)
 /// and its formal charge (−1, 0 or +1).
@@ -226,6 +294,16 @@ pub struct Builder {
     pub filled: bool,
     /// The search field of the "more…" periodic table.
     pub ptable_query: String,
+    /// The last Replace, for the scene chip's Reset.
+    pub last_replace: Option<Handoff>,
+    /// The enlarged grid the user accepted for the next hand-off (spec §6: offered when the
+    /// molecule does not fit; used while it still holds it).
+    pub enlarge: Option<(usize, f64)>,
+    /// A hand-off pressed with warnings: (Replace?, the drawing then) — the same button again on the
+    /// same drawing goes ahead (spec §4: radicals are legitimate).
+    pub armed: Option<(bool, Drawing)>,
+    /// The embedding of the drawing as it was (spec §5), recomputed only when the drawing changes.
+    pub(crate) embedded: Option<(Drawing, Vec<[f64; 3]>)>,
 }
 
 impl Default for Builder {
@@ -244,6 +322,10 @@ impl Default for Builder {
             relax_after: true,
             filled: false,
             ptable_query: String::new(),
+            last_replace: None,
+            enlarge: None,
+            armed: None,
+            embedded: None,
         }
     }
 }
@@ -291,6 +373,8 @@ impl Builder {
             self.forget_indices();
         }
         self.filled = false;
+        self.enlarge = None;
+        self.armed = None;
     }
 
     /// Fill hydrogens (undoable): returns how many were added.
@@ -347,6 +431,14 @@ impl Builder {
     fn forget_indices(&mut self) {
         self.selection.clear();
         self.gesture = ui::Gesture::None;
+    }
+
+    /// The drawing in 3D (Bohr, centred), cached until the drawing changes.
+    pub fn embedding(&mut self) -> &[[f64; 3]] {
+        if self.embedded.as_ref().is_none_or(|(d, _)| *d != self.drawing) {
+            self.embedded = Some((self.drawing.clone(), embed::embed(&self.drawing)));
+        }
+        &self.embedded.as_ref().unwrap().1
     }
 
     /// The one selected atom, when exactly one is.
@@ -448,6 +540,72 @@ mod tests {
         assert_eq!(two2.components(), vec![vec![0, 1], vec![2]]);
         assert!(two2.label(crate::names::NameStyle::Common).contains(" + "));
         assert_eq!(Drawing::default().label(crate::names::NameStyle::Common), "");
+    }
+
+    fn scene(n: usize, h: f64, charge: i32) -> Scene {
+        Scene { nuclei: vec![SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }], charge, multiplicity: Some(2), grid_n: n, grid_h: h, sigma: Some(0.2), ionic: sim::IonicPolicy::Accepted }
+    }
+
+    fn handoff(replace: bool, charge: i32) -> Handoff {
+        Handoff { replace, nuclei: vec![(7, [0.0, 0.0, 0.0]), (1, [1.9, 0.0, 0.0])], charge, relax: true, grid: None, label: "HN".into() }
+    }
+
+    #[test]
+    fn replace_scene_charge_is_the_formal_sum() {
+        // NH₄⁺ drawn: the scene's charge is the drawing's +1, whatever the old scene's was
+        let mut d = Drawing::default();
+        d.add_atom(7, [0.0, 0.0]);
+        d.atoms[0].charge = 1;
+        chem::fill_hydrogens(&mut d);
+        let now = scene(81, 0.15, -2);
+        let s = replace_scene(&now, &handoff(true, d.charge()));
+        assert_eq!(s.charge, 1);
+        assert_eq!(s.multiplicity, None, "multiplicity auto");
+        assert_eq!((s.grid_n, s.grid_h, s.sigma, s.ionic), (81, 0.15, Some(0.2), sim::IonicPolicy::Accepted), "grid, σ and policy kept");
+        assert_eq!(s.nuclei.iter().map(|n| (n.z, n.a)).collect::<Vec<_>>(), vec![(7, None), (1, None)], "default isotopes");
+        assert!(s.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+        // an accepted enlargement is the new scene's grid
+        let s = replace_scene(&now, &Handoff { grid: Some((101, 0.15)), ..handoff(true, 0) });
+        assert_eq!((s.grid_n, s.grid_h), (101, 0.15));
+    }
+
+    #[test]
+    fn insert_sends_one_set_charge_with_the_new_total() {
+        let now = scene(81, 0.15, 1);
+        let v = insert_commands(&now, &handoff(false, -1));
+        assert_eq!(v.len(), 3);
+        assert!(matches!(v[0], Command::AddNucleus { z: 7, a: None, .. }) && matches!(v[1], Command::AddNucleus { z: 1, .. }));
+        assert!(matches!(v[2], Command::SetCharge(0)), "1 + (−1)");
+        // a neutral drawing changes no charge
+        let v = insert_commands(&now, &handoff(false, 0));
+        assert_eq!(v.iter().filter(|c| matches!(c, Command::SetCharge(_))).count(), 0);
+    }
+
+    #[test]
+    fn fit_check_and_enlarge_n() {
+        // 81³ × 0.15: half-box 6 Bohr, the providers' 3h margin and half a step: 5.475
+        let lim = fit_limit(81, 0.15, None);
+        assert!((lim - (6.0 - 0.45 - 0.075)).abs() < 1e-9, "{lim}");
+        // walls at 4.5: their soft layer starts at 3.5
+        assert!((fit_limit(81, 0.15, Some(4.5)) - 3.5).abs() < 1e-9);
+        assert_eq!(max_abs(&[[1.0, -7.25, 2.0], [0.5, 0.0, 3.0]]), 7.25);
+        // a molecule reaching 7.25 Bohr: the half-box must be ≥ 11.25 → n ≥ 151 at h = 0.15
+        let n = enlarge_n(7.25, 0.15, 81);
+        assert_eq!(n % 2, 1);
+        assert!((n as f64 - 1.0) * 0.15 / 2.0 >= 7.25 + ENLARGE_MARGIN);
+        assert!((n as f64 - 3.0) * 0.15 / 2.0 < 7.25 + ENLARGE_MARGIN, "the smallest such n: {n}");
+        // and the enlarged cell fits it, walls at their default included
+        let walls = crate::ui::default_wall_half_width(&scene(n, 0.15, 0));
+        assert!(fit_limit(n, 0.15, Some(walls)) >= 7.25);
+        // never smaller than the box now
+        assert_eq!(enlarge_n(0.1, 0.15, 121), 121);
+    }
+
+    #[test]
+    fn handoff_is_not_replayable() {
+        let a = crate::ui::Action::Builder(handoff(true, 0));
+        assert_eq!(a.describe(), None);
+        assert_eq!(crate::replay::unreplayable_kind(&a), Some("builder"));
     }
 
     #[test]

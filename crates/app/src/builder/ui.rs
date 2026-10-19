@@ -117,7 +117,7 @@ fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 /// The window, while open.
-pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _acts: &mut Vec<Action>) {
+pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     if !st.builder.open {
         return;
     }
@@ -137,7 +137,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
         .show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(inner, Sense::hover());
             let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 30.0));
-            let footer_h = 96.0;
+            let footer_h = 150.0;
             let footer = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - footer_h), rect.max);
             let body = Rect::from_min_max(egui::pos2(rect.left(), header.bottom() + 6.0), egui::pos2(rect.right(), footer.top() - 8.0));
             let palette_w = 150.0;
@@ -154,7 +154,13 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
             });
             child(ui, palette, egui::Layout::top_down(egui::Align::Min), |ui| palette_column(ui, st));
             canvas_area(ui, canvas, &mut st.builder);
-            child(ui, footer, egui::Layout::top_down(egui::Align::Min), |ui| footer_rows(ui, st));
+            child(ui, footer, egui::Layout::top_down(egui::Align::Min), |ui| {
+                footer_rows(ui, st);
+                ui.add_space(4.0);
+                if handoff_rows(ui, st, input, acts) {
+                    close = true;
+                }
+            });
         });
     // Esc deselects, or closes when nothing is selected — unless a popover (the periodic table) or
     // a text field has it
@@ -631,6 +637,146 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
     }
     ui.label(RichText::new(RULE_1_LINE).size(11.5).color(theme::INK_FAINT));
 }
+
+/// Whether a hand-off fits the cell (spec §6): as it is, in the accepted enlarged grid, or not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fit {
+    Now,
+    Enlarged((usize, f64)),
+    /// Does not fit: the farthest coordinate and the limit of the grid now.
+    No { reach: f64, limit: f64 },
+}
+
+/// The hand-off row: the fit check and the enlarge offer, the warnings' confirm line, Relax
+/// after, Insert and Replace. Returns true when a hand-off was sent (the window closes).
+fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> bool {
+    use super::{embed, enlarge_n, fit_limit, max_abs};
+    let walls_on = st.walls_on;
+    let wall_now = st.wall_half_width;
+    let (backend, gpu) = (st.backend, st.gpu_available);
+    let b = &mut st.builder;
+    if b.drawing.atoms.is_empty() {
+        ui.label(RichText::new("draw a molecule to put it into the scene").size(12.5).color(theme::INK_FAINT));
+        return false;
+    }
+    let scene = input.scene;
+    let (n0, h0) = (scene.grid_n, scene.grid_h);
+    let new = b.embedding().to_vec();
+    let existing: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    let mut beside = new.clone();
+    embed::place_beside(&existing, &mut beside);
+    let reach_replace = max_abs(&new);
+    let reach_insert = max_abs(&beside).max(max_abs(&existing));
+    // the walls of a grid: today's on the grid now, else the default for that cell
+    let walls_of = |n: usize, h: f64| -> Option<f64> {
+        walls_on.then(|| if (n, h) == (n0, h0) { wall_now } else { crate::ui::default_wall_half_width(&crate::scene::Scene { grid_n: n, grid_h: h, ..scene.clone() }) })
+    };
+    let accepted = b.enlarge.filter(|&(n, h)| h == h0 && n > n0);
+    let fit = |reach: f64| {
+        let limit = fit_limit(n0, h0, walls_of(n0, h0));
+        if reach <= limit {
+            Fit::Now
+        } else if let Some(g) = accepted.filter(|&(n, h)| reach <= fit_limit(n, h, walls_of(n, h))) {
+            Fit::Enlarged(g)
+        } else {
+            Fit::No { reach, limit }
+        }
+    };
+    let (fit_r, fit_i) = (fit(reach_replace), fit(reach_insert));
+
+    // ── the enlarge offer (spec §6), with the memory guard's verdict before it is accepted ──
+    let misfit = [fit_r, fit_i].into_iter().filter_map(|f| if let Fit::No { reach, limit } = f { Some((reach, limit)) } else { None }).fold(None, |m: Option<(f64, f64)>, (r, l)| Some(m.map_or((r, l), |(mr, _)| (mr.max(r), l))));
+    if let Some((reach, limit)) = misfit {
+        let n = enlarge_n(reach, h0, n0);
+        let mut probe = scene.clone();
+        probe.grid_n = n;
+        probe.nuclei.extend(new.iter().zip(&b.drawing.atoms).map(|(&pos, a)| crate::scene::SceneNucleus { z: a.z, a: None, pos, vel: [0.0; 3] }));
+        let solvers = crate::quality::gpu_solvers(backend, gpu);
+        let verdict = crate::quality::vram_check(&probe, solvers, crate::quality::vram_budget());
+        let memory = if solvers == 0 {
+            "CPU solver: no GPU memory limit, but a larger grid is slower".to_string()
+        } else {
+            let need = probe.to_sim().map(|s| solvers * providers::gpu_footprint_bytes(&s)).unwrap_or(0);
+            format!("≈ {:.1} GB of the {} GPU budget", need as f64 / 1e9, crate::quality::vram_budget().gb())
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("does not fit the {n0}³ × {h0:.3} Bohr box: the molecule reaches ±{reach:.1} Bohr, the box{} holds ±{limit:.1}", if walls_on { " with its walls" } else { "" }))
+                    .size(12.5)
+                    .color(UNDER),
+            );
+            match &verdict {
+                Ok(()) => {
+                    let r = ui.button(format!("Enlarge the box to {n}³")).on_hover_text(format!(
+                        "{n}³ × {h0:.3} Bohr: ±{:.1} Bohr, {ENLARGE_MARGIN_TEXT}; {memory}{}",
+                        (n as f64 - 1.0) * h0 / 2.0,
+                        if walls_on { "; the walls move out with it" } else { "" }
+                    ));
+                    ui.label(RichText::new(memory.clone()).size(11.5).color(theme::INK_FAINT));
+                    if r.clicked() {
+                        b.enlarge = Some((n, h0));
+                    }
+                }
+                Err(e) => {
+                    ui.add_enabled(false, egui::Button::new(format!("Enlarge the box to {n}³"))).on_disabled_hover_text(e.clone());
+                    ui.label(RichText::new("over the GPU memory budget").size(11.5).color(OVER)).on_hover_text(e.clone());
+                }
+            }
+        });
+    } else if let Some((n, _)) = [fit_r, fit_i].into_iter().find_map(|f| if let Fit::Enlarged(g) = f { Some(g) } else { None }) {
+        ui.label(RichText::new(format!("the box will be enlarged to {n}³ (from {n0}³) on hand-off")).size(12.5).color(theme::ACCENT_INK));
+    }
+
+    // ── the warnings' confirm line ──
+    let marks = super::chem::warnings(&b.drawing);
+    let armed = b.armed.as_ref().filter(|(_, d)| *d == b.drawing).map(|(r, _)| *r);
+    if let (Some(replace), false) = (armed, marks.is_empty()) {
+        ui.label(
+            RichText::new(format!("{} — press {} again to hand it over anyway", super::chem::describe(&b.drawing, &marks), if replace { "Replace scene" } else { "Insert into scene" }))
+                .size(12.5)
+                .color(UNDER),
+        );
+    }
+
+    // ── the buttons ──
+    let mut sent = false;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut b.relax_after, "Relax after").on_hover_text("relax the geometry on the solver's own surface once the atoms are in (FIRE); the guess here is only a start");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (replace, fit, label, tip) in [
+                (true, fit_r, "Replace scene", "a new scene of these atoms (the grid, walls and ionic potential kept; time restarts)"),
+                (false, fit_i, "Insert into scene", "add these atoms beside the scene's (3 Bohr apart at least)"),
+            ] {
+                let can = !matches!(fit, Fit::No { .. });
+                let r = ui.add_enabled(can, egui::Button::new(RichText::new(label).strong()).min_size(Vec2::new(130.0, 30.0)));
+                let r = if can { r.on_hover_text(tip) } else { r.on_disabled_hover_text("does not fit the box: enlarge it first") };
+                if r.clicked() {
+                    if !marks.is_empty() && armed != Some(replace) {
+                        b.armed = Some((replace, b.drawing.clone()));
+                        continue;
+                    }
+                    let atoms = if replace { &new } else { &beside };
+                    let z: Vec<u8> = b.drawing.atoms.iter().map(|a| a.z).collect();
+                    acts.push(Action::Builder(super::Handoff {
+                        replace,
+                        nuclei: z.iter().copied().zip(atoms.iter().copied()).collect(),
+                        charge: b.drawing.charge(),
+                        relax: b.relax_after,
+                        grid: if let Fit::Enlarged(g) = fit { Some(g) } else { None },
+                        label: crate::names::formula(&z, None),
+                    }));
+                    b.armed = None;
+                    b.enlarge = None;
+                    sent = true;
+                }
+            }
+        });
+    });
+    sent
+}
+
+/// The enlarge offer's margin, in words.
+const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the box";
 
 #[cfg(test)]
 mod tests {

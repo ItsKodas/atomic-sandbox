@@ -315,6 +315,13 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                     acts.push(Action::LoadScene { sidecar: true });
                 }
             }
+            super::SceneSource::Built(_) => {
+                if let Some(h) = st.builder.last_replace.clone() {
+                    if probed("reset", ui.button("Reset")).on_hover_text("the molecule builder's geometry again, unrelaxed (pauses; time restarts)").clicked() {
+                        acts.push(Action::Builder(crate::builder::Handoff { relax: false, ..h }));
+                    }
+                }
+            }
         }
     });
 }
@@ -334,7 +341,7 @@ fn file_windows(ui: &mut Ui, st: &mut UiState) {
         super::files::open_save(st);
         ui.close();
     }
-    if ui.add(Button::new(RichText::new("Builder…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("the molecule builder: sketch a structural formula and put it into the scene").clicked() {
+    if ui.add(Button::new(RichText::new("Builder…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("the molecule builder: sketch a structural formula and put it into the scene (Replace or Insert)").clicked() {
         crate::builder::ui::open(st);
         ui.close();
     }

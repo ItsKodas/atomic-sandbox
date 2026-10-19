@@ -66,6 +66,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Load model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Profiles", "layout look save load reset user", Menu(M::File), "m-files"),
+    e("Molecule builder", "builder draw sketch 2D structural formula molecule bonds hydrogens benzene ethanol insert replace", Menu(M::File), "m-files"),
     e("Forget model", "drop samples estimated", Dock(D::Model), "d-model-file"),
     // Scene
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),

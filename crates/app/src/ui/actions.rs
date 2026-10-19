@@ -161,6 +161,11 @@ pub enum Action {
     ColourBlend { additive: bool },
     /// All orbitals coloured: each orbital scaled to its own peak (false) or to the physical ρ max.
     ColourScale { physical: bool },
+    /// The molecule builder's Replace scene / Insert into scene (`crate::builder`, spec §6): the
+    /// built nuclei as `SetScene` or `AddNucleus` + `SetCharge`, the enlarged grid first when one was
+    /// accepted, then Relax. Recorded as `# not replayable: builder` (a script does not carry the
+    /// drawing).
+    Builder(crate::builder::Handoff),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -535,11 +540,68 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::ColourBlend { additive } => st.colour_additive = additive,
+        Action::Builder(h) => builder_hand_off(st, input, h, out),
         Action::ColourScale { physical } => {
             st.colour_physical = physical;
             if st.show == ShowMode::Coloured {
                 send_orbital_view(st, out);
             }
+        }
+    }
+}
+
+/// The molecule builder's hand-off (spec §6). Replace: a new scene of the built nuclei with the
+/// drawing's charge, multiplicity auto, σ and the ionic policy kept (the grid too, unless enlarged);
+/// the walls follow an enlarged cell. Insert: the enlarged grid first, then one `AddNucleus` per
+/// atom and one `SetCharge` with the new total. Both pass the GPU memory guard first; Relax after
+/// is refused during a sampling pass like the button.
+fn builder_hand_off(st: &mut UiState, input: &PanelInput<'_>, h: crate::builder::Handoff, out: &mut PanelOutput) {
+    use crate::scene::SceneNucleus;
+    let now = (input.scene.grid_n, input.scene.grid_h);
+    let enlarged = h.grid.filter(|&g| g != now);
+    let what = format!("{} ({} atom{})", h.label, h.nuclei.len(), if h.nuclei.len() == 1 { "" } else { "s" });
+    if h.replace {
+        let s = crate::builder::replace_scene(input.scene, &h);
+        if let Err(e) = vram_check(st, &s) {
+            out.error = Some(e);
+            return;
+        }
+        st.source = super::SceneSource::Built(h.label.clone());
+        st.adopt(&s);
+        if enlarged.is_some() {
+            st.wall_half_width = super::default_wall_half_width(&s);
+        }
+        out.commands.push(Command::SetScene(s));
+        if st.walls_on {
+            out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+        }
+        st.builder.last_replace = Some(h.clone());
+        st.set_status(format!("the builder replaced the scene with {what}"));
+    } else {
+        let (n, gh) = enlarged.unwrap_or(now);
+        let mut s = Scene { grid_n: n, grid_h: gh, charge: input.scene.charge + h.charge, ..input.scene.clone() };
+        s.nuclei.extend(h.nuclei.iter().map(|&(z, pos)| SceneNucleus { z, a: None, pos, vel: [0.0; 3] }));
+        if let Err(e) = vram_check(st, &s) {
+            out.error = Some(e);
+            return;
+        }
+        if enlarged.is_some() {
+            (st.grid_n, st.grid_h) = (n, gh);
+            st.box_len = (n as f64 - 1.0) * gh;
+            out.commands.push(Command::SetGrid { n, h: gh });
+            if st.walls_on {
+                st.wall_half_width = super::default_wall_half_width(&s);
+                out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+            }
+        }
+        out.commands.extend(crate::builder::insert_commands(input.scene, &h));
+        st.set_status(format!("the builder inserted {what} into the scene"));
+    }
+    if h.relax {
+        if input.sampling() {
+            st.set_status(super::RELAX_REFUSED_SAMPLING);
+        } else {
+            out.commands.push(Command::Dyn(DynCommand::Relax));
         }
     }
 }
@@ -643,7 +705,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | Builder(_) => return None,
         })
     }
 

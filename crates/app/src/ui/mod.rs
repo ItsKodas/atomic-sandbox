@@ -169,11 +169,13 @@ const SPARK_WINDOW: usize = 400;
 
 /// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
 /// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
-/// line — all through [`UiState::adopt_file`]).
+/// line — all through [`UiState::adopt_file`]), or the molecule builder's Replace (its formula;
+/// Reset sends the built geometry again, `builder::Builder::last_replace`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneSource {
     Preset(String),
     File(String),
+    Built(String),
 }
 
 impl SceneSource {
@@ -181,7 +183,7 @@ impl SceneSource {
     pub fn preset(&self) -> Option<&str> {
         match self {
             SceneSource::Preset(p) => Some(p),
-            SceneSource::File(_) => None,
+            SceneSource::File(_) | SceneSource::Built(_) => None,
         }
     }
 
@@ -190,6 +192,7 @@ impl SceneSource {
         match self {
             SceneSource::Preset(p) => p.clone(),
             SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
+            SceneSource::Built(formula) => format!("built {formula}"),
         }
     }
 }

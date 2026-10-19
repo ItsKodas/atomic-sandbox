@@ -389,6 +389,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::TeachAroundBlockers => "teach-around-blockers",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",
+        Action::Builder(_) => "builder",
         _ => "action",
     })
 }
