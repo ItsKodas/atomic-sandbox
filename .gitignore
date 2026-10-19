@@ -19,3 +19,5 @@ target-shot/
 .superpowers/
 # build.bat output: the runnable folder and its zip
 /dist
+# viewer capture output (screenshots, recordings)
+/captures

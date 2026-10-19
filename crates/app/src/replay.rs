@@ -389,14 +389,15 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::TeachAroundBlockers => "teach-around-blockers",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",
+        Action::Screenshot | Action::Record(_) => "capture",
         _ => "action",
     })
 }
 
-/// A skipped recorded save changes nothing the replay checks; any other unreplayable action would
-/// make the replay diverge from the session.
+/// A skipped recorded save (or a capture: display only) changes nothing the replay checks; any
+/// other unreplayable action would make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
-    matches!(kind, "save-scene" | "save-model")
+    matches!(kind, "save-scene" | "save-model" | "capture")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

@@ -22,7 +22,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let chip = status_chip(ctx, view, st, input);
     st.chip_rect = Some(chip);
     bonds_now(ctx, view, st, input, acts);
-    let mut right_y = view.top() + 12.0;
+    // the capture buttons at the top right; the atom card and the offer cards stack under them
+    let mut right_y = super::capture::show(ctx, view, st, acts) + 10.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
             let pseudo = input.snapshot.and_then(|s| super::pseudo::of_species(&s.dynamics.eval.pseudised, n.z));

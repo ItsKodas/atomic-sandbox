@@ -228,6 +228,11 @@ pub struct Painter {
     dots_seed: u32,
     shimmer: bool,
     dots: DotsLook,
+    /// The colour format the pipelines were built for (the capture's offscreen target matches it).
+    pub format: wgpu::TextureFormat,
+    /// The capture's own bloom chain and Camera-view glow targets (sized to the capture), swapped in
+    /// by [`Painter::paint_offscreen`] so the window's are not reallocated every captured frame.
+    capture_fx: Option<(render::bloom::Bloom, render::glow::GlowPass)>,
 }
 
 /// What [`Painter::show_display`] and [`Painter::show_orbitals`] did.
@@ -280,7 +285,29 @@ impl Painter {
             dots_seed: 1,
             shimmer: true,
             dots: DotsLook { colour_by: render::dots::COLOUR_BY_DENSITY, signed: false, tint: [1.0; 4], tint_neg: [1.0; 4] },
+            format,
+            capture_fx: None,
         }
+    }
+
+    /// The 3D view alone into the capture's offscreen `target` (`crate::capture`; no chrome): the
+    /// window's passes, bound for the frame to the target's depth and given the capture's own
+    /// bloom and glow targets, then rebound to `window_depth`. The caller sets the look first
+    /// ([`Painter::set_view`]). Display only.
+    pub fn paint_offscreen(&mut self, ctx: &GpuContext, target: Target<'_>, world: World<'_>, egui_ctx: &egui::Context, window_depth: &wgpu::TextureView) {
+        let format = self.format;
+        let mut fx = self.capture_fx.take().unwrap_or_else(|| {
+            (render::bloom::Bloom::new(ctx, format), render::glow::GlowPass::new(ctx, format, &self.renderer.camera_uniform))
+        });
+        std::mem::swap(&mut self.bloom, &mut fx.0);
+        std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        self.rebind(ctx, target.depth);
+        let none = egui::FullOutput { pixels_per_point: 1.0, ..Default::default() };
+        self.paint(ctx, target, world, egui_ctx, none);
+        std::mem::swap(&mut self.bloom, &mut fx.0);
+        std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        self.capture_fx = Some(fx);
+        self.rebind(ctx, window_depth);
     }
 
     /// Shows a snapshot's density (`DynSnapshot::display`, ruling R5) through

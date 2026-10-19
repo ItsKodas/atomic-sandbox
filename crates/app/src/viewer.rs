@@ -455,6 +455,8 @@ pub struct Viewer {
     last_play_log: Option<Instant>,
     /// The flash of the last sample the pass finished (`crate::ghost`).
     ghost: crate::ghost::Tracker,
+    /// Screenshots and recordings (`crate::capture`; display only).
+    pub capture: crate::capture::Capture,
 }
 
 impl Viewer {
@@ -511,6 +513,7 @@ impl Viewer {
             screen: None,
             last_play_log: None,
             ghost: Default::default(),
+            capture: Default::default(),
         })
     }
 
@@ -695,6 +698,8 @@ impl Viewer {
         if cmd.is_edit() {
             self.edits_sent += 1;
             self.last_error = None;
+            // a recording never interpolates across an edit
+            self.capture.on_edit();
         }
         let replaces = matches!(
             cmd,
@@ -1047,6 +1052,14 @@ impl Viewer {
         if out.toggle_play {
             self.toggle_play();
         }
+        if let Some(r) = out.capture {
+            let scene = self.ui.source.label();
+            match self.capture.request(r, &self.ui.capture, &scene) {
+                Ok(msg) => self.ui.set_status(msg),
+                Err(e) => self.last_error = Some(format!("capture: {e}")),
+            }
+            self.ui.capture_view = self.capture.view().clone();
+        }
         for cmd in out.commands {
             self.send(cmd);
         }
@@ -1274,6 +1287,9 @@ impl Viewer {
                         let cur = self.motion[1].take();
                         self.motion = [cur, Some(sample)];
                     }
+                    // a simulated-time recording follows the run (nothing while paused)
+                    let pos = s.scene.nuclei.iter().map(|n| n.pos).collect();
+                    self.capture.on_snapshot(s.dynamics.sim_time_fs(), s.dynamics.step, pos, !s.dynamics.paused);
                 }
                 if self
                     .tool
@@ -2260,6 +2276,7 @@ impl Viewer {
         let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;
         let screen_points = raw.screen_rect.map(|r| r.size());
+        self.ui.capture_view = self.capture.view().clone();
         let full = ctx.run_ui(raw, |root| {
             let out = ui::show(
                 root,

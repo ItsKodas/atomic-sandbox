@@ -125,15 +125,23 @@ fn vulkan_device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
 }
 
 /// `sampleable`: the frames can also be read as textures (`TEXTURE_BINDING`, when the surface offers it): the
-/// viewer's bloom reads the finished 3D frame.
-pub struct SurfaceState { pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub depth: wgpu::TextureView, pub sampleable: bool }
+/// viewer's bloom reads the finished 3D frame. `copyable`: they can be copied out (`COPY_SRC`, when offered):
+/// the viewer's capture of the whole window.
+pub struct SurfaceState { pub surface: wgpu::Surface<'static>, pub config: wgpu::SurfaceConfiguration, pub depth: wgpu::TextureView, pub sampleable: bool, pub copyable: bool }
 
 impl SurfaceState {
     pub fn new(ctx: &GpuContext, surface: wgpu::Surface<'static>, width: u32, height: u32) -> SurfaceState {
         let caps = surface.get_capabilities(&ctx.adapter);
         let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let sampleable = caps.usages.contains(wgpu::TextureUsages::TEXTURE_BINDING);
-        let usage = if sampleable { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING } else { wgpu::TextureUsages::RENDER_ATTACHMENT };
+        let copyable = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if sampleable {
+            usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+        }
+        if copyable {
+            usage |= wgpu::TextureUsages::COPY_SRC;
+        }
         let config = wgpu::SurfaceConfiguration {
             usage, format,
             width: width.max(1), height: height.max(1),
@@ -143,7 +151,7 @@ impl SurfaceState {
         };
         surface.configure(&ctx.device, &config);
         let depth = Self::make_depth(ctx, config.width, config.height);
-        SurfaceState { surface, config, depth, sampleable }
+        SurfaceState { surface, config, depth, sampleable, copyable }
     }
     fn make_depth(ctx: &GpuContext, w: u32, h: u32) -> wgpu::TextureView {
         ctx.device.create_texture(&wgpu::TextureDescriptor {

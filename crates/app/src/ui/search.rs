@@ -13,6 +13,8 @@ pub enum Place {
     SceneChip,
     Menu(super::menus::MenuId),
     Dock(DockTab),
+    /// The buttons over the 3D view (top right: the capture's).
+    View,
 }
 
 /// One searchable control: its name (and other words it answers to), where it lives, and the
@@ -178,6 +180,10 @@ pub const ENTRIES: &[Entry] = &[
     e("Show the atom card", "schematic Bohr", Dock(D::Selection), "d-card"),
     // Log
     e("Log", "errors refused notes status history messages", Dock(D::Log), "d-log"),
+    // the 3D view's capture buttons (top right)
+    e("Screenshot", "capture image picture png save frame photo snapshot", Place::View, "v-capture"),
+    e("Record video", "capture movie mp4 recording frames time-lapse ffmpeg clip", Place::View, "v-capture"),
+    e("Capture settings", "hide UI resolution 1080p 1440p 4K fs per frame simulated time as seen", Place::View, "v-capture"),
 ];
 
 /// How long a revealed control stays outlined.
@@ -259,6 +265,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
         // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
         Place::Dock(tab) => st.open_tab(tab),
+        // the buttons are always there; the settings open beside them
+        Place::View => st.capture.open = entry.name == "Capture settings",
     }
     st.search.reveal = Some((entry.anchor, Instant::now(), false));
     st.search.open = false;
@@ -358,6 +366,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                             format!("dock › {} (pick Estimated first)", DockTab::Activity.title())
                         }
                         Place::Dock(t) => format!("dock › {}", t.title()),
+                        Place::View => "3D view › top right".to_string(),
                     };
                     let r = ui.add(
                         egui::Button::selectable(
