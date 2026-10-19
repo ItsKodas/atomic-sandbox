@@ -81,8 +81,8 @@ pub struct World<'a> {
     pub warp_from: Option<&'a [[f64; 3]]>,
     /// The Camera view (`Viewer::camera_frames`): each shutter instant's positions, and the exposure
     /// (EV); `None` = the diagram view.
-    /// (instants, exposure EV, solidity 0–1, size × the diagram radius)
-    pub glow: Option<(&'a [Vec<[f64; 3]>], f32, f32, f32)>,
+    /// (instants, exposure EV, solidity 0–1, size × the diagram radius, the smooth union's neck width in Bohr)
+    pub glow: Option<(&'a [Vec<[f64; 3]>], f32, f32, f32, f32)>,
 }
 
 /// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
@@ -751,7 +751,7 @@ impl Painter {
             .collect();
         self.renderer.ghosts.set_instances(ctx, &ghosts);
         self.renderer.glow_on = world.glow.is_some();
-        if let Some((all, ev, solidity, size)) = world.glow {
+        if let Some((all, ev, solidity, size, smooth)) = world.glow {
             // with any solidity each instant is two passes: at most 16 instants, evenly spread
             let frames: Vec<&Vec<[f64; 3]>> = if solidity > 0.0 && all.len() > 16 {
                 (0..16).map(|k| &all[k * (all.len() - 1) / 15]).collect()
@@ -773,7 +773,7 @@ impl Painter {
                 .collect();
             self.renderer.glow.ensure(ctx, [w_px, h_px]);
             let per = world.nuclei.len().min(frames.first().map_or(0, |f| f.len()));
-            self.renderer.glow.set(ctx, &glow, per, ev, solidity);
+            self.renderer.glow.set(ctx, &glow, per, ev, solidity, smooth);
         }
         self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {

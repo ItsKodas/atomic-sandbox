@@ -566,6 +566,8 @@ pub struct UiState {
     /// the field of view (degrees, Camera only).
     pub camera_solidity: f32,
     pub camera_size: f32,
+    /// The Camera view's solid: the smooth union's neck width (Bohr; 0 = separate balls).
+    pub camera_smooth: f32,
     pub fov_deg: f32,
     /// View ▸ Display aids ▸ background, sRGB; `None` = the default dark blue.
     pub background: Option<[u8; 3]>,
@@ -849,6 +851,7 @@ right {}
             exposure_ev: 0.0,
             camera_solidity: 0.0,
             camera_size: 1.6,
+            camera_smooth: 0.6,
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,

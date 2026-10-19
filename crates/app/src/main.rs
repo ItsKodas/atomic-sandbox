@@ -812,7 +812,7 @@ impl App {
             viewport: v.viewport,
             risk: &risk,
             blur: &blur,
-            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size)),
+            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size, v.ui.camera_smooth)),
             warp_from: warp_from.as_deref(),
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);

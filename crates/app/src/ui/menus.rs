@@ -791,6 +791,8 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
             let t = format!("{:.1}×", st.camera_size);
             row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
+            let t = if st.camera_smooth <= 0.0 { "balls".into() } else { format!("{:.2} Bohr", st.camera_smooth) };
+            row(ui, "smooth", &mut st.camera_smooth, 0.0..=2.0, t, "with any solidity: one smooth surface instead of separate balls — atoms close together flow into each other through a soft neck this wide (0 = separate balls, the hard crease)");
         });
         ui.separator();
         ui.horizontal(|ui| {
