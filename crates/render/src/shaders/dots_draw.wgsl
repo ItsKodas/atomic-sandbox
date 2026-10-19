@@ -29,7 +29,16 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     var clip = cam.view_proj * vec4(pt.xyz, 1.0);
     // an empty slot (alpha 0) or a dot behind the eye: off screen
     if (c.a <= 0.0 || clip.w <= 0.0) { o.pos = vec4(2.0, 2.0, 2.0, 1.0); o.uv = q; o.colour = vec4(0.0); return o; }
-    clip = vec4(clip.xy + q * prm.size_px / cam.viewport * 2.0 * clip.w, clip.z, clip.w);
+    if (prm.glow != 0u) {
+        // glowing dots have a size in the world (size_px × 0.012 Bohr): tiny far away, large up
+        // close, like the reference — a billboard facing the camera
+        let right = normalize((cam.inv_view_proj * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
+        let up = normalize((cam.inv_view_proj * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
+        let r = prm.size_px * 0.012;
+        clip = cam.view_proj * vec4(pt.xyz + (right * q.x + up * q.y) * r, 1.0);
+    } else {
+        clip = vec4(clip.xy + q * prm.size_px / cam.viewport * 2.0 * clip.w, clip.z, clip.w);
+    }
     o.pos = clip;
     o.uv = q;
     o.colour = vec4(c.rgb, 1.0);
