@@ -241,8 +241,8 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                 frame = frame.stroke(Stroke::new(1.0, RED)).fill(Color32::from_rgba_premultiplied(70, 14, 20, 225));
             }
             frame.show(ui, |ui| {
-                // within the 3D view (a narrow view: the row wraps instead of running over the dock)
-                ui.set_max_width((view.width() - 300.0).clamp(260.0, 640.0).min(view.width() - 40.0));
+                // within the 3D view: one line while it fits, wrapped only when the view is narrower than the row
+                ui.set_max_width((view.width() - 40.0).max(200.0));
                 ui.horizontal_wrapped(|ui| {
                     if busy {
                         ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
