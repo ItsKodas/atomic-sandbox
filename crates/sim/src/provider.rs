@@ -113,10 +113,35 @@ pub enum OrbitalRequest {
     /// occupied), `physical` scales by max ρ instead of each orbital's peak. (The blend, additive
     /// or weighted, is a render setting: the producer's field does not depend on it, so it is not
     /// part of the request.)
-    AllColoured { include: Option<Vec<u32>>, physical: bool },
+    /// `look`: by density, or each orbital's boundary surface ([`ColourLook`]).
+    AllColoured { include: Option<Vec<u32>>, physical: bool, look: ColourLook },
     /// m = ρ↑ − ρ↓.
     SpinDensity,
 }
+
+/// How "All orbitals coloured" draws each orbital (user request 2026-10-19; display only): as
+/// its **boundary surface** — the region where its density is above the level that encloses
+/// `enclose` % of its probability, uniformly filled or (`shell`, the default) only a band just
+/// inside that boundary, the textbook picture — or (`enclose` = `None`) by its density as before;
+/// `hide_core` leaves out the core orbitals (more than [`CORE_GAP`] Hartree below the highest
+/// occupied one: Li's 1s; a pseudised atom has none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColourLook {
+    pub enclose: Option<u8>,
+    pub shell: bool,
+    pub hide_core: bool,
+}
+
+impl Default for ColourLook {
+    fn default() -> Self {
+        ColourLook { enclose: Some(90), shell: true, hide_core: false }
+    }
+}
+
+/// An occupied orbital this far (Hartree) below the highest occupied one is a core orbital for
+/// [`ColourLook::hide_core`] (Li 1s is 1.8 Ha below its 2s; the valence 2s of O, N, F sit
+/// 0.6–0.9 Ha below their HOMOs). A display choice, not physics.
+pub const CORE_GAP: f64 = 1.5;
 
 impl OrbitalRequest {
     pub fn is_off(&self) -> bool {
@@ -780,6 +805,15 @@ pub trait ForceProvider: Send {
     /// analytic providers, which have no pseudopotentials — is the policy's own word.
     fn ionic_tag(&self, scene: &Scene) -> String {
         scene.ionic.word().to_string()
+    }
+    /// The charge each nucleus's electrons are counted against in the density this provider
+    /// solves `scene` with, in scene order: Z for an all-electron nucleus, the valence charge Z_v
+    /// for a pseudised one (`providers::pseudo::valence_charges`) — the Z_A of the Hirshfeld
+    /// charges (`crate::charges`, display only). `None` when it cannot be told now (the
+    /// pseudopotential cache is busy generating a table); the charges then wait. The default —
+    /// the analytic providers, which have no pseudopotentials — is Z.
+    fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
+        Some(scene.nuclei.iter().map(|n| n.z as f64).collect())
     }
 }
 

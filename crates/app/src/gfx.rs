@@ -55,6 +55,8 @@ pub struct Target<'a> {
     pub depth: &'a wgpu::TextureView,
     /// Physical pixels.
     pub size: [u32; 2],
+    /// `colour` can be sampled (the target has `TEXTURE_BINDING`): bloom is drawn.
+    pub sampleable: bool,
 }
 
 /// What the 3D part of a frame shows.
@@ -74,10 +76,13 @@ pub struct World<'a> {
     pub risk: &'a [f32],
     /// Motion blur (`Viewer::blur_ghosts`): (nucleus, position, alpha) of each translucent copy.
     pub blur: &'a [(usize, [f64; 3], f32)],
+    /// The positions the shown field was solved at (`Viewer::warp_source`): it is warped to
+    /// `nuclei` (`render::warp`); `None` draws it as solved.
+    pub warp_from: Option<&'a [[f64; 3]]>,
     /// The Camera view (`Viewer::camera_frames`): each shutter instant's positions, and the exposure
     /// (EV); `None` = the diagram view.
-    /// (instants, exposure EV, solidity 0–1, size × the diagram radius)
-    pub glow: Option<(&'a [Vec<[f64; 3]>], f32, f32, f32)>,
+    /// (instants, exposure EV, solidity 0–1, size × the diagram radius, the smooth union's neck width in Bohr)
+    pub glow: Option<(&'a [Vec<[f64; 3]>], f32, f32, f32, f32)>,
 }
 
 /// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
@@ -176,6 +181,10 @@ pub struct Painter {
     dots_size: f32,
     dots_brightness: f32,
     dots_feather: f32,
+    /// Bloom (`render::bloom`): its strength (0 = off) and threshold, from View.
+    bloom: render::bloom::Bloom,
+    bloom_intensity: f32,
+    bloom_threshold: f32,
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
     /// one bound): created by the painter, never handed out (so uploading into them cannot touch
@@ -246,6 +255,9 @@ impl Painter {
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            bloom: render::bloom::Bloom::new(ctx, format),
+            bloom_intensity: 0.0,
+            bloom_threshold: 0.7,
             renderer: Renderer::new(ctx, format),
             uploads: [None, None],
             uploaded: None,
@@ -611,6 +623,7 @@ impl Painter {
         // the dots' look (View ▸ Density ▸ dots)
         self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
         (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather);
+        (self.bloom_intensity, self.bloom_threshold) = (ui.bloom, ui.bloom_threshold);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
             let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
@@ -714,6 +727,16 @@ impl Painter {
         let vp = world.viewport;
         let vp = if vp.size[0] < 1.0 || vp.size[1] < 1.0 { Viewport::full(w as f32, h as f32) } else { vp };
         self.renderer.update_camera_in(ctx, world.camera, vp);
+        match world.warp_from {
+            Some(from) => {
+                let f32s = |p: &[f64; 3]| p.map(|x| x as f32);
+                let solved: Vec<[f32; 3]> = from.iter().map(f32s).collect();
+                let now: Vec<[f32; 3]> = world.nuclei.iter().map(|n| f32s(&n.pos)).collect();
+                let (lo, hi) = (self.renderer.volume_params.box_min, self.renderer.volume_params.box_max);
+                self.renderer.warp.set(ctx, lo, hi, &solved, &now);
+            }
+            None => self.renderer.warp.off(ctx),
+        }
         self.renderer
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));
@@ -728,7 +751,7 @@ impl Painter {
             .collect();
         self.renderer.ghosts.set_instances(ctx, &ghosts);
         self.renderer.glow_on = world.glow.is_some();
-        if let Some((all, ev, solidity, size)) = world.glow {
+        if let Some((all, ev, solidity, size, smooth)) = world.glow {
             // with any solidity each instant is two passes: at most 16 instants, evenly spread
             let frames: Vec<&Vec<[f64; 3]>> = if solidity > 0.0 && all.len() > 16 {
                 (0..16).map(|k| &all[k * (all.len() - 1) / 15]).collect()
@@ -750,7 +773,7 @@ impl Painter {
                 .collect();
             self.renderer.glow.ensure(ctx, [w_px, h_px]);
             let per = world.nuclei.len().min(frames.first().map_or(0, |f| f.len()));
-            self.renderer.glow.set(ctx, &glow, per, ev, solidity);
+            self.renderer.glow.set(ctx, &glow, per, ev, solidity, smooth);
         }
         self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {
@@ -771,6 +794,10 @@ impl Painter {
             });
         self.renderer
             .render_in(&mut enc, target.colour, target.depth, self.clear, Some((vp, target.size)));
+        // the glow of the bright parts, over the 3D frame and under the UI
+        if target.sampleable {
+            self.bloom.apply(ctx, &mut enc, target.colour, target.colour, target.size, self.bloom_intensity, self.bloom_threshold);
+        }
         let extra = self
             .egui
             .update_buffers(&ctx.device, &ctx.queue, &mut enc, &jobs, &screen);
@@ -1059,7 +1086,7 @@ mod tests {
         ui.show = ShowMode::Coloured;
         let rgba: Arc<Vec<[f32; 4]>> = Arc::new(values.iter().map(|&v| { let s = v * v / 0.3679; [0.9 * s, 0.4 * s, 0.1 * s, s] }).collect());
         let cf = OrbitalField::CpuColour { rgba: rgba.clone(), scale: 1.0 };
-        let what = OrbitalRequest::AllColoured { include: None, physical: false };
+        let what = OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() };
         assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, what.clone(), Some(cf)), &hl.depth), Ok(Shown::Snapped));
         ui.volume_mode = crate::ui::VOLUME_VOLUME;
         ui.colour_additive = true;

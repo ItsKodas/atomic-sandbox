@@ -636,6 +636,14 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
 
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
+    let mut warp = st.warp_fields;
+    if ui
+        .checkbox(&mut warp, "fields follow the atoms")
+        .on_hover_text("the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)")
+        .changed()
+    {
+        acts.push(Action::WarpFields(warp));
+    }
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
     let mut changed = false;
     ui.add_enabled_ui(estimated, |ui| {
@@ -779,6 +787,19 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 }
             });
         });
+        // bloom: the bright parts glow (display only)
+        ui.horizontal(|ui| {
+            ui.label("bloom");
+            ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2))
+                .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
+        });
+        ui.add_enabled_ui(st.bloom > 0.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("bloom from");
+                ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2))
+                    .on_hover_text("how bright a part must be to glow (1 = only full white)");
+            });
+        });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
         theme::section(ui, "Camera");
@@ -804,6 +825,8 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
             let t = format!("{:.1}×", st.camera_size);
             row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
+            let t = if st.camera_smooth <= 0.0 { "balls".into() } else { format!("{:.2} Bohr", st.camera_smooth) };
+            row(ui, "smooth", &mut st.camera_smooth, 0.0..=2.0, t, "with any solidity: one smooth surface instead of separate balls — atoms close together flow into each other through a soft neck this wide (0 = separate balls, the hard crease)");
         }
         ui.separator();
         ui.horizontal(|ui| {
@@ -850,9 +873,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             );
         });
         ui.horizontal(|ui| {
+            probed("show-charges", ui.checkbox(&mut st.show_charges, "partial charges")).on_hover_text(super::CHARGES_TIP);
+        });
+        ui.horizontal(|ui| {
             ui.label("label opacity");
             ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
-                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths and angles (display only)");
+                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths, angles and partial charges (display only)");
             ui.label(format!("{:.0} %", st.label_opacity * 100.0));
         });
         ui.horizontal(|ui| {
@@ -1117,6 +1143,7 @@ fn help_menu(ui: &mut Ui, st: &mut UiState) {
             (HelpTopic::Gravity, "Gravity is invisible at atomic scale, by design"),
             (HelpTopic::AtomCard, "The atom card is a schematic"),
             (HelpTopic::FastPlay, "Fast play: shimmer, not swing"),
+            (HelpTopic::Charges, "Partial charges are one partition of many"),
         ] {
             if ui.add(Button::new(format!("{label}  ›")).frame_when_inactive(false)).clicked() {
                 st.help = Some(topic);
@@ -1171,6 +1198,12 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         HelpTopic::AtomCard => (
             "The atom card is a schematic",
             "The atom card is a labelled 2D Bohr-style schematic, not the simulation: the sandbox never resolves nucleons (the nucleus is a point of charge +Z and a mass), and in a molecule the electrons are shared — the density cloud in the 3D view is the real picture. Everything on it derives from Z and the isotope mass table: N = A − Z with A the mass number of the most abundant isotope, and the shell occupation is the textbook 2 / 8 / 8 / 18 filling of a neutral atom.".into(),
+        ),
+        HelpTopic::Charges => (
+            "Partial charges are one partition of many",
+            "The small +/− labels on the atoms (View ▸ Bonds and molecules ▸ partial charges; also Dock ▸ Selection and the hover badge) are Hirshfeld charges: q_A = Z_A − ∫ w_A ρ, where ρ is the solved electron density and w_A = ρ_A⁰ / Σ_B ρ_B⁰ shares every point between the atoms in proportion to their free-atom densities — this solver's own isolated neutral atoms, the same ones the bond detector compares with. Z_A is the nuclear charge, or the valence charge for a pseudopotential atom (its density is the valence density). Because the weights add up to one everywhere, the charges add up exactly to the scene's charge (Scene ▸ Charge); the viewer checks that and hides charges that do not.\n\n\
+             An atom's charge in a molecule is not an observable: it depends on how space is divided between the atoms. Hirshfeld is one parameter-free choice among several (Mulliken, Bader's QTAIM basins, fits to the electrostatic potential, iterative Hirshfeld-I) and is known to give small magnitudes — the free-atom weights pull the partition toward neutral atoms — so read the sign and the trend, not the size. They are measured from this LSDA density at this grid and smearing, so they carry its approximations too.\n\n\
+             Display only: computed after a converged DFT density and never fed back into the forces. Under the estimated solver a model step has no electrons, so the charges are the last DFT density's (a fallback, an audit or a display refresh), drawn faded with their time.".into(),
         ),
         HelpTopic::FastPlay => (
             "Fast play: shimmer, not swing",

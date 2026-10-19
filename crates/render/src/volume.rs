@@ -104,7 +104,7 @@ impl Sampling {
 /// variant's `sample_one`) and the colour volume's (`fs_colour`).
 fn shader_source(sampling: Sampling) -> String {
     let variant = if sampling == Sampling::Filtered { include_str!("shaders/volume_filtered.wgsl") } else { include_str!("shaders/volume_manual.wgsl") };
-    format!("{}\n{variant}\n{}", include_str!("shaders/volume.wgsl"), include_str!("shaders/volume_colour.wgsl"))
+    format!("{}\n{variant}\n{}\n{}", include_str!("shaders/volume.wgsl"), include_str!("shaders/volume_colour.wgsl"), crate::warp::WGSL)
 }
 
 /// Group 0 of both pipelines: the camera uniform, the layout of `SpherePass`, so one camera buffer
@@ -147,6 +147,8 @@ fn depth_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 pub struct VolumePass {
     pipeline: wgpu::RenderPipeline,
     camera_bg: wgpu::BindGroup,
+    /// Group 2: the display warp (`crate::warp`; the identity until the renderer shares its own).
+    warp_bg: wgpu::BindGroup,
     volume_bgl: wgpu::BindGroupLayout,
     volume_bg: Option<wgpu::BindGroup>,
     params: UniformBuffer<VolumeUniform>,
@@ -183,14 +185,19 @@ impl VolumePass {
             entries.push(wgpu::BindGroupLayoutEntry { binding: 3, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
         }
         let volume_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("volume bgl"), entries: &entries });
-        let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&volume_bgl)], immediate_size: 0 });
+        let warp_bgl = crate::warp::layout(dev);
+        let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&volume_bgl), Some(&warp_bgl)], immediate_size: 0 });
         let pipeline = fullscreen_pipeline(dev, &shader, &layout, colour_format, "volume", "fs_main");
         let params = UniformBuffer::<VolumeUniform>::new(ctx, "volume params");
         params.write(ctx, &VolumeUniform::default());
-        VolumePass { pipeline, camera_bg, volume_bgl, volume_bg: None, params, sampling }
+        let warp_bg = crate::warp::Warp::new(ctx).bind_group().clone();
+        VolumePass { pipeline, camera_bg, warp_bg, volume_bgl, volume_bg: None, params, sampling }
     }
 
     pub fn sampling(&self) -> Sampling { self.sampling }
+
+    /// Reads the display warp through `bg` (`crate::warp::Warp::bind_group`).
+    pub fn set_warp(&mut self, bg: &wgpu::BindGroup) { self.warp_bg = bg.clone(); }
 
     /// Rebind when the Volume3D or the depth view changes (grid change / resize / a new texture
     /// from the GPU solver). The volume must be unpadded n³ (`Volume3D` contract). Binds it in
@@ -229,6 +236,7 @@ impl VolumePass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, bg, &[]);
+        pass.set_bind_group(2, &self.warp_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -240,6 +248,7 @@ impl VolumePass {
 pub struct ColourVolumePass {
     pipeline: wgpu::RenderPipeline,
     camera_bg: wgpu::BindGroup,
+    warp_bg: wgpu::BindGroup,
     bgl: wgpu::BindGroupLayout,
     bg: Option<wgpu::BindGroup>,
     params: UniformBuffer<VolumeUniform>,
@@ -261,11 +270,17 @@ impl ColourVolumePass {
             wgpu::BindGroupLayoutEntry { binding: 6, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             tex(7),
         ] });
-        let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&bgl)], immediate_size: 0 });
+        let warp_bgl = crate::warp::layout(dev);
+        let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&bgl), Some(&warp_bgl)], immediate_size: 0 });
         let pipeline = fullscreen_pipeline(dev, &shader, &layout, colour_format, "volume colour", "fs_colour");
         let params = UniformBuffer::<VolumeUniform>::new(ctx, "volume colour params");
         params.write(ctx, &VolumeUniform::default());
-        ColourVolumePass { pipeline, camera_bg, bgl, bg: None, params }
+        let warp_bg = crate::warp::Warp::new(ctx).bind_group().clone();
+        ColourVolumePass { pipeline, camera_bg, warp_bg, bgl, bg: None, params }
+    }
+
+    /// Reads the display warp through `bg` (`crate::warp::Warp::bind_group`).
+    pub fn set_warp(&mut self, bg: &wgpu::BindGroup) { self.warp_bg = bg.clone();
     }
 
     /// Binds the previous and the current colour volume (and the scene depth). Both are sampled
@@ -294,6 +309,7 @@ impl ColourVolumePass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, bg, &[]);
+        pass.set_bind_group(2, &self.warp_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -914,6 +930,7 @@ mod orbital_tests {
                     box_min: [LO; 3], use_colour: 0, box_max: [-LO; 3], count: 200_000, dims: [0; 3], seed: 7,
                     tint: [0.9, 0.3, 0.2, 1.0], tint_neg: [0.2, 0.45, 0.9, 1.0], size_px: 1.25, intensity: 0.35,
                     colour_by: if signed { crate::dots::COLOUR_BY_SIGN } else { crate::dots::COLOUR_BY_DENSITY }, signed: u32::from(signed),
+                    walk: 0.0, refresh: 1.0, glow: 0, cut: 0.0,
                 });
             }
             let frame = || {

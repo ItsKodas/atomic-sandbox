@@ -103,6 +103,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
     e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
     e("Bond angles", "angle degrees geometry bonds HOH water", Menu(M::View), "m-bonds"),
+    e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Menu(M::View), "m-bonds"),
     // Physics
     e("Ionic potential", "pseudopotential all-electron cores valence nlcc ionic policy none cores only all species h_req egg-box", Menu(M::Physics), "m-ionic"),
     e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
@@ -173,6 +174,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Distance guides", "bond length Bohr Å", Dock(D::Selection), "d-guides"),
     e("Isotope of the selected nucleus", "mass number deuterium tritium swap", Dock(D::Selection), "d-selection"),
     e("Bonds of the selected nucleus", "bonded pair verdict density", Dock(D::Selection), "d-bonds"),
+    e("Partial charges of every atom", "Hirshfeld charge list sum δ+ δ− polarity", Dock(D::Selection), "d-charges"),
     e("Molecules (formula and name)", "labels water net charge", Dock(D::Selection), "d-molecules"),
     e("Show the atom card", "schematic Bohr", Dock(D::Selection), "d-card"),
     // Log

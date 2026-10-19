@@ -399,6 +399,7 @@ pub enum HelpTopic {
     Gravity,
     AtomCard,
     FastPlay,
+    Charges,
 }
 
 /// Standard gravity g = 9.8 m/s² as an acceleration in atomic units (Bohr per atomic time unit²):
@@ -444,6 +445,10 @@ pub struct UiState {
     /// View ▸ Bonds and molecules ▸ bond lengths: each drawn bond's length (Å) at its midpoint
     /// (user request 2026-10-18). Display only, not recorded.
     pub show_bond_lengths: bool,
+    /// View ▸ Bonds and molecules ▸ partial charges: each atom's Hirshfeld charge (`sim::charges`)
+    /// as a small label on it, blue + / red −, also in Dock ▸ Selection and the badge. Display only,
+    /// not recorded; on by default.
+    pub show_charges: bool,
     /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
     /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
     pub follow_selected: bool,
@@ -516,6 +521,8 @@ pub struct UiState {
     /// peak or to the physical ρ max.
     pub colour_additive: bool,
     pub colour_physical: bool,
+    /// All orbitals coloured: boundary surfaces (shell by default) or the density (`sim::ColourLook`).
+    pub colour_look: sim::ColourLook,
     /// All orbitals coloured: the tracks included (`None` = every occupied orbital).
     pub included: Option<std::collections::BTreeSet<u32>>,
     /// Screenshots: the spheres' size factor instead of the automatic one (the automatic one
@@ -569,6 +576,8 @@ pub struct UiState {
     /// the field of view (degrees, Camera only).
     pub camera_solidity: f32,
     pub camera_size: f32,
+    /// The Camera view's solid: the smooth union's neck width (Bohr; 0 = separate balls).
+    pub camera_smooth: f32,
     pub fov_deg: f32,
     /// View ▸ Display aids ▸ background, sRGB; `None` = the default dark blue.
     pub background: Option<[u8; 3]>,
@@ -624,6 +633,13 @@ pub struct UiState {
     /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
     /// superposition between DFT densities (default on), and a display refresh every N s.
     pub cloud_superposition: bool,
+    /// The display warp (`render::warp`, user request 2026-10-20): the shown density or orbitals
+    /// follow the atoms from the geometry they were solved at to where they are drawn now. Display only.
+    pub warp_fields: bool,
+    /// Bloom (`render::bloom`, display only): the glow strength (0 = off) and the brightness it
+    /// starts at (0–1 of full white).
+    pub bloom: f32,
+    pub bloom_threshold: f32,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
@@ -794,6 +810,7 @@ right {}
             show_ghost: true,
             show_angles: true,
             show_bond_lengths: true,
+            show_charges: true,
             follow_selected: false,
             audit_every_on: 2000,
             audit_auto: true,
@@ -823,6 +840,7 @@ right {}
             spin_iso: SPIN_ISO_DEFAULT,
             colour_additive: true,
             colour_physical: false,
+            colour_look: sim::ColourLook::default(),
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
@@ -845,6 +863,7 @@ right {}
             exposure_ev: 0.0,
             camera_solidity: 0.0,
             camera_size: 1.6,
+            camera_smooth: 0.6,
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
@@ -883,6 +902,9 @@ right {}
             edit_group: Vec::new(),
             smooth_motion: true,
             cloud_superposition: true,
+            warp_fields: true,
+            bloom: 0.35,
+            bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
             dock_tab: DockTab::Model,
@@ -1070,7 +1092,7 @@ impl UiState {
             ShowMode::Coloured => (
                 // (the blend is a render setting, `Painter::set_view`, not part of the request: a toggle
                 // would otherwise be a view change, and in estimated mode a background solve)
-                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical },
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, look: self.colour_look },
                 self.unoccupied,
             ),
             ShowMode::Spin => (R::SpinDensity, 0),
@@ -1444,6 +1466,50 @@ pub fn bonds_label(d: &sim::DynSnapshot) -> Option<String> {
     let g = d.bonds.as_ref().filter(|_| d.bonds_stale)?;
     Some(format!("bonds from the last DFT step (t = {:.2} fs) — the surrogate has no electrons", units::au_time_to_fs(g.sim_time)))
 }
+
+/// The partial charges that can be drawn on `d`'s scene (`sim::charges`): the newest ones when
+/// they are for these nuclei and their sum is the scene's charge (`PartialCharges::balanced`),
+/// with whether they were measured at the current positions.
+pub fn shown_charges(d: &sim::DynSnapshot) -> Option<(&sim::PartialCharges, bool)> {
+    let c = d.charges.as_deref().filter(|c| c.fits(&d.scene) && c.balanced())?;
+    Some((c, c.is_current(&d.scene)))
+}
+
+/// The faded charges' label: "charges from t = … fs" while the drawn charges were measured at
+/// another geometry (estimated mode between DFT densities; a drag before its solve).
+pub fn charges_label(d: &sim::DynSnapshot) -> Option<String> {
+    let (c, current) = shown_charges(d)?;
+    if current {
+        return None;
+    }
+    let from = match c.source {
+        sim::ChargeSource::Step => "a DFT step",
+        sim::ChargeSource::Side(sim::SideKind::Audit) => "an audit's DFT density",
+        sim::ChargeSource::Side(sim::SideKind::Refresh) => "a DFT display refresh",
+    };
+    Some(format!("charges from t = {:.2} fs ({from}) — faded until the next DFT density", c.t_fs()))
+}
+
+/// A charge as the view and the panels write it: the sign always, two decimals, a true minus.
+pub fn charge_text(q: f64) -> String {
+    let q = if q.abs() < 0.005 { 0.0 } else { q };
+    if q < 0.0 { format!("\u{2212}{:.2}", -q) } else { format!("+{q:.2}") }
+}
+
+/// The colour of a charge: blue for +, red for −, grey near 0 (|q| < 0.005).
+pub fn charge_colour(q: f64, alpha: u8) -> egui::Color32 {
+    if q >= 0.005 {
+        egui::Color32::from_rgba_unmultiplied(120, 180, 255, alpha)
+    } else if q <= -0.005 {
+        egui::Color32::from_rgba_unmultiplied(255, 125, 115, alpha)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(200, 200, 200, alpha)
+    }
+}
+
+/// What the partial charges are (the View toggle's tooltip, the Selection tab's hover; Help ▸
+/// "Partial charges are one partition of many" has the long form). Rule 7.
+pub const CHARGES_TIP: &str = "each atom's partial charge q = Z − (its share of the solved electrons), in e: blue +, red −. Hirshfeld (stockholder) partition: every point of the density is shared between the atoms in proportion to their free-atom densities (this solver's own isolated atoms, the bond references). One partition scheme of several (Mulliken, Bader, fitted charges, …): the numbers depend on the scheme, and Hirshfeld's are known to be small in magnitude. Measured from this LSDA density at this grid and smearing; with pseudopotentials Z is the valence charge. The charges always add up to the scene's charge (Scene ▸ Charge). With more than 12 atoms only the selected or hovered atom and its bonded neighbours are labelled. Display only: nothing feeds back into the forces";
 
 /// Opens the periodic table (the toolbar's element group; the screenshot flag's `ptable=open`).
 pub fn open_ptable(ctx: &egui::Context) {

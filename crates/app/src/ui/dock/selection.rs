@@ -13,6 +13,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let Some((i, n)) = input.selection() else {
         theme::note(ui, "no selection (Inspect or Edit: click a nucleus)");
         molecules(ui, st, input);
+        charges(ui, st, input, None);
         card_toggle(ui, st);
         return;
     };
@@ -45,6 +46,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.label("electrons");
             ui.label(atom_card::electrons_line(n.z));
             ui.end_row();
+            if let Some((c, current, q, counted)) = input.snapshot.and_then(|s| super::super::shown_charges(&s.dynamics)).and_then(|(c, cur)| Some((c, cur, *c.q.get(i)?, c.counted[i]))) {
+                ui.label("partial charge").on_hover_text(super::super::CHARGES_TIP);
+                let alpha = if current { 255 } else { 140 };
+                ui.label(RichText::new(format!("{} e", super::super::charge_text(q))).monospace().color(super::super::charge_colour(q, alpha)))
+                    .on_hover_text(format!("Hirshfeld: Z {counted} − {:.4} electrons in its share = {q:+.4} e{}", counted - q, if current { String::new() } else { format!(" (from t = {:.2} fs)", c.t_fs()) }));
+                ui.end_row();
+            }
         });
         pseudopotential(ui, input, n.z);
         isotopes(ui, i, n, acts);
@@ -91,7 +99,43 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     bonds(ui, st, input, i);
     molecules(ui, st, input);
+    charges(ui, st, input, Some(i));
     card_toggle(ui, st);
+}
+
+/// Every atom's partial charge (`sim::charges`, Hirshfeld; the selected one marked), their sum
+/// against the scene's charge, the measurement's time and the honesty line.
+fn charges(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, selected: Option<usize>) {
+    super::group(ui, st, "d-charges", |ui, _| {
+        theme::section(ui, "Partial charges (Hirshfeld)").on_hover_text(super::super::CHARGES_TIP);
+        let Some(d) = input.snapshot.map(|s| &s.dynamics) else { return };
+        let Some((c, current)) = super::super::shown_charges(d) else {
+            let why = match d.charges.as_deref() {
+                Some(c) if c.fits(&d.scene) && !c.balanced() => format!("not shown: they add up to {:+.4} e against the scene's charge {:+} (the density does not hold the solve's electrons)", c.sum(), c.system_charge),
+                _ if !d.bonds_pending.is_empty() => "solving the free-atom references first: the charges appear with the bonds".into(),
+                _ => "none yet: measured from the density after a converged DFT step".into(),
+            };
+            theme::note(ui, why);
+            return;
+        };
+        let alpha = if current { 255 } else { 140 };
+        super::wide_grid(ui, "charges", 3).striped(true).show(ui, |ui| {
+            for (k, (z, q)) in c.z.iter().zip(&c.q).enumerate() {
+                let who = format!("{} #{k}", elements::symbol(*z));
+                ui.label(if selected == Some(k) { RichText::new(who).strong() } else { RichText::new(who) });
+                ui.label(RichText::new(super::super::charge_text(*q)).monospace().color(super::super::charge_colour(*q, alpha)));
+                ui.label(RichText::new(format!("Z {}", c.counted[k])).size(10.5).color(theme::INK_FAINT))
+                    .on_hover_text("the charge its electrons are counted against: Z, or the valence charge Z_v of a pseudopotential atom");
+                ui.end_row();
+            }
+        });
+        ui.label(RichText::new(format!("Σq = {:+.4} e (scene charge {:+}) · {:.4} electrons", c.sum(), c.system_charge, c.electrons)).size(11.0).color(theme::INK_DIM))
+            .on_hover_text("the weights add up to one at every point, so the charges add up to the scene's charge exactly (to rounding): a check that the density holds the solve's electrons");
+        if !current {
+            theme::note(ui, super::super::charges_label(d).unwrap_or_default());
+        }
+        theme::note(ui, "one partition scheme of several (Hirshfeld magnitudes are small): read the signs and trends; measured from this LSDA density — Help ▸ Partial charges");
+    });
 }
 
 /// A pseudised species' record (M7): what the generator chose and measured for it (`qm::radial::GenerationRecord`),

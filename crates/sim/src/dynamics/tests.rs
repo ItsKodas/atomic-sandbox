@@ -2849,3 +2849,41 @@ fn the_partial_core_display_reaches_the_provider_and_the_policy_the_scene_carrie
     assert_eq!(seen.first(), Some(&crate::scene::IonicPolicy::CoresOnly));
     assert_eq!(seen.last(), Some(&crate::scene::IonicPolicy::All), "{seen:?}");
 }
+
+/// Partial charges (module doc, "Partial charges"): published with the graph from the same
+/// density, at the step's positions, one per nucleus; symmetric for a symmetric dimer; Σq = ΣZ − N
+/// of the sampled density (the stand-in Gaussians are not normalised to Z, so not the scene's
+/// charge here — `crate::charges` tests the sum rule on normalised densities); dropped with the
+/// graph on a nucleus count change; a side density is accepted for the scene's grid and nuclei
+/// only, and never replaces newer charges.
+#[test]
+fn partial_charges_follow_the_graph_and_side_densities() {
+    use crate::test_providers::Gaussians;
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let g = Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+    let mut d = Dynamics::new(s.clone(), Box::new(g.clone()), DT_FS, 1);
+    assert!(d.snapshot().charges.is_none(), "no references yet: no charges");
+    d.apply(DynCommand::Play);
+    let t = settle_references(&mut d);
+    let t = if t.charges.is_some() { t } else { d.tick(f64::INFINITY, &mut never()) };
+    let c = t.charges.clone().expect("charges with the graph");
+    println!("stand-in H₂: q = {:?}, N = {:.6}, Σq = {:.6}", c.q, c.electrons, c.sum());
+    assert_eq!((c.z.clone(), c.counted.clone(), c.step, c.source), (vec![1, 1], vec![1.0, 1.0], t.step, crate::charges::ChargeSource::Step));
+    assert!(c.is_current(&t.scene), "measured at the published geometry");
+    assert!((c.q[0] - c.q[1]).abs() < 1e-9, "{:?}", c.q);
+    assert!((c.sum() - (2.0 - c.electrons)).abs() < 1e-9);
+    // a side density: the wrong grid is refused, an older one does not replace newer charges
+    let n = t.scene.cell.n;
+    let rho = vec![0.0; n * n * n];
+    let pos: Vec<[f64; 3]> = t.scene.nuclei.iter().map(|x| x.pos).collect();
+    assert!(d.measure_side_charges(&rho[..8], &Cell { n: 2, h: 0.25 }, &pos, t.sim_time, crate::provider::SideKind::Audit).is_err());
+    assert!(d.measure_side_charges(&rho, &t.scene.cell, &pos, t.sim_time - 1.0, crate::provider::SideKind::Audit).is_err());
+    d.measure_side_charges(&rho, &t.scene.cell, &pos, t.sim_time + 1.0, crate::provider::SideKind::Refresh).expect("a newer side density");
+    let side = d.snapshot().charges.expect("side charges");
+    assert_eq!(side.source, crate::charges::ChargeSource::Side(crate::provider::SideKind::Refresh));
+    assert_eq!((side.q.clone(), side.electrons), (vec![1.0, 1.0], 0.0), "no electrons: q = Z");
+    // a count change drops them with the graph
+    d.apply(DynCommand::Pause);
+    d.apply(DynCommand::RemoveNucleus(1));
+    assert!(d.snapshot().charges.is_none());
+}

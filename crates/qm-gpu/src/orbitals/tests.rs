@@ -421,7 +421,7 @@ fn colour_volume_matches_the_cpu_reference() {
     let probe = view.update(&s, &state, &nuclei, 1e-6, Product::None);
     let include: Vec<u32> = probe.out.rows.iter().map(|r| r.track).collect();
     for physical in [false, true] {
-        let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include, physical, out: &vol });
+        let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include, physical, boundary: None, out: &vol });
         assert_eq!(upd.readbacks, 1);
         let shown: Vec<Vec<f64>> = view.prev[0].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
         let rho_max = upd.spin.rho_max;
@@ -464,7 +464,7 @@ fn one_readback_per_update() {
         let tracks: Vec<u32> = first.out.rows.iter().map(|r| r.track).collect();
         let (spin, track) = (first.out.rows[0].spin, first.out.rows[0].track);
         let products = [Product::None, Product::Orbital { spin, track, squared: false, out: &vol }, Product::Orbital { spin, track, squared: true, out: &vol },
-                        Product::Colour { include: &tracks, physical: false, out: &cvol }, Product::Colour { include: &tracks, physical: true, out: &cvol },
+                        Product::Colour { include: &tracks, physical: false, boundary: None, out: &cvol }, Product::Colour { include: &tracks, physical: true, boundary: None, out: &cvol },
                         Product::Spin { out: &vol }];
         for p in products {
             let what = format!("{p:?}");
@@ -500,7 +500,7 @@ fn update_does_not_write_solver_fields() {
             let tracks: Vec<u32> = first.out.rows.iter().map(|r| r.track).collect();
             let (spin, track) = (first.out.rows[0].spin, first.out.rows[0].track);
             for p in [Product::Orbital { spin, track, squared: false, out: &vol }, Product::Orbital { spin, track, squared: true, out: &vol },
-                      Product::Colour { include: &tracks, physical: false, out: &cvol }, Product::Colour { include: &tracks, physical: true, out: &cvol },
+                      Product::Colour { include: &tracks, physical: false, boundary: None, out: &cvol }, Product::Colour { include: &tracks, physical: true, boundary: None, out: &cvol },
                       Product::Spin { out: &vol }] {
                 view.update(&s, state, &nuclei, settings.tol, p);
             }
@@ -545,7 +545,7 @@ fn display_updates_between_solves_leave_the_scf_bitwise_unchanged() {
                 let tracks: Vec<u32> = first.out.rows.iter().map(|r| r.track).collect();
                 let track = first.out.rows[0].track;
                 v.update(&s, state, &nuclei, settings.tol, Product::Orbital { spin: Spin::Up, track, squared: true, out: &vol });
-                v.update(&s, state, &nuclei, settings.tol, Product::Colour { include: &tracks, physical: true, out: &cvol });
+                v.update(&s, state, &nuclei, settings.tol, Product::Colour { include: &tracks, physical: true, boundary: None, out: &cvol });
                 v.update(&s, state, &nuclei, settings.tol, Product::Spin { out: &vol });
             }
         }
@@ -581,7 +581,7 @@ fn bench_orbital_update() {
             let track = first.out.rows[2].track;
             let sync = || { gpu::wait_idle(&s.ctx).expect("wait idle"); };
             for (pname, p) in [("none", Product::None), ("orbital", Product::Orbital { spin: Spin::Up, track, squared: false, out: &vol }),
-                               ("colour", Product::Colour { include: &tracks, physical: false, out: &cvol }), ("spin", Product::Spin { out: &vol })] {
+                               ("colour", Product::Colour { include: &tracks, physical: false, boundary: None, out: &cvol }), ("spin", Product::Spin { out: &vol })] {
                 for _ in 0..3 { view.update(&s, &state, &nuclei, 1e-5, p); sync(); }
                 let reps = 10;
                 let t = std::time::Instant::now();
@@ -670,7 +670,7 @@ fn colour_volume_chains_more_than_six_orbitals() {
     let probe = view.update(&s, &state, &nuclei, 1e-6, Product::None);
     let include: Vec<u32> = probe.out.rows.iter().map(|r| r.track).collect();
     assert_eq!(include.len(), 8);
-    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include, physical: false, out: &vol });
+    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include, physical: false, boundary: None, out: &vol });
     assert!(view.colour_acc.is_some(), "8 orbitals need the accumulator");
     let shown: [Vec<Vec<f64>>; 2] = [0, 1].map(|ch| view.prev[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect());
     let terms: Vec<(&[f64], f64, [f64; 3], f64)> = upd.out.rows.iter().map(|r| {
@@ -687,7 +687,7 @@ fn colour_volume_chains_more_than_six_orbitals() {
     println!("colour 23³, 8 orbitals in 2 chained dispatches: max rel err {worst:.2e}; slots {:?}", upd.out.rows.iter().map(|r| r.slot).collect::<Vec<_>>());
     assert!(worst <= 2e-3, "{worst:.3e}");
     // a subset that fits one dispatch afterwards still matches (the accumulator is not read)
-    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include[..2], physical: true, out: &vol });
+    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include[..2], physical: true, boundary: None, out: &vol });
     let got = vol.read_back(&s.ctx).expect("readback");
     let first: Vec<(&[f64], f64, [f64; 3], f64)> = upd.out.rows.iter().filter(|r| include[..2].contains(&r.track)).map(|r| {
         (shown[r.spin.index()][r.index].as_slice(), r.occupation, ORBITAL_PALETTE[r.slot as usize].map(|v| v as f64), upd.spin.rho_max)

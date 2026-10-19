@@ -45,6 +45,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("multigrid", include_str!("shaders/multigrid.wgsl")),
     ("orbital_moments", include_str!("shaders/orbital_moments.wgsl")),
     ("colour_accumulate", include_str!("shaders/colour_accumulate.wgsl")),
+    ("enclosure", include_str!("shaders/enclosure.wgsl")),
     ("sample", include_str!("shaders/sample.wgsl")),
     // M7 Task 8a: erf.wgsl is a verbatim copy of nuclear.wgsl's erf (nuclear.wgsl untouched: the None path is bitwise)
     ("ionic", concat!(include_str!("shaders/erf.wgsl"), include_str!("shaders/ionic.wgsl"))),
@@ -99,8 +100,10 @@ const SPECS: &[Spec] = &[
     Spec {
         entry: "colour_accumulate",
         shader: "colour_accumulate",
-        bindings: &[(0, U), (1, R), (2, R), (3, R), (4, R), (5, R), (6, R), (7, RW), (8, TW)],
+        bindings: &[(0, U), (1, R), (2, R), (3, R), (4, R), (5, R), (6, R), (7, RW), (8, TW), (9, R)],
     },
+    Spec { entry: "enclosure_hist", shader: "enclosure", bindings: &[(0, U), (1, R), (2, RW)] },
+    Spec { entry: "enclosure_level", shader: "enclosure", bindings: &[(4, U), (5, R), (6, RW)] },
     Spec { entry: "sample_density", shader: "sample", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
     // M7 Task 8a (shaders/ionic.wgsl, `ionic`; the occupation-weighted density in pointwise.wgsl)
     Spec { entry: "mul_add_sq_w", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
@@ -115,8 +118,8 @@ const SPECS: &[Spec] = &[
     Spec { entry: "gather_dot4", shader: "ionic_forces", bindings: &[(10, U), (11, R), (12, R), (13, R), (2, RW), (15, R)] },
 ];
 
-/// Orbitals bound per `colour_accumulate` dispatch (6 + its accumulator = 7 storage buffers,
-/// within WebGPU's default 8); more are chained through the accumulator.
+/// Orbitals bound per `colour_accumulate` dispatch (6 + its accumulator + the boundary levels =
+/// 8 storage buffers, WebGPU's default); more are chained through the accumulator.
 pub const COLOUR_MAX_TERMS: usize = 6;
 
 /// Workgroups (= partials per pair) of the fused Gram kernel: fewer than `reduce::MAX_PARTIALS`

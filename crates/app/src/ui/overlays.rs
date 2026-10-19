@@ -485,6 +485,10 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                             ui.label("exposure");
                             ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
                             ui.label(format!("{:+.1} EV", st.exposure_ev));
+                            ui.add_space(8.0);
+                            ui.label("smooth");
+                            ui.add(egui::Slider::new(&mut st.camera_smooth, 0.0..=2.0).show_value(false))
+                                .on_hover_text("with any solidity: one smooth surface — neighbouring atoms flow into each other through a soft neck (0 = separate balls)");
                         });
                     });
                 }

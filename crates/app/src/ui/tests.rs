@@ -1751,6 +1751,48 @@ fn the_stale_bonds_are_labelled_under_the_surrogate() {
     assert_eq!(bonds_label(&s.dynamics).as_deref(), Some("bonds from the last DFT step (t = 12.50 fs) — the surrogate has no electrons"));
 }
 
+/// Partial charges (`sim::charges`): drawn only for the scene's nuclei and when they add up to the
+/// scene's charge; current at the geometry they were measured at, else faded with "charges from
+/// t = … fs" naming the density; the text carries the sign always and a true minus, near-zero is
+/// grey and printed +0.00.
+#[test]
+fn partial_charges_are_shown_balanced_and_labelled_when_earlier() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+    assert!(shown_charges(&s.dynamics).is_none() && charges_label(&s.dynamics).is_none(), "none measured");
+    let pos: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+    let mut c = sim::PartialCharges {
+        q: vec![0.0004, -0.0004],
+        counted: vec![1.0, 1.0],
+        z: vec![1, 1],
+        positions: pos.clone(),
+        electrons: 2.0,
+        system_charge: 0,
+        t: 12.5 / units::au_time_to_fs(1.0),
+        step: 4,
+        source: sim::ChargeSource::Step,
+        ionic: "none".into(),
+    };
+    s.dynamics.charges = Some(std::sync::Arc::new(c.clone()));
+    let (shown, current) = shown_charges(&s.dynamics).expect("balanced, these nuclei");
+    assert!(current && shown.q.len() == 2);
+    assert_eq!(charges_label(&s.dynamics), None, "measured here");
+    // the atoms moved since (a model step): faded, labelled with the density's time and kind
+    s.dynamics.scene.nuclei[1].pos[0] += 0.01;
+    c.source = sim::ChargeSource::Side(sim::SideKind::Audit);
+    s.dynamics.charges = Some(std::sync::Arc::new(c.clone()));
+    assert_eq!(shown_charges(&s.dynamics).map(|x| x.1), Some(false));
+    assert_eq!(charges_label(&s.dynamics).as_deref(), Some("charges from t = 12.50 fs (an audit's DFT density) — faded until the next DFT density"));
+    // a sum that misses the scene's charge is not drawn; nor charges of other nuclei
+    s.dynamics.charges = Some(std::sync::Arc::new(sim::PartialCharges { q: vec![1.0, 1.0], ..c.clone() }));
+    assert!(shown_charges(&s.dynamics).is_none(), "Σq = 2 against charge 0");
+    s.dynamics.charges = Some(std::sync::Arc::new(sim::PartialCharges { z: vec![1], q: vec![0.0], counted: vec![1.0], positions: pos[..1].to_vec(), ..c }));
+    assert!(shown_charges(&s.dynamics).is_none(), "one nucleus, the scene has two");
+    assert_eq!((charge_text(0.4234), charge_text(-0.4234), charge_text(-0.004)), ("+0.42".to_string(), "\u{2212}0.42".to_string(), "+0.00".to_string()));
+    assert!(charge_colour(0.3, 255).b() > charge_colour(0.3, 255).r() && charge_colour(-0.3, 255).r() > charge_colour(-0.3, 255).b());
+    assert_eq!(charge_colour(0.001, 255), charge_colour(-0.001, 255), "near zero: grey either way");
+}
+
 /// Spec §4.4's tooltip lines: a bonded pair's numbers and route, a rejected one's reason.
 #[test]
 fn pair_lines_carry_the_numbers_behind_the_verdict() {
@@ -2223,7 +2265,7 @@ mod orbital_viewer {
         assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
         // the other modes
         for (mode, want) in [
-            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false }),
+            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() }),
             (ShowMode::Spin, OrbitalRequest::SpinDensity),
             (ShowMode::Density, OrbitalRequest::Off),
         ] {
@@ -2275,15 +2317,15 @@ mod orbital_viewer {
         // all coloured: the include boxes start from the occupied tracks
         st.show = ShowMode::Coloured;
         let r = one(act(&mut st, &inp, Action::Include { track: 1, on: false }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false, look: Default::default() });
         let r = one(act(&mut st, &inp, Action::Include { track: 3, on: true }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false, look: Default::default() });
         assert!(act(&mut st, &inp, Action::ColourBlend { additive: false }).commands.is_empty(), "the blend is a render setting");
         assert!(!st.colour_additive);
         let r = one(act(&mut st, &inp, Action::ColourScale { physical: true }));
         assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, .. }), "{:?}", r.what);
         let r = one(act(&mut st, &inp, Action::IncludeAllOccupied));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true, look: Default::default() });
         // the words
         for a in [
             Action::Show(ShowMode::Coloured),
@@ -2294,6 +2336,9 @@ mod orbital_viewer {
             Action::IncludeAllOccupied,
             Action::ColourBlend { additive: false },
             Action::ColourScale { physical: true },
+            Action::ColourLook(sim::ColourLook { enclose: Some(75), shell: false, hide_core: true }),
+            Action::ColourLook(sim::ColourLook { enclose: Some(90), shell: true, hide_core: false }),
+            Action::WarpFields(false),
         ] {
             let text = a.describe().expect("a script form");
             let words: Vec<&str> = text.split(' ').collect();
@@ -2626,7 +2671,7 @@ mod orbital_viewer {
         assert!(l.tip.contains("Spin is intrinsic (↑/↓), not a rotation."));
         // coloured: one swatch per colour slot (↓ shares ↑'s), the scale in the text
         st.show = ShowMode::Coloured;
-        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false });
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() });
         o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
         let snap = with_payload(&scene, Backend::Gpu, o);
         let inp = input(&scene, Some(&snap), &cam);
@@ -2832,6 +2877,10 @@ mod orbital_viewer {
         st.show = ShowMode::Orbitals;
         assert!(orbitals::dots_note(&st).starts_with("dots are samples of where an electron is likely to be"));
         st.show = ShowMode::Coloured;
+        // the default look is the boundary surfaces: the dots fill each orbital's region
+        let boundary = orbitals::dots_note(&st);
+        assert!(boundary.contains("boundary surface") && boundary.contains("not the density"), "{boundary}");
+        st.colour_look.enclose = None;
         let peak = orbitals::dots_note(&st);
         assert!(peak.contains("own peak") && peak.contains("not the electron density"), "{peak}");
         st.colour_physical = true;

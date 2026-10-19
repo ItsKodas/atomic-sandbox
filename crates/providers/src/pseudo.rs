@@ -270,6 +270,39 @@ pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
     }
 }
 
+/// The charge each nucleus's electrons are counted against under `scene`'s policy (`sim::ForceProvider::valence_charges`,
+/// the Z_A of the Hirshfeld charges): the table's Z_v for a species [`provenance_tag`]'s rule pseudises, Z otherwise —
+/// the same per-species rule as the tag and the setup (`PseudoCache::pseudised`: the policy's [`wants_table`] and a table
+/// the recipe accepts; a refused species stays all-electron). `None` while another thread holds the cache (a generation:
+/// never wait on the worker for a display number) and for a species whose table is not cached yet (never generated here).
+pub fn valence_charges(scene: &Scene) -> Option<Vec<f64>> {
+    valence_in(cache(), scene)
+}
+
+/// [`valence_charges`] on a given cache.
+pub fn valence_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> Option<Vec<f64>> {
+    let all_electron = || scene.nuclei.iter().map(|n| n.z as f64).collect();
+    if scene.ionic == IonicPolicy::None || scene.nuclei.is_empty() {
+        return Some(all_electron());
+    }
+    let mut c = cache.try_lock().ok()?;
+    let mut out = Vec::with_capacity(scene.nuclei.len());
+    for n in &scene.nuclei {
+        // `PseudoCache::pseudised`'s rule, without its generation on a miss (physics review NIT-4): a species whose
+        // table is not cached yet has had no solve, so there is no density to count against — `None`
+        let core = if scene.ionic == IonicPolicy::CoresOnly { c.has_core(n.z) } else { Ok(false) };
+        if !wants_table(scene.ionic, n.z, &core) {
+            out.push(n.z as f64);
+        } else if !c.has_table(n.z) {
+            return None;
+        } else {
+            // cached: no generation; a refusal is the all-electron fallback
+            out.push(c.table(n.z).map_or(n.z as f64, |t| t.z_v));
+        }
+    }
+    Some(out)
+}
+
 /// The tag of a scene under `policy` with at least one species pseudised: the formatting half of
 /// [`provenance_tag`], needing no scene (no table is generated) — what the viewer compares a model file's
 /// ionic tag with before loading it. `"none"` for the policy `None`.
