@@ -55,7 +55,7 @@ All measured on the repository, unless marked as an estimate.
 | Markdown | about 15,000 lines (specs, plans, notes, README, `references.md` at 1,864 lines) | `git ls-files '*.md'` |
 | `#[test]` functions on `main` | 803 (the oracles are release-only by design) | `git grep` |
 | Suite sizes at the orbital-viewer merge | app 210 (2 ignored), providers 106, render 35, sim 102 | orbital ledger |
-| Milestones merged to `main` | M1, M2, M3, M4, M5, M5b (viewer extras), UI redesign, M6, orbital viewer, Activity tab, M7 | git |
+| Milestones merged to `main` | M1, M2, M3, M4, M5, M5b (viewer extras), UI redesign, M6, orbital viewer, Activity tab, M7, custom window frame | git |
 | In flight, not merged | none (next: M8) | branches |
 | Commit trailers on `main` | Opus 5.5: 167 · Fable 5.1: 110 · Sonnet 5.5: 1 | `git log` |
 

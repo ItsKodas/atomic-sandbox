@@ -540,7 +540,7 @@ Watching the H₂O sampling pass in the M7 preview (CoresOnly, 95³ × 0.15): "t
 - Each finished sample flashes green (kept) / red (failed, stalled) / grey (skipped), matching the solve log.
 - View ▸ Display aids toggle "show what training is solving" (default on during a pass); display-only; the worker ships the job's positions (a few dozen numbers per sample), no density readback. A low-res density thumbnail is a possible later add-on.
 
-## Custom window frame (user request 2026-10-18) — after M7 merges
+## Custom window frame (user request 2026-10-18) — done 2026-10-19 (`crates/app/src/frame.rs`, user hand-tested: "works great")
 
 "Would you be able to create a custom window for the app? Like windows window?" → chose **option B**, "leave it till after M7 is complete". A borderless window with the app's own title bar in the theme: the menu bar (File / Scene / View / Physics / Help, scene chip, Ctrl-K search) moves into the title bar; custom minimise / maximise / close buttons; drag by the empty bar (double-click maximises); edge/corner resize; Windows 11 rounded corners. Keep native behaviour: Snap Layouts on maximise-button hover (WM_NCHITTEST → HTMAXBUTTON), Win+arrow snapping, Aero Snap by drag, correct maximised insets, multi-monitor DPI. Display/plumbing only; replay/screenshot harness unaffected (headless). Option A (dark native caption via DWM attributes) is the fallback if B's native behaviours can't all be kept.
 
