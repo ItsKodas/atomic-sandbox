@@ -242,7 +242,15 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
     });
     // the scenes take a little over half the height, the models the rest
     let total = ui.available_height();
-    egui::ScrollArea::vertical().id_salt("files-scenes").auto_shrink([false, true]).max_height(total * 0.5).show(ui, |ui| {
+    // room for about two and a half rows of cards (the half row says there is more), scrolled
+    let row = CARD_W * 0.72 + 50.0;
+    let scenes_h = (row * 2.5).min(total * 0.58).max(row * 1.2);
+    egui::ScrollArea::vertical()
+        .id_salt("files-scenes")
+        .auto_shrink([false, false])
+        .min_scrolled_height(scenes_h)
+        .max_height(scenes_h)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(12.0);
             for i in 0..st.files.scenes.len() {
