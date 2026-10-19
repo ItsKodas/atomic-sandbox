@@ -58,7 +58,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     // above the Camera view's shutter and exposure row (bottom left, beside the view switch)
-    let mut bottom = view.bottom() - if st.camera_view { 58.0 } else { 14.0 };
+    let mut bottom = view.bottom() - if st.camera_view || st.volume_mode == super::VOLUME_DOTS { 58.0 } else { 14.0 };
     // in an orbital mode the orbitals' own label or note replaces the density's
     let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
     let label = match (layer_label, &input.bonds_label) {
