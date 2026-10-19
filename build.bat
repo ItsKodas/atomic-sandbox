@@ -53,7 +53,8 @@ if exist "LICENSE" copy /y "LICENSE" "%OUT%\" >nul
 copy /y "crates\app\presets\*.scene" "%OUT%\scenes\" >nul || goto :copyfail
 xcopy /e /i /q /y "docs\images" "%OUT%\docs\images" >nul || goto :copyfail
 
-powershell -NoProfile -Command "Compress-Archive -Path '%OUT%' -DestinationPath 'dist\%NAME%.zip' -Force"
+rem a few tries: a virus scan of the just-copied exe can hold it for a moment
+powershell -NoProfile -Command "for ($i = 0; $i -lt 5; $i++) { try { Compress-Archive -Path '%OUT%' -DestinationPath 'dist\%NAME%.zip' -Force -ErrorAction Stop; exit 0 } catch { Start-Sleep -Seconds 2 } }; exit 1"
 if errorlevel 1 (
     echo The folder is ready but zipping it failed: %OUT%
     pause
