@@ -1488,6 +1488,7 @@ impl Viewer {
         let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
         // clipped to the 3D view: a guide to a nucleus behind the dock stops at its edge
         let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        fixed_layer(root, "distance-guides", clip);
         let painter = root
             .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("distance-guides")))
             .with_clip_rect(clip);
@@ -1752,6 +1753,9 @@ impl Viewer {
         let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
         // under every chrome element (the background order: the overlays, menus and windows draw
         // over them), clipped to the 3D view, at View ▸ Bonds and molecules ▸ label opacity
+        // registered as an area so egui keeps its place in the layer order (a bare painter layer's
+        // place among the background layers changes frame to frame: the labels flickered)
+        fixed_layer(root, "molecule-labels", clip);
         let mut painter = root
             .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("molecule-labels")))
             .with_clip_rect(clip);
@@ -3347,4 +3351,17 @@ nucleus 1 {a} {} {}
         v.set_view(&mut painter, &hl.ctx);
         assert_eq!(painter.renderer.volume_params.fade, visible);
     }
+}
+
+/// An empty, non-interactive background area with this id over `rect`: its layer then has a fixed
+/// place in egui's layer order (under the chrome's areas, menus and windows), so what a
+/// `layer_painter` of the same id draws does not flicker.
+fn fixed_layer(ctx: &egui::Context, id: &str, rect: egui::Rect) {
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Background)
+        .fixed_pos(rect.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.allocate_space(rect.size());
+        });
 }
