@@ -296,6 +296,9 @@ pub struct Mouse {
 pub struct Viewer {
     /// The bond-length and angle labels' smoothing (display only; [`LabelSmoother`]).
     pub label_smooth: std::cell::RefCell<LabelSmoother>,
+    /// The side of its bond each bond-length label sits on (+1/−1), kept until the other side is
+    /// clearly better: a bond pointing at the molecule's centre flipped it every frame.
+    pub label_side: std::cell::RefCell<std::collections::HashMap<(u8, usize, usize, usize), f32>>,
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
     pub sim: Option<SimWorker>,
     /// The backend `sim` runs.
@@ -397,6 +400,7 @@ impl Viewer {
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
             label_smooth: Default::default(),
+            label_side: Default::default(),
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
@@ -1903,12 +1907,20 @@ impl Viewer {
                         let mut n = egui::vec2(-(b.1 - a.1), b.0 - a.0);
                         if n.length() > 1e-3 {
                             n = n.normalized();
+                            // away from the centre, with hysteresis: the side changes only when the
+                            // other one is clearly better (|cos| > 0.35), else the label keeps its side
+                            let mut sides = self.label_side.borrow_mut();
+                            let side = sides.entry(l.key).or_insert(1.0);
                             if let Some(c) = centre {
-                                if n.dot(egui::vec2(px.0 - c.0, px.1 - c.1)) < 0.0 {
-                                    n = -n;
+                                let out = egui::vec2(px.0 - c.0, px.1 - c.1);
+                                let cos = n.dot(out) / out.length().max(1e-3);
+                                if cos > 0.35 {
+                                    *side = 1.0;
+                                } else if cos < -0.35 {
+                                    *side = -1.0;
                                 }
                             }
-                            at += n * 14.0;
+                            at += n * (14.0 * *side);
                         }
                     }
                 }
