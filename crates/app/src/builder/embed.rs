@@ -52,21 +52,6 @@ struct Plane {
     d: usize,
 }
 
-/// The ideal angle at a centre (degrees) from its steric number and lone pairs; `None` when the
-/// centre has no single ideal angle (SN ≥ 5: only kept from crowding, at 90°) or too few bonds.
-fn ideal_angle(sn: u32, lp: u32) -> Option<f64> {
-    match sn {
-        2 => Some(180.0),
-        3 => Some(120.0),
-        4 => Some(match lp {
-            0 => 109.47,
-            1 => 107.0,
-            _ => 104.5,
-        }),
-        _ => None,
-    }
-}
-
 /// The terms of a drawing's embedding energy.
 struct Terms {
     springs: Vec<Spring>,
@@ -137,7 +122,7 @@ fn terms(d: &Drawing) -> Terms {
         let a = &d.atoms[c];
         let lp = chem::lone_pairs(a.z, a.charge, d.bond_sum(c));
         let sn = nb.len() as u32 + lp;
-        let angle = ideal_angle(sn, lp);
+        let angle = chem::ideal_angle(sn, lp);
         for x in 0..nb.len() {
             for y in x + 1..nb.len() {
                 let (i, k) = (nb[x], nb[y]);

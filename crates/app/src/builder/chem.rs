@@ -167,23 +167,99 @@ pub fn describe(d: &Drawing, w: &[(usize, Warning)]) -> String {
         .join("; ")
 }
 
-/// The drawn length of a bond to hydrogen (canvas units; any other bond is drawn 1 long).
-pub const H_DRAWN: f32 = 0.8;
+/// The canvas length of a bond (user request 2026-10-20: rough real distances in the drawing): its
+/// r₀ over a C–C single bond's, so C–C is 1, C–H ≈ 0.70, O–H ≈ 0.64, C=O ≈ 0.81.
+pub fn drawn_length(za: u8, zb: u8, order: u8) -> f32 {
+    (bond_length(za, zb, order) / bond_length(6, 6, 1)) as f32
+}
 
-/// The canvas length a new bond between these elements is drawn at (the Atom tool's snap, Fill
-/// hydrogens, the stamps): 1, or [`H_DRAWN`] to a hydrogen. Drawing only — the embedding takes
-/// the real lengths from the radii.
-pub fn drawn_length(za: u8, zb: u8) -> f32 {
-    if za == 1 || zb == 1 {
-        H_DRAWN
-    } else {
-        1.0
+/// The VSEPR angle (degrees) at a centre with steric number `sn` and `lp` lone pairs: 180°,
+/// 120°, 109.47° (107° / 104.5° with one / two lone pairs); `None` for SN ≥ 5 (no single angle)
+/// or below 2. The drawing's angles and the embedding's 1–3 targets.
+pub fn ideal_angle(sn: u32, lp: u32) -> Option<f64> {
+    match sn {
+        2 => Some(180.0),
+        3 => Some(120.0),
+        4 => Some(match lp {
+            0 => 109.47,
+            1 => 107.0,
+            _ => 104.5,
+        }),
+        _ => None,
     }
 }
 
+/// The angle (radians) a new bond of `order` from atom `i` makes with `i`'s bonds in the drawing:
+/// the VSEPR angle of `i` once its usual valence is filled with single bonds after this one — 109.5°
+/// at a saturated carbon, 120° next to a double bond, 180° at a triple bond, 104.5° at O.
+pub fn bond_angle_at(d: &Drawing, i: usize, order: u8) -> f32 {
+    let a = d.atoms[i];
+    let after = d.bond_sum(i) + order as u32;
+    let target = allowed(a.z, a.charge).into_iter().map(u32::from).find(|&v| v >= after).unwrap_or(after);
+    let sigma = d.neighbours(i).len() as u32 + 1 + (target - after);
+    let lp = lone_pairs(a.z, a.charge, target);
+    ideal_angle(sigma + lp, lp).unwrap_or(90.0).to_radians() as f32
+}
+
+/// The shortest angular distance between two directions (radians).
+fn angular_distance(a: f32, b: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let d = (a - b).rem_euclid(TAU);
+    if d > PI {
+        TAU - d
+    } else {
+        d
+    }
+}
+
+/// The direction (radians, canvas) of a new bond of `order` from atom `i` (user request
+/// 2026-10-20: the drawing follows the real angles once there is a bond to measure from). With no
+/// bond yet there is no reference: `prefer` (the cursor's direction) or, for Fill, 150°. Otherwise
+/// the candidates are the directions at [`bond_angle_at`] from each existing bond, either side,
+/// that keep clear of every bond (at least ¾ of that angle, or of half the widest gap when the atom
+/// is crowded): the one nearest `prefer`, else the first. When none is clear (a fourth bond in 2D),
+/// the middle of the widest gap.
+pub fn next_direction(d: &Drawing, i: usize, order: u8, prefer: Option<f32>) -> f32 {
+    let here = d.atoms[i].pos;
+    let existing: Vec<f32> = d
+        .neighbours(i)
+        .into_iter()
+        .map(|j| {
+            let p = d.atoms[j].pos;
+            (p[1] - here[1]).atan2(p[0] - here[0])
+        })
+        .collect();
+    if existing.is_empty() {
+        return prefer.unwrap_or(150f32.to_radians());
+    }
+    let theta = bond_angle_at(d, i, order);
+    let (gap_mid, gap_width) = widest_gap(&existing);
+    let need = 0.75 * theta.min(gap_width / 2.0);
+    let clear = |c: f32| existing.iter().map(|&p| angular_distance(c, p)).fold(f32::INFINITY, f32::min);
+    let valid: Vec<f32> = existing.iter().flat_map(|&p| [p + theta, p - theta]).filter(|&c| clear(c) >= need).collect();
+    if valid.is_empty() {
+        return gap_mid;
+    }
+    match prefer {
+        Some(p) => valid.into_iter().min_by(|x, y| angular_distance(*x, p).total_cmp(&angular_distance(*y, p))).unwrap(),
+        None => valid[0],
+    }
+}
+
+/// Adds an atom of `z` bonded to `from` by a bond of `order`, at the drawn length in
+/// [`next_direction`]; returns it.
+pub fn grow(d: &mut Drawing, from: usize, z: u8, order: u8, prefer: Option<f32>) -> usize {
+    let angle = next_direction(d, from, order, prefer);
+    let len = drawn_length(d.atoms[from].z, z, order);
+    let p = d.atoms[from].pos;
+    let j = d.add_atom(z, [p[0] + len * angle.cos(), p[1] + len * angle.sin()]);
+    d.bonds.push(super::Bond { a: from, b: j, order });
+    j
+}
+
 /// Fill hydrogens (spec §4): every atom other than H gets single-bonded hydrogens up to the
-/// smallest allowed valence at or above its bond-order sum, drawn in the free directions around
-/// it. Returns how many were added.
+/// smallest allowed valence at or above its bond-order sum, drawn at their real lengths and
+/// angles ([`grow`]). Returns how many were added.
 pub fn fill_hydrogens(d: &mut Drawing) -> usize {
     let n = d.atoms.len();
     let mut added = 0;
@@ -194,71 +270,34 @@ pub fn fill_hydrogens(d: &mut Drawing) -> usize {
         }
         let sum = d.bond_sum(i);
         let Some(&target) = allowed(a.z, a.charge).iter().find(|&&v| v as u32 >= sum) else { continue };
-        let missing = target as u32 - sum;
-        if missing == 0 {
-            continue;
-        }
-        let lp = lone_pairs(a.z, a.charge, target as u32);
-        for dir in free_directions(d, i, missing as usize, lp as usize) {
-            let h = d.add_atom(1, [a.pos[0] + dir[0] * H_DRAWN, a.pos[1] + dir[1] * H_DRAWN]);
-            d.bond(i, h);
+        for _ in sum..target as u32 {
+            grow(d, i, 1, 1, None);
             added += 1;
         }
     }
     added
 }
 
-/// `m` unit directions (canvas) for new bonds from atom `i`: with no bonds yet, spread over the
-/// atom's domains (bonds + lone pairs) from the lower left; with one, the next domains round from it
-/// (a zigzag for OH, a cross for CH₃); with more, each in the widest gap left.
-pub fn free_directions(d: &Drawing, i: usize, m: usize, lone_pairs: usize) -> Vec<[f32; 2]> {
-    use std::f32::consts::TAU;
-    let here = d.atoms[i].pos;
-    let mut angles: Vec<f32> = d
-        .neighbours(i)
-        .into_iter()
-        .map(|j| {
-            let p = d.atoms[j].pos;
-            (p[1] - here[1]).atan2(p[0] - here[0])
-        })
-        .collect();
-    let domains = (angles.len() + m + lone_pairs).max(1) as f32;
-    let step = TAU / domains;
-    let out: Vec<f32> = match angles.len() {
-        0 => (0..m).map(|k| 150f32.to_radians() + k as f32 * step).collect(),
-        1 => (1..=m).map(|k| angles[0] + k as f32 * step).collect(),
-        _ => {
-            let mut v = Vec::new();
-            for _ in 0..m {
-                let a = widest_gap(&angles);
-                angles.push(a);
-                v.push(a);
-            }
-            v
-        }
-    };
-    out.into_iter().map(|a| [a.cos(), a.sin()]).collect()
-}
-
-/// The middle of the widest angular gap between `angles` (radians; one angle: its opposite).
-fn widest_gap(angles: &[f32]) -> f32 {
+/// The middle of the widest angular gap between `angles` (radians; one angle: its opposite) and
+/// the gap's width.
+fn widest_gap(angles: &[f32]) -> (f32, f32) {
     use std::f32::consts::{PI, TAU};
     if angles.is_empty() {
-        return 0.0;
+        return (0.0, TAU);
     }
     let mut a: Vec<f32> = angles.iter().map(|x| x.rem_euclid(TAU)).collect();
     a.sort_by(f32::total_cmp);
     if a.len() == 1 {
-        return a[0] + PI;
+        return (a[0] + PI, TAU);
     }
     let mut best = (0.0, 0.0);
     for k in 0..a.len() {
         let (s, e) = (a[k], if k + 1 < a.len() { a[k + 1] } else { a[0] + TAU });
-        if e - s > best.0 {
-            best = (e - s, s + (e - s) / 2.0);
+        if e - s > best.1 {
+            best = (s + (e - s) / 2.0, e - s);
         }
     }
-    best.1
+    best
 }
 
 /// A group stamp (spec §4).
@@ -295,52 +334,70 @@ impl Stamp {
     }
 }
 
-/// Places a stamp: bonded to `anchor` along its widest free direction, or free with its first atom
-/// at `at`. Returns the new atoms (the first is the one bonded to the anchor).
+/// Places a stamp: bonded to `anchor` (at the real length and angle, [`grow`]), or free with its
+/// first atom at `at`; its own atoms at their real lengths and angles too. Returns the new atoms
+/// (the first is the one bonded to the anchor).
 pub fn stamp(d: &mut Drawing, s: Stamp, anchor: Option<usize>, at: [f32; 2]) -> Vec<usize> {
     let anchor = anchor.filter(|&i| i < d.atoms.len());
-    let (origin, dir) = match anchor {
-        Some(i) => {
-            let dir = free_directions(d, i, 1, 0)[0];
-            let p = d.atoms[i].pos;
-            ([p[0] + dir[0], p[1] + dir[1]], dir)
-        }
-        None => (at, [1.0, 0.0]),
+    let first_z = match s {
+        Stamp::Hydroxyl => 8,
+        Stamp::Amino => 7,
+        _ => 6,
     };
-    // local frame: x outward along `dir`, y to its left
-    let place = |x: f32, y: f32| [origin[0] + dir[0] * x - dir[1] * y, origin[1] + dir[1] * x + dir[0] * y];
-    let h = H_DRAWN;
-    let (s60, c60) = (60f32.to_radians().sin(), 0.5);
-    // (Z, local x, local y) and bonds (local indices, order); atom 0 bonds to the anchor
-    let (atoms, bonds): (Vec<(u8, f32, f32)>, Vec<(usize, usize, u8)>) = match s {
-        Stamp::Methyl => (vec![(6, 0.0, 0.0), (1, h, 0.0), (1, 0.0, h), (1, 0.0, -h)], vec![(0, 1, 1), (0, 2, 1), (0, 3, 1)]),
-        Stamp::Hydroxyl => (vec![(8, 0.0, 0.0), (1, h * c60, -h * s60)], vec![(0, 1, 1)]),
-        Stamp::Amino => (vec![(7, 0.0, 0.0), (1, h * c60, h * s60), (1, h * c60, -h * s60)], vec![(0, 1, 1), (0, 2, 1)]),
-        Stamp::Carboxyl => (
-            vec![(6, 0.0, 0.0), (8, c60, s60), (8, c60, -s60), (1, c60 + h, -s60)],
-            vec![(0, 1, 2), (0, 2, 1), (2, 3, 1)],
-        ),
-        Stamp::Benzene => {
-            // a regular hexagon of side 1 whose first vertex points back at the anchor
-            let back = std::f32::consts::PI;
-            let ring = (0..6).map(|k| {
-                let a = back + k as f32 * std::f32::consts::FRAC_PI_3;
-                (6u8, 1.0 + a.cos(), a.sin())
-            });
-            (ring.collect(), (0..6).map(|k| (k, (k + 1) % 6, if k % 2 == 0 { 2 } else { 1 })).collect())
+    let start = d.atoms.len();
+    if s == Stamp::Benzene {
+        // a regular hexagon (120° inside, as benzene is) of the aromatic C–C length, its first
+        // vertex bonded to the anchor and the ring beyond it
+        let side = drawn_length(6, 6, 1) * (1.0 + order_factor(2) as f32) / 2.0;
+        let (first, dir) = match anchor {
+            Some(i) => {
+                let dir = next_direction(d, i, 1, None);
+                let len = drawn_length(d.atoms[i].z, 6, 1);
+                let p = d.atoms[i].pos;
+                ([p[0] + len * dir.cos(), p[1] + len * dir.sin()], dir)
+            }
+            None => (at, 0.0),
+        };
+        let centre = [first[0] + side * dir.cos(), first[1] + side * dir.sin()];
+        let back = dir + std::f32::consts::PI;
+        for k in 0..6 {
+            let a = back + k as f32 * std::f32::consts::FRAC_PI_3;
+            d.atoms.push(Atom { z: 6, pos: [centre[0] + side * a.cos(), centre[1] + side * a.sin()], charge: 0 });
         }
+        for k in 0..6 {
+            d.bonds.push(super::Bond { a: start + k, b: start + (k + 1) % 6, order: if k % 2 == 0 { 2 } else { 1 } });
+        }
+        if let Some(i) = anchor {
+            d.bond(i, start);
+        }
+        return (start..d.atoms.len()).collect();
+    }
+    let first = match anchor {
+        Some(i) => grow(d, i, first_z, 1, None),
+        None => d.add_atom(first_z, at),
     };
-    let first = d.atoms.len();
-    for &(z, x, y) in &atoms {
-        d.atoms.push(Atom { z, pos: place(x, y), charge: 0 });
+    match s {
+        Stamp::Methyl => {
+            for _ in 0..3 {
+                grow(d, first, 1, 1, None);
+            }
+        }
+        Stamp::Hydroxyl => {
+            grow(d, first, 1, 1, None);
+        }
+        Stamp::Amino => {
+            for _ in 0..2 {
+                grow(d, first, 1, 1, None);
+            }
+        }
+        Stamp::Carboxyl => {
+            grow(d, first, 8, 2, None);
+            let o = grow(d, first, 8, 1, None);
+            grow(d, o, 1, 1, None);
+        }
+        Stamp::Benzene => unreachable!(),
     }
-    for &(a, b, order) in &bonds {
-        d.bonds.push(super::Bond { a: first + a, b: first + b, order });
-    }
-    if let Some(i) = anchor {
-        d.bond(i, first);
-    }
-    (first..d.atoms.len()).collect()
+    (start..d.atoms.len()).collect()
 }
 
 #[cfg(test)]
@@ -469,6 +526,53 @@ mod tests {
         assert_eq!(lone_pairs(6, 0, 3), 0, "a radical's odd electron is no pair");
     }
 
+    /// The 2D angle at atom `c` between its bonds to `a` and `e` (degrees).
+    fn drawn_angle(d: &Drawing, a: usize, c: usize, e: usize) -> f32 {
+        let (pa, pc, pe) = (d.atoms[a].pos, d.atoms[c].pos, d.atoms[e].pos);
+        let (u, v) = ([pa[0] - pc[0], pa[1] - pc[1]], [pe[0] - pc[0], pe[1] - pc[1]]);
+        let n = |w: [f32; 2]| (w[0] * w[0] + w[1] * w[1]).sqrt();
+        ((u[0] * v[0] + u[1] * v[1]) / (n(u) * n(v))).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// Fill hydrogens draws the real angles and lengths (user request 2026-10-20): water 104.5°,
+    /// ammonia 107°, ethylene 120° at each carbon, acetylene straight, C–H at its length.
+    #[test]
+    fn drawn_angles_follow_vsepr() {
+        let mut w = lone(8, 0);
+        fill_hydrogens(&mut w);
+        assert!((drawn_angle(&w, 1, 0, 2) - 104.5).abs() < 0.05, "{}", drawn_angle(&w, 1, 0, 2));
+        let mut n = lone(7, 0);
+        fill_hydrogens(&mut n);
+        assert!((drawn_angle(&n, 1, 0, 2) - 107.0).abs() < 0.05);
+        let pair = |order: u8| {
+            let mut d = Drawing::default();
+            d.add_atom(6, [0.0, 0.0]);
+            d.add_atom(6, [drawn_length(6, 6, order), 0.0]);
+            d.bonds.push(super::super::Bond { a: 0, b: 1, order });
+            fill_hydrogens(&mut d);
+            d
+        };
+        let e = pair(2);
+        for c in [0, 1] {
+            let nb = e.neighbours(c);
+            assert_eq!(nb.len(), 3);
+            for (x, y) in [(0, 1), (0, 2), (1, 2)] {
+                assert!((drawn_angle(&e, nb[x], c, nb[y]) - 120.0).abs() < 0.05, "ethylene C{c}: {}", drawn_angle(&e, nb[x], c, nb[y]));
+            }
+        }
+        let y = pair(3);
+        assert!((drawn_angle(&y, 2, 0, 1) - 180.0).abs() < 0.05, "acetylene {}", drawn_angle(&y, 2, 0, 1));
+        let ch = {
+            let (p, q) = (w.atoms[0].pos, w.atoms[1].pos);
+            ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()
+        };
+        assert!((ch - drawn_length(8, 1, 1)).abs() < 1e-5);
+        // the lengths are the radii's, relative to C–C
+        assert_eq!(drawn_length(6, 6, 1), 1.0);
+        assert!((drawn_length(6, 1, 1) - 1.07 / 1.52).abs() < 1e-4);
+        assert!(drawn_length(6, 8, 2) < drawn_length(6, 8, 1));
+    }
+
     #[test]
     fn benzene_stamp_is_a_regular_alternating_ring() {
         let mut d = Drawing::default();
@@ -477,10 +581,11 @@ mod tests {
         assert_eq!(d.bonds.len(), 6);
         let orders: Vec<u8> = d.bonds.iter().map(|b| b.order).collect();
         assert_eq!(orders, vec![2, 1, 2, 1, 2, 1]);
+        let side = drawn_length(6, 6, 1) * (1.0 + 0.87) / 2.0;
         for b in &d.bonds {
             let (p, q) = (d.atoms[b.a].pos, d.atoms[b.b].pos);
             let len = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-            assert!((len - 1.0).abs() < 1e-5, "side {len}");
+            assert!((len - side).abs() < 1e-5, "side {len}");
         }
         fill_hydrogens(&mut d);
         assert_eq!(d.label(crate::names::NameStyle::Common), "C₆H₆ — benzene");
