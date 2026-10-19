@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod dots;
 pub mod elements;
+pub mod glow;
 pub mod headless;
 pub mod lines;
 pub mod spheres;
@@ -20,6 +21,9 @@ pub struct Renderer {
     pub camera_uniform: UniformBuffer<CameraUniform>, pub spheres: SpherePass, pub lines: LinePass,
     /// Translucent copies of the atoms along their recent path (the viewer's motion blur).
     pub ghosts: SpherePass,
+    /// The Camera view's atoms (`glow`): drawn instead of the spheres and ghosts when `glow_on`.
+    pub glow: glow::GlowPass,
+    pub glow_on: bool,
     pub volume: VolumePass, pub colour: ColourVolumePass, pub volume_params: VolumeUniform, pub dots: dots::DotsPass,
     /// Draw the colour volume bound in `colour` instead of the scalar field in `volume`.
     pub draw_colour: bool,
@@ -34,13 +38,14 @@ impl Renderer {
         let spheres = SpherePass::new(ctx, colour_format, &camera_uniform);
         let lines = LinePass::new(ctx, colour_format, &camera_uniform);
         let ghosts = SpherePass::with_blend(ctx, colour_format, &camera_uniform, true);
+        let glow = glow::GlowPass::new(ctx, colour_format, &camera_uniform);
         let volume = VolumePass::new(ctx, colour_format, &camera_uniform);
         let colour = ColourVolumePass::new(ctx, colour_format, &camera_uniform);
         let volume_params = VolumeUniform::default();
         volume.set_params(ctx, &volume_params);
         colour.set_params(ctx, &volume_params);
         let dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
-        Renderer { camera_uniform, spheres, lines, ghosts, volume, colour, volume_params, dots, draw_colour: false, draw_cloud: true }
+        Renderer { camera_uniform, spheres, lines, ghosts, glow, glow_on: false, volume, colour, volume_params, dots, draw_colour: false, draw_cloud: true }
     }
 
     /// The camera for a scene filling the whole `width × height` target.
@@ -87,12 +92,19 @@ impl Renderer {
             if !confine(&mut pass) {
                 return;
             }
-            self.spheres.draw(&mut pass);
+            if !self.glow_on {
+                self.spheres.draw(&mut pass);
+            }
             self.lines.draw(&mut pass);
-            self.ghosts.draw(&mut pass);
+            if !self.glow_on {
+                self.ghosts.draw(&mut pass);
+            }
         }
         // `MODE_DOTS` = probability dots (`dots`) instead of the raymarch
         if !self.draw_cloud {
+            if self.glow_on {
+                self.glow.render(enc, colour, &confine);
+            }
             return;
         }
         let dots = self.volume_params.mode == volume::MODE_DOTS;
@@ -109,6 +121,10 @@ impl Renderer {
             } else {
                 self.volume.draw(&mut pass)
             }
+        }
+        drop(pass);
+        if self.glow_on {
+            self.glow.render(enc, colour, &confine);
         }
     }
 }

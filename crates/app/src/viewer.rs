@@ -1050,6 +1050,29 @@ impl Viewer {
         out
     }
 
+    /// The Camera view (View ▸ Camera, `UiState::camera_view`): the positions at each instant of the
+    /// shutter — the last `shutter` share of the steps the last tick passed through
+    /// (`DynSnapshot::tick_path`) and the drawn positions — for the glow's time-average. Paused, or
+    /// one step per tick, it is the drawn positions alone (sharp).
+    pub fn camera_frames(&self, shown: &Scene) -> Vec<Vec<[f64; 3]>> {
+        let now: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        let n = now.len();
+        let path = self.snapshot.as_ref().filter(|_| self.playing).map(|s| &s.dynamics.tick_path);
+        let Some(path) = path.filter(|p| p.len() >= 2 && p.iter().all(|f| f.len() == n)) else { return vec![now] };
+        let keep = ((path.len() as f32 * self.ui.shutter).ceil() as usize).clamp(1, path.len());
+        // between two samples, straight lines: 3 instants each, for a smooth streak
+        let tail = &path[path.len() - keep..];
+        let mut frames = Vec::with_capacity(keep * 3 + 1);
+        for w in tail.windows(2) {
+            for f in 0..3 {
+                let t = f as f64 / 3.0;
+                frames.push((0..n).map(|i| std::array::from_fn(|c| w[0][i][c] + t * (w[1][i][c] - w[0][i][c]))).collect());
+            }
+        }
+        frames.push(tail[tail.len() - 1].clone());
+        frames
+    }
+
     fn record_trails(&mut self) {
         if !self.ui.show_trails {
             self.trails.clear();

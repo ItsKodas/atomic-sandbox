@@ -493,6 +493,7 @@ impl Shot {
                 viewport: viewer.viewport,
                 risk: &risk,
                 blur: &[],
+                glow: None,
             };
             self.painter.paint(&self.hl.ctx, target, world, &viewer.egui_ctx, out);
         }

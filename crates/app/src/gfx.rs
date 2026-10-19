@@ -73,6 +73,9 @@ pub struct World<'a> {
     pub risk: &'a [f32],
     /// Motion blur (`Viewer::blur_ghosts`): (nucleus, position, alpha) of each translucent copy.
     pub blur: &'a [(usize, [f64; 3], f32)],
+    /// The Camera view (`Viewer::camera_frames`): each shutter instant's positions, and the exposure
+    /// (EV); `None` = the diagram view.
+    pub glow: Option<(&'a [Vec<[f64; 3]>], f32)>,
 }
 
 /// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
@@ -672,6 +675,7 @@ impl Painter {
         out: egui::FullOutput,
     ) {
         let [w, h] = target.size;
+        let (w_px, h_px) = (w, h);
         // the scene in its viewport (clamped to the target): aspect, pixel → NDC, viewport and scissor
         let vp = world.viewport;
         let vp = if vp.size[0] < 1.0 || vp.size[1] < 1.0 { Viewport::full(w as f32, h as f32) } else { vp };
@@ -689,6 +693,24 @@ impl Painter {
             })
             .collect();
         self.renderer.ghosts.set_instances(ctx, &ghosts);
+        self.renderer.glow_on = world.glow.is_some();
+        if let Some((frames, ev)) = world.glow {
+            let w = 1.0 / frames.len().max(1) as f32;
+            let scale = self.nucleus_scale;
+            let glow: Vec<SphereInstance> = frames
+                .iter()
+                .flat_map(|f| {
+                    f.iter().zip(world.nuclei).map(move |(p, n)| SphereInstance {
+                        centre: p.map(|x| x as f32),
+                        radius: elements::radius(n.z) * scale * 1.6,
+                        colour: elements::colour(n.z),
+                        selected: w,
+                    })
+                })
+                .collect();
+            self.renderer.glow.ensure(ctx, [w_px, h_px]);
+            self.renderer.glow.set(ctx, &glow, ev);
+        }
         self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {

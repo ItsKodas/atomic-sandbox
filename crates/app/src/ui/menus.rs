@@ -708,6 +708,26 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             acts.push(Action::SmoothMotion(smooth));
         }
         trail_controls(ui, st);
+        // the Camera view: the atoms as their electron glow, with a shutter and an exposure
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("render");
+            if let Some(cam) = theme::segmented(ui, st.camera_view, &[(false, "Diagram", "crisp spheres: positions and sizes at a glance"), (true, "Camera", "what an atom looks like: no surface, a soft electron glow, densest at the centre; a moving atom streaks over the shutter")]) {
+                st.camera_view = cam;
+            }
+        });
+        if st.camera_view {
+            ui.horizontal(|ui| {
+                ui.label("shutter");
+                ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false)).on_hover_text("how much of the motion between frames one picture collects: longer streaks to the right (a sharp still at 0)");
+                ui.label(format!("{:.0} %", st.shutter * 100.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("exposure");
+                ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
+                ui.label(format!("{:+.1} EV", st.exposure_ev));
+            });
+        }
         ui.horizontal(|ui| {
             ui.label("motion blur");
             ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false))

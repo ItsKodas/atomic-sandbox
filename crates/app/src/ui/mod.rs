@@ -544,6 +544,12 @@ pub struct UiState {
     pub motion_blur: f32,
     /// View ▸ Density ▸ show ▸ None: no electron cloud, only the atoms (display only).
     pub hide_cloud: bool,
+    /// View ▸ Camera: the atoms as soft electron glows, time-averaged over the shutter (real motion
+    /// blur), with an exposure; the share of the last tick's path the shutter covers (0–1) and the
+    /// exposure in EV. Display only.
+    pub camera_view: bool,
+    pub shutter: f32,
+    pub exposure_ev: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -794,6 +800,9 @@ right {}
             show_trails: false,
             motion_blur: 0.5,
             hide_cloud: false,
+            camera_view: false,
+            shutter: 0.5,
+            exposure_ev: 0.0,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
