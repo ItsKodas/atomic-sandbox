@@ -191,20 +191,39 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if !st.files.open {
         return;
     }
-    let mut open = true;
-    // most of the app window: 80 % of it, at most 1280 × 900 points
+    // 80 % of the app window, recomputed every frame so it follows the window's size; drawn as an
+    // area of its own (an egui Window keeps the size its content first asked for)
     let screen = ctx.content_rect();
-    let size = Vec2::new((screen.width() * 0.8).min(1280.0), (screen.height() * 0.8).min(900.0));
-    egui::Window::new("Files")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
+    let size = Vec2::new((screen.width() * 0.8).min(1280.0), (screen.height() * 0.8).min(900.0)).max(Vec2::new(360.0, 300.0));
+    let rect = egui::Rect::from_center_size(screen.center(), size);
+    let mut close = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    egui::Area::new(egui::Id::new("files-window"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size(size)
-        .frame(egui::Frame::new().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(10).inner_margin(14).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) }))
-        .show(ctx, |ui| body(ui, st, input, acts));
-    if !open {
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .corner_radius(10)
+                .inner_margin(14)
+                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) })
+                .show(ui, |ui| {
+                    let inner = size - Vec2::splat(28.0);
+                    ui.set_min_size(inner);
+                    ui.set_max_size(inner);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Files").size(17.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("✕").size(14.0)).on_hover_text("close (Esc)").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    body(ui, st, input, acts);
+                });
+        });
+    if close {
         st.files.open = false;
     }
 }
@@ -223,7 +242,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
     });
     // the scenes take a little over half the height, the models the rest
     let total = ui.available_height();
-    egui::ScrollArea::vertical().id_salt("files-scenes").auto_shrink([false, false]).max_height(total * 0.5).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("files-scenes").auto_shrink([false, true]).max_height(total * 0.5).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(12.0);
             for i in 0..st.files.scenes.len() {
