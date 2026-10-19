@@ -433,7 +433,9 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
 }
 
 /// Bottom-left: the axes gizmo (with the axes toggle) and the quick Volume / Isosurface switch.
-fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+/// Camera (the fourth choice) is the glow view (`UiState::camera_view`), its shutter and exposure
+/// beside the switch while it is on.
+fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let dots_tip = format!("random samples of the field drawn, resampled every frame (View › Density › shimmer). {}", super::dock::orbitals::dots_note(st));
     egui::Area::new(Id::new("view-switch"))
         .pivot(Align2::LEFT_BOTTOM)
@@ -446,18 +448,40 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     gizmo(ui, input);
                 }
                 egui::Frame::new().fill(theme::CARD).corner_radius(7).show(ui, |ui| {
+                    let current = if st.camera_view { 3 } else { st.volume_mode };
                     if let Some(m) = theme::segmented(
                         ui,
-                        st.volume_mode,
+                        current,
                         &[
                             (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › Density for gamma and opacity)"),
                             (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › Density, and the iso slider in the Orbitals tab)"),
                             (2, "Dots", dots_tip.as_str()),
+                            (3, "Camera", "what an atom looks like: no surface, a soft electron glow densest at the centre; a moving atom streaks over the shutter (a time-average, like a camera's exposure)"),
                         ],
                     ) {
-                        acts.push(Action::VolumeMode(m));
+                        if m == 3 {
+                            st.camera_view = true;
+                        } else {
+                            st.camera_view = false;
+                            acts.push(Action::VolumeMode(m));
+                        }
                     }
                 });
+                if st.camera_view {
+                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 110.0;
+                            ui.label("shutter");
+                            ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false))
+                                .on_hover_text("how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
+                            ui.label(format!("{:.0} %", st.shutter * 100.0));
+                            ui.add_space(8.0);
+                            ui.label("exposure");
+                            ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
+                            ui.label(format!("{:+.1} EV", st.exposure_ev));
+                        });
+                    });
+                }
             });
         });
 }
