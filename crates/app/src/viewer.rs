@@ -340,6 +340,9 @@ pub struct Viewer {
     pub viewport: Viewport,
     /// Where an estimated worker keeps the model across solver switches (deleted at exit).
     pub autosave: PathBuf,
+    /// Estimated mode with no model starts a sampling pass by itself (`Command::EnsureModel`):
+    /// the screenshot and replay harness; the window sets it false (a pass from Start sampling only).
+    pub auto_pass: bool,
     /// (wall, simulated fs) of recent playing snapshots: the measured rate over [`RATE_WINDOW`].
     rate: std::collections::VecDeque<(Instant, f64)>,
     /// The last two adopted playing snapshots (smooth motion, [`interpolate`]).
@@ -415,6 +418,7 @@ impl Viewer {
             orbital_at: [None, None],
             viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
+            auto_pass: true,
             rate: Default::default(),
             retiring: Vec::new(),
             pending_teach: None,
@@ -499,6 +503,7 @@ impl Viewer {
                 Command::EnsureModel {
                     autoload: None, // decided when it is sent: the autosave may still be written
                     plan: self.ui.plan.clone(),
+                    auto_pass: self.auto_pass,
                 },
                 self.ui.cloud_command(),
             ];

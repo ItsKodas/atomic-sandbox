@@ -312,7 +312,7 @@ pub(super) const REFIT_SAMPLES: usize = 25;
 
 impl Worker {
     /// [`Command::EnsureModel`] (`worker` module doc, "Teaching"; "Autosave" for the ownership).
-    pub(super) fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan) {
+    pub(super) fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan, auto_pass: bool) {
         if trainable(&mut self.dy).is_none() {
             return;
         }
@@ -330,7 +330,7 @@ impl Worker {
             return;
         }
         let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
-        if !fitted && !sampling_active(&self.dy.snapshot()) {
+        if auto_pass && !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
         }
     }

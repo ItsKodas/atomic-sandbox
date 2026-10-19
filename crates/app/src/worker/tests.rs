@@ -481,7 +481,7 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
         Command::Dyn(DynCommand::CancelSampling),
         Command::Dyn(DynCommand::ForgetModel),
         Command::Dyn(DynCommand::LoadModel("x.model".into())),
-        Command::EnsureModel { autoload: None, plan: SamplingPlan::default() },
+        Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true },
         Command::Shutdown,
     ] {
         assert!(c.aborts(), "{c:?} must abort a step");
@@ -555,7 +555,7 @@ fn taught(scene: Scene, ctx: GpuContext, autosave: Option<PathBuf>) -> (SimWorke
     let w = SimWorker::spawn_with(scene, Backend::Estimated, Some(ctx), Vec::new(), autosave);
     idle(&w);
     let t = Instant::now();
-    w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+    w.send(Command::EnsureModel { autoload: None, plan: test_plan(), auto_pass: true });
     snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
     let s = snapshot_until(&w, "the end of the pass", |s| {
         s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)
@@ -620,7 +620,7 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
     assert!(!m0.fitted && m0.samples == 1 && m0.last_refit.is_none() && s0.dynamics.sampling.is_none(), "{m0:?}");
     assert_eq!(s0.dynamics.source, sim::Source::Fallback, "no model yet: the teacher answers");
     let t = Instant::now();
-    w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+    w.send(Command::EnsureModel { autoload: None, plan: test_plan(), auto_pass: true });
     let first = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
     assert!(first.dynamics.paused && first.working);
     w.send(Command::Dyn(DynCommand::Play));
@@ -829,7 +829,7 @@ fn model_sidecar_saves_and_loads_with_the_scene() {
     for path in [&saved, &autosave] {
         let b = SimWorker::spawn(h2_41(), Backend::Estimated, Some(ctx.clone()));
         idle(&b);
-        b.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan() });
+        b.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan(), auto_pass: true });
         let s = snapshot_until(&b, "the loaded model", |s| model(s).fitted);
         let mb = model(&s);
         assert!(s.dynamics.sampling.is_none(), "a pass started despite the model");
@@ -857,7 +857,7 @@ fn model_sidecar_saves_and_loads_with_the_scene() {
     let bytes = std::fs::read(&saved).unwrap();
     let c = SimWorker::spawn_with(other, Backend::Estimated, Some(ctx), Vec::new(), Some(saved.clone()));
     idle(&c);
-    c.send(Command::EnsureModel { autoload: Some(saved.clone()), plan: test_plan() });
+    c.send(Command::EnsureModel { autoload: Some(saved.clone()), plan: test_plan(), auto_pass: true });
     let s = snapshot_until(&c, "the refused load", |s| model(s).autoload_refused.is_some());
     let why = model(&s).autoload_refused.clone().unwrap();
     assert!(why.contains("41³") && why.contains("33³"), "{why}");
@@ -901,7 +901,7 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     eprintln!("H₂O 97³: bond references in {:.0} s (background)", t.elapsed().as_secs_f64());
     // Task 9 item 4: the automatic first pass would take far longer than its 2-minute target
     // here, so it waits for "Start anyway" (an offer, no pass) …
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     let offered = snapshot_until_progress(&w, "the pass offer", |s| model(s).pass_offer.is_some());
     let o = model(&offered).pass_offer.clone().unwrap();
     eprintln!(
@@ -1257,7 +1257,7 @@ fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
         let s0 = idle(&w);
         let full = plan.solves(&s0.dynamics.scene).unwrap();
         script.lock().unwrap().extend(times);
-        w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
+        w.send(Command::EnsureModel { autoload: None, plan: plan.clone(), auto_pass: true });
         // follow the pass until a few snapshots after the edit's evaluation; the edit (a slow
         // live evaluation: a tick without a pass step) is sent a third into the third solve
         let mut totals: Vec<usize> = Vec::new();
@@ -1416,7 +1416,7 @@ fn a_worker_shut_down_before_ensure_model_leaves_the_autosave_alone() {
     std::fs::write(&path, b"the session's model").unwrap();
     let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx), Vec::new(), Some(path.clone()));
     // both queued while the worker is still in `Dynamics::new`'s cold evaluation
-    w.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan() });
+    w.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan(), auto_pass: true });
     assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
     assert_eq!(std::fs::read(&path).unwrap(), b"the session's model", "the autosave was rewritten or removed");
     let _ = std::fs::remove_file(&path);
@@ -2261,7 +2261,7 @@ fn events_arrive_once_in_order_across_ticks_and_early_publishes() {
     let w = morse_estimated(h2_33());
     let mut events: Vec<sim::TeachEvent> = Vec::new();
     snapshots_until(&w, "an idle worker", |s| events.extend(s.activity.events.iter().cloned()), |s| !s.working);
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     snapshots_until(&w, "the pass to finish", |s| events.extend(s.activity.events.iter().cloned()), pass_done);
     // play with a flood of speed commands (early publishes)
     w.send(Command::Dyn(DynCommand::Play));
@@ -2316,7 +2316,7 @@ fn a_scene_replacement_delivers_the_events_before_it() {
         runs.extend(s.activity.run_started);
     }, |s| !s.working);
     assert_eq!(runs.len(), 1, "the worker's first snapshot starts its first run");
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     let mut each = |s: &Snapshot| {
         events.extend(s.activity.events.iter().cloned());
         runs.extend(s.activity.run_started);
@@ -2376,7 +2376,7 @@ fn the_fit_history_gains_a_point_per_refit() {
     let mut points = Vec::new();
     snapshots_until(&w, "an idle worker", |s| points.extend(s.activity.fit_points.iter().cloned()), |s| !s.working);
     assert!(points.is_empty(), "no fit before the pass");
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     let s = snapshots_until(&w, "a fitted model", |s| points.extend(s.activity.fit_points.iter().cloned()), |s| {
         s.model.as_ref().is_some_and(|m| m.fitted) && !s.working
     });
@@ -2403,7 +2403,7 @@ fn the_fit_history_gains_a_point_per_refit() {
 fn views_are_built_only_while_open_and_at_most_every_2_s() {
     let w = morse_estimated(h2_33());
     idle(&w);
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     snapshot_until(&w, "a fitted model", |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working);
     w.send(Command::Dyn(DynCommand::Step(1)));
     let s = idle(&w);
@@ -2466,7 +2466,7 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
 fn the_last_audit_step_is_the_audit_events_step() {
     let w = morse_estimated_at(h2_33(), 0.0);
     idle(&w);
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     let s = snapshot_until(&w, "the pass to finish", pass_done);
     assert!(s.model.as_ref().unwrap().trusted, "{:?}", s.model.as_ref().unwrap().untrusted_reason);
     w.send(Command::SetAudit(3));
@@ -2592,7 +2592,7 @@ fn activity_overhead_is_reported() {
     let w = SimWorker::spawn_with(Scene::preset("h2").unwrap(), Backend::Estimated, Some(ctx), Vec::new(), None);
     idle(&w);
     w.send(Command::SetActivityViews(true));
-    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
     let mut solve_ms = Vec::new();
     let mut last = ActivityDelta::default();
     let mut builds = Vec::new();
@@ -2964,7 +2964,7 @@ fn a_running_pass_ships_the_geometry_it_is_solving() {
     let idle = snapshots_until(&w, "an idle worker", |_| {}, |s| !s.working);
     assert!(idle.dynamics.ghost.is_none(), "no pass, no ghost");
     let plan = SamplingPlan { perturbations: 6, hot_burst_steps: 6, scan_points_per_pair: 4, ..SamplingPlan::default() };
-    w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
+    w.send(Command::EnsureModel { autoload: None, plan: plan.clone(), auto_pass: true });
     let mut ghosts: Vec<sim::PassGhost> = Vec::new();
     let mut active_without = 0;
     let end = snapshots_until(

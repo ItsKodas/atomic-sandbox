@@ -472,6 +472,8 @@ fn main() {
     }
     let mut viewer = Viewer::new(&preset)
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
+    // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
+    viewer.auto_pass = false;
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");
         std::process::exit(1);

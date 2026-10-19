@@ -48,11 +48,13 @@ pub enum Command {
     Dyn(DynCommand),
     /// Estimated solver (`worker` module doc): install the model at `autoload` if the file exists — a
     /// refused load starts nothing (the panel offers to forget it) — else, when the surrogate has
-    /// no model and no pass runs, start a sampling pass with `plan`. Ignored by the other
-    /// backends.
+    /// no model, no pass runs and `auto_pass` is set, start a sampling pass with `plan`. The window
+    /// sends `auto_pass: false` (user request 2026-10-19: a pass starts only from Start sampling);
+    /// the screenshot and replay harness keep it. Ignored by the other backends.
     EnsureModel {
         autoload: Option<PathBuf>,
         plan: SamplingPlan,
+        auto_pass: bool,
     },
     /// Estimated solver: the surrogate's audit cadence (`FallbackPolicy::audit_every`, ruling
     /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
@@ -316,7 +318,7 @@ impl Worker {
                     }
                 }
             }
-            Command::EnsureModel { autoload, plan } => self.ensure_model(autoload, plan),
+            Command::EnsureModel { autoload, plan, auto_pass } => self.ensure_model(autoload, plan, auto_pass),
             Command::SetAudit(n) => {
                 self.audit_every = Some(n);
                 self.apply_audit();
