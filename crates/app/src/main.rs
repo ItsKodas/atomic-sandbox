@@ -82,6 +82,9 @@ struct App {
     egui_repaint_at: Option<Instant>,
     /// The custom frame's close button was pressed: exit at the next `about_to_wait`.
     closing: bool,
+    /// The window has the keyboard focus: the floating dots animate only then (a background window
+    /// draws nothing new).
+    focused: bool,
     /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
     frames: FrameStats,
 }
@@ -534,6 +537,7 @@ fn main() {
         egui_repaint: true,
         egui_repaint_at: None,
         closing: false,
+        focused: true,
         frames: FrameStats::default(),
     };
     event_loop.run_app(&mut app).expect("run");
@@ -653,6 +657,10 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(&window),
+            WindowEvent::Focused(f) => {
+                self.focused = f;
+                window.request_redraw();
+            }
             e => {
                 // the 3D view's mouse and keys: one path, `Viewer::input` (the replayer's too)
                 if let Some(ev) = replay::from_winit(&e, self.viewer.viewport) {
@@ -685,7 +693,9 @@ impl ApplicationHandler for App {
         if due {
             self.egui_repaint_at = None;
         }
-        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due;
+        // the floating dots drift by themselves: keep drawing while they are shown and the window has focus
+        let floating = self.focused && self.viewer.dots_floating();
+        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due || floating;
         // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
         // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
         // (no vsync) would pace the loop and a solve would spin a core. Poll instead.

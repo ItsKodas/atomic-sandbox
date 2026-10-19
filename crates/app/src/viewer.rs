@@ -883,6 +883,12 @@ impl Viewer {
         self.send(Command::Dyn(c));
     }
 
+    /// The floating dots are on screen (Dots mode, floating on, the cloud shown): the window keeps
+    /// drawing so they drift (`main`, only while focused).
+    pub fn dots_floating(&self) -> bool {
+        self.ui.volume_mode == ui::VOLUME_DOTS && self.ui.dots_float && !self.ui.camera_view && !self.ui.hide_cloud
+    }
+
     /// The estimated solver with no fitted model (and no pass running that will make one).
     fn estimated_without_model(&self) -> bool {
         let Some(s) = self.snapshot.as_ref().filter(|s| s.backend == crate::sim::Backend::Estimated) else { return false };
