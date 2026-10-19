@@ -64,7 +64,10 @@ fn fs_main(in: VOut) -> FOut {
     var a = 1.0;
     if (in.selected < 0.0) {
         let e = clamp(disc / (in.radius * in.radius), 0.0, 1.0);
-        a = -in.selected * e * e;
+        // full strength out to 82 % of the radius, faded only over the rim: the copy keeps the
+        // atom's size, the rim's step does not show
+        let q = sqrt(1.0 - e);
+        a = -in.selected * (1.0 - smoothstep(0.82, 1.0, q));
         col = in.colour * (0.35 + 0.65 * diffuse);
     }
     out.colour = vec4(col, a);
