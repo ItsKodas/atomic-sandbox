@@ -549,12 +549,13 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             }
         });
     }
-    let scene = st
-        .files
-        .scenes
-        .get(st.files.selected)
-        .and_then(|e| e.scene.as_ref().ok())
-        .cloned();
+    // the open scene as it is now (its settings may have changed since it was opened), else the
+    // selected one as it would load
+    let scene = if sel_current {
+        Some(input.scene.clone())
+    } else {
+        st.files.scenes.get(st.files.selected).and_then(|e| e.scene.as_ref().ok()).cloned()
+    };
     track_loads(st, input);
     let rest = (ui.available_height() - 40.0).max(120.0);
     egui::ScrollArea::vertical().id_salt("files-models").auto_shrink([false, false]).max_height(rest).show(ui, |ui| {
@@ -660,10 +661,19 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     load = Some(m.path.clone());
                 }
                 // the model's settings without the model (to train one of your own at them)
-                if matches!(f, Fit::Settings(..)) && estimated && !input.sampling() {
+                // (kept, disabled, once the scene has them: "Settings applied")
+                if matches!(f, Fit::Settings(..) | Fit::Ready) && estimated {
                     let at2 = at.translate(Vec2::new(-(LOAD_W + 8.0), 0.0));
-                    let b2 = egui::Button::new(RichText::new("Use its settings").size(13.0)).corner_radius(8);
-                    if ui.put(at2, b2).on_hover_text("switch the scene to this model's settings (grid, σ, charge, multiplicity, ionic potential) without loading the model").clicked() {
+                    let applied = matches!(f, Fit::Ready);
+                    let word = if applied { "Settings applied" } else { "Use its settings" };
+                    let b2 = egui::Button::new(RichText::new(word).size(13.0).color(if applied { theme::INK_FAINT } else { theme::INK })).corner_radius(8);
+                    let enabled = !applied && !input.sampling();
+                    let tip = if applied {
+                        "the scene already has this model's settings"
+                    } else {
+                        "switch the scene to this model's settings (grid, σ, charge, multiplicity, ionic potential) without loading the model"
+                    };
+                    if ui.put(at2, b2.sense(if enabled { Sense::click() } else { Sense::hover() })).on_hover_text(tip).clicked() && enabled {
                         settings_only = Some(m.path.clone());
                     }
                 }
