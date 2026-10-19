@@ -8,6 +8,9 @@ How it was built, what failed on the way and how long each part took: [DEVLOG.md
 
 ## What it does today
 
+**Since the M7 merge (2026-10-19):** File ▸ **Open…** browses the scenes (presets with previews, the `scenes/` folder) and the models in `models/`, marking each model against the selected scene (ready / needs settings / can't run here, the elements it was taught, a *recommended* badge, *Use its settings* without loading it); opening a scene saved at another grid or ionic potential asks which settings to use. File ▸ **Save…** saves the scene, the model or both (to the folders or anywhere). File ▸ **Profiles…** saves and loads the app's layout and look (`profiles/`, shareable); the layout and look you leave are restored at the next launch. Dock tabs can be dragged up and down or to the other dock (right-click: move, reset). The view switch's fourth choice, **Camera**, draws the atoms as they look — from a soft electron glow to solid shaded balls — time-averaged over a shutter (real motion blur), with exposure, field of view, solidity and size in View ▸ Display aids; the diagram view has its own motion blur, a background colour and a label opacity. In estimated mode: **Solve Bonds** (bottom right) solves the density once between steps for the bonds and angles, the bond references solve only for a loaded scene or on that button, switching to Estimated never starts a sampling pass by itself, Play needs a model, and a run pauses itself when every one of the last 100 steps fell back to DFT. The app is a windowed program with its own icon.
+
+
 | Milestone | Status | What you get |
 |---|---|---|
 | M1 — CPU reference solver (`qm`) | done | f64 spin-polarised LSDA Kohn-Sham solver on a uniform real-space grid, validated against NIST/literature atoms and the H₂ bond length |
