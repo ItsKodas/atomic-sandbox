@@ -168,7 +168,15 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
         Action::TogglePlay => out.toggle_play = true,
-        Action::Play => out.commands.push(dyn_(DynCommand::Play)),
+        Action::Play => {
+            // estimated with no model: nothing to play on (the viewer's toggle refuses the same)
+            let no_model = st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling();
+            if no_model {
+                out.error = Some("the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into());
+            } else {
+                out.commands.push(dyn_(DynCommand::Play));
+            }
+        }
         Action::Pause => out.commands.push(dyn_(DynCommand::Pause)),
         Action::Step => out.commands.push(dyn_(DynCommand::Step(1))),
         Action::Rewind => out.commands.push(dyn_(DynCommand::Rewind)),

@@ -871,12 +871,43 @@ impl Viewer {
 
     /// Play ↔ Pause (the panel button and the Space key).
     pub fn toggle_play(&mut self) {
+        if !self.playing && self.estimated_without_model() {
+            self.ui.set_status(NO_MODEL_PLAY.to_string());
+            return;
+        }
         let c = if self.playing {
             DynCommand::Pause
         } else {
             DynCommand::Play
         };
         self.send(Command::Dyn(c));
+    }
+
+    /// The estimated solver with no fitted model (and no pass running that will make one).
+    fn estimated_without_model(&self) -> bool {
+        let Some(s) = self.snapshot.as_ref().filter(|s| s.backend == crate::sim::Backend::Estimated) else { return false };
+        !s.model.as_ref().is_some_and(|m| m.fitted) && !crate::sim::sampling_active(&s.dynamics)
+    }
+
+    /// Estimated play stops itself (user request 2026-10-19): with no model (it was forgotten or
+    /// refused), or when every one of the last 100 steps fell back to DFT (the model answers
+    /// nothing here: playing on is a slow DFT run).
+    fn guard_estimated(&mut self) {
+        if !self.playing {
+            return;
+        }
+        let why = if self.estimated_without_model() {
+            Some("paused: the estimated solver has no model — load one (File ▸ Open) or Start sampling in the Model tab")
+        } else {
+            self.snapshot
+                .as_ref()
+                .filter(|s| s.backend == crate::sim::Backend::Estimated && s.dynamics.step >= 100 && s.dynamics.fallback_fraction_100 >= 0.999)
+                .map(|_| "paused: every one of the last 100 steps fell back to DFT — the model answers nothing here (Model tab: teach around the blockers, or sample more)")
+        };
+        if let Some(why) = why {
+            self.send(Command::Dyn(DynCommand::Pause));
+            self.ui.set_status(why.to_string());
+        }
     }
 
     /// The wheel over the 3D view (`lines` up positive; a pixel wheel's 40 px count as a line):
@@ -1874,6 +1905,7 @@ impl Viewer {
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         self.auto_audit(measured_fs_per_s);
+        self.guard_estimated();
         let shown = self.shown_scene(Instant::now());
         self.follow_selected(&shown);
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
@@ -3365,3 +3397,6 @@ fn fixed_layer(ctx: &egui::Context, id: &str, rect: egui::Rect) {
             ui.allocate_space(rect.size());
         });
 }
+
+/// Play refused in estimated mode without a model (the status line).
+const NO_MODEL_PLAY: &str = "the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab";
