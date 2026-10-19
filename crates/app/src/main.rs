@@ -795,6 +795,7 @@ impl App {
             colour: &view,
             depth: &g.surface.depth,
             size: [g.surface.config.width, g.surface.config.height],
+            sampleable: g.surface.sampleable,
         };
         let shown = v.shown_scene(Instant::now());
         let lines = v.overlay_lines(&shown);
@@ -802,6 +803,7 @@ impl App {
         let blur = if v.ui.camera_view { Vec::new() } else { v.blur_ghosts(&shown) };
         let frames = if v.ui.camera_view { v.camera_frames(&shown) } else { Vec::new() };
         let selected = v.tool.set(shown.nuclei.len());
+        let warp_from = v.warp_source();
         let world = World {
             camera: &v.camera,
             nuclei: v.drawn_nuclei(&shown),
@@ -810,7 +812,8 @@ impl App {
             viewport: v.viewport,
             risk: &risk,
             blur: &blur,
-            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size)),
+            glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size, v.ui.camera_smooth)),
+            warp_from: warp_from.as_deref(),
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

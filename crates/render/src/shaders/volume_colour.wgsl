@@ -21,7 +21,8 @@ fn sample_colour_one(t: texture_3d<f32>, p: vec3<f32>) -> vec4<f32> {
     return textureSampleLevel(t, colour_sampler, uvw, 0.0);
 }
 
-fn sample_colour(p: vec3<f32>) -> vec4<f32> {
+fn sample_colour(p_now: vec3<f32>) -> vec4<f32> {
+    let p = warp_back(p_now);
     if (prm.mix_w >= 1.0) { return sample_colour_one(colour_cur, p); }
     if (prm.mix_w <= 0.0) { return sample_colour_one(colour_prev, p); }
     return mix(sample_colour_one(colour_prev, p), sample_colour_one(colour_cur, p), prm.mix_w);

@@ -19,6 +19,8 @@ pub struct GlowPass {
     /// The balls' depth for one instant (solidity > 0).
     prepass: wgpu::RenderPipeline,
     glow_bg: wgpu::BindGroup,
+    /// Group 0's layout (the camera, the look and the instances as storage: rebuilt with the buffer).
+    cam_bgl: wgpu::BindGroupLayout,
     composite: wgpu::RenderPipeline,
     composite_bgl: wgpu::BindGroupLayout,
     look: UniformBuffer<[f32; 4]>,
@@ -32,6 +34,19 @@ pub struct GlowPass {
     /// Instances per instant (laid out instant after instant), and the solidity.
     per_instant: u32,
     solidity: f32,
+}
+
+/// Group 0: the camera, the look, the instances (storage: the smooth union reads its instant's atoms).
+fn glow_group(ctx: &GpuContext, bgl: &wgpu::BindGroupLayout, cam: &UniformBuffer<CameraUniform>, look: &UniformBuffer<[f32; 4]>, instances: &wgpu::Buffer) -> wgpu::BindGroup {
+    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("glow camera"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: cam.buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: look.buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: instances.as_entire_binding() },
+        ],
+    })
 }
 
 fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -55,14 +70,15 @@ impl GlowPass {
         look.write(ctx, &[1.0, 0.0, 0.0, 0.0]);
         let cam_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("glow camera"),
-            entries: &[uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT), uniform(1, wgpu::ShaderStages::VERTEX_FRAGMENT)],
-        });
-        let glow_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("glow camera"),
-            layout: &cam_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: cam.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: look.buffer.as_entire_binding() },
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                uniform(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let glow_layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&cam_bgl)], immediate_size: 0 });
@@ -129,24 +145,28 @@ impl GlowPass {
             cache: None,
         });
         let instances = Self::make_buffer(ctx, 64);
-        GlowPass { glow, prepass, glow_bg, composite, composite_bgl, look, cam, accum: None, instances, capacity: 64, count: 0, per_instant: 0, solidity: 0.0 }
+        let glow_bg = glow_group(ctx, &cam_bgl, &cam, &look, &instances);
+        GlowPass { glow, prepass, glow_bg, cam_bgl, composite, composite_bgl, look, cam, accum: None, instances, capacity: 64, count: 0, per_instant: 0, solidity: 0.0 }
     }
 
     fn make_buffer(ctx: &GpuContext, capacity: usize) -> wgpu::Buffer {
         ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("glow instances"),
             size: (capacity * std::mem::size_of::<SphereInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
     }
 
     /// Every instant's atoms, `per_instant` each, instant after instant (`selected` = the
-    /// instant's weight, 1/N), the exposure (EV) and the solidity (0 glow … 1 ball).
-    pub fn set(&mut self, ctx: &GpuContext, instances: &[SphereInstance], per_instant: usize, exposure_ev: f32, solidity: f32) {
+    /// instant's weight, 1/N), the exposure (EV), the solidity (0 glow … 1 ball) and the smooth
+    /// union's neck width `smooth` (Bohr; 0 = separate balls).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set(&mut self, ctx: &GpuContext, instances: &[SphereInstance], per_instant: usize, exposure_ev: f32, solidity: f32, smooth: f32) {
         if instances.len() > self.capacity {
             self.capacity = instances.len().next_power_of_two();
             self.instances = Self::make_buffer(ctx, self.capacity);
+            self.glow_bg = glow_group(ctx, &self.cam_bgl, &self.cam, &self.look, &self.instances);
         }
         if !instances.is_empty() {
             ctx.queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(instances));
@@ -154,7 +174,7 @@ impl GlowPass {
         self.count = instances.len() as u32;
         self.per_instant = per_instant as u32;
         self.solidity = solidity;
-        self.look.write(ctx, &[2f32.powf(exposure_ev), solidity, 0.0, 0.0]);
+        self.look.write(ctx, &[2f32.powf(exposure_ev), solidity, per_instant.max(1) as f32, smooth.max(0.0)]);
     }
 
     /// The camera of this frame (`Renderer::update_camera_in`), scaled to the supersampled targets.

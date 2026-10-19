@@ -513,6 +513,8 @@ pub struct UiState {
     /// peak or to the physical ρ max.
     pub colour_additive: bool,
     pub colour_physical: bool,
+    /// All orbitals coloured: boundary surfaces (shell by default) or the density (`sim::ColourLook`).
+    pub colour_look: sim::ColourLook,
     /// All orbitals coloured: the tracks included (`None` = every occupied orbital).
     pub included: Option<std::collections::BTreeSet<u32>>,
     /// Screenshots: the spheres' size factor instead of the automatic one (the automatic one
@@ -564,6 +566,8 @@ pub struct UiState {
     /// the field of view (degrees, Camera only).
     pub camera_solidity: f32,
     pub camera_size: f32,
+    /// The Camera view's solid: the smooth union's neck width (Bohr; 0 = separate balls).
+    pub camera_smooth: f32,
     pub fov_deg: f32,
     /// View ▸ Display aids ▸ background, sRGB; `None` = the default dark blue.
     pub background: Option<[u8; 3]>,
@@ -619,6 +623,13 @@ pub struct UiState {
     /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
     /// superposition between DFT densities (default on), and a display refresh every N s.
     pub cloud_superposition: bool,
+    /// The display warp (`render::warp`, user request 2026-10-20): the shown density or orbitals
+    /// follow the atoms from the geometry they were solved at to where they are drawn now. Display only.
+    pub warp_fields: bool,
+    /// Bloom (`render::bloom`, display only): the glow strength (0 = off) and the brightness it
+    /// starts at (0–1 of full white).
+    pub bloom: f32,
+    pub bloom_threshold: f32,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
@@ -818,6 +829,7 @@ right {}
             spin_iso: SPIN_ISO_DEFAULT,
             colour_additive: true,
             colour_physical: false,
+            colour_look: sim::ColourLook::default(),
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
@@ -839,6 +851,7 @@ right {}
             exposure_ev: 0.0,
             camera_solidity: 0.0,
             camera_size: 1.6,
+            camera_smooth: 0.6,
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
@@ -877,6 +890,9 @@ right {}
             edit_group: Vec::new(),
             smooth_motion: true,
             cloud_superposition: true,
+            warp_fields: true,
+            bloom: 0.35,
+            bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
             dock_tab: DockTab::Model,
@@ -1064,7 +1080,7 @@ impl UiState {
             ShowMode::Coloured => (
                 // (the blend is a render setting, `Painter::set_view`, not part of the request: a toggle
                 // would otherwise be a view change, and in estimated mode a background solve)
-                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical },
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, look: self.colour_look },
                 self.unoccupied,
             ),
             ShowMode::Spin => (R::SpinDensity, 0),

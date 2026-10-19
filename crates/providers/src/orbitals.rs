@@ -368,7 +368,7 @@ pub enum ViewChange {
 pub enum PickKind {
     None,
     Orbital { spin: qo::Spin, track: u32, squared: bool },
-    Colour { include: Vec<u32>, physical: bool },
+    Colour { include: Vec<u32>, physical: bool, look: sim::ColourLook },
     Spin,
 }
 
@@ -490,8 +490,8 @@ impl ViewState {
                     None => Pick { kind: PickKind::None, what: self.req.what.clone(), note: None },
                 }
             }
-            OrbitalRequest::AllColoured { include, physical } => {
-                let (raw, note): (Vec<u32>, Option<String>) = match include {
+            OrbitalRequest::AllColoured { include, physical, look } => {
+                let (mut raw, note): (Vec<u32>, Option<String>) = match include {
                     None => (out.rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.track).collect(), None),
                     Some(tracks) => {
                         let raw: Vec<u32> = tracks.iter().filter_map(|&t| self.raw(t)).filter(|t| out.rows.iter().any(|r| r.track == *t)).collect();
@@ -502,8 +502,15 @@ impl ViewState {
                 let what = OrbitalRequest::AllColoured {
                     include: include.as_ref().map(|_| raw.iter().map(|&t| export(t)).collect()),
                     physical: *physical,
+                    look: *look,
                 };
-                Pick { kind: PickKind::Colour { include: raw, physical: *physical }, what, note }
+                // the core orbitals left out (`sim::ColourLook::hide_core`): an occupied row more
+                // than `CORE_GAP` below the highest occupied one
+                if look.hide_core {
+                    let homo = out.rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.energy).fold(f64::NEG_INFINITY, f64::max);
+                    raw.retain(|t| out.rows.iter().filter(|r| r.track == *t).all(|r| r.energy >= homo - sim::CORE_GAP));
+                }
+                Pick { kind: PickKind::Colour { include: raw, physical: *physical, look: *look }, what, note }
             }
         }
     }
@@ -792,7 +799,7 @@ impl CpuView {
                 signed: true,
                 scale: spin.scale() as f32,
             }),
-            PickKind::Colour { include, physical } => {
+            PickKind::Colour { include, physical, .. } => {
                 let shown: Vec<(&[f64], f64, [f64; 3], f64)> = out.rows.iter().filter(|r| include.contains(&r.track)).filter_map(|r| {
                     let ch = r.spin.index();
                     let pk = if *physical { spin.rho_max } else { out.scale[ch][r.index].powi(2) };
@@ -1006,15 +1013,15 @@ mod tests {
         assert_eq!((p.kind.clone(), p.note.clone()), (PickKind::Orbital { spin: Up, track: 8, squared: false }, None), "TRACK_HOMO");
         assert_eq!(p.what, OrbitalRequest::Orbital { spin: Spin::Up, track: 3 + 8, squared: false }, "exported: raw 8 + base 3");
         // colour: all occupied, or the listed ones that still exist
-        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: None, physical: false }));
+        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() }));
         let mut fourth = third.rows.clone();
         fourth.push(row(Down, 1, 10, 0.1, 0.0));
         let fourth = output(fourth);
-        assert_eq!(v.pick(&fourth).kind, PickKind::Colour { include: vec![7, 8, 9], physical: false });
-        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: Some(vec![2, 3 + 8, 3 + 9]), physical: true }));
+        assert_eq!(v.pick(&fourth).kind, PickKind::Colour { include: vec![7, 8, 9], physical: false, look: Default::default() });
+        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: Some(vec![2, 3 + 8, 3 + 9]), physical: true, look: Default::default() }));
         let p = v.pick(&fourth);
-        assert_eq!(p.kind, PickKind::Colour { include: vec![8, 9], physical: true });
-        assert_eq!(p.what, OrbitalRequest::AllColoured { include: Some(vec![11, 12]), physical: true });
+        assert_eq!(p.kind, PickKind::Colour { include: vec![8, 9], physical: true, look: Default::default() });
+        assert_eq!(p.what, OrbitalRequest::AllColoured { include: Some(vec![11, 12]), physical: true, look: Default::default() });
         assert!(p.note.as_deref().is_some_and(|n| n.contains("1 included orbital no longer exists")), "{:?}", p.note);
         // off: a rebuild; the same view again: nothing
         assert_eq!(v.set(OrbitalViewRequest::default()), ViewChange::Off);

@@ -625,6 +625,14 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
 
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
+    let mut warp = st.warp_fields;
+    if ui
+        .checkbox(&mut warp, "fields follow the atoms")
+        .on_hover_text("the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)")
+        .changed()
+    {
+        acts.push(Action::WarpFields(warp));
+    }
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
     let mut changed = false;
     ui.add_enabled_ui(estimated, |ui| {
@@ -768,6 +776,19 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 }
             });
         });
+        // bloom: the bright parts glow (display only)
+        ui.horizontal(|ui| {
+            ui.label("bloom");
+            ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2))
+                .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
+        });
+        ui.add_enabled_ui(st.bloom > 0.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("bloom from");
+                ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2))
+                    .on_hover_text("how bright a part must be to glow (1 = only full white)");
+            });
+        });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
         theme::section(ui, "Camera");
@@ -793,6 +814,8 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
             let t = format!("{:.1}×", st.camera_size);
             row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
+            let t = if st.camera_smooth <= 0.0 { "balls".into() } else { format!("{:.2} Bohr", st.camera_smooth) };
+            row(ui, "smooth", &mut st.camera_smooth, 0.0..=2.0, t, "with any solidity: one smooth surface instead of separate balls — atoms close together flow into each other through a soft neck this wide (0 = separate balls, the hard crease)");
         }
         ui.separator();
         ui.horizontal(|ui| {

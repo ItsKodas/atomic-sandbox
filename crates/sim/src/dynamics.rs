@@ -2959,7 +2959,7 @@ fn answers_view(view: &OrbitalViewRequest, o: &OrbitalDisplay) -> bool {
         (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
             squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
         }
-        (R::AllColoured { physical, .. }, R::AllColoured { physical: p2, .. }) => physical == p2,
+        (R::AllColoured { physical, look, .. }, R::AllColoured { physical: p2, look: l2, .. }) => physical == p2 && look == l2,
         _ => false,
     }
 }

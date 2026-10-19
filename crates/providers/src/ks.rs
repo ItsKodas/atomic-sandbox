@@ -909,9 +909,10 @@ impl GpuKs {
                 let product = match (&p.kind, sv, cv) {
                     (&PickKind::Orbital { spin, track, squared }, Some(v), _) => Product::Orbital { spin, track, squared, out: v },
                     (PickKind::Spin, Some(v), _) => Product::Spin { out: v },
-                    (PickKind::Colour { include, physical }, _, Some(c)) => {
+                    (PickKind::Colour { include, physical, look }, _, Some(c)) => {
                         inc.extend_from_slice(include);
-                        Product::Colour { include: inc.as_slice(), physical: *physical, out: c }
+                        let boundary = look.enclose.map(|pct| qm_gpu::orbitals::Boundary { share: pct as f32 / 100.0, shell: look.shell });
+                        Product::Colour { include: inc.as_slice(), physical: *physical, boundary, out: c }
                     }
                     _ => Product::None,
                 };
@@ -2149,7 +2150,7 @@ mod tests {
                     p.set_orbital_view(view(match i % 4 {
                         0 => OrbitalRequest::List,
                         1 => OrbitalRequest::Orbital { spin: Spin::Up, track: sigma_g.expect("listed at the step before"), squared: false },
-                        2 => OrbitalRequest::AllColoured { include: None, physical: false },
+                        2 => OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() },
                         _ => OrbitalRequest::SpinDensity,
                     }));
                 }

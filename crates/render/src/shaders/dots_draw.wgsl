@@ -23,7 +23,9 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
 @vertex fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
     var corners = array<vec2<f32>, 6>(vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0));
     let q = corners[vi];
-    let pt = pts[ii];
+    let raw = pts[ii];
+    // the display warp (warp.wgsl): a dot of the solved field, drawn where its atoms are now
+    let pt = vec4(warp_forward(raw.xyz), raw.w);
     let c = unpack4x8unorm(bitcast<u32>(pt.w));
     var o: VOut;
     var clip = cam.view_proj * vec4(pt.xyz, 1.0);

@@ -161,6 +161,11 @@ pub enum Action {
     ColourBlend { additive: bool },
     /// All orbitals coloured: each orbital scaled to its own peak (false) or to the physical ρ max.
     ColourScale { physical: bool },
+    /// All orbitals coloured: boundary surfaces (enclosed %, shell or filled) or the density, and
+    /// whether the core orbitals are left out (`sim::ColourLook`).
+    ColourLook(sim::ColourLook),
+    /// View: the shown fields follow the atoms (`UiState::warp_fields`; display only).
+    WarpFields(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -541,6 +546,13 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 send_orbital_view(st, out);
             }
         }
+        Action::WarpFields(on) => st.warp_fields = on,
+        Action::ColourLook(look) => {
+            st.colour_look = look;
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
     }
 }
 
@@ -634,6 +646,17 @@ impl Action {
             IncludeAllOccupied => "orbital-include-reset".into(),
             ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
+            WarpFields(on) => format!("warp-fields {on}"),
+            ColourLook(l) => format!(
+                "colour-look {} {} {}",
+                match l.enclose {
+                    None => "density",
+                    Some(_) if l.shell => "shell",
+                    Some(_) => "filled",
+                },
+                l.enclose.unwrap_or(90),
+                if l.hide_core { "valence" } else { "all" }
+            ),
             Quality(h) => format!("quality {h}"),
             TempUnits(u) => format!(
                 "temp-units {}",
@@ -866,6 +889,33 @@ impl Action {
                         w => return Err(format!("action colour-scale: peak or physical, got '{w}'")),
                     },
                 }
+            }
+            "warp-fields" => {
+                want(1)?;
+                WarpFields(match args[0] {
+                    "true" => true,
+                    "false" => false,
+                    w => return Err(format!("action warp-fields: true or false, got '{w}'")),
+                })
+            }
+            "colour-look" => {
+                want(3)?;
+                let pct: u8 = num(head, args[1])?;
+                if !(50..=99).contains(&pct) {
+                    return Err(format!("action colour-look: the enclosed share is 50–99 %, got {pct}"));
+                }
+                let (enclose, shell) = match args[0] {
+                    "shell" => (Some(pct), true),
+                    "filled" => (Some(pct), false),
+                    "density" => (None, true),
+                    w => return Err(format!("action colour-look: shell, filled or density, got '{w}'")),
+                };
+                let hide_core = match args[2] {
+                    "all" => false,
+                    "valence" => true,
+                    w => return Err(format!("action colour-look: all or valence, got '{w}'")),
+                };
+                ColourLook(sim::ColourLook { enclose, shell, hide_core })
             }
             "temp-units" => {
                 want(1)?;
