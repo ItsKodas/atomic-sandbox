@@ -60,6 +60,17 @@
 //!   backend-dependent: the GPU's AE σ → 0 R_e is 1.4489 against the CPU oracle's 1.4511 (the ×88 extrapolation of a
 //!   3e-6 per-solve force difference). Today's nearest verdict is H f = 1.4 polynomial, +0.0237 Bohr (+0.0216 against the
 //!   CPU R_e): 0.0037 Bohr from the bound, a fail either way.
+//! - **The provenance tag carries the procedure, not the verdict (final review M5, ruled in the M7 leftovers).** `"all/…"`
+//!   hashes `recipe_hash` (the ledger and `DIMER_PROCEDURE`), not which f the H and He ladders settled on. On one machine
+//!   that is exact (the verdict is a deterministic function of the procedure on its backend; an `All` model cannot exist
+//!   with H refused — `setup_for` errors). Across machines and adapters — the shipped `models/`, the disk cache replayed
+//!   on another adapter — it holds only while every verdict lies outside the backend margin ([`DIMER_BACKEND_MARGIN_RE`],
+//!   [`DIMER_BACKEND_MARGIN_OMEGA`], [`verdict_is_backend_robust`]), so the procedure decides the verdict on any backend
+//!   (the tag is unchanged, so every model file loads or is refused exactly as before). Folding the verdicts into the tag
+//!   instead would make the lock-free `tag_of` (final review I3) wait for H and He to be generated and generate He for every
+//!   `All` tag (≈ 40 min on a CPU), for no difference while the margin holds. The premise is enforced:
+//!   `dimer_gate_runs_for_hydrogen_and_is_not_applicable_for_helium` asserts it on every rung the ladder asks for; a recipe
+//!   change that brings a verdict within the margin fails there, and the tag must then carry the verdict.
 //! - **Not applicable.** Only when the AE dimer has no force zero in the bracket *and* the pseudised wall agrees at the
 //!   outer end within `wall_rel` (Task 11 review Minor-2; He: 0.3 %); the end-sign test presumes the AE curve is monotone
 //!   there (Z ≤ 2).
@@ -474,6 +485,26 @@ pub fn footprint_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> FootprintInput
 }
 
 // ---------------------------------------------------------------- the dimer gate (module doc)
+
+/// The backend margin in R_e (Bohr; module doc, "Backend margin"): the GPU's all-electron σ → 0 R_e of H₂ is 2.2e-3 Bohr off
+/// the CPU oracle's (the ×88 extrapolation of a ≈ 3e-6 Ha/Bohr per-solve force difference), rounded up.
+pub const DIMER_BACKEND_MARGIN_RE: f64 = 2.5e-3;
+
+/// The backend margin in ω/ω_AE − 1 (module doc, "Backend margin").
+pub const DIMER_BACKEND_MARGIN_OMEGA: f64 = 5e-3;
+
+/// Whether a dimer-gate verdict on `pair` is the same on every backend we can measure: a pass inside both bounds
+/// (`LEDGER.dimer_re`, `dimer_omega_rel`) by more than the margins, a fail outside one of them by more than its margin. The
+/// provenance tag relies on it (module doc, "Backend margin"; final review M5).
+pub fn verdict_is_backend_robust(pair: &DimerPair) -> bool {
+    let (dr, dw) = ((pair.pp.0 - pair.ae.0).abs(), (pair.pp.1 / pair.ae.1 - 1.0).abs());
+    let (re, om) = (LEDGER.dimer_re, LEDGER.dimer_omega_rel);
+    if dr < re && dw < om {
+        re - dr > DIMER_BACKEND_MARGIN_RE && om - dw > DIMER_BACKEND_MARGIN_OMEGA
+    } else {
+        dr - re > DIMER_BACKEND_MARGIN_RE || dw - om > DIMER_BACKEND_MARGIN_OMEGA
+    }
+}
 
 /// Where the dimer gate solves (module doc, "Backend").
 #[derive(Clone)]
@@ -1065,11 +1096,12 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore = "release-only (GPU dimer solves); cargo test -p providers --release")]
     fn dimer_gate_runs_for_hydrogen_and_is_not_applicable_for_helium() {
         let Some(ctx) = gpu::GpuContext::new_headless() else { return };
-        let mut gate = GridDimerGate::new(DimerBackend::Gpu(ctx));
+        let mut rec = Recording { inner: GridDimerGate::new(DimerBackend::Gpu(ctx)), seen: Vec::new() };
         let t0 = std::time::Instant::now();
-        let h = qm::radial::generate_with(1, Some(&mut gate)).expect("H generates");
+        let h = qm::radial::generate_with(1, Some(&mut rec)).expect("H generates");
         let t_h = t0.elapsed().as_secs_f64();
-        let he = qm::radial::generate_with(2, Some(&mut gate)).expect("He generates");
+        let he = qm::radial::generate_with(2, Some(&mut rec)).expect("He generates");
+        let gate = &rec.inner;
         eprintln!("{}", gate.log.join("\n"));
         eprintln!("H: f = {}, {}, h_req {:?}, h_eb {:?}; dimer gate: {}\nHe: f = {}, {}, h_req {:?}; dimer gate: {}\n{} solves, H {t_h:.0} s, total {:.0} s (gate {:.0} s)",
                   h.f, h.record.local, h.record.h_req, h.record.h_eb, h.record.dimer, he.f, he.record.local, he.record.h_req, he.record.dimer,
@@ -1080,6 +1112,48 @@ mod tests {
         // review Minor-2: "not applicable" only with the pseudised repulsive wall agreeing at the outer bracket end
         assert!(he.record.dimer.contains("repulsive wall at the outer end"), "{}", he.record.dimer);
         assert!(!h.provisional && !he.provisional, "gated tables are usable");
+        // final review M5 (the M7 leftovers): the provenance tag carries the gate's procedure, not its verdict — sound
+        // only while every verdict the ladder asks for is outside the backend margin (module doc, "Backend margin")
+        for (f, local, a) in &rec.seen {
+            if let Ok(pair) = a {
+                let (dr, dw) = (pair.pp.0 - pair.ae.0, pair.pp.1 / pair.ae.1 - 1.0);
+                eprintln!("f = {f} {local:?}: ΔR_e {dr:+.4} Bohr ({:.4} from the bound), ω {:+.2} % ({:.2} % from the bound)",
+                          (dr.abs() - LEDGER.dimer_re).abs(), dw * 1e2, (dw.abs() - LEDGER.dimer_omega_rel).abs() * 1e2);
+                assert!(verdict_is_backend_robust(pair), "f = {f} {local:?}: ΔR_e {dr:+.4} Bohr, ω {:+.2} % — a verdict within the backend margin \
+                         ({DIMER_BACKEND_MARGIN_RE} Bohr / {} %) of its bound: the provenance tag must then carry the verdict (final review M5)",
+                         dw * 1e2, DIMER_BACKEND_MARGIN_OMEGA * 1e2);
+            }
+        }
+        assert!(rec.seen.iter().any(|(_, _, a)| a.is_ok()), "the H ladder judged at least one pair");
+    }
+
+    /// The gate's answers as the ladder asked for them (the M5 margin check above).
+    struct Recording {
+        inner: GridDimerGate,
+        seen: Vec<Answer>,
+    }
+
+    impl DimerGate for Recording {
+        fn dimers(&mut self, t: &PseudoTable) -> Result<DimerPair, DimerError> {
+            let a = self.inner.dimers(t);
+            self.seen.push((t.f, t.local, a.clone()));
+            a
+        }
+    }
+
+    /// The margin rule itself: a pass needs both criteria inside their bounds by more than the margin, a fail one criterion
+    /// outside by more than it (Task 11's numbers: f = 1.2 passes 0.005 Bohr inside, f = 1.4 polynomial fails 0.0037 out).
+    #[test]
+    fn the_backend_margin_rule_reads_both_criteria() {
+        let ae = (1.4489, 0.019402);
+        let at = |dr: f64, dw: f64| DimerPair { pp: (ae.0 + dr, ae.1 * (1.0 + dw)), ae };
+        assert!(verdict_is_backend_robust(&at(-0.0150, -0.0345)), "Task 11's H pass");
+        assert!(verdict_is_backend_robust(&at(0.0237, -0.0374)), "f = 1.4 polynomial: a fail 0.0037 Bohr out");
+        assert!(verdict_is_backend_robust(&at(-0.0558, -0.0085)), "f = 1.4 s-local");
+        assert!(!verdict_is_backend_robust(&at(0.0190, 0.0)), "a pass 1e-3 Bohr inside");
+        assert!(!verdict_is_backend_robust(&at(0.0, 0.048)), "a pass 0.2 % inside in ω");
+        assert!(!verdict_is_backend_robust(&at(0.0210, 0.0)), "a fail 1e-3 Bohr out");
+        assert!(verdict_is_backend_robust(&at(0.0210, 0.09)), "a fail decided by ω far out");
     }
 
     /// Final review I3: `tag_of` is the formatting half of `tag_in` (byte-identical for the same policy, on a scene that
