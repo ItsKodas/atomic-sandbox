@@ -636,6 +636,7 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => {
+                ui::profile::flush(&mut self.viewer.ui); // the layout and look as left
                 // Disappear at once; `main` then exits without waiting for the solver.
                 window.set_title("Atomic Sandbox — closing…");
                 window.set_visible(false);
@@ -758,6 +759,7 @@ impl App {
             Some(frame::Cmd::Minimise) => window.set_minimized(true),
             Some(frame::Cmd::ToggleMaximise) => window.set_maximized(!window.is_maximized()),
             Some(frame::Cmd::Close) => {
+                ui::profile::flush(&mut self.viewer.ui);
                 // the same path as the native close: `CloseRequested` is not sent for our button
                 window.set_title("Atomic Sandbox — closing…");
                 window.set_visible(false);

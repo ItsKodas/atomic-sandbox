@@ -1132,7 +1132,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     files::show(root.ctx(), st, input, &mut acts);
     files::show_save(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
-    profile::autosave(st);
+    profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);

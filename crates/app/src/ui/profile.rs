@@ -149,8 +149,22 @@ pub fn load_current(st: &mut UiState) {
     st.profiles.written = capture(st);
 }
 
-/// Writes the state in force a moment after it last changed (once per frame: a cheap compare).
-pub fn autosave(st: &mut UiState) {
+/// Writes the state in force now if it changed (the window's close).
+pub fn flush(st: &mut UiState) {
+    let Some(path) = st.profiles.current_file.clone() else { return };
+    let now = capture(st);
+    if now != st.profiles.written {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, &now);
+        st.profiles.written = now;
+    }
+}
+
+/// Writes the state in force a moment after it last changed (once per frame: a cheap compare);
+/// asks for the frame that writes it, so an idle window still saves.
+pub fn autosave(ctx: &egui::Context, st: &mut UiState) {
     let Some(path) = st.profiles.current_file.clone() else { return };
     let now = capture(st);
     if now == st.profiles.written {
@@ -158,6 +172,7 @@ pub fn autosave(st: &mut UiState) {
         return;
     }
     let since = *st.profiles.changed_at.get_or_insert_with(Instant::now);
+    ctx.request_repaint_after(Duration::from_millis(750));
     if since.elapsed() >= Duration::from_millis(700) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
