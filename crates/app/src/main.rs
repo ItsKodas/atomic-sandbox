@@ -519,11 +519,6 @@ impl ApplicationHandler for App {
             .with_title("Atomic Sandbox")
             .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0))
             .with_window_icon(winit::window::Icon::from_rgba(icon::rgba(64), 64, 64).ok());
-        #[cfg(windows)]
-        let attrs = {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            attrs.with_taskbar_icon(winit::window::Icon::from_rgba(icon::rgba(256), 256, 256).ok())
-        };
         // the custom frame (`frame.rs`): the top bar is the title bar
         #[cfg(windows)]
         let attrs = if frame::native_requested() {
@@ -536,6 +531,14 @@ impl ApplicationHandler for App {
                 .with_corner_preference(CornerPreference::Round)
         };
         let window = Arc::new(el.create_window(attrs).expect("create window"));
+        // the taskbar's (big) icon at the size Windows asks for: 32 px × the display scale (a
+        // 256 px one is shown as the generic icon on some builds)
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowExtWindows;
+            let s = (32.0 * window.scale_factor()).round().clamp(16.0, 256.0) as u32;
+            window.set_taskbar_icon(winit::window::Icon::from_rgba(icon::rgba(s), s, s).ok());
+        }
         if !frame::native_requested() && !frame::install(&window) {
             window.set_decorations(true); // no subclass: the native caption, so it can still be moved
         }
