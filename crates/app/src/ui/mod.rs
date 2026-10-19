@@ -555,6 +555,8 @@ pub struct UiState {
     pub camera_solidity: f32,
     pub camera_size: f32,
     pub fov_deg: f32,
+    /// View ▸ Display aids ▸ background, sRGB; `None` = the default dark blue.
+    pub background: Option<[u8; 3]>,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -811,6 +813,7 @@ right {}
             camera_solidity: 0.0,
             camera_size: 1.6,
             fov_deg: 50.0,
+            background: None,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,

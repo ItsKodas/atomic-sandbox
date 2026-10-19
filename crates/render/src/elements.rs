@@ -35,7 +35,7 @@ pub const JMOL_SRGB: [[u8; 3]; 119] = [
 pub fn colour_srgb(z: u8) -> [u8; 3] { JMOL_SRGB.get(z as usize).copied().unwrap_or(JMOL_SRGB[0]) }
 
 /// sRGB-encoded channel in 0..=1 to linear light (the IEC 61966-2-1 transfer function).
-fn srgb_to_linear(c: f32) -> f32 { (if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }).clamp(0.0, 1.0) }
+pub fn srgb_to_linear(c: f32) -> f32 { (if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }).clamp(0.0, 1.0) }
 
 /// Display colour as **linear** RGB for the GPU path: the sphere shader's output goes to an sRGB
 /// surface (the window's, `gpu` picks an sRGB format; the screenshot's `Rgba8UnormSrgb`), which

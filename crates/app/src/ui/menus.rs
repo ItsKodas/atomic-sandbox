@@ -708,6 +708,18 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             acts.push(Action::SmoothMotion(smooth));
         }
         trail_controls(ui, st);
+        // the 3D view's background (a reset to the default dark blue)
+        ui.horizontal(|ui| {
+            ui.label("background");
+            // the default as sRGB (gfx::CLEAR is linear 0.012 / 0.014 / 0.022)
+            let mut c = st.background.unwrap_or([29, 31, 41]);
+            if egui::color_picker::color_edit_button_srgb(ui, &mut c).changed() {
+                st.background = Some(c);
+            }
+            if ui.add_enabled(st.background.is_some(), egui::Button::new("Reset")).on_hover_text("the default dark blue").clicked() {
+                st.background = None;
+            }
+        });
         // the Camera view's settings (it is picked in the view's bottom-left switch)
         ui.separator();
         theme::section(ui, "Camera");

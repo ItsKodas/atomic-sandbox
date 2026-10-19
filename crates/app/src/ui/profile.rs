@@ -49,6 +49,7 @@ pub fn capture(st: &UiState) -> String {
     }
     fields!(put);
     out += &format!("nucleus_scale = {}\n", st.nucleus_scale.map_or("auto".into(), |x| x.to_string()));
+    out += &format!("background = {}\n", st.background.map_or("default".into(), |c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])));
     out += &format!("name_style = {:?}\n", st.name_style);
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
@@ -77,6 +78,12 @@ pub fn apply(st: &mut UiState, text: &str) {
     fields!(get);
     if let Some(v) = kv.get("nucleus_scale") {
         st.nucleus_scale = v.parse().ok();
+    }
+    if let Some(v) = kv.get("background") {
+        st.background = v.strip_prefix('#').filter(|h| h.len() == 6).and_then(|h| {
+            let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+            Some([b(0)?, b(2)?, b(4)?])
+        });
     }
     if let Some(v) = kv.get("name_style").and_then(|w| pick(&NAME_STYLES, w)) {
         st.name_style = v;

@@ -62,7 +62,13 @@ fn ball_hit(r: Ray, centre: vec3<f32>, radius: f32) -> vec4<f32> {
 // the ball's depth only (an instant's first pass, with any solidity)
 @fragment
 fn fs_depth(in: VOut) -> @builtin(frag_depth) f32 {
-    let hit = ball_hit(ray_of(in.pos), in.centre, in.radius);
+    let r = ray_of(in.pos);
+    // only the ball's solid inside hides what is behind: its anti-aliased rim (the outer 4 %) lets
+    // the ball behind show through, or the rim would ring dark against the background
+    let oc = in.centre - r.o;
+    let perp = length(oc - r.d * dot(oc, r.d)) / in.radius;
+    if (perp > 0.96) { discard; }
+    let hit = ball_hit(r, in.centre, in.radius);
     if (hit.w == 0.0) { discard; }
     return depth_at(hit.xyz);
 }

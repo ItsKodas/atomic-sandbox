@@ -165,6 +165,8 @@ struct DotsLook {
 }
 
 pub struct Painter {
+    /// The background (linear): View ▸ Display aids ▸ background, else [`CLEAR`].
+    clear: wgpu::Color,
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
     /// one bound): created by the painter, never handed out (so uploading into them cannot touch
@@ -228,6 +230,7 @@ impl Painter {
             ..Default::default()
         };
         Painter {
+            clear: CLEAR,
             renderer: Renderer::new(ctx, format),
             uploads: [None, None],
             uploaded: None,
@@ -590,6 +593,11 @@ impl Painter {
         let drawn = self.drawn(ui);
         self.refresh(ctx);
         self.shimmer = ui.shimmer;
+        // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
+        self.clear = ui.background.map_or(CLEAR, |c| {
+            let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
+            wgpu::Color { r: lin(c[0]), g: lin(c[1]), b: lin(c[2]), a: 1.0 }
+        });
         self.renderer.draw_cloud = !ui.hide_cloud;
         self.nucleus_scale = nucleus_scale(ui, drawn == Drawn::Orbital);
         let dots = ui.volume_mode == VOLUME_DOTS;
@@ -737,7 +745,7 @@ impl Painter {
                 label: Some("frame"),
             });
         self.renderer
-            .render_in(&mut enc, target.colour, target.depth, CLEAR, Some((vp, target.size)));
+            .render_in(&mut enc, target.colour, target.depth, self.clear, Some((vp, target.size)));
         let extra = self
             .egui
             .update_buffers(&ctx.device, &ctx.queue, &mut enc, &jobs, &screen);
