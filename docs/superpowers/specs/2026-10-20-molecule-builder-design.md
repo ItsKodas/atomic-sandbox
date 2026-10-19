@@ -41,10 +41,11 @@ Valences (usual neutral valence; the warnings and fill use these, with formal ch
 Layout (left to right): a narrow **palette** column (element buttons H C N O F P S Cl and "more…" opening the periodic table popover already used by the toolbar, `ui/ptable.rs`; tools: Atom · Bond · Charge · Erase · Select/Move; stamps: CH₃ · OH · NH₂ · COOH · benzene), the **canvas** (most of the window), and a **footer**: live formula + name (`names`), the warnings count, the Rule-1 line, and the buttons **Fill hydrogens · Clear · Replace scene · Insert into scene**, with a "Relax after" checkbox.
 
 Canvas interactions (the default tool is Atom with C selected):
-- **Click empty space**: a new atom of the selected element. **Click an atom**: change it to the selected element.
-- **Drag from an atom**: a bond to the atom released on, or to a new atom of the selected element created at the release point (the common "draw a chain" gesture). Bond tool: click a bond to cycle 1 → 2 → 3 → 1.
+- **Atom tool** (revised by the user's hand-test, 2026-10-20): **click an atom** to select it; with an atom selected, **click empty space** for a new atom of the selected element bonded to it — a ghost bond and atom follow the cursor — which becomes the selection, so clicks draw a chain; with nothing selected the click places a lone atom. **Click the selected atom again**: change it to the selected element. **Shift-click another atom**: bond it to the selection (a ring closure). **Drag an atom**: move it.
+- **Right-click** deselects (right-drag pans); **Esc** deselects, and closes the window when nothing is selected.
+- **Bond tool**: drag from atom to atom for a bond; click a bond to cycle 1 → 2 → 3 → 1 (the Atom tool cycles too).
 - **Charge tool**: click an atom to cycle 0 → +1 → −1 → 0 (drawn as a superscript).
-- **Erase tool / right-click / Delete**: removes an atom (and its bonds) or a bond.
+- **Erase tool / Delete**: removes an atom (and its bonds) or a bond.
 - **Select/Move**: drag an atom; box-select and drag a group.
 - **Wheel** zooms, **middle- or right-drag** pans. **Ctrl-Z / Ctrl-Y** undo/redo (a snapshot stack of the drawing).
 - Implicit hydrogens are **not** drawn until Fill hydrogens adds them as real atoms (what you see is what goes into the scene). Carbon is drawn as a "C" label (no skeletal-formula shorthand in v1).

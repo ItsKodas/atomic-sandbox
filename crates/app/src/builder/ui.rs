@@ -1,17 +1,21 @@
-//! The builder's window (spec Â§4): a palette column (elements, tools), the canvas, and a footer
+//! The builder's window (spec §4): a palette column (elements, tools), the canvas, and a footer
 //! with the live formula and name. An `egui::Modal` like the File window, sized from the app's
 //! window every frame; it closes on Close or Esc, never on a click outside (a stray click must not
-//! end a drawing â€” the drawing is kept anyway).
+//! end a drawing — the drawing is kept anyway).
 //!
-//! Canvas gestures (the default tool is Atom with carbon):
-//! - click empty space: a new atom of the selected element; click an atom: it becomes that element;
-//! - drag from an atom (Atom or Bond tool): a bond to the atom released on, or to a new atom at the
-//!   release point â€” the "draw a chain" gesture; with the Atom tool a drag from empty space starts
-//!   with a new atom there;
-//! - click a bond (Bond tool, or the Atom tool): its order cycles 1 â†’ 2 â†’ 3 â†’ 1;
-//! - Charge tool: click an atom to cycle 0 â†’ +1 â†’ âˆ’1 â†’ 0;
-//! - Erase tool, right-click, Delete: removes the atom (and its bonds) or the bond under the cursor
-//!   (Delete with nothing under it: the selection);
+//! Canvas gestures (the default tool is Atom with carbon; the Atom tool and right-click revised by
+//! the user's hand-test, 2026-10-20 — spec §4):
+//! - Atom tool: click an atom to select it; with an atom selected, a click on empty space places a
+//!   new atom of the palette's element bonded to it (a ghost bond and atom follow the cursor) and
+//!   selects the new one, so clicks draw a chain; with nothing selected a click places a lone atom.
+//!   Click the selected atom again: it becomes the palette's element. Shift-click another atom: a
+//!   bond to it (a ring closure). Drag an atom: it moves (the selection with it);
+//! - right-click deselects; Esc deselects, and closes the window when nothing is selected;
+//! - click a bond (Bond tool, or the Atom tool): its order cycles 1 → 2 → 3 → 1; Bond tool: drag
+//!   from atom to atom for a bond;
+//! - Charge tool: click an atom to cycle 0 → +1 → −1 → 0;
+//! - Erase tool, Delete: removes the atom (and its bonds) or the bond under the cursor (Delete
+//!   with nothing under it: the selection);
 //! - Select/Move: drag an atom (the whole selection when it is in it), drag on empty space to
 //!   box-select, Shift adds;
 //! - wheel zooms about the cursor, middle- or right-drag pans, Ctrl-Z / Ctrl-Y (Ctrl-Shift-Z) undo /
@@ -25,9 +29,9 @@ use render::elements::symbol;
 pub const UNIT: f32 = 46.0;
 /// The drawn atom's radius at zoom 1 (points).
 const ATOM_R: f32 = 13.0;
-/// The palette's elements (spec Â§4); "moreâ€¦" opens the periodic table.
+/// The palette's elements (spec §4); "more…" opens the periodic table.
 const PALETTE: [u8; 8] = [1, 6, 7, 8, 9, 15, 16, 17];
-/// The rule-1 line (spec Â§3: the window states it).
+/// The rule-1 line (spec §3: the window states it).
 pub const RULE_1_LINE: &str = "bond lengths and valences here only place the atoms; the solver decides the real geometry and bonds";
 
 /// What a press on the canvas started, while the button is held.
@@ -43,7 +47,7 @@ pub enum Gesture {
     Box { from: Pos2 },
 }
 
-/// Opens the window (File â–¸ Builderâ€¦); the last drawing is still there.
+/// Opens the window (File ▸ Builder…); the last drawing is still there.
 pub fn open(st: &mut UiState) {
     st.builder.open = true;
 }
@@ -143,7 +147,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
                 ui.label(RichText::new("Molecule builder").size(17.0).strong());
                 ui.label(RichText::new("sketch the structural formula; the scene gets the atoms").size(12.0).color(theme::INK_FAINT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").on_hover_text("Esc â€” the drawing is kept for next time").clicked() {
+                    if ui.button("Close").on_hover_text("Esc (once nothing is selected) — the drawing is kept for next time").clicked() {
                         close = true;
                     }
                 });
@@ -152,9 +156,14 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
             canvas_area(ui, canvas, &mut st.builder);
             child(ui, footer, egui::Layout::top_down(egui::Align::Min), |ui| footer_rows(ui, st));
         });
-    // Esc closes unless a popover (the periodic table) or a text field has it
+    // Esc deselects, or closes when nothing is selected — unless a popover (the periodic table) or
+    // a text field has it
     if !egui::Popup::is_any_open(ctx) && !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        close = true;
+        if st.builder.selection.is_empty() {
+            close = true;
+        } else {
+            st.builder.selection.clear();
+        }
     }
     if close {
         st.builder.open = false;
@@ -179,12 +188,12 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
             let [r, g, bl] = render::elements::colour_srgb(z);
             let text = RichText::new(symbol(z)).size(14.0).strong().color(if on { Color32::WHITE } else { theme::INK });
             let btn = egui::Button::new(text).min_size(Vec2::new(32.0, 28.0)).fill(if on { theme::ACCENT_BG } else { theme::PANEL_2 }).stroke(Stroke::new(1.0, if on { theme::ACCENT } else { Color32::from_rgb(r, g, bl).gamma_multiply(0.6) }));
-            if ui.add(btn).on_hover_text(format!("{} â€” click on the canvas to place it", crate::names::element_name(z))).clicked() {
+            if ui.add(btn).on_hover_text(format!("{} — click on the canvas to place it", crate::names::element_name(z))).clicked() {
                 pick_element(b, z);
             }
         }
-        let more = ui.add(egui::Button::new(RichText::new("moreâ€¦").size(12.5)).min_size(Vec2::new(68.0, 28.0)));
-        let more = more.on_hover_text(format!("the periodic table (Z 1â€“{})", crate::ui::ptable::Z_ENABLED));
+        let more = ui.add(egui::Button::new(RichText::new("more…").size(12.5)).min_size(Vec2::new(68.0, 28.0)));
+        let more = more.on_hover_text(format!("the periodic table (Z 1–{})", crate::ui::ptable::Z_ENABLED));
         egui::Popup::from_toggle_button_response(&more)
             .id(Id::new("builder-ptable"))
             .align(egui::RectAlign::RIGHT_START)
@@ -214,10 +223,10 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
     ui.add_space(10.0);
     theme::section(ui, "Tool");
     for (tool, name, tip) in [
-        (Tool::Atom, "Atom", "click: a new atom, or change the one clicked; drag from an atom: a bond (and a new atom where you let go)"),
-        (Tool::Bond, "Bond", "click a bond: single â†’ double â†’ triple; drag atom to atom: a bond"),
-        (Tool::Charge, "Charge", "click an atom: 0 â†’ +1 â†’ âˆ’1 â†’ 0"),
-        (Tool::Erase, "Erase", "click an atom or a bond to remove it (right-click and Delete do the same with any tool)"),
+        (Tool::Atom, "Atom", "click an atom to select it, then click nearby: a new atom bonded to it, and so on along a chain; with nothing selected a click places a lone atom; right-click deselects; click the selected atom again to change its element; Shift-click another atom to bond to it; drag an atom to move it"),
+        (Tool::Bond, "Bond", "click a bond: single → double → triple; drag atom to atom: a bond"),
+        (Tool::Charge, "Charge", "click an atom: 0 → +1 → −1 → 0"),
+        (Tool::Erase, "Erase", "click an atom or a bond to remove it (Delete does the same with any tool)"),
         (Tool::Select, "Select / Move", "drag an atom (the selection with it), drag on empty space to select a group; Shift adds"),
     ] {
         let on = b.tool == tool;
@@ -244,10 +253,10 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
     });
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(b.can_undo(), egui::Button::new("â†¶ Undo")).on_hover_text("Ctrl-Z").clicked() {
+        if ui.add_enabled(b.can_undo(), egui::Button::new("↶ Undo")).on_hover_text("Ctrl-Z").clicked() {
             b.undo();
         }
-        if ui.add_enabled(b.can_redo(), egui::Button::new("â†· Redo")).on_hover_text("Ctrl-Y").clicked() {
+        if ui.add_enabled(b.can_redo(), egui::Button::new("↷ Redo")).on_hover_text("Ctrl-Y").clicked() {
             b.redo();
         }
     });
@@ -267,7 +276,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     let over = pointer.filter(|p| rect.contains(*p));
     let hovered = if b.gesture == Gesture::None { over.and_then(|p| hit(b, &view, p, None)) } else { None };
 
-    // â”€â”€ zoom and pan â”€â”€
+    // ── zoom and pan ──
     if resp.hovered() {
         let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
         let f = (scroll / 300.0).exp() * pinch;
@@ -285,32 +294,24 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         b.pan = [b.pan[0] - d.x, b.pan[1] - d.y];
     }
 
-    // â”€â”€ clicks â”€â”€
+    // ── clicks ──
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             click(b, &view, p, shift);
         }
     }
+    // right-click deselects (a right-drag pans)
     if resp.secondary_clicked() {
-        match resp.interact_pointer_pos().and_then(|p| hit(b, &view, p, None)) {
-            Some(Hit::Atom(i)) => b.erase_atom(i),
-            Some(Hit::Bond(k)) => b.erase_bond(k),
-            None => {}
-        }
+        b.selection.clear();
     }
 
-    // â”€â”€ primary drags â”€â”€
+    // ── primary drags ──
     if resp.drag_started_by(PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(rect.center());
         let at = hit(b, &view, origin, None);
         b.gesture = match (b.tool, at) {
-            (Tool::Atom | Tool::Bond, Some(Hit::Atom(i))) => Gesture::Bond { from: i },
-            (Tool::Atom, None) => {
-                b.checkpoint();
-                let i = b.drawing.add_atom(b.element, view.canvas(origin));
-                Gesture::Bond { from: i }
-            }
-            (Tool::Select, Some(Hit::Atom(i))) => {
+            (Tool::Bond, Some(Hit::Atom(i))) => Gesture::Bond { from: i },
+            (Tool::Atom | Tool::Select, Some(Hit::Atom(i))) => {
                 b.checkpoint();
                 if !b.selection.contains(&i) {
                     if !shift {
@@ -369,7 +370,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         }
     }
 
-    // â”€â”€ keys (the window has them: the 3D view ignores input while it is open) â”€â”€
+    // ── keys (the window has them: the 3D view ignores input while it is open) ──
     if !ui.ctx().egui_wants_keyboard_input() {
         let (redo, undo, delete) = ui.input_mut(|i| {
             let redo = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y);
@@ -392,8 +393,16 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         }
     }
 
+    // the Atom tool's ghost: where a click would put the next atom (bonded to the selection), or the
+    // atom a Shift-click would bond the selection to
+    let anchor = b.selected_one();
+    let ghost = over.filter(|_| b.tool == Tool::Atom && b.gesture == Gesture::None && resp.hovered()).and_then(|p| match hovered {
+        None => Some((anchor, p, None)),
+        Some(Hit::Atom(j)) if shift && anchor.is_some_and(|a| a != j) => Some((anchor, p, Some(j))),
+        _ => None,
+    });
     let marks = super::chem::warnings(&b.drawing);
-    paint(ui, rect, b, &view, hovered, pointer, &marks);
+    paint(ui, rect, b, &view, hovered, pointer, &marks, ghost);
     if hovered.is_some() || b.gesture != Gesture::None {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -403,20 +412,34 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
 fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool) {
     let at = hit(b, view, p, None);
     match (b.tool, at) {
-        (Tool::Atom, Some(Hit::Atom(i))) => {
-            if b.drawing.atoms[i].z != b.element {
+        (Tool::Atom, Some(Hit::Atom(i))) => match b.selected_one() {
+            // Shift-click another atom: bond them (a ring closure), and go on from it
+            Some(a) if shift && a != i => {
                 b.checkpoint();
-                b.drawing.set_z(i, b.element);
+                b.drawing.bond(a, i);
+                b.selection = [i].into();
             }
-            b.selection = [i].into();
-        }
+            // the selected atom again: it becomes the palette's element
+            Some(a) if a == i => {
+                if b.drawing.atoms[i].z != b.element {
+                    b.checkpoint();
+                    b.drawing.set_z(i, b.element);
+                }
+            }
+            _ => b.selection = [i].into(),
+        },
         (Tool::Atom | Tool::Bond, Some(Hit::Bond(k))) => {
             b.checkpoint();
             b.drawing.cycle_order(k);
         }
+        // a new atom, bonded to the selected one if there is one; it becomes the selection
         (Tool::Atom, None) => {
+            let from = b.selected_one();
             b.checkpoint();
             let i = b.drawing.add_atom(b.element, view.canvas(p));
+            if let Some(a) = from {
+                b.drawing.bond(a, i);
+            }
             b.selection = [i].into();
         }
         (Tool::Charge, Some(Hit::Atom(i))) => {
@@ -439,11 +462,16 @@ fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool) {
     }
 }
 
-/// The warning rings (spec Â§4): over the allowed valence red, under it amber.
+/// The warning rings (spec §4): over the allowed valence red, under it amber.
 const OVER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
 const UNDER: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x5a);
 
-fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, pointer: Option<Pos2>, marks: &[(usize, super::chem::Warning)]) {
+/// The Atom tool's ghost: the anchor (the selected atom, if any), the cursor, and the atom a
+/// Shift-click would bond to instead of placing a new one.
+type Ghost = (Option<usize>, Pos2, Option<usize>);
+
+#[allow(clippy::too_many_arguments)]
+fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, pointer: Option<Pos2>, marks: &[(usize, super::chem::Warning)], ghost: Option<Ghost>) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 8.0, theme::APP);
     p.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
@@ -498,6 +526,16 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
             }
         }
     }
+    if let Some((anchor, at, onto)) = ghost {
+        let end = onto.map_or(at, |j| view.screen(d.atoms[j].pos));
+        if let Some(a) = anchor.and_then(|a| d.atoms.get(a)) {
+            p.add(egui::Shape::dashed_line(&[view.screen(a.pos), end], Stroke::new(2.0, theme::ACCENT.gamma_multiply(0.7)), 6.0, 4.0));
+        }
+        if onto.is_none() {
+            p.circle_stroke(end, r, Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6)));
+            p.text(end, Align2::CENTER_CENTER, symbol(b.element), FontId::proportional(13.0 * b.zoom.clamp(0.6, 1.8)), theme::ACCENT_INK.gamma_multiply(0.7));
+        }
+    }
     for (i, a) in d.atoms.iter().enumerate() {
         let c = view.screen(a.pos);
         if !rect.expand(r).contains(c) {
@@ -527,7 +565,7 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
             let at = c + Vec2::new(r * 0.85, -r * 0.85);
             p.circle_filled(at, fs * 0.48, theme::PANEL);
             p.circle_stroke(at, fs * 0.48, Stroke::new(1.0, theme::INK_DIM));
-            p.text(at, Align2::CENTER_CENTER, if a.charge > 0 { "+" } else { "âˆ’" }, FontId::proportional(fs * 0.8), theme::INK);
+            p.text(at, Align2::CENTER_CENTER, if a.charge > 0 { "+" } else { "−" }, FontId::proportional(fs * 0.8), theme::INK);
         }
     }
     if let (Gesture::Box { from }, Some(ptr)) = (&b.gesture, pointer) {
@@ -539,14 +577,14 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "click to place an atom Â· drag from an atom to draw a bond Â· wheel zooms, right-drag pans",
+            "click to place an atom · click nearby for one bonded to it · right-click deselects · wheel zooms, right-drag pans",
             FontId::proportional(14.0),
             theme::INK_FAINT,
         );
     }
 }
 
-/// `a` â†’ `b` by `t` in sRGB (a display tint).
+/// `a` → `b` by `t` in sRGB (a display tint).
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
@@ -588,8 +626,51 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
         if under > 0 {
             words.push(format!("{under} under it (a radical, or a missing bond)"));
         }
-        ui.label(RichText::new(format!("âš  {} atom{}: {}", marks.len(), if marks.len() == 1 { "" } else { "s" }, words.join(", "))).size(12.5).color(if over > 0 { OVER } else { UNDER }))
+        ui.label(RichText::new(format!("⚠ {} atom{}: {}", marks.len(), if marks.len() == 1 { "" } else { "s" }, words.join(", "))).size(12.5).color(if over > 0 { OVER } else { UNDER }))
             .on_hover_text(super::chem::describe(&b.drawing, &marks));
     }
     ui.label(RichText::new(RULE_1_LINE).size(11.5).color(theme::INK_FAINT));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
+    /// the next click elsewhere places one bonded to it, deselect, then a lone one again; clicking the
+    /// selected atom changes its element; Shift-click bonds two existing atoms.
+    #[test]
+    fn atom_tool_clicks_chain_and_deselect_starts_a_lone_atom() {
+        let mut b = Builder::default();
+        let view = View { centre: Pos2::ZERO, pan: [0.0, 0.0], scale: UNIT };
+        let at = |x: f32, y: f32| Pos2::new(x * UNIT, y * UNIT);
+        click(&mut b, &view, at(0.0, 0.0), false);
+        click(&mut b, &view, at(1.0, 0.0), false);
+        click(&mut b, &view, at(2.0, 0.5), false);
+        assert_eq!(b.drawing.atoms.len(), 3);
+        assert_eq!(b.drawing.bonds, vec![super::super::Bond { a: 0, b: 1, order: 1 }, super::super::Bond { a: 1, b: 2, order: 1 }]);
+        assert_eq!(b.selected_one(), Some(2));
+        // right-click's deselect, then a lone atom
+        b.selection.clear();
+        click(&mut b, &view, at(0.0, 3.0), false);
+        assert_eq!(b.drawing.atoms.len(), 4);
+        assert_eq!(b.drawing.bonds.len(), 2, "no bond to a lone atom");
+        // clicking an unselected atom selects it; clicking it again changes it to the palette's element
+        b.element = 8;
+        click(&mut b, &view, at(1.0, 0.0), false);
+        assert_eq!((b.selected_one(), b.drawing.atoms[1].z), (Some(1), 6));
+        click(&mut b, &view, at(1.0, 0.0), false);
+        assert_eq!(b.drawing.atoms[1].z, 8);
+        // Shift-click another atom bonds it to the selection (a ring closure)
+        click(&mut b, &view, at(0.0, 3.0), true);
+        assert!(b.drawing.bond_between(1, 3).is_some());
+        assert_eq!(b.selected_one(), Some(3));
+        // everything is undoable, one click at a time
+        let mut steps = 0;
+        while b.can_undo() {
+            b.undo();
+            steps += 1;
+        }
+        assert_eq!((steps, b.drawing.atoms.len()), (6, 0));
+    }
 }
