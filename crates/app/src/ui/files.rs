@@ -542,12 +542,32 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
     });
     let estimated = st.backend == Backend::Estimated;
     if !estimated {
-        ui.horizontal(|ui| {
-            theme::note(ui, "Models run in the Estimated solver.");
-            if ui.small_button("Switch to Estimated").clicked() {
-                acts.push(Action::Backend(Backend::Estimated));
-            }
-        });
+        // models only run in the Estimated solver: a clear banner with the switch as its button
+        egui::Frame::new()
+            .fill(theme::ACCENT_BG)
+            .stroke(Stroke::new(1.0, theme::ACCENT))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Models run in the Estimated solver").size(14.5).strong().color(theme::ACCENT_INK));
+                        ui.label(RichText::new("Switch to it to load one of these, or to train your own.").size(12.5).color(theme::INK_DIM));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = egui::Button::new(RichText::new("Switch to Estimated").size(15.0).strong().color(Color32::WHITE))
+                            .fill(theme::GLOW)
+                            .stroke(Stroke::new(1.0, theme::ACCENT))
+                            .corner_radius(8)
+                            .min_size(Vec2::new(200.0, 36.0));
+                        if ui.add(b).on_hover_text("the toolbar's Solver ▸ Estimated").clicked() {
+                            acts.push(Action::Backend(Backend::Estimated));
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
     }
     // the open scene as it is now (its settings may have changed since it was opened), else the
     // selected one as it would load
