@@ -13,6 +13,10 @@
 // enclosure.wgsl as ψ̃²/peak) and 0 outside, softened over the last 30 % of the level; with bit 3
 // (shell) only a band just inside the boundary, ψ̃²/peak in [lo, SHELL·lo], is kept (the hollow
 // textbook look). m[t] = (1/peak, the orbital's index in `levels`, 0, 0).
+// A boundary point takes the pure colour of the one orbital most present there (the largest
+// mask × ψ̃²/level, how far inside its own boundary it is), not the mix (user 2026-10-20: the mix
+// averaged overlapping lobes to grey): rgb = that colour × a, a = Σ f·mask. Chained chunks keep
+// (colour, best score) and (a, 0, 0, 0) in two vec4s per point (`acc` is sized for two).
 
 struct ColourParams {
     n: u32, p: u32,
@@ -36,9 +40,17 @@ fn mask(s: f32, t: u32) -> f32 {
     return m;
 }
 
-fn term(s: f32, t: u32) -> vec4<f32> {
-    if ((C.flags & 4u) != 0u) { return C.w[t] * mask(s, t); }
-    return C.w[t] * (s * s);
+// boundary: (the orbital's pure colour, its score) and its a, folded into the running best
+fn boundary_term(s: f32, t: u32, best: ptr<function, vec4<f32>>, a: ptr<function, f32>) {
+    let m = mask(s, t);
+    if (m <= 0.0) { return; }
+    let w = C.w[t];
+    *a = *a + w.w * m;
+    let lo = max(levels[u32(C.m[t].y)], 1e-30);
+    let score = m * s * s * C.m[t].x / lo;
+    if (score > (*best).w) {
+        *best = vec4<f32>(w.rgb / max(w.w, 1e-12), score);
+    }
 }
 
 @group(0) @binding(0) var<uniform> C: ColourParams;
@@ -62,18 +74,37 @@ fn colour_accumulate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
         let j = t % n;
         let k = t / n;
         let q = (i + 4u) + C.p * ((j + 4u) + C.p * (k + 4u));
+        let at = vec3<i32>(i32(i), i32(j), i32(k));
+        if ((C.flags & 4u) != 0u) {
+            var best = vec4<f32>(0.0);
+            var a = 0.0;
+            if ((C.flags & 1u) == 0u) { best = acc[2u * idx]; a = acc[2u * idx + 1u].x; }
+            if (C.count > 0u) { boundary_term(o0[q], 0u, &best, &a); }
+            if (C.count > 1u) { boundary_term(o1[q], 1u, &best, &a); }
+            if (C.count > 2u) { boundary_term(o2[q], 2u, &best, &a); }
+            if (C.count > 3u) { boundary_term(o3[q], 3u, &best, &a); }
+            if (C.count > 4u) { boundary_term(o4[q], 4u, &best, &a); }
+            if (C.count > 5u) { boundary_term(o5[q], 5u, &best, &a); }
+            if ((C.flags & 2u) != 0u) {
+                textureStore(out, at, vec4<f32>(best.rgb * a, a));
+            } else {
+                acc[2u * idx] = best;
+                acc[2u * idx + 1u] = vec4<f32>(a, 0.0, 0.0, 0.0);
+            }
+            continue;
+        }
         var v = vec4<f32>(0.0);
-        if ((C.flags & 1u) == 0u) { v = acc[idx]; }
-        if (C.count > 0u) { v = v + term(o0[q], 0u); }
-        if (C.count > 1u) { v = v + term(o1[q], 1u); }
-        if (C.count > 2u) { v = v + term(o2[q], 2u); }
-        if (C.count > 3u) { v = v + term(o3[q], 3u); }
-        if (C.count > 4u) { v = v + term(o4[q], 4u); }
-        if (C.count > 5u) { v = v + term(o5[q], 5u); }
+        if ((C.flags & 1u) == 0u) { v = acc[2u * idx]; }
+        if (C.count > 0u) { let s = o0[q]; v = v + C.w[0] * (s * s); }
+        if (C.count > 1u) { let s = o1[q]; v = v + C.w[1] * (s * s); }
+        if (C.count > 2u) { let s = o2[q]; v = v + C.w[2] * (s * s); }
+        if (C.count > 3u) { let s = o3[q]; v = v + C.w[3] * (s * s); }
+        if (C.count > 4u) { let s = o4[q]; v = v + C.w[4] * (s * s); }
+        if (C.count > 5u) { let s = o5[q]; v = v + C.w[5] * (s * s); }
         if ((C.flags & 2u) != 0u) {
-            textureStore(out, vec3<i32>(i32(i), i32(j), i32(k)), v);
+            textureStore(out, at, v);
         } else {
-            acc[idx] = v;
+            acc[2u * idx] = v;
         }
     }
 }

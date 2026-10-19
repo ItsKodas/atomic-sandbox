@@ -685,7 +685,7 @@ impl OrbitalView {
                 let chunks = terms.len().div_ceil(COLOUR_MAX_TERMS).max(1);
                 if chunks > 1 && self.colour_acc.is_none() {
                     self.colour_acc = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("colour accumulator"), size: (g.interior_len() * 16) as u64,
+                        label: Some("colour accumulator"), size: (g.interior_len() * 32) as u64, // two vec4 per point (the boundary path)
                         usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
                     }));
                 }
