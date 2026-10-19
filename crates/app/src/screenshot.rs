@@ -351,6 +351,7 @@ impl ShotUi {
                 "orbit" => ToolMode::Orbit,
                 "place" => ToolMode::Place,
                 "select" => ToolMode::Select,
+                "edit" => ToolMode::Edit,
                 other => return Err(format!("--ui: unknown tool {other}")),
             };
         }
@@ -485,10 +486,11 @@ impl Shot {
             let shown = viewer.shown_scene(Instant::now());
             let lines = viewer.overlay_lines(&shown);
             let risk = viewer.atom_risk();
+            let selected = viewer.tool.set(shown.nuclei.len());
             let world = World {
                 camera: &viewer.camera,
                 nuclei: viewer.drawn_nuclei(&shown),
-                selected: viewer.tool.selected,
+                selected: &selected,
                 lines: &lines,
                 viewport: viewer.viewport,
                 risk: &risk,

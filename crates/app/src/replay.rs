@@ -112,6 +112,10 @@ pub enum Button {
 pub enum KeyName {
     Space,
     Delete,
+    /// Held for the Edit tool's add-to-selection clicks and boxes.
+    Shift,
+    /// Clears the selection.
+    Escape,
 }
 
 /// One input event of the 3D view. `Cursor` is in view coordinates (module doc), `Resize` in
@@ -234,7 +238,16 @@ impl Event {
             Event::Cursor { x, y } => format!("cursor {x} {y}"),
             Event::Button { which, down } => format!("button {} {}", button_word(which), updown(*down)),
             Event::Wheel { lines } => format!("wheel {lines}"),
-            Event::Key { key, down } => format!("key {} {}", if *key == KeyName::Space { "space" } else { "delete" }, updown(*down)),
+            Event::Key { key, down } => format!(
+                "key {} {}",
+                match key {
+                    KeyName::Space => "space",
+                    KeyName::Delete => "delete",
+                    KeyName::Shift => "shift",
+                    KeyName::Escape => "escape",
+                },
+                updown(*down)
+            ),
             Event::Resize { w, h } => format!("resize {w} {h}"),
             Event::CursorLeft => "cursor-left".into(),
             Event::FocusLost => "focus-lost".into(),
@@ -263,7 +276,9 @@ impl Event {
                 key: match *k {
                     "space" => KeyName::Space,
                     "delete" => KeyName::Delete,
-                    _ => return Err(format!("key space or delete, got '{k}'")),
+                    "shift" => KeyName::Shift,
+                    "escape" => KeyName::Escape,
+                    _ => return Err(format!("key space, delete, shift or escape, got '{k}'")),
                 },
                 down: down(d)?,
             },
@@ -510,6 +525,8 @@ pub fn key_event(key: &winit::keyboard::Key, state: winit::event::ElementState, 
     let key = match key {
         Key::Named(NamedKey::Space) => KeyName::Space,
         Key::Named(NamedKey::Delete) => KeyName::Delete,
+        Key::Named(NamedKey::Shift) => KeyName::Shift,
+        Key::Named(NamedKey::Escape) => KeyName::Escape,
         _ => return None,
     };
     Some(Event::Key { key, down: state.is_pressed() })

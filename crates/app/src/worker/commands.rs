@@ -16,6 +16,11 @@ pub enum Command {
         index: usize,
         pos: [f64; 3],
     },
+    /// The Edit tool's rigid move (paused only): each nucleus to its position, velocities kept
+    /// (`DynCommand::MoveNuclei`).
+    MoveNuclei {
+        moves: Vec<(usize, [f64; 3])>,
+    },
     /// Placed at rest; allowed while playing. `a`: the isotope's mass number (`None` = the most
     /// abundant one; an unlisted A is reported as an error and nothing is added).
     AddNucleus {
@@ -44,7 +49,7 @@ pub enum Command {
     DisplayPartialCore(bool),
     /// Time control, thermostat, field, COM correction, pins and drag springs, passed to the
     /// driver as is. Scene edits go through the variants above (the viewer mirrors those);
-    /// `Dyn(ReplaceScene | MoveNucleusDiscontinuous | AddNucleus | RemoveNucleus)` is never sent.
+    /// `Dyn(ReplaceScene | MoveNucleusDiscontinuous | MoveNuclei | AddNucleus | RemoveNucleus)` is never sent.
     Dyn(DynCommand),
     /// Estimated solver (`worker` module doc): install the model at `autoload` if the file exists — a
     /// refused load starts nothing (the panel offers to forget it) — else, when the surrogate has
@@ -93,6 +98,13 @@ impl Command {
                 if let Some(n) = s.nuclei.get_mut(*index) {
                     n.pos = *pos;
                     n.vel = [0.0; 3];
+                }
+            }
+            Command::MoveNuclei { moves } => {
+                for &(i, pos) in moves {
+                    if let Some(n) = s.nuclei.get_mut(i) {
+                        n.pos = pos;
+                    }
                 }
             }
             Command::AddNucleus { z, a, pos } => s.nuclei.push(crate::scene::SceneNucleus {
@@ -197,6 +209,7 @@ impl Command {
                 DynCommand::Pause
                     | DynCommand::ReplaceScene(_)
                     | DynCommand::MoveNucleusDiscontinuous { .. }
+                    | DynCommand::MoveNuclei { .. }
                     | DynCommand::AddNucleus(_)
                     | DynCommand::RemoveNucleus(_)
                     | DynCommand::StartSampling(_)
@@ -236,6 +249,10 @@ impl Command {
                 Command::MoveNucleus { index: a, .. },
                 Some(Command::MoveNucleus { index: b, .. }),
             ) => a == b,
+            // a held Edit handle: each motion moves the same nuclei to new absolute positions
+            (Command::MoveNuclei { moves: a }, Some(Command::MoveNuclei { moves: b })) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0)
+            }
             // the view is a setting: only the last one counts
             (Command::OrbitalView(_), Some(Command::OrbitalView(_))) => true,
             _ => false,
@@ -281,6 +298,7 @@ impl Worker {
             Command::MoveNucleus { index, pos } => self
                 .dy
                 .apply(DynCommand::MoveNucleusDiscontinuous { index, pos }),
+            Command::MoveNuclei { moves } => self.dy.apply(DynCommand::MoveNuclei { moves }),
             Command::AddNucleus { z, a, pos } => match (units::isotope_mass_amu(z), a) {
                 (Some(_), None) => self
                     .dy

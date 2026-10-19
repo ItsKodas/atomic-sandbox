@@ -31,6 +31,7 @@ const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
 const ORBIT_TIP: &str = "Inspect: look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
 const PLACE_TIP: &str = "click to drop a nucleus at rest (also while playing)";
+const EDIT_TIP: &str = "Edit: click an atom, Shift-click to add or remove, drag a box on empty space for a group (Esc clears); drag an arrow (X/Y/Z) or a square (a plane) to move the selection rigidly — velocities kept, the run pauses while you hold and resumes on release; middle-drag orbits";
 const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
@@ -75,7 +76,7 @@ const MIN_SUB: f32 = 48.0;
 /// The selection hint. The Selection group is sized for a selection's coordinates (|x| < 10
 /// Bohr), not for this: at 1400 pt that leaves the Solver line its room, and the hint elides its
 /// last words (full text on hover).
-const NO_SELECTION: &str = "no selection (Select tool, click a nucleus)";
+const NO_SELECTION: &str = "no selection (Inspect or Edit: click a nucleus)";
 /// The Relax / Stop button's least width (the Time group, full layout).
 const RELAX_W: f32 = 48.0;
 /// The element group's sub-line opener of the periodic table.
@@ -161,7 +162,7 @@ impl Widths {
             dt: max(&[caps("dt", false), dt_field, w("under-resolved", &sub), w(&format!("amber > {DT_WARN_FS}"), &sub)]) + PAD,
             tool: max(&[
                 caps("Tool", false),
-                segs(&[btn("      Orbit"), btn("      Place"), btn("      Select")]),
+                segs(&[btn("      Inspect"), btn("      Place"), btn("      Grab"), btn("      Edit")]),
                 w("right-drag pans · wheel zooms", &sub),
                 line_w(&["drag + wheel: pull ", "0.0000", " Ha/Bohr"]),
             ]) + PAD,
@@ -176,7 +177,7 @@ impl Widths {
             c_time: 28.0 + sp + 30.0 + sp + 28.0,
             c_speed: c_speed_field + sp + c_rate + sp + w("watch", &sub) + 2.0 * bp,
             c_dt: dt_field,
-            c_tool: segs(&[30.0; 3]),
+            c_tool: segs(&[30.0; 4]),
             c_elements: (w("He ▾", &mono) + 2.0 * bp).max(40.0),
             c_selection: selection_row + sp + w("no selection", &body),
             c_solver: c_solver_row + sp + solver_sub,
@@ -374,6 +375,8 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             // the pull the wheel sets while dragging (Physics ▸ Drag pull)
             sub(ui, line(&["drag + wheel: pull ", &super::sig3(st.drag_force), " Ha/Bohr"], SUB, theme::INK_DIM))
                 .on_hover_text(format!("{} now. {}", super::pull_label(st.drag_force), super::menus::DRAG_TIP));
+        } else if st.mode == ToolMode::Edit {
+            sub(ui, "Shift-click adds · box selects · Esc clears");
         } else {
             sub(ui, "right-drag pans · wheel zooms");
         }
@@ -554,6 +557,7 @@ fn tool_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action
                 (ToolMode::Orbit, Icon::Orbit, "Inspect", ORBIT_TIP),
                 (ToolMode::Place, Icon::Place, "Place", PLACE_TIP),
                 (ToolMode::Select, Icon::Grab, "Grab", SELECT_TIP),
+                (ToolMode::Edit, Icon::Move, "Edit", EDIT_TIP),
             ] {
                 let text = if compact { "" } else { text };
                 if icons::seg_button(ui, icon, text, st.mode == mode).on_hover_text(tip).clicked() {

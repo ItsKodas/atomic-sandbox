@@ -224,8 +224,10 @@
 //! `last_rejection` instead, which the next accepted command clears.
 //!
 //! # Edits (ruling R8)
-//! `AddNucleus` and `RemoveNucleus` are accepted at any time; `MoveNucleusDiscontinuous` and
-//! `ReplaceScene` only while paused (else rejected). Move zeroes that nucleus's velocity; Add
+//! `AddNucleus` and `RemoveNucleus` are accepted at any time; `MoveNucleusDiscontinuous`,
+//! `MoveNuclei` and `ReplaceScene` only while paused (else rejected). Move zeroes that nucleus's
+//! velocity; `MoveNuclei` (the Edit tool's rigid group move, user request 2026-10-20) keeps every
+//! velocity — K is unchanged and the history restarts, so E_conserved is re-referenced; Add
 //! puts the nucleus in at rest (spec §7, "place = nucleus at rest"); ReplaceScene keeps the new
 //! scene's velocities (finite positions, velocities and field and positive masses required) and
 //! restarts time, step count, pins and drag. Add, Remove and ReplaceScene call
@@ -628,6 +630,11 @@ pub enum DynCommand {
     ReplaceScene(Scene),
     /// Paused only: teleport, velocity zeroed, provider reset.
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
+    /// Paused only (the Edit tool, user request 2026-10-20): each listed nucleus to its new
+    /// position, **velocities kept** (module doc, "Edits"); otherwise a teleport like
+    /// `MoveNucleusDiscontinuous` (`discontinuity`, stale forces, history restart). The whole list
+    /// is refused if any index is out of range, repeated, or any position non-finite.
+    MoveNuclei { moves: Vec<(usize, [f64; 3])> },
     /// Any time (R8): added at rest, unpinned, provider reset.
     AddNucleus(Nucleus),
     /// Any time (spec §5.3): the nucleus takes isotope A's mass from the table (refused with the
@@ -1328,6 +1335,26 @@ impl Dynamics {
                 let n = &mut self.scene.nuclei[index];
                 n.pos = pos;
                 n.vel = [0.0; 3];
+                self.after_edit(true);
+            }
+            DynCommand::MoveNuclei { moves } => {
+                if !self.paused {
+                    return self.reject("pause before moving nuclei (the Edit tool pauses while it moves them)".into());
+                }
+                let n = self.scene.nuclei.len();
+                let mut seen = vec![false; n];
+                for &(i, pos) in &moves {
+                    if i >= n || seen[i] || !finite3(pos) {
+                        return self.reject(format!("move nucleus {i} to {pos:?}: no such nucleus, listed twice, or a non-finite position"));
+                    }
+                    seen[i] = true;
+                }
+                if moves.is_empty() {
+                    return;
+                }
+                for (i, pos) in moves {
+                    self.scene.nuclei[i].pos = pos;
+                }
                 self.after_edit(true);
             }
             DynCommand::AddNucleus(n) => {

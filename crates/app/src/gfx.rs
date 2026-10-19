@@ -61,7 +61,8 @@ pub struct Target<'a> {
 pub struct World<'a> {
     pub camera: &'a OrbitCamera,
     pub nuclei: &'a [SceneNucleus],
-    pub selected: Option<usize>,
+    /// The selected nuclei (highlighted): one, or the Edit tool's group.
+    pub selected: &'a [usize],
     /// Reference geometry (cell, grids, axes) as line-list vertices; see `overlay::build`.
     pub lines: &'a [LineVertex],
     /// The rect of the target the scene is drawn into (the 3D view the chrome leaves); outside it
@@ -818,7 +819,7 @@ pub fn risk_tint(risk: f32) -> f32 {
 
 const RISK_RED: [f32; 3] = [1.0, 0.12, 0.08];
 
-fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32], scale: f32) -> Vec<SphereInstance> {
+fn instances(nuclei: &[SceneNucleus], selected: &[usize], risk: &[f32], scale: f32) -> Vec<SphereInstance> {
     nuclei
         .iter()
         .enumerate()
@@ -829,7 +830,7 @@ fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32], sca
                 centre: n.pos.map(|x| x as f32),
                 radius: elements::radius(n.z) * scale,
                 colour: std::array::from_fn(|k| base[k] + t * (RISK_RED[k] - base[k])),
-                selected: if selected == Some(i) { 1.0 } else { 0.0 },
+                selected: if selected.contains(&i) { 1.0 } else { 0.0 },
             }
         })
         .collect()
@@ -876,8 +877,8 @@ mod tests {
         assert_eq!(risk_tint(2.0), 0.85);
         assert_eq!(risk_tint(50.0), 0.85);
         let n = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
-        assert_eq!(instances(&n, None, &[], 1.0)[0].colour, elements::colour(1), "no risk: no tint");
-        let red = instances(&n, None, &[10.0], 1.0)[0].colour;
+        assert_eq!(instances(&n, &[], &[], 1.0)[0].colour, elements::colour(1), "no risk: no tint");
+        let red = instances(&n, &[], &[10.0], 1.0)[0].colour;
         assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
     }
 

@@ -11,11 +11,23 @@ use render::elements;
 
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let Some((i, n)) = input.selection() else {
-        theme::note(ui, "no selection (Select tool, click a nucleus)");
+        theme::note(ui, "no selection (Inspect or Edit: click a nucleus)");
         molecules(ui, st, input);
         card_toggle(ui, st);
         return;
     };
+    if st.edit_group.len() > 1 {
+        // the Edit tool's group: what the handles move together (Delete removes them all)
+        let atoms: Vec<String> = st
+            .edit_group
+            .iter()
+            .filter_map(|&j| input.scene.nuclei.get(j).map(|m| format!("{} #{j}", elements::symbol(m.z))))
+            .collect();
+        ui.label(RichText::new(format!("{} atoms selected", atoms.len())).strong().size(14.0));
+        ui.label(RichText::new(atoms.join(" · ")).monospace().color(theme::INK_DIM));
+        theme::note(ui, "the Edit tool's handles move them together (velocities kept); Delete removes them all; below: the last one clicked");
+        ui.add_space(6.0);
+    }
     super::group(ui, st, "d-selection", |ui, st| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(atom_card::title(n)).strong().size(14.0));
