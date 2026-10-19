@@ -184,8 +184,20 @@ pub fn contents(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         }
     });
-    prime();
     let query = st.ptable_query.clone();
+    let selected = st.element;
+    if let Some(z) = grid(ui, &query, Some(selected), "ptable") {
+        acts.push(Action::Element(z));
+    }
+    isotope_row(ui, st, acts);
+    theme::note(ui, format!("Z 1–{Z_ENABLED} can be placed; heavier elements need the next pseudopotential stage (ONCV, semicore). Greyed (Z > {Z_ENABLED}): {GREYED_TIP}."));
+}
+
+/// The table's cells (no search row, no isotopes): the enabled element clicked, if any. `salt`
+/// keeps two tables apart (the toolbar's `"ptable"`, the molecule builder's); `selected` is
+/// highlighted, `query` dims the elements it does not match.
+pub fn grid(ui: &mut Ui, query: &str, selected: Option<u8>, salt: &str) -> Option<u8> {
+    prime();
     let cols = 18.0;
     let size = Vec2::new(cols * CELL.x + (cols - 1.0) * GAP, 9.0 * (CELL.y + GAP) + ROW_GAP);
     let (area, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -199,20 +211,20 @@ pub fn contents(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, theme::LINE_SOFT), egui::StrokeKind::Inside);
         ui.painter().text(r.center(), Align2::CENTER_CENTER, text, FontId::monospace(7.0), theme::INK_FAINT);
     }
+    let mut picked = None;
     for z in 1..=Z_MAX {
         let Some((row, col)) = position(z) else { continue };
         let rect = at(row, col);
-        let r = ui.interact(rect, Id::new(("ptable", z)), if enabled(z) { Sense::click() } else { Sense::hover() });
-        let hit = matches(&query, z);
-        let selected = enabled(z) && st.element == z;
-        cell(ui, rect, z, selected, r.hovered(), hit && !query.trim().is_empty(), hit);
-        super::probe(&format!("ptable-{z}"), &r);
+        let r = ui.interact(rect, Id::new((salt, z)), if enabled(z) { Sense::click() } else { Sense::hover() });
+        let hit = matches(query, z);
+        let is_selected = enabled(z) && selected == Some(z);
+        cell(ui, rect, z, is_selected, r.hovered(), hit && !query.trim().is_empty(), hit);
+        super::probe(&format!("{salt}-{z}"), &r);
         if r.on_hover_text(tip(z)).clicked() && enabled(z) {
-            acts.push(Action::Element(z));
+            picked = Some(z);
         }
     }
-    isotope_row(ui, st, acts);
-    theme::note(ui, format!("Z 1–{Z_ENABLED} can be placed; heavier elements need the next pseudopotential stage (ONCV, semicore). Greyed (Z > {Z_ENABLED}): {GREYED_TIP}."));
+    picked
 }
 
 /// One painted cell: symbol, Z, the display colour as a stripe for the enabled ones.

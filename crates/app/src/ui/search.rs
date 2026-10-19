@@ -66,6 +66,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Load model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Profiles", "layout look save load reset user", Menu(M::File), "m-files"),
+    e("Molecule builder", "builder draw sketch 2D structural formula molecule bonds hydrogens benzene ethanol insert replace", Menu(M::File), "m-files"),
     e("Forget model", "drop samples estimated", Dock(D::Model), "d-model-file"),
     // Scene
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),
@@ -113,6 +114,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Drag pull (drag force)", "pull force strength wheel spring tug drag reset", Menu(M::Physics), "m-drag"),
     e("Draft mode", "guess instead of falling back unsafe estimated", Menu(M::Physics), "m-draft"),
     e("Relax geometry (FIRE)", "minimise optimise relaxation stop", Menu(M::Physics), "m-relax"),
+    e("Compare with reference…", "pyscf reference oracle outside code lda pbe b3lyp ccsd(t) coupled cluster validate check", Menu(M::Physics), "m-compare"),
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
@@ -134,6 +136,8 @@ pub const ENTRIES: &[Entry] = &[
     e("dt warning", "health", Dock(D::Readouts), "d-health"),
     e("Dynamics notes", "thermostat Maxwell-Boltzmann", Dock(D::Readouts), "d-health"),
     e("Energy breakdown and solver", "kinetic external Hartree xc nuclear SCF residual Poisson ρ max", Dock(D::Readouts), "d-breakdown"),
+    e("Set up PySCF", "install python pyscf wsl pip reference enable", Dock(D::Readouts), "d-compare"),
+    e("Compare with reference (PySCF)", "pyscf reference forces dipole relax both bond lengths angles lda pbe b3lyp ccsd(t) deviation", Dock(D::Readouts), "d-compare"),
     // Graph
     e("Graph: E total and T", "sparkline plot history curve", Dock(D::Graph), "d-graph"),
     // Model
