@@ -1052,6 +1052,10 @@ pub struct Dynamics {
     density_refresh: bool,
     /// `RefreshBonds` asked for a graph at the current positions (done at the next tick).
     bonds_requested: bool,
+    /// A learning provider (the estimated solver) solves its bond references only when asked
+    /// (user request 2026-10-19): for a loaded scene, or by `RefreshBonds` — never because an atom
+    /// was added or a first density arrived mid-play. Cleared once the queue is done.
+    refs_wanted: bool,
     /// The references' solver as (its SCF tolerance, its name) — the key's provenance — read
     /// once from the provider (`reference_solver`).
     ref_solver: (Option<f64>, &'static str),
@@ -1141,6 +1145,7 @@ impl Dynamics {
             ref_failed: Vec::new(),
             density_refresh: false,
             bonds_requested: false,
+            refs_wanted: true,
             ref_solver: (None, ""),
             bonds: None,
             bonds_stale: false,
@@ -1185,7 +1190,11 @@ impl Dynamics {
             }
             DynCommand::Relax => self.start_relax(),
             DynCommand::StopRelax => self.finish_relax(None, &mut || false),
-            DynCommand::RefreshBonds => self.bonds_requested = true,
+            DynCommand::RefreshBonds => {
+                self.bonds_requested = true;
+                self.refs_wanted = true;
+                self.queue_missing_references();
+            }
             DynCommand::Step(n) => {
                 self.paused = true;
                 self.pending_steps = self.pending_steps.saturating_add(n);
@@ -1306,6 +1315,7 @@ impl Dynamics {
                 self.step = 0;
                 self.after_edit(false);
                 self.drop_bonds();
+                self.refs_wanted = true; // a loaded scene: its references are wanted
                 self.queue_missing_references();
             }
             DynCommand::MoveNucleusDiscontinuous { index, pos } => {
@@ -2512,6 +2522,10 @@ impl Dynamics {
         if !self.density_seen {
             return;
         }
+        // the estimated solver: only when asked (`refs_wanted`)
+        if self.provider.as_trainable().is_some() && !self.refs_wanted {
+            return;
+        }
         let (tol, name) = self.reference_solver();
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
         let ionic = self.provider.ionic_tag(&self.scene);
@@ -2573,6 +2587,9 @@ impl Dynamics {
             let was_pending = !self.ref_queue.is_empty();
             self.queue_missing_references();
             if self.ref_queue.is_empty() {
+                if self.density_seen {
+                    self.refs_wanted = false; // done: the next ones wait to be asked for (estimated)
+                }
                 // nothing left to solve: free the side solver (a second solver's buffers at the
                 // scene's grid, outside the stepping provider's VRAM check — final review M8);
                 // the next job builds a fresh one, and every reference is a cold solve anyway
