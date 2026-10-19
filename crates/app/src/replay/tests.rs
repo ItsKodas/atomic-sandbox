@@ -153,7 +153,9 @@ fn actions_parse_and_describe_symmetrically() {
         Action::Play,
         Action::Pause,
         Action::Step,
-        Action::Rewind,
+        Action::ReverseVelocities,
+        Action::RewindTo(0),
+        Action::RewindTo(3),
         Action::SetSpeed(250),
         Action::SetDt(0.125),
         Action::Tool(ToolMode::Select),
@@ -388,7 +390,7 @@ fn a_recorded_session_replays_to_the_same_snapshot_sequence() {
         s.input(&mut v, &mut p, Event::Cursor { x: x + 0.25, y: y + 0.05 });
         s.input(&mut v, &mut p, Event::Button { which: Button::Left, down: false });
         live.push(s.idle(&mut v, &mut p));
-        for a in [Action::Step, Action::Step, Action::Pin(1, true), Action::Step, Action::Rewind, Action::Step] {
+        for a in [Action::Step, Action::Step, Action::Pin(1, true), Action::Step, Action::ReverseVelocities, Action::Step] {
             s.act(&mut v, &mut p, a);
             live.push(s.idle(&mut v, &mut p));
         }

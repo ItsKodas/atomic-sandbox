@@ -23,8 +23,10 @@ pub enum Action {
     Pause,
     /// Pause and advance one time step.
     Step,
-    /// v → −v.
-    Rewind,
+    /// Physics ▸ Reverse velocities: v → −v (`DynCommand::Rewind`; time reversal).
+    ReverseVelocities,
+    /// The toolbar's Rewind: back to Play snapshot i (0 = the newest; `ui::rewind`).
+    RewindTo(usize),
     /// Steps per tick (the slider, the typed field, the watchable preset). Never dt (rule 8).
     SetSpeed(u32),
     /// The time step (fs).
@@ -192,19 +194,27 @@ pub enum Action {
 pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
-        Action::TogglePlay => out.toggle_play = true,
+        Action::TogglePlay => {
+            if starts_play(st, input) {
+                super::rewind::take(st, input);
+            }
+            out.toggle_play = true;
+        }
         Action::Play => {
             // estimated with no model: nothing to play on (the viewer's toggle refuses the same)
-            let no_model = st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling();
-            if no_model {
+            if no_model(st, input) {
                 out.error = Some("the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into());
             } else {
+                if starts_play(st, input) {
+                    super::rewind::take(st, input);
+                }
                 out.commands.push(dyn_(DynCommand::Play));
             }
         }
         Action::Pause => out.commands.push(dyn_(DynCommand::Pause)),
         Action::Step => out.commands.push(dyn_(DynCommand::Step(1))),
-        Action::Rewind => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::ReverseVelocities => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::RewindTo(i) => super::rewind::restore(st, i, out),
         Action::SetSpeed(n) => {
             st.speed = n;
             out.commands.push(dyn_(DynCommand::SetSpeed(n)));
@@ -739,7 +749,9 @@ impl Action {
             Play => "play".into(),
             Pause => "pause".into(),
             Step => "step".into(),
-            Rewind => "rewind".into(),
+            ReverseVelocities => "reverse-velocities".into(),
+            RewindTo(0) => "rewind".into(),
+            RewindTo(i) => format!("rewind {i}"),
             SetSpeed(n) => format!("speed {n}"),
             SetDt(dt) => format!("dt {dt}"),
             Tool(m) => format!("tool {}", tool_word(*m)),
@@ -831,14 +843,14 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
+            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
                     "play" => Play,
                     "pause" => Pause,
                     "step" => Step,
-                    "rewind" => Rewind,
+                    "reverse-velocities" => ReverseVelocities,
                     "deselect" => Deselect,
                     "focus" => Focus,
                     "forget" => Forget,
@@ -850,6 +862,11 @@ impl Action {
                     _ => StopRelax,
                 }
             }
+            "rewind" => match args {
+                [] => RewindTo(0),
+                [i] => RewindTo(num(head, i)?),
+                _ => return Err(format!("action rewind takes 0 or 1 arguments (the snapshot, 0 = the newest), got {}", args.len())),
+            },
             "speed" => {
                 want(1)?;
                 SetSpeed(num(head, args[0])?)
@@ -1197,7 +1214,18 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
 
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the
 /// backend's solver count and the budget): refused before the worker allocates anything.
-fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
+/// The estimated solver with no fitted model and no pass that will make one: nothing to play on.
+fn no_model(st: &UiState, input: &PanelInput<'_>) -> bool {
+    st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling()
+}
+
+/// Play from paused that the driver will run (not during a pass or a relax, which refuse it): the
+/// moment a Play snapshot is taken (`ui::rewind`).
+fn starts_play(st: &UiState, input: &PanelInput<'_>) -> bool {
+    !input.playing && !no_model(st, input) && !input.sampling() && !input.relaxing()
+}
+
+pub(super) fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
     crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget())
 }
 
