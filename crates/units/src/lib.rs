@@ -11,6 +11,9 @@ pub const HARTREE_IN_EV: f64 = 27.211386245988;
 pub const AU_TIME_IN_FS: f64 = 0.024188843265857;
 pub const KB_HARTREE_PER_K: f64 = 3.166811563e-6;
 pub const AMU_IN_ME: f64 = 1822.888486209;
+/// One atomic unit of electric dipole (e·a₀ = 8.4783536255e-30 C·m) in debye (1 D = 1e-21/c C·m,
+/// exact): 2.541746473.
+pub const AU_DIPOLE_IN_DEBYE: f64 = 2.541746473;
 
 pub fn bohr_to_angstrom(x: f64) -> f64 { x * BOHR_IN_ANGSTROM }
 pub fn angstrom_to_bohr(x: f64) -> f64 { x / BOHR_IN_ANGSTROM }
@@ -21,6 +24,7 @@ pub fn fs_to_au_time(t: f64) -> f64 { t / AU_TIME_IN_FS }
 pub fn kelvin_to_hartree(t: f64) -> f64 { t * KB_HARTREE_PER_K }
 pub fn hartree_to_kelvin(e: f64) -> f64 { e / KB_HARTREE_PER_K }
 pub fn amu_to_au_mass(m: f64) -> f64 { m * AMU_IN_ME }
+pub fn au_dipole_to_debye(d: f64) -> f64 { d * AU_DIPOLE_IN_DEBYE }
 
 /// 0 °C in kelvin (exact, SI definition).
 pub const ZERO_CELSIUS_IN_K: f64 = 273.15;

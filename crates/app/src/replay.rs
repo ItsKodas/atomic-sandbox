@@ -389,6 +389,11 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::TeachAroundBlockers => "teach-around-blockers",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",
+        Action::CompareReference { relax: false, .. } => "compare-reference",
+        Action::CompareReference { relax: true, .. } => "compare-reference-relax",
+        Action::SetupPyscf => "setup-pyscf",
+        Action::CancelSetup => "cancel-setup",
+        Action::Builder(_) => "builder",
         Action::Screenshot | Action::Record(_) => "capture",
         _ => "action",
     })
@@ -397,7 +402,9 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 /// A skipped recorded save (or a capture: display only) changes nothing the replay checks; any
 /// other unreplayable action would make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
-    matches!(kind, "save-scene" | "save-model" | "capture")
+    // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
+    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).
