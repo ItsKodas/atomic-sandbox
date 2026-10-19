@@ -1030,14 +1030,24 @@ impl Viewer {
         if path.len() < 2 || path.iter().any(|p| p.len() != n) {
             return Vec::new();
         }
-        let k = path.len() as f32;
-        path.iter()
-            .enumerate()
-            .flat_map(|(j, p)| {
-                let a = s * 0.45 * (j as f32 + 1.0) / k;
-                p.iter().enumerate().map(move |(i, pos)| (i, *pos, a))
-            })
-            .collect()
+        // BLUR_FILL copies between each two samples (straight lines between them): a smooth smear
+        const BLUR_FILL: usize = 4;
+        let total = ((path.len() - 1) * BLUR_FILL + 1) as f32;
+        let mut out = Vec::with_capacity(n * total as usize);
+        for (j, w) in path.windows(2).enumerate() {
+            for f in 0..BLUR_FILL {
+                let t = f as f64 / BLUR_FILL as f64;
+                let idx = (j * BLUR_FILL + f) as f32;
+                let a = s * 0.6 * (idx + 1.0) / total;
+                for i in 0..n {
+                    let pos = std::array::from_fn(|c| w[0][i][c] + t * (w[1][i][c] - w[0][i][c]));
+                    out.push((i, pos, a));
+                }
+            }
+        }
+        let last = path.last().expect("two or more samples");
+        out.extend(last.iter().enumerate().map(|(i, p)| (i, *p, s * 0.6)));
+        out
     }
 
     fn record_trails(&mut self) {

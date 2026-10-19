@@ -59,8 +59,15 @@ fn fs_main(in: VOut) -> FOut {
     if (in.selected > 0.5) { col = mix(col, vec3(1.0, 0.9, 0.3), rim * 0.9 + 0.1); }
     let clip = cam.view_proj * vec4(hit, 1.0);
     var out: FOut;
-    // a negative `selected` is a motion-blur ghost's alpha (the blended pass); 1 otherwise
-    out.colour = vec4(col, select(1.0, -in.selected, in.selected < 0.0));
+    // a negative `selected` is a motion-blur ghost's alpha (the blended pass): no rim, and faded
+    // toward the outline (disc / r² is 1 through the centre, 0 at the edge) so stacked copies smear
+    var a = 1.0;
+    if (in.selected < 0.0) {
+        let e = clamp(disc / (in.radius * in.radius), 0.0, 1.0);
+        a = -in.selected * e * e;
+        col = in.colour * (0.35 + 0.65 * diffuse);
+    }
+    out.colour = vec4(col, a);
     out.depth = clip.z / clip.w;
     return out;
 }
