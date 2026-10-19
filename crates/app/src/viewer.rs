@@ -782,6 +782,7 @@ impl Viewer {
                         if down {
                             self.on_left_press();
                         } else {
+                            self.inspect_click();
                             self.end_drag();
                             self.end_edit();
                         }
@@ -853,19 +854,22 @@ impl Viewer {
 
     /// Every button up: ends a Select-drag ([`Viewer::end_drag`]) and stops orbit / pan.
     fn release_all(&mut self) {
-        // Inspect: a click (the press and release within a few pixels) selects the nucleus under the
-        // cursor, or clears the selection on empty space — nothing moves
-        if let Some((x0, y0)) = self.mouse.press_at.take() {
-            let (px, py) = self.mouse.pos;
-            if self.mouse.left && self.ui.mode == ui::ToolMode::Orbit && (px - x0).hypot(py - y0) < 5.0 {
-                self.tool.selected = tools::pick(&self.camera, px, py, self.viewport, &self.scene.nuclei);
-            }
-        }
+        self.mouse.press_at = None;
         self.mouse.left = false;
         self.mouse.right = false;
         self.mouse.middle = false;
         self.end_drag();
         self.end_edit();
+    }
+
+    /// Inspect: the left button came up — a click (press and release within a few pixels) selects
+    /// the nucleus under the cursor, or clears the selection on empty space; nothing moves.
+    fn inspect_click(&mut self) {
+        let Some((x0, y0)) = self.mouse.press_at.take() else { return };
+        let (px, py) = self.mouse.pos;
+        if self.ui.mode == ui::ToolMode::Orbit && (px - x0).hypot(py - y0) < 5.0 {
+            self.tool.selected = tools::pick(&self.camera, px, py, self.viewport, &self.scene.nuclei);
+        }
     }
 
     // ---- The Edit tool (user request 2026-10-20) ----
