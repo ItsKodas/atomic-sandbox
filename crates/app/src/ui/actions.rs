@@ -627,6 +627,14 @@ fn compare_reference(st: &mut UiState, input: &PanelInput<'_>, method: crate::re
         relax_note: None,
         bonds,
         bonds_from_graph,
+        constraints: [
+            (d.walls.is_some(), "container walls"),
+            (d.pins.iter().any(|&p| p), "pinned atoms"),
+            (d.scene.external_field != [0.0; 3], "an external field"),
+        ]
+        .into_iter()
+        .filter_map(|(on, what)| on.then_some(what))
+        .collect(),
     };
     match st.compare.start(ours, method, relax, d.scene.multiplicity, d.relax.clone()) {
         Ok(()) => {

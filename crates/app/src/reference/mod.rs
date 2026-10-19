@@ -372,6 +372,8 @@ pub struct Ours {
     pub relax_note: Option<String>,
     /// The bonds the geometry tables use (our bond graph's pairs, else every pair — [`pairs_for`]).
     pub bonds: Vec<(usize, usize)>,
+    /// What constrains our relax and not theirs (walls, pins, an external field), for the note.
+    pub constraints: Vec<&'static str>,
     pub bonds_from_graph: bool,
 }
 
@@ -601,7 +603,11 @@ pub fn angle_triples(n: usize, bonds: &[(usize, usize)]) -> Vec<(usize, usize, u
 /// The angle i–j–k (degrees).
 pub fn angle(pos: &[[f64; 3]], (i, j, k): (usize, usize, usize)) -> f64 {
     let (a, b) = (sub(pos[i], pos[j]), sub(pos[k], pos[j]));
-    let c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (norm(a) * norm(b));
+    let (na, nb) = (norm(a), norm(b));
+    if na == 0.0 || nb == 0.0 {
+        return f64::NAN; // two nuclei on one point: no angle
+    }
+    let c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb);
     c.clamp(-1.0, 1.0).acos().to_degrees()
 }
 

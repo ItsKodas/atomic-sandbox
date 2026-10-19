@@ -21,7 +21,7 @@ goes to stderr):
     {"ok": false, "error": "..."} on failure (exit code 1).
 
 Methods: lda = Slater exchange + Perdew–Wang 92 correlation (LDA_X,LDA_C_PW — this program's own
-LSDA), pbe, b3lyp (Kohn-Sham DFT; restricted for a singlet, unrestricted otherwise), ccsd_t =
+LSDA), pbe, b3lyp (unrestricted Kohn-Sham DFT, forces with the grid-weight response), ccsd_t =
 CCSD(T) on a Hartree-Fock reference (energy; forces from the CCSD(T) analytic gradient where PySCF
 has one — closed shell —, otherwise none; dipole from the unrelaxed CCSD density). "optimise" needs
 the geomeTRIC (`pip install geometric`) or PyBerny (`pip install pyberny`) package.
@@ -69,8 +69,9 @@ def optimise(target, notes):
     if solver is None:
         raise RuntimeError("relaxing needs the geomeTRIC or PyBerny package: pip install geometric")
     notes.append(f"relaxed with {name}")
+    # assert_convergence=False: an unconverged optimisation is reported, not raised
     try:
-        conv, mol_eq = solver.kernel(target, maxsteps=100)
+        conv, mol_eq = solver.kernel(target, maxsteps=100, assert_convergence=False)
     except TypeError:
         mol_eq, conv = solver.optimize(target, maxsteps=100), None
     return mol_eq.atom_coords(unit="Bohr").tolist(), (None if conv is None else bool(conv))
@@ -94,7 +95,9 @@ def run(req):
     mol = gto.M(atom=[[ELEMENTS[a], tuple(p)] for a, p in zip(z, pos)], unit="Bohr", basis=basis, charge=charge, spin=spin, verbose=0)
     out = {"ok": True, "method": method, "basis": basis, "spin": spin, "forces": None, "dipole": None, "optimised": None, "optimise_converged": None}
     if method in XC:
-        mf = (dft.RKS(mol) if spin == 0 else dft.UKS(mol))
+        # unrestricted always, like this program's two-channel LSDA (identical to restricted from a
+        # symmetric guess; both may break spin symmetry at stretched bonds)
+        mf = dft.UKS(mol)
         mf.xc = XC[method]
         mf.grids.level = 4
         mf.conv_tol = 1e-9
@@ -102,8 +105,10 @@ def run(req):
         out["energy"] = float(mf.kernel())
         if not mf.converged:
             notes.append("SCF did not converge")
-        notes.append(f"{'restricted' if spin == 0 else 'unrestricted'} Kohn-Sham, xc {XC[method]}, grid level 4")
-        out["forces"] = (-mf.nuc_grad_method().kernel()).tolist()
+        notes.append(f"unrestricted Kohn-Sham, xc {XC[method]}, grid level 4 with grid response")
+        g = mf.nuc_grad_method()
+        g.grid_response = True
+        out["forces"] = (-g.kernel()).tolist()
         out["dipole"] = [float(x) for x in mf.dip_moment(unit="AU", verbose=0)]
         target = mf
     elif method == "ccsd_t":

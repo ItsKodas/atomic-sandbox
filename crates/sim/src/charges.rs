@@ -273,7 +273,8 @@ pub fn hirshfeld(free: &[&RadialDensity], pos: &[[f64; 3]], counted: &[f64], cel
 /// order (as [`hirshfeld`]): μ = Σ_A Z_A R_A − h³ Σ_n ρ(r_n) r_n, the convention of μ pointing from
 /// the negative to the positive charge. Under pseudopotentials `counted` is Z_v and `rho` the
 /// valence density: a frozen core is a neutral (Z − Z_v nucleus + core electrons) charge at R_A,
-/// so μ is the all-electron dipole up to the core's polarisation. The box truncates the density's
+/// so μ is the all-electron dipole up to the core's polarisation and the pseudised valence density inside
+/// r_c (norm conservation keeps its charge, not its first moment, in a non-spherical environment). The box truncates the density's
 /// tail (the cell is finite) — the same truncation the solve has. Display only (rule 4: compensated
 /// sums over the n³ nodes).
 pub fn dipole(pos: &[[f64; 3]], counted: &[f64], cell: &Cell, rho: &[f64]) -> [f64; 3] {

@@ -234,6 +234,10 @@ fn dipole(ui: &mut Ui, o: &reference::Ours, a: &reference::Answer, done: bool) {
     }
     if o.pseudised {
         theme::note(ui, "ours: valence density + ion charges Z_v (a frozen core is a neutral charge on its nucleus)");
+        theme::note(
+            ui,
+            "open-shell fragments (O, OH, CH₃ …) differ by construction under pseudopotentials: ours share a degenerate shell's electrons fractionally, PySCF takes one integer, symmetry-broken state — their forces and dipoles differ for that reason too",
+        );
     }
 }
 
@@ -256,6 +260,16 @@ fn geometry(ui: &mut Ui, run: &reference::Run, a: &reference::Answer) {
     if let Some(n) = &o.relax_note {
         theme::note(ui, n);
     }
+    if !o.constraints.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            theme::light(ui, AMBER);
+            ui.label(RichText::new(format!("ours relaxed with {} — theirs is free: the geometries need not agree for that reason", o.constraints.join(", "))).size(11.5).color(AMBER));
+        });
+    }
+    theme::note(
+        ui,
+        "noise floor: ours stops at max |F| < 1e-3 Ha/Bohr, theirs at geomeTRIC's ≈ 4.5e-4 — δr ≈ F/k, ≈ 0.002 Å for a stiff bond like H₂'s, more for soft bends",
+    );
     match a.optimise_converged {
         Some(false) => {
             theme::note(ui, "theirs did not converge in 100 steps");
