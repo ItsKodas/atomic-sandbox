@@ -1,0 +1,12 @@
+# atomic sandbox scene v1
+# Borane BH3: B-H 1.19 A, trigonal planar (120 degrees).
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 12 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 81 0.15
+charge 0
+ionic accepted
+nucleus 5 0.0000 0.0000 0.0000
+nucleus 1 2.2488 0.0000 0.0000
+nucleus 1 -1.1244 1.9475 0.0000
+nucleus 1 -1.1244 -1.9475 0.0000

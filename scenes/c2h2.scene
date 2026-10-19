@@ -1,0 +1,12 @@
+# atomic sandbox scene v1
+# Acetylene: C-C 1.203 A, C-H 1.063 A, linear.
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 16 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 108 0.15
+charge 0
+ionic accepted
+nucleus 1 -3.1454 0.0000 0.0000
+nucleus 6 -1.1367 0.0000 0.0000
+nucleus 6 1.1367 0.0000 0.0000
+nucleus 1 3.1454 0.0000 0.0000

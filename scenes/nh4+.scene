@@ -1,0 +1,13 @@
+# atomic sandbox scene v1
+# Ammonium cation NH4+: N-H 1.032 A, tetrahedral; charge +1.
+# Geometry: typical crystal value (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 12 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 81 0.15
+charge 1
+ionic accepted
+nucleus 7 0.0000 0.0000 0.0000
+nucleus 1 1.1259 1.1259 1.1259
+nucleus 1 1.1259 -1.1259 -1.1259
+nucleus 1 -1.1259 1.1259 -1.1259
+nucleus 1 -1.1259 -1.1259 1.1259

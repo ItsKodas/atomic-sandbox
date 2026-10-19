@@ -1,0 +1,12 @@
+# atomic sandbox scene v1
+# Formaldehyde: C=O 1.205 A, C-H 1.111 A, H-C-H 116.1 degrees (planar).
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 12 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 81 0.15
+charge 0
+ionic accepted
+nucleus 6 -0.6000 0.0000 0.0000
+nucleus 8 1.6771 0.0000 0.0000
+nucleus 1 -1.7110 1.7814 0.0000
+nucleus 1 -1.7110 -1.7814 0.0000

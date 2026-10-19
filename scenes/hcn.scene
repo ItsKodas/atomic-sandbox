@@ -1,0 +1,11 @@
+# atomic sandbox scene v1
+# Hydrogen cyanide: H-C 1.065 A, C-N 1.153 A, linear.
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 14 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 94 0.15
+charge 0
+ionic accepted
+nucleus 1 -2.0126 0.0000 0.0000
+nucleus 6 0.0000 0.0000 0.0000
+nucleus 7 2.1789 0.0000 0.0000

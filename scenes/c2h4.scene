@@ -1,0 +1,14 @@
+# atomic sandbox scene v1
+# Ethylene: C=C 1.339 A, C-H 1.087 A, H-C-H 117.4 degrees (planar).
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 14 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 94 0.15
+charge 0
+ionic accepted
+nucleus 6 -1.2652 0.0000 0.0000
+nucleus 6 1.2652 0.0000 0.0000
+nucleus 1 2.3323 1.7552 0.0000
+nucleus 1 2.3323 -1.7552 0.0000
+nucleus 1 -2.3323 1.7552 0.0000
+nucleus 1 -2.3323 -1.7552 0.0000

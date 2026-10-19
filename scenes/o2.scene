@@ -1,0 +1,11 @@
+# atomic sandbox scene v1
+# Oxygen O2: O-O 1.208 A, triplet ground state (multiplicity 3).
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 12 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 81 0.15
+charge 0
+multiplicity 3
+ionic accepted
+nucleus 8 -1.1414 0.0000 0.0000
+nucleus 8 1.1414 0.0000 0.0000
