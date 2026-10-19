@@ -205,23 +205,44 @@ pub fn teach_label(m: &ModelStatus) -> Option<String> {
 /// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
 pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
     let Some(o) = &m.teach_offer else { return };
-    if let Some(p) = &o.prompt {
-        ui.colored_label(AMBER, p);
-    }
-    if let Some(label) = teach_label(m) {
-        let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
-        if ui
-            .add_enabled(!sampling, egui::Button::new(RichText::new(label).strong()))
-            .on_disabled_hover_text("a pass is running")
-            .on_hover_text(format!(
-                "a targeted pass around the training samples that keep a class untrusted: {}. About 10 DFT solves each — random nudges each clearly apart from the sample and from each other, and steps toward its nearest learned neighbour — of which 2 are held out to check the result. Accepted only if the unchanged class rule then passes with the sample still in the fit and the checks pass; at most two rounds. Pauses the dynamics.",
-                names.join(", ")
-            ))
-            .clicked()
-        {
-            acts.push(Action::TeachAroundBlockers);
-        }
-    }
+    // the warning and its fix in one amber box whose outline pulses (user request 2026-10-19:
+    // the button was easy to miss); still while a pass runs
+    let pulse = if sampling {
+        0.0
+    } else {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+        (0.5 + 0.5 * (ui.input(|i| i.time) * 3.5).sin()) as f32
+    };
+    egui::Frame::new()
+        .fill(AMBER.gamma_multiply(0.08))
+        .stroke(egui::Stroke::new(1.0 + 1.5 * pulse, AMBER.gamma_multiply(0.35 + 0.65 * pulse)))
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(p) = &o.prompt {
+                ui.colored_label(AMBER, p);
+            }
+            if let Some(label) = teach_label(m) {
+                let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
+                ui.add_space(4.0);
+                let button = egui::Button::new(RichText::new(format!("Fix it: {label}")).strong().size(14.0).color(egui::Color32::from_rgb(0x1c, 0x14, 0x05)))
+                    .fill(AMBER)
+                    .corner_radius(6)
+                    .min_size(egui::Vec2::new(ui.available_width().min(360.0), 32.0));
+                if ui
+                    .add_enabled(!sampling, button)
+                    .on_disabled_hover_text("a pass is running")
+                    .on_hover_text(format!(
+                        "a targeted pass around the training samples that keep a class untrusted: {}. About 10 DFT solves each — random nudges each clearly apart from the sample and from each other, and steps toward its nearest learned neighbour — of which 2 are held out to check the result. Accepted only if the unchanged class rule then passes with the sample still in the fit and the checks pass; at most two rounds. Pauses the dynamics.",
+                        names.join(", ")
+                    ))
+                    .clicked()
+                {
+                    acts.push(Action::TeachAroundBlockers);
+                }
+            }
+        });
     for (i, c, ins, why) in &o.refused {
         ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
     }
