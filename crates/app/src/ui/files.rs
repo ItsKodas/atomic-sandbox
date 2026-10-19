@@ -321,8 +321,8 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     // Modal: centred on its measured size, the app dimmed behind it, Esc or a click outside closes
     let screen = ctx.content_rect();
     let size = Vec2::new(
-        (screen.width() * 0.8).min(1280.0),
-        (screen.height() * 0.8).min(900.0),
+        (screen.width() * 0.82).min(1600.0),
+        screen.height() * 0.86,
     )
     .max(Vec2::new(360.0, 300.0));
     let inner = size - Vec2::splat(28.0);
