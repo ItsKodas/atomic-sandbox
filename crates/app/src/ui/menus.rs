@@ -312,6 +312,11 @@ fn file_items(ui: &mut Ui, st: &mut UiState) {
         super::files::open_save(st);
         ui.close();
     }
+    ui.separator();
+    if ui.add(Button::new(RichText::new("Profiles…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("the app's layout and look: save, load, reset").clicked() {
+        super::profile::open(st);
+        ui.close();
+    }
 }
 
 fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {

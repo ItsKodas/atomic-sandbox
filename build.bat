@@ -47,6 +47,7 @@ if exist "dist\%NAME%.zip" del /q "dist\%NAME%.zip"
 
 mkdir "%OUT%\scenes" "%OUT%\models" "%OUT%\docs\images" >nul
 xcopy /e /i /q /y "models" "%OUT%\models" >nul || goto :copyfail
+if exist "profiles" xcopy /e /i /q /y "profiles" "%OUT%\profiles" >nul
 copy /y "target\release\app.exe" "%OUT%\AtomicSandbox.exe" >nul || goto :copyfail
 copy /y "README.md" "%OUT%\" >nul || goto :copyfail
 if exist "LICENSE" copy /y "LICENSE" "%OUT%\" >nul

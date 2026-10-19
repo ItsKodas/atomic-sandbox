@@ -476,10 +476,10 @@ fn main() {
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
     // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
     viewer.auto_pass = false;
-    // the docks' tab layout (drag a strip icon to reorder or move it): kept per user
+    // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        viewer.ui.layout_file = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("layout.txt"));
-        viewer.ui.load_layout();
+        viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("current.profile"));
+        ui::profile::load_current(&mut viewer.ui);
     }
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");

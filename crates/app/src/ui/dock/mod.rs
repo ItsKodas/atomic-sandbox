@@ -28,6 +28,7 @@ use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     side(root, st, input, acts, DockSide::Left);
     side(root, st, input, acts, DockSide::Right);
+    st.dock_w_set = None; // a profile's widths are applied for one frame
     drag_tabs(root.ctx(), st);
     if st.tab_shown(DockTab::Log) {
         st.log.unread = 0;
@@ -48,12 +49,16 @@ fn side(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<
             DockSide::Left => Margin { left: 8, right: 12, top: 8, bottom: 8 },
             DockSide::Right => Margin { left: 12, right: 8, top: 8, bottom: 8 },
         };
-        panel
+        let panel = match st.dock_w_set {
+            Some(w) => panel.exact_size(w[side as usize]),
+            None => panel.default_size(336.0), // 420 − 20 % (user request 2026-10-19)
+        };
+        let shown = panel
             .resizable(true)
-            .default_size(336.0) // 420 − 20 % (user request 2026-10-19)
             .size_range(280.0..=720.0)
             .frame(Frame::new().fill(theme::PANEL).inner_margin(margin))
             .show(root, |ui| body(ui, st, input, acts, side));
+        st.dock_w[side as usize] = shown.response.rect.width();
     }
     strip_panel
         .exact_size(44.0)

@@ -24,6 +24,7 @@ pub mod actions;
 pub mod activity;
 mod dock;
 mod files;
+pub mod profile;
 mod icons;
 pub mod logbook;
 mod menus;
@@ -605,6 +606,12 @@ pub struct UiState {
     pub strip_geom: [Option<(egui::Rect, Vec<(DockTab, egui::Rect)>)>; 2],
     /// Where the window saves the tab layout (`None`: headless, never saved).
     pub layout_file: Option<std::path::PathBuf>,
+    /// Each dock's panel width as last drawn (left, right), and a width a profile asks for
+    /// (applied for one frame).
+    pub dock_w: [f32; 2],
+    pub dock_w_set: Option<[f32; 2]>,
+    /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
+    pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
     /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
@@ -698,26 +705,6 @@ impl UiState {
         self.fix_selection(DockSide::Left);
         self.fix_selection(DockSide::Right);
         self.save_layout();
-    }
-
-    /// Reads the tab layout from `layout_file` (two lines, `left …` and `right …`, tab names);
-    /// a file that does not name every tab exactly once is ignored.
-    pub fn load_layout(&mut self) {
-        let Some(text) = self.layout_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return };
-        let parse = |key: &str| -> Option<Vec<DockTab>> {
-            let line = text.lines().find(|l| l.split_whitespace().next() == Some(key))?;
-            line.split_whitespace().skip(1).map(|w| DockTab::ALL.iter().copied().find(|t| format!("{t:?}") == w)).collect()
-        };
-        let (Some(l), Some(r)) = (parse("left"), parse("right")) else { return };
-        let mut all: Vec<DockTab> = l.iter().chain(&r).copied().collect();
-        all.sort_by_key(|t| *t as u8);
-        all.dedup();
-        if all.len() != DockTab::ALL.len() || l.len() + r.len() != DockTab::ALL.len() {
-            return;
-        }
-        (self.left_tabs, self.right_tabs) = (l, r);
-        self.fix_selection(DockSide::Left);
-        self.fix_selection(DockSide::Right);
     }
 
     fn save_layout(&self) {
@@ -829,6 +816,9 @@ right {}
             drag_tab: None,
             strip_geom: [None, None],
             layout_file: None,
+            dock_w: [336.0, 336.0],
+            dock_w_set: None,
+            profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
             temp_avg: TempAverage::default(),
@@ -1132,6 +1122,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
     files::show_save(root.ctx(), st, input, &mut acts);
+    profile::show(root.ctx(), st);
+    profile::autosave(st);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
