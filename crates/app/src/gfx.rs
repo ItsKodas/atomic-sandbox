@@ -231,8 +231,9 @@ pub struct Painter {
     /// The colour format the pipelines were built for (the capture's offscreen target matches it).
     pub format: wgpu::TextureFormat,
     /// The capture's own bloom chain and Camera-view glow targets (sized to the capture), swapped in
-    /// by [`Painter::paint_offscreen`] so the window's are not reallocated every captured frame.
-    capture_fx: Option<(render::bloom::Bloom, render::glow::GlowPass)>,
+    /// by [`Painter::paint_offscreen`] so the window's are not reallocated every captured frame, and
+    /// its egui renderer (the capture overlay's context has its own font atlas).
+    capture_fx: Option<(render::bloom::Bloom, render::glow::GlowPass, egui_wgpu::Renderer)>,
 }
 
 /// What [`Painter::show_display`] and [`Painter::show_orbitals`] did.
@@ -290,22 +291,32 @@ impl Painter {
         }
     }
 
-    /// The 3D view alone into the capture's offscreen `target` (`crate::capture`; no chrome): the
-    /// window's passes, bound for the frame to the target's depth and given the capture's own
-    /// bloom and glow targets, then rebound to `window_depth`. The caller sets the look first
-    /// ([`Painter::set_view`]). Display only.
-    pub fn paint_offscreen(&mut self, ctx: &GpuContext, target: Target<'_>, world: World<'_>, egui_ctx: &egui::Context, window_depth: &wgpu::TextureView) {
+    /// The 3D view into the capture's offscreen `target` (`crate::capture`) with the capture
+    /// overlay's egui output on top (`overlay`: its context and output; no output: nothing over
+    /// the view, and the context only tessellates nothing): the window's passes, bound for the frame to the target's depth and given the
+    /// capture's own bloom, glow and egui renderer, then rebound to `window_depth`. The caller sets
+    /// the look first ([`Painter::set_view`]). Display only.
+    pub fn paint_offscreen(&mut self, ctx: &GpuContext, target: Target<'_>, world: World<'_>, overlay: (&egui::Context, Option<egui::FullOutput>), window_depth: &wgpu::TextureView) {
         let format = self.format;
         let mut fx = self.capture_fx.take().unwrap_or_else(|| {
-            (render::bloom::Bloom::new(ctx, format), render::glow::GlowPass::new(ctx, format, &self.renderer.camera_uniform))
+            let options = egui_wgpu::RendererOptions { msaa_samples: 1, ..Default::default() };
+            (
+                render::bloom::Bloom::new(ctx, format),
+                render::glow::GlowPass::new(ctx, format, &self.renderer.camera_uniform),
+                egui_wgpu::Renderer::new(&ctx.device, format, options),
+            )
         });
         std::mem::swap(&mut self.bloom, &mut fx.0);
         std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        std::mem::swap(&mut self.egui, &mut fx.2);
         self.rebind(ctx, target.depth);
-        let none = egui::FullOutput { pixels_per_point: 1.0, ..Default::default() };
-        self.paint(ctx, target, world, egui_ctx, none);
+        // no overlay: an empty output, tessellated by any initialised context
+        let (egui_ctx, out) = overlay;
+        let out = out.unwrap_or(egui::FullOutput { pixels_per_point: 1.0, ..Default::default() });
+        self.paint(ctx, target, world, egui_ctx, out);
         std::mem::swap(&mut self.bloom, &mut fx.0);
         std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        std::mem::swap(&mut self.egui, &mut fx.2);
         self.capture_fx = Some(fx);
         self.rebind(ctx, window_depth);
     }

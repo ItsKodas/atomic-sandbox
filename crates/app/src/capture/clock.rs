@@ -44,6 +44,8 @@ pub struct Sample {
 pub struct SimFrame {
     pub index: u64,
     pub t_fs: f64,
+    /// The step at the frame's instant (interpolated between the snapshots', rounded).
+    pub step: u64,
     pub pos: Vec<[f64; 3]>,
     pub alpha: f64,
 }
@@ -122,17 +124,18 @@ impl SimClock {
                 // nothing before it in this stretch (the first snapshot, or after a break or a gap
                 // the history no longer holds): the frame is the snapshot itself
                 let s = &self.history[0];
-                SimFrame { index: self.index, t_fs: s.t_fs, pos: s.pos.clone(), alpha: 1.0 }
+                SimFrame { index: self.index, t_fs: s.t_fs, step: s.step, pos: s.pos.clone(), alpha: 1.0 }
             } else {
                 let (a, b) = (&self.history[after - 1], &self.history[after]);
                 let gap = b.t_fs - a.t_fs;
                 if gap > COARSE_SLICES * self.slice {
                     self.coarse += 1;
-                    SimFrame { index: self.index, t_fs: b.t_fs, pos: b.pos.clone(), alpha: 1.0 }
+                    SimFrame { index: self.index, t_fs: b.t_fs, step: b.step, pos: b.pos.clone(), alpha: 1.0 }
                 } else {
                     let alpha = ((next - a.t_fs) / gap).clamp(0.0, 1.0);
                     let pos = a.pos.iter().zip(&b.pos).map(|(p, q)| std::array::from_fn(|k| p[k] + alpha * (q[k] - p[k]))).collect();
-                    SimFrame { index: self.index, t_fs: next, pos, alpha }
+                    let step = a.step + (alpha * (b.step - a.step) as f64).round() as u64;
+                    SimFrame { index: self.index, t_fs: next, step, pos, alpha }
                 }
             };
             // the next frame one slice later — after this frame's time, which a snapshot frame
