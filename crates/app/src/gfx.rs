@@ -690,7 +690,8 @@ impl Painter {
             size_px: if glow { 2.2 * self.dots_size } else { 1.25 * self.dots_size },
             intensity: if glow { 0.18 * self.dots_brightness } else { 0.35 } * p.fade,
             colour_by: look.colour_by, signed: u32::from(look.signed),
-            walk: self.dots_float, refresh: 0.01, glow: u32::from(glow), _pad: 0,
+            // the fresh re-draws (which keep the walk honest) slow with the drift, so slow dots do not pop
+            walk: self.dots_float, refresh: 0.01 * (self.dots_float / 0.35).clamp(0.02, 1.0), glow: u32::from(glow), _pad: 0,
         });
     }
 

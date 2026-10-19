@@ -673,7 +673,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 ui.checkbox(&mut st.dots_glow, "glow").on_hover_text("soft dots whose light adds up: dense regions burn toward white");
             });
             if st.dots_float {
-                ui.add(egui::Slider::new(&mut st.dots_drift, 0.05..=1.5).text("drift (grid cells per frame)"));
+                ui.add(egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).text("drift (grid cells per frame)"));
             }
             ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount (× the default)"));
             ui.add(egui::Slider::new(&mut st.dots_size, 0.5..=3.0).text("dot size"));

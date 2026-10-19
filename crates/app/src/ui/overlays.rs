@@ -478,7 +478,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                             ui.label(format!("{:.1}×", st.dots_amount));
                             ui.add_space(8.0);
                             ui.label("drift");
-                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.05..=1.5).show_value(false))
+                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
                                 .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
                             ui.add_space(8.0);
                             ui.label("size");
