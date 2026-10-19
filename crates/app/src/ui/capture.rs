@@ -123,7 +123,8 @@ fn settings(ctx: &egui::Context, anchor: Rect, buttons: Rect, st: &mut UiState, 
                 theme::section(ui, "Capture");
                 let can_show_ui = cv.surface_copyable;
                 ui.add_enabled_ui(can_show_ui, |ui| {
-                    ui.checkbox(&mut s.hide_ui, "Hide the UI (the 3D view only)");
+                    ui.checkbox(&mut s.hide_ui, "Hide the UI (the 3D view only)")
+                        .on_hover_text("No chrome and no editor geometry: the cell box, walls, floor grid, axes, placement grid, selection highlight and bond-angle arcs are left out. Bonds, trails and the cloud stay.");
                 });
                 if !can_show_ui {
                     theme::note(ui, "this window's surface cannot be copied: captures are the 3D view only");

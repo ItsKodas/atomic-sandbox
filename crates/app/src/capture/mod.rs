@@ -636,7 +636,8 @@ impl crate::viewer::Viewer {
             _ => mix,
         };
         painter.set_view(ctx, &self.ui, fade, mix);
-        let lines = self.overlay_lines(&shown);
+        // no editor geometry (cell box, walls, floor, axes, placement grid) with the UI hidden
+        let lines = self.scene_lines(&shown, false);
         let risk = self.atom_risk();
         let blur = if self.ui.camera_view || at.is_some() { Vec::new() } else { self.blur_ghosts(&shown) };
         let frames = match (self.ui.camera_view, at) {

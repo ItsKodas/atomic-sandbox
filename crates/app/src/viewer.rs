@@ -1890,7 +1890,15 @@ impl Viewer {
     /// the atom trails with View ▸ Display aids ▸ Trails on and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
     /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
     pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
-        let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        self.scene_lines(shown, true)
+    }
+
+    /// [`Viewer::overlay_lines`]; `editor` false leaves out the editor's geometry — the cell box,
+    /// the walls, the floor grid, the axes, the placement grid — and the bond-angle arcs (their
+    /// numbers are chrome): a capture with the UI hidden (`crate::capture`). Bonds, trails, core
+    /// overlaps and the training ghost stay — they are the scene.
+    pub fn scene_lines(&self, shown: &Scene, editor: bool) -> Vec<render::lines::LineVertex> {
+        let mut lines = if editor { crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode) } else { Vec::new() };
         // while a sampling pass runs the ghost of its job replaces the scene: the cell and the
         // walls stay, the scene's bonds do not
         if let Some(g) = self.ghost_now() {
@@ -1912,7 +1920,7 @@ impl Viewer {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
             lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
         }
-        if let Some((marks, stale)) = self.angle_marks(shown) {
+        if let Some((marks, stale)) = self.angle_marks(shown).filter(|_| editor) {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
             for m in &marks {
                 lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), stale));
