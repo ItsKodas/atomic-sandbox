@@ -647,6 +647,32 @@
 //! one teacher answer in [`THIN_EVERY`] is kept, with a note saying how many are held and
 //! that a sampling pass is what builds the model.
 //!
+//! **A fit that does not form** (2026-10-20, the PH₃ session: its isolated P reference did not
+//! solve, so the model stayed unfitted, Save was unavailable and the session autosave deleted
+//! the minutes of DFT it had taught). Samples without a model are state worth keeping:
+//! - **Saved.** `save_sidecar` writes them as a samples-only file (`surrogate::sidecar` version
+//!   6) with the reference energies known and the solve record; the worker's autosave keeps
+//!   such a state instead of removing the file. Loading one ([`install_samples`](SurrogateKs::install_samples))
+//!   restores the samples and fits when a fit can form.
+//! - **Said plainly.** [`no_model`](SurrogateKs::no_model) gives the reason, in this order: a
+//!   species whose reference is missing ("the P atom reference did not solve (4 cold attempts:
+//!   SCF stalled …)" — the failed scan is remembered per species until an energy arrives), too
+//!   few usable samples for Q′, the last fit error, a fit not made yet; `TrainableStatus::no_model`
+//!   carries the words to the Model and Activity tabs.
+//! - **Retried where that can help** (physics review of the fix). A cold solve is deterministic, so
+//!   the reference scan retries only a multiplicity lost to the device, once, cold, after its first
+//!   round (`sim::references`, "The retry round"; each attempt an Activity event). A reference whose
+//!   SCF itself failed (stalled, capped) is said to be reproducible and gets no Retry: this surface
+//!   cannot have a model until the solver converges that atom there. A reference not solved yet
+//!   (samples loaded from a file, a pass cancelled) or lost to the device gets the Model tab's
+//!   Retry ([`retry_fit`](SurrogateKs::retry_fit)): a references-only pass for the missing species
+//!   (`Sampler::references_only`, on the scene — refused when the scene's surface is not the
+//!   samples', and under an ionic policy when the scene lacks the species, whose lone atom could
+//!   otherwise be solved on another surface) whose end refits like any pass; with every reference
+//!   known it refits at once; with too few samples it is not offered (sample more). A samples-only
+//!   file's references of another rule than S9 are not fitted on (they count as missing). The
+//!   reference rule is untouched: the lowest-energy converged multiplicity is the reference.
+//!
 //! # One-surface energy accounting (spec §5)
 //!
 //! The driver's `E_conserved` must be computed on ONE potential-energy surface, or every hand-
@@ -779,6 +805,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
+use units::isotopes::symbol;
 use surrogate::{
     describe_values, Accumulator, ActiveSet, Basis, Envelope, FitError, FitOptions, FitReport, Model, NullSpace, Provenance,
     Sample, SampleStore, SampleTag, StoreError,
@@ -1028,6 +1055,11 @@ pub struct SurrogateKs {
     ref_cache: AtomReferences,
     /// Messages for the user from the `Trainable` operations (`Trainable::take_notes`).
     user_notes: Vec<String>,
+    /// Species whose isolated-atom reference scan converged nothing in a pass, with how it failed
+    /// (module doc, "No model yet"); cleared by a reference energy for the species.
+    failed_refs: BTreeMap<u8, crate::sampling::FailedReference>,
+    /// The last refit's error while no model formed (module doc, "No model yet"); cleared by a fit.
+    last_fit_error: Option<String>,
     /// The store length when the running (or last) sampling pass started: its samples are the
     /// pass-tagged ones from there (`finish_pass`'s coverage).
     pass_start: Option<usize>,
@@ -1146,6 +1178,8 @@ impl SurrogateKs {
             last_pass: None,
             ref_cache: AtomReferences::default(),
             user_notes: Vec::new(),
+            failed_refs: BTreeMap::new(),
+            last_fit_error: None,
             probe: None,
             ledger: Ledger::default(),
             strict_verdict: None,
@@ -1855,10 +1889,19 @@ impl SurrogateKs {
         let shells = sampler.take_shell_checks();
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
+        if let Some(f) = sampler.take_failed_reference() {
+            self.failed_refs.insert(f.z, f);
+        }
         self.last_pass = Some(progress.clone());
         let added = sampler.samples_added();
         let how = if progress.cancelled { "cancelled" } else { "finished" };
-        let kind = if teach.is_some() { "teach-around pass" } else { "sampling pass" };
+        let kind = if teach.is_some() {
+            "teach-around pass"
+        } else if sampler.is_references_only() {
+            "reference retry"
+        } else {
+            "sampling pass"
+        };
         self.teacher.discontinuity();
         let (fittable, q_prime) = self.fittable_and_q_prime();
         let msg = if self.samples() == 0 {
@@ -1890,7 +1933,12 @@ impl SurrogateKs {
                         coverage.as_ref().and_then(PassCoverage::words).map_or(String::new(), |w| format!(". {w}"))
                     )
                 }
-                Err(e) => format!("{kind} {how}: {added} samples added; the refit failed ({e})"),
+                Err(e) => {
+                    if self.model.is_none() {
+                        self.last_fit_error = Some(e.to_string());
+                    }
+                    format!("{kind} {how}: {added} samples added; the refit failed ({e})")
+                }
             }
         };
         self.pass_coverage = self.compute_pass_coverage();
@@ -2061,8 +2109,13 @@ impl Trainable for SurrogateKs {
     }
 
     fn refit(&mut self) -> Result<String, String> {
-        SurrogateKs::refit(self)
-            .map(|r| format!("{} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_energy_per_atom, r.rmse_force))
+        let r = SurrogateKs::refit(self);
+        if let Err(e) = &r {
+            if self.model.is_none() {
+                self.last_fit_error = Some(e.to_string());
+            }
+        }
+        r.map(|r| format!("{} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_energy_per_atom, r.rmse_force))
             .map_err(|e| e.to_string())
     }
 
@@ -2086,7 +2139,10 @@ impl Trainable for SurrogateKs {
         if self.pass.is_some() {
             return Err("load model: cancel the running sampling pass first".into());
         }
-        let sc = surrogate::sidecar::read(path).map_err(|e| format!("load model: {e}"))?;
+        let sc = match surrogate::sidecar::read_any(path).map_err(|e| format!("load model: {e}"))? {
+            surrogate::sidecar::Contents::Fitted(sc) => *sc,
+            surrogate::sidecar::Contents::Samples(set) => return self.load_samples(path, set, scene),
+        };
         let want = self.provenance_for(scene);
         if sc.model.provenance != want {
             let msg = format!(
@@ -2132,6 +2188,10 @@ impl Trainable for SurrogateKs {
         SurrogateKs::teacher_mut(self)
     }
 
+    fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
+        SurrogateKs::retry_fit(self, scene, refs)
+    }
+
     fn status(&self, scene: &Scene, forces: &[[f64; 3]]) -> TrainableStatus {
         let fmin = forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(f64::INFINITY, f64::min);
         TrainableStatus {
@@ -2169,6 +2229,8 @@ impl Trainable for SurrogateKs {
             model_gen: self.model_generation(),
             readiness: self.readiness(scene),
             teach_offer: self.teach_offer(),
+            no_model: self.no_model().map(|n| n.words),
+            retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
         }
     }
 
@@ -2238,6 +2300,188 @@ impl Trainable for SurrogateKs {
 
     fn atom_reference_done(&self) -> Option<usize> {
         SurrogateKs::atom_reference_done(self)
+    }
+}
+
+/// Why samples are held but no model formed (module doc, "No model yet"): the plain words, and
+/// whether the Retry (`SurrogateKs::retry_fit`) can help.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoModel {
+    pub words: String,
+    pub retry: bool,
+    /// The species without a reference energy (sorted).
+    pub missing: Vec<u8>,
+}
+
+impl SurrogateKs {
+    /// `Trainable::load` of a samples-only file (`surrogate::sidecar` version 6): the provenance
+    /// checked against `scene` as for a model, then `install_samples` — which fits when it can —
+    /// and its S9 references seeded into the cache (a later pass skips their scans).
+    fn load_samples(&mut self, path: &std::path::Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
+        let want = self.provenance_for(scene);
+        if set.provenance != want {
+            let msg = format!(
+                "samples {} refused: they were taught at {} but the scene is solved at {} — another Kohn-Sham surface",
+                path.display(),
+                set.provenance.describe(),
+                want.describe()
+            );
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
+        let prov = set.provenance.clone();
+        let refs = set.references.clone();
+        let s9 = set.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
+        let n = set.samples.len();
+        self.install_samples(set).map_err(|e| format!("load model {}: {e}", path.display()))?;
+        if s9 {
+            for (z, e) in refs {
+                self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
+            }
+        }
+        self.last_pass = None;
+        let state = match self.no_model() {
+            None if self.trusted() => "fitted, trusted".to_string(),
+            None => "fitted, untrusted".to_string(),
+            Some(nm) => nm.words,
+        };
+        self.user_notes.push(format!("samples loaded from {} ({n} samples, saved before a model formed): {state}", path.display()));
+        Ok(())
+    }
+
+    /// Why there is no model although samples are held (module doc, "No model yet"); `None` with a
+    /// model or without samples. In order: a species whose isolated-atom reference is missing (and
+    /// how its scan failed, if it did), too few samples to fit (Q′), the last fit error, else a
+    /// fit not yet made.
+    pub fn no_model(&self) -> Option<NoModel> {
+        if self.model.is_some() || self.samples() == 0 {
+            return None;
+        }
+        let store = self.store.as_ref()?;
+        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        let missing: Vec<u8> = species.iter().copied().filter(|z| !self.refs.get(z).is_some_and(|e| e.is_finite())).collect();
+        let (fittable, q_prime) = self.fittable_and_q_prime();
+        let n = self.samples();
+        // a reference whose SCF itself fails: a cold solve is deterministic (`sim::references`,
+        // "The retry round"), so neither Retry nor another pass on this surface can change it
+        let stuck: Vec<&crate::sampling::FailedReference> = missing.iter().filter_map(|z| self.failed_refs.get(z)).filter(|f| !f.transient).collect();
+        if !stuck.is_empty() {
+            let parts: Vec<String> = stuck.iter().map(|f| format!("the {} atom reference did not solve ({})", symbol(f.z), f.why)).collect();
+            return Some(NoModel {
+                words: format!(
+                    "no model yet: {}. A cold solve is deterministic, so retrying here fails the same way: this solver does not converge that isolated atom at this grid and ionic potential, and a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept — Save model… writes them — but they belong to this surface (another grid or ionic potential is another one)",
+                    parts.join("; ")
+                ),
+                retry: false,
+                missing,
+            });
+        }
+        if !missing.is_empty() {
+            let parts: Vec<String> = missing
+                .iter()
+                .map(|&z| match self.failed_refs.get(&z) {
+                    Some(f) => format!("the {} atom reference was lost to the device ({}; GPU busy — a retry may succeed)", symbol(z), f.why),
+                    None => format!("the {} atom reference is not solved yet", symbol(z)),
+                })
+                .collect();
+            if fittable < q_prime {
+                // a pass solves the references first: sampling more is the remedy for both
+                return Some(NoModel {
+                    words: format!(
+                        "no model yet: {} usable samples, a fit needs Q′ = {q_prime}, and {} — sample more (a pass solves the references first; the {n} samples so far are kept)",
+                        fittable,
+                        parts.join("; ")
+                    ),
+                    retry: false,
+                    missing,
+                });
+            }
+            return Some(NoModel {
+                words: format!(
+                    "no model yet: {} — a fit needs every species' isolated-atom energy. The {n} samples taught so far are kept (Save model… writes them); Retry solves the reference (every allowed multiplicity, cold) and fits",
+                    parts.join("; ")
+                ),
+                retry: true,
+                missing,
+            });
+        }
+        if fittable < q_prime {
+            return Some(NoModel {
+                words: format!("no model yet: {fittable} usable samples, a fit needs Q′ = {q_prime} — sample more (the {n} samples so far are kept)"),
+                retry: false,
+                missing,
+            });
+        }
+        let words = match &self.last_fit_error {
+            Some(e) => format!("no model yet: the fit failed ({e}) — Retry fits the {n} samples again"),
+            None => format!("no model yet: the {n} samples are not fitted — Retry fits them"),
+        };
+        Some(NoModel { words, retry: true, missing })
+    }
+
+    /// The Retry (`Trainable::retry_fit`; module doc, "No model yet"): a references-only pass over
+    /// the missing species on `scene` (whose settings must be the samples' — another grid's
+    /// reference would be another surface's), started like any pass; else a refit at once. `Err`
+    /// while a pass runs, with nothing to retry, for another surface, with too few samples, for a
+    /// reference whose SCF itself failed (deterministic), and — under an ionic policy — for a
+    /// missing species with no nucleus in the scene: the provenance tag says nothing about a
+    /// species the scene lacks, so its lone atom could be solved on another surface (pseudised
+    /// against all-electron samples) and cached under the samples' key (physics review of the fix).
+    pub fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
+        if self.pass.is_some() {
+            return Err("a pass is already running (cancel it first)".into());
+        }
+        let Some(nm) = self.no_model() else {
+            return Err(if self.model.is_some() { "the model is fitted".into() } else { "no samples yet: start sampling".into() });
+        };
+        if !nm.retry {
+            return Err(nm.words);
+        }
+        if !nm.missing.is_empty() {
+            let want = self.provenance_for(scene);
+            if let Some(store) = &self.store {
+                if store.provenance != want {
+                    return Err(format!(
+                        "the samples were taught at {} but the scene is solved at {} — the reference must be on the samples' surface (switch the scene back, or forget the samples)",
+                        store.provenance.describe(),
+                        want.describe()
+                    ));
+                }
+            }
+            if scene.ionic != sim::IonicPolicy::None {
+                if let Some(&z) = nm.missing.iter().find(|&&z| !scene.nuclei.iter().any(|n| n.z == z)) {
+                    return Err(format!(
+                        "the scene has no {} atom: under an ionic potential its reference must be solved with one in the scene, so that the scene's settings are the samples' for it too (put one back, or set Physics ▸ Ionic potential to none if the samples are all-electron)",
+                        symbol(z)
+                    ));
+                }
+            }
+            let sampler = Sampler::references_only(scene, &nm.missing)?;
+            for (key, r) in refs.iter() {
+                if self.ref_cache.get(key).is_none() {
+                    self.ref_cache.insert(key.clone(), r.clone());
+                }
+            }
+            let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
+            self.pass_start = Some(self.samples());
+            let names: Vec<&str> = nm.missing.iter().map(|&z| symbol(z)).collect();
+            self.user_notes.push(format!(
+                "reference retry started: the isolated {} atom{} (every allowed multiplicity, cold); the model is fitted at its end",
+                names.join(", "),
+                if names.len() == 1 { "" } else { "s" }
+            ));
+            self.pass = Some(sampler);
+            return Ok(true);
+        }
+        match Trainable::refit(self) {
+            Ok(summary) => {
+                self.user_notes.push(format!("retry: fitted ({summary})"));
+                Ok(false)
+            }
+            Err(e) => Err(format!("the fit failed again ({e})")),
+        }
     }
 }
 

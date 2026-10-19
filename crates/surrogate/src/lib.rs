@@ -35,4 +35,4 @@ pub use fit::{
 pub use model::{energy_and_forces, Model, Prediction, Provenance};
 pub use grade::ActiveSet;
 pub use novelty::NullSpace;
-pub use sidecar::Sidecar;
+pub use sidecar::{SampleSet, Sidecar};

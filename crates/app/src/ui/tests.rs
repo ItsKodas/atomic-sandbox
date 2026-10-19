@@ -200,6 +200,8 @@ pub(crate) fn model() -> ModelStatus {
         solve_s_measured: false,
         pass_eta_s: Some(25.0),
         pass_offer: None,
+        no_model: None,
+        retry_fit: false,
     }
 }
 
@@ -1138,6 +1140,35 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample"));
     assert!(matches!(c.as_slice(), [DynCommand::StartSampling(p)] if p.seed == seed), "{c:?}");
     assert_eq!(st.plan.seed, seed + 1);
+}
+
+/// The 2026-10-20 PH₃ data loss: samples held but no model formed — the Model tab shows the reason
+/// and its Retry sends `RetryFit`, and so does the Activity tab's trust group.
+#[test]
+fn a_fit_that_did_not_form_shows_why_and_retries() {
+    let scene = Scene::preset("ph3").unwrap();
+    let cam = camera();
+    let why = "no model yet: the P atom reference did not solve (2 cold attempts: SCF stalled)";
+    let m = ModelStatus { fitted: false, trusted: false, fit: None, samples: 41, no_model: Some(why.into()), retry_fit: true, ..model() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("ph3", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
+    assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
+    // the Activity tab's trust group says the same and retries too
+    st.open_tab(DockTab::Activity);
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
+    assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
 }
 
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the

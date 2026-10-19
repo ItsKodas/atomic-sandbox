@@ -41,6 +41,7 @@ impl SurrogateKs {
     /// lowest-energy multiplicity — what `crate::sampling` computes); the sidecar records it.
     pub fn set_reference_energy(&mut self, z: u8, e: f64) {
         self.legacy_refs.remove(&z);
+        self.failed_refs.remove(&z);
         if self.refs.insert(z, e) != Some(e) {
             self.refs_dirty = true;
         }
@@ -122,6 +123,8 @@ impl SurrogateKs {
         self.desc_cache.clear();
         self.desc_basis = None;
         self.recovery = None;
+        self.failed_refs.clear();
+        self.last_fit_error = None;
         self.reset_audits();
         // a new model's lifetime starts here (the queued events stay: they happened)
         self.ledger.counts = SolveCounts::default();
@@ -130,12 +133,10 @@ impl SurrogateKs {
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
     /// report and every sample held — including any taken since the last refit, which a load
     /// restores as pending — and the lifetime teaching solves (`teacher_solves`, with
-    /// `complete: false` while earlier solves are unrecorded: plan review M4). `InvalidInput` if
-    /// nothing has been fitted yet.
+    /// `complete: false` while earlier solves are unrecorded: plan review M4). Before any fit
+    /// formed (module doc, "No model yet") the samples alone, with the reference energies known
+    /// (`surrogate::sidecar` version 6). `InvalidInput` with no samples at all.
     pub fn save_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let (Some(model), Some(acc)) = (&self.model, &self.accumulator) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no fitted model to save (sample and refit first)"));
-        };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
         // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it)
@@ -148,6 +149,25 @@ impl SurrogateKs {
         };
         let c = self.ledger.counts;
         let solves = TeacherSolves { pass: c.pass, fallback: c.fallback, audit: c.audit, verification: c.verification, kept: c.kept, complete: !c.unrecorded_before };
+        let (Some(model), Some(acc)) = (&self.model, &self.accumulator) else {
+            let Some(store) = self.store.as_ref().filter(|s| !s.is_empty()) else {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "nothing to save: no samples yet (start sampling first)"));
+            };
+            // no fit formed: the samples and what is known of the references (a failed fit must
+            // not lose minutes of DFT — the 2026-10-20 PH₃ session)
+            let set = surrogate::SampleSet {
+                provenance: store.provenance.clone(),
+                samples: samples.to_vec(),
+                references: self.refs.iter().filter(|(_, e)| e.is_finite()).map(|(&z, &e)| (z, e)).collect(),
+                reference_rule: rule.map(str::to_string),
+                quarantine: flags,
+                face_density: face,
+                teacher_solves: Some(solves),
+                teacher_solves_note: None,
+                created_by: surrogate::sidecar::CREATED_BY.to_string(),
+            };
+            return surrogate::sidecar::write_samples(path, &set);
+        };
         // the failed audits not yet re-earned, and the audit fences (round 1, SHOULD-2)
         let case = |c: &FailedAudit, fenced: bool| surrogate::sidecar::AuditCase {
             pos: c.pos.clone(),
@@ -163,6 +183,65 @@ impl SurrogateKs {
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
         surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
+    }
+
+    /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
+    /// version 6; module doc, "No model yet"): the samples with their flags and face densities,
+    /// the reference energies the file knew and its solve record — then a fit when one can form
+    /// (every species' reference known and Q′ usable samples). A fit that cannot form leaves the
+    /// samples installed and unfitted: `no_model` says why and the Retry re-solves a missing
+    /// reference. The caller has checked the provenance against the scene.
+    pub fn install_samples(&mut self, set: surrogate::SampleSet) -> Result<(), String> {
+        let surrogate::SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, .. } = set;
+        if !quarantine.is_empty() && quarantine.len() != samples.len() {
+            return Err(format!("the file has {} quarantine flags for {} samples", quarantine.len(), samples.len()));
+        }
+        let mut store = SampleStore::new(provenance);
+        for (i, smp) in samples.into_iter().enumerate() {
+            store.push(smp).map_err(|e| format!("sample {i}: {e}"))?;
+        }
+        // a draft guess's audit is held out of the fit (`Q_DRAFT`): restored from its tag
+        let mut quarantine = quarantine;
+        if store.samples.iter().any(|s| s.tag == SampleTag::DraftAudit) {
+            quarantine.resize(store.len(), Q_NONE);
+            for (i, s) in store.samples.iter().enumerate() {
+                if s.tag == SampleTag::DraftAudit && quarantine[i] == Q_NONE {
+                    quarantine[i] = Q_DRAFT;
+                }
+            }
+        }
+        // a clean slate (what `forget` leaves), the epoch moved if a model was answering
+        self.forget();
+        let n = store.len();
+        self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
+        self.store = Some(store);
+        self.quarantine = quarantine;
+        // references of another rule are not fitted on (a new fit would bake them in — the model has
+        // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
+        let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
+        if s9 {
+            for &(z, e) in &references {
+                self.refs.insert(z, e);
+            }
+        } else if !references.is_empty() {
+            self.user_notes.push("samples file: its reference energies predate ruling S9 (lowest-energy multiplicity) — not used; Retry or a sampling pass re-solves them".into());
+        }
+        self.refs_dirty = true;
+        self.pending_refit = true;
+        self.ledger.counts = match teacher_solves {
+            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete },
+            None => SolveCounts { unrecorded_before: true, ..SolveCounts::default() },
+        };
+        if let Some(n) = teacher_solves_note {
+            self.user_notes.push(format!("surrogate: {n}"));
+        }
+        // the fit, when one can form (the refit's own errors are the reason shown otherwise)
+        if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
+            if let Err(e) = SurrogateKs::refit(self) {
+                self.last_fit_error = Some(e.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
