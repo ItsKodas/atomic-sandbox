@@ -14,9 +14,11 @@
 //! exclude the cores entirely, and the panel says so instead.
 //!
 //! Interpreter: `ATOMIC_SANDBOX_PYTHON` (a path, or a command line such as `wsl -e python3`), else
-//! `python`, `python3`, `py -3`, and on Windows `wsl -e python3` — PySCF publishes no Windows
-//! build, so WSL is the usual way there. The first that answers `--probe` with PySCF is used.
+//! the one the panel's "Set up PySCF" makes ([`setup`]: on Windows a private WSL distro, since PySCF
+//! publishes no Windows build), else `python`, `python3`, `py -3`, and on Windows `wsl -e python3`.
+//! The first that answers `--probe` with PySCF is used.
 pub mod json;
+pub mod setup;
 
 use json::Json;
 use std::io::{Read, Write};
@@ -214,6 +216,8 @@ pub fn candidates() -> Vec<Vec<String>> {
             out.push(if Path::new(&v).is_file() { vec![v] } else { v.split_whitespace().map(str::to_string).collect() });
         }
     }
+    // the one "Set up PySCF" makes (`setup`), before anything on PATH
+    out.extend(setup::managed_interpreter());
     let words: &[&[&str]] = if cfg!(windows) { &[&["python"], &["python3"], &["py", "-3"], &["wsl", "-e", "python3"]] } else { &[&["python3"], &["python"]] };
     out.extend(words.iter().map(|w| w.iter().map(|s| s.to_string()).collect()));
     out
@@ -416,11 +420,14 @@ pub struct Compare {
     pub arrows: bool,
     /// Physics ▸ Compare with reference… asked for the section open.
     pub open_request: bool,
+    /// "Set up PySCF": its plan is shown (the first press), and the setup itself.
+    pub setup_armed: bool,
+    pub setup: Option<setup::Setup>,
 }
 
 impl Default for Compare {
     fn default() -> Compare {
-        Compare { method: Method::Lda, relax: false, timeout_min: Method::Lda.default_timeout_min(), probe: Probe::NotRun, run: None, arrows: true, open_request: false }
+        Compare { method: Method::Lda, relax: false, timeout_min: Method::Lda.default_timeout_min(), probe: Probe::NotRun, run: None, arrows: true, open_request: false, setup_armed: false, setup: None }
     }
 }
 
@@ -465,6 +472,20 @@ impl Compare {
         Ok(())
     }
 
+    /// The panel's "Set up PySCF" (`Action::SetupPyscf`): the first press shows the plan, the second
+    /// starts it; refused while one runs.
+    pub fn setup_pressed(&mut self) {
+        if self.setup.as_ref().is_some_and(setup::Setup::running) {
+            return;
+        }
+        if self.setup_armed {
+            self.setup_armed = false;
+            self.setup = Some(setup::Setup::start());
+        } else {
+            self.setup_armed = true;
+        }
+    }
+
     pub fn cancel(&mut self) {
         if let Some(job) = self.run.as_ref().and_then(|r| r.job.as_ref()) {
             job.cancel.store(true, Ordering::Relaxed);
@@ -481,6 +502,11 @@ impl Compare {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.probe = Probe::Missing("the probe thread ended".into()),
             }
+        }
+        // a finished setup: look again (its interpreter is the first candidate)
+        if self.setup.as_mut().is_some_and(|x| x.poll() && x.result.as_ref().is_some_and(|r| r.is_ok())) {
+            self.probe = Probe::NotRun;
+            self.ensure_probe();
         }
         let Some(run) = self.run.as_mut() else { return };
         if let Some(job) = &run.job {

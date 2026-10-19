@@ -40,17 +40,19 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 theme::light(ui, AMBER);
                 ui.label(RichText::new(reference::INSTALL_HINT).color(AMBER));
             });
-            theme::note(
-                ui,
-                "PySCF has no Windows build: install it inside WSL (`wsl -e python3` is tried), or set ATOMIC_SANDBOX_PYTHON to an interpreter that has it. Relaxing the reference also needs `pip install geometric`.",
-            );
             let why = why.clone();
-            egui::CollapsingHeader::new("what was tried").id_salt("compare-tried").show(ui, |ui| {
+            setup_ui(ui, st, acts);
+            egui::CollapsingHeader::new("set it up by hand instead").id_salt("compare-manual").show(ui, |ui| {
+                theme::note(
+                    ui,
+                    "PySCF has no Windows build: install it inside WSL (`wsl -e python3` is tried), or set ATOMIC_SANDBOX_PYTHON to an interpreter that has it. Relaxing the reference also needs `pip install geometric`.",
+                );
+                ui.label(RichText::new("what was tried:").size(10.5).color(theme::INK_FAINT));
                 ui.label(RichText::new(why).monospace().size(10.5).color(theme::INK_FAINT));
+                if ui.button("Check again").clicked() {
+                    st.compare.probe = Probe::NotRun;
+                }
             });
-            if ui.button("Check again").clicked() {
-                st.compare.probe = Probe::NotRun;
-            }
             return;
         }
         Probe::Ready(i) => {
@@ -102,6 +104,60 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         }
     });
     results(ui, st, input);
+}
+
+/// "Set up PySCF": the button, the plan (first press), the running step with its log and Cancel,
+/// the failure with Try again (`reference::setup`).
+fn setup_ui(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    use reference::setup;
+    let running = st.compare.setup.as_ref().is_some_and(setup::Setup::running);
+    if running {
+        let x = st.compare.setup.as_ref().unwrap();
+        let (k, n, label) = *x.step.lock().unwrap();
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new(format!("setting up PySCF — step {k} of {n}: {label} · {:.0} s", x.started.elapsed().as_secs_f64())).color(theme::INK_DIM));
+        });
+        if ui.button("Cancel setup").on_hover_text("stops the current step; what is installed stays, and Set up continues from there next time").clicked() {
+            acts.push(Action::CancelSetup);
+        }
+        log_view(ui, &x.log.lock().unwrap());
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        return;
+    }
+    if let Some(Err(e)) = st.compare.setup.as_ref().and_then(|x| x.result.as_ref()) {
+        ui.label(RichText::new(format!("setup stopped: {e}")).color(RED));
+        let lines = st.compare.setup.as_ref().unwrap().log.lock().unwrap().clone();
+        egui::CollapsingHeader::new("setup log").id_salt("compare-setup-log").default_open(true).show(ui, |ui| log_view(ui, &lines));
+    }
+    if st.compare.setup_armed {
+        theme::note(ui, setup::plan_text());
+        ui.horizontal(|ui| {
+            if ui.button("Start setup").clicked() {
+                acts.push(Action::SetupPyscf);
+            }
+            if ui.button("Not now").clicked() {
+                st.compare.setup_armed = false;
+            }
+        });
+    } else {
+        let again = st.compare.setup.is_some();
+        if ui.button(if again { "Try setup again" } else { "Set up PySCF" }).on_hover_text("installs a private Python with PySCF for the comparison (shows what it will do first)").clicked() {
+            acts.push(Action::SetupPyscf);
+        }
+    }
+}
+
+/// The newest lines of a setup log, monospace, scrolled to the end.
+fn log_view(ui: &mut Ui, lines: &[String]) {
+    egui::Frame::new().fill(theme::PANEL_2).corner_radius(5).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("compare-setup-scroll").max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for l in lines.iter().rev().take(200).rev() {
+                ui.label(RichText::new(l).monospace().size(10.0).color(theme::INK_DIM));
+            }
+        });
+    });
 }
 
 fn results(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {

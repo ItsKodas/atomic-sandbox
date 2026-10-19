@@ -391,6 +391,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
+        Action::SetupPyscf => "setup-pyscf",
+        Action::CancelSetup => "cancel-setup",
         _ => "action",
     })
 }
@@ -399,7 +401,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 /// make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference")
+    // nor does setting up PySCF (a replay never installs software: skipped)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

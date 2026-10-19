@@ -173,6 +173,11 @@ pub enum Action {
     CompareReference { method: crate::reference::Method, relax: bool },
     /// Kill the reference process in flight (script word `cancel-compare`).
     CancelCompare,
+    /// "Set up PySCF" (`reference::setup`): the first press shows the plan, the second installs.
+    /// Recorded, not replayable (it installs software); a replay skips it.
+    SetupPyscf,
+    /// Stop the setup at its current step.
+    CancelSetup,
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -493,6 +498,12 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
         Action::CompareReference { method, relax } => compare_reference(st, input, method, relax, out),
         Action::CancelCompare => st.compare.cancel(),
+        Action::SetupPyscf => st.compare.setup_pressed(),
+        Action::CancelSetup => {
+            if let Some(x) = &st.compare.setup {
+                x.cancel();
+            }
+        }
         Action::SmoothMotion(on) => st.smooth_motion = on,
         Action::Show(mode) => {
             let was = st.show;
@@ -730,7 +741,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | CompareReference { .. } => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | CompareReference { .. } | SetupPyscf | CancelSetup => return None,
         })
     }
 

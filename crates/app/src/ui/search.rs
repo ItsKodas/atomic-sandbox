@@ -135,6 +135,7 @@ pub const ENTRIES: &[Entry] = &[
     e("dt warning", "health", Dock(D::Readouts), "d-health"),
     e("Dynamics notes", "thermostat Maxwell-Boltzmann", Dock(D::Readouts), "d-health"),
     e("Energy breakdown and solver", "kinetic external Hartree xc nuclear SCF residual Poisson ρ max", Dock(D::Readouts), "d-breakdown"),
+    e("Set up PySCF", "install python pyscf wsl pip reference enable", Dock(D::Readouts), "d-compare"),
     e("Compare with reference (PySCF)", "pyscf reference forces dipole relax both bond lengths angles lda pbe b3lyp ccsd(t) deviation", Dock(D::Readouts), "d-compare"),
     // Graph
     e("Graph: E total and T", "sparkline plot history curve", Dock(D::Graph), "d-graph"),
