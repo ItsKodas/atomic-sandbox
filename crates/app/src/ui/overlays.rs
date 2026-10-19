@@ -449,27 +449,37 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                     gizmo(ui, input);
                 }
                 egui::Frame::new().fill(theme::CARD).corner_radius(7).show(ui, |ui| {
-                    let current = if st.camera_view { 3 } else { st.volume_mode };
                     if let Some(m) = theme::segmented(
                         ui,
-                        current,
+                        st.volume_mode,
                         &[
                             (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › Density for gamma and opacity)"),
                             (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › Density, and the iso slider in the Orbitals tab)"),
                             (2, "Dots", dots_tip.as_str()),
-                            (3, "Camera", "what an atom looks like: no surface, a soft electron glow densest at the centre; a moving atom streaks over the shutter (a time-average, like a camera's exposure)"),
                         ],
                     ) {
-                        if m == 3 {
-                            st.camera_view = true;
-                        } else {
+                        // the Camera view draws no isosurface: picking it leaves the Camera view
+                        if m == super::VOLUME_ISO {
                             st.camera_view = false;
-                            acts.push(Action::VolumeMode(m));
+                        }
+                        acts.push(Action::VolumeMode(m));
+                    }
+                });
+                // Camera: a toggle over Volume or Dots (the atoms as they look; Isosurface turns it off)
+                egui::Frame::new().fill(theme::CARD).corner_radius(7).show(ui, |ui| {
+                    let on = st.camera_view;
+                    let r = ui.add(egui::Button::selectable(on, "Camera")).on_hover_text(
+                        "what an atom looks like: no surface, a soft electron glow densest at the centre (or solid balls); a moving atom streaks over the shutter — over the Volume or the Dots (not the Isosurface)",
+                    );
+                    if r.clicked() {
+                        st.camera_view = !on;
+                        if st.camera_view && st.volume_mode == super::VOLUME_ISO {
+                            acts.push(Action::VolumeMode(super::VOLUME_VOLUME));
                         }
                     }
                 });
                 // the dots' density, drift speed and size, beside the switch while Dots is on
-                if !st.camera_view && st.volume_mode == super::VOLUME_DOTS {
+                if st.volume_mode == super::VOLUME_DOTS {
                     egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().slider_width = 90.0;
