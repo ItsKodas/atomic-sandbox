@@ -581,6 +581,9 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
     if s.scene.nuclei.len() < 2 {
         return;
     }
+    if s.dynamics.bonds_pending.is_empty() {
+        st.ref_seen = None;
+    }
     let stale = s.dynamics.bonds_stale || s.dynamics.bonds.is_none();
     let busy = st.bonds_refresh.is_some_and(|t| t.elapsed().as_secs_f64() < 20.0) && (stale || st.bonds_refresh.is_some_and(|t| t.elapsed().as_secs_f64() < 0.6));
     if !busy {
@@ -595,19 +598,53 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
             // cannot be read without them, and a press waits for them in the driver
             let pending = &s.dynamics.bonds_pending;
             if !pending.is_empty() {
-                let z = s.dynamics.bond_reference.as_ref().map_or(pending[0], |r| r.z);
-                let pct = s.dynamics.bond_reference.as_ref().filter(|r| r.total > 0).map_or(String::new(), |r| format!(" {:.0} %", 100.0 * r.done as f64 / r.total as f64));
+                let r = s.dynamics.bond_reference.as_ref();
+                let z = r.map_or(pending[0], |r| r.z);
+                // smooth: the solves done so far set the pace, the time since the last report fills in
+                // between them (never past the next solve's share); the ETA from the same pace
+                let now = ui.input(|i| i.time);
+                let seen = *st.ref_seen.get_or_insert((now, r.map_or(0.0, |r| r.elapsed_s)));
+                if r.is_some_and(|r| (r.elapsed_s - seen.1).abs() > 1e-9) {
+                    st.ref_seen = Some((now, r.map_or(0.0, |r| r.elapsed_s)));
+                }
+                let (t0, e0) = st.ref_seen.unwrap_or(seen);
+                let (frac, eta) = match r.filter(|r| r.total > 0) {
+                    Some(r) => {
+                        let elapsed = e0 + (now - t0);
+                        let step = 1.0 / r.total as f64;
+                        let done = r.done as f64 * step;
+                        if r.done > 0 {
+                            let per = r.elapsed_s / r.done as f64;
+                            let frac = (elapsed / (per * r.total as f64)).clamp(done, done + step * 0.98);
+                            (frac as f32, Some((per * r.total as f64 - elapsed).max(0.0)))
+                        } else {
+                            (0.0, None)
+                        }
+                    }
+                    None => (0.0, None),
+                };
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
                 egui::Frame::new()
                     .fill(theme::PANEL_3)
                     .stroke(egui::Stroke::new(1.0, theme::LINE))
                     .corner_radius(8)
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
-                        ui.set_min_width(172.0);
+                        ui.set_width(220.0);
                         ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(16.0).color(theme::INK));
-                            ui.label(egui::RichText::new(format!("Bond references: {}{pct}", units::elements::symbol(z))).strong().size(14.0).color(theme::INK));
+                            ui.add(egui::Spinner::new().size(14.0).color(theme::INK));
+                            ui.label(egui::RichText::new(format!("Bond references: {}", units::elements::symbol(z))).strong().size(14.0).color(theme::INK));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let words = match eta {
+                                    Some(e) if e >= 1.0 => format!("≈ {}:{:02} left", (e / 60.0) as u64, (e % 60.0) as u64),
+                                    Some(_) => "almost done".into(),
+                                    None => "starting".into(),
+                                };
+                                ui.label(egui::RichText::new(words).size(12.0).color(theme::INK_DIM));
+                            });
                         });
+                        ui.add_space(4.0);
+                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(theme::ACCENT));
                     })
                     .response
                     .on_hover_text("the bonds are read against isolated-atom references, one per element, solved in the background first; a press made now runs once they are done");

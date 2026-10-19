@@ -546,6 +546,9 @@ pub struct UiState {
     pub hide_cloud: bool,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
+    /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
+    /// smooth bar fills in from it.
+    pub ref_seen: Option<(f64, f64)>,
     pub trail_fs: f64,
     pub trail_opacity: f32,
     /// Run settings as last sent (re-sent to a new worker, `run_settings`): time step (fs),
@@ -792,6 +795,7 @@ right {}
             motion_blur: 0.5,
             hide_cloud: false,
             bonds_refresh: None,
+            ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
             trail_opacity: crate::trails::OPACITY_DEFAULT,
             dt_fs: DEFAULT_DT_FS,

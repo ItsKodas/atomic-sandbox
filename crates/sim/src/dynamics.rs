@@ -2586,6 +2586,11 @@ impl Dynamics {
                 // its next fallback, module doc)
                 self.refresh_bonds();
                 self.density_refresh = self.provider.sample_density(&[]).is_none() && self.provider.as_trainable().is_none();
+                // a surrogate holds no density: the references' end asks for the one teacher solve
+                // the graph needs (as "Bonds now" does) instead of waiting for a fallback
+                if self.provider.sample_density(&[]).is_none() && self.provider.as_trainable().is_some() {
+                    self.bonds_requested = true;
+                }
             }
         }
         // (playing, the next step's evaluation reads the graph: no extra solve)
