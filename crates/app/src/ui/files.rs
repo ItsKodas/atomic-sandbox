@@ -34,7 +34,11 @@ pub struct Browser {
     scenes: Vec<SceneEntry>,
     models: Vec<ModelEntry>,
     scene_name: String,
-    model_name: String,
+    /// The Save window (`File ▸ Save…`): open, what to save, the name, the folders or elsewhere.
+    pub save_open: bool,
+    save_kind: SaveKind,
+    save_name: String,
+    save_elsewhere: bool,
     /// A save was sent: read the folders again at this time.
     refresh_at: Option<std::time::Instant>,
 }
@@ -431,17 +435,6 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 open_scene(st, st.files.selected, acts);
             }
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Save current scene").on_hover_text("positions and velocities as they are now, into the scenes folder").clicked() {
-                let dir = crate::scene::scenes_dir().unwrap_or_else(|| PathBuf::from("scenes"));
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    st.scene_path = dir.join(format!("{}.scene", clean(&st.files.scene_name))).display().to_string();
-                    acts.push(Action::SaveScene);
-                    st.files.pending_refresh();
-                }
-            }
-            ui.add(egui::TextEdit::singleline(&mut st.files.scene_name).desired_width(130.0).hint_text("name"));
-        });
     });
 
     ui.add_space(6.0);
@@ -478,7 +471,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
     let rest = (ui.available_height() - 80.0).max(120.0);
     egui::ScrollArea::vertical().id_salt("files-models").auto_shrink([false, false]).max_height(rest).show(ui, |ui| {
         if st.files.models.is_empty() {
-            theme::note(ui, "No models yet: train one in the Estimated solver, then save it below.");
+            theme::note(ui, "No models yet: train one in the Estimated solver, then File ▸ Save ▸ Model.");
         }
         let mut load: Option<PathBuf> = None;
         for m in &st.files.models {
@@ -528,62 +521,13 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
             acts.push(Action::LoadModel);
         }
     });
-    let fitted = input.model().is_some_and(|m| m.fitted);
+    // a model anywhere else on disk: the native dialog (as the Model tab had it)
     ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(estimated && fitted, egui::Button::new("Save current model"))
-                .on_hover_text("the model, its fit and its samples, into the models folder")
-                .on_disabled_hover_text("a fitted model in the Estimated solver")
-                .clicked()
-            {
-                let dir = crate::scene::models_dir().unwrap_or_else(|| PathBuf::from("models"));
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    let name = if st.files.model_name.trim().is_empty() {
-                        st.files.scene_name.clone()
-                    } else {
-                        st.files.model_name.clone()
-                    };
-                    st.model_file = Some(dir.join(format!("{}.model", clean(&name))));
-                    acts.push(Action::SaveModel);
-                    st.files.pending_refresh();
-                }
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut st.files.model_name)
-                    .desired_width(130.0)
-                    .hint_text("name"),
-            );
-        });
-    });
-    // anywhere else on disk: the native dialogs (as the Model tab had them)
-    ui.horizontal(|ui| {
-        let last = st
-            .model_file
-            .clone()
-            .unwrap_or_else(|| crate::scene::model_path(&st.scene_path));
-        if ui
-            .add_enabled(
-                estimated && !input.sampling(),
-                egui::Button::new("Load from another folder…"),
-            )
-            .clicked()
-        {
+        let last = st.model_file.clone().unwrap_or_else(|| crate::scene::model_path(&st.scene_path));
+        if ui.add_enabled(estimated && !input.sampling(), egui::Button::new("Load from another folder…")).clicked() {
             if let Some(p) = super::dock::model::model_dialog(&last).pick_file() {
                 st.model_file = Some(p);
                 acts.push(Action::LoadModel);
-            }
-        }
-        if ui
-            .add_enabled(
-                estimated && fitted,
-                egui::Button::new("Save to another folder…"),
-            )
-            .clicked()
-        {
-            if let Some(p) = super::dock::model::model_dialog(&last).save_file() {
-                st.model_file = Some(super::dock::model::with_model_extension(p));
-                acts.push(Action::SaveModel);
             }
         }
     });
@@ -636,4 +580,211 @@ fn clean(name: &str) -> String {
     } else {
         s
     }
+}
+
+/// What the Save window writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SaveKind {
+    #[default]
+    Scene,
+    Model,
+    Both,
+}
+
+/// Opens the Save window (`File ▸ Save…`), named after the scene in force.
+pub fn open_save(st: &mut UiState) {
+    let name = match &st.source {
+        SceneSource::Preset(p) => p.clone(),
+        SceneSource::File(f) => stem(Path::new(f)),
+    };
+    let b = &mut st.files;
+    b.save_open = true;
+    b.save_name = name;
+}
+
+/// One of the three big choices: a drawing and a word.
+fn kind_button(ui: &mut Ui, on: bool, enabled: bool, label: &str, draw: impl FnOnce(&egui::Painter, egui::Rect)) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(150.0, 118.0), if enabled { Sense::click() } else { Sense::hover() });
+    let p = ui.painter();
+    let (fill, stroke) = if on {
+        (theme::ACCENT_BG, theme::ACCENT)
+    } else if r.hovered() && enabled {
+        (theme::PANEL_3, theme::LINE)
+    } else {
+        (theme::PANEL_2, theme::LINE)
+    };
+    p.rect(rect, 10.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    let art = egui::Rect::from_center_size(rect.center() - Vec2::new(0.0, 12.0), Vec2::new(110.0, 62.0));
+    draw(p, art);
+    let ink = if !enabled {
+        theme::INK_FAINT
+    } else if on {
+        theme::ACCENT_INK
+    } else {
+        theme::INK
+    };
+    p.text(egui::pos2(rect.center().x, rect.bottom() - 16.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(15.0), ink);
+    if !enabled {
+        p.rect_filled(rect, 10.0, theme::PANEL.gamma_multiply(0.55));
+    }
+    r
+}
+
+/// The current scene's nuclei as a small glyph (the scene choice's drawing).
+fn scene_glyph(p: &egui::Painter, rect: egui::Rect, scene: &Scene) {
+    let n = scene.nuclei.len().max(1) as f64;
+    let c = scene.nuclei.iter().fold([0.0; 2], |a, x| [a[0] + x.pos[0] / n, a[1] + x.pos[1] / n]);
+    let extent = scene.nuclei.iter().fold(1.5f64, |m, x| m.max((x.pos[0] - c[0]).abs()).max((x.pos[1] - c[1]).abs()));
+    let scale = (rect.height() as f64 * 0.38) / extent;
+    for x in &scene.nuclei {
+        let at = rect.center() + Vec2::new(((x.pos[0] - c[0]) * scale) as f32, (-(x.pos[1] - c[1]) * scale) as f32);
+        let [r, g, b] = render::elements::colour_srgb(x.z);
+        p.circle_filled(at, (render::elements::radius(x.z) as f64 * scale).clamp(4.0, 14.0) as f32, Color32::from_rgb(r, g, b));
+    }
+}
+
+/// The Save window, while open.
+pub fn show_save(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    if !st.files.save_open {
+        return;
+    }
+    let estimated = st.backend == Backend::Estimated;
+    let fitted = estimated && input.model().is_some_and(|m| m.fitted);
+    if !fitted && st.files.save_kind != SaveKind::Scene {
+        st.files.save_kind = SaveKind::Scene; // no model to save
+    }
+    let mut close = false;
+    let modal = egui::Modal::new(egui::Id::new("save-window"))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .corner_radius(10)
+                .inner_margin(18)
+                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(150.0 * 3.0 + 2.0 * 12.0);
+            ui.label(RichText::new("Save").size(17.0).strong());
+            ui.add_space(8.0);
+            let model_tip = "no fitted model: train one in the Estimated solver first";
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let k = st.files.save_kind;
+                if kind_button(ui, k == SaveKind::Scene, true, "Scene", |p, r| scene_glyph(p, r, input.scene))
+                    .on_hover_text("the nuclei, their velocities and the grid, as they are now")
+                    .clicked()
+                {
+                    st.files.save_kind = SaveKind::Scene;
+                }
+                let r = kind_button(ui, k == SaveKind::Model, fitted, "Model", |p, r| {
+                    super::icons::paint(p, egui::Rect::from_center_size(r.center(), Vec2::splat(54.0)), super::icons::Icon::Model, theme::ACCENT_INK)
+                });
+                if r.on_hover_text(if fitted { "the estimated solver's model, its fit and its samples" } else { model_tip }).clicked() && fitted {
+                    st.files.save_kind = SaveKind::Model;
+                }
+                let r = kind_button(ui, k == SaveKind::Both, fitted, "Both", |p, r| {
+                    let (a, b) = r.split_left_right_at_fraction(0.5);
+                    scene_glyph(p, a, input.scene);
+                    super::icons::paint(p, egui::Rect::from_center_size(b.center(), Vec2::splat(44.0)), super::icons::Icon::Model, theme::ACCENT_INK);
+                });
+                if r.on_hover_text(if fitted { "the scene and its model under one name: name.scene and name.model, together" } else { model_tip }).clicked() && fitted {
+                    st.files.save_kind = SaveKind::Both;
+                }
+            });
+            ui.add_space(12.0);
+            let kind = st.files.save_kind;
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut st.files.save_name).desired_width(260.0).hint_text("name"));
+            });
+            ui.add_space(4.0);
+            let folder_word = match kind {
+                SaveKind::Scene => "the scenes folder",
+                SaveKind::Model => "the models folder",
+                SaveKind::Both => "the scenes and models folders",
+            };
+            ui.radio_value(&mut st.files.save_elsewhere, false, format!("In {folder_word}"));
+            ui.radio_value(&mut st.files.save_elsewhere, true, "Somewhere else… (choose in the next step)");
+            let name = clean(&st.files.save_name);
+            let scene_dir = crate::scene::scenes_dir().unwrap_or_else(|| PathBuf::from("scenes"));
+            let model_dir = crate::scene::models_dir().unwrap_or_else(|| PathBuf::from("models"));
+            let scene_file = scene_dir.join(format!("{name}.scene"));
+            let model_file = model_dir.join(format!("{name}.model"));
+            // in the folders: a name already taken is refused for Both, replaced on confirmation otherwise
+            let mut taken: Vec<String> = Vec::new();
+            if !st.files.save_elsewhere {
+                if kind != SaveKind::Model && scene_file.exists() {
+                    taken.push(format!("{name}.scene"));
+                }
+                if kind != SaveKind::Scene && model_file.exists() {
+                    taken.push(format!("{name}.model"));
+                }
+            }
+            let blocked = kind == SaveKind::Both && !taken.is_empty();
+            if !taken.is_empty() {
+                let (words, colour) = if blocked {
+                    (format!("{} already exists: pick another name to save both together", taken.join(" and ")), theme::DANGER_INK)
+                } else {
+                    (format!("{} already exists: Save replaces it", taken.join(" and ")), Color32::from_rgb(0xf0, 0xb4, 0x5a))
+                };
+                ui.label(RichText::new(words).size(12.5).color(colour));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if !taken.is_empty() && !blocked {
+                        "Replace"
+                    } else if st.files.save_elsewhere {
+                        "Choose where…"
+                    } else {
+                        "Save"
+                    };
+                    let can = !blocked && !st.files.save_name.trim().is_empty();
+                    if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong()).min_size(Vec2::new(110.0, 30.0))).clicked() {
+                        let (scene_to, model_to) = if st.files.save_elsewhere {
+                            // one dialog: the files land side by side under the chosen name
+                            let ext = if kind == SaveKind::Model { "model" } else { "scene" };
+                            let what = if kind == SaveKind::Model { "Atomic Sandbox model" } else { "Atomic Sandbox scene" };
+                            match rfd::FileDialog::new().add_filter(what, &[ext]).set_file_name(format!("{name}.{ext}")).save_file() {
+                                Some(p) => (Some(p.with_extension("scene")), Some(p.with_extension("model"))),
+                                None => (None, None),
+                            }
+                        } else {
+                            if kind != SaveKind::Model {
+                                let _ = std::fs::create_dir_all(&scene_dir);
+                            }
+                            if kind != SaveKind::Scene {
+                                let _ = std::fs::create_dir_all(&model_dir);
+                            }
+                            (Some(scene_file.clone()), Some(model_file.clone()))
+                        };
+                        if let (Some(sp), Some(mp)) = (scene_to, model_to) {
+                            if kind != SaveKind::Model {
+                                st.scene_path = sp.display().to_string();
+                                acts.push(Action::SaveScene);
+                            }
+                            if kind != SaveKind::Scene {
+                                st.model_file = Some(mp);
+                                acts.push(Action::SaveModel);
+                            }
+                            st.files.pending_refresh();
+                            close = true;
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+    if close || modal.should_close() {
+        st.files.save_open = false;
+    }
+}
+
+/// The Save window on Model (the Model tab's Save model…).
+pub fn open_save_model(st: &mut UiState) {
+    open_save(st);
+    st.files.save_kind = SaveKind::Model;
 }

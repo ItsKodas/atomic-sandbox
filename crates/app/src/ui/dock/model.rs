@@ -289,11 +289,6 @@ pub(in crate::ui) fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
     d
 }
 
-/// A save name without an extension gains `.model` (as `scene::model_path` does).
-pub(in crate::ui) fn with_model_extension(p: std::path::PathBuf) -> std::path::PathBuf {
-    if p.extension().is_none() { p.with_extension("model") } else { p }
-}
-
 pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     expire_arming(st);
     let estimated = st.backend == Backend::Estimated;
@@ -308,7 +303,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
             .clicked()
         {
             // the File window (`ui::files`): the models folder, with the native dialog one click away there
-            super::super::files::open(st);
+            super::super::files::open_save_model(st);
         }
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model…"))

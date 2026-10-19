@@ -66,18 +66,13 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                     for m in MenuId::ALL {
                         let open = Popup::is_id_open(ui.ctx(), popup_id(m));
                         if m == MenuId::File {
-                            // File opens the File window (`files`); a request for its menu (the
-                            // control search, `--ui menu=file`) opens the window too
-                            let r = ui.add(Button::selectable(st.files.open, m.title()).frame_when_inactive(false));
+                            // File: Open… (the File window) and Save… (the Save window), `files`
+                            let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
                             hot.push(r.rect);
-                            if open {
-                                Popup::close_id(ui.ctx(), popup_id(m));
-                            }
-                            if r.clicked() && st.files.open {
-                                st.files.open = false;
-                            } else if r.clicked() || open {
-                                super::files::open(st);
-                            }
+                            menu_popup(&r, popup_id(m)).show(|ui| {
+                                ui.set_min_width(200.0);
+                                file_items(ui, st);
+                            });
                             continue;
                         }
                         let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
@@ -307,11 +302,21 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     });
 }
 
-fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    // the compact layout's File submenu: the File window is one click away
-    if ui.button("Browse scenes and models…").clicked() {
+/// The File menu's two entries: Open… (browse the scenes and models) and Save… (scene, model or both).
+fn file_items(ui: &mut Ui, st: &mut UiState) {
+    if ui.add(Button::new(RichText::new("Open…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("browse the scenes and models").clicked() {
         super::files::open(st);
+        ui.close();
     }
+    if ui.add(Button::new(RichText::new("Save…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("save the scene, the model, or both").clicked() {
+        super::files::open_save(st);
+        ui.close();
+    }
+}
+
+fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    // the compact layout's File submenu: the two windows first
+    file_items(ui, st);
     ui.separator();
     anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts));
     ui.separator();

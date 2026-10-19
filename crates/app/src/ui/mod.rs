@@ -1131,6 +1131,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
+    files::show_save(root.ctx(), st, input, &mut acts);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
