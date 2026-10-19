@@ -58,7 +58,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     // above the Camera view's shutter and exposure row (bottom left, beside the view switch)
-    let mut bottom = view.bottom() - if st.camera_view || st.volume_mode == super::VOLUME_DOTS { 58.0 } else { 14.0 };
+    // above the view switch and its stacked slider panels (Camera, Dots: one row each)
+    let rows = u8::from(st.camera_view) + u8::from(st.volume_mode == super::VOLUME_DOTS);
+    let mut bottom = view.bottom() - 14.0 - 40.0 * rows as f32;
     // in an orbital mode the orbitals' own label or note replaces the density's
     let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
     let label = match (layer_label, &input.bonds_label) {
@@ -444,6 +446,41 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
+            // the slider panels stacked above the switch row (a single row ran off small screens)
+            ui.vertical(|ui| {
+                // the dots' density, drift speed and size, beside the switch while Dots is on
+                if st.volume_mode == super::VOLUME_DOTS {
+                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 90.0;
+                            ui.label("density");
+                            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).show_value(false)).on_hover_text("how many dots: more fill the same space more densely");
+                            ui.label(format!("{:.1}×", st.dots_amount));
+                            ui.add_space(8.0);
+                            ui.label("drift");
+                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
+                                .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
+                            ui.add_space(8.0);
+                            ui.label("size");
+                            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
+                        });
+                    });
+                }
+                if st.camera_view {
+                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 110.0;
+                            ui.label("shutter");
+                            ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false))
+                                .on_hover_text("how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
+                            ui.label(format!("{:.0} %", st.shutter * 100.0));
+                            ui.add_space(8.0);
+                            ui.label("exposure");
+                            ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
+                            ui.label(format!("{:+.1} EV", st.exposure_ev));
+                        });
+                    });
+                }
             ui.horizontal(|ui| {
                 if st.show_axes {
                     gizmo(ui, input);
@@ -478,39 +515,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                         }
                     }
                 });
-                // the dots' density, drift speed and size, beside the switch while Dots is on
-                if st.volume_mode == super::VOLUME_DOTS {
-                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().slider_width = 90.0;
-                            ui.label("density");
-                            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).show_value(false)).on_hover_text("how many dots: more fill the same space more densely");
-                            ui.label(format!("{:.1}×", st.dots_amount));
-                            ui.add_space(8.0);
-                            ui.label("drift");
-                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
-                                .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
-                            ui.add_space(8.0);
-                            ui.label("size");
-                            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
-                        });
-                    });
-                }
-                if st.camera_view {
-                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().slider_width = 110.0;
-                            ui.label("shutter");
-                            ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false))
-                                .on_hover_text("how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
-                            ui.label(format!("{:.0} %", st.shutter * 100.0));
-                            ui.add_space(8.0);
-                            ui.label("exposure");
-                            ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
-                            ui.label(format!("{:+.1} EV", st.exposure_ev));
-                        });
-                    });
-                }
+                });
             });
         });
 }
