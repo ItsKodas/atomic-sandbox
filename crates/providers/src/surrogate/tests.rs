@@ -6942,6 +6942,8 @@ fn the_training_curve_refuses_a_fenced_shell_band_as_evaluate_does() {
     }
     for &j in &answered {
         assert_eq!(c.refused[j], Some(R::NearQuarantine), "r = {}: refused by the fence", c.r[j]);
+        // the shell fence names the pair's second atom; the audit fence of the same case names none (physics review Minor 1)
+        assert_eq!(s.would_answer(&dimer_at_x(c.r[j]), &[1, 1], &prov), Err((R::NearQuarantine, Some(1))), "r = {}: the shell fence, not only the case's quarantine radius", c.r[j]);
     }
     // evaluate agrees at an answered band point: the teacher answers, the shell fence named
     let r = c.r[answered[0]];
@@ -7003,6 +7005,16 @@ fn shell_checks_are_judged_against_the_passs_own_refit_or_said_unmeasured() {
     assert!(notes.contains(&want), "{notes:?}");
     assert!(!notes.iter().any(|n| n.contains("cutoff holds") || n.contains("still interacts")));
     assert!(t.audit_fences.is_empty());
+    // (c) judged against a fit with a caveat (untrusted, or without this pass's samples): fenced as before, the note says
+    // the verdict may be the fit's (physics review Minor 2)
+    let far = in_big_cell(h2(5.2));
+    let (pos, z) = pos_z(&far);
+    let p = t.model().unwrap().predict(&pos, &z, false).unwrap();
+    let check = crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: p.energy + 0.1, forces: p.forces, face: None, unfit: false };
+    t.judge_shell_checks_with(vec![check], Some("judged against a fit that is not trusted"));
+    let note = t.user_notes.last().unwrap();
+    assert!(note.contains("still interacts") && note.ends_with("(judged against a fit that is not trusted: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)"), "{note}");
+    assert!(t.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "the fence is kept: the safe side");
 }
 
 /// An H₂ at `r` along x whose fixed atom sits at −1.5 − r/2 in the fixture's 33³ cell, so the scan's

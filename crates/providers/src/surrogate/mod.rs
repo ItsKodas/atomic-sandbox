@@ -1866,6 +1866,9 @@ impl SurrogateKs {
         // no refit the model standing is none or an earlier fit, whose verdict on the shell is
         // not this pass's measurement
         let mut unjudged: Option<String> = None;
+        // a check judged against a fit that is not trusted, or holds none of this pass's samples, says so (physics review
+        // of the M7 leftovers, Minor 2): its fence is kept (the safe side) but may be the fit's error, not the cutoff's
+        let mut caveat: Option<&'static str> = None;
         let msg = if self.samples() == 0 {
             unjudged = Some("the pass fitted no model".into());
             format!("{kind} {how}: no samples to fit")
@@ -1880,9 +1883,13 @@ impl SurrogateKs {
                 Ok(r) => {
                     let coverage = self.compute_pass_coverage();
                     let trust = match (self.untrusted_reason(), coverage.as_ref()) {
-                        (Some(why), _) => format!("untrusted ({why})"),
+                        (Some(why), _) => {
+                            caveat = Some("judged against a fit that is not trusted");
+                            format!("untrusted ({why})")
+                        }
                         // fix (e): never "trusted" for a scene whose own pass is not in the fit
                         (None, Some(c)) if c.fitted == 0 && c.total > 0 => {
+                            caveat = Some("judged against a fit that holds none of this pass's samples");
                             "trusted elsewhere, but NOT for this scene: none of its pass samples is in the fit".to_string()
                         }
                         (None, _) => "trusted".to_string(),
@@ -1906,7 +1913,7 @@ impl SurrogateKs {
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
         match unjudged {
-            None => self.judge_shell_checks(shells),
+            None => self.judge_shell_checks_with(shells, caveat),
             Some(why) => self.leave_shell_checks_unjudged(&shells, &why),
         }
         for ((za, zb), r) in unrun {
