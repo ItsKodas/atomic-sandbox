@@ -49,15 +49,22 @@ fn depth_at(p: vec3<f32>) -> f32 {
     return clip.z / clip.w;
 }
 
+// where the ray meets the ball (w = 0: it misses) — one formula for both passes, so the colour
+// pass meets exactly the depth the depth pass laid
+fn ball_hit(r: Ray, centre: vec3<f32>, radius: f32) -> vec4<f32> {
+    let oc = r.o - centre;
+    let b = dot(oc, r.d);
+    let disc = b * b - (dot(oc, oc) - radius * radius);
+    if (disc < 0.0) { return vec4(0.0); }
+    return vec4(r.o + r.d * (-b - sqrt(disc)), 1.0);
+}
+
 // the ball's depth only (an instant's first pass, with any solidity)
 @fragment
 fn fs_depth(in: VOut) -> @builtin(frag_depth) f32 {
-    let r = ray_of(in.pos);
-    let oc = r.o - in.centre;
-    let b = dot(oc, r.d);
-    let disc = b * b - (dot(oc, oc) - in.radius * in.radius);
-    if (disc < 0.0) { discard; }
-    return depth_at(r.o + r.d * (-b - sqrt(disc)));
+    let hit = ball_hit(ray_of(in.pos), in.centre, in.radius);
+    if (hit.w == 0.0) { discard; }
+    return depth_at(hit.xyz);
 }
 
 @fragment
@@ -78,9 +85,9 @@ fn fs_glow(in: VOut) -> FOut {
     var ball_col = vec3(0.0);
     var ball_a = 0.0;
     var depth = depth_at(in.centre);
-    if (perp < 1.0) {
-        let disc = 1.0 - perp * perp;
-        let hit = r.o + r.d * (along - sqrt(disc) * in.radius);
+    let bh = ball_hit(r, in.centre, in.radius);
+    if (perp < 1.0 && bh.w > 0.0) {
+        let hit = bh.xyz;
         let n = normalize(hit - in.centre);
         let v = -r.d;
         let cam_up = normalize((cam.inv_view_proj * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
@@ -92,7 +99,8 @@ fn fs_glow(in: VOut) -> FOut {
         ball_col = in.colour * (0.22 + 0.78 * diffuse) + vec3(0.35) * spec + in.colour * rim * 0.15;
         ball_a = 1.0 - smoothstep(0.96, 1.0, perp);
         ball_col = ball_col * ball_a;
-        if (h > 0.0) { depth = depth_at(hit); }
+        // a hair in front of the depth pass's value: equal surfaces always pass
+        if (h > 0.0) { depth = max(depth_at(hit) - 1e-6, 0.0); }
     }
     let col = mix(glow_col, ball_col, h);
     let a = mix(glow_a, ball_a, h);
