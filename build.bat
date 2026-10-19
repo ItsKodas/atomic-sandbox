@@ -5,7 +5,7 @@ rem
 rem   dist\AtomicSandbox-<version>-windows-x64\        the folder to run or hand out
 rem       AtomicSandbox.exe                            everything the app needs is inside it
 rem       README.md, docs\images\                      the readme and its pictures
-rem       scenes\*.scene                               the presets as files (--scene scenes\h2o.scene)
+rem       scenes\*.scene                               the presets as files (--scene scenes\h2o.scene) and the repo's scenes\ library
 rem       models\                                     the repo's models\ (trained models, pre-downloaded); Save/Load model start there
 rem   dist\AtomicSandbox-<version>-windows-x64.zip     the same folder zipped, for a GitHub release
 setlocal
@@ -48,11 +48,14 @@ if exist "dist\%NAME%.zip" del /q "dist\%NAME%.zip"
 mkdir "%OUT%\scenes" "%OUT%\models" "%OUT%\docs\images" >nul
 xcopy /e /i /q /y "models" "%OUT%\models" >nul || goto :copyfail
 if exist "profiles" xcopy /e /i /q /y "profiles" "%OUT%\profiles" >nul
-if exist "timings" xcopy /e /i /q /y "timings" "%OUT%	imings" >nul
+if exist "timings" xcopy /e /i /q /y "timings" "%OUT%\timings" >nul
 copy /y "target\release\app.exe" "%OUT%\AtomicSandbox.exe" >nul || goto :copyfail
 copy /y "README.md" "%OUT%\" >nul || goto :copyfail
 if exist "LICENSE.md" copy /y "LICENSE.md" "%OUT%\" >nul
 copy /y "crates\app\presets\*.scene" "%OUT%\scenes\" >nul || goto :copyfail
+rem the repository's scene library (scenes\): the committed files, so a scratch scene stays out;
+rem without git, every scenes\*.scene
+where git >nul 2>nul && (for /f "delims=" %%f in ('git -C scenes ls-files') do copy /y "scenes\%%f" "%OUT%\scenes\" >nul) || copy /y "scenes\*.scene" "%OUT%\scenes\" >nul
 xcopy /e /i /q /y "docs\images" "%OUT%\docs\images" >nul || goto :copyfail
 
 rem a few tries: a virus scan of the just-copied exe can hold it for a moment
