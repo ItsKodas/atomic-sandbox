@@ -12,7 +12,7 @@ use crate::spheres::CameraUniform;
 use gpu::{ColourVolume3D, GpuContext, UniformBuffer, Volume3D};
 
 /// Most dots per frame (the points buffer's size).
-pub const MAX_DOTS: u32 = 500_000;
+pub const MAX_DOTS: u32 = 1_000_000;
 
 /// Field order is the WGSL `Params` (both shaders) — change all together.
 #[repr(C)]
@@ -34,6 +34,13 @@ pub struct DotsUniform {
     /// (an orbital is drawn as its square instead, which is smooth through its nodes). 0 = a
     /// non-negative field (negative noise clamped to 0).
     pub signed: u32,
+    /// The floating dots (user request 2026-10-19): a Metropolis step of `walk` grid cells per
+    /// frame for each live dot (0 = a fresh sample every time), `refresh` = the share re-drawn
+    /// fresh each frame, `glow` = soft sprites added (the glow pipeline).
+    pub walk: f32,
+    pub refresh: f32,
+    pub glow: u32,
+    pub _pad: u32,
 }
 
 /// Dot colour: the volume mode's ramp of the field at the dot (log over 3 decades of its max).
@@ -46,7 +53,7 @@ pub const COLOUR_BY_TINT: u32 = 2;
 /// `tint_neg` where it is negative.
 pub const COLOUR_BY_SIGN: u32 = 3;
 
-const _: () = assert!(std::mem::size_of::<DotsUniform>() == 96);
+const _: () = assert!(std::mem::size_of::<DotsUniform>() == 112);
 
 struct Bound { compute_bg: wgpu::BindGroup, draw_bg: wgpu::BindGroup, n_rows: u32, dims: [u32; 3], colour: bool }
 
@@ -55,6 +62,9 @@ pub struct DotsPass {
     row_scan: wgpu::ComputePipeline,
     gen_points: wgpu::ComputePipeline,
     draw: wgpu::RenderPipeline,
+    /// The same sprites added (One, One): the glowing dots.
+    draw_glow: wgpu::RenderPipeline,
+    glow: bool,
     compute_bgl: wgpu::BindGroupLayout,
     draw_bgl: wgpu::BindGroupLayout,
     camera_bg: wgpu::BindGroup,
@@ -104,9 +114,20 @@ impl DotsPass {
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
+        let add = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+        };
+        let draw_glow = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("dots glow"), layout: Some(&dl),
+            vertex: wgpu::VertexState { module: &ds, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &ds, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: colour_format, blend: Some(add), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
         let points = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("dots points"), size: MAX_DOTS as u64 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         DotsPass {
-            row_sums, row_scan, gen_points, draw, compute_bgl, draw_bgl, camera_bg,
+            row_sums, row_scan, gen_points, draw, draw_glow, glow: false, compute_bgl, draw_bgl, camera_bg,
             params: UniformBuffer::new(ctx, "dots params"), points, rows: None,
             dummy_scalar: Volume3D::new(ctx, [1; 3]), dummy_colour: ColourVolume3D::new(ctx, [1; 3]),
             bound: None, count: 0,
@@ -151,6 +172,7 @@ impl DotsPass {
     /// This frame's parameters (`count` is clamped to [`MAX_DOTS`]; `dims` and `use_colour` are
     /// the bound field's).
     pub fn set_params(&mut self, ctx: &GpuContext, p: &DotsUniform) {
+        self.glow = p.glow != 0;
         let Some(b) = &self.bound else { return };
         let p = DotsUniform { count: p.count.min(MAX_DOTS), dims: b.dims, use_colour: u32::from(b.colour), ..*p };
         self.count = p.count;
@@ -190,7 +212,7 @@ impl DotsPass {
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         let Some(b) = &self.bound else { return };
         if self.count == 0 { return; }
-        pass.set_pipeline(&self.draw);
+        pass.set_pipeline(if self.glow { &self.draw_glow } else { &self.draw });
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, &b.draw_bg, &[]);
         pass.draw(0..6, 0..self.count);
@@ -231,6 +253,7 @@ mod tests {
         pass.set_params(ctx, &DotsUniform {
             box_min: [LO; 3], use_colour: 0, box_max: [HI; 3], count: DOTS, dims: [0; 3], seed,
             tint: [1.0; 4], tint_neg: [1.0; 4], size_px: 1.0, intensity: 1.0, colour_by: COLOUR_BY_DENSITY, signed,
+            walk: 0.0, refresh: 0.0, glow: 0, _pad: 0,
         });
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         pass.generate(&mut enc);

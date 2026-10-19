@@ -9,6 +9,9 @@ struct Params {
     tint: vec4<f32>,
     tint_neg: vec4<f32>,
     size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
+    // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
+    // re-drawn fresh each frame, glow (additive soft sprites) on/off
+    walk: f32, refresh: f32, glow: u32, _pad: u32,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
@@ -38,6 +41,8 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     if (d2 > 1.0) { discard; }
     let z = textureLoad(scene_depth, vec2<i32>(in.pos.xy), 0);
     if (in.pos.z > z) { discard; }
-    let w = (1.0 - d2 * d2) * prm.intensity;
+    var w = (1.0 - d2 * d2) * prm.intensity;
+    // glow: a soft Gaussian sprite, added (dense regions burn toward white)
+    if (prm.glow != 0u) { w = exp(-4.0 * d2) * prm.intensity; }
     return vec4(in.colour.rgb * w, w);
 }

@@ -25,6 +25,9 @@ struct Params {
     tint: vec4<f32>,
     tint_neg: vec4<f32>,
     size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
+    // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
+    // re-drawn fresh each frame, glow (additive soft sprites) on/off
+    walk: f32, refresh: f32, glow: u32, _pad: u32,
 };
 @group(0) @binding(0) var<uniform> prm: Params;
 @group(0) @binding(1) var scal: texture_3d<f32>;
@@ -130,11 +133,71 @@ fn linear_draw(bit: i32, xi: f32) -> f32 {
     return 1.0 - sqrt(1.0 - xi);
 }
 
+// the trilinear field at a world position (0 outside the box)
+fn field_at(p: vec3<f32>) -> f32 {
+    let dims = vec3<f32>(prm.dims);
+    let g = (p - prm.box_min) / (prm.box_max - prm.box_min) * (dims - vec3(1.0));
+    if (any(g < vec3(0.0)) || any(g > dims - vec3(1.0))) { return 0.0; }
+    let cell = min(vec3<i32>(floor(g)), vec3<i32>(cells()) - vec3(1));
+    let f = g - vec3<f32>(cell);
+    let v = corners(cell);
+    let x0 = mix(v[0], v[1], f.x); let x1 = mix(v[2], v[3], f.x);
+    let x2 = mix(v[4], v[5], f.x); let x3 = mix(v[6], v[7], f.x);
+    return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
+}
+
+// a dot's colour at a world position (as the fresh draw colours it)
+fn colour_at(p: vec3<f32>) -> vec3<f32> {
+    let dims = vec3<f32>(prm.dims);
+    let g = clamp((p - prm.box_min) / (prm.box_max - prm.box_min) * (dims - vec3(1.0)), vec3(0.0), dims - vec3(1.0));
+    let near = vec3<i32>(round(g));
+    if (prm.colour_by == 1u && prm.use_colour != 0u) {
+        let q = textureLoad(col, near, 0);
+        return clamp(q.rgb / max(q.a, 1e-6), vec3(0.0), vec3(1.0));
+    } else if (prm.colour_by == 2u) {
+        return prm.tint.rgb;
+    } else if (prm.colour_by == 3u && prm.use_colour == 0u) {
+        let q = textureLoad(scal, near, 0).r;
+        return select(prm.tint_neg.rgb, prm.tint.rgb, q >= 0.0);
+    }
+    let nc = cells();
+    let gmax = rows[2u * nc.y * nc.z];
+    let s = sqrt(clamp(field_at(p) / max(gmax, 1e-30), 0.0, 1.0));
+    return ramp(0.1 + 0.9 * s);
+}
+
+// one dot per thread: with `walk` > 0 a live dot takes one Metropolis step on the field (a
+// Gaussian proposal of `walk` cells, accepted with min(1, ρ_new / ρ_old)) — the cloud stays a
+// sample of the field while each dot drifts smoothly ("floating"); a `refresh` share, and every
+// dead or new slot, is drawn fresh (`gen_points` below), so no chain stays stuck
 @compute @workgroup_size(64)
 fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= prm.count) { return; }
     let nc = cells();
+    if (prm.walk > 0.0) {
+        let old = pts[i];
+        let alive = unpack4x8unorm(bitcast<u32>(old.w)).a > 0.0;
+        var hw = pcg(i ^ pcg(prm.seed ^ 0x9e3779b9u));
+        // a dot where the field is zero (a new scene, a moved box) is drawn fresh instead
+        let rp = select(0.0, field_at(old.xyz), alive);
+        if (alive && rp > 0.0 && unit(hw) >= prm.refresh) {
+            let cell_size = (prm.box_max - prm.box_min) / (vec3<f32>(prm.dims) - vec3(1.0));
+            hw = pcg(hw); let u1 = max(unit(hw), 1e-7);
+            hw = pcg(hw); let u2 = unit(hw);
+            hw = pcg(hw); let u3 = max(unit(hw), 1e-7);
+            hw = pcg(hw); let u4 = unit(hw);
+            let r1 = sqrt(-2.0 * log(u1)); let r2 = sqrt(-2.0 * log(u3));
+            let gauss = vec3(r1 * cos(6.2831853 * u2), r1 * sin(6.2831853 * u2), r2 * cos(6.2831853 * u4));
+            let q = old.xyz + gauss * prm.walk * cell_size;
+            let rq = field_at(q);
+            hw = pcg(hw);
+            var p = old.xyz;
+            if (unit(hw) * rp < rq) { p = q; }
+            pts[i] = vec4(p, bitcast<f32>(pack4x8unorm(vec4(colour_at(p), 1.0))));
+            return;
+        }
+    }
     let n_rows = nc.y * nc.z;
     let total = rows[n_rows - 1u];
     if (!(total > 0.0)) { pts[i] = vec4(0.0, 0.0, 0.0, 0.0); return; }

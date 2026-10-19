@@ -665,6 +665,22 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.add_enabled(st.volume_mode == super::VOLUME_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
         });
+        // the dots' look: floating (each dot wanders by a Metropolis walk on the field, so the cloud
+        // stays a true sample of it) and glowing (soft sprites added: dense regions burn to white)
+        ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut st.dots_float, "floating").on_hover_text("each dot wanders: a random step each frame, kept or refused by the density there (a Metropolis walk) — the cloud stays a true sample of the field while the dots drift");
+                ui.checkbox(&mut st.dots_glow, "glow").on_hover_text("soft dots whose light adds up: dense regions burn toward white");
+            });
+            if st.dots_float {
+                ui.add(egui::Slider::new(&mut st.dots_drift, 0.05..=1.5).text("drift (grid cells per frame)"));
+            }
+            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount (× the default)"));
+            ui.add(egui::Slider::new(&mut st.dots_size, 0.5..=3.0).text("dot size"));
+            if st.dots_glow {
+                ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness"));
+            }
+        });
         // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
         let mut core = st.show_partial_core;
         if probed("show-partial-core", ui.checkbox(&mut core, "with partial core")).on_hover_text(super::pseudo::PARTIAL_CORE_TIP).changed() {

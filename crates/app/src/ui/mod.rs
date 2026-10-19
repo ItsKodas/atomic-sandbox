@@ -559,6 +559,14 @@ pub struct UiState {
     pub background: Option<[u8; 3]>,
     /// The labels in the 3D view (molecule names, bond lengths, angles): opacity 0–1.
     pub label_opacity: f32,
+    /// The dots' look (View ▸ Density): floating (a Metropolis walk, `dots_drift` grid cells per
+    /// frame), glowing (soft additive sprites), the amount (× the default count), size and brightness.
+    pub dots_float: bool,
+    pub dots_drift: f32,
+    pub dots_glow: bool,
+    pub dots_amount: f32,
+    pub dots_size: f32,
+    pub dots_brightness: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -817,6 +825,12 @@ right {}
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
+            dots_float: true,
+            dots_drift: 0.35,
+            dots_glow: true,
+            dots_amount: 2.0,
+            dots_size: 1.0,
+            dots_brightness: 1.0,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,

@@ -167,6 +167,13 @@ struct DotsLook {
 pub struct Painter {
     /// The background (linear): View ▸ Display aids ▸ background, else [`CLEAR`].
     clear: wgpu::Color,
+    /// The dots: the Metropolis step (grid cells; 0 = off), glow, amount (× the default count),
+    /// sprite size and the glow's brightness.
+    dots_float: f32,
+    dots_glow: bool,
+    dots_amount: f32,
+    dots_size: f32,
+    dots_brightness: f32,
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
     /// one bound): created by the painter, never handed out (so uploading into them cannot touch
@@ -231,6 +238,11 @@ impl Painter {
         };
         Painter {
             clear: CLEAR,
+            dots_float: 0.0,
+            dots_glow: false,
+            dots_amount: 1.0,
+            dots_size: 1.0,
+            dots_brightness: 1.0,
             renderer: Renderer::new(ctx, format),
             uploads: [None, None],
             uploaded: None,
@@ -593,6 +605,9 @@ impl Painter {
         let drawn = self.drawn(ui);
         self.refresh(ctx);
         self.shimmer = ui.shimmer;
+        // the dots' look (View ▸ Density ▸ dots)
+        self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
+        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
             let lin = |b: u8| render::elements::srgb_to_linear(b as f32 / 255.0) as f64;
@@ -660,17 +675,22 @@ impl Painter {
         if self.renderer.volume_params.mode != MODE_DOTS {
             return;
         }
-        if self.shimmer {
+        // a new seed each frame: the shimmer's fresh sample, or the floating dots' next step
+        if self.shimmer || self.dots_float > 0.0 {
             self.dots_seed = self.dots_seed.wrapping_add(1);
         }
         let p = &self.renderer.volume_params;
-        let count = (DOTS_PER_FRAME as f32 * area.max(1.0) / (1400.0 * 900.0)).clamp(50_000.0, render::dots::MAX_DOTS as f32) as u32;
+        let count = (DOTS_PER_FRAME as f32 * self.dots_amount * area.max(1.0) / (1400.0 * 900.0)).clamp(50_000.0, render::dots::MAX_DOTS as f32) as u32;
+        let glow = self.dots_glow;
         let look = self.dots;
         self.renderer.dots.set_params(ctx, &render::dots::DotsUniform {
             box_min: p.box_min, use_colour: 0, box_max: p.box_max, count, dims: [0; 3], seed: self.dots_seed,
             tint: if look.colour_by == render::dots::COLOUR_BY_SIGN { look.tint } else { [0.55, 0.8, 1.0, 1.0] },
-            tint_neg: look.tint_neg, size_px: 1.25, intensity: 0.35 * p.fade,
+            tint_neg: look.tint_neg,
+            size_px: if glow { 2.2 * self.dots_size } else { 1.25 * self.dots_size },
+            intensity: if glow { 0.18 * self.dots_brightness } else { 0.35 } * p.fade,
             colour_by: look.colour_by, signed: u32::from(look.signed),
+            walk: self.dots_float, refresh: 0.01, glow: u32::from(glow), _pad: 0,
         });
     }
 
