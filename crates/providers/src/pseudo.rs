@@ -139,9 +139,11 @@ impl PseudoCache {
         }
         let t0 = std::time::Instant::now();
         let gated = z <= qm::radial::ledger::LEDGER.dimer_z_max;
-        let _status = Generating::start(z, gated);
         // the gate runs only for Z ≤ LEDGER.dimer_z_max: the ladder decides that, not the cache
-        let mut gate = ReplayGate::new(z, GridDimerGate::new(dimer_backend()), if gated { disk_cache() } else { None });
+        let backend = dimer_backend();
+        let gpu = matches!(backend, DimerBackend::Gpu(_));
+        let mut gate = ReplayGate::new(z, GridDimerGate::new(backend), if gated { disk_cache() } else { None });
+        let _status = Generating::start(z, cost_of(gated, !gate.recorded.is_empty(), gpu));
         let t = generate_with(z, Some(&mut gate)).map(Arc::new);
         gate.store();
         self.generated += 1;
@@ -527,22 +529,68 @@ pub fn dimer_backend_is_gpu() -> bool {
     matches!(dimer_backend(), DimerBackend::Gpu(_))
 }
 
-// ---- what is being generated now (the app's status line)
+// ---- what is being generated now (the app's status line), and what generating would cost
 
-static GENERATING: Mutex<Option<(u8, std::time::Instant, bool)>> = Mutex::new(None);
+/// What making a species' table available costs (final review M6: the app says it, never silently): `Ready` (cached in
+/// this process), `Seconds` (no dimer gate, or the gate's answers replayed from the disk cache), `GpuGate` (the dimer
+/// gate on the GPU, ≈ 1 min), `CpuGate` (the gate on the CPU, ≈ 40 min — a run without a GPU dimer backend under `All`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationCost { Ready, Seconds, GpuGate, CpuGate }
 
-/// The species whose table is being generated right now, the seconds so far, and whether its dimer gate runs (≈ 1 min on
-/// the GPU — the app's status line says so while it lasts). `None` when nothing is generated.
-pub fn generating() -> Option<(u8, f64, bool)> {
-    GENERATING.lock().unwrap_or_else(|e| e.into_inner()).map(|(z, t, g)| (z, t.elapsed().as_secs_f64(), g))
+impl GenerationCost {
+    /// The cost in words: "seconds", "≈ 1 min: its dimer check", "≈ 40 min on the CPU: its dimer check (no GPU)".
+    pub fn words(self) -> &'static str {
+        match self {
+            GenerationCost::Ready => "ready",
+            GenerationCost::Seconds => "seconds",
+            GenerationCost::GpuGate => "≈ 1 min: its dimer check",
+            GenerationCost::CpuGate => "≈ 40 min on the CPU: its dimer check (no GPU)",
+        }
+    }
+}
+
+/// The cost of a generation that is not cached: `gated` (Z ≤ `dimer_z_max`), `replayed` (the disk cache holds answers for
+/// this species identity), `gpu` (a GPU dimer backend).
+fn cost_of(gated: bool, replayed: bool, gpu: bool) -> GenerationCost {
+    match (gated, replayed, gpu) {
+        (false, _, _) | (true, true, _) => GenerationCost::Seconds,
+        (true, false, true) => GenerationCost::GpuGate,
+        (true, false, false) => GenerationCost::CpuGate,
+    }
+}
+
+/// What making Z's table available would cost now ([`GenerationCost`]). **Takes no blocking lock** (final review I3: the UI
+/// thread asks): the cache is only `try_lock`ed — while another thread holds it (a generation) the table counts as not
+/// cached —, the disk cache file is read and checked as [`ReplayGate`] would, and the backend is the process-wide one.
+pub fn generation_cost(z: u8) -> GenerationCost {
+    if cache().try_lock().is_ok_and(|c| c.has_table(z)) {
+        return GenerationCost::Ready;
+    }
+    let gated = z <= qm::radial::ledger::LEDGER.dimer_z_max;
+    let replayed = gated && disk_cache().is_some_and(|d| replay_available(&d, z));
+    cost_of(gated, replayed, dimer_backend_is_gpu())
+}
+
+/// Whether `dir`'s disk cache holds answers for Z's species identity that [`ReplayGate`] would read.
+fn replay_available(dir: &std::path::Path, z: u8) -> bool {
+    std::fs::read_to_string(disk_file(dir, z)).ok().and_then(|t| read_answers(&t, z)).is_some_and(|a| !a.is_empty())
+}
+
+static GENERATING: Mutex<Option<(u8, std::time::Instant, GenerationCost)>> = Mutex::new(None);
+
+/// The species whose table is being generated right now, the seconds so far, and what it costs ([`GenerationCost`]: the
+/// dimer gate takes ≈ 1 min on the GPU, ≈ 40 min on the CPU — the app's status line says so while it lasts). `None` when
+/// nothing is generated.
+pub fn generating() -> Option<(u8, f64, GenerationCost)> {
+    GENERATING.lock().unwrap_or_else(|e| e.into_inner()).map(|(z, t, c)| (z, t.elapsed().as_secs_f64(), c))
 }
 
 /// Sets [`generating`] for its lifetime (cleared on drop, a panic included).
 struct Generating;
 
 impl Generating {
-    fn start(z: u8, gated: bool) -> Generating {
-        *GENERATING.lock().unwrap_or_else(|e| e.into_inner()) = Some((z, std::time::Instant::now(), gated));
+    fn start(z: u8, cost: GenerationCost) -> Generating {
+        *GENERATING.lock().unwrap_or_else(|e| e.into_inner()) = Some((z, std::time::Instant::now(), cost));
         Generating
     }
 }
@@ -1139,6 +1187,26 @@ mod tests {
             self.seen.push((t.f, t.local, a.clone()));
             a
         }
+    }
+
+    /// Final review M6 (the M7 leftovers): the cost of a generation in words — the dimer gate's ≈ 40 min on the CPU is said,
+    /// never "≈ 1 min" — and the disk cache's answers make a gated species cost seconds.
+    #[test]
+    fn the_generation_cost_names_the_cpu_gate() {
+        assert_eq!(cost_of(false, false, false), GenerationCost::Seconds, "no gate: seconds on any backend");
+        assert_eq!(cost_of(true, true, false), GenerationCost::Seconds, "replayed from the disk cache");
+        assert_eq!(cost_of(true, false, true), GenerationCost::GpuGate);
+        assert_eq!(cost_of(true, false, false), GenerationCost::CpuGate);
+        assert!(GenerationCost::CpuGate.words().contains("40 min on the CPU"), "{}", GenerationCost::CpuGate.words());
+        assert!(GenerationCost::GpuGate.words().contains("1 min"));
+        let dir = std::env::temp_dir().join(format!("pseudo-cost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!replay_available(&dir, 1), "an empty cache directory replays nothing");
+        let pair = DimerPair { pp: (1.434, 0.018732), ae: (1.4489, 0.019402) };
+        std::fs::write(disk_file(&dir, 1), write_answers(1, &[(1.2, LocalCandidate::HighestChannel, Ok(pair))])).unwrap();
+        assert!(replay_available(&dir, 1), "the gate's answers for H's identity");
+        assert!(!replay_available(&dir, 2), "not He's");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The margin rule itself: a pass needs both criteria inside their bounds by more than the margin, a fail one criterion

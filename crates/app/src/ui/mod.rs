@@ -1130,9 +1130,10 @@ pub struct PanelInput<'a> {
     /// An orbital request is out and its payload has not arrived: the display eigensolve may be
     /// running ("computing unoccupied orbitals…", `Viewer::orbital_waiting`).
     pub orbital_waiting: bool,
-    /// A pseudopotential being generated now (`providers::pseudo::generating`: Z, seconds so far, whether its dimer gate
-    /// runs — ≈ 1 min for H/He on the GPU): the status line says so while the first solve waits for it (M7 Task 11).
-    pub pseudo_generating: Option<(u8, f64, bool)>,
+    /// A pseudopotential being generated now (`providers::pseudo::generating`: Z, seconds so far, what it costs — the dimer
+    /// gate of H/He takes ≈ 1 min on the GPU, ≈ 40 min on the CPU): the status line says so while the first solve waits for
+    /// it (M7 Task 11; the CPU's 40 min since the M7 leftovers, final review M6).
+    pub pseudo_generating: Option<(u8, f64, providers::pseudo::GenerationCost)>,
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,

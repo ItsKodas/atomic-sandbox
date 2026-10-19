@@ -93,6 +93,27 @@ pub struct Context<'a> {
     pub pseudised: bool,
     /// The GPU memory guard (`quality::vram_check`) on the scene the edits would produce.
     pub vram: &'a dyn Fn(&Scene) -> Result<(), String>,
+    /// What making a species' pseudopotential available would cost now (`providers::pseudo::generation_cost`): the ionic
+    /// row says when Apply would start the dimer gate on the CPU (≈ 40 min; final review M6).
+    pub generation_cost: &'a dyn Fn(u8) -> providers::pseudo::GenerationCost,
+}
+
+/// The note of an ionic row whose Apply would generate H or He through the dimer gate on the CPU (≈ 40 min each, none
+/// cached here or on disk): which species, and that the solve waits for it.
+fn cpu_gate_note(scene: &Scene, cost: &dyn Fn(u8) -> providers::pseudo::GenerationCost) -> Option<String> {
+    let mut zs: Vec<u8> = scene.nuclei.iter().map(|n| n.z).filter(|&z| z <= qm::radial::ledger::LEDGER.dimer_z_max).collect();
+    zs.sort_unstable();
+    zs.dedup();
+    let slow: Vec<&str> = zs.into_iter().filter(|&z| cost(z) == providers::pseudo::GenerationCost::CpuGate).map(units::isotopes::symbol).collect();
+    if slow.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "applying generates the {} pseudopotential{} on the CPU first — about {} min (the dimer check; this machine has no GPU for it), and the first solve waits for it",
+        slow.join(" and "),
+        if slow.len() > 1 { "s" } else { "" },
+        40 * slow.len()
+    ))
 }
 
 /// Teacher name for the card: "Kohn-Sham (GPU)" → "GPU solver".
@@ -243,6 +264,11 @@ pub fn offer(path: &Path, prov: &Provenance, scene: &Scene, ctx: &Context<'_>) -
                 if p == sim::IonicPolicy::CoresOnly {
                     r.note = Some("takes effect only for species that have a core (not H, He)".to_string());
                 }
+                // `All` pseudises H and He whatever the backend: without a GPU their dimer gate runs on the CPU (final
+                // review M6 — said on the row, never only after the click; `Accepted` keeps them all-electron there)
+                if p == sim::IonicPolicy::All {
+                    r.note = cpu_gate_note(scene, ctx.generation_cost);
+                }
             }
         }
         ionic_row = Some(rows.len());
@@ -335,7 +361,7 @@ mod tests {
     }
 
     fn ctx<'a>(vram: &'a dyn Fn(&Scene) -> Result<(), String>) -> Context<'a> {
-        Context { teacher: "Kohn-Sham (GPU)", sample_tol: 1e-6, pseudised: false, vram }
+        Context { teacher: "Kohn-Sham (GPU)", sample_tol: 1e-6, pseudised: false, vram, generation_cost: &|_| providers::pseudo::GenerationCost::Seconds }
     }
 
     fn make(prov: &Provenance, s: &Scene) -> Option<ModelOffer> {
@@ -461,6 +487,32 @@ mod tests {
         let c = Context { pseudised: false, ..ctx(&ok) };
         let o = offer(Path::new("x.model"), &p, &s2, &c).unwrap();
         assert!(o.blocked().unwrap().contains("nothing here has a core"), "{:?}", o.blocked());
+    }
+
+    /// Final review M6 (the M7 leftovers): an `all/…` model offered in a run whose H would go through the dimer gate on
+    /// the CPU says so on its row — about 40 min, before the click — and says nothing when the gate costs seconds (the
+    /// disk cache, a cached table) or the scene has no H or He.
+    #[test]
+    fn the_ionic_row_names_a_cpu_dimer_gate_before_apply() {
+        use providers::pseudo::GenerationCost as G;
+        let s = scene(); // H₂ under CoresOnly: nothing pseudised
+        let mut p = prov_of(&s);
+        p.ionic = providers::pseudo::tag_of(sim::IonicPolicy::All);
+        let cpu = |z: u8| if z == 1 { G::CpuGate } else { G::Seconds };
+        let c = Context { generation_cost: &cpu, ..ctx(&ok) };
+        let o = offer(Path::new("x.model"), &p, &s, &c).unwrap();
+        assert_eq!(o.edits, vec![Edit::Ionic(sim::IonicPolicy::All)]);
+        let note = o.rows[0].note.as_deref().expect("the CPU gate is said");
+        assert_eq!(note, "applying generates the H pseudopotential on the CPU first — about 40 min (the dimer check; this machine has no GPU for it), and the first solve waits for it");
+        assert_eq!(o.blocked(), None, "said, not refused: the user may want it");
+        let fast = |_: u8| G::Seconds;
+        let o = offer(Path::new("x.model"), &p, &s, &Context { generation_cost: &fast, ..ctx(&ok) }).unwrap();
+        assert_eq!(o.rows[0].note, None, "replayed or cached: nothing to say");
+        let mut he = s.clone();
+        he.nuclei[1].z = 2;
+        let both = |z: u8| if z <= 2 { G::CpuGate } else { G::Seconds };
+        let o = offer(Path::new("x.model"), &p, &he, &Context { generation_cost: &both, ..ctx(&ok) }).unwrap();
+        assert!(o.rows.iter().find(|r| r.name == "ionic potential").unwrap().note.as_deref().unwrap().contains("H and He pseudopotentials on the CPU first — about 80 min"));
     }
 
     #[test]

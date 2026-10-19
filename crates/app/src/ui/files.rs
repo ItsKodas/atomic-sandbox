@@ -212,6 +212,7 @@ fn fit(
         sample_tol: crate::worker::SAMPLE_TOL,
         pseudised: !super::pseudo::pseudised(input).is_empty(),
         vram: &vram,
+        generation_cost: &providers::pseudo::generation_cost,
     };
     let f = match model_offer::offer(&m.path, prov, scene, &ctx) {
         None => Fit::Ready,

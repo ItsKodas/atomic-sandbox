@@ -4152,10 +4152,15 @@ fn the_default_is_accepted_species_and_generation_is_said() {
     assert!(all.contains("accepted species (default)"), "the Physics menu:\n{all}");
     assert!(!all.contains("cores only (default)") && all.contains("cores only") && all.contains("all species"));
     // the status line while H is generated through its dimer gate, and nothing when nothing is
-    let gen = PanelInput { pseudo_generating: Some((1, 12.4, true)), ..input(&scene, None, &cam) };
+    use providers::pseudo::GenerationCost as G;
+    let gen = PanelInput { pseudo_generating: Some((1, 12.4, G::GpuGate)), ..input(&scene, None, &cam) };
     let notes = overlays::chip_notes(&st, &gen);
     assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s"), "{notes:?}");
-    let o = PanelInput { pseudo_generating: Some((8, 3.0, false)), ..input(&scene, None, &cam) };
+    // final review M6: the CPU gate's 40 minutes are said
+    let cpu = PanelInput { pseudo_generating: Some((1, 75.0, G::CpuGate)), ..input(&scene, None, &cam) };
+    let notes = overlays::chip_notes(&st, &cpu);
+    assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 40 min on the CPU: its dimer check (no GPU))… 75 s"), "{notes:?}");
+    let o = PanelInput { pseudo_generating: Some((8, 3.0, G::Seconds)), ..input(&scene, None, &cam) };
     assert!(overlays::chip_notes(&st, &o).iter().any(|(_, t)| t == "generating the O pseudopotential (seconds)… 3 s"));
     assert!(!overlays::chip_notes(&st, &inp).iter().any(|(_, t)| t.starts_with("generating")));
 }
