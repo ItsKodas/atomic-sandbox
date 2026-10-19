@@ -252,3 +252,14 @@ Scaling up the "ladder": more elements (pseudopotentials for Z > 10), larger sys
 
 
 Nuclear physics (decay, transmutation) is planned as a **nuclear-events layer**, not as explicit protons and neutrons: the nucleus is 10⁻⁵ of the atom and no first-principles route from QCD exists, so nuclei stay points for the electrons while a stochastic α/β/γ event process — Q-values from the isotope mass table, rates from measured half-lives — changes Z live and lets the chemistry respond. Decay time gets its own labelled clock, separate from the MD speed.
+
+## License
+
+Copyright © 2026 Dakoda Lancelot. Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — source-available, not open source:
+
+- **Allowed:** using, copying, forking and modifying the project, and sharing your versions, for any noncommercial purpose — personal use, hobby projects, study, research, education, and use by charities, schools and public bodies.
+- **Not allowed:** any commercial use — selling it or anything built from it, or using it to make money.
+- Anyone who shares a copy must pass these terms on with it (the license's *Required Notice* line included).
+
+Contributions (pull requests) are accepted under the same license. For anything the license does not cover, ask the copyright holder.
+

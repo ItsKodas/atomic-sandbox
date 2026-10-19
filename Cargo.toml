@@ -5,7 +5,7 @@ members = ["crates/units", "crates/qm", "crates/validate", "crates/gpu", "crates
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/ItsKodas/atomic-sandbox"
 
 [workspace.dependencies]
