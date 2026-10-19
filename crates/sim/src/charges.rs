@@ -112,6 +112,10 @@ pub struct PartialCharges {
     pub source: ChargeSource,
     /// The ionic surface's tag (`ForceProvider::ionic_tag`): `"none"` = all-electron.
     pub ionic: String,
+    /// The electric dipole μ = Σ_A Z_A R_A − ∫ ρ r d³r of the same density ([`dipole`]; e·Bohr,
+    /// about the cell centre — origin-dependent for a charged scene). Display only (the reference
+    /// comparison, `app::reference`).
+    pub dipole: [f64; 3],
 }
 
 impl PartialCharges {
@@ -264,10 +268,61 @@ pub fn hirshfeld(free: &[&RadialDensity], pos: &[[f64; 3]], counted: &[f64], cel
     (q, h3 * total.value())
 }
 
+/// The electric dipole (e·Bohr, about the cell centre — the coordinates' origin) of point charges
+/// `counted[a]` at `pos[a]` and the electron density `rho` at `cell`'s n³ nodes in `qm::Grid`
+/// order (as [`hirshfeld`]): μ = Σ_A Z_A R_A − h³ Σ_n ρ(r_n) r_n, the convention of μ pointing from
+/// the negative to the positive charge. Under pseudopotentials `counted` is Z_v and `rho` the
+/// valence density: a frozen core is a neutral (Z − Z_v nucleus + core electrons) charge at R_A,
+/// so μ is the all-electron dipole up to the core's polarisation. The box truncates the density's
+/// tail (the cell is finite) — the same truncation the solve has. Display only (rule 4: compensated
+/// sums over the n³ nodes).
+pub fn dipole(pos: &[[f64; 3]], counted: &[f64], cell: &Cell, rho: &[f64]) -> [f64; 3] {
+    let n = cell.n;
+    assert_eq!(rho.len(), n * n * n, "dipole: ρ has {} values for {n}³ nodes", rho.len());
+    let (h, half) = (cell.h, cell.half_extent());
+    let coord = |i: usize| -half + i as f64 * h;
+    let mut el = [Acc::default(); 3];
+    for kz in 0..n {
+        let z = coord(kz);
+        for jy in 0..n {
+            let y = coord(jy);
+            let row = n * (jy + n * kz);
+            for ix in 0..n {
+                let v = rho[row + ix];
+                if v != 0.0 {
+                    el[0].add(v * coord(ix));
+                    el[1].add(v * y);
+                    el[2].add(v * z);
+                }
+            }
+        }
+    }
+    let h3 = h * h * h;
+    std::array::from_fn(|c| neumaier(pos.iter().zip(counted).map(|(p, q)| q * p[c])) - h3 * el[c].value())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scene::Nucleus;
+
+    /// Two unit charges with their electrons displaced: μ = Σ Z R − Σ N_e r_e. A neutral atom whose
+    /// electron sits on it has μ = 0; an electron moved by d gives μ = −d per electron.
+    #[test]
+    fn the_dipole_of_displaced_gaussians() {
+        let cell = Cell { n: 49, h: 0.25 };
+        let g = gauss(0.6);
+        let pos = [[-1.0, 0.0, 0.5], [1.2, 0.3, 0.0]];
+        let rho = on_nodes(&cell, &[(1.0, pos[0], &g), (1.0, pos[1], &g)]);
+        let mu = dipole(&pos, &[1.0, 1.0], &cell, &rho);
+        assert!(mu.iter().all(|m| m.abs() < 1e-8), "{mu:?}");
+        // atom 1's electron moved to atom 0: μ = R₁ − R₀ (one electron's charge from R₁ to R₀)
+        let rho = on_nodes(&cell, &[(2.0, pos[0], &g)]);
+        let mu = dipole(&pos, &[1.0, 1.0], &cell, &rho);
+        for c in 0..3 {
+            assert!((mu[c] - (pos[1][c] - pos[0][c])).abs() < 1e-8, "{mu:?}");
+        }
+    }
 
     /// The density Σ_A c_A g(|r − R_A|) at the nodes of `cell`.
     fn on_nodes(cell: &Cell, terms: &[(f64, [f64; 3], &dyn Fn(f64) -> f64)]) -> Vec<f64> {
@@ -342,6 +397,7 @@ mod tests {
                 step: 0,
                 source: ChargeSource::Step,
                 ionic: "none".into(),
+                dipole: [0.0; 3],
             };
             assert!(pc.balanced(), "{}", pc.sum_error());
         }
@@ -380,7 +436,7 @@ mod tests {
         let pos = [[0.0; 3]];
         let rho = on_nodes(&cell, &[(3.0, pos[0], &g)]); // 3 electrons against Z_v = 1
         let (q, electrons) = hirshfeld(&[&atom], &pos, &[1.0], &cell, &rho);
-        let pc = PartialCharges { q, counted: vec![1.0], z: vec![1], positions: pos.to_vec(), electrons, system_charge: 0, t: 0.0, step: 0, source: ChargeSource::Step, ionic: "none".into() };
+        let pc = PartialCharges { q, counted: vec![1.0], z: vec![1], positions: pos.to_vec(), electrons, system_charge: 0, t: 0.0, step: 0, source: ChargeSource::Step, ionic: "none".into(), dipole: [0.0; 3] };
         assert!(!pc.balanced() && (pc.sum_error() + 2.0).abs() < 1e-3, "{}", pc.sum_error());
         let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None };
         assert!(pc.is_current(&scene));
