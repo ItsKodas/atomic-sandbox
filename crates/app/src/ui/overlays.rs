@@ -583,7 +583,8 @@ fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>)
     let Some(l) = legend_of(st, input) else { return };
     egui::Area::new(Id::new("orbital-legend"))
         .pivot(Align2::LEFT_BOTTOM)
-        .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 70.0))
+        // above the switch and its stacked slider panels (Camera, Dots: one row each)
+        .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 70.0 - 40.0 * (u8::from(st.camera_view) + u8::from(st.volume_mode == super::VOLUME_DOTS)) as f32))
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
