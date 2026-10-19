@@ -23,6 +23,8 @@ pub struct Renderer {
     pub volume: VolumePass, pub colour: ColourVolumePass, pub volume_params: VolumeUniform, pub dots: dots::DotsPass,
     /// Draw the colour volume bound in `colour` instead of the scalar field in `volume`.
     pub draw_colour: bool,
+    /// Draw the electron cloud at all (the density / orbitals / dots); false = View ▸ show ▸ None.
+    pub draw_cloud: bool,
 }
 
 impl Renderer {
@@ -38,7 +40,7 @@ impl Renderer {
         volume.set_params(ctx, &volume_params);
         colour.set_params(ctx, &volume_params);
         let dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
-        Renderer { camera_uniform, spheres, lines, ghosts, volume, colour, volume_params, dots, draw_colour: false }
+        Renderer { camera_uniform, spheres, lines, ghosts, volume, colour, volume_params, dots, draw_colour: false, draw_cloud: true }
     }
 
     /// The camera for a scene filling the whole `width × height` target.
@@ -90,6 +92,9 @@ impl Renderer {
             self.ghosts.draw(&mut pass);
         }
         // `MODE_DOTS` = probability dots (`dots`) instead of the raymarch
+        if !self.draw_cloud {
+            return;
+        }
         let dots = self.volume_params.mode == volume::MODE_DOTS;
         if dots {
             self.dots.generate(enc);

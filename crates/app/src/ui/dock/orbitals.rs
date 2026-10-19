@@ -424,7 +424,9 @@ pub fn included(st: &UiState, r: &OrbitalInfo) -> bool {
 // ---- the tab ----
 
 /// The `show` selector: one button per mode, probed as `{prefix}-{word}`; returns the picked mode.
-pub fn show_selector(ui: &mut Ui, current: ShowMode, prefix: &str) -> Option<ShowMode> {
+/// "None" (first) hides the electron cloud altogether (`hidden`, `UiState::hide_cloud`); picking a
+/// mode shows it again.
+pub fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str) -> Option<ShowMode> {
     let mut picked = None;
     egui::Frame::new()
         .fill(theme::APP)
@@ -435,10 +437,16 @@ pub fn show_selector(ui: &mut Ui, current: ShowMode, prefix: &str) -> Option<Sho
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             ui.horizontal_wrapped(|ui| {
+                let r = ui.add(egui::Button::selectable(*hidden, "None")).on_hover_text("no electron cloud: only the atoms, their bonds and labels");
+                super::super::probe(&format!("{prefix}-none"), &r);
+                if r.clicked() {
+                    *hidden = true;
+                }
                 for mode in ShowMode::ALL {
-                    let r = ui.add(egui::Button::selectable(current == mode, mode.title())).on_hover_text(mode_tip(mode));
+                    let r = ui.add(egui::Button::selectable(!*hidden && current == mode, mode.title())).on_hover_text(mode_tip(mode));
                     super::super::probe(&format!("{prefix}-{}", mode.word()), &r);
                     if r.clicked() {
+                        *hidden = false;
                         picked = Some(mode);
                     }
                 }
@@ -454,7 +462,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.label("show");
             theme::info(ui, format!("{KS_NOTE} {SPIN_NOTE}"));
         });
-        if let Some(m) = show_selector(ui, st.show, "show") {
+        if let Some(m) = show_selector(ui, st.show, &mut st.hide_cloud, "show") {
             acts.push(Action::Show(m));
         }
         ui.add(egui::Label::new(RichText::new(KS_NOTE).size(11.0).color(theme::INK_DIM)).wrap());

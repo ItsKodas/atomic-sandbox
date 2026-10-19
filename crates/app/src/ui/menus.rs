@@ -648,7 +648,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.label("show");
             theme::info(ui, format!("{} {}", orbitals::KS_NOTE, orbitals::SPIN_NOTE));
         });
-        if let Some(m) = orbitals::show_selector(ui, st.show, "menu-show") {
+        if let Some(m) = orbitals::show_selector(ui, st.show, &mut st.hide_cloud, "menu-show") {
             acts.push(Action::Show(m));
         }
         ui.horizontal(|ui| {

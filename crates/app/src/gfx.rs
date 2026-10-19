@@ -586,6 +586,7 @@ impl Painter {
         let drawn = self.drawn(ui);
         self.refresh(ctx);
         self.shimmer = ui.shimmer;
+        self.renderer.draw_cloud = !ui.hide_cloud;
         self.nucleus_scale = nucleus_scale(ui, drawn == Drawn::Orbital);
         let dots = ui.volume_mode == VOLUME_DOTS;
         let scalar_mode = |dots: bool| if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_ISO } else { MODE_VOLUME };

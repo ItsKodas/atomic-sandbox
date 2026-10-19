@@ -17,7 +17,7 @@ macro_rules! fields {
     ($m:ident) => {
         $m!(show_partial_core, show_bonds, show_labels, show_badge, show_ghost, show_angles, show_bond_lengths, follow_selected,
             shimmer, dots_by_orbital, orbital_phase, colour_additive, colour_physical, show_cell, show_floor, show_axes,
-            show_place_grid, grid_in_angstrom, show_trails, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
+            show_place_grid, grid_in_angstrom, show_trails, hide_cloud, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
             gamma, opacity, iso, phase_iso, spin_iso, trail_opacity, trail_fs, volume_mode, motion_blur)
     };
 }

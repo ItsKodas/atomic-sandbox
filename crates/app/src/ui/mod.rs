@@ -542,6 +542,8 @@ pub struct UiState {
     pub show_trails: bool,
     /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
     pub motion_blur: f32,
+    /// View ▸ Density ▸ show ▸ None: no electron cloud, only the atoms (display only).
+    pub hide_cloud: bool,
     pub trail_fs: f64,
     pub trail_opacity: f32,
     /// Run settings as last sent (re-sent to a new worker, `run_settings`): time step (fs),
@@ -786,6 +788,7 @@ right {}
             grid_in_angstrom: false,
             show_trails: false,
             motion_blur: 0.5,
+            hide_cloud: false,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
             trail_opacity: crate::trails::OPACITY_DEFAULT,
             dt_fs: DEFAULT_DT_FS,
