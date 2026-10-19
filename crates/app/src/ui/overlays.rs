@@ -232,6 +232,7 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
     }
     egui::Area::new(Id::new("status-chip"))
         .fixed_pos(view.min + Vec2::splat(12.0))
+        .constrain_to(view)
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
@@ -240,8 +241,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                 frame = frame.stroke(Stroke::new(1.0, RED)).fill(Color32::from_rgba_premultiplied(70, 14, 20, 225));
             }
             frame.show(ui, |ui| {
-                ui.set_max_width((view.width() - 300.0).clamp(260.0, 640.0));
-                ui.horizontal(|ui| {
+                // within the 3D view (a narrow view: the row wraps instead of running over the dock)
+                ui.set_max_width((view.width() - 300.0).clamp(260.0, 640.0).min(view.width() - 40.0));
+                ui.horizontal_wrapped(|ui| {
                     if busy {
                         ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
                     } else {
