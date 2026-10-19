@@ -78,6 +78,8 @@ struct App {
     record: Option<Record>,
     /// egui asked for another frame (animation, tooltip).
     egui_repaint: bool,
+    /// egui asked for a frame later (a tooltip's hover delay, a blinking cursor): when.
+    egui_repaint_at: Option<Instant>,
     /// The custom frame's close button was pressed: exit at the next `about_to_wait`.
     closing: bool,
     /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
@@ -530,6 +532,7 @@ fn main() {
         egui_state: None,
         record,
         egui_repaint: true,
+        egui_repaint_at: None,
         closing: false,
         frames: FrameStats::default(),
     };
@@ -676,7 +679,12 @@ impl ApplicationHandler for App {
             }
             r.was_idle = idle;
         }
-        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got;
+        // a frame egui asked for later (tooltips appear after a hover delay with the mouse still)
+        let due = self.egui_repaint_at.is_some_and(|t| Instant::now() >= t);
+        if due {
+            self.egui_repaint_at = None;
+        }
+        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due;
         // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
         // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
         // (no vsync) would pace the loop and a solve would spin a core. Poll instead.
@@ -690,7 +698,8 @@ impl ApplicationHandler for App {
             }
             el.set_control_flow(ControlFlow::Wait);
         } else {
-            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + IDLE_POLL));
+            let poll = Instant::now() + IDLE_POLL;
+            el.set_control_flow(ControlFlow::WaitUntil(self.egui_repaint_at.map_or(poll, |t| t.min(poll))));
         }
     }
 }
@@ -762,10 +771,10 @@ impl App {
             }
         }
         egui_state.handle_platform_output(window, std::mem::take(&mut out.platform_output));
-        self.egui_repaint = out
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|v| v.repaint_delay.is_zero());
+        let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
+        self.egui_repaint = delay.is_some_and(|d| d.is_zero());
+        // a later frame (egui says Duration::MAX for none): the idle loop wakes for it
+        self.egui_repaint_at = delay.filter(|d| !d.is_zero() && *d < Duration::from_secs(60)).map(|d| Instant::now() + d);
         self.viewer.set_view(&mut g.painter, &g.ctx);
         let v = &self.viewer;
         let target = Target {
