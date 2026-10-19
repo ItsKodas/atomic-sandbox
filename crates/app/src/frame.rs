@@ -97,7 +97,7 @@ pub fn native_requested() -> bool {
 }
 
 #[cfg(windows)]
-pub use win::install;
+pub use win::{exe_icon, install};
 
 /// No custom frame off Windows: the native decorations stay.
 #[cfg(not(windows))]
@@ -135,6 +135,34 @@ mod win {
     const HTBOTTOMRIGHT: usize = 17;
     /// The resize border inside the window's edge, in points.
     const BORDER_PT: f32 = 6.0;
+
+    /// The exe's own icon (resource 1, embedded by `build.rs`) as the window's big and small icon
+    /// and its class icon, loaded by Windows at the sizes it asks for: the taskbar shows the
+    /// generic icon with only winit's RGBA icons. False when the exe carries no icon.
+    pub fn exe_icon(window: &winit::window::Window) -> bool {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, LoadImageW, SendMessageW, SetClassLongPtrW, GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL,
+            IMAGE_ICON, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
+        };
+        let Ok(h) = window.window_handle() else { return false };
+        let RawWindowHandle::Win32(w) = h.as_raw() else { return false };
+        let hwnd = w.hwnd.get() as HWND;
+        unsafe {
+            let module = GetModuleHandleW(std::ptr::null());
+            let load = |cx, cy| LoadImageW(module, 1 as *const u16, IMAGE_ICON, GetSystemMetrics(cx), GetSystemMetrics(cy), 0);
+            let big = load(SM_CXICON, SM_CYICON);
+            let small = load(SM_CXSMICON, SM_CYSMICON);
+            if big.is_null() || small.is_null() {
+                return false;
+            }
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as WPARAM, big as LPARAM);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, small as LPARAM);
+            SetClassLongPtrW(hwnd, GCLP_HICON, big as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, small as isize);
+        }
+        true
+    }
 
     /// Subclasses the window's procedure; true if the custom frame is in place.
     pub fn install(window: &winit::window::Window) -> bool {

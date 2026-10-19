@@ -531,14 +531,10 @@ impl ApplicationHandler for App {
                 .with_corner_preference(CornerPreference::Round)
         };
         let window = Arc::new(el.create_window(attrs).expect("create window"));
-        // the taskbar's (big) icon at the size Windows asks for: 32 px × the display scale (a
-        // 256 px one is shown as the generic icon on some builds)
+        // the exe's embedded icon for the taskbar and the window (Windows loads it at its sizes);
+        // winit's RGBA icon (`with_window_icon`) stays when the exe has none
         #[cfg(windows)]
-        {
-            use winit::platform::windows::WindowExtWindows;
-            let s = (32.0 * window.scale_factor()).round().clamp(16.0, 256.0) as u32;
-            window.set_taskbar_icon(winit::window::Icon::from_rgba(icon::rgba(s), s, s).ok());
-        }
+        frame::exe_icon(&window);
         if !frame::native_requested() && !frame::install(&window) {
             window.set_decorations(true); // no subclass: the native caption, so it can still be moved
         }
