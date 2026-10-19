@@ -2084,6 +2084,40 @@ impl Viewer {
         Some((text, at))
     }
 
+    /// Readouts ▸ Compare with reference's arrows (display only): PySCF's force on each atom (orange)
+    /// beside ours (blue), from each nucleus, while the atoms are still where the comparison was
+    /// made (within 0.01 Bohr). One scale for both: the larger |F| is 1.5 Bohr long (forces under
+    /// 0.02 Ha/Bohr stay short).
+    fn reference_arrows(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || !self.ui.compare.arrows || self.ui.files.open {
+            return;
+        }
+        let Some(run) = self.ui.compare.run.as_ref() else { return };
+        let Some(theirs) = run.answer.as_ref().and_then(|a| a.as_ref().ok()).and_then(|a| a.forces.as_ref()) else { return };
+        let o = &run.ours;
+        let here = shown.nuclei.len() == o.positions.len()
+            && shown.nuclei.iter().zip(&o.positions).all(|(n, p)| (0..3).map(|k| (n.pos[k] - p[k]).powi(2)).sum::<f64>() < 1e-4);
+        if !here {
+            return;
+        }
+        let ppp = root.pixels_per_point();
+        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+        let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        fixed_layer(root, "reference-arrows", clip);
+        let painter = root.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("reference-arrows"))).with_clip_rect(clip);
+        let fmax = o.forces.iter().chain(theirs).map(|f| crate::reference::norm(*f)).fold(0.02, f64::max);
+        let scale = 1.5 / fmax;
+        for (forces, colour, width) in [(&o.forces, egui::Color32::from_rgb(110, 170, 255), 2.0), (theirs, egui::Color32::from_rgb(255, 150, 60), 2.5)] {
+            for (n, f) in shown.nuclei.iter().zip(forces.iter()) {
+                let tip: [f64; 3] = std::array::from_fn(|k| n.pos[k] + scale * f[k]);
+                if let (Some(a), Some(b)) = (tools::project(&self.camera, tools::v3(n.pos), vp), tools::project(&self.camera, tools::v3(tip), vp)) {
+                    let (a, b) = (to_pos(a), to_pos(b));
+                    painter.arrow(a, b - a, egui::Stroke::new(width, colour));
+                }
+            }
+        }
+    }
+
     /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
     /// at its centroid as drawn now, faded with the bonds when the graph is an earlier step's;
     /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
@@ -2309,6 +2343,7 @@ impl Viewer {
                 }),
             );
             self.label_overlay(root, &shown, viewport);
+            self.reference_arrows(root, &shown, viewport);
         });
         self.viewport = viewport;
         let ppp = ctx.pixels_per_point();

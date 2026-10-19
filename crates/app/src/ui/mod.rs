@@ -702,6 +702,8 @@ pub struct UiState {
     pub help: Option<HelpTopic>,
     /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
     pub activity: activity::ActivityState,
+    /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
+    pub compare: crate::reference::Compare,
 }
 
 impl UiState {
@@ -930,6 +932,7 @@ right {}
             search: search::SearchState::default(),
             help: None,
             activity: activity::ActivityState::new(),
+            compare: Default::default(),
         }
     }
 
@@ -1196,6 +1199,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
     let queued = acts.len();
     st.log.record(&st.status, st.status_seq, input);
+    // the reference comparison's results (a helper process on its own thread; never blocks)
+    st.compare.poll(input.snapshot);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
