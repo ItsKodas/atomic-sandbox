@@ -30,7 +30,7 @@ const REWIND_TIP: &str = "reverse every velocity (v → −v): without thermosta
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
 const ORBIT_TIP: &str = "Inspect: look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
-const PLACE_TIP: &str = "click to drop a nucleus at rest (also while playing)";
+const PLACE_TIP: &str = "Place: click to drop a nucleus at rest (also while playing)";
 const EDIT_TIP: &str = "Edit: click an atom, Shift-click to add or remove, drag a box on empty space for a group (Esc clears); drag an arrow (X/Y/Z) or a square (a plane) to move the selection rigidly — velocities kept, the run pauses while you hold and resumes on release; middle-drag orbits";
 const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
@@ -162,7 +162,7 @@ impl Widths {
             dt: max(&[caps("dt", false), dt_field, w("under-resolved", &sub), w(&format!("amber > {DT_WARN_FS}"), &sub)]) + PAD,
             tool: max(&[
                 caps("Tool", false),
-                segs(&[btn("      Inspect"), btn("      Place"), btn("      Grab"), btn("      Edit")]),
+                segs(&[btn("      Inspect"), 30.0, 30.0, 30.0]),
                 w("right-drag pans · wheel zooms", &sub),
                 line_w(&["drag + wheel: pull ", "0.0000", " Ha/Bohr"]),
             ]) + PAD,
@@ -559,7 +559,9 @@ fn tool_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action
                 (ToolMode::Select, Icon::Grab, "Grab", SELECT_TIP),
                 (ToolMode::Edit, Icon::Move, "Edit", EDIT_TIP),
             ] {
-                let text = if compact { "" } else { text };
+                // the active tool's name only (the others by icon, named in their tooltips): four
+                // named buttons no longer let the full layout fit 1400 pt
+                let text = if compact || st.mode != mode { "" } else { text };
                 if icons::seg_button(ui, icon, text, st.mode == mode).on_hover_text(tip).clicked() {
                     acts.push(Action::Tool(mode));
                 }
