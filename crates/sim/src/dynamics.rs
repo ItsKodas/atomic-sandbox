@@ -670,7 +670,7 @@ pub enum DynCommand {
 }
 
 /// At most this many positions per tick go to the viewer's motion blur ([`DynSnapshot::tick_path`]).
-pub const TICK_PATH_SAMPLES: usize = 12;
+pub const TICK_PATH_SAMPLES: usize = 24;
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
 /// empty, paused placeholder for before the first snapshot (it describes no real scene).
@@ -1580,7 +1580,9 @@ impl Dynamics {
         }
         let mut done = 0usize;
         self.tick_path.clear();
-        let stride = (want / TICK_PATH_SAMPLES).max(1);
+        // every `stride`-th step, the stride doubling (and the list halving) whenever it fills: up to
+        // [`TICK_PATH_SAMPLES`] evenly spread over the steps the tick actually ran, however many
+        let mut stride = 1usize;
         while done < want && self.forces.is_some() {
             if should_abort() {
                 break;
@@ -1594,8 +1596,18 @@ impl Dynamics {
             match self.step_once(should_abort) {
                 Ok(()) => {
                     done += 1;
-                    if want > 1 && done % stride == 0 && self.tick_path.len() < TICK_PATH_SAMPLES {
-                        self.tick_path.push(self.scene.nuclei.iter().map(|n| n.pos).collect());
+                    if want > 1 && done % stride == 0 {
+                        if self.tick_path.len() == TICK_PATH_SAMPLES {
+                            let mut k = 0;
+                            self.tick_path.retain(|_| {
+                                k += 1;
+                                k % 2 == 0
+                            });
+                            stride *= 2;
+                        }
+                        if done % stride == 0 {
+                            self.tick_path.push(self.scene.nuclei.iter().map(|n| n.pos).collect());
+                        }
                     }
                     if self.paused {
                         self.pending_steps -= 1;
