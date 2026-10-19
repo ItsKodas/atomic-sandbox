@@ -1853,6 +1853,7 @@ impl SurrogateKs {
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
         let shells = sampler.take_shell_checks();
+        let unrun = sampler.pending_shell_checks();
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
         self.last_pass = Some(progress.clone());
@@ -1861,9 +1862,15 @@ impl SurrogateKs {
         let kind = if teach.is_some() { "teach-around pass" } else { "sampling pass" };
         self.teacher.discontinuity();
         let (fittable, q_prime) = self.fittable_and_q_prime();
+        // the shell checks are judged against this pass's own refit only (final review M2): with
+        // no refit the model standing is none or an earlier fit, whose verdict on the shell is
+        // not this pass's measurement
+        let mut unjudged: Option<String> = None;
         let msg = if self.samples() == 0 {
+            unjudged = Some("the pass fitted no model".into());
             format!("{kind} {how}: no samples to fit")
         } else if fittable < q_prime {
+            unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below Q′ = {q_prime}"));
             // below Q′ the model cannot earn trust (the trust rule needs n ≥ Q′), and the fit
             // with its trust recovery costs seconds on the worker thread (Task 3 fix round 2):
             // keep the samples, skip the refit until there are enough
@@ -1890,13 +1897,24 @@ impl SurrogateKs {
                         coverage.as_ref().and_then(PassCoverage::words).map_or(String::new(), |w| format!(". {w}"))
                     )
                 }
-                Err(e) => format!("{kind} {how}: {added} samples added; the refit failed ({e})"),
+                Err(e) => {
+                    unjudged = Some(format!("the pass's refit failed ({e})"));
+                    format!("{kind} {how}: {added} samples added; the refit failed ({e})")
+                }
             }
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
-        if !shells.is_empty() {
-            self.judge_shell_checks(shells);
+        match unjudged {
+            None => self.judge_shell_checks(shells),
+            Some(why) => self.leave_shell_checks_unjudged(&shells, &why),
+        }
+        for ((za, zb), r) in unrun {
+            self.user_notes.push(format!(
+                "sampling: the pass ended before its shell check of {}–{} at r = {r:.2} Bohr — the cutoff shell of this pair stays unmeasured",
+                units::elements::symbol(za),
+                units::elements::symbol(zb)
+            ));
         }
         match teach {
             Some((targets, holdouts)) => self.finish_teach(&targets, holdouts, &progress),

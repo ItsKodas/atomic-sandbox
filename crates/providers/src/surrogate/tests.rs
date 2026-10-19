@@ -6965,6 +6965,52 @@ fn the_training_curve_refuses_a_fenced_shell_band_as_evaluate_does() {
     }
 }
 
+/// Final review M2 (the M7 leftovers): a pass's shell checks are judged against that pass's own
+/// refit only, and a check that is not judged is said, never dropped. (a) A pass too small to fit
+/// (below Q′, no model at all): its shell check was solved but is reported "could not be judged
+/// (the pass's refit did not run …) — … stays unmeasured", and nothing is fenced. (b) A pass
+/// cancelled before its shell check (a model standing, the refit runs on the kept samples): "the
+/// pass ended before its shell check of H–H …", nothing fenced and no "holds" verdict.
+#[test]
+fn shell_checks_are_judged_against_the_passs_own_refit_or_said_unmeasured() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    // (a) no model, below Q′
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &off_centre_h2(3.3), &plan, &mut refs).unwrap();
+    assert_eq!(s.pass.as_ref().unwrap().pending_shell_checks().len(), 1, "premise: the 3.3 Bohr scan crosses 5/6 r_cut");
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    println!("{}", notes.join("\n"));
+    let (fittable, q_prime) = s.fittable_and_q_prime();
+    assert!(s.model().is_none() && fittable < q_prime, "premise: below Q′ ({fittable} < {q_prime}), no fit");
+    assert!(
+        notes.iter().any(|n| n.starts_with("sampling: the shell check of H–H at r = ") && n.contains("could not be judged (the pass's refit did not run") && n.ends_with("stays unmeasured")),
+        "{notes:?}"
+    );
+    assert!(!notes.iter().any(|n| n.contains("cutoff holds") || n.contains("still interacts")), "no verdict without the pass's fit");
+    assert!(s.audit_fences.is_empty(), "nothing fenced");
+    // (b) cancelled before the check: the refit runs, the unrun check is said
+    let (mut t, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let _ = Trainable::take_notes(&mut t);
+    Trainable::start_pass(&mut t, &off_centre_h2(3.3), &plan, &mut refs).unwrap();
+    let r = t.pass.as_ref().unwrap().pending_shell_checks()[0].1;
+    Trainable::cancel_pass(&mut t);
+    let notes = Trainable::take_notes(&mut t);
+    println!("{}", notes.join("\n"));
+    assert!(notes.iter().any(|n| n.contains("refit on")), "premise: the cancelled pass refits: {notes:?}");
+    let want = format!("sampling: the pass ended before its shell check of H–H at r = {r:.2} Bohr — the cutoff shell of this pair stays unmeasured");
+    assert!(notes.contains(&want), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("cutoff holds") || n.contains("still interacts")));
+    assert!(t.audit_fences.is_empty());
+}
+
+/// An H₂ at `r` along x whose fixed atom sits at −1.5 − r/2 in the fixture's 33³ cell, so the scan's
+/// moved atom (index 1, +x) stays inside the cell's margin out past 5/6 r_cut (the shell check).
+fn off_centre_h2(r: f64) -> Scene {
+    dimer(r, [1.0, 0.0, 0.0], [-1.5, 0.0, 0.0], 1, 1)
+}
+
 /// The training curve's dimer at distance `r` (Bohr), as `views` builds it.
 fn dimer_at_x(r: f64) -> [[f64; 3]; 2] {
     [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]]

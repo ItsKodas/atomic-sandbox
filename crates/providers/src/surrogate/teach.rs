@@ -960,7 +960,10 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = c.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = c.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else { continue };
+            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else {
+                self.leave_shell_checks_unjudged(std::slice::from_ref(&c), "the model cannot predict this geometry");
+                continue;
+            };
             if e <= 1.0 && f <= 1.0 {
                 self.user_notes.push(format!(
                     "sampling: the model's cutoff holds for {name}: at r = {:.2} Bohr the interaction left is within the tiers (energy {e:.2}× the tier, forces {f:.2}× their bound)",
@@ -978,6 +981,20 @@ impl SurrogateKs {
                 let pair = (c.pair.0.min(c.pair.1), c.pair.0.max(c.pair.1));
                 self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
             }
+        }
+    }
+
+    /// The pass's shell checks that are not judged (final review M2): solved, but the pass left no
+    /// fit of its own to judge them against (`why`), so each pair's cutoff shell stays unmeasured —
+    /// said, never a silent drop, and never a verdict of an earlier fit. No fence, no sample.
+    pub(super) fn leave_shell_checks_unjudged(&mut self, shells: &[crate::sampling::ShellCheck], why: &str) {
+        for c in shells {
+            self.user_notes.push(format!(
+                "sampling: the shell check of {}–{} at r = {:.2} Bohr could not be judged ({why}) — the cutoff shell of this pair stays unmeasured",
+                units::elements::symbol(c.pair.0),
+                units::elements::symbol(c.pair.1),
+                c.r
+            ));
         }
     }
 
