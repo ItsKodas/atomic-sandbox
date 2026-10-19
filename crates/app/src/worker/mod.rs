@@ -666,20 +666,23 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// into a texture of its own pool: the audits' and refreshes' densities are the cloud between DFT
 /// steps (module doc, "The cloud").
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    GpuKs::new(ctx.clone(), SAMPLE_TOL).with_vram_budget(crate::quality::vram_budget_bytes() / 2)
+    let b = crate::quality::vram_budget();
+    GpuKs::new(ctx.clone(), SAMPLE_TOL).with_vram_budget(b.bytes / 2).with_vram_budget_note(format!("the auditor's half of the {} budget: {}", b.gb(), b.why()))
 }
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
 /// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
 /// estimated solver's teacher), reporting its solves on `probe`'s `slot` (activity spec A1: the
 /// GPU solver counts its SCF steps, the CPU one marks the solve only).
-/// A GPU solver gets the GPU memory budget (`quality::vram_budget_bytes`; half of it when it is
+/// A GPU solver gets the GPU memory budget (`quality::vram_budget`; half of it when it is
 /// the estimated solver's teacher (`solvers` = 2), whose auditor takes the other half —
 /// `providers::ks`, "GPU memory"), so a scene over it is refused before anything is allocated.
 fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64, probe: &Arc<sim::ActivityProbe>, slot: sim::Slot) -> Box<dyn ForceProvider> {
-    let budget = crate::quality::vram_budget_bytes() / solvers.max(1);
+    let b = crate::quality::vram_budget();
+    let budget = b.bytes / solvers.max(1);
+    let note = if solvers > 1 { format!("the teacher's half of the {} budget: {}", b.gb(), b.why()) } else { b.why() };
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget).with_probe(probe.clone(), slot)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget).with_vram_budget_note(note).with_probe(probe.clone(), slot)),
         _ => Box::new(CpuKs::new(tol).with_probe(probe.clone(), slot)),
     }
 }

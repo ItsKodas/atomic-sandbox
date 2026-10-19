@@ -1006,7 +1006,7 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the
 /// backend's solver count and the budget): refused before the worker allocates anything.
 fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
-    crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
+    crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget())
 }
 
 /// The settings edits of a model offer (`model_offer::Edit`), sent as the ordinary commands.

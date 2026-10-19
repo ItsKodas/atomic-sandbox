@@ -1787,8 +1787,8 @@ fn superscripts_are_drawn_raised() {
 /// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
-    use crate::quality::{gpu_solvers, vram_check, VRAM_BUDGET_GB};
-    let budget = (VRAM_BUDGET_GB * 1e9) as u64;
+    use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
+    let budget = VramBudget::fixed((VRAM_BUDGET_GB * 1e9) as u64);
     let cam = camera();
     let mut big = Scene::preset("empty").unwrap();
     big.grid_n = 65; // 16 Bohr at 0.25
@@ -1799,7 +1799,7 @@ fn a_change_over_the_vram_budget_is_refused() {
     let fine = crate::quality::regrid(&big, 16.0, 0.08);
     assert_eq!(fine.grid_n, 201);
     let e = vram_check(&fine, 1, budget).unwrap_err();
-    assert!(e.contains("GPU memory") && e.contains("budget") && e.contains("201³"), "{e}");
+    assert!(e.contains("GPU memory") && e.contains("the 12.0 GB budget") && e.contains("201³"), "{e}");
     assert!(vram_check(&fine, 0, budget).is_ok(), "the CPU backend allocates no GPU memory");
     let mut st = UiState::new("empty", &big);
     (st.backend, st.gpu_available) = (Backend::Gpu, true);
@@ -2008,15 +2008,16 @@ fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
     let mut third = scene.nuclei[0].clone();
     third.pos = [3.725, 0.0, 0.0];
     scene.nuclei.push(third);
-    let a = box_advice_with(&scene, 0, u64::MAX);
+    use crate::quality::VramBudget;
+    let a = box_advice_with(&scene, 0, VramBudget::fixed(u64::MAX));
     assert!(a.starts_with("Enlarge the cell (Scene ▸ Grid: 123³ at 0.15 Bohr, a 18.3 Bohr box — every nucleus ≥ 5.3 Bohr from a face"), "{a}");
     assert!(!a.contains("refuse") && !a.contains("beyond"), "{a}");
-    assert!(box_advice_with(&scene, 2, 1).contains("The GPU memory guard would refuse that cell"));
+    assert!(box_advice_with(&scene, 2, VramBudget::fixed(1)).contains("The GPU memory guard would refuse that cell"));
     // already inside that box (the samples reached farther than the scene does now): grow by
     // d_box on every side; past the largest grid: say so
     let mut far = scene.clone();
     far.nuclei[2].pos = [20.0, 0.0, 0.0];
-    assert!(box_advice_with(&far, 0, u64::MAX).contains("beyond the largest grid (201³)"));
+    assert!(box_advice_with(&far, 0, VramBudget::fixed(u64::MAX)).contains("beyond the largest grid (201³)"));
 }
 
 /// The sampling-plan presets (user request 2026-10-15): every one is a valid plan, Standard is

@@ -531,6 +531,8 @@ impl Viewer {
         self.begin_loading(self.scene.grid_n);
         if let Some(ctx) = &gpu {
             providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+            // the GPU memory budget follows the card when it reports its memory (`quality::vram_budget`)
+            crate::quality::set_adapter_memory(ctx.device_local_memory_bytes());
         }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
