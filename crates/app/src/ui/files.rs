@@ -39,6 +39,8 @@ pub struct Browser {
     save_kind: SaveKind,
     save_name: String,
     save_elsewhere: bool,
+    /// The scenes area's height once the splitter was dragged (`None`: about 2.5 rows).
+    scenes_h: Option<f32>,
     /// A Load in flight: the file, the model's (samples, epoch) when it was clicked, and since when
     /// (kept fresh while the settings card is up). Cleared when the model changes, or after
     /// [`LOAD_GIVE_UP`] with nothing loaded (refused, or the card cancelled).
@@ -137,28 +139,31 @@ impl Species {
 }
 
 /// The model to recommend for a scene: one that knows every element and can run here — ready
-/// before needing settings, then taught exactly these elements; the first such on a tie.
+/// before needing settings, then taught exactly these elements, then the fewest settings to
+/// change; the first such on a tie.
 fn recommended(fits: &[(Fit, Option<Species>)]) -> Option<usize> {
     fits.iter()
         .enumerate()
         .filter_map(|(i, (f, sp))| {
             let sp = sp.as_ref().filter(|sp| sp.covers())?;
-            let ready = match f {
-                Fit::Ready => 1,
-                Fit::Settings(_) => 0,
+            // ready first; then taught exactly these elements; then the fewest settings to change
+            let (ready, changes) = match f {
+                Fit::Ready => (1, 0),
+                Fit::Settings(n, _) => (0, *n),
                 _ => return None,
             };
-            Some((ready, sp.exact as u8, std::cmp::Reverse(i)))
+            Some((ready, sp.exact as u8, std::cmp::Reverse(changes), std::cmp::Reverse(i)))
         })
         .max()
-        .map(|(_, _, std::cmp::Reverse(i))| i)
+        .map(|(_, _, _, std::cmp::Reverse(i))| i)
 }
 
 /// Where the model stands against a scene.
 enum Fit {
     Ready,
     /// Loads after the card applies these settings.
-    Settings(String),
+    /// Loads after the card applies these settings (how many differ, and their words).
+    Settings(usize, String),
     Blocked(String),
     Unreadable(String),
 }
@@ -210,6 +215,7 @@ fn fit(
         Some(o) => match o.blocked() {
             Some(why) => Fit::Blocked(why.to_string()),
             None => Fit::Settings(
+                o.rows.iter().filter(|r| r.compared).count(),
                 o.rows
                     .iter()
                     .filter(|r| r.compared)
@@ -393,7 +399,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
     let total = ui.available_height();
     // room for about two and a half rows of cards (the half row says there is more), scrolled
     let row = CARD_W * 0.72 + 50.0;
-    let scenes_h = (row * 2.5).min(total * 0.58).max(row * 1.2);
+    let scenes_h = st.files.scenes_h.unwrap_or((row * 2.5).min(total * 0.58)).clamp(row * 0.8, (total - 260.0).max(row * 0.8));
     egui::ScrollArea::vertical()
         .id_salt("files-scenes")
         .auto_shrink([false, false])
@@ -500,8 +506,26 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         });
     }
 
-    ui.add_space(6.0);
-    ui.separator();
+    // the splitter between the scenes and the models: drag it to share the height
+    ui.add_space(2.0);
+    let (bar, drag) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::drag());
+    let hot = drag.hovered() || drag.dragged();
+    ui.painter().line_segment(
+        [egui::pos2(bar.left(), bar.center().y), egui::pos2(bar.right(), bar.center().y)],
+        Stroke::new(if hot { 2.0 } else { 1.0 }, if hot { theme::ACCENT } else { theme::LINE }),
+    );
+    let grip = egui::Rect::from_center_size(bar.center(), Vec2::new(36.0, 4.0));
+    ui.painter().rect_filled(grip, 2.0, if hot { theme::ACCENT } else { theme::PANEL_3 });
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let drag = drag.on_hover_text("drag to give the scenes or the models more room");
+    if drag.dragged() {
+        st.files.scenes_h = Some(scenes_h + drag.drag_delta().y);
+    }
+    if drag.double_clicked() {
+        st.files.scenes_h = None;
+    }
     // ── models ──
     ui.horizontal(|ui| {
         theme::section(ui, "Models");
@@ -552,7 +576,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         for (mi, (m, (f, species))) in st.files.models.iter().zip(&fits).enumerate() {
             let (chip, colour, detail) = match &f {
                 Fit::Ready => ("ready", Color32::from_rgb(0x7d, 0xd3, 0x8f), String::new()),
-                Fit::Settings(s) => ("needs settings", Color32::from_rgb(0xf0, 0xb4, 0x5a), format!("loading applies: {s}")),
+                Fit::Settings(_, s) => ("needs settings", Color32::from_rgb(0xf0, 0xb4, 0x5a), format!("loading applies: {s}")),
                 Fit::Blocked(why) => ("can't run here", theme::DANGER_INK, why.clone()),
                 Fit::Unreadable(e) => ("unreadable", theme::DANGER_INK, e.clone()),
             };
@@ -608,7 +632,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     .rect;
                 let busy = st.files.loading.as_ref().is_some_and(|(p, _, _)| *p == m.path);
                 let in_force = st.files.loaded.as_ref().is_some_and(|(p, _)| *p == m.path);
-                let can = estimated && sel_current && !input.sampling() && !busy && !in_force && st.files.loading.is_none() && matches!(f, Fit::Ready | Fit::Settings(_));
+                let can = estimated && sel_current && !input.sampling() && !busy && !in_force && st.files.loading.is_none() && matches!(f, Fit::Ready | Fit::Settings(..));
                 let hover = if busy {
                     "loading…"
                 } else if in_force {
@@ -636,7 +660,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                     load = Some(m.path.clone());
                 }
                 // the model's settings without the model (to train one of your own at them)
-                if matches!(f, Fit::Settings(_)) && estimated && !input.sampling() {
+                if matches!(f, Fit::Settings(..)) && estimated && !input.sampling() {
                     let at2 = at.translate(Vec2::new(-(LOAD_W + 8.0), 0.0));
                     let b2 = egui::Button::new(RichText::new("Use its settings").size(13.0)).corner_radius(8);
                     if ui.put(at2, b2).on_hover_text("switch the scene to this model's settings (grid, σ, charge, multiplicity, ionic potential) without loading the model").clicked() {
