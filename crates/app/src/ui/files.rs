@@ -317,7 +317,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if !st.files.open {
         return;
     }
-    // 80 % of the app window, recomputed every frame so it follows the window's size; an egui
+    // 82 % of the app window wide (at most 1600 points) and 86 % tall, recomputed every frame so it follows the window's size; an egui
     // Modal: centred on its measured size, the app dimmed behind it, Esc or a click outside closes
     let screen = ctx.content_rect();
     let size = Vec2::new(
