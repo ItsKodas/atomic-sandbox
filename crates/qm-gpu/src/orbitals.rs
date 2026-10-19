@@ -140,6 +140,12 @@ use qm::ScfSettings;
 /// The colours of the 12 colour slots of `qm::orbitals` (`PALETTE_SLOTS`; spec §3: a fixed
 /// qualitative palette — display data, not physics). Linear RGB in [0, 1].
 pub const ORBITAL_PALETTE: [[f32; 3]; 12] = [
+    // vivid and mutually distinct (user 2026-10-20: the Tableau grey, brown and olive were unreadable
+    // as orbitals): blue, orange, green, red, violet, cyan, magenta, yellow, lime, coral, teal, azure
+    [0.15, 0.50, 1.00], [1.00, 0.55, 0.10], [0.20, 0.85, 0.30], [1.00, 0.20, 0.25],
+    [0.65, 0.35, 1.00], [0.10, 0.90, 0.95], [1.00, 0.30, 0.85], [1.00, 0.88, 0.15],
+    [0.65, 1.00, 0.20], [1.00, 0.50, 0.45], [0.00, 0.75, 0.60], [0.40, 0.75, 1.00],
+]; 12] = [
     [0.122, 0.467, 0.706], [1.000, 0.498, 0.055], [0.173, 0.627, 0.173], [0.839, 0.153, 0.157],
     [0.580, 0.404, 0.741], [0.549, 0.337, 0.294], [0.890, 0.467, 0.761], [0.498, 0.498, 0.498],
     [0.737, 0.741, 0.133], [0.090, 0.745, 0.812], [0.682, 0.780, 0.910], [1.000, 0.733, 0.471],

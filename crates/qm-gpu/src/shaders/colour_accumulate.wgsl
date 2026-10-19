@@ -26,7 +26,7 @@ struct ColourParams {
     m: array<vec4<f32>, 6>,   // boundary: (1 / peak, index into `levels`, 0, 0)
 }
 
-const SHELL: f32 = 3.0;
+const SHELL: f32 = 1.8;   // a thin band: seen edge-on it reads as a bright rim, a bubble
 
 fn mask(s: f32, t: u32) -> f32 {
     let lo = levels[u32(C.m[t].y)];
@@ -35,7 +35,7 @@ fn mask(s: f32, t: u32) -> f32 {
     var m = smoothstep(0.7 * lo, lo, r);
     if ((C.flags & 8u) != 0u) {
         let hi = SHELL * lo;
-        m = m * (1.0 - smoothstep(hi, 1.4 * hi, r));
+        m = m * (1.0 - smoothstep(hi, 1.25 * hi, r));
     }
     return m;
 }
