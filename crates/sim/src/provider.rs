@@ -228,6 +228,15 @@ pub struct OrbitalInfo {
     pub smeared_1s: bool,
     pub residual: Option<f64>,
     pub not_converged: bool,
+    /// The angular character of a one-nucleus scene's row (`qm::orbitals::Row::l`: 0 s, 1 p, …),
+    /// also for a pseudised atom whose rows read `#k`; `None` in a molecule. The Orbitals tab's
+    /// "p only" preset reads it.
+    pub l: Option<u8>,
+    /// All orbitals coloured as boundary surfaces (GPU): this drawn orbital's surface — the level
+    /// enclosing the chosen share of it — reaches the outer L/6 of the box, where the Dirichlet
+    /// walls bend it ("boundary touches the box: enlarge the box").
+    /// `false` in every other view.
+    pub touches_box: bool,
 }
 
 /// The spin readout (spec §5.5; `qm::orbitals::SpinSummary` with its display scale): occupied

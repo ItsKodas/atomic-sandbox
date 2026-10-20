@@ -183,6 +183,17 @@
 //!    A = WΣVᵀ gives tr(UᵀWΣVᵀ) = tr(Σ·VᵀUᵀW), maximal at VᵀUᵀW = I: **U = WVᵀ** (a reflection is
 //!    allowed; it is a sign), and UᵀA = VΣVᵀ has a non-negative diagonal. The rotated overlaps are
 //!    O' = UᵀO_{C,·}; nothing is re-read. Larger clusters are runs of box states: continuity only.
+//!    *A one-nucleus scene §4 did not label* (a pseudised atom; user request 2026-10-20, the
+//!    textbook p dumbbells): a cluster that is a full l-set by W_l (d = 2l + 1, l ≥ 1,
+//!    `UpdateInput::character`) passing §4's rank test is aligned to the cell axes as §4 aligns a
+//!    shell, at every update (stateless, so both channels agree), and keeps its `#k` labels.
+//!    *A ↓ cluster follows ↑* (user request 2026-10-20: one colour per spatial orbital): with
+//!    Y_ik = ⟨ψᵢ↓|ψ̃ₖ↑⟩ (the raw ↓ orbitals against this update's displayed ↑ rows, from the
+//!    cross overlaps), when the d ↑ rows with the largest Σ_{i∈C}Y²ᵢₖ hold a mean weight
+//!    ≥ `SHARE_COLOUR_MIN`² per member, the cluster is rotated toward them instead (the same
+//!    U = WVᵀ on A = Y_{C,P}): a closed shell's ↓ p set then points its lobes where the ↑ set
+//!    does, and continuity holds through ↑'s. Otherwise (an open shell whose ↓ set differs, no
+//!    cross overlaps) it is rotated toward its own previous display as above.
 //! 2. *Matching*: Hungarian maximum-weight assignment ([`hungarian_max`], O(K³), hand-written) on
 //!    |O'| with entries below `MATCH_MIN` set to 0; a pair is matched when |O'| ≥ `MATCH_MIN`.
 //!    A matched row inherits the track and its colour slot, and its sign makes O' positive
@@ -198,9 +209,10 @@
 //!    solver sign is kept, and that sign is not deterministic**: it needs an orbital with no
 //!    weight within ~1 Bohr of the centroid in any of nine shapes; continuity holds it from then.
 //! 4. *Colour slots* (`PALETTE_SLOTS` = 12): a new track takes the lowest free slot, in energy
-//!    order, ↑ before ↓; a new ↓ track whose displayed cross overlap with an ↑ row is
+//!    order, ↑ before ↓; a ↓ row whose largest displayed cross overlap with an ↑ row is
 //!    ≥ `SHARE_COLOUR_MIN` takes that row's slot (one colour per spatial orbital of a closed
-//!    shell). Beyond 12 live tracks the least-used slot repeats.
+//!    shell) — at every update, so a surviving ↓ track follows its partner when the ↑ track was
+//!    renewed. Beyond 12 live tracks the least-used slot repeats.
 //! 5. *Resets*: [`Tracker::reset`] (grid change, provider reset, view off) forgets the previous
 //!    display; track ids keep counting up, so a stale selection never names a new orbital.
 //!
@@ -610,6 +622,23 @@ pub fn procrustes_continuity(a: &DMatrix<f64>) -> DMatrix<f64> {
     svd.u.expect("U requested") * svd.v_t.expect("Vᵀ requested")
 }
 
+/// §5 item 1 for cluster `range` against the columns of `m` (rows: the channel's raw orbitals,
+/// columns: displayed rows — the previous display's, or this update's ↑ rows): P = the d columns
+/// with the largest Σ_{i∈C} m²ᵢⱼ (sorted by index; zero columns pad P if fewer exist), U from
+/// [`procrustes_continuity`] on A = m_{C,P}; also Σ_{i∈C, j∈P} m²ᵢⱼ, how much of the cluster those
+/// columns hold (d when it lies within them).
+fn rotate_toward(m: &DMatrix<f64>, range: &Range<usize>) -> (DMatrix<f64>, f64) {
+    let d = range.len();
+    let weight = |j: usize| range.clone().map(|i| m[(i, j)] * m[(i, j)]).sum::<f64>();
+    let mut cols: Vec<usize> = (0..m.ncols()).collect();
+    cols.sort_by(|&a, &c| weight(c).total_cmp(&weight(a)).then(a.cmp(&c)));
+    cols.truncate(d);
+    cols.sort_unstable();
+    let held = cols.iter().map(|&j| weight(j)).sum();
+    let a = DMatrix::from_fn(d, d, |i, k| if k < cols.len() { m[(range.start + i, cols[k])] } else { 0.0 });
+    (procrustes_continuity(&a), held)
+}
+
 // ───────────────────────────── §4 radial nodes ─────────────────────────────
 
 /// Radial-shell projections of one orbital about the nucleus (§4 item 5): bin k covers
@@ -1013,6 +1042,10 @@ pub struct UpdateInput<'a> {
     pub cross: Option<&'a DMatrix<f64>>,
     /// Some iff lone atom (exactly one nucleus), together with `radial`.
     pub moments: Option<[&'a [Moments]; 2]>,
+    /// The moments about the nucleus of a one-nucleus scene, also a pseudised atom whose rows are
+    /// not labelled (`moments` is `None` there): only the rows' angular character ([`Row::l`]).
+    /// `None` for molecules. Entries for at least the shown rows that have them.
+    pub character: Option<[&'a [Moments]; 2]>,
     /// Radial profiles about the nucleus (controller ruling 1: labels by node count).
     pub radial: Option<[&'a [RadialProfile]; 2]>,
     /// [`first_sign_functionals`] of the raw orbitals.
@@ -1056,12 +1089,15 @@ impl std::fmt::Display for Label {
 /// `cluster` = (size, spread) of its set when > 1; `grid_split` = the spread of an aligned
 /// lone-atom shell (degenerate in physics, split by the grid). Unoccupied rows of a display
 /// eigensolve (§8): `residual` = the largest member residual of the row's set, `not_converged`
-/// = a member ended above the eigensolve's tolerance; None/false for occupied rows.
+/// = a member ended above the eigensolve's tolerance; None/false for occupied rows. `l`: the
+/// angular character of a one-nucleus scene's row — its shell's l, or the l with
+/// W_l(set) ≥ `L_CHAR_MIN` of its set (rotation-invariant, so a rotated member has its set's) —
+/// `None` in a molecule or without a dominant l.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub eps_range: (f64, f64), pub occupation: f64,
     pub label: Label, pub cluster: Option<(usize, f64)>, pub rotated: bool, pub grid_split: Option<f64>,
-    pub box_state: bool, pub smeared_1s: bool, pub residual: Option<f64>, pub not_converged: bool,
+    pub box_state: bool, pub smeared_1s: bool, pub residual: Option<f64>, pub not_converged: bool, pub l: Option<u8>,
 }
 
 /// The result of an update. `rotations[ch]` partitions the shown rows of the channel into ranges
@@ -1150,7 +1186,12 @@ impl Tracker {
             }
         }
         let (lone_atom, atom) = analyse_lone_atom(input);
-        let plans: Vec<Plan> = (0..2).map(|ch| self.plan_channel(input, ch, tau, atom.as_ref())).collect();
+        // ↑ first; a ↓ cluster may follow the displayed ↑ rows (§5 item 1): Y = ⟨ψ↓|ψ̃↑⟩
+        let up = self.plan_channel(input, 0, tau, atom.as_ref(), None);
+        let toward_up = input.cross.filter(|x| x.nrows() >= up.n_shown && up.n_shown > 0)
+            .map(|x| x.rows(0, up.n_shown).transpose() * up.matrix());
+        let dn = self.plan_channel(input, 1, tau, atom.as_ref(), toward_up.as_ref());
+        let plans = [up, dn];
 
         // tracks and slots: survivors first, then new tracks (↑ before ↓, energy order)
         let mut usage = [0u32; PALETTE_SLOTS as usize];
@@ -1171,7 +1212,7 @@ impl Tracker {
         });
         for ch in 0..2 {
             for i in 0..plans[ch].n_shown {
-                if assigned[ch][i].is_some() { continue; }
+                // a ↓ row takes its ↑ partner's slot, also a surviving track (§5 item 4)
                 let shared = if ch == 1 {
                     cross.as_ref().and_then(|x| {
                         (0..x.nrows()).max_by(|&a, &b| x[(a, i)].abs().total_cmp(&x[(b, i)].abs()))
@@ -1179,6 +1220,14 @@ impl Tracker {
                             .and_then(|u| assigned[0][u].map(|t| t.1))
                     })
                 } else { None };
+                if let Some((track, slot)) = assigned[ch][i] {
+                    if let Some(s) = shared.filter(|&s| s != slot) {
+                        usage[slot as usize] -= 1;
+                        usage[s as usize] += 1;
+                        assigned[ch][i] = Some((track, s));
+                    }
+                    continue;
+                }
                 let slot = shared.unwrap_or_else(|| {
                     (0..PALETTE_SLOTS).min_by_key(|&s| (usage[s as usize], s)).expect("at least one slot")
                 });
@@ -1207,6 +1256,12 @@ impl Tracker {
                 // clusters never cross an occupation change, so a block is all unoccupied or none
                 let residual = b.range.clone().filter_map(|i| unocc(i).map(|u| u.0)).reduce(f64::max);
                 let not_converged = b.range.clone().any(|i| unocc(i).is_some_and(|u| !u.1));
+                // the set's angular character (one nucleus only)
+                let set_l = match b.kind {
+                    Kind::Shell { l, .. } => Some(l),
+                    Kind::Cluster { .. } => input.character.map(|ms| ms[ch]).filter(|ms| ms.len() >= b.range.end)
+                        .and_then(|ms| set_character(&ms[b.range.clone()]).iter().position(|&w| w >= L_CHAR_MIN).map(|l| l as u8)),
+                };
                 for k in 0..d {
                     let i = b.range.start + k;
                     let (track, slot) = assigned[ch][i].expect("every shown row has a track");
@@ -1222,7 +1277,7 @@ impl Tracker {
                     rows.push(Row {
                         spin, index: i, track, slot, energy: plan.energies[i], eps_range, occupation: occ[i], label,
                         cluster: (d > 1).then_some((d, b.spread)), rotated, grid_split,
-                        box_state: i >= n_occ && boxy, smeared_1s, residual, not_converged,
+                        box_state: i >= n_occ && boxy, smeared_1s, residual, not_converged, l: set_l,
                     });
                     scale[ch][i] = smax;
                 }
@@ -1234,7 +1289,9 @@ impl Tracker {
         UpdateOutput { rotations, rows, scale, hidden_unoccupied: [plans[0].hidden, plans[1].hidden], lone_atom }
     }
 
-    fn plan_channel(&self, input: &UpdateInput, ch: usize, tau: f64, atom: Option<&AtomLabels>) -> Plan {
+    /// One channel's rotations, matching and signs. `toward_up` (↓ only): ⟨ψᵢ↓|ψ̃ₖ↑⟩, rows the
+    /// raw ↓ orbitals, columns the displayed ↑ rows (§5 item 1).
+    fn plan_channel(&self, input: &UpdateInput, ch: usize, tau: f64, atom: Option<&AtomLabels>, toward_up: Option<&DMatrix<f64>>) -> Plan {
         let (e, occ) = (input.evals[ch], input.occupations[ch]);
         let n_occ = input.n_occ[ch];
         let (n_shown, hidden) = block_edge(e, n_occ, input.n_computed[ch], tau);
@@ -1271,18 +1328,36 @@ impl Tracker {
             _ => None,
         };
 
-        // continuity Procrustes on the unaligned clusters (§5 item 1)
-        if let Some(o) = &o {
-            for b in blocks.iter_mut() {
-                let d = b.range.len();
-                if !matches!(b.kind, Kind::Cluster { .. }) || !(2..=MAX_ROTATED_CLUSTER).contains(&d) { continue; }
-                let weight = |j: usize| b.range.clone().map(|i| o[(i, j)] * o[(i, j)]).sum::<f64>();
-                let mut cols: Vec<usize> = (0..n_prev).collect();
-                cols.sort_by(|&a, &c| weight(c).total_cmp(&weight(a)).then(a.cmp(&c)));
-                cols.truncate(d);
-                cols.sort_unstable();
-                let a = DMatrix::from_fn(d, d, |i, k| if k < cols.len() { o[(b.range.start + i, cols[k])] } else { 0.0 });
-                b.u = procrustes_continuity(&a);
+        // a ↓ cluster follows the displayed ↑ rows when it lies within them, else continuity
+        // Procrustes toward its own previous display (§5 item 1)
+        for b in blocks.iter_mut() {
+            let d = b.range.len();
+            if !matches!(b.kind, Kind::Cluster { .. }) || !(2..=MAX_ROTATED_CLUSTER).contains(&d) { continue; }
+            // a one-nucleus scene whose shells §4 did not align (a pseudised atom, an unlabelled
+            // one): a full l-set is aligned to the cell axes all the same, the textbook picture
+            // (its rows keep their #k labels)
+            if atom.is_none() {
+                if let Some(set) = input.character.map(|ms| ms[ch]).filter(|ms| ms.len() >= b.range.end).map(|ms| &ms[b.range.clone()]) {
+                    let w = set_character(set);
+                    if let Some(l) = (1..=3u8).find(|&l| w[l as usize] >= L_CHAR_MIN && d == 2 * l as usize + 1) {
+                        let (u, rank) = alignment(set, l);
+                        if rank >= ALIGN_RANK_MIN {
+                            b.u = u;
+                            b.kind = Kind::Cluster { rotated: true };
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some((u, w)) = toward_up.map(|y| rotate_toward(y, &b.range)) {
+                if w >= SHARE_COLOUR_MIN * SHARE_COLOUR_MIN * d as f64 {
+                    b.u = u;
+                    b.kind = Kind::Cluster { rotated: true };
+                    continue;
+                }
+            }
+            if let Some(o) = &o {
+                b.u = rotate_toward(o, &b.range).0;
                 b.kind = Kind::Cluster { rotated: true };
             }
         }

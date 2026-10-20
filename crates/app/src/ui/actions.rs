@@ -156,6 +156,9 @@ pub enum Action {
     Include { track: u32, on: bool },
     /// All orbitals coloured: back to the default, every occupied orbital.
     IncludeAllOccupied,
+    /// All orbitals coloured: a quick preset (`ui::ColourPreset`) — the include list resolved
+    /// against the rows on screen ([`preset_include`]) and whether the core is hidden.
+    ColourPreset(super::ColourPreset),
     /// All orbitals coloured: additive (emission only) or weighted blend — a render setting, no
     /// request to the worker.
     ColourBlend { additive: bool },
@@ -559,6 +562,13 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 send_orbital_view(st, out);
             }
         }
+        Action::ColourPreset(p) => {
+            st.included = preset_include(p, payload_rows(input));
+            st.colour_look.hide_core = p == super::ColourPreset::Valence;
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
         Action::ColourBlend { additive } => st.colour_additive = additive,
         Action::ColourScale { physical } => {
             st.colour_physical = physical;
@@ -584,6 +594,24 @@ fn send_orbital_view(st: &UiState, out: &mut PanelOutput) {
 /// The newest orbital payload's rows, if any.
 fn payload_rows<'a>(input: &'a PanelInput<'_>) -> &'a [sim::OrbitalInfo] {
     input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()).map_or(&[][..], |o| &o.rows[..])
+}
+
+/// The include list of a preset for these rows (`None` = every occupied orbital): one spin keeps
+/// the occupied ↑ rows, p only the occupied rows of p character (`OrbitalInfo::l`).
+pub fn preset_include(p: super::ColourPreset, rows: &[sim::OrbitalInfo]) -> Option<std::collections::BTreeSet<u32>> {
+    use super::ColourPreset as P;
+    let keep = |f: &dyn Fn(&sim::OrbitalInfo) -> bool| Some(rows.iter().filter(|r| r.occupation > 0.0 && f(r)).map(|r| r.track).collect());
+    match p {
+        P::Valence | P::Everything => None,
+        P::OneSpin => keep(&|r| r.spin == sim::Spin::Up),
+        P::POnly => keep(&|r| r.l == Some(1)),
+    }
+}
+
+/// The preset the state now matches, for these rows (the highlighted button), if any.
+pub fn preset_active(st: &UiState, rows: &[sim::OrbitalInfo]) -> Option<super::ColourPreset> {
+    use super::ColourPreset as P;
+    P::ALL.into_iter().find(|&p| st.colour_look.hide_core == (p == P::Valence) && st.included == preset_include(p, rows))
 }
 
 /// The tracks of the occupied orbitals on screen (the include set's default).
@@ -718,6 +746,7 @@ impl Action {
             Unoccupied(m) => format!("unoccupied {m}"),
             Include { track, on: o } => format!("orbital-include {track} {}", on(*o)),
             IncludeAllOccupied => "orbital-include-reset".into(),
+            ColourPreset(p) => format!("colour-preset {}", p.word()),
             ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
             WarpFields(on) => format!("warp-fields {on}"),
@@ -918,6 +947,10 @@ impl Action {
                     Some(h) => h,
                     None => num(head, args[0])?,
                 })
+            }
+            "colour-preset" => {
+                want(1)?;
+                ColourPreset(super::ColourPreset::from_word(args[0]).ok_or_else(|| format!("action colour-preset: valence, one-spin, p or everything, got '{}'", args[0]))?)
             }
             "show" => {
                 want(1)?;

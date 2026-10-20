@@ -29,7 +29,14 @@
 //!    selected orbital (or ψ̃², via `mul` into scratch) or the spin density `unpad`ed and copied
 //!    into an r32float `Volume3D` exactly as `GpuSolver::copy_density_to_volume` does, or the
 //!    `colour_accumulate` kernel (`shaders/colour_accumulate.wgsl`) writing an rgba16float
-//!    `ColourVolume3D`. One submission; nothing waits for it.
+//!    `ColourVolume3D`. One submission; nothing waits for it — except a colour product with
+//!    **boundary surfaces** (`Boundary`): its `enclosure_hist` pass also keeps each orbital's
+//!    largest ψ̃²/peak in the outer L/6 of the box (the box rule's region, `qm::orbitals` §6),
+//!    and the K levels and K of those maxima (8K bytes) are read back after the submission (the
+//!    update's second map) so the payload can say which boundary reaches the zone where the walls
+//!    bend the orbital ([`ViewUpdate::touching`]; user request 2026-10-20). The
+//!    level is known only on the GPU, and the displayed ψ̃ of a rotated set is not one of the
+//!    raw orbitals the first readback sees, so the test cannot ride on it.
 //!
 //! No orbital or field value crosses to the CPU: the readback carries O(K² + 42K) finished
 //! scalars (+ 16·N_bins per orbital for a lone atom). What is mapped is the f32 workgroup
@@ -124,7 +131,7 @@
 //! coefficients: |ψ̃_gpu − ψ̃_cpu| ≲ d·2⁻²⁴·max|ψ| (`display_copy_matches_cpu_reference`).
 use crate::batch::{Batch, Recorder};
 use crate::eigen::{lobpcg, rayleigh_residuals, GpuHamiltonian, Stop as EigenStop};
-use crate::grid::{readbacks_on_this_thread, Field, GpuGrid};
+use crate::grid::{map_read_f32, readbacks_on_this_thread, Field, GpuGrid};
 use crate::kernels::{workgroups_for, Kernels, COLOUR_MAX_TERMS, WORKGROUP};
 use crate::physics::{NucleusRecord, MAX_NUCLEI};
 use crate::pointwise::{fill_in, lincomb_in, mul_add_sq_in, mul_in, unpad_rec, unpad_row_stride};
@@ -213,13 +220,20 @@ struct LevelParams { count: u32, share: f32, pad: [u32; 2] }
 /// Histogram bins per orbital (`shaders/enclosure.wgsl`'s BINS).
 const ENCLOSURE_BINS: usize = 256;
 
+/// The boundary pass's buffers for up to `cap` orbitals: the histograms, the levels and the wall
+/// maxima (ψ̃²/peak in the outer L/6 of the box), and the staging copy of (levels, wall maxima).
+struct Enclosure { hist: wgpu::Buffer, levels: wgpu::Buffer, face: wgpu::Buffer, staging: wgpu::Buffer, cap: usize }
+
 /// The result of one update. `scale` is what 1.0 means in the written texture (spec §3):
 /// max|ψ| over the orbital's set (phase), its square (|ψ|²), `SpinSummary::scale` (spin), 1
 /// (colour: the kernel already divides by P). `scale == 0.0` ⇔ nothing was written
 /// (`Product::None`, or an `Orbital` whose track is not shown by this update). `readbacks` is
-/// the number of GPU→CPU maps the update made (always 1).
+/// the number of GPU→CPU maps the update made: 1, and 2 for a colour product with boundary
+/// surfaces (its levels and wall maxima, read once the product is written). `touching`: the
+/// tracks of that product's orbitals whose boundary surface reaches the outer L/6 of the box
+/// (the largest ψ̃²/peak there ≥ the level; empty otherwise).
 #[derive(Debug)]
-pub struct ViewUpdate { pub out: UpdateOutput, pub spin: SpinSummary, pub scale: f32, pub readbacks: usize }
+pub struct ViewUpdate { pub out: UpdateOutput, pub spin: SpinSummary, pub scale: f32, pub readbacks: usize, pub touching: Vec<u32> }
 
 /// The finished scalars of one readback (step 1 of the module doc), per channel `[↑, ↓]`, rows
 /// the solver's orbitals in order, then this view's unoccupied vectors (if any). `moments` are about the nuclear centroid (used only for a
@@ -276,8 +290,8 @@ pub struct OrbitalView {
     /// Bound in place of the boundary levels when the colour product has no boundary (a second
     /// buffer: one buffer cannot be both the read-write accumulator and the read-only levels).
     dummy_levels: wgpu::Buffer,
-    /// The boundary surfaces' histograms and levels, for this many orbitals (grow-only).
-    enclosure: Option<(wgpu::Buffer, wgpu::Buffer, usize)>,
+    /// The boundary surfaces' buffers (grow-only).
+    enclosure: Option<Enclosure>,
     /// The display eigensolve's unoccupied vectors per channel (ascending ε; module doc
     /// "Unoccupied orbitals") and its result; `unocc[ch].len()` = `unocc_info`'s count always.
     unocc: [Vec<Field>; 2],
@@ -582,6 +596,8 @@ impl OrbitalView {
             overlaps_prev: [sc.overlaps_prev[0].as_ref(), sc.overlaps_prev[1].as_ref()],
             cross: sc.cross.as_ref(),
             moments: lone.then(|| [&sc.moments[0][..], &sc.moments[1][..]]),
+            // one nucleus, pseudised too: the moments about it give the rows' angular character
+            character: (nuclei.len() == 1).then(|| [&sc.moments[0][..], &sc.moments[1][..]]),
             radial: sc.radial.as_ref().map(|r| [&r[0][..], &r[1][..]]),
             first_sign: [&sc.first_sign[0], &sc.first_sign[1]],
             max_abs: [&sc.max_abs[0], &sc.max_abs[1]],
@@ -617,6 +633,8 @@ impl OrbitalView {
             }
         }
         let scratch = self.scratch.as_ref().expect("read_scalars made it");
+        // the tracks of a boundary product's orbitals, in its term order (the box test's readback)
+        let mut boundary_terms: Vec<u32> = Vec::new();
         let scale = match product {
             Product::None => 0.0,
             Product::Orbital { spin, track, squared, out: vol } => {
@@ -642,42 +660,59 @@ impl OrbitalView {
                 sc.spin.scale() as f32
             }
             Product::Colour { include, physical, boundary, out: cv } => {
-                // (field, weight, 1 / its own peak ψ̃²): the weight is f c / P by density, f c inside a boundary
-                let terms: Vec<(&Field, [f32; 4], f32)> = out.rows.iter().filter(|r| include.contains(&r.track)).filter_map(|r| {
+                // (field, weight, 1 / its own peak ψ̃², track): the weight is f c / P by density, f c inside a
+                // boundary — where an included unoccupied orbital (ticked by hand) is drawn at f = 1, its
+                // shape being the point (user request 2026-10-20); by density it has no electrons to draw
+                let terms: Vec<(&Field, [f32; 4], f32, u32)> = out.rows.iter().filter(|r| include.contains(&r.track)).filter_map(|r| {
                     let ch = r.spin.index();
                     let own = out.scale[ch][r.index].powi(2);
                     let pk = if physical { sc.spin.rho_max } else { own };
-                    if pk <= 0.0 || own <= 0.0 || r.occupation == 0.0 { return None; }
+                    if pk <= 0.0 || own <= 0.0 || (r.occupation == 0.0 && boundary.is_none()) { return None; }
                     let c = ORBITAL_PALETTE[r.slot as usize % ORBITAL_PALETTE.len()];
-                    let w = if boundary.is_some() { r.occupation } else { r.occupation / pk };
-                    Some((&self.prev[ch][r.index], [(c[0] as f64 * w) as f32, (c[1] as f64 * w) as f32, (c[2] as f64 * w) as f32, w as f32], (1.0 / own) as f32))
+                    let w = match boundary {
+                        Some(_) if r.occupation == 0.0 => 1.0,
+                        Some(_) => r.occupation,
+                        None => r.occupation / pk,
+                    };
+                    Some((&self.prev[ch][r.index], [(c[0] as f64 * w) as f32, (c[1] as f64 * w) as f32, (c[2] as f64 * w) as f32, w as f32], (1.0 / own) as f32, r.track))
                 }).collect();
                 // the boundary levels: a histogram per orbital, then the level enclosing `share` of it
                 if let Some(bd) = boundary.filter(|_| !terms.is_empty()) {
-                    if self.enclosure.as_ref().is_none_or(|e| e.2 < terms.len()) {
+                    if self.enclosure.as_ref().is_none_or(|e| e.cap < terms.len()) {
                         let cap = terms.len().next_power_of_two().max(8);
-                        let make = |label: &str, size: usize, extra: wgpu::BufferUsages| self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some(label), size: size as u64, usage: wgpu::BufferUsages::STORAGE | extra, mapped_at_creation: false,
+                        let make = |label: &str, size: usize, usage: wgpu::BufferUsages| self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(label), size: size as u64, usage, mapped_at_creation: false,
                         });
-                        let hist = make("enclosure histograms", cap * ENCLOSURE_BINS * 4, wgpu::BufferUsages::COPY_DST);
-                        let levels = make("enclosure levels", cap * 4, wgpu::BufferUsages::empty());
-                        self.enclosure = Some((hist, levels, cap));
+                        use wgpu::BufferUsages as B;
+                        self.enclosure = Some(Enclosure {
+                            hist: make("enclosure histograms", cap * ENCLOSURE_BINS * 4, B::STORAGE | B::COPY_DST),
+                            levels: make("enclosure levels", cap * 4, B::STORAGE | B::COPY_SRC),
+                            face: make("enclosure face maxima", cap * 4, B::STORAGE | B::COPY_DST | B::COPY_SRC),
+                            staging: make("enclosure staging", cap * 8, B::MAP_READ | B::COPY_DST),
+                            cap,
+                        });
                     }
-                    let (hist, levels, _) = self.enclosure.as_ref().expect("made above");
-                    b.encoder().clear_buffer(hist, 0, Some((terms.len() * ENCLOSURE_BINS * 4) as u64));
-                    for (t, (f, _, inv_peak)) in terms.iter().enumerate() {
+                    let e = self.enclosure.as_ref().expect("made above");
+                    b.encoder().clear_buffer(&e.hist, 0, Some((terms.len() * ENCLOSURE_BINS * 4) as u64));
+                    b.encoder().clear_buffer(&e.face, 0, Some((terms.len() * 4) as u64));
+                    for (t, (f, _, inv_peak, _)) in terms.iter().enumerate() {
                         let params = HistParams { n: g.n as u32, p: g.p as u32, term: t as u32, inv_peak: *inv_peak };
                         let u = b.uniform(ctx, k, "enclosure_hist", &params);
-                        let bg = k.bind_group(ctx, "enclosure_hist", &[u.binding(), f.buffer.as_entire_binding(), hist.as_entire_binding()]);
+                        let bg = k.bind_group(ctx, "enclosure_hist", &[u.binding(), f.buffer.as_entire_binding(), e.hist.as_entire_binding(), e.face.as_entire_binding()]);
                         b.dispatch(k, "enclosure_hist", &bg, [workgroups_for(g.interior_len()), 1, 1]);
                     }
                     let params = LevelParams { count: terms.len() as u32, share: bd.share.clamp(0.01, 0.999), pad: [0; 2] };
                     let u = b.uniform(ctx, k, "enclosure_level", &params);
-                    let bg = k.bind_group(ctx, "enclosure_level", &[u.binding(), hist.as_entire_binding(), levels.as_entire_binding()]);
+                    let bg = k.bind_group(ctx, "enclosure_level", &[u.binding(), e.hist.as_entire_binding(), e.levels.as_entire_binding()]);
                     b.dispatch(k, "enclosure_level", &bg, [(terms.len() as u32).div_ceil(64), 1, 1]);
+                    // (levels, face maxima) for the box test after the submission
+                    let bytes = (terms.len() * 4) as u64;
+                    b.encoder().copy_buffer_to_buffer(&e.levels, 0, &e.staging, 0, bytes);
+                    b.encoder().copy_buffer_to_buffer(&e.face, 0, &e.staging, bytes, bytes);
+                    boundary_terms = terms.iter().map(|t| t.3).collect();
                 }
                 let levels = match (&boundary, &self.enclosure) {
-                    (Some(_), Some(e)) if !terms.is_empty() => &e.1,
+                    (Some(_), Some(e)) if !terms.is_empty() => &e.levels,
                     _ => &self.dummy_levels,
                 };
                 let mode = match boundary {
@@ -697,7 +732,7 @@ impl OrbitalView {
                     let chunk = &terms[(ci * COLOUR_MAX_TERMS).min(terms.len())..((ci + 1) * COLOUR_MAX_TERMS).min(terms.len())];
                     let mut w = [[0.0f32; 4]; COLOUR_MAX_TERMS];
                     let mut m = [[0.0f32; 4]; COLOUR_MAX_TERMS];
-                    for (j, (_, t, inv_peak)) in chunk.iter().enumerate() {
+                    for (j, (_, t, inv_peak, _)) in chunk.iter().enumerate() {
                         w[j] = *t;
                         m[j] = [*inv_peak, (ci * COLOUR_MAX_TERMS + j) as f32, 0.0, 0.0];
                     }
@@ -718,7 +753,15 @@ impl OrbitalView {
             }
         };
         b.submit();
-        ViewUpdate { out, spin: sc.spin, scale, readbacks: readbacks_on_this_thread() - maps }
+        // the boundary surfaces that reach the walls' zone: the largest ψ̃²/peak there at or above the
+        // level (a level of 0 — an empty orbital, a failed readback's zeros — is never a touch)
+        let mut touching = Vec::new();
+        if let (false, Some(e)) = (boundary_terms.is_empty(), &self.enclosure) {
+            let n = boundary_terms.len();
+            let v = map_read_f32(&self.ctx, &e.staging, 2 * n);
+            touching = (0..n).filter(|&t| v[t] > 0.0 && v[n + t] >= v[t]).map(|t| boundary_terms[t]).collect();
+        }
+        ViewUpdate { out, spin: sc.spin, scale, readbacks: readbacks_on_this_thread() - maps, touching }
     }
 
     /// The display eigensolve for m unoccupied orbitals per channel (module doc, "Unoccupied

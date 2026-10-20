@@ -200,6 +200,7 @@ impl Case {
             overlaps_prev: [self.prev[0].as_ref(), self.prev[1].as_ref()],
             cross: self.cross.as_ref(),
             moments: if self.lone { Some([&u.moments, &d.moments]) } else { None },
+            character: if self.lone { Some([&u.moments, &d.moments]) } else { None },
             radial: if self.lone { Some([&u.radial, &d.radial]) } else { None },
             first_sign: [&u.first_sign, &d.first_sign],
             max_abs: [&u.max_abs, &d.max_abs],
@@ -894,6 +895,64 @@ fn closed_shell_down_shares_up_colours() {
     assert_eq!(dn, vec![0, 1, 3]);
 }
 
+/// One colour per spatial orbital (user request 2026-10-20): a degenerate ↓ set whose raw
+/// vectors are a rotation of the ↑ set's is rotated onto the displayed ↑ rows (displayed cross
+/// overlaps ≈ I), so each ↓ member takes its ↑ partner's slot — before, the raw ↓ basis left a
+/// member with no partner above 0.9 and a colour of its own.
+#[test]
+fn a_degenerate_down_set_follows_the_up_set_and_shares_its_colours() {
+    let e = [-1.0, -0.3, -0.3, -0.3];
+    let case_with = |r: &DMatrix<f64>| {
+        let mut case = Case::new(Chan::synthetic(&e, 4), Chan::synthetic(&e, 4), false);
+        // ⟨ψ↑ᵢ|ψ↓ⱼ⟩: 1 on the s, a proper rotation R within the p set
+        case.cross = Some(DMatrix::from_fn(4, 4, |i, j| match (i, j) {
+            (0, 0) => 1.0,
+            (0, _) | (_, 0) => 0.0,
+            _ => r[(i - 1, j - 1)],
+        }));
+        case
+    };
+    // 50° about (1, 1, 1)/√3: no member of either raw basis has a partner above 0.9
+    let (c, s) = (50f64.to_radians().cos(), 50f64.to_radians().sin());
+    let k = DMatrix::from_row_slice(3, 3, &[0.0, -1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 1.0, 0.0]) / 3f64.sqrt();
+    let r = DMatrix::identity(3, 3) + &k * s + &k * &k * (1.0 - c);
+    assert!(r.iter().all(|v| v.abs() < 0.9), "the raw cross overlaps are all below the share threshold");
+    let case = case_with(&r);
+    let out = Tracker::new().update(&case.input());
+    let up: Vec<u8> = rows(&out, Spin::Up).iter().map(|r| r.slot).collect();
+    let dn: Vec<u8> = rows(&out, Spin::Down).iter().map(|r| r.slot).collect();
+    assert_eq!(up, vec![0, 1, 2, 3]);
+    assert_eq!(dn, up, "every ↓ member shares its ↑ partner's colour");
+    // the displayed cross overlaps: B↑ᵀ X B↓ = I (each ↓ member points where its ↑ partner does)
+    let mat = |ch: usize| {
+        let mut m = DMatrix::zeros(4, 4);
+        for (rg, u) in &out.rotations[ch] { m.view_mut((rg.start, rg.start), (rg.len(), rg.len())).copy_from(u); }
+        m
+    };
+    let shown = mat(0).transpose() * case.cross.as_ref().unwrap() * mat(1);
+    assert!((shown - DMatrix::<f64>::identity(4, 4)).abs().max() < 1e-12, "displayed ↑·↓ overlaps are the identity");
+    assert!(rows(&out, Spin::Down)[1..].iter().all(|r| r.rotated), "the ↓ p rows are rotated for display");
+}
+
+/// A surviving ↓ track takes its ↑ partner's slot once their overlap reaches the threshold (its
+/// track is kept): the colour pairing is re-read at every update, not only at a track's start.
+#[test]
+fn a_surviving_down_track_rejoins_its_up_partners_colour() {
+    let e = [-1.0, -0.5, -0.3];
+    let mut case = Case::new(Chan::synthetic(&e, 3), Chan::synthetic(&e, 3), false);
+    case.cross = Some(DMatrix::from_fn(3, 3, |i, j| if i == j && i < 2 { 0.999 } else if i == j { 0.6 } else { 0.01 }));
+    let mut t = Tracker::new();
+    let first = t.update(&case.input());
+    let dn0: Vec<(u32, u8)> = rows(&first, Spin::Down).iter().map(|r| (r.track, r.slot)).collect();
+    assert_eq!(dn0.iter().map(|x| x.1).collect::<Vec<_>>(), vec![0, 1, 3], "below the threshold: a slot of its own");
+    case.prev = [Some(DMatrix::identity(3, 3)), Some(DMatrix::identity(3, 3))];
+    case.cross = Some(DMatrix::from_fn(3, 3, |i, j| if i == j { 0.999 } else { 0.01 }));
+    let second = t.update(&case.input());
+    let dn1: Vec<(u32, u8)> = rows(&second, Spin::Down).iter().map(|r| (r.track, r.slot)).collect();
+    assert_eq!(dn1.iter().map(|x| x.0).collect::<Vec<_>>(), dn0.iter().map(|x| x.0).collect::<Vec<_>>(), "the tracks survive");
+    assert_eq!(dn1.iter().map(|x| x.1).collect::<Vec<_>>(), vec![0, 1, 2], "the third ↓ row now shares ↑'s slot 2");
+}
+
 // ───────────────────────────── §5.5 – §5.7 ─────────────────────────────
 
 /// The noise budget's arithmetic: SCF 2·tol + eigenvectors 2·(n↑ + n↓)·eig_tol + the f32 term, in
@@ -1329,4 +1388,40 @@ fn unoccupied_cpu_uses_the_pseudo_hamiltonian() {
             assert!((e - u.evals[ch][i]).abs() <= 1e-12 && (res - u.residuals[ch][i]).abs() <= 1e-12 * (1.0 + res), "re-measured ε, residual");
         }
     }
+}
+
+/// The rows' angular character (`Row::l`, the Orbitals tab's "p only"): a labelled lone atom's
+/// from its shells; a one-nucleus scene without labels (a pseudised atom: `moments` None,
+/// `character` Some) from W_l of each set — a rotated p set's members all read p — and a molecule
+/// (neither) has none.
+#[test]
+fn rows_carry_their_angular_character_about_one_nucleus() {
+    let g = Grid::cube(49, 0.25);
+    let mut psis = neon_like(&g, OFF);
+    let q = random_orthogonal(&mut Rng(7), 3);
+    let p = mix(&psis[2..], &q);
+    psis.truncate(2);
+    psis.extend(p);
+    let ch = Chan::from_grid(&g, &psis, &[-1.0, -0.3, -0.2, -0.2, -0.2], 5, OFF);
+    let ls = |out: &UpdateOutput| rows(out, Spin::Up).iter().map(|r| r.l).collect::<Vec<_>>();
+    let want = vec![Some(0), Some(0), Some(1), Some(1), Some(1)];
+    let lone = Case::new(ch.clone(), ch.clone(), true);
+    assert_eq!(ls(&Tracker::new().update(&lone.input())), want, "labelled: the shells' l");
+    let molecule = Case::new(ch.clone(), ch.clone(), false);
+    let mut input = molecule.input();
+    assert_eq!(ls(&Tracker::new().update(&input)), vec![None; 5], "a molecule: none");
+    input.character = Some([&ch.moments, &ch.moments]);
+    let out = Tracker::new().update(&input);
+    assert_eq!(ls(&out), want, "unlabelled, one nucleus: W_l of each set");
+    assert!(rows(&out, Spin::Up).iter().all(|r| matches!(r.label, Label::Index(_))), "no names for it");
+    // and its p set is aligned to the cell axes as a labelled atom's is (the textbook dumbbells):
+    // the same rotation as the labelled run's 2p shell, column for column up to sign
+    let labelled = Tracker::new().update(&lone.input());
+    let block = |o: &UpdateOutput| o.rotations[0].iter().find(|(r, _)| r.len() == 3).expect("the p set").1.clone();
+    let (a, b) = (block(&out), block(&labelled));
+    for k in 0..3 {
+        let dot: f64 = (0..3).map(|j| a[(j, k)] * b[(j, k)]).sum();
+        assert!((dot.abs() - 1.0).abs() < 1e-9, "member {k}: {dot}");
+    }
+    assert!(rows(&out, Spin::Up)[2..].iter().all(|r| r.rotated));
 }

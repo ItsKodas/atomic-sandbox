@@ -2729,7 +2729,7 @@ impl ForceProvider for Viewing {
         }
         let row = sim::OrbitalInfo {
             spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, eps_range: (-0.6, -0.6), occupation: 1.0, label: sim::OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         };
         Some(sim::OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [-4.0; 3], positions: Vec::new(), rows: vec![row], field: None,

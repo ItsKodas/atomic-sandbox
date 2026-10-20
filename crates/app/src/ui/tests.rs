@@ -2193,7 +2193,7 @@ mod orbital_viewer {
     fn row(spin: Spin, index: usize, track: u32, slot: u8, e: f64, occ: f64, label: OrbitalLabel) -> OrbitalInfo {
         OrbitalInfo {
             spin, index, track, slot, energy: e, eps_range: (e, e), occupation: occ, label, cluster: None, rotated: false,
-            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         }
     }
 
@@ -2346,6 +2346,110 @@ mod orbital_viewer {
             assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
         }
         assert!(Action::parse(&["show", "plasma"]).unwrap_err().contains("density, orbitals, colour or spin"));
+    }
+
+    /// An O-atom-like list: ↑ s + p×3, ↓ s + p (each ↓ sharing its ↑ partner's slot), one
+    /// unoccupied ↑ row; the angular characters known (a lone atom's, pseudised or not).
+    fn atom_rows() -> Vec<OrbitalInfo> {
+        let with_l = |mut r: OrbitalInfo, l: Option<u8>| {
+            r.l = l;
+            r
+        };
+        vec![
+            with_l(row(Spin::Up, 0, 1, 0, -0.9, 1.0, idx(1)), Some(0)),
+            with_l(row(Spin::Up, 1, 2, 1, -0.34, 1.0, idx(2)), Some(1)),
+            with_l(row(Spin::Up, 2, 3, 2, -0.34, 1.0, idx(3)), Some(1)),
+            with_l(row(Spin::Up, 3, 4, 3, -0.34, 1.0, idx(4)), Some(1)),
+            with_l(row(Spin::Up, 4, 7, 4, 0.05, 0.0, idx(5)), Some(0)),
+            with_l(row(Spin::Down, 0, 5, 0, -0.8, 1.0, idx(1)), Some(0)),
+            with_l(row(Spin::Down, 1, 6, 1, -0.2, 1.0, idx(2)), Some(1)),
+        ]
+    }
+
+    /// The quick presets (user request 2026-10-20): each sets the include list from the rows on
+    /// screen and the core flag, keeps the draw look, sends the view, is the one highlighted
+    /// afterwards, and is a script word.
+    #[test]
+    fn colour_presets_set_the_include_list_and_round_trip() {
+        use crate::ui::actions::{preset_active, preset_include};
+        use crate::ui::ColourPreset as P;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let rows = atom_rows();
+        let snap = with_payload(&scene, Backend::Gpu, payload(rows.clone(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Coloured;
+        let look = sim::ColourLook { enclose: Some(75), shell: false, hide_core: false };
+        act(&mut st, &inp, Action::ColourLook(look));
+        assert_eq!(preset_active(&st, &rows), Some(P::Everything), "the default is everything");
+        let set = |v: &[u32]| Some(v.iter().copied().collect::<std::collections::BTreeSet<u32>>());
+        for (p, include, hide_core) in [
+            (P::Valence, None, true),
+            (P::OneSpin, set(&[1, 2, 3, 4]), false),
+            (P::POnly, set(&[2, 3, 4, 6]), false),
+            (P::Everything, None, false),
+        ] {
+            assert_eq!(preset_include(p, &rows), include, "{p:?}");
+            let out = act(&mut st, &inp, Action::ColourPreset(p));
+            let r = match out.commands.as_slice() {
+                [Command::OrbitalView(r)] => r.clone(),
+                c => panic!("{p:?}: {c:?}"),
+            };
+            assert_eq!(st.included, include, "{p:?}");
+            assert_eq!(st.colour_look, sim::ColourLook { hide_core, ..look }, "{p:?}: only the core flag changes");
+            assert_eq!(r.what, OrbitalRequest::AllColoured { include: include.map(|s| s.into_iter().collect()), physical: false, look: st.colour_look });
+            assert_eq!(preset_active(&st, &rows), Some(p), "{p:?} is highlighted");
+        }
+        assert_eq!(preset_include(P::POnly, &h2_rows()), set(&[]), "a molecule has no p rows (the button is off there)");
+        for p in P::ALL {
+            let a = Action::ColourPreset(p);
+            let text = a.describe().expect("a script form");
+            let words: Vec<&str> = text.split(' ').collect();
+            assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
+        }
+        assert!(Action::parse(&["colour-preset", "d"]).unwrap_err().contains("valence, one-spin, p or everything"));
+    }
+
+    /// The coloured legend (user request 2026-10-20): one chip per colour slot — an ↑ orbital and
+    /// its ↓ partner are one — naming the channel when a slot is drawn in one only; a ticked
+    /// unoccupied orbital has a chip only as a boundary surface; an occupied orbital whose
+    /// boundary reaches the box puts the warning under the legend and a tag on its row.
+    #[test]
+    fn the_coloured_legend_has_one_chip_per_pair_and_warns_of_the_box() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Coloured;
+        let colour = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
+        let legend = |rows: Vec<OrbitalInfo>, include: Option<Vec<u32>>, look: sim::ColourLook| {
+            let mut o = payload(rows, OrbitalRequest::AllColoured { include, physical: false, look });
+            o.field = colour.clone();
+            let snap = with_payload(&scene, Backend::Gpu, o);
+            legend_of(&st, &input(&scene, Some(&snap), &cam)).unwrap()
+        };
+        let shell = sim::ColourLook::default();
+        let l = legend(atom_rows(), None, shell);
+        let names: Vec<&str> = l.swatches.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(names, ["#1", "#2", "#3↑", "#4↑"], "s and the first p are pairs; the other p's are ↑ only");
+        assert!(l.text.contains("boundary surface") && l.text.contains("90 %"), "{}", l.text);
+        assert!(l.warn.is_none());
+        // the unoccupied #5 ticked: a chip as a boundary surface, none by density
+        let l = legend(atom_rows(), Some(vec![1, 7]), shell);
+        assert_eq!(l.swatches.len(), 2);
+        let l = legend(atom_rows(), Some(vec![1, 7]), sim::ColourLook { enclose: None, ..shell });
+        assert_eq!(l.swatches.len(), 1, "by density the unoccupied orbital is not drawn");
+        // the box
+        let mut rows = atom_rows();
+        rows[1].touches_box = true;
+        rows[6].touches_box = true;
+        let l = legend(rows.clone(), None, shell);
+        assert_eq!(l.warn.as_deref(), Some("boundary touches the box: enlarge the box (#2)"), "named once per pair");
+        let v = RowView::of(&rows[1], &Levels::of(&rows));
+        assert!(v.tags.iter().any(|t| t.text == orbitals::TOUCHES_BOX && t.warn), "{:?}", v.tags);
+        // an unoccupied row keeps its own box tag instead
+        rows[4].touches_box = true;
+        assert!(!RowView::of(&rows[4], &Levels::of(&rows)).tags.iter().any(|t| t.text == orbitals::TOUCHES_BOX));
     }
 
     /// `run_settings` carries the orbital view, so a solver switch (a new worker) keeps it.
@@ -2678,7 +2782,14 @@ mod orbital_viewer {
         let inp = input(&scene, Some(&snap), &cam);
         let l = legend_of(&st, &inp).unwrap();
         assert_eq!(l.swatches.len(), 1, "σ_g↑ and σ_g↓ share slot 0; σ_u is unoccupied and not included");
-        assert_eq!(l.text, "each orbital scaled to its own peak");
+        assert_eq!(l.swatches[0].1, "#1", "a pair's chip names no channel");
+        assert_eq!(l.text, "each orbital's boundary surface: the region holding 90 % of it, drawn as a shell");
+        st.colour_look.enclose = None;
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, look: st.colour_look });
+        o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        assert_eq!(legend_of(&st, &inp).unwrap().text, "each orbital scaled to its own peak");
     }
 
     /// The chrome lays out with a payload in every mode and tab, sends nothing without input, and
