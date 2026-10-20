@@ -1355,7 +1355,7 @@ impl Viewer {
                     }
                     // a simulated-time recording follows the run (nothing while paused)
                     let pos = s.scene.nuclei.iter().map(|n| n.pos).collect();
-                    self.capture.on_snapshot(s.dynamics.sim_time_fs(), s.dynamics.step, pos, !s.dynamics.paused);
+                    self.capture.on_snapshot(s.dynamics.sim_time_fs(), s.dynamics.step, s.dynamics.temperature, pos, !s.dynamics.paused);
                 }
                 if self
                     .tool

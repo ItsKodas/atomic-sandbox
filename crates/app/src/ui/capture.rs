@@ -215,6 +215,8 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                                 ui.checkbox(&mut s.overlay.title, "title: the molecules' formulas and names")
                                     .on_hover_text("Top left: the molecules as the view names them (View ▸ Bonds and molecules ▸ name style), instead of their names over them, with the scene and the solver.");
                                 ui.checkbox(&mut s.overlay.time, "time, step and rate");
+                                ui.checkbox(&mut s.overlay.temperature, "temperature")
+                                    .on_hover_text("The scene's temperature at each frame, in the units set in Physics ▸ Thermostat.");
                                 ui.checkbox(&mut s.overlay.scale, "distance scale (at the camera's focus)");
                             });
                         }

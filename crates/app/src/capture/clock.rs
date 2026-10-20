@@ -29,11 +29,12 @@ pub const HISTORY: usize = 64;
 /// Float slack in comparisons of simulated times (fs).
 const EPS: f64 = 1e-9;
 
-/// One adopted playing snapshot: simulated time, step and the nuclei's positions.
+/// One adopted playing snapshot: simulated time, step, the kinetic temperature (K) and the nuclei's positions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     pub t_fs: f64,
     pub step: u64,
+    pub temp_k: f64,
     pub pos: Vec<[f64; 3]>,
 }
 
@@ -46,6 +47,8 @@ pub struct SimFrame {
     pub t_fs: f64,
     /// The step at the frame's instant (interpolated between the snapshots', rounded).
     pub step: u64,
+    /// The kinetic temperature (K) at the frame's instant (interpolated like the positions).
+    pub temp_k: f64,
     pub pos: Vec<[f64; 3]>,
     pub alpha: f64,
 }
@@ -124,18 +127,19 @@ impl SimClock {
                 // nothing before it in this stretch (the first snapshot, or after a break or a gap
                 // the history no longer holds): the frame is the snapshot itself
                 let s = &self.history[0];
-                SimFrame { index: self.index, t_fs: s.t_fs, step: s.step, pos: s.pos.clone(), alpha: 1.0 }
+                SimFrame { index: self.index, t_fs: s.t_fs, step: s.step, temp_k: s.temp_k, pos: s.pos.clone(), alpha: 1.0 }
             } else {
                 let (a, b) = (&self.history[after - 1], &self.history[after]);
                 let gap = b.t_fs - a.t_fs;
                 if gap > COARSE_SLICES * self.slice {
                     self.coarse += 1;
-                    SimFrame { index: self.index, t_fs: b.t_fs, step: b.step, pos: b.pos.clone(), alpha: 1.0 }
+                    SimFrame { index: self.index, t_fs: b.t_fs, step: b.step, temp_k: b.temp_k, pos: b.pos.clone(), alpha: 1.0 }
                 } else {
                     let alpha = ((next - a.t_fs) / gap).clamp(0.0, 1.0);
                     let pos = a.pos.iter().zip(&b.pos).map(|(p, q)| std::array::from_fn(|k| p[k] + alpha * (q[k] - p[k]))).collect();
                     let step = a.step + (alpha * (b.step - a.step) as f64).round() as u64;
-                    SimFrame { index: self.index, t_fs: next, step, pos, alpha }
+                    let temp_k = a.temp_k + alpha * (b.temp_k - a.temp_k);
+                    SimFrame { index: self.index, t_fs: next, step, temp_k, pos, alpha }
                 }
             };
             // the next frame one slice later — after this frame's time, which a snapshot frame
@@ -195,7 +199,7 @@ mod tests {
     use std::time::Duration;
 
     fn s(t: f64, step: u64, x: f64) -> Sample {
-        Sample { t_fs: t, step, pos: vec![[x, 0.0, 0.0]] }
+        Sample { t_fs: t, step, temp_k: 0.0, pos: vec![[x, 0.0, 0.0]] }
     }
 
     #[test]

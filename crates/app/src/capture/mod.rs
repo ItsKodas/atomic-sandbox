@@ -78,14 +78,31 @@ pub struct Overlay {
     pub labels: bool,
     pub title: bool,
     pub time: bool,
+    /// The scene's kinetic temperature, in the app's temperature units.
+    pub temperature: bool,
     pub scale: bool,
 }
 
 impl Default for Overlay {
     fn default() -> Self {
-        Overlay { on: false, labels: true, title: true, time: true, scale: true }
+        Overlay { on: false, labels: true, title: true, time: true, temperature: true, scale: true }
     }
 }
+
+/// The capture overlay's pixels per point: the UI's scale × the frame's height over the 3D view's
+/// height it stands for (labels as large in the frame as in the window). A degenerate view — the
+/// main window minimised or squeezed while the pop-out or a recording keeps rendering — counts as
+/// [`OVERLAY_MIN_VIEW_H`] tall and the scale is capped at [`OVERLAY_MAX_PPP`]: a 3D view a few pixels
+/// tall once asked egui for a 3640-pixel glyph and crashed the app (user report 2026-10-21).
+pub fn overlay_ppp(ui_ppp: f32, frame_h: u32, view_h: f32) -> f32 {
+    (ui_ppp * frame_h as f32 / view_h.max(OVERLAY_MIN_VIEW_H)).clamp(0.5, OVERLAY_MAX_PPP)
+}
+
+/// A 3D view shorter than this (px) is treated as this tall by [`overlay_ppp`].
+pub const OVERLAY_MIN_VIEW_H: f32 = 240.0;
+/// The capture overlay's largest pixels per point (an 18 pt label at 8× is 144 px, well inside
+/// egui's 2048 px glyph atlas).
+pub const OVERLAY_MAX_PPP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordMode {
@@ -461,7 +478,7 @@ impl Capture {
     }
 
     /// An adopted snapshot (the viewer's mirror took it): simulated-time recording follows the run.
-    pub fn on_snapshot(&mut self, t_fs: f64, step: u64, pos: Vec<[f64; 3]>, playing: bool) {
+    pub fn on_snapshot(&mut self, t_fs: f64, step: u64, temp_k: f64, pos: Vec<[f64; 3]>, playing: bool) {
         let Some(s) = self.session.as_mut().filter(|s| s.mode == RecordMode::SimTime) else { return };
         if !playing {
             if s.playing {
@@ -471,7 +488,7 @@ impl Capture {
             return;
         }
         s.playing = true;
-        s.sim.push(Sample { t_fs, step, pos });
+        s.sim.push(Sample { t_fs, step, temp_k, pos });
     }
 
     /// The scene was edited (a teleport, an addition): never interpolate across it.
@@ -812,7 +829,7 @@ impl crate::viewer::Viewer {
             }
             _ => self.viewport.size[1],
         };
-        let ppp = (self.egui_ctx.pixels_per_point() * h as f32 / view_h.max(1.0)).max(0.5);
+        let ppp = overlay_ppp(self.egui_ctx.pixels_per_point(), h, view_h);
         let hud = self.capture_hud(job);
         let scale = camera::scale_bar(&cam, h as f32 / ppp, 0.22 * w as f32 / ppp);
         // a recording's labels are smoothed on the video's clock, a screenshot's on the wall's
@@ -851,6 +868,18 @@ impl crate::viewer::Viewer {
                 _ if self.playing => "running".to_string(),
                 _ => "paused".to_string(),
             });
+        }
+        // the temperature at the frame's instant (a simulated-time frame's, interpolated), in the
+        // app's units; nothing for an empty scene (no temperature is defined)
+        if o.temperature {
+            let d = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|d| !d.scene.nuclei.is_empty());
+            let t_k = match &job.at {
+                Some(f) => d.map(|_| f.temp_k),
+                None => d.map(|d| d.temperature),
+            };
+            if let Some(t) = t_k {
+                hud.time.push(format!("T = {}", self.ui.temp_units.show(t, 0)));
+            }
         }
         hud
     }
@@ -913,6 +942,17 @@ fn summary(s: &Session, frames: u64) -> String {
 mod tests {
     use super::*;
 
+    /// User report 2026-10-21: a 3D view a few pixels tall must not blow the overlay's text up.
+    #[test]
+    fn overlay_text_scale_stays_sane() {
+        // the ordinary case: a 1080 frame of a 540 px view at 1.25 → 2.5
+        assert!((overlay_ppp(1.25, 1080, 540.0) - 2.5).abs() < 1e-6);
+        // a minimised or squeezed main window: capped
+        assert!(overlay_ppp(1.25, 2160, 5.0) <= OVERLAY_MAX_PPP);
+        assert!(overlay_ppp(1.25, 2160, 0.0) <= OVERLAY_MAX_PPP);
+        assert!(overlay_ppp(1.0, 4, 2000.0) >= 0.5);
+    }
+
     #[test]
     fn a_set_length_stops_the_recording_by_itself() {
         let mut c = Capture::default();
@@ -927,7 +967,7 @@ mod tests {
             started: Instant::now(), limit: Some(3), playing: false,
         });
         for k in 0..20u64 {
-            c.on_snapshot(k as f64 * 0.5, k, vec![[0.0; 3]], true);
+            c.on_snapshot(k as f64 * 0.5, k, 300.0, vec![[0.0; 3]], true);
         }
         let p = c.plan(Instant::now(), (800, 600), (800, 600), 8192);
         assert_eq!(p.offscreen.len(), 3, "never past the set length, though 20 are due");

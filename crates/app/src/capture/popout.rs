@@ -105,6 +105,33 @@ pub fn rec_words(r: &RecordingView) -> String {
     }
 }
 
+/// The strip's job line (user request 2026-10-20: the Activity tab's job card, in the strip): what
+/// runs, its time left, and its bar — the scene loading (the Jobs card's words and bar), else the
+/// status chip's headline (solving, sampling, a relax, an audit…), else playing / paused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobLine {
+    pub title: String,
+    pub detail: Option<String>,
+    pub bar: Option<crate::ui::activity::headline::BarMode>,
+}
+
+pub fn job_line(ui: &crate::ui::UiState, playing: bool, now: std::time::Instant) -> JobLine {
+    use crate::ui::activity::headline::BarMode;
+    if let Some((t0, eta, _)) = &ui.loading {
+        let el = now.duration_since(*t0).as_secs_f64();
+        let left = eta - el;
+        return JobLine {
+            title: "Loading the new scene".into(),
+            detail: Some(if left > 0.5 { format!("≈ {left:.0} s left") } else { "almost done".into() }),
+            bar: Some(BarMode::Fraction((el / eta.max(0.1)).min(0.97) as f32)),
+        };
+    }
+    if let Some(h) = ui.activity.headline.peek().as_ref().filter(|h| !h.text.is_empty()) {
+        return JobLine { title: h.text.clone(), detail: h.audit.clone(), bar: Some(h.bar) };
+    }
+    JobLine { title: if playing { "playing".into() } else { "paused".into() }, detail: None, bar: None }
+}
+
 /// The window's title.
 pub fn title(f: &Frame, rec: Option<&RecordingView>) -> String {
     let base = format!("Capture view {} × {} — Atomic Sandbox", f.size.0, f.size.1);
@@ -119,6 +146,8 @@ struct Shown {
     frame: Frame,
     recording: Option<RecordingView>,
     settings: Settings,
+    /// The app's job line ([`job_line`]).
+    job: JobLine,
 }
 
 pub struct Popout {
@@ -228,7 +257,8 @@ impl Popout {
             }
             None => v.render_popout(ctx, painter, target, &mut self.labels, window_depth),
         }
-        self.shown = Some(Shown { frame: f, recording: v.ui.capture_view.recording.clone(), settings: v.ui.capture.clone() });
+        let job = job_line(&v.ui, v.playing, std::time::Instant::now());
+        self.shown = Some(Shown { frame: f, recording: v.ui.capture_view.recording.clone(), settings: v.ui.capture.clone(), job });
     }
 
     fn minimised(&self) -> bool {
@@ -293,6 +323,7 @@ impl Popout {
         let rect = layout(win, shown.frame.size, strip);
         let words = size_words(&shown.frame, &shown.settings, shown.recording.is_some(), rect.width() * ppp);
         let rec = shown.recording.as_ref().map(rec_words);
+        let job = shown.job.clone();
         let t = self.started.elapsed().as_secs_f64();
         let out = self.egui.run_ui(raw, |root| {
             let p = root.ctx().layer_painter(egui::LayerId::background());
@@ -300,12 +331,41 @@ impl Popout {
             p.rect_stroke(rect.expand(1.0), 0.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Outside);
             if strip {
                 let y = win.y - STRIP / 2.0;
-                p.text(pos2(10.0, y), Align2::LEFT_CENTER, &words, FontId::proportional(12.0), theme::INK_DIM);
+                let left = p.text(pos2(10.0, y), Align2::LEFT_CENTER, &words, FontId::proportional(12.0), theme::INK_DIM);
+                // right to left: the recording, then the app's live state (loading, solving, …)
+                let mut right = win.x - 10.0;
                 if let Some(r) = &rec {
-                    let g = p.text(pos2(win.x - 10.0, y), Align2::RIGHT_CENTER, r, FontId::monospace(12.0), theme::INK);
+                    let g = p.text(pos2(right, y), Align2::RIGHT_CENTER, r, FontId::monospace(12.0), theme::INK);
                     let on = t.fract() < 0.6;
                     let red = crate::ui::RED;
                     p.circle_filled(pos2(g.left() - 10.0, y), 5.0, if on { red } else { red.gamma_multiply(0.35) });
+                    right = g.left() - 28.0;
+                }
+                // the job: its title (strong) and time left (dim), only when it fits beside the size
+                // words (a narrow window keeps the left text whole); its bar along the strip's top edge
+                let detail = job.detail.as_deref().map(|d| p.layout_no_wrap(format!("  {d}"), FontId::proportional(11.5), theme::INK_DIM));
+                let title = p.layout_no_wrap(job.title.clone(), FontId::proportional(12.5), theme::INK);
+                let w = title.size().x + detail.as_ref().map_or(0.0, |d| d.size().x);
+                if right - w > left.right() + 24.0 {
+                    let x0 = right - w;
+                    let tw = title.size().x;
+                    p.galley(pos2(x0, y - title.size().y / 2.0), title, theme::INK);
+                    if let Some(d) = detail {
+                        p.galley(pos2(x0 + tw, y - d.size().y / 2.0), d, theme::INK_DIM);
+                    }
+                }
+                let top = win.y - STRIP;
+                match job.bar {
+                    Some(crate::ui::activity::headline::BarMode::Fraction(f)) => {
+                        p.rect_filled(Rect::from_min_max(pos2(0.0, top), pos2(win.x, top + 3.0)), 0.0, theme::LINE);
+                        p.rect_filled(Rect::from_min_max(pos2(0.0, top), pos2(win.x * f.clamp(0.0, 1.0), top + 3.0)), 0.0, theme::ACCENT);
+                    }
+                    Some(crate::ui::activity::headline::BarMode::Sweep) => {
+                        let e = crate::ui::activity::headline::sweep_edge(crate::ui::activity::headline::sweep_phase(t));
+                        let (a, b) = ((e.max(0.0)) * win.x, ((e + 0.2).min(1.0)) * win.x);
+                        p.rect_filled(Rect::from_min_max(pos2(a, top), pos2(b, top + 3.0)), 0.0, theme::ACCENT);
+                    }
+                    None => {}
                 }
             } else if rec.is_some() {
                 // full screen: the dot alone, in the top-right corner
