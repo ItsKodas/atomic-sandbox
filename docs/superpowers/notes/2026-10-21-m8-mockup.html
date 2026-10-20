@@ -1,0 +1,1222 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared model mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+color-scheme:dark;
+
+--page:#0d0c12;
+--page-ink:#dcd8e6;
+--page-dim:#9894a8;
+
+--app:#15141b;
+--panel:#1c1b23;
+--panel-2:#24222d;
+--panel-3:#2e2b39;
+--line:#35323f;
+--line-soft:#2a2833;
+--ink:#d6d2e0;
+--ink-dim:#9792a6;
+--ink-faint:#6b6779;
+
+--accent:#a78bfa;
+--accent-ink:#cbbcff;
+--accent-bg:#2d2547;
+--glow:#8b5cf6;
+
+--ok:#6ed278;      
+--warn:#f0c83c;    
+--bad:#ff5a5a;     
+--dft:#6eb4ff;     
+--temp:#ff9650;    
+--cell:#f2cc59;
+--pin:#78c8ff;
+--spring:#ffbe5a;
+--place:#73ccff;
+--new:#5fd4d0;
+--font-ui:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;
+--font-head:"IBM Plex Sans Condensed","IBM Plex Sans","Arial Narrow",system-ui,sans-serif;
+--font-mono:"IBM Plex Mono","Cascadia Mono",Consolas,ui-monospace,monospace;
+}
+*{box-sizing:border-box;}
+[hidden]{display:none !important;}
+html,body{background:var(--page);color:var(--page-ink);}
+body{margin:0;font:14px/1.5 var(--font-ui);}
+.page{max-width:1480px;margin:0 auto;padding-inline:20px;padding-block:28px 64px;display:grid;gap:40px;}
+h1,h2,h3{font-family:var(--font-head);text-wrap:balance;margin:0;letter-spacing:.01em;}
+h1{font-size:34px;font-weight:700;}
+h2{font-size:22px;font-weight:600;}
+h3{font-size:15px;font-weight:600;}
+p{margin:0;max-width:72ch;}
+.lede{color:var(--page-dim);font-size:15px;}
+.eyebrow{font:600 11px/1 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--accent);}
+.intro{display:grid;gap:12px;}
+.principles{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 24px;margin-top:8px;}
+.principles div{border-top:1px solid var(--line);padding-top:10px;min-width:0;}
+.principles b{display:block;font-family:var(--font-head);font-size:15px;color:var(--page-ink);}
+.principles span{color:var(--page-dim);font-size:13px;}
+.legend-row{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12px;color:var(--page-dim);align-items:center;}
+section{display:grid;gap:14px;}
+.scroller{overflow-x:auto;border-radius:10px;}
+.cap{color:var(--page-dim);font-size:13px;max-width:110ch;}
+
+
+.app{position:relative;background:var(--app);color:var(--ink);font-size:12.5px;line-height:1.35;
+border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:0 30px 80px -30px rgba(0,0,0,.8);}
+.mono,.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;}
+.dim{color:var(--ink-dim);}
+.faint{color:var(--ink-faint);}
+.okc{color:var(--ok);} .warnc{color:var(--warn);} .badc{color:var(--bad);} .dftc{color:var(--dft);} .tempc{color:var(--temp);}
+
+
+.topbar{grid-column:1 / -1;display:flex;align-items:center;gap:4px;padding:0 10px;background:var(--panel);border-bottom:1px solid var(--line);}
+.brand{display:flex;align-items:center;gap:8px;font:600 13px var(--font-head);letter-spacing:.02em;margin-right:10px;}
+.brand i{width:18px;height:18px;border-radius:50%;background:radial-gradient(circle at 40% 40%,#fff 0 12%,var(--accent) 30%,transparent 72%);box-shadow:0 0 12px var(--glow);}
+.menu{padding:6px 10px;border-radius:6px;color:var(--ink);cursor:default;}
+.menu:hover{background:var(--panel-3);}
+.menu.open{background:var(--accent-bg);color:var(--accent-ink);}
+.scene-title{margin-left:18px;display:flex;align-items:center;gap:8px;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);}
+.scene-title b{font-weight:600;}
+.spacer{flex:1;}
+.search{display:flex;align-items:center;gap:8px;width:250px;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:var(--app);color:var(--ink-faint);}
+.kbd{font:500 10.5px var(--font-mono);padding:1px 5px;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;color:var(--ink-dim);background:var(--panel-2);}
+
+
+.viewport{position:relative;overflow:hidden;background:radial-gradient(ellipse at 50% 42%,#221b36 0%,#14121c 55%,#0e0d13 100%);}
+.viewport > svg.scene{position:absolute;inset:0;width:100%;height:100%;}
+.ov{position:absolute;}
+.chip-status{top:12px;left:12px;display:flex;align-items:center;gap:10px;padding:6px 10px 6px 8px;background:rgba(20,19,27,.86);border:1px solid var(--line);border-radius:8px;backdrop-filter:blur(4px);}
+.pulse{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(110,210,120,.18);}
+.src{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:999px;font:500 11px var(--font-mono);border:1px solid currentColor;}
+.src.sur{color:var(--ok);background:rgba(110,210,120,.08);}
+.src.fb{color:var(--warn);background:rgba(240,200,60,.08);}
+.sep-v{width:1px;align-self:stretch;background:var(--line);}
+
+.banner-x{top:58px;left:50%;transform:translateX(-50%);max-width:470px;padding:8px 12px;border-radius:8px;
+background:rgba(120,20,28,.82);border:1px solid var(--bad);color:#ffe1e1;display:grid;gap:2px;}
+.card{background:rgba(28,27,35,.94);border:1px solid var(--line);border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.45);}
+.atomcard small,.note-s{font-size:11px;color:var(--ink-dim);}
+.density-label{bottom:14px;left:50%;transform:translateX(-50%);padding:5px 9px;border-radius:4px;background:rgba(0,0,0,.6);color:#d2d2d2;white-space:nowrap;}
+
+
+.tag{display:inline-block;font:600 9.5px/1.5 var(--font-mono);letter-spacing:.06em;text-transform:uppercase;padding:0 5px;border-radius:4px;vertical-align:1px;}
+.i{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--ink-faint);color:var(--ink-dim);font:600 9px var(--font-mono);cursor:help;vertical-align:1px;}
+
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;padding:0 10px;border-radius:6px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink);font:500 12px var(--font-ui);white-space:nowrap;}
+.btn:hover{background:var(--panel-3);}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#17112a;font-weight:600;}
+.btn.ghost{background:transparent;}
+.btn.sm{height:24px;padding:0 8px;font-size:11.5px;}
+.btn.icon{width:30px;padding:0;}
+.btn.danger{color:#ffb4b4;border-color:#5a2a30;}
+.btn.amber{color:var(--warn);border-color:#5b4b1c;}
+.btn[disabled],.btn.disabled{opacity:.4;}
+.btn svg,.seg svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
+.btn svg.fill{fill:currentColor;stroke:none;}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;background:var(--app);padding:2px;gap:2px;}
+.seg span{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border-radius:5px;color:var(--ink-dim);white-space:nowrap;}
+.seg span.on{background:var(--accent-bg);color:var(--accent-ink);box-shadow:inset 0 0 0 1px #4b3d78;}
+.seg span.off{opacity:.4;}
+.field{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 7px;border:1px solid var(--line);border-radius:5px;background:var(--app);font:500 12px var(--font-mono);color:var(--ink);white-space:nowrap;}
+.field.wide{min-width:150px;}
+.sw{display:inline-block;width:26px;height:15px;border-radius:999px;background:var(--panel-3);position:relative;vertical-align:-3px;border:1px solid var(--line);}
+.sw::after{content:"";position:absolute;top:1px;left:1px;width:11px;height:11px;border-radius:50%;background:var(--ink-dim);}
+.sw.on{background:var(--accent);border-color:var(--accent);}
+.sw.on::after{left:12px;background:#fff;}
+.cb{display:inline-block;width:13px;height:13px;border:1px solid var(--ink-faint);border-radius:3px;vertical-align:-2px;margin-right:5px;position:relative;}
+.cb.on{background:var(--accent);border-color:var(--accent);}
+.cb.on::after{content:"";position:absolute;left:3.5px;top:.5px;width:3px;height:7px;border:solid #17112a;border-width:0 2px 2px 0;transform:rotate(45deg);}
+.rd{display:inline-block;width:12px;height:12px;border:1px solid var(--ink-faint);border-radius:50%;vertical-align:-2px;margin-right:4px;}
+.rd.on{border:4px solid var(--accent);}
+.slider{position:relative;height:18px;display:inline-block;vertical-align:middle;}
+.slider .tr{position:absolute;left:0;right:0;top:8px;height:3px;border-radius:2px;background:var(--panel-3);}
+.slider .fi{position:absolute;left:0;top:8px;height:3px;border-radius:2px;background:var(--accent);}
+.slider .th{position:absolute;top:3px;width:13px;height:13px;border-radius:50%;background:#efeaff;box-shadow:0 0 0 3px rgba(167,139,250,.35);transform:translateX(-50%);}
+.ticks{display:flex;justify-content:space-between;font:9.5px var(--font-mono);color:var(--ink-faint);}
+.light{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:0;}
+.light.ok{background:var(--ok);box-shadow:0 0 6px var(--ok);}
+.light.warn{background:var(--warn);box-shadow:0 0 6px var(--warn);}
+.light.off{background:var(--ink-faint);}
+
+
+.toolbar{grid-column:1 / -1;display:flex;align-items:stretch;background:var(--panel);border-top:1px solid var(--line);padding:0 6px;}
+.tg{display:grid;grid-template-rows:16px 30px 14px;align-content:center;gap:2px;padding:0 9px;border-right:1px solid var(--line-soft);min-width:0;}
+.tg:last-child{border-right:0;}
+.tg > .lab{font:600 9.5px/16px var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);white-space:nowrap;display:flex;gap:6px;align-items:center;}
+.tg > .row{display:flex;align-items:center;gap:6px;}
+.tg > .sub{font-size:10.5px;color:var(--ink-dim);white-space:nowrap;}
+.play{width:74px;}
+.toolbar{overflow:hidden;}
+.toolbar .seg span{padding:0 7px;}
+.bigrate{font:600 15px var(--font-mono);color:var(--ink);}
+
+
+.strip{background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:8px;}
+.tabbtn{position:relative;width:34px;height:34px;display:grid;place-items:center;border-radius:7px;color:var(--ink-dim);border:0;background:transparent;cursor:pointer;}
+.tabbtn:hover{background:var(--panel-3);color:var(--ink);}
+.tabbtn.on{background:var(--accent-bg);color:var(--accent-ink);}
+.tabbtn:focus-visible{outline:2px solid var(--accent);}
+.tabbtn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;}
+.tabbtn .dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;border:1.5px solid var(--panel);}
+.strip .grow{flex:1;}
+.dock{background:var(--panel);border-left:1px solid var(--line-soft);overflow:hidden;display:flex;flex-direction:column;min-height:0;}
+.dock-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;border-bottom:1px solid var(--line-soft);}
+.dock-head h3{font-size:14px;}
+.tabpanel{overflow:auto;padding:10px 14px 16px;display:grid;gap:12px;align-content:start;flex:1;min-height:0;}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;}
+.tile{background:var(--panel-2);border:1px solid var(--line-soft);border-radius:7px;padding:6px 8px;min-width:0;}
+.tile .k{font-size:10px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.08em;}
+.tile .v{font:600 14px var(--font-mono);white-space:nowrap;}
+.tile .u{font-size:10.5px;color:var(--ink-dim);}
+.grp{display:grid;gap:5px;}
+.grp > h4{margin:0;font:600 10px/1.4 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);display:flex;justify-content:space-between;align-items:center;}
+table.kv{width:100%;border-collapse:collapse;font-size:12px;}
+table.kv td{padding:3px 4px;border-bottom:1px solid var(--line-soft);vertical-align:top;}
+table.kv tr:nth-child(odd) td{background:rgba(255,255,255,.015);}
+table.kv td:first-child{color:var(--ink-dim);white-space:nowrap;}
+table.kv td.r{text-align:right;font-family:var(--font-mono);font-variant-numeric:tabular-nums;white-space:nowrap;}
+details{border:1px solid var(--line-soft);border-radius:7px;background:rgba(255,255,255,.012);}
+details > summary{padding:6px 9px;cursor:pointer;color:var(--ink);font-weight:500;list-style:none;display:flex;justify-content:space-between;align-items:center;}
+details > summary::-webkit-details-marker{display:none;}
+details > summary::after{content:"▸";color:var(--ink-faint);}
+details[open] > summary::after{content:"▾";}
+details > .body{padding:2px 9px 9px;display:grid;gap:6px;}
+.health{display:grid;gap:4px;font-size:11.5px;}
+.health div{display:flex;gap:6px;align-items:baseline;}
+.bar{height:6px;border-radius:3px;background:var(--panel-3);position:relative;overflow:hidden;}
+.bar > i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;}
+.unc{position:relative;height:8px;border-radius:4px;background:linear-gradient(90deg,rgba(110,210,120,.25) 0 50%,rgba(240,200,60,.22) 50% 100%);}
+.unc .mark{position:absolute;top:-3px;width:2px;height:14px;background:var(--ink);}
+.unc .val{position:absolute;top:-2px;width:12px;height:12px;border-radius:50%;background:var(--warn);transform:translateX(-50%);border:2px solid var(--panel);}
+.warnbox{border:1px solid #5b4b1c;background:rgba(240,200,60,.07);color:#f5dd8a;border-radius:7px;padding:7px 9px;font-size:11.5px;display:grid;gap:6px;}
+.btnrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+
+
+.dropdown{position:absolute;z-index:5;width:360px;padding:6px;background:var(--panel);border:1px solid #3e3a4b;border-radius:9px;box-shadow:0 18px 50px rgba(0,0,0,.6);}
+.mi{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 8px;border-radius:5px;min-height:30px;}
+.mi:hover{background:var(--panel-2);}
+.mi .l{display:flex;align-items:center;gap:6px;}
+.mh{padding:8px 8px 3px;font:600 9.5px var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);display:flex;justify-content:space-between;}
+.mnote{padding:0 8px 6px;font-size:11px;color:var(--ink-dim);}
+
+
+.samplecard{left:calc(50% + 120px);bottom:18px;transform:translateX(-50%);width:560px;padding:12px 14px;display:grid;gap:8px;}
+.linkbtn{font:500 10.5px var(--font-ui);color:var(--accent-ink);border-bottom:1px dashed var(--accent);cursor:pointer;}
+
+
+@media (prefers-reduced-motion:no-preference) {
+.pulse{animation:pulse 1.6s ease-in-out infinite;}
+@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(110,210,120,0);}}
+@keyframes spin{to{transform:rotate(360deg);}}
+}
+
+
+.app.m8main{width:1400px;height:860px;display:grid;grid-template-rows:40px 736px 84px;grid-template-columns:44px 972px 44px 340px;}
+.app.m8main > .topbar,.app.m8main > .toolbar{grid-column:1 / -1;}
+.app.f1000{width:1000px;display:grid;grid-template-rows:40px 1fr;}
+.app.f1000.tb{grid-template-rows:40px 1fr 84px;}
+.strip.left{border-left:0;border-right:1px solid var(--line);}
+.winbtns{display:flex;gap:2px;margin-left:8px;color:var(--ink-dim);}
+.winbtns span{width:34px;text-align:center;font-size:12px;}
+.viewport > svg.scene{position:absolute;inset:0;width:100%;height:100%;}
+.pin-n{position:absolute;z-index:9;width:20px;height:20px;border-radius:50%;background:#fff;color:#17112a;font:700 11px/20px var(--font-mono);text-align:center;box-shadow:0 0 0 3px rgba(167,139,250,.55),0 4px 10px rgba(0,0,0,.5);pointer-events:none;}
+.notes-n{display:grid;gap:6px;margin:0;padding-left:0;list-style:none;max-width:120ch;counter-reset:n;}
+.notes-n li{color:var(--page-dim);display:grid;grid-template-columns:26px 1fr;gap:6px;counter-increment:n;}
+.notes-n li::before{content:counter(n);width:20px;height:20px;border-radius:50%;background:#fff;color:#17112a;font:700 11px/20px var(--font-mono);text-align:center;}
+.notes-n li.plain::before{content:"·";background:none;color:var(--page-dim);}
+.notes-n b{color:var(--page-ink);}
+.tag.a{color:var(--ok);border:1px solid var(--ok);}
+.tag.b{color:#9ad8ff;border:1px solid #9ad8ff;}
+.tag.p{color:var(--warn);border:1px dashed var(--warn);}
+.slug{font:500 11px var(--font-mono);color:var(--accent-ink);word-break:break-all;}
+.srcline{display:grid;gap:3px;padding:8px 10px;border:1px solid #4b3d78;background:rgba(45,37,71,.35);border-radius:7px;}
+.srcline .big{font:600 12.5px var(--font-mono);color:var(--ink);word-break:break-all;}
+.kgraph{display:block;background:radial-gradient(ellipse at 50% 45%,#1d1a2a,#15141b 70%);border-radius:7px;}
+.kgraph .gedge,.kgraph .gnode{cursor:pointer;outline:none;}
+.kgraph .gedge:hover .ge,.kgraph .gedge:focus .ge,.kgraph .gedge.sel .ge{filter:drop-shadow(0 0 5px #cbbcff) drop-shadow(0 0 2px #cbbcff);}
+.kgraph .gnode:hover circle,.kgraph .gnode:focus circle,.kgraph .gnode.sel circle{stroke:#cbbcff;stroke-width:3;}
+.hist{display:block;}
+.kleg{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11px;color:var(--ink-dim);align-items:center;}
+.kleg i{display:inline-block;width:16px;height:3px;border-radius:2px;vertical-align:3px;margin-right:4px;}
+.ktable{width:100%;border-collapse:collapse;font-size:11.5px;}
+.ktable td{padding:4px 4px;border-bottom:1px solid var(--line-soft);vertical-align:top;}
+.ktable td:first-child{font:600 12px var(--font-mono);white-space:nowrap;}
+.verdict{font:500 11px var(--font-mono);}
+.popwin{width:1180px;height:740px;background:var(--panel);border:1px solid #3e3a4b;border-radius:10px;display:grid;grid-template-rows:36px 1fr;overflow:hidden;box-shadow:0 30px 80px -30px rgba(0,0,0,.8);color:var(--ink);font-size:12.5px;line-height:1.35;position:relative;}
+.wtitle{display:flex;align-items:center;gap:10px;padding:0 0 0 12px;background:var(--app);border-bottom:1px solid var(--line);font:600 13px var(--font-head);}
+.wtitle .slug{font-weight:500;}
+.wbody{display:grid;grid-template-columns:470px 1fr;min-height:0;}
+.wleft{padding:14px;border-right:1px solid var(--line-soft);display:grid;gap:10px;align-content:start;}
+.wright{padding:14px 16px;display:grid;gap:14px;align-content:start;overflow:hidden;}
+.detail{border:1px solid var(--line-soft);border-radius:8px;padding:10px 12px;display:grid;gap:7px;background:rgba(255,255,255,.012);}
+.detail h3{display:flex;gap:8px;align-items:baseline;}
+.crow{display:grid;grid-template-columns:150px 1fr 150px;gap:8px;align-items:center;font-size:11.5px;padding:2px 0;}
+.crow .bar{height:8px;}
+.kgrad{height:10px;width:220px;border-radius:5px;background:linear-gradient(90deg,#7a7690,#f0c83c 50%,#6ed278);border:1px solid rgba(255,255,255,.15);}
+.legendcard{left:14px;bottom:14px;padding:9px 11px;display:grid;gap:5px;font-size:11px;}
+.legendcard .ticks{width:220px;}
+.hovercard{padding:9px 11px;display:grid;gap:4px;font-size:11.5px;width:290px;}
+.hovercard b{font-size:12.5px;}
+.ice{color:#9ad8ff;}
+.banner-ice{top:58px;left:50%;transform:translateX(-50%);width:560px;padding:8px 12px;border-radius:8px;background:rgba(18,44,66,.9);border:1px solid #9ad8ff;color:#e3f4ff;display:grid;gap:4px;}
+.banner-ice b{color:#fff;}
+.banner-amber{padding:6px 12px;border-radius:8px;background:rgba(70,56,14,.88);border:1px solid var(--warn);color:#f8e7a8;font-size:11.5px;}
+.btn.train{color:#c9f5cf;border-color:#2f6b3a;background:rgba(110,210,120,.12);}
+.btn.ice{color:#dff3ff;border-color:#3b6d8c;background:rgba(154,216,255,.12);}
+.confirm{right:14px;top:14px;width:352px;padding:12px 14px;display:grid;gap:8px;}
+.confirm table.kv td{font-size:11.5px;}
+.backchip{margin-left:8px;display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--accent);background:var(--accent-bg);color:var(--accent-ink);font-size:12px;}
+.refusals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;max-width:1180px;}
+.refusals .card{padding:11px 13px;display:grid;gap:6px;font-size:12px;color:var(--ink);}
+.refusals .card .k{font:600 10px var(--font-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);}
+.gal3{display:grid;grid-template-columns:repeat(3,340px);gap:16px;align-items:start;}
+.gal2{display:grid;grid-template-columns:520px 440px;gap:16px;align-items:start;}
+.gpanel{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:10px;font-size:12.5px;line-height:1.35;overflow:hidden;}
+.gpanel .tabpanel{overflow:visible;}
+.dlg{background:var(--panel);color:var(--ink);border:1px solid #3e3a4b;border-radius:10px;padding:14px 16px;display:grid;gap:9px;font-size:12.5px;line-height:1.4;box-shadow:0 18px 50px rgba(0,0,0,.5);}
+.dlg h3{font-size:15px;}
+.okline{color:var(--ok);}
+.rep{display:grid;gap:4px;font-size:12px;}
+.rep > div{display:grid;grid-template-columns:18px 1fr;gap:6px;}
+.speclist{display:flex;gap:8px;flex-wrap:wrap;}
+.speclist label{display:inline-flex;align-items:center;gap:2px;padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);font:600 12px var(--font-mono);}
+.mlist{display:grid;gap:3px;}
+.mlist > div{display:grid;grid-template-columns:18px 1fr;gap:4px;padding:5px 6px;border-radius:6px;border:1px solid transparent;font-size:11.5px;}
+.mlist > div.on{border-color:#4b3d78;background:rgba(45,37,71,.45);}
+.mlist .slug{font-size:10.5px;}
+.selname{color:var(--ink);letter-spacing:0;text-transform:none;font-family:var(--font-ui);}
+.decisions{display:grid;gap:8px;padding-left:20px;margin:0;max-width:120ch;}
+.decisions li{color:var(--page-dim);}
+.decisions li b{color:var(--page-ink);}
+.toc{display:flex;gap:8px 16px;flex-wrap:wrap;font:500 13px var(--font-mono);}
+.toc a{color:var(--accent-ink);text-decoration:none;border-bottom:1px dashed var(--accent);}
+
+</style></head><body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<radialGradient id="gO" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#ffd1cc"/><stop offset=".35" stop-color="#ec5a50"/><stop offset="1" stop-color="#5a1612"/></radialGradient>
+<radialGradient id="gH" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#ffffff"/><stop offset=".45" stop-color="#cfd3dc"/><stop offset="1" stop-color="#4b4f5c"/></radialGradient>
+<radialGradient id="gC" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#c9ccd4"/><stop offset=".4" stop-color="#5d616c"/><stop offset="1" stop-color="#16171c"/></radialGradient>
+<radialGradient id="gCap" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#f2fffe"/><stop offset=".45" stop-color="#8fe3df"/><stop offset="1" stop-color="#1f5755"/></radialGradient>
+<radialGradient id="gCloud" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#c4a8ff" stop-opacity=".55"/><stop offset=".5" stop-color="#8b5cf6" stop-opacity=".25"/><stop offset="1" stop-color="#5b2fd0" stop-opacity="0"/></radialGradient>
+<g id="frz"><polygon points="0.866,0.500 0.000,1.000 -0.866,0.500 -0.866,-0.500 -0.000,-1.000 0.866,-0.500" fill="rgba(154,216,255,.12)" stroke="#9ad8ff" stroke-width="1.8" vector-effect="non-scaling-stroke"/><path d="M-.36 0H.36M0-.36V.36M-.25-.25L.25 .25M.25-.25L-.25 .25" stroke="#dff3ff" stroke-width="1.6" vector-effect="non-scaling-stroke"/></g>
+</defs></svg>
+<main class="page">
+<header class="intro">
+<span class="eyebrow">Atomic Sandbox · M8 mockup · approval gate for the knowledge-map UI · nothing implemented</span>
+<h1>The shared model, what it knows, and Sandbox</h1>
+<p class="lede">One model per set of solver settings keeps learning from every neutral scene. This page mocks how you see which collection a scene uses, what that collection knows, where the open scene leaves it, how you teach the gap, and (M8b) a solver that answers from the model alone and freezes what it has not learned. The frames use the app's own chrome from the 2026-10-14 UI mockup.</p>
+<div class="principles">
+<div><b>(a) Knowledge map</b><span>A right-dock tab next to Model, and a larger pop-out window. Elements, pairs, distances, angles.</span></div>
+<div><b>(b) Model tab</b><span>Which collection, or which file; import with a report; save a specialised model.</span></div>
+<div><b>(c) 3D overlay</b><span>Each atom tinted by how well its surroundings are known, with the reason on hover.</span></div>
+<div><b>(d) Train this segment</b><span>Selection → segment with caps → confirmation → a new scene in Estimated, and the way back.</span></div>
+<div><b>(e) Sandbox (M8b)</b><span>The fourth solver, its panel, frozen atoms, low precision, the cascade guard.</span></div>
+</div>
+<div class="legend-row">
+<span><span class="tag a">M8a</span> the shared model milestone</span>
+<span><span class="tag b">M8b</span> the Sandbox milestone (preview)</span>
+<span><span class="light ok"></span> trusted <span class="light warn" style="margin-left:6px"></span> thin <span class="light off" style="margin-left:6px"></span> never seen</span>
+<span><span class="pin-n" style="position:static;display:inline-block">1</span> numbered notes under each frame</span>
+</div>
+<p class="cap">The numbers are illustrative but made to agree with each other: the example collection was taught on H₂, water, water dimers, methane and methane beside water (2 140 samples: H in all 2 140, O 880, C 610). The molecules are built with real bond lengths, and the overlay, the segment, the caps and the frozen atoms in this page are computed from that geometry, the example histograms and a table of the three-body families taught (the pairs of neighbours around an atom, which the model's descriptor sees). The surface key in every slug is <span class="slug">lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a</span>.</p>
+<nav class="toc"><a href="#a">(a) knowledge map</a><a href="#b">(b) Model tab</a><a href="#c">(c) overlay</a><a href="#d">(d) Train this segment</a><a href="#e">(e) Sandbox</a><a href="#q">choices for you</a></nav>
+</header>
+
+<section id="a">
+<h2>(a) The knowledge map · the dock tab <span class="tag a">M8a</span></h2>
+<p class="cap">Propane in Estimated, on the H₂ + water + methane collection, paused at its first step. The collection has never seen two carbons within 6 Bohr: the C see C–C, and every H sees two C around it, so all 11 atoms are refused and the step falls back to DFT. Each fallback is kept as a sample, so propane would teach the collection C–C by itself as it plays. The Knowledge tab sits in the right dock next to Model; here the C–C line was clicked.</p>
+<div class="scroller"><div class="app m8main">
+<div class="topbar"><div class="brand"><i></i>Atomic Sandbox</div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><span class="dim">scene</span><b>propane</b><span class="faint">·</span><span class="mono dim">121³ × 0.150 Bohr · 11 nuclei · 20 valence e⁻ · charge 0</span><span class="faint">▾</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="strip left"><span class="tabbtn" title="Activity"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg></span><span class="tabbtn" title="Readouts"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></span><span class="tabbtn" title="Graph"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 3 5-8 4 5"/></svg></span><div class="grow"></div><span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg></span></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 972 736" preserveAspectRatio="xMidYMid slice" aria-label="propane, estimated solver"><path d="M-78 605L270 948M-78 605L642 473M20 587L387 920M-42 640L691 502M116 570L500 893M-5 677L742 532M209 553L609 866M35 716L796 563M300 536L715 841M77 757L852 596M389 520L818 816M121 801L911 631M475 504L918 792M168 847L973 668M560 488L1014 769M218 896L1039 706M642 473L1108 747M270 948L1108 747" fill="none" stroke="rgba(255,255,255,.08)"/><path d="M-72 712L273 1077M-72 712L-116 -108M-72 712L640 571M273 1077L252 70M273 1077L1101 863M-116 -108L252 70M-116 -108L651 -175M252 70L1155 -35M640 571L1101 863M640 571L651 -175M1101 863L1155 -35M651 -175L1155 -35" fill="none" stroke="rgba(242,204,89,.5)" stroke-width="1.3"/><g opacity=".55"><circle cx="379" cy="411" r="70" fill="url(#gCloud)"/><circle cx="486" cy="316" r="70" fill="url(#gCloud)"/><circle cx="590" cy="376" r="70" fill="url(#gCloud)"/><circle cx="302" cy="364" r="44" fill="url(#gCloud)"/><circle cx="417" cy="494" r="44" fill="url(#gCloud)"/><circle cx="341" cy="444" r="44" fill="url(#gCloud)"/><circle cx="527" cy="280" r="44" fill="url(#gCloud)"/><circle cx="447" cy="238" r="44" fill="url(#gCloud)"/><circle cx="661" cy="307" r="44" fill="url(#gCloud)"/><circle cx="551" cy="408" r="44" fill="url(#gCloud)"/><circle cx="632" cy="455" r="44" fill="url(#gCloud)"/></g>
+<path d="M379 411L486 316M379 411L302 364M379 411L417 494M379 411L341 444M486 316L590 376M486 316L527 280M486 316L447 238M590 376L661 307M590 376L551 408M590 376L632 455" stroke="rgba(214,210,224,.55)" stroke-width="3.0" stroke-linecap="round"/>
+<circle cx="551" cy="408" r="26.4" fill="url(#gH)"/>
+<circle cx="661" cy="307" r="26.9" fill="url(#gH)"/>
+<circle cx="590" cy="376" r="41.8" fill="url(#gC)"/>
+<circle cx="341" cy="444" r="27.2" fill="url(#gH)"/>
+<circle cx="447" cy="238" r="27.2" fill="url(#gH)"/>
+<circle cx="632" cy="455" r="27.4" fill="url(#gH)"/>
+<circle cx="486" cy="316" r="42.7" fill="url(#gC)"/>
+<circle cx="379" cy="411" r="43.1" fill="url(#gC)"/>
+<circle cx="417" cy="494" r="28.3" fill="url(#gH)"/>
+<circle cx="302" cy="364" r="28.3" fill="url(#gH)"/>
+<circle cx="527" cy="280" r="28.4" fill="url(#gH)"/>
+</svg>
+<div class="ov chip-status"><span class="light warn"></span><b>Paused</b><span class="src fb"><span class="light warn"></span>fallback (DFT) · C–C never taught</span><span class="sep-v"></span><span class="mono">t 0.00 fs</span><span class="mono dim">step 0 · the first step</span></div>
+<div class="ov density-label">density from this DFT step (the fallback) · bonds from the density</div>
+</div>
+<div class="strip right"><span class="tabbtn" title="Model"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5l3.5 9M16.5 7.5l-3.5 9M8 6h8"/></svg><span class="dot" style="background:var(--warn)"></span></span><span class="tabbtn on" title="Knowledge"><svg viewBox="0 0 24 24"><path d="M3 6.5l6-2.5 6 2.5 6-2.5v13.5l-6 2.5-6-2.5-6 2.5z"/><path d="M9 4v13.5M15 6.5V20"/></svg></span><span class="tabbtn" title="Orbitals"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.8"/><ellipse cx="12" cy="12" rx="9" ry="3.8"/><ellipse cx="12" cy="12" rx="3.8" ry="9"/></svg></span><span class="tabbtn" title="Selection"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/></svg></span><span class="tabbtn" title="Log"><svg viewBox="0 0 24 24"><path d="M6 4h9l3 3v13H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg></span><div class="grow"></div><span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg></span></div>
+<div class="dock">
+<div class="dock-head"><h3>Knowledge · shared model</h3><span class="btn sm"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8"/><path d="M18 14v5H5V6h5"/></svg>Pop out</span></div>
+<div class="tabpanel">
+<div class="slug">lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a</div>
+<div class="mono" style="font-size:11px">2 140 samples · H C O · r_cut 6 Bohr · pairs <span class="okc">4 trusted</span> · <span class="warnc">1 thin</span> · <span class="dim">1 never</span></div>
+<svg viewBox="0 0 310 170" width="310" height="170" class="kgraph" font-family="IBM Plex Mono, monospace" font-size="10" aria-label="knowledge graph"><g><path class="ge" d="M145 49C108 19 202 19 165 49" fill="none" stroke="#6ed278" stroke-width="6.3" stroke-linecap="round"/></g><g><path class="ge" d="M96 140L155 70" fill="none" stroke="#6ed278" stroke-width="5.5" stroke-linecap="round"/></g><g><path class="ge" d="M155 70L214 140" fill="none" stroke="#6ed278" stroke-width="5.7" stroke-linecap="round"/></g><g><path class="ge" d="M224 129C242 86 270 164 229 141" fill="none" stroke="#6ed278" stroke-width="5.3" stroke-linecap="round"/></g><g><path class="ge" d="M96 140L214 140" fill="none" stroke="#f0c83c" stroke-width="3.8" stroke-linecap="round"/></g><g><path d="M83 141C42 163 69 87 87 131" fill="none" stroke="rgba(203,188,255,.35)" stroke-width="11.4" stroke-linecap="round"/><path class="ge" d="M83 141C42 163 69 87 87 131" fill="none" stroke="#6b6779" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="5 4"/></g><g><circle cx="155" cy="70" r="23" fill="url(#gH)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="155" y="75" text-anchor="middle" font-size="15" font-weight="600" fill="#17112a">H</text><text x="155" y="106" text-anchor="middle" fill="#9792a6">2 140</text></g><g><circle cx="96" cy="140" r="13" fill="url(#gC)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="96" y="145" text-anchor="middle" font-size="15" font-weight="600" fill="#fff">C</text><text x="96" y="166" text-anchor="middle" fill="#9792a6">610</text></g><g><circle cx="214" cy="140" r="15" fill="url(#gO)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="214" y="145" text-anchor="middle" font-size="15" font-weight="600" fill="#fff">O</text><text x="214" y="168" text-anchor="middle" fill="#9792a6">880</text></g><g pointer-events="none"><rect x="122" y="2" width="66" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="155" y="14" text-anchor="middle" fill="#6ed278">H–H · 0.4×</text></g><g pointer-events="none"><rect x="85" y="105" width="66" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="118" y="117" text-anchor="middle" fill="#6ed278">C–H · 0.6×</text></g><g pointer-events="none"><rect x="159" y="105" width="66" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="192" y="117" text-anchor="middle" fill="#6ed278">O–H · 0.5×</text></g><g pointer-events="none"><rect x="229" y="114" width="66" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="262" y="126" text-anchor="middle" fill="#6ed278">O–O · 0.8×</text></g><g pointer-events="none"><rect x="122" y="132" width="66" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="155" y="144" text-anchor="middle" fill="#f0c83c">C–O · 2.1×</text></g><g pointer-events="none"><rect x="14" y="115" width="72" height="16" rx="3" fill="rgba(13,12,18,.82)"/><text x="50" y="127" text-anchor="middle" fill="#9792a6">C–C · never</text></g></svg>
+<div class="grp"><h4>This scene asks · propane <span class="faint" style="text-transform:none;letter-spacing:0">pairs within 6 Bohr</span></h4><table class="ktable"><tr><td>C–H</td><td><span class="okc">trusted 0.6×</span> · <span class="okc">8 at 2.06 taught</span> · <span class="warnc">10 at 4.05 thin</span> · <span class="okc">4 at 5.24 taught</span> <span class="faint">Bohr</span></td></tr><tr><td>H–H</td><td><span class="okc">trusted 0.4×</span> · <span class="okc">23 at 3.36–5.90 taught</span> <span class="faint">Bohr</span></td></tr><tr><td>C–C</td><td><span class="dim">never seen</span> · <span class="dim">3 at 2.89–4.79 never taught</span> <span class="faint">Bohr</span></td></tr></table></div>
+<div class="grp"><h4>Around one atom <span class="faint" style="text-transform:none;letter-spacing:0">three-body</span></h4><table class="ktable"><tr><td>H: C, C</td><td><span class="dim">never seen · 8 H</span></td></tr><tr><td>C: C, C</td><td><span class="dim">never seen · 3 C</span></td></tr><tr><td>C: C, H</td><td><span class="dim">never seen · 3 C</span></td></tr><tr><td class="faint" colspan="2" style="font:400 11px var(--font-ui)">+ 3 kinds taught</td></tr></table></div>
+<div class="grp"><h4>C–C · the pair you clicked</h4>
+<svg viewBox="0 0 310 76" width="310" height="76" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="276" height="30" fill="rgba(0,0,0,.25)"/><path d="M26 46h5M32 46h5M38 46h5M44 46h5M50 46h5M55 46h5M61 46h5M67 46h5M72 46h5M78 46h5M84 46h5M90 46h5M96 46h5M101 46h5M107 46h5M113 46h5M118 46h5M124 46h5M130 46h5M136 46h5M142 46h5M147 46h5M153 46h5M159 46h5M164 46h5M170 46h5M176 46h5M182 46h5M188 46h5M193 46h5M199 46h5M205 46h5M210 46h5M216 46h5M222 46h5M228 46h5M234 46h5M239 46h5M245 46h5M251 46h5M256 46h5M262 46h5M268 46h5M274 46h5M280 46h5M285 46h5M291 46h5M297 46h5" stroke="#6b6779" stroke-width="2"/><path d="M43.2 46v3" stroke="#6b6779"/><text x="43.2" y="57" text-anchor="middle" fill="#6b6779">1.5</text><path d="M72.0 46v3" stroke="#6b6779"/><text x="72.0" y="57" text-anchor="middle" fill="#6b6779">2</text><path d="M129.5 46v3" stroke="#6b6779"/><text x="129.5" y="57" text-anchor="middle" fill="#6b6779">3</text><path d="M187.0 46v3" stroke="#6b6779"/><text x="187.0" y="57" text-anchor="middle" fill="#6b6779">4</text><path d="M244.5 46v3" stroke="#6b6779"/><text x="244.5" y="57" text-anchor="middle" fill="#6b6779">5</text><path d="M302.0 46v3" stroke="#6b6779"/><text x="302.0" y="57" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="73" fill="#6b6779">compressed ←</text><text x="302" y="73" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text><path d="M123 14V46M233 14V46" stroke="#ffffff" stroke-width="1.3" stroke-dasharray="2 2" opacity=".85"/><path d="M119 8h8l-4 6zM229 8h8l-4 6z" fill="#fff"/><text x="123" y="7" fill="#fff" font-size="9">asked now</text><text x="164" y="34" text-anchor="middle" fill="#9792a6" font-size="10">no C–C distance taught yet</text></svg>
+<div class="verdict dim">pair class: never seen · 0 samples</div>
+<div class="note-s">Each fallback step is kept as a sample, so C–C turns amber as they add up.</div>
+<div class="btnrow"><span class="btn sm">Select the 11 atoms it refuses</span><span class="btn sm ghost">Window ›</span></div>
+</div>
+</div></div>
+<div class="toolbar">
+<div class="tg"><div class="lab">Time</div><div class="row"><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span><span class="btn primary play"><svg class="fill" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</span><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span></div><div class="sub"><span class="kbd">Space</span> play / pause</div></div>
+<div class="tg"><div class="lab">Speed · steps per tick</div><div class="row"><span class="slider" style="width:90px"><span class="tr"></span><span class="fi" style="width:60%"></span><span class="th" style="left:60%"></span></span><span class="field">4</span><span class="bigrate">— fs/s</span></div><div class="sub">dt 0.250 fs · <span class="linkbtn">Watchable</span></div></div>
+<div class="tg"><div class="lab">Tool</div><div class="row"><span class="seg"><span class=on>Inspect</span><span>Place</span><span>Grab</span><span>Edit</span></span></div><div class="sub">Edit: click, Shift-click or a box</div></div>
+<div class="tg"><div class="lab">Selection</div><div class="row"><span class="btn sm disabled">Pin</span><span class="btn sm disabled">Focus</span><span class="btn sm disabled">Train this segment</span><span class="faint">no selection</span></div><div class="sub"></div></div>
+<div class="tg" style="flex:1"><div class="lab">Solver</div><div class="row"><span class="seg"><span>CPU</span><span>GPU</span><span class=on>Estimated</span></span></div><div class="sub"><span class="light warn"></span> <span class="warnc">fallback (DFT)</span> · 11 of 11 atoms refused · shared model</div></div>
+</div>
+<span class="pin-n" style="left:1018px;top:106px">1</span><span class="pin-n" style="left:1376px;top:50px">2</span><span class="pin-n" style="left:1040px;top:250px">3</span><span class="pin-n" style="left:1040px;top:420px">4</span><span class="pin-n" style="left:1376px;top:600px">5</span><span class="pin-n" style="left:1250px;top:818px">6</span>
+</div></div>
+<ol class="notes-n">
+<li><span><b>Knowledge</b> is a new right-dock tab next to Model (the strip becomes Model · Knowledge · Orbitals · Selection · Log). Ctrl-K: "Knowledge map", "Open the knowledge map window".</span></li>
+<li><span><b>Pop out</b> opens the larger window below (a second real window, like the camera pop-out view). The tab and the window show the same selection.</span></li>
+<li><span><b>The graph:</b> one node per element, its area ∝ the samples that contain it; one line per pair class, coloured by the calibrated verdict (§4.1): green trusted, amber thin, grey dashed never seen. The label is the verdict's number: calibrated error as a multiple of the bound. Same-element pairs are loops.</span></li>
+<li><span><b>This scene asks:</b> every pair class the open scene has within r_cut, with how many of its distances fall where the collection was taught, thinly taught, or never. This is the line that tells you why the model refuses.</span></li>
+<li><span><b>Pair detail:</b> the distances taught, 0.1 Bohr bins from compressed (left) to stretched (right, up to r_cut), log scale; green bins ≥ 40 distances, amber fewer, grey none. The white ticks are the distances the open scene asks now (with play, they move).</span></li>
+<li><span>The Solver line already says why it falls back and that it runs on the shared model.</span></li>
+</ol>
+</section>
+
+<section>
+<h2>(a) The knowledge map · the pop-out window <span class="tag a">M8a</span></h2>
+<p class="cap">The same map with room for both details: a pair's distances and an element's coordination and bond angles. <b>This frame is live:</b> click a line or an element in the graph.</p>
+<div class="scroller"><div class="popwin" id="kmap">
+<div class="wtitle"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#cbbcff" stroke-width="1.7"><path d="M3 6.5l6-2.5 6 2.5 6-2.5v13.5l-6 2.5-6-2.5-6 2.5z"/><path d="M9 4v13.5M15 6.5V20"/></svg>Knowledge map<span class="slug">lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a</span><span class="spacer"></span><span class="dim" style="font:500 12px var(--font-ui)">asked by</span><span class="field">propane (the open scene) ▾</span><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="wbody">
+<div class="wleft">
+<svg viewBox="0 0 440 380" width="440" height="380" class="kgraph" font-family="IBM Plex Mono, monospace" font-size="11.5" aria-label="knowledge graph"><g data-pair="H-H" class="gedge" tabindex="0" role="button" aria-label="H–H pair"><path d="M204 88C164 60 276 60 236 88" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M204 88C164 60 276 60 236 88" fill="none" stroke="#6ed278" stroke-width="6.3" stroke-linecap="round"/></g><g data-pair="C-H" class="gedge" tabindex="0" role="button" aria-label="C–H pair"><path d="M92 290L220 120" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M92 290L220 120" fill="none" stroke="#6ed278" stroke-width="5.5" stroke-linecap="round"/></g><g data-pair="H-O" class="gedge" tabindex="0" role="button" aria-label="O–H pair"><path d="M220 120L348 290" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M220 120L348 290" fill="none" stroke="#6ed278" stroke-width="5.7" stroke-linecap="round"/></g><g data-pair="O-O" class="gedge" tabindex="0" role="button" aria-label="O–O pair"><path d="M371 288C412 263 379 352 364 307" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M371 288C412 263 379 352 364 307" fill="none" stroke="#6ed278" stroke-width="5.3" stroke-linecap="round"/></g><g data-pair="C-O" class="gedge" tabindex="0" role="button" aria-label="C–O pair"><path d="M92 290L348 290" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M92 290L348 290" fill="none" stroke="#f0c83c" stroke-width="3.8" stroke-linecap="round"/></g><g data-pair="C-C" class="gedge" tabindex="0" role="button" aria-label="C–C pair"><path d="M79 304C62 348 32 265 73 288" fill="none" stroke="transparent" stroke-width="18"/><path class="ge" d="M79 304C62 348 32 265 73 288" fill="none" stroke="#6b6779" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="5 4"/></g><g data-el="H" class="gnode" tabindex="0" role="button" aria-label="element H"><circle cx="220" cy="120" r="36" fill="url(#gH)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="220" y="125" text-anchor="middle" font-size="16.5" font-weight="600" fill="#17112a">H</text><text x="220" y="171" text-anchor="middle" fill="#9792a6">2 140</text></g><g data-el="C" class="gnode" tabindex="0" role="button" aria-label="element C"><circle cx="92" cy="290" r="19" fill="url(#gC)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="92" y="295" text-anchor="middle" font-size="16.5" font-weight="600" fill="#fff">C</text><text x="92" y="324" text-anchor="middle" fill="#9792a6">610</text></g><g data-el="O" class="gnode" tabindex="0" role="button" aria-label="element O"><circle cx="348" cy="290" r="23" fill="url(#gO)" stroke="rgba(255,255,255,.25)" stroke-width="1"/><text x="348" y="295" text-anchor="middle" font-size="16.5" font-weight="600" fill="#fff">O</text><text x="348" y="328" text-anchor="middle" fill="#9792a6">880</text></g><g pointer-events="none"><rect x="183" y="38" width="75" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="220" y="52" text-anchor="middle" fill="#6ed278">H–H · 0.4×</text></g><g pointer-events="none"><rect x="103" y="216" width="75" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="141" y="229" text-anchor="middle" fill="#6ed278">C–H · 0.6×</text></g><g pointer-events="none"><rect x="262" y="216" width="75" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="299" y="229" text-anchor="middle" fill="#6ed278">O–H · 0.5×</text></g><g pointer-events="none"><rect x="366" y="300" width="75" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="404" y="314" text-anchor="middle" fill="#6ed278">O–O · 0.8×</text></g><g pointer-events="none"><rect x="183" y="280" width="75" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="220" y="294" text-anchor="middle" fill="#f0c83c">C–O · 2.1×</text></g><g pointer-events="none"><rect x="-1" y="299" width="81" height="18" rx="3" fill="rgba(13,12,18,.82)"/><text x="40" y="313" text-anchor="middle" fill="#9792a6">C–C · never</text></g></svg>
+<div class="kleg"><span><i style="background:var(--ok)"></i>trusted (calibrated error ≤ 1× the bound)</span><span><i style="background:var(--warn)"></i>thin</span><span><i style="background:var(--ink-faint)"></i>never seen</span><span>line width = samples · click a line or an element</span><span>bins: green ≥ 40 distances, amber fewer (a display threshold, not the verdict)</span></div>
+<table class="kv">
+<tr><td>samples</td><td class="r">2 140 · 31 box-affected kept out</td></tr>
+<tr><td>species</td><td class="r">H 2 140 · O 880 · C 610</td></tr>
+<tr><td>reach</td><td class="r">r_cut 6.0 Bohr (3.2 Å)</td></tr>
+<tr><td>last refit</td><td class="r">0.4 s at 2 140 samples</td></tr>
+<tr><td>taught by</td><td class="r">h2, water, ch4 .model files (imported)</td></tr>
+<tr><td>folder</td><td class="r" style="font-size:10.5px">models/collections/lsda-h0.15-s0.15-tol1e-6…/</td></tr>
+</table>
+<div class="note-s">The same words are written to the collection's README.txt, so a shared folder says what it knows.</div>
+</div>
+<div class="wright"><div class="detail pair-panel" data-pair="H-H" hidden>
+<h3>H–H <span class="dim" style="font:500 11px var(--font-mono)">pair · 2140 samples · 7059 distances taught</span></h3>
+<div class="verdict"><span class="okc">pair class: calibrated error 0.4× the bound · trusted</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M26 120v-60h12V120zM39 120v-79h12V120zM52 120v-97h12V120zM64 120v-79h12V120zM77 120v-60h12V120zM90 120v-60h12V120zM102 120v-60h12V120zM115 120v-60h12V120zM128 120v-60h12V120zM140 120v-60h12V120zM153 120v-60h12V120zM165 120v-60h12V120zM178 120v-60h12V120zM191 120v-63h12V120zM203 120v-74h12V120zM216 120v-86h12V120zM228 120v-91h12V120zM241 120v-88h12V120zM254 120v-79h12V120zM266 120v-84h12V120zM279 120v-98h12V120zM292 120v-104h12V120zM304 120v-100h12V120zM317 120v-87h12V120zM330 120v-72h12V120zM342 120v-66h12V120zM355 120v-67h12V120zM367 120v-68h12V120zM380 120v-70h12V120zM393 120v-72h12V120zM405 120v-74h12V120zM418 120v-75h12V120zM430 120v-77h12V120zM443 120v-78h12V120zM456 120v-74h12V120zM468 120v-74h12V120zM481 120v-75h12V120zM494 120v-75h12V120zM506 120v-74h12V120zM519 120v-74h12V120zM532 120v-72h12V120zM544 120v-71h12V120zM557 120v-68h12V120zM569 120v-66h12V120zM582 120v-63h12V120zM595 120v-59h12V120z" fill="#6ed278" fill-opacity=".8"/><path d="M607 120v-56h12V120zM620 120v-51h12V120z" fill="#f0c83c" fill-opacity=".85"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text><path d="M299 14V120M463 14V120M464 14V120M486 14V120M601 14V120M619 14V120" stroke="#ffffff" stroke-width="1.3" stroke-dasharray="2 2" opacity=".85"/><path d="M295 8h8l-4 6zM459 8h8l-4 6zM460 8h8l-4 6zM482 8h8l-4 6zM597 8h8l-4 6zM615 8h8l-4 6z" fill="#fff"/><text x="299" y="7" fill="#fff" font-size="9">asked now</text></svg>
+<div class="note-s">taught 1.2–6.0 Bohr · shortest 1.20 Bohr (Sandbox keeps two answered atoms of this pair at least this far apart). H₂ (1.4, with its scans), water (2.86), methane (3.36) and the dimers' contacts.</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="okc">23 at 3.36–5.90 taught</span> <span class="faint">Bohr</span></div>
+</div><div class="detail pair-panel" data-pair="C-H">
+<h3>C–H <span class="dim" style="font:500 11px var(--font-mono)">pair · 610 samples · 3953 distances taught</span></h3>
+<div class="verdict"><span class="okc">pair class: calibrated error 0.6× the bound · trusted</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M77 120v-55h12V120zM90 120v-55h12V120zM102 120v-59h12V120zM115 120v-88h12V120zM128 120v-104h12V120zM140 120v-93h12V120zM153 120v-63h12V120zM165 120v-55h12V120zM178 120v-55h12V120zM191 120v-55h12V120zM203 120v-55h12V120zM216 120v-55h12V120zM228 120v-55h12V120zM241 120v-55h12V120zM254 120v-55h12V120zM266 120v-55h12V120zM279 120v-55h12V120zM418 120v-53h12V120zM430 120v-53h12V120zM443 120v-53h12V120zM456 120v-53h12V120zM468 120v-53h12V120zM481 120v-53h12V120zM494 120v-53h12V120zM506 120v-53h12V120zM519 120v-53h12V120zM532 120v-53h12V120zM544 120v-53h12V120zM557 120v-53h12V120zM569 120v-53h12V120zM582 120v-53h12V120zM595 120v-53h12V120zM607 120v-53h12V120zM620 120v-53h12V120z" fill="#6ed278" fill-opacity=".8"/><path d="M292 120v-37h12V120zM304 120v-37h12V120zM317 120v-37h12V120zM330 120v-37h12V120zM342 120v-37h12V120zM355 120v-37h12V120zM367 120v-37h12V120zM380 120v-37h12V120zM393 120v-37h12V120z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 120h12M39 120h12M52 120h12M64 120h12M405 120h12" stroke="#6b6779" stroke-width="2"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text><path d="M135 14V120M386 14V120M388 14V120M536 14V120" stroke="#ffffff" stroke-width="1.3" stroke-dasharray="2 2" opacity=".85"/><path d="M131 8h8l-4 6zM382 8h8l-4 6zM384 8h8l-4 6zM532 8h8l-4 6z" fill="#fff"/><text x="135" y="7" fill="#fff" font-size="9">asked now</text></svg>
+<div class="note-s">taught 1.6–6.0 Bohr · shortest 1.60 Bohr (Sandbox keeps two answered atoms of this pair at least this far apart). Few distances at 3.3–4.2 Bohr (12 per bin): beyond the bond scans, only the hottest geometries reached it. Propane asks exactly there: the H–C distance across the C–C bond.</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="okc">8 at 2.06 taught</span> · <span class="warnc">10 at 4.05 thin</span> · <span class="okc">4 at 5.24 taught</span> <span class="faint">Bohr</span></div>
+</div><div class="detail pair-panel" data-pair="H-O" hidden>
+<h3>O–H <span class="dim" style="font:500 11px var(--font-mono)">pair · 880 samples · 3802 distances taught</span></h3>
+<div class="verdict"><span class="okc">pair class: calibrated error 0.5× the bound · trusted</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M52 120v-58h12V120zM64 120v-58h12V120zM77 120v-66h12V120zM90 120v-100h12V120zM102 120v-104h12V120zM115 120v-73h12V120zM128 120v-58h12V120zM140 120v-58h12V120zM153 120v-58h12V120zM165 120v-58h12V120zM178 120v-58h12V120zM191 120v-58h12V120zM203 120v-58h12V120zM216 120v-58h12V120zM228 120v-58h12V120zM317 120v-59h12V120zM330 120v-66h12V120zM342 120v-66h12V120zM355 120v-59h12V120zM405 120v-62h12V120zM418 120v-62h12V120zM430 120v-62h12V120zM443 120v-62h12V120zM456 120v-62h12V120zM468 120v-62h12V120zM481 120v-62h12V120zM494 120v-62h12V120zM506 120v-62h12V120zM519 120v-62h12V120zM532 120v-62h12V120zM544 120v-62h12V120zM557 120v-62h12V120zM569 120v-62h12V120zM582 120v-62h12V120zM595 120v-62h12V120zM607 120v-62h12V120zM620 120v-62h12V120z" fill="#6ed278" fill-opacity=".8"/><path d="M241 120v-36h12V120zM254 120v-36h12V120zM266 120v-36h12V120zM279 120v-38h12V120zM292 120v-42h12V120zM304 120v-46h12V120zM367 120v-46h12V120zM380 120v-28h12V120zM393 120v-10h12V120z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 120h12M39 120h12" stroke="#6b6779" stroke-width="2"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text></svg>
+<div class="note-s">taught 1.4–6.0 Bohr · shortest 1.40 Bohr (Sandbox keeps two answered atoms of this pair at least this far apart). The O–H bond (1.81), its scans, and the water dimer's hydrogen bond (3.6–3.8 Bohr).</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="faint">none in propane</span></div>
+</div><div class="detail pair-panel" data-pair="O-O" hidden>
+<h3>O–O <span class="dim" style="font:500 11px var(--font-mono)">pair · 420 samples · 637 distances taught</span></h3>
+<div class="verdict"><span class="okc">pair class: calibrated error 0.8× the bound · trusted</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M532 120v-91h12V120zM544 120v-99h12V120zM557 120v-104h12V120zM569 120v-104h12V120zM582 120v-99h12V120zM595 120v-91h12V120z" fill="#6ed278" fill-opacity=".8"/><path d="M430 120v-64h12V120zM443 120v-64h12V120zM456 120v-64h12V120zM468 120v-64h12V120zM481 120v-64h12V120zM494 120v-66h12V120zM506 120v-71h12V120zM519 120v-80h12V120zM607 120v-80h12V120zM620 120v-71h12V120z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 120h12M39 120h12M52 120h12M64 120h12M77 120h12M90 120h12M102 120h12M115 120h12M128 120h12M140 120h12M153 120h12M165 120h12M178 120h12M191 120h12M203 120h12M216 120h12M228 120h12M241 120h12M254 120h12M266 120h12M279 120h12M292 120h12M304 120h12M317 120h12M330 120h12M342 120h12M355 120h12M367 120h12M380 120h12M393 120h12M405 120h12M418 120h12" stroke="#6b6779" stroke-width="2"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text></svg>
+<div class="note-s">taught 4.4–6.0 Bohr · shortest 4.40 Bohr (Sandbox keeps two answered atoms of this pair at least this far apart). Water dimers only: nothing below 4.4 Bohr. Liquid water's first shell (≈ 5.3) is covered, a compressed pair is not.</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="faint">none in propane</span></div>
+</div><div class="detail pair-panel" data-pair="C-O" hidden>
+<h3>C–O <span class="dim" style="font:500 11px var(--font-mono)">pair · 38 samples · 67 distances taught</span></h3>
+<div class="verdict"><span class="warnc">pair class: calibrated error 2.1× the bound · thin</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M532 120v-82h12V120zM544 120v-83h12V120zM557 120v-89h12V120zM569 120v-97h12V120zM582 120v-104h12V120zM595 120v-104h12V120zM607 120v-97h12V120zM620 120v-89h12V120z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 120h12M39 120h12M52 120h12M64 120h12M77 120h12M90 120h12M102 120h12M115 120h12M128 120h12M140 120h12M153 120h12M165 120h12M178 120h12M191 120h12M203 120h12M216 120h12M228 120h12M241 120h12M254 120h12M266 120h12M279 120h12M292 120h12M304 120h12M317 120h12M330 120h12M342 120h12M355 120h12M367 120h12M380 120h12M393 120h12M405 120h12M418 120h12M430 120h12M443 120h12M456 120h12M468 120h12M481 120h12M494 120h12M506 120h12M519 120h12" stroke="#6b6779" stroke-width="2"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text></svg>
+<div class="note-s">taught 5.2–6.0 Bohr · shortest 5.20 Bohr (Sandbox keeps two answered atoms of this pair at least this far apart). 38 samples, all methane beside water: C–O never closer than 5.2 Bohr. A C–O bond (2.7) has never been seen.</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="faint">none in propane</span></div>
+</div><div class="detail pair-panel" data-pair="C-C" hidden>
+<h3>C–C <span class="dim" style="font:500 11px var(--font-mono)">pair · 0 samples · 0 distances taught</span></h3>
+<div class="verdict"><span class="dim">pair class: never seen · nothing to calibrate</span></div>
+<svg viewBox="0 0 640 150" width="640" height="150" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="104" fill="rgba(0,0,0,.25)"/><path d="M26 120h12M39 120h12M52 120h12M64 120h12M77 120h12M90 120h12M102 120h12M115 120h12M128 120h12M140 120h12M153 120h12M165 120h12M178 120h12M191 120h12M203 120h12M216 120h12M228 120h12M241 120h12M254 120h12M266 120h12M279 120h12M292 120h12M304 120h12M317 120h12M330 120h12M342 120h12M355 120h12M367 120h12M380 120h12M393 120h12M405 120h12M418 120h12M430 120h12M443 120h12M456 120h12M468 120h12M481 120h12M494 120h12M506 120h12M519 120h12M532 120h12M544 120h12M557 120h12M569 120h12M582 120h12M595 120h12M607 120h12M620 120h12" stroke="#6b6779" stroke-width="2"/><path d="M63.9 120v3" stroke="#6b6779"/><text x="63.9" y="131" text-anchor="middle" fill="#6b6779">1.5</text><path d="M127.0 120v3" stroke="#6b6779"/><text x="127.0" y="131" text-anchor="middle" fill="#6b6779">2</text><path d="M253.2 120v3" stroke="#6b6779"/><text x="253.2" y="131" text-anchor="middle" fill="#6b6779">3</text><path d="M379.5 120v3" stroke="#6b6779"/><text x="379.5" y="131" text-anchor="middle" fill="#6b6779">4</text><path d="M505.7 120v3" stroke="#6b6779"/><text x="505.7" y="131" text-anchor="middle" fill="#6b6779">5</text><path d="M632.0 120v3" stroke="#6b6779"/><text x="632.0" y="131" text-anchor="middle" fill="#6b6779">6</text><text x="26" y="147" fill="#6b6779">compressed ←</text><text x="632" y="147" text-anchor="end" fill="#6b6779">→ stretched · r_cut 6 Bohr</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text><path d="M239 14V120M479 14V120" stroke="#ffffff" stroke-width="1.3" stroke-dasharray="2 2" opacity=".85"/><path d="M235 8h8l-4 6zM475 8h8l-4 6z" fill="#fff"/><text x="239" y="7" fill="#fff" font-size="9">asked now</text><text x="329" y="71" text-anchor="middle" fill="#9792a6" font-size="10">nothing taught</text></svg>
+<div class="note-s">no distances taught. No sample has two carbons within 6 Bohr. Train a segment of a molecule with a C–C bond to teach it.</div>
+<div class="note-s"><b style="color:var(--ink)">asked now</b> (propane): <span class="dim">3 at 2.89–4.79 never taught</span> <span class="faint">Bohr</span></div>
+</div><div class="detail el-panel" data-el="C"><h3>C <span class="dim" style="font:500 11px var(--font-mono)">element · 610 samples</span></h3>
+<div class="grp"><h4>Coordination: bonded neighbours, by kind</h4>
+<div class="crow"><span>4 · 4 H (methane)</span><span class="bar"><i style="width:100%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">571 </span></div>
+<div class="crow"><span>4 · 3 H + 1 C *</span><span class="bar"><i style="width:0%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">0 <span class="dim">asked: C#0, C#2</span></span></div>
+<div class="crow"><span>4 · 2 H + 2 C *</span><span class="bar"><i style="width:0%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">0 <span class="dim">asked: C#1</span></span></div>
+<div class="note-s">* C–C has no histogram yet, so no first shell: the scene's C–C bonds are counted from its DFT bond graph and marked.</div>
+<div class="crow"><span>3 · 3 H (a C–H stretched out)</span><span class="bar"><i style="width:56%;background:var(--warn)"></i></span><span class="mono" style="font-size:11px">33 </span></div>
+<div class="crow"><span>5 · an H pushed in</span><span class="bar"><i style="width:31%;background:var(--warn)"></i></span><span class="mono" style="font-size:11px">6 </span></div></div>
+<div class="grp"><h4>Bond angles at C · H–C–H · 5° bins</h4><svg viewBox="0 0 640 120" width="640" height="120" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="74" fill="rgba(0,0,0,.25)"/><path d="M346 90v-46h16V90zM363 90v-65h16V90zM380 90v-74h16V90zM397 90v-73h16V90zM414 90v-62h16V90zM430 90v-41h16V90z" fill="#6ed278" fill-opacity=".8"/><path d="M313 90v-14h16V90zM330 90v-22h16V90zM447 90v-19h16V90zM464 90v-14h16V90z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 90h16M43 90h16M60 90h16M77 90h16M94 90h16M111 90h16M128 90h16M144 90h16M161 90h16M178 90h16M195 90h16M212 90h16M228 90h16M245 90h16M262 90h16M279 90h16M296 90h16M481 90h16M498 90h16M515 90h16M532 90h16M548 90h16M565 90h16M582 90h16M599 90h16M616 90h16" stroke="#6b6779" stroke-width="2"/><path d="M26.0 90v3" stroke="#6b6779"/><text x="26.0" y="101" text-anchor="middle" fill="#6b6779">0</text><path d="M127.0 90v3" stroke="#6b6779"/><text x="127.0" y="101" text-anchor="middle" fill="#6b6779">30</text><path d="M228.0 90v3" stroke="#6b6779"/><text x="228.0" y="101" text-anchor="middle" fill="#6b6779">60</text><path d="M329.0 90v3" stroke="#6b6779"/><text x="329.0" y="101" text-anchor="middle" fill="#6b6779">90</text><path d="M430.0 90v3" stroke="#6b6779"/><text x="430.0" y="101" text-anchor="middle" fill="#6b6779">120</text><path d="M531.0 90v3" stroke="#6b6779"/><text x="531.0" y="101" text-anchor="middle" fill="#6b6779">150</text><path d="M632.0 90v3" stroke="#6b6779"/><text x="632.0" y="101" text-anchor="middle" fill="#6b6779">180</text><text x="26" y="117" fill="#6b6779"></text><text x="632" y="117" text-anchor="end" fill="#6b6779">bond angle, degrees</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text><path d="M395 14V90" stroke="#ffffff" stroke-width="1.3" stroke-dasharray="2 2" opacity=".85"/><path d="M391 8h8l-4 6z" fill="#fff"/><text x="395" y="7" fill="#fff" font-size="9">asked now</text></svg></div>
+<table class="ktable"><tr><td>H–C–H</td><td><span class="okc">taught 95–125°</span> · asked 7: ≈ 109°</td></tr><tr><td>H–C–C</td><td><span class="dim">never taught</span> · asked 10: ≈ 109°</td></tr><tr><td>C–C–C</td><td><span class="dim">never taught</span> · asked 1: 112°</td></tr></table></div><div class="detail el-panel" data-el="O" hidden><h3>O <span class="dim" style="font:500 11px var(--font-mono)">element · 880 samples</span></h3>
+<div class="grp"><h4>Coordination: bonded neighbours, by kind</h4>
+<div class="crow"><span>2 · 2 H (water)</span><span class="bar"><i style="width:100%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">846 </span></div>
+<div class="crow"><span>1 · 1 H (an O–H stretched out)</span><span class="bar"><i style="width:53%;background:var(--warn)"></i></span><span class="mono" style="font-size:11px">34 </span></div></div>
+<div class="grp"><h4>Bond angles at O · H–O–H · 5° bins</h4><svg viewBox="0 0 640 120" width="640" height="120" class="hist" font-family="IBM Plex Mono, monospace" font-size="8.5"><rect x="26" y="16" width="606" height="74" fill="rgba(0,0,0,.25)"/><path d="M346 90v-65h16V90zM363 90v-74h16V90zM380 90v-73h16V90zM397 90v-61h16V90z" fill="#6ed278" fill-opacity=".8"/><path d="M313 90v-25h16V90zM330 90v-45h16V90zM414 90v-41h16V90zM430 90v-22h16V90zM447 90v-18h16V90zM464 90v-18h16V90z" fill="#f0c83c" fill-opacity=".85"/><path d="M26 90h16M43 90h16M60 90h16M77 90h16M94 90h16M111 90h16M128 90h16M144 90h16M161 90h16M178 90h16M195 90h16M212 90h16M228 90h16M245 90h16M262 90h16M279 90h16M296 90h16M481 90h16M498 90h16M515 90h16M532 90h16M548 90h16M565 90h16M582 90h16M599 90h16M616 90h16" stroke="#6b6779" stroke-width="2"/><path d="M26.0 90v3" stroke="#6b6779"/><text x="26.0" y="101" text-anchor="middle" fill="#6b6779">0</text><path d="M127.0 90v3" stroke="#6b6779"/><text x="127.0" y="101" text-anchor="middle" fill="#6b6779">30</text><path d="M228.0 90v3" stroke="#6b6779"/><text x="228.0" y="101" text-anchor="middle" fill="#6b6779">60</text><path d="M329.0 90v3" stroke="#6b6779"/><text x="329.0" y="101" text-anchor="middle" fill="#6b6779">90</text><path d="M430.0 90v3" stroke="#6b6779"/><text x="430.0" y="101" text-anchor="middle" fill="#6b6779">120</text><path d="M531.0 90v3" stroke="#6b6779"/><text x="531.0" y="101" text-anchor="middle" fill="#6b6779">150</text><path d="M632.0 90v3" stroke="#6b6779"/><text x="632.0" y="101" text-anchor="middle" fill="#6b6779">180</text><text x="26" y="117" fill="#6b6779"></text><text x="632" y="117" text-anchor="end" fill="#6b6779">bond angle, degrees</text><text x="23" y="22" text-anchor="end" fill="#6b6779">log</text></svg></div>
+<div class="note-s">Propane has no O: nothing asked. C–O–H and C–O–C were never taught.</div></div><div class="detail el-panel" data-el="H" hidden><h3>H <span class="dim" style="font:500 11px var(--font-mono)">element · 2 140 samples</span></h3>
+<div class="grp"><h4>Coordination: bonded neighbours, by kind</h4>
+<div class="crow"><span>1 · 1 O (water)</span><span class="bar"><i style="width:100%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">880 </span></div>
+<div class="crow"><span>1 · 1 C (methane)</span><span class="bar"><i style="width:95%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">610 <span class="okc">asked: all 8</span></span></div>
+<div class="crow"><span>1 · 1 H (H₂)</span><span class="bar"><i style="width:96%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">688 </span></div>
+<div class="crow"><span>0 · stretched past the bond</span><span class="bar"><i style="width:59%;background:var(--ok)"></i></span><span class="mono" style="font-size:11px">52 </span></div>
+<div class="crow"><span>2 · H pushed onto H</span><span class="bar"><i style="width:24%;background:var(--warn)"></i></span><span class="mono" style="font-size:11px">4 </span></div></div>
+<div class="note-s">An H has one bonded neighbour, so no bond angle at H. Its neighbour pairs still matter: every H in propane has two C around it, which no sample has shown.</div></div></div>
+</div>
+<span class="pin-n" style="left:196px;top:48px">1</span><span class="pin-n" style="left:830px;top:8px">2</span><span class="pin-n" style="left:1150px;top:72px">3</span><span class="pin-n" style="left:1150px;top:260px">4</span><span class="pin-n" style="left:1150px;top:400px">5</span>
+</div></div>
+<ol class="notes-n">
+<li><span>Click a line for its pair detail, a node for its element detail. Keyboard: Tab and Enter.</span></li>
+<li><span><b>asked by</b> picks whose distances are ticked: the open scene (default), the Sandbox scene (M8b), or none.</span></li>
+<li><span>The pair's verdict is a calibrated one ("calibrated error 0.6× the bound"), with hysteresis so it does not flip between neighbouring steps. A trusted class can still have thin distances (C–H at 3.3–4.2 Bohr): the overlay (c) judges each atom where it is, not the class.</span></li>
+<li><span><b>Coordination</b> counts bonded neighbours by kind, so "4 neighbours" as CH₄ is told apart from "4 neighbours with a carbon among them". Bonded = inside the first shell of that pair's own histogram (no table).</span></li>
+<li><span><b>Bond angles</b> at the element in 5° bins, for each kind of triple; the kinds never taught are listed with what the scene asks.</span></li>
+</ol>
+</section>
+
+<section id="b">
+<h2>(b) The Model tab <span class="tag a">M8a</span></h2>
+<p class="cap">Left: the default, Estimated on the shared collection. Middle: a specialised model file chosen instead. Right: a charged scene, which keeps its own model. Below: the import report and the specialised-model dialog.</p>
+<div class="scroller"><div class="gal3"><div class="gpanel"><div class="dock-head"><h3>Model · estimated solver</h3></div><div class="tabpanel">
+<div class="btnrow"><span class="seg"><span class="on">Shared collection</span><span>Model file</span></span><span class="i" title="the shared collection learns from every neutral scene solved with these settings; a model file is a fixed, usually smaller model">i</span></div>
+<div class="srcline"><span class="big">model: shared — lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a · 2 140 samples</span><span class="note-s">for this scene's solver settings: LSDA · h 0.15 · σ 0.15 · SCF tol 1e-6 · GPU teacher · ionic accepted (3f9a). The box size is not part of it.</span></div>
+<table class="kv">
+<tr><td>this step</td><td><span class="src fb">fallback (DFT)</span> <span class="faint">11 of 11 atoms refused</span></td></tr>
+<tr><td>uncertainty</td><td><div class="unc"><span class="mark" style="left:50%"></span><span class="val" style="left:88%"></span></div><div class="mono warnc" style="font-size:11px;margin-top:3px">C#1: outside what it learned</div></td></tr>
+<tr><td>verdicts</td><td class="mono" style="font-size:11px"><div class="okc">C–H trusted · calibrated 0.6× the bound</div><div class="okc">H–H trusted · 0.4×</div><div class="dim">C–C never seen · DFT answers</div></td></tr>
+<tr><td>samples</td><td class="mono">2 140 <span class="dim">(this scene's fallbacks will add to it)</span></td></tr>
+<tr><td>last refit</td><td class="mono" style="font-size:11px">2 140 samples, 0.4 s, at load</td></tr>
+</table>
+<div class="btnrow"><span class="btn sm"><svg viewBox="0 0 24 24"><path d="M3 6.5l6-2.5 6 2.5 6-2.5v13.5l-6 2.5-6-2.5-6 2.5z"/><path d="M9 4v13.5M15 6.5V20"/></svg>Knowledge map</span><span class="btn sm">Import a model file…</span><span class="btn sm">Save a specialised model…</span></div>
+<div class="mono dim" style="font-size:10.5px">models/collections/lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a/ · autosaved 12:41</div>
+<details><summary>Sampling plan · Standard</summary><div class="body note-s">as today</div></details>
+<details><summary>Audits · every 2000 answered steps</summary><div class="body note-s">as today</div></details>
+</div></div><div class="gpanel"><div class="dock-head"><h3>Model · estimated solver</h3></div><div class="tabpanel">
+<div class="btnrow"><span class="seg"><span>Shared collection</span><span class="on">Model file</span></span></div>
+<div class="srcline"><span class="big">file: propane.model · 1 260 samples</span><span class="note-s">specialised from lsda-h0.15-s0.15-tol1e… on 2026-10-21 · species H, C · fitted on these samples only: smaller, faster to answer</span></div>
+<table class="kv">
+<tr><td>this step</td><td><span class="src fb">fallback (DFT)</span></td></tr>
+<tr><td>verdicts</td><td class="mono" style="font-size:11px"><span class="okc">C–H 0.5× · H–H 0.4×</span> · <span class="dim">C–C never seen</span></td></tr>
+<tr><td>samples</td><td class="mono">1 260</td></tr>
+</table>
+<div class="note-s">What this scene teaches goes into the file <b>and</b>, when the file's settings match, into the collection, so the collection still learns from everything.</div>
+<div class="btnrow"><span class="btn sm">Load model file…</span><span class="btn sm">Back to the shared collection</span></div>
+<div class="note-s">A file whose settings differ from the scene's is refused on load, as today, with the reason.</div>
+</div></div><div class="gpanel"><div class="dock-head"><h3>Model · estimated solver</h3></div><div class="tabpanel">
+<div class="btnrow"><span class="seg"><span class="off" title="charge +1: collections are neutral until M9">Shared collection</span><span class="on">Model file</span></span></div>
+<div class="srcline"><span class="big">file: nh4+.model · 412 samples</span><span class="note-s">this scene's own model, as before M8</span></div>
+<div class="warnbox"><span><b>charge +1: collections are neutral until M9.</b> A local model cannot see the total charge (long-range electrostatics, M9), so a charged scene keeps its own model file and never teaches or uses a collection.</span></div>
+<table class="kv"><tr><td>this step</td><td><span class="src sur">surrogate</span></td></tr><tr><td>samples</td><td class="mono">412</td></tr></table>
+</div></div></div></div>
+<div class="scroller"><div class="gal2"><div class="dlg"><h3>Import a model file… · report</h3>
+<div class="note-s">Picked 4 files. Each file's samples go to the collection of <i>its</i> settings; nothing is merged silently.</div>
+<div class="rep">
+<div><span class="okc">✓</span><span><b>water.model</b> → this collection: imported 412 samples (408 new, 4 already in) · 9 box-affected left out (they stay in the file)</span></div>
+<div><span class="okc">✓</span><span><b>ch4.model</b> → this collection: imported 273 samples · species C added: <span class="warnc">full refit, 1.8 s</span></span></div>
+<div><span class="okc">✓</span><span><b>h2o-balanced.model</b> → <span class="slug">lsda-h0.25-s0.25-tol1e-6-gpu-accepted-3f9a</span> (another collection: grid h 0.25): 365 samples</span></div>
+<div><span class="badc">✕</span><span><b>nh4+.model</b> refused: charge +1: collections are neutral until M9. It stays a per-scene model; load it from Model file.</span></div>
+</div>
+<div class="btnrow"><span class="okline mono" style="font-size:11.5px">imported 1 050 samples from 3 files · refused 1</span><span class="spacer" style="flex:1"></span><span class="btn sm">Open knowledge map</span><span class="btn sm primary">Done</span></div>
+<div class="note-s">Other refusal words: "SCF tol 1e-5 ≠ 1e-6: labels at another tolerance are not mixed", "unreadable: not an Atomic Sandbox model". The report also goes to the Log.</div>
+</div><div class="dlg"><h3>Save a specialised model…</h3>
+<div class="note-s">A model fitted only on the samples this scene needs: its species and their pair classes. It answers faster and is a normal model file.</div>
+<div class="grp"><h4>species <span class="faint" style="text-transform:none;letter-spacing:0">preselected from propane</span></h4>
+<div class="speclist"><label><span class="cb on"></span>H</label><label><span class="cb on"></span>C</label><label><span class="cb"></span>O</label></div></div>
+<table class="kv">
+<tr><td>pair classes</td><td class="mono" style="font-size:11px"><span class="okc">H–H 1 260 · C–H 572</span> · <span class="dim">C–C 0: it will refuse C–C</span></td></tr>
+<tr><td>samples</td><td class="r">1 260 of 2 140 (the H₂ and methane samples)</td></tr>
+<tr><td>size</td><td class="r">≈ 1.1 MB · basis 2 species instead of 3</td></tr>
+</table>
+<div class="btnrow"><span class="field wide">models/propane.model</span><span class="btn sm">Browse…</span></div>
+<div class="btnrow"><span class="spacer" style="flex:1"></span><span class="btn sm ghost">Cancel</span><span class="btn sm primary">Save</span></div>
+</div></div></div>
+<ol class="notes-n">
+<li class="plain"><span><b>The line</b> reads "model: shared — &lt;slug&gt; · N samples" or "file: &lt;name&gt; · N samples". The slug is the surface key: functional, h, σ, SCF tolerance, teacher, ionic tag, and a short hash. The switch flips between the collection and a file.</span></li>
+<li class="plain"><span><b>Import a model file…</b> takes one or several old <code>.model</code> files. Each file's samples go into the collection of its own settings (which may not be this scene's). Box-affected samples are left out. Charged files are refused with the reason. The report lists every file.</span></li>
+<li class="plain"><span><b>Save a specialised model…</b> preselects the scene's species. It shows the pair classes and samples it will take, and warns about a class with no samples (C–C here: the specialised model will refuse it too).</span></li>
+<li class="plain"><span>The rest of the tab (sampling plan, audits, draft mode, the trust lines) stays as today. "Load model…" and "Forget model…" become "Load model file…" and, on a collection, "Forget this scene's samples…": forgetting a whole collection lives in File ▸ Collections, not one click away.</span></li>
+</ol>
+</section>
+
+<section id="c">
+<h2>(c) The 3D knowledge overlay <span class="tag a">M8a</span></h2>
+<p class="cap">View ▸ Display aids ▸ knowledge overlay, on a test scene with propane, a methane and two waters, on the same collection. Propane is grey throughout: its C see C–C, and every H sees two C around it, which no sample has shown. The methane's C is nearly grey (C–O at 5.7 Bohr: the thin class, few distances there), and so is the near water's O, which has a C and another O around it, a combination no sample had. The methane's two H facing the water are amber: an H with a C close and an O near belongs to the thin C–O family (38 samples). Everything else is green.</p>
+<div class="scroller"><div class="app f1000" style="height:700px">
+<div class="topbar"><div class="brand"><i></i></div><span class="menu">File</span><span class="menu">Scene</span><span class="menu open">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><b>test scene</b><span class="mono dim">propane, methane, 2 waters · 22 nuclei</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 1000 660" preserveAspectRatio="xMidYMid slice" aria-label="a mixed scene tinted by knowledge"><path d="M52 565L202 917M52 565L716 487M143 555L331 894M65 597L752 512M232 544L455 872M80 631L791 539M318 534L574 851M96 668L833 568M402 524L688 831M113 708L878 600M484 514L798 811M132 753L928 634M563 505L904 793M153 802L981 671M640 496L1006 775M176 856L1040 712M716 487L1105 757M202 917L1105 757" fill="none" stroke="rgba(255,255,255,.08)"/>
+<path d="M220 509L291 453M220 509L167 478M220 509L232 561M220 509L210 527M291 453L364 492M291 453L303 432M291 453L278 404M364 492L412 452M364 492L352 511M364 492L380 543M688 416L735 388M688 416L704 436M688 416L643 377M688 416L669 462M691 254L653 224M691 254L731 218M837 242L860 195M837 242L869 274" stroke="rgba(214,210,224,.55)" stroke-width="3.0" stroke-linecap="round"/>
+<circle cx="704" cy="436" r="15.6" fill="url(#gH)"/>
+<circle cx="704" cy="436" r="15.6" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="869" cy="274" r="15.7" fill="url(#gH)"/>
+<circle cx="869" cy="274" r="15.7" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="643" cy="377" r="15.9" fill="url(#gH)"/>
+<circle cx="643" cy="377" r="15.9" fill="#e4c044" fill-opacity=".55" stroke="#e4c044" stroke-width="2"/>
+<circle cx="837" cy="242" r="23.1" fill="url(#gO)"/>
+<circle cx="837" cy="242" r="23.1" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="860" cy="195" r="15.9" fill="url(#gH)"/>
+<circle cx="860" cy="195" r="15.9" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="688" cy="416" r="24.7" fill="url(#gC)"/>
+<circle cx="688" cy="416" r="24.7" fill="#978a7b" fill-opacity=".55" stroke="#978a7b" stroke-width="2"/>
+<circle cx="735" cy="388" r="16.2" fill="url(#gH)"/>
+<circle cx="735" cy="388" r="16.2" fill="#e4c044" fill-opacity=".55" stroke="#e4c044" stroke-width="2"/>
+<circle cx="669" cy="462" r="16.2" fill="url(#gH)"/>
+<circle cx="669" cy="462" r="16.2" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="731" cy="218" r="16.3" fill="url(#gH)"/>
+<circle cx="731" cy="218" r="16.3" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="352" cy="511" r="16.3" fill="url(#gH)"/>
+<circle cx="352" cy="511" r="16.3" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="691" cy="254" r="23.7" fill="url(#gO)"/>
+<circle cx="691" cy="254" r="23.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="653" cy="224" r="16.5" fill="url(#gH)"/>
+<circle cx="653" cy="224" r="16.5" fill="#6ed278" fill-opacity=".55" stroke="#6ed278" stroke-width="2"/>
+<circle cx="210" cy="527" r="16.7" fill="url(#gH)"/>
+<circle cx="210" cy="527" r="16.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="412" cy="452" r="16.7" fill="url(#gH)"/>
+<circle cx="412" cy="452" r="16.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="364" cy="492" r="25.9" fill="url(#gC)"/>
+<circle cx="364" cy="492" r="25.9" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="278" cy="404" r="16.8" fill="url(#gH)"/>
+<circle cx="278" cy="404" r="16.8" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="380" cy="543" r="17.0" fill="url(#gH)"/>
+<circle cx="380" cy="543" r="17.0" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="291" cy="453" r="26.4" fill="url(#gC)"/>
+<circle cx="291" cy="453" r="26.4" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="220" cy="509" r="26.5" fill="url(#gC)"/>
+<circle cx="220" cy="509" r="26.5" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="167" cy="478" r="17.4" fill="url(#gH)"/>
+<circle cx="167" cy="478" r="17.4" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="232" cy="561" r="17.5" fill="url(#gH)"/>
+<circle cx="232" cy="561" r="17.5" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="303" cy="432" r="17.5" fill="url(#gH)"/>
+<circle cx="303" cy="432" r="17.5" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+
+<path d="M305 465L686 560M653 369L700 160" stroke="rgba(255,255,255,.5)"/></svg>
+<div class="dropdown" style="left:140px;top:2px;width:340px">
+<div class="mh"><span>Display aids</span></div>
+<div class="mi"><span class="l"><span class="cb on"></span>cell <span class="cb on" style="margin-left:8px"></span>floor grid <span class="cb on" style="margin-left:8px"></span>axes</span></div>
+<div class="mi"><span class="l"><span class="cb"></span>show what training is solving</span></div>
+<div class="mi" style="background:var(--panel-2)"><span class="l"><span class="sw on"></span><b>knowledge overlay</b></span><span class="tag a">M8a</span></div>
+<div class="mnote">Tints each atom by how well the model knows its surroundings, 0 never seen … 1 well known. Estimated and Sandbox. Display only, not recorded.</div>
+<div class="mi"><span class="l"><span class="cb on"></span>smooth motion</span></div>
+<div class="mi"><span class="l">Trails ›</span></div>
+</div>
+<div class="ov card hovercard" style="right:14px;bottom:14px;width:300px"><b>C #1 (propane) · knowledge 0.00</b><span><b>C–C at 2.89 Bohr</b>: never taught.</span><span class="dim">Estimated: the step falls back to DFT. Sandbox: frozen.</span><span class="btnrow"><span class="btn sm train">Train this segment</span><span class="btn sm ghost">Knowledge map ›</span></span></div>
+<div class="ov card hovercard" style="right:14px;top:56px;width:290px"><b>H #14 · knowledge 0.45</b><span>Weakest: <b>an H with C at 2.06 and O at 4.81 Bohr</b> around it: thinly taught, and not this close.</span><span class="dim">The C–O class is thin: only 38 samples of methane beside water.</span></div>
+<div class="ov card legendcard"><b style="font-size:11.5px">knowledge overlay</b><div class="kgrad"></div><div class="ticks"><span>0 never seen</span><span>0.5 thin</span><span>1 well known</span></div><span class="dim">per atom: the weakest of what the model sees within 6 Bohr</span><span class="dim">(each neighbour, and each pair of neighbours around it)</span></div>
+<div class="ov chip-status" style="left:auto;right:12px"><span class="light warn"></span><b>Paused</b><span class="src fb">fallback (DFT)</span></div>
+<span class="pin-n" style="left:460px;top:108px">1</span><span class="pin-n" style="left:18px;top:526px">2</span><span class="pin-n" style="left:676px;top:512px">3</span>
+</div></div></div>
+<ol class="notes-n">
+<li><span>A switch in View ▸ Display aids, and a Ctrl-K entry. It is display only (not recorded), and it works in Estimated and Sandbox. In CPU/GPU it uses the collection of the scene's settings.</span></li>
+<li><span><b>The legend:</b> 0 never seen (grey) → 0.5 thin (amber) → 1 well known (green), the same colours as the graph's lines. The value is per atom: the weakest of everything the model sees within r_cut, which is each neighbour at its distance and each pair of neighbours around the atom (the three-body terms). In the app it is the same per-atom verdict that refuses (Estimated) or freezes (Sandbox), so the tint never disagrees with the solver; this mock computes a stand-in from the example histograms.</span></li>
+<li><span><b>Hover</b> an atom for the reason in words and a shortcut to Train this segment and the map.</span></li>
+</ol>
+</section>
+
+<section id="d">
+<h2>(d) Train this segment <span class="tag a">M8a</span></h2>
+<p class="cap">Nonane in Estimated: the collection refuses every atom. Why not let fallbacks teach it, as propane would? Each nonane fallback is a 219³ solve of minutes, on every step; a segment teaches the same surroundings once, at a smaller grid, and a Sandbox scene (M8b) has no DFT at all. 1. Select the atoms with the Edit tool (here a box around C#3–C#5 and their hydrogens) and press Train this segment.</p>
+<div class="scroller"><div class="app f1000 tb" style="height:700px">
+<div class="topbar"><div class="brand"><i></i></div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><b>nonane</b><span class="mono dim">219³ × 0.150 · 29 nuclei</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 1000 576" preserveAspectRatio="xMidYMid slice" aria-label="nonane with a box selection"><path d="M-109 376L110 903M-109 376L688 247M1 358L266 865M-90 423L734 284M109 341L415 828M-69 474L784 323M212 324L557 794M-46 529L838 366M313 308L693 760M-20 590L896 412M411 292L824 729M7 657L959 462M506 277L949 698M38 730L1027 516M598 262L1069 669M72 812L1102 575M688 247L1184 640M110 903L1184 640" fill="none" stroke="rgba(255,255,255,.08)"/>
+<path d="M154 374L234 308M154 374L94 344M154 374L172 437M154 374L140 387M234 308L316 347M234 308L250 292M234 308L215 248M316 347L393 283M316 347L336 408M316 347L299 361M393 283L470 321M393 283L413 266M393 283L373 224M470 321L545 259M470 321L492 380M470 321L449 335M545 259L617 296M545 259L569 242M545 259L523 202M617 296L690 235M617 296L640 354M617 296L593 311M690 235L758 273M690 235L717 218M690 235L667 180M758 273L807 228M758 273L731 287M758 273L783 328" stroke="rgba(214,210,224,.55)" stroke-width="3.0" stroke-linecap="round"/>
+<circle cx="731" cy="287" r="17.3" fill="url(#gH)"/>
+<circle cx="731" cy="287" r="17.3" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="593" cy="311" r="17.7" fill="url(#gH)"/>
+<circle cx="593" cy="311" r="17.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="807" cy="228" r="17.8" fill="url(#gH)"/>
+<circle cx="807" cy="228" r="17.8" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="758" cy="273" r="27.5" fill="url(#gC)"/>
+<circle cx="758" cy="273" r="27.5" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="667" cy="180" r="17.9" fill="url(#gH)"/>
+<circle cx="667" cy="180" r="17.9" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="783" cy="328" r="18.0" fill="url(#gH)"/>
+<circle cx="783" cy="328" r="18.0" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="449" cy="335" r="18.1" fill="url(#gH)"/>
+<circle cx="449" cy="335" r="18.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="449" cy="335" r="23.1" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="690" cy="235" r="28.1" fill="url(#gC)"/>
+<circle cx="690" cy="235" r="28.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="617" cy="296" r="28.1" fill="url(#gC)"/>
+<circle cx="617" cy="296" r="28.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="523" cy="202" r="18.3" fill="url(#gH)"/>
+<circle cx="523" cy="202" r="18.3" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="523" cy="202" r="23.3" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="640" cy="354" r="18.4" fill="url(#gH)"/>
+<circle cx="640" cy="354" r="18.4" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="299" cy="361" r="18.6" fill="url(#gH)"/>
+<circle cx="299" cy="361" r="18.6" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="545" cy="259" r="28.7" fill="url(#gC)"/>
+<circle cx="545" cy="259" r="28.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="545" cy="259" r="33.7" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="470" cy="321" r="28.8" fill="url(#gC)"/>
+<circle cx="470" cy="321" r="28.8" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="470" cy="321" r="33.8" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="717" cy="218" r="18.7" fill="url(#gH)"/>
+<circle cx="717" cy="218" r="18.7" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="373" cy="224" r="18.8" fill="url(#gH)"/>
+<circle cx="373" cy="224" r="18.8" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="373" cy="224" r="23.8" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="492" cy="380" r="18.9" fill="url(#gH)"/>
+<circle cx="492" cy="380" r="18.9" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="492" cy="380" r="23.9" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="140" cy="387" r="19.0" fill="url(#gH)"/>
+<circle cx="140" cy="387" r="19.0" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="393" cy="283" r="29.4" fill="url(#gC)"/>
+<circle cx="393" cy="283" r="29.4" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="393" cy="283" r="34.4" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="316" cy="347" r="29.5" fill="url(#gC)"/>
+<circle cx="316" cy="347" r="29.5" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="569" cy="242" r="19.1" fill="url(#gH)"/>
+<circle cx="569" cy="242" r="19.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="569" cy="242" r="24.1" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="215" cy="248" r="19.2" fill="url(#gH)"/>
+<circle cx="215" cy="248" r="19.2" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="336" cy="408" r="19.3" fill="url(#gH)"/>
+<circle cx="336" cy="408" r="19.3" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="234" cy="308" r="30.1" fill="url(#gC)"/>
+<circle cx="234" cy="308" r="30.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="154" cy="374" r="30.2" fill="url(#gC)"/>
+<circle cx="154" cy="374" r="30.2" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="413" cy="266" r="19.6" fill="url(#gH)"/>
+<circle cx="413" cy="266" r="19.6" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="413" cy="266" r="24.6" fill="none" stroke="#a78bfa" stroke-width="2.2"/>
+<circle cx="172" cy="437" r="19.8" fill="url(#gH)"/>
+<circle cx="172" cy="437" r="19.8" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="94" cy="344" r="19.9" fill="url(#gH)"/>
+<circle cx="94" cy="344" r="19.9" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<circle cx="250" cy="292" r="20.1" fill="url(#gH)"/>
+<circle cx="250" cy="292" r="20.1" fill="#7a7690" fill-opacity=".55" stroke="#7a7690" stroke-width="2"/>
+<rect x="345" y="172" width="252" height="238" fill="rgba(167,139,250,.06)" stroke="#a78bfa" stroke-dasharray="5 4"/></svg>
+<div class="ov chip-status"><span class="light warn"></span><b>Paused</b><span class="src fb">fallback (DFT) · C–C never taught</span></div>
+<div class="ov card legendcard"><b style="font-size:11.5px">knowledge overlay</b><div class="kgrad"></div><div class="ticks"><span>0</span><span>0.5</span><span>1</span></div></div>
+</div>
+<div class="toolbar">
+<div class="tg"><div class="lab">Time</div><div class="row"><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span><span class="btn primary play"><svg class="fill" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</span><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span></div><div class="sub"><span class="kbd">Space</span> play / pause</div></div>
+
+<div class="tg"><div class="lab">Tool</div><div class="row"><span class="seg"><span>Inspect</span><span>Place</span><span>Grab</span><span class=on>Edit</span></span></div><div class="sub">Edit: click, Shift-click or a box</div></div>
+<div class="tg"><div class="lab">Selection · <span class=selname>9 atoms</span></div><div class="row"><span class="btn sm"><span class="cb"></span>Pin</span><span class="btn sm">Focus</span><span class="btn sm train" style="position:relative">Train this segment<span class="pin-n" style="left:-10px;top:-12px">2</span></span><span class="btn sm danger">Delete</span></div><div class="sub">C#3–C#5 and their 6 H · Ctrl-K "Train this segment"</div></div>
+<div class="tg" style="flex:1"><div class="lab">Solver</div><div class="row"><span class="seg"><span>CPU</span><span>GPU</span><span class=on>Estimated</span></span></div><div class="sub"><span class="light warn"></span> <span class="warnc">fallback (DFT)</span> · 29 of 29 refused · shared model</div></div>
+</div>
+<span class="pin-n" style="left:333px;top:222px">1</span>
+</div></div>
+<ol class="notes-n">
+<li><span>The selection is the Edit tool's: click, Shift-click, or a box on empty space. "Select the atoms it refuses" (Knowledge tab, the Sandbox banner) makes the same selection for you.</span></li>
+<li><span><b>Train this segment</b> sits in the toolbar's Selection group, in Dock ▸ Selection, on the overlay's hover card, and in Ctrl-K. Pressing it pauses the run and shows the preview.</span></li>
+</ol>
+<p class="cap">2. The segment preview and its confirmation. The view keeps the original scene; what is left behind fades.</p>
+<div class="scroller"><div class="app f1000" style="height:620px">
+<div class="topbar"><div class="brand"><i></i></div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><b>nonane</b><span class="mono dim">segment preview</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 1000 580" preserveAspectRatio="xMidYMid slice" aria-label="segment preview"><path d="M-164 365L23 814M-164 365L516 255M-70 350L156 782M-148 405L555 286M22 335L283 751M-129 448L598 320M110 321L404 721M-110 496L644 356M196 307L520 693M-88 547L693 395M280 293L632 666M-65 604L747 438M361 280L738 639M-38 667L805 484M440 267L841 614M-9 736L869 535M516 255L939 590M23 814L939 590" fill="none" stroke="rgba(255,255,255,.08)"/><circle cx="264" cy="285" r="177" fill="none" stroke="rgba(203,188,255,.35)" stroke-dasharray="3 5"/><circle cx="330" cy="318" r="173" fill="none" stroke="rgba(203,188,255,.35)" stroke-dasharray="3 5"/><circle cx="394" cy="265" r="173" fill="none" stroke="rgba(203,188,255,.35)" stroke-dasharray="3 5"/>
+<path d="M129 307L199 340M129 307L142 293M129 307L113 256M199 340L264 285M199 340L216 392M199 340L184 352M264 285L330 318M264 285L282 271M264 285L247 235M330 318L394 265M330 318L348 368M330 318L312 330M394 265L455 297M394 265L414 250M394 265L375 216M455 297L518 245M455 297L475 346M455 297L435 309M518 245L541 230M518 245L498 198" stroke="rgba(214,210,224,.55)" stroke-width="3.0" stroke-linecap="round"/>
+<path d="M61 363L129 307M61 363L9 337M61 363L75 417M61 363L49 375M518 245L575 277M575 277L617 239M575 277L553 289M575 277L597 324" stroke="rgba(214,210,224,.14)" stroke-width="3.0"/>
+<path d="M129 307L81 346" stroke="#5fd4d0" stroke-width="3.0" stroke-dasharray="4 3"/>
+<path d="M518 245L558 267" stroke="#5fd4d0" stroke-width="3.0" stroke-dasharray="4 3"/>
+<circle cx="553" cy="289" r="14.8" fill="url(#gH)" opacity=".16"/>
+<circle cx="435" cy="309" r="15.1" fill="url(#gH)"/>
+<circle cx="617" cy="239" r="15.2" fill="url(#gH)" opacity=".16"/>
+<circle cx="575" cy="277" r="23.5" fill="url(#gC)" opacity=".16"/>
+<circle cx="558" cy="267" r="15.3" fill="url(#gCap)"/><circle cx="558" cy="267" r="19.3" fill="none" stroke="#5fd4d0" stroke-width="1.6" stroke-dasharray="3 2.5"/>
+<circle cx="498" cy="198" r="15.3" fill="url(#gH)"/>
+<circle cx="597" cy="324" r="15.4" fill="url(#gH)" opacity=".16"/>
+<circle cx="312" cy="330" r="15.5" fill="url(#gH)"/>
+<circle cx="312" cy="330" r="18.5" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="323" cy="319" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="518" cy="245" r="23.9" fill="url(#gC)"/>
+<circle cx="455" cy="297" r="24.0" fill="url(#gC)"/>
+<circle cx="375" cy="216" r="15.6" fill="url(#gH)"/>
+<circle cx="375" cy="216" r="18.6" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="387" cy="205" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="475" cy="346" r="15.7" fill="url(#gH)"/>
+<circle cx="184" cy="352" r="15.8" fill="url(#gH)"/>
+<circle cx="394" cy="265" r="24.5" fill="url(#gC)"/>
+<circle cx="394" cy="265" r="27.5" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="412" cy="247" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="330" cy="318" r="24.6" fill="url(#gC)"/>
+<circle cx="330" cy="318" r="27.6" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="348" cy="300" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="541" cy="230" r="15.9" fill="url(#gH)"/>
+<circle cx="247" cy="235" r="16.0" fill="url(#gH)"/>
+<circle cx="247" cy="235" r="19.0" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="259" cy="224" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="348" cy="368" r="16.1" fill="url(#gH)"/>
+<circle cx="348" cy="368" r="19.1" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="360" cy="357" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="49" cy="375" r="16.2" fill="url(#gH)" opacity=".16"/>
+<circle cx="264" cy="285" r="25.1" fill="url(#gC)"/>
+<circle cx="264" cy="285" r="28.1" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="283" cy="267" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="199" cy="340" r="25.1" fill="url(#gC)"/>
+<circle cx="414" cy="250" r="16.3" fill="url(#gH)"/>
+<circle cx="414" cy="250" r="19.3" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="426" cy="239" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="113" cy="256" r="16.4" fill="url(#gH)"/>
+<circle cx="216" cy="392" r="16.5" fill="url(#gH)"/>
+<circle cx="129" cy="307" r="25.7" fill="url(#gC)"/>
+<circle cx="81" cy="346" r="16.7" fill="url(#gCap)"/><circle cx="81" cy="346" r="20.7" fill="none" stroke="#5fd4d0" stroke-width="1.6" stroke-dasharray="3 2.5"/>
+<circle cx="61" cy="363" r="25.8" fill="url(#gC)" opacity=".16"/>
+<circle cx="282" cy="271" r="16.7" fill="url(#gH)"/>
+<circle cx="282" cy="271" r="19.7" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="294" cy="259" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="75" cy="417" r="16.9" fill="url(#gH)" opacity=".16"/>
+<circle cx="9" cy="337" r="16.9" fill="url(#gH)" opacity=".16"/>
+<circle cx="142" cy="293" r="17.1" fill="url(#gH)"/>
+<text x="93" y="334" fill="#5fd4d0" font-family="IBM Plex Mono, monospace" font-size="11">cap</text><text x="570" y="255" fill="#5fd4d0" font-family="IBM Plex Mono, monospace" font-size="11">cap</text></svg>
+<div class="ov chip-status"><span class="light off"></span><b>Segment preview</b><span class="dim">the run stays paused</span></div>
+<div class="ov card confirm">
+<b style="font-size:14px">Train this segment</b>
+<table class="kv">
+<tr><td>atoms</td><td class="r">23 = 21 from nonane + 2 caps</td></tr>
+<tr><td>caps</td><td class="r"><span style="color:#5fd4d0">2 H</span> on the cut C–C bonds</td></tr>
+<tr><td>trained on</td><td class="r okc">9 atoms: the selection</td></tr>
+<tr><td>not trained</td><td class="r dim">12 edge atoms + 2 caps</td></tr>
+<tr><td>solver</td><td class="r">LSDA · ionic accepted (the scene's key)</td></tr>
+<tr><td>box</td><td class="r">25 Bohr · 168³ × 0.15 (Accurate)</td></tr>
+<tr><td>GPU memory</td><td class="r">≈ 3.3 GB of 12.9 GB</td></tr>
+<tr><td>plan</td><td class="r">Standard · ≈ 316 solves</td></tr>
+<tr><td>sampling time</td><td class="r warnc">estimate: 5–9 h (51–103 s a solve)</td></tr>
+</table>
+<div class="note-s">The segment is the selection plus every atom within r_cut = 6 Bohr (3.2 Å) of it; an H goes with its carbon. Each cut bond gets a capping H placed with the molecule builder's tables (placement only). Only atoms whose whole 6 Bohr neighbourhood is nonane's own are taught.</div>
+<div class="note-s">Not measured: scaled from H₂O at 97³ (1.8–3.6 s) by grid points × orbitals (22), before a longer chain's extra SCF iterations; the measured time replaces it after the first solve. The 5 Bohr margin keeps the samples clear of the box rule, so they can enter the collection.</div>
+<div class="btnrow"><span class="btn sm primary">Open the segment</span><span class="btn sm ghost">Cancel</span></div>
+</div>
+<div class="ov card legendcard" style="gap:4px"><span><span class="light" style="background:#6ed278"></span> trained (interior)</span><span><span class="light" style="background:#5fd4d0"></span> capping H (not trained)</span><span><span class="light" style="background:#d6d2e0"></span> edge atom (context, not trained)</span><span class="dim">faded: left behind · dashed: 6 Bohr from the selection</span></div>
+<span class="pin-n" style="left:320px;top:168px">1</span><span class="pin-n" style="left:47px;top:336px">2</span><span class="pin-n" style="left:282px;top:251px">3</span><span class="pin-n" style="left:624px;top:24px">4</span>
+</div></div></div>
+<ol class="notes-n">
+<li><span><b>The segment</b> is the selection plus every atom within 6 Bohr of it (dashed circles). A hydrogen always comes with its heavy atom.</span></li>
+<li><span><b>Caps</b> (teal, dashed ring, labelled): one H on every cut bond, along the old bond at the builder's C–H distance, so the segment is a closed-shell molecule, not a radical. Caps are never trained.</span></li>
+<li><span><b>Trained atoms</b> (green ring and dot): only atoms whose whole 6 Bohr neighbourhood is the original scene's. The edge atoms are there so the trained ones see their real neighbours; they are not taught.</span></li>
+<li><span><b>The confirmation</b> shows the counts, the box and grid (the default grid, so the samples land in this collection), the GPU memory against the budget, the plan, and an honest time estimate.</span></li>
+</ol>
+<p class="cap">3. The segment opens as a new scene in Estimated with the Standard plan ready. The original scene was saved and is one click away.</p>
+<div class="scroller"><div class="app f1000" style="height:600px">
+<div class="topbar"><div class="brand"><i></i></div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span>
+<div class="scene-title"><b>nonane · segment</b><span class="mono dim">23 nuclei (2 caps) · 168³ × 0.15</span></div>
+<span class="backchip" style="position:relative" title="saved as nonane.scene">← back to nonane<span class="pin-n" style="left:-10px;top:-12px">1</span></span><div class="spacer"></div><span class="kbd">Ctrl K</span></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 1000 560" preserveAspectRatio="xMidYMid slice" aria-label="the segment scene"><path d="M-47 326L141 712M-47 326L571 223M37 312L252 685M-29 362L607 253M120 298L360 660M-10 402L644 284M200 285L464 636M10 444L684 318M278 272L564 612M32 489L727 354M354 259L661 590M56 538L773 392M428 247L754 568M82 591L822 434M501 235L845 547M110 649L875 478M571 223L932 526M141 712L932 526" fill="none" stroke="rgba(255,255,255,.08)"/><path d="M-34 470L151 890M-34 470L-96 -193M-34 470L567 356M151 890L101 32M151 890L913 689M-96 -193L101 32M-96 -193L588 -251M101 32L1003 -79M567 356L913 689M567 356L588 -251M913 689L1003 -79M588 -251L1003 -79" fill="none" stroke="rgba(242,204,89,.5)" stroke-width="1.3"/>
+<path d="M185 257L260 292M185 257L200 242M185 257L168 202M260 292L330 233M260 292L278 347M260 292L244 304M330 233L400 268M330 233L348 219M330 233L311 180M400 268L468 211M400 268L420 322M400 268L381 281M468 211L534 245M468 211L490 196M468 211L448 159M534 245L600 190M534 245L555 298M534 245L512 258M600 190L625 175M600 190L579 139" stroke="rgba(214,210,224,.55)" stroke-width="3.0" stroke-linecap="round"/>
+<path d="M185 257L134 298" stroke="#5fd4d0" stroke-width="3.0" stroke-dasharray="4 3"/>
+<path d="M600 190L644 214" stroke="#5fd4d0" stroke-width="3.0" stroke-dasharray="4 3"/>
+<circle cx="512" cy="258" r="16.1" fill="url(#gH)"/>
+<circle cx="644" cy="214" r="16.3" fill="url(#gCap)"/><circle cx="644" cy="214" r="20.3" fill="none" stroke="#5fd4d0" stroke-width="1.6" stroke-dasharray="3 2.5"/>
+<circle cx="579" cy="139" r="16.3" fill="url(#gH)"/>
+<circle cx="381" cy="281" r="16.5" fill="url(#gH)"/>
+<circle cx="381" cy="281" r="19.5" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="393" cy="269" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="600" cy="190" r="25.5" fill="url(#gC)"/>
+<circle cx="534" cy="245" r="25.6" fill="url(#gC)"/>
+<circle cx="448" cy="159" r="16.7" fill="url(#gH)"/>
+<circle cx="448" cy="159" r="19.7" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="460" cy="147" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="555" cy="298" r="16.8" fill="url(#gH)"/>
+<circle cx="244" cy="304" r="16.9" fill="url(#gH)"/>
+<circle cx="468" cy="211" r="26.1" fill="url(#gC)"/>
+<circle cx="468" cy="211" r="29.1" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="487" cy="192" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="400" cy="268" r="26.2" fill="url(#gC)"/>
+<circle cx="400" cy="268" r="29.2" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="419" cy="249" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="625" cy="175" r="17.0" fill="url(#gH)"/>
+<circle cx="311" cy="180" r="17.1" fill="url(#gH)"/>
+<circle cx="311" cy="180" r="20.1" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="324" cy="168" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="420" cy="322" r="17.2" fill="url(#gH)"/>
+<circle cx="420" cy="322" r="20.2" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="432" cy="310" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="330" cy="233" r="26.8" fill="url(#gC)"/>
+<circle cx="330" cy="233" r="29.8" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="349" cy="214" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="260" cy="292" r="26.8" fill="url(#gC)"/>
+<circle cx="490" cy="196" r="17.4" fill="url(#gH)"/>
+<circle cx="490" cy="196" r="20.4" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="503" cy="184" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="168" cy="202" r="17.5" fill="url(#gH)"/>
+<circle cx="278" cy="347" r="17.6" fill="url(#gH)"/>
+<circle cx="185" cy="257" r="27.4" fill="url(#gC)"/>
+<circle cx="134" cy="298" r="17.8" fill="url(#gCap)"/><circle cx="134" cy="298" r="21.8" fill="none" stroke="#5fd4d0" stroke-width="1.6" stroke-dasharray="3 2.5"/>
+<circle cx="348" cy="219" r="17.8" fill="url(#gH)"/>
+<circle cx="348" cy="219" r="20.8" fill="none" stroke="#6ed278" stroke-width="2"/><circle cx="361" cy="206" r="4" fill="#6ed278" stroke="#14121c" stroke-width="1.2"/>
+<circle cx="200" cy="242" r="18.3" fill="url(#gH)"/>
+</svg>
+<div class="ov chip-status"><span class="light off"></span><b>Paused</b><span class="src sur" style="color:var(--accent-ink)">Estimated · shared model</span><span class="dim">segment ready: 9 atoms to teach</span></div>
+<div class="ov card samplecard" style="left:auto;right:14px;transform:none;width:470px">
+<div class="btnrow" style="justify-content:space-between"><b>Sampling plan · Standard</b><span class="seg" style="font-size:11px"><span>Quick look</span><span>Gentle</span><span class="on">Standard</span><span>Hot</span></span></div>
+<div class="note-s">120 perturbations of the trained atoms · scans of the 9 trained atoms' new pairs (C–C, H–C across the bond) · 100-step hot burst at 1500 K.</div>
+<div class="btnrow"><span class="btn sm amber" style="position:relative">Start anyway (estimate 5–9 h)<span class="pin-n" style="left:-10px;top:-12px">3</span></span><span class="dim mono" style="font-size:11px">316 solves · learns into lsda-h0.15-s0.15-t…</span></div>
+<div class="note-s">Over 2 min, so the button asks for a second click, as today. Close the app any time: the collection keeps what was learned.</div>
+</div>
+<span class="pin-n" style="left:346px;top:193px">2</span>
+</div></div></div>
+<ol class="notes-n">
+<li><span><b>back to the scene:</b> a chip next to the scene chip, until you go back or open another scene. Going back reloads nonane where you left it; the collection has learned in the meantime, so the overlay there shows it.</span></li>
+<li><span>The trained atoms stay marked in the segment scene, so you can see which atoms the pass teaches.</span></li>
+<li><span>The Standard plan is selected and ready; the long-pass rule (above 2 min, a second click) is unchanged.</span></li>
+</ol>
+<p class="cap">4. The refusals: the button explains itself instead of doing something odd.</p>
+<div class="refusals">
+<div class="card"><span class="k">nothing selected</span><span>Nothing to train: select atoms with the Edit tool (click, Shift-click or a box), or use "Select the atoms it refuses".</span><span class="note-s">The button is disabled with this tooltip.</span></div>
+<div class="card"><span class="k">a lone atom</span><span>This atom has no neighbour within 6 Bohr: there are no surroundings to learn. A lone atom is the isolated-atom reference, which the collection already has.</span></div>
+<div class="card"><span class="k">over the GPU memory budget</span><span>The segment (148 atoms, a 48 Bohr box, 321³ × 0.15) needs ≈ 120 GB of GPU memory (≈ 150 orbitals); the budget is 12.9 GB (half the card's memory). Select fewer atoms.</span><span class="note-s">A coarser grid would fit, but it teaches a different collection (h is part of the key), so it is not offered as the fix.</span></div>
+</div>
+</section>
+
+<section id="e">
+<h2>(e) Sandbox, the fourth solver <span class="tag b">M8b</span></h2>
+<p class="cap">Ethanol in 60 waters (189 atoms), after the collection learned C–C from nonane segments and liquid water from water-cluster segments (3 820 samples). It has never seen a C–O bond: the ethanol's heavy atoms are frozen, and so are its H that see a C and the O close together. Two waters are frozen too: one O at 5.38 Bohr from a carbon (C–O is thin there), and one H in a hydrogen bond shorter than any taught. Atoms in thinly taught surroundings move with a low-precision tint.</p>
+<div class="scroller"><div class="app m8main">
+<div class="topbar"><div class="brand"><i></i>Atomic Sandbox</div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><span class="dim">sandbox</span><b>ethanol in water</b><span class="faint">·</span><span class="mono dim">189 nuclei · no grid · walls ±14 Bohr · charge 0</span><span class="faint">▾</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="strip left"><span class="tabbtn" title="Activity"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg></span><span class="tabbtn" title="Readouts"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></span><span class="tabbtn" title="Graph"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 3 5-8 4 5"/></svg></span><div class="grow"></div><span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg></span></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 972 736" preserveAspectRatio="xMidYMid slice" aria-label="Sandbox: ethanol in 60 waters"><path d="M125 599L305 888M125 599L611 511M201 586L400 865M145 632L645 537M274 572L491 842M167 667L681 566M346 559L579 820M191 704L719 596M415 547L664 799M216 745L760 628M482 534L746 779M243 789L803 663M548 522L825 759M272 836L851 700M611 511L901 740M305 888L901 740" fill="none" stroke="rgba(255,255,255,.08)"/><path d="M125 599L305 888M125 599L88 54M125 599L611 511M305 888L279 191M305 888L901 740M88 54L279 191M88 54L623 14M279 191L952 120M611 511L901 740M611 511L623 14M901 740L952 120M623 14L952 120" fill="none" stroke="rgba(120,200,255,.32)" stroke-width="1.3" stroke-dasharray="6 5"/>
+<circle cx="513" cy="464" r="9.9" fill="url(#gH)"/>
+<circle cx="529" cy="439" r="14.5" fill="url(#gO)"/>
+<circle cx="597" cy="362" r="10.0" fill="url(#gH)"/>
+<circle cx="503" cy="423" r="10.1" fill="url(#gH)"/>
+<circle cx="595" cy="279" r="10.1" fill="url(#gH)"/>
+<circle cx="423" cy="467" r="14.8" fill="url(#gO)"/>
+<circle cx="442" cy="438" r="10.2" fill="url(#gH)"/>
+<circle cx="298" cy="523" r="10.2" fill="url(#gH)"/>
+<circle cx="605" cy="362" r="14.9" fill="url(#gO)"/>
+<circle cx="595" cy="250" r="14.9" fill="url(#gO)"/>
+<circle cx="589" cy="135" r="10.2" fill="url(#gH)"/>
+<circle cx="345" cy="494" r="10.2" fill="url(#gH)"/>
+<circle cx="573" cy="442" r="10.3" fill="url(#gH)"/>
+<circle cx="595" cy="330" r="10.3" fill="url(#gH)"/>
+<circle cx="397" cy="466" r="10.3" fill="url(#gH)"/>
+<circle cx="316" cy="507" r="15.0" fill="url(#gO)"/>
+<circle cx="605" cy="263" r="10.4" fill="url(#gH)"/>
+<circle cx="477" cy="537" r="10.4" fill="url(#gH)"/>
+<circle cx="587" cy="128" r="15.1" fill="url(#gO)"/>
+<circle cx="541" cy="475" r="10.4" fill="url(#gH)"/>
+<circle cx="556" cy="109" r="10.4" fill="url(#gH)"/>
+<circle cx="569" cy="452" r="15.2" fill="url(#gO)"/>
+<circle cx="518" cy="375" r="10.5" fill="url(#gH)"/>
+<circle cx="480" cy="189" r="10.5" fill="url(#gH)"/>
+<circle cx="619" cy="501" r="10.5" fill="url(#gH)"/>
+<circle cx="527" cy="341" r="15.4" fill="url(#gO)"/>
+<circle cx="491" cy="553" r="15.4" fill="url(#gO)"/>
+<circle cx="605" cy="557" r="10.6" fill="url(#gH)"/>
+<circle cx="265" cy="480" r="10.6" fill="url(#gH)"/>
+<circle cx="560" cy="345" r="10.7" fill="url(#gH)"/>
+<circle cx="229" cy="435" r="10.7" fill="url(#gH)"/>
+<circle cx="448" cy="230" r="10.7" fill="url(#gH)"/>
+<circle cx="375" cy="384" r="15.5" fill="url(#gO)"/>
+<circle cx="623" cy="530" r="15.5" fill="url(#gO)"/>
+<circle cx="652" cy="427" r="10.7" fill="url(#gH)"/>
+<circle cx="465" cy="550" r="10.7" fill="url(#gH)"/>
+<circle cx="473" cy="204" r="15.6" fill="url(#gO)"/>
+<circle cx="373" cy="348" r="10.7" fill="url(#gH)"/>
+<circle cx="471" cy="458" r="15.6" fill="url(#gO)"/>
+<circle cx="655" cy="391" r="15.6" fill="url(#gO)"/>
+<circle cx="463" cy="422" r="10.7" fill="url(#gH)"/>
+<circle cx="619" cy="379" r="10.7" fill="url(#gH)"/>
+<circle cx="579" cy="229" r="10.8" fill="url(#gH)"/>
+<circle cx="242" cy="463" r="15.7" fill="url(#gO)"/>
+<circle cx="391" cy="213" r="10.8" fill="url(#gH)"/>
+<circle cx="558" cy="256" r="15.7" fill="url(#gO)"/>
+<circle cx="379" cy="402" r="10.8" fill="url(#gH)"/>
+<circle cx="657" cy="272" r="10.9" fill="url(#gH)"/>
+<circle cx="226" cy="350" r="15.9" fill="url(#gO)"/>
+<circle cx="463" cy="471" r="10.9" fill="url(#gH)"/>
+<circle cx="512" cy="616" r="11.0" fill="url(#gH)"/>
+<circle cx="386" cy="504" r="11.0" fill="url(#gH)"/>
+<circle cx="578" cy="269" r="11.0" fill="url(#gH)"/>
+<circle cx="707" cy="536" r="11.0" fill="url(#gH)"/>
+<circle cx="221" cy="316" r="11.0" fill="url(#gH)"/>
+<circle cx="388" cy="206" r="16.0" fill="url(#gO)"/>
+<circle cx="274" cy="561" r="11.0" fill="url(#gH)"/>
+<circle cx="302" cy="508" r="11.0" fill="url(#gH)"/>
+<circle cx="243" cy="372" r="11.1" fill="url(#gH)"/>
+<circle cx="679" cy="271" r="16.1" fill="url(#gO)"/>
+<circle cx="418" cy="184" r="11.1" fill="url(#gH)"/>
+<circle cx="348" cy="340" r="11.1" fill="url(#gH)"/>
+<circle cx="307" cy="545" r="16.1" fill="url(#gO)"/>
+<circle cx="599" cy="623" r="11.1" fill="url(#gH)"/>
+<circle cx="509" cy="589" r="16.1" fill="url(#gO)"/>
+<circle cx="603" cy="562" r="11.1" fill="url(#gH)"/>
+<circle cx="413" cy="518" r="16.2" fill="url(#gO)"/>
+<circle cx="681" cy="308" r="11.1" fill="url(#gH)"/>
+<circle cx="263" cy="172" r="11.1" fill="url(#gH)"/>
+<circle cx="400" cy="310" r="11.1" fill="url(#gH)"/>
+<circle cx="203" cy="157" r="11.1" fill="url(#gH)"/>
+<circle cx="761" cy="525" r="11.2" fill="url(#gH)"/>
+<circle cx="617" cy="596" r="16.3" fill="url(#gO)"/>
+<circle cx="726" cy="539" r="16.3" fill="url(#gO)"/>
+<circle cx="476" cy="599" r="11.2" fill="url(#gH)"/>
+<circle cx="236" cy="145" r="16.3" fill="url(#gO)"/>
+<circle cx="370" cy="327" r="16.3" fill="url(#gO)"/>
+<circle cx="740" cy="416" r="11.3" fill="url(#gH)"/>
+<circle cx="633" cy="190" r="11.3" fill="url(#gH)"/>
+<circle cx="395" cy="524" r="11.3" fill="url(#gH)"/>
+<circle cx="570" cy="370" r="11.3" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(570 370) scale(16.3)"/>
+<circle cx="436" cy="425" r="11.3" fill="url(#gH)"/>
+<circle cx="516" cy="183" r="11.3" fill="url(#gH)"/>
+<circle cx="541" cy="396" r="16.5" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(541 396) scale(21.5)"/>
+<circle cx="274" cy="223" r="11.3" fill="url(#gH)"/>
+<circle cx="285" cy="284" r="11.4" fill="url(#gH)"/>
+<circle cx="483" cy="335" r="11.4" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(483 335) scale(16.4)"/>
+<circle cx="217" cy="429" r="11.4" fill="url(#gH)"/>
+<circle cx="733" cy="389" r="16.6" fill="url(#gO)"/>
+<circle cx="588" cy="157" r="11.5" fill="url(#gH)"/>
+<circle cx="291" cy="248" r="16.7" fill="url(#gO)"/>
+<circle cx="466" cy="203" r="11.5" fill="url(#gH)"/>
+<circle cx="625" cy="171" r="16.7" fill="url(#gO)"/>
+<circle cx="498" cy="371" r="17.8" fill="url(#gC)" opacity=".5"/>
+<use href="#frz" transform="translate(498 371) scale(22.8)"/>
+<circle cx="497" cy="179" r="16.7" fill="url(#gO)"/>
+<circle cx="251" cy="421" r="16.8" fill="url(#gO)"/>
+<circle cx="450" cy="413" r="17.8" fill="url(#gC)" opacity=".5"/>
+<use href="#frz" transform="translate(450 413) scale(22.8)"/>
+<circle cx="338" cy="455" r="11.6" fill="url(#gH)"/>
+<circle cx="648" cy="615" r="11.6" fill="url(#gH)"/>
+<circle cx="755" cy="401" r="11.6" fill="url(#gH)"/>
+<circle cx="577" cy="519" r="17.0" fill="url(#gO)"/>
+<circle cx="477" cy="565" r="11.7" fill="url(#gH)"/>
+<circle cx="668" cy="408" r="11.7" fill="url(#gH)"/>
+<circle cx="465" cy="450" r="11.7" fill="url(#gH)"/>
+<circle cx="415" cy="393" r="11.7" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(415 393) scale(16.7)"/>
+<circle cx="417" cy="544" r="11.7" fill="url(#gH)"/>
+<circle cx="532" cy="275" r="11.7" fill="url(#gH)"/>
+<circle cx="439" cy="578" r="17.0" fill="url(#gO)"/>
+<circle cx="612" cy="539" r="11.7" fill="url(#gH)"/>
+<circle cx="715" cy="532" r="11.7" fill="url(#gH)"/>
+<circle cx="573" cy="272" r="17.1" fill="url(#gO)"/>
+<circle cx="513" cy="357" r="11.7" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(513 357) scale(16.7)"/>
+<circle cx="244" cy="433" r="11.8" fill="url(#gH)"/>
+<circle cx="623" cy="671" r="11.8" fill="url(#gH)"/>
+<circle cx="584" cy="311" r="11.8" fill="url(#gH)"/>
+<circle cx="441" cy="248" r="11.8" fill="url(#gH)"/>
+<circle cx="516" cy="660" r="17.2" fill="url(#gO)"/>
+<circle cx="316" cy="191" r="11.8" fill="url(#gH)"/>
+<circle cx="195" cy="165" r="11.8" fill="url(#gH)"/>
+<circle cx="342" cy="445" r="17.2" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(342 445) scale(22.2)"/>
+<circle cx="552" cy="533" r="11.8" fill="url(#gH)"/>
+<circle cx="640" cy="637" r="17.2" fill="url(#gO)"/>
+<circle cx="478" cy="656" r="11.9" fill="url(#gH)"/>
+<circle cx="377" cy="463" r="11.9" fill="url(#gH)"/>
+<circle cx="659" cy="399" r="17.3" fill="url(#gO)"/>
+<circle cx="371" cy="162" r="11.9" fill="url(#gH)"/>
+<circle cx="273" cy="283" r="11.9" fill="url(#gH)"/>
+<circle cx="723" cy="254" r="11.9" fill="url(#gH)"/>
+<circle cx="531" cy="694" r="11.9" fill="url(#gH)"/>
+<circle cx="225" cy="169" r="17.4" fill="url(#gO)"/>
+<circle cx="277" cy="323" r="17.4" fill="url(#gO)"/>
+<circle cx="228" cy="210" r="12.0" fill="url(#gH)"/>
+<circle cx="719" cy="543" r="17.4" fill="url(#gO)"/>
+<circle cx="343" cy="189" r="17.4" fill="url(#gO)"/>
+<circle cx="427" cy="266" r="17.4" fill="url(#gO)"/>
+<circle cx="715" cy="584" r="12.0" fill="url(#gH)"/>
+<circle cx="401" cy="675" r="12.0" fill="url(#gH)"/>
+<circle cx="335" cy="668" r="12.0" fill="url(#gH)"/>
+<circle cx="674" cy="431" r="12.0" fill="url(#gH)"/>
+<circle cx="761" cy="243" r="17.5" fill="url(#gO)"/>
+<circle cx="783" cy="279" r="12.1" fill="url(#gH)"/>
+<circle cx="745" cy="453" r="12.1" fill="url(#gH)"/>
+<circle cx="779" cy="429" r="17.6" fill="url(#gO)"/>
+<circle cx="241" cy="333" r="12.1" fill="url(#gH)"/>
+<circle cx="369" cy="659" r="17.6" fill="url(#gO)"/>
+<circle cx="459" cy="262" r="12.2" fill="url(#gH)"/>
+<circle cx="506" cy="492" r="17.7" fill="url(#gO)"/>
+<circle cx="501" cy="362" r="12.2" fill="url(#gH)"/>
+<circle cx="468" cy="506" r="12.3" fill="url(#gH)"/>
+<circle cx="533" cy="305" r="12.3" fill="url(#gH)"/>
+<circle cx="333" cy="355" r="12.3" fill="url(#gH)"/>
+<circle cx="791" cy="424" r="12.3" fill="url(#gH)"/>
+<circle cx="518" cy="463" r="12.3" fill="url(#gH)"/>
+<circle cx="371" cy="458" r="12.3" fill="url(#gH)"/>
+<circle cx="530" cy="347" r="18.0" fill="url(#gO)"/>
+<circle cx="601" cy="547" r="12.5" fill="url(#gH)"/>
+<circle cx="363" cy="496" r="18.2" fill="url(#gO)"/>
+<circle cx="360" cy="337" r="18.2" fill="url(#gO)"/>
+<circle cx="619" cy="508" r="18.2" fill="url(#gO)"/>
+<circle cx="534" cy="608" r="18.2" fill="url(#gO)"/>
+<circle cx="581" cy="211" r="12.6" fill="url(#gH)"/>
+<circle cx="413" cy="189" r="12.6" fill="url(#gH)"/>
+<circle cx="524" cy="569" r="12.6" fill="url(#gH)"/>
+<circle cx="575" cy="615" r="12.6" fill="url(#gH)"/>
+<circle cx="338" cy="305" r="12.6" fill="url(#gH)"/>
+<circle cx="621" cy="195" r="18.4" fill="url(#gO)"/>
+<circle cx="707" cy="292" r="18.5" fill="url(#gO)"/>
+<circle cx="343" cy="485" r="12.7" fill="url(#gH)"/>
+<circle cx="601" cy="495" r="12.7" fill="url(#gH)"/>
+<circle cx="750" cy="299" r="12.7" fill="url(#gH)"/>
+<circle cx="410" cy="219" r="18.6" fill="url(#gO)"/>
+<circle cx="520" cy="440" r="18.7" fill="url(#gO)"/>
+<circle cx="624" cy="191" r="12.9" fill="url(#gH)"/>
+<circle cx="697" cy="272" r="12.9" fill="url(#gH)"/>
+<circle cx="376" cy="607" r="18.9" fill="url(#gO)"/>
+<circle cx="495" cy="409" r="13.0" fill="url(#gH)"/>
+<circle cx="414" cy="194" r="13.0" fill="url(#gH)"/>
+<circle cx="341" cy="223" r="13.1" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(341 223) scale(18.1)"/>
+<circle cx="529" cy="471" r="13.1" fill="url(#gH)"/>
+<circle cx="516" cy="323" r="13.1" fill="url(#gH)"/>
+<circle cx="275" cy="251" r="13.1" fill="url(#gH)"/>
+<circle cx="414" cy="598" r="13.1" fill="url(#gH)"/>
+<circle cx="343" cy="585" r="13.1" fill="url(#gH)"/>
+<circle cx="302" cy="222" r="19.3" fill="url(#gO)"/>
+<circle cx="517" cy="284" r="19.3" fill="url(#gO)"/>
+<circle cx="559" cy="282" r="13.4" fill="url(#gH)"/>
+<circle cx="386" cy="301" r="13.5" fill="url(#gH)"/>
+<circle cx="407" cy="323" r="19.9" fill="url(#gO)"/>
+<circle cx="389" cy="301" r="14.0" fill="url(#gH)"/>
+<circle cx="463" cy="471" r="10.9" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="436" cy="425" r="11.3" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="338" cy="455" r="11.6" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="465" cy="450" r="11.7" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="532" cy="275" r="11.7" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="573" cy="272" r="17.1" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="584" cy="311" r="11.8" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="316" cy="191" r="11.8" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="377" cy="463" r="11.9" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="225" cy="169" r="17.4" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="501" cy="362" r="12.2" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="371" cy="458" r="12.3" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/><circle cx="410" cy="219" r="18.6" fill="#f0c83c" fill-opacity=".45" stroke="#f0c83c" stroke-width="1.6"/></svg>
+<div class="ov chip-status"><span class="pulse"></span><b>Playing</b><span class="src" style="color:#9ad8ff;background:rgba(154,216,255,.08)">Sandbox · model only</span><span class="sep-v"></span><span class="mono">t 1.204 ps</span><span class="mono dim">step 4 816</span><span class="sep-v"></span><span class="mono">T 301 K</span></div>
+<div class="ov banner-ice"><div><b>9 atoms frozen: the model has not learned their surroundings</b> — <u>Train this segment</u></div><div style="font-size:11px;opacity:.85">frozen atoms are held still and left out of the energy; nothing they would feel acts on the others</div></div>
+<div class="ov banner-amber" style="top:122px;left:50%;transform:translateX(-50%)">Low precision: 13 atoms answered with a large uncertainty (amber). They move, but read their forces as a guess.</div>
+<div class="ov card hovercard" style="left:538px;top:431px;width:270px"><b class="ice">C #1 · frozen</b><span>why: <b>a C with C at 2.89 and O at 2.70 Bohr</b> around it: never seen. The collection was taught C–O only at 5.2–6.0 Bohr (methane beside water).</span><span class="btnrow"><span class="btn sm train">Train this segment</span></span></div>
+<div class="ov card legendcard" style="gap:4px"><span><span class="light" style="background:#9ad8ff"></span> frozen (held, velocity 0)</span><span><span class="light warn"></span> answered, low precision</span><span class="dim">plain: answered, well known</span></div>
+<div class="ov density-label" style="bottom:auto;top:12px;left:auto;right:12px;transform:none">no density in Sandbox</div>
+</div>
+<div class="strip right"><span class="tabbtn on" title="Model"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5l3.5 9M16.5 7.5l-3.5 9M8 6h8"/></svg><span class="dot" style="background:#9ad8ff"></span></span><span class="tabbtn" title="Knowledge"><svg viewBox="0 0 24 24"><path d="M3 6.5l6-2.5 6 2.5 6-2.5v13.5l-6 2.5-6-2.5-6 2.5z"/><path d="M9 4v13.5M15 6.5V20"/></svg></span><span class="tabbtn" title="Orbitals"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.8"/><ellipse cx="12" cy="12" rx="9" ry="3.8"/><ellipse cx="12" cy="12" rx="3.8" ry="9"/></svg></span><span class="tabbtn" title="Selection"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/></svg></span><span class="tabbtn" title="Log"><svg viewBox="0 0 24 24"><path d="M6 4h9l3 3v13H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg></span><div class="grow"></div><span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg></span></div>
+<div class="dock">
+<div class="dock-head"><h3>Model · Sandbox solver</h3><span class="tag b">M8b</span></div>
+<div class="tabpanel">
+<div class="note-s">Every step from the model alone: no DFT, no grid, no fallback, no audits, no learning.</div>
+<div class="grp"><h4>Model</h4>
+<div class="mlist">
+<div class="on"><span class="rd on"></span><span><span class="slug">lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a</span><br><span class="dim">collection · 3 820 samples · H C O</span></span></div>
+<div><span class="rd"></span><span><span class="slug">lsda-h0.25-s0.25-tol1e-6-gpu-accepted-3f9a</span><br><span class="dim">collection · 365 samples · H O</span></span></div>
+<div><span class="rd"></span><span>water.model <span class="dim">· specialised · 1 290 samples · H O</span></span></div>
+</div>
+<div class="btnrow"><span class="btn sm">Browse…</span></div></div>
+<div class="grp"><h4>Space</h4>
+<div class="btnrow"><span class="sw on"></span><span>walls, half-width</span><span class="field">14.0 Bohr</span><span class="dim" style="font-size:11px">off = unbounded, warns when an atom is far away</span></div></div>
+<div class="grp"><h4>Frozen · 9 atoms <span class="faint" style="text-transform:none;letter-spacing:0">what froze it, Bohr</span></h4>
+<table class="kv" style="font-size:11px"><tr><td>C #0</td><td class="dim">ethanol</td><td>C 2.89 · O 4.55 around it</td></tr><tr><td>C #1</td><td class="dim">ethanol</td><td>C 2.89 · O 2.70 around it</td></tr><tr><td>O #2</td><td class="dim">ethanol</td><td>C 2.70 · C 4.55 around it</td></tr><tr><td>H #3</td><td class="dim">ethanol</td><td>C 2.06 · O 4.08 around it</td></tr><tr><td colspan="3" class="faint">… 5 more: Select them</td></tr></table>
+<div class="btnrow"><span class="btn sm train">Train this segment (9 atoms)</span><span class="btn sm">Select them</span></div>
+</div>
+<div class="grp"><h4>Guards, from the data</h4>
+<div class="health"><div><span class="light ok"></span><span>closest approach = the shortest distance taught (H–H 1.2, O–H 1.4, C–H 1.6, C–C 2.3, O–O 4.4, C–O 5.2 Bohr), between answered atoms (note 6)</span></div>
+<div><span class="light ok"></span><span>force cap, speed guard, cascade guard: pause with the reason</span></div></div></div>
+<table class="kv"><tr><td>answered</td><td class="r">180 of 189 · <span class="warnc">13 low precision</span></td></tr><tr><td>E (unfrozen atoms)</td><td class="r">−1 004.6152 Ha</td></tr><tr><td>freeze / unfreeze work</td><td class="r">+0.0021 Ha</td></tr><tr><td>E conserved</td><td class="r">drift −3e-6 Ha/ps</td></tr></table>
+
+</div></div>
+<div class="toolbar">
+<div class="tg"><div class="lab">Time</div><div class="row"><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span><span class="btn primary play"><svg class="fill" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>Pause</span><span class="btn icon"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span></div><div class="sub"><span class="kbd">Space</span> play / pause</div></div>
+<div class="tg"><div class="lab">Speed · steps per tick</div><div class="row"><span class="slider" style="width:90px"><span class="tr"></span><span class="fi" style="width:60%"></span><span class="th" style="left:60%"></span></span><span class="field">400</span><span class="bigrate">610 fs/s</span></div><div class="sub">dt 0.250 fs · <span class="linkbtn">Watchable</span></div></div>
+<div class="tg"><div class="lab">Tool</div><div class="row"><span class="seg"><span>Inspect</span><span>Place</span><span class=on>Grab</span><span>Edit</span></span></div><div class="sub">Edit: click, Shift-click or a box</div></div>
+<div class="tg"><div class="lab">Selection</div><div class="row"><span class="btn sm disabled">Pin</span><span class="btn sm disabled">Focus</span><span class="btn sm disabled">Train this segment</span><span class="faint">no selection</span></div><div class="sub"></div></div>
+<div class="tg" style="flex:1"><div class="lab">Solver</div><div class="row"><span class="seg"><span>CPU</span><span>GPU</span><span>Estimated</span><span class=on>Sandbox</span></span></div><div class="sub"><span class="light" style="background:#9ad8ff"></span> <span class="ice">9 frozen</span> · <span class="warnc">13 low precision</span> · model only</div></div>
+</div>
+<span class="pin-n" style="left:1240px;top:818px">1</span><span class="pin-n" style="left:206px;top:102px">2</span><span class="pin-n" style="left:268px;top:166px">3</span><span class="pin-n" style="left:1376px;top:172px">4</span><span class="pin-n" style="left:1376px;top:352px">5</span><span class="pin-n" style="left:1376px;top:470px">6</span><span class="pin-n" style="left:528px;top:423px">7</span>
+</div></div>
+<ol class="notes-n">
+<li><span><b>Sandbox</b> is the fourth option of the toolbar's Solver group. A charged scene is refused with "charge +1: Sandbox scenes are neutral until M9", and species the model does not cover are frozen. It has its own scene slot: switching to it swaps in the Sandbox scene, and switching back restores the DFT solvers' scene. Both save with the session.</span></li>
+<li><span><b>The banner:</b> "N atoms frozen: the model has not learned their surroundings — Train this segment". The link selects the frozen atoms and opens the preview of (d), in Estimated.</span></li>
+<li><span><b>Low precision</b> (amber, like draft mode today): answered, but the uncertainty is large. These atoms move.</span></li>
+<li><span><b>Model:</b> picked from the collections on disk (any settings: Sandbox has no grid of its own) and specialised files.</span></li>
+<li><span><b>Space:</b> one switch: walls on by default, with a half-width you type; off is unbounded, with a "far away" warning instead of the box-face guard.</span></li>
+<li><span><b>Frozen, with why:</b> each frozen atom with the pair, or the two neighbours around it, that froze it. The guards are listed with where their numbers come from: the collection's own data, not a table. The closest-approach guard holds two <i>answered</i> atoms of a pair apart at the shortest distance taught; a pair that is already closer (as the ethanol's C–O at load) freezes instead of being pushed apart; a never-seen class has no bound, because its atoms are frozen. The exact rule is the plan's.</span></li>
+<li><span><b>Frozen atoms</b> are drawn faded inside an ice-blue hexagon with a star, held still and left out of the energy. Hover for the reason.</span></li>
+</ol>
+<p class="cap">The cascade guard: when the frozen count keeps growing, the run pauses and says so.</p>
+<div class="scroller"><div class="app f1000" style="height:520px">
+<div class="topbar"><div class="brand"><i></i></div><span class="menu">File</span><span class="menu">Scene</span><span class="menu">View</span><span class="menu">Physics</span><span class="menu">Help</span><div class="scene-title"><b>ethanol in water</b><span class="mono dim">sandbox · 189 nuclei</span></div><div class="spacer"></div><div class="search"><svg viewBox="0 0 24 24" width=13 height=13 fill=none stroke=currentColor stroke-width=2><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div><div class="winbtns"><span>–</span><span>▢</span><span>✕</span></div></div>
+<div class="viewport"><svg class="scene" viewBox="0 0 1000 480" preserveAspectRatio="xMidYMid slice" aria-label="cascade guard pause, close-up of the ethanol">
+<circle cx="460" cy="232" r="12.9" fill="url(#gH)"/>
+<circle cx="471" cy="190" r="18.9" fill="url(#gO)"/>
+<circle cx="511" cy="195" r="13.1" fill="url(#gH)"/>
+<circle cx="283" cy="243" r="19.0" fill="url(#gO)"/>
+<circle cx="281" cy="199" r="13.2" fill="url(#gH)"/>
+<circle cx="401" cy="334" r="19.2" fill="url(#gO)"/>
+<circle cx="391" cy="289" r="13.2" fill="url(#gH)"/>
+<circle cx="584" cy="237" r="13.2" fill="url(#gH)"/>
+<circle cx="508" cy="86" r="19.3" fill="url(#gO)"/>
+<circle cx="288" cy="265" r="13.3" fill="url(#gH)"/>
+<circle cx="392" cy="350" r="13.4" fill="url(#gH)"/>
+<circle cx="298" cy="390" r="13.5" fill="url(#gH)"/>
+<circle cx="533" cy="101" r="13.5" fill="url(#gH)"/>
+<circle cx="250" cy="189" r="13.6" fill="url(#gH)"/>
+<circle cx="331" cy="407" r="19.8" fill="url(#gO)"/>
+<circle cx="314" cy="152" r="13.7" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(314 152) scale(18.7)"/>
+<circle cx="278" cy="172" r="20.1" fill="url(#gO)"/>
+<circle cx="309" cy="415" r="13.9" fill="url(#gH)"/>
+<circle cx="523" cy="226" r="13.9" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(523 226) scale(18.9)"/>
+<circle cx="359" cy="293" r="13.9" fill="url(#gH)"/>
+<circle cx="488" cy="258" r="20.2" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(488 258) scale(25.2)"/>
+<circle cx="416" cy="183" r="14.0" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(416 183) scale(19.0)"/>
+<circle cx="395" cy="21" r="14.1" fill="url(#gH)"/>
+<circle cx="434" cy="226" r="21.8" fill="url(#gC)" opacity=".5"/>
+<use href="#frz" transform="translate(434 226) scale(26.8)"/>
+<circle cx="376" cy="278" r="21.9" fill="url(#gC)" opacity=".5"/>
+<use href="#frz" transform="translate(376 278) scale(26.9)"/>
+<circle cx="239" cy="330" r="14.2" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(239 330) scale(19.2)"/>
+<circle cx="532" cy="408" r="20.8" fill="url(#gO)"/>
+<circle cx="409" cy="464" r="14.3" fill="url(#gH)"/>
+<circle cx="643" cy="272" r="14.3" fill="url(#gH)"/>
+<circle cx="394" cy="323" r="14.3" fill="url(#gH)"/>
+<circle cx="333" cy="254" r="14.3" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(333 254) scale(19.3)"/>
+<circle cx="335" cy="439" r="14.4" fill="url(#gH)"/>
+<circle cx="477" cy="109" r="14.4" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(477 109) scale(19.4)"/>
+<circle cx="363" cy="481" r="20.9" fill="url(#gO)"/>
+<circle cx="575" cy="432" r="14.4" fill="url(#gH)"/>
+<circle cx="526" cy="106" r="21.0" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(526 106) scale(26.0)"/>
+<circle cx="454" cy="210" r="14.4" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(454 210) scale(19.4)"/>
+<circle cx="541" cy="153" r="14.5" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(541 153) scale(19.5)"/>
+<circle cx="365" cy="75" r="14.5" fill="url(#gH)"/>
+<circle cx="243" cy="318" r="21.1" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(243 318) scale(26.1)"/>
+<circle cx="501" cy="425" r="14.5" fill="url(#gH)"/>
+<circle cx="286" cy="340" r="14.6" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(286 340) scale(19.6)"/>
+<circle cx="632" cy="261" r="21.2" fill="url(#gO)"/>
+<circle cx="348" cy="97" r="21.4" fill="url(#gO)"/>
+<circle cx="651" cy="300" r="14.8" fill="url(#gH)"/>
+<circle cx="386" cy="93" r="14.9" fill="url(#gH)"/>
+<circle cx="445" cy="375" r="21.7" fill="url(#gO)"/>
+<circle cx="438" cy="216" r="15.0" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(438 216) scale(20.0)"/>
+<circle cx="398" cy="392" r="15.0" fill="url(#gH)"/>
+<circle cx="477" cy="146" r="15.1" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(477 146) scale(20.1)"/>
+<circle cx="232" cy="207" r="15.1" fill="url(#gH)"/>
+<circle cx="459" cy="339" r="15.1" fill="url(#gH)"/>
+<circle cx="279" cy="333" r="15.2" fill="url(#gH)" opacity=".5"/>
+<use href="#frz" transform="translate(279 333) scale(20.2)"/>
+<circle cx="475" cy="197" r="22.1" fill="url(#gO)" opacity=".5"/>
+<use href="#frz" transform="translate(475 197) scale(27.1)"/>
+<circle cx="266" cy="185" r="22.3" fill="url(#gO)"/>
+</svg>
+<div class="ov chip-status" style="border-color:#9ad8ff"><span class="light" style="background:#9ad8ff"></span><b>Paused by the cascade guard</b><span class="mono dim">t 1.388 ps</span></div>
+<div class="ov card" style="right:14px;top:14px;width:380px;padding:12px 14px;display:grid;gap:8px">
+<b>The frozen atoms keep spreading</b>
+<span>9 → 28 frozen in the last 600 steps. Atoms pushed against frozen ones reach geometries the model never learned and freeze in turn, so the run paused before the scene turns to stone.</span>
+<div class="btnrow"><span class="btn sm train">Train this segment (28 atoms)</span><span class="btn sm">Rewind to Play</span><span class="btn sm ghost">Resume anyway</span></div>
+<span class="note-s">The exact rule (a rising count over a window, or a share of the scene) is set in the plan.</span>
+</div></div></div></div>
+</section>
+
+<section id="q">
+<h2>Choices for you to approve</h2>
+<ol class="decisions">
+<li><b>Where the map lives:</b> a right-dock tab "Knowledge" after Model, plus a pop-out window. (Alternative: a section of the Model tab, which is already long.)</li>
+<li><b>Colours:</b> the overlay runs grey → amber → green so it matches the map's never / thin / trusted; it is not red for unknown, because in Estimated an unknown atom is safe (DFT answers it). Frozen atoms in Sandbox get their own ice-blue mark, kept apart from the pin's blue square.</li>
+<li><b>The overlay's per-atom number</b> is the weakest pair or neighbour pair around the atom; the hover names it. In the app the tint is driven by the same per-atom verdict that refuses or freezes, and the hover names its dominant cause in pair or neighbour-pair words.</li>
+<li><b>Coordination</b> is counted from each pair's own first shell in the collection's histograms (data, no covalent-radius table), and split by neighbour kind.</li>
+<li><b>Segment rule details:</b> a hydrogen always goes with its heavy atom. The box is the segment plus 5 Bohr each side, at the default (Accurate) grid. The sampling plan perturbs and scans only around the trained atoms, which keeps a 23-atom segment to ≈ 316 solves (estimated 5–9 h at h = 0.15, not measured) rather than a full Standard pass over every pair; a sampling-plan question for the plan and the physics reviewer. The memory refusal does not offer a coarser grid, because that would teach another collection.</li>
+<li><b>A specialised file in Estimated:</b> what the scene teaches goes into the file and also into the collection, so the collection still learns from everything.</li>
+<li><b>Forgetting:</b> on a collection, the Model tab's Forget removes only this scene's samples. Deleting a collection lives in File ▸ Collections.</li>
+<li><b>Sandbox panel:</b> it replaces the Model tab's content when Sandbox is the solver (the tab is titled "Model · Sandbox solver"), rather than adding another tab.</li>
+</ol>
+</section>
+</main>
+<script>
+(function () {
+var win = document.getElementById('kmap');
+if (!win) return;
+function pick(attr, val) {
+win.querySelectorAll(attr === 'data-pair' ? '.gedge' : '.gnode').forEach(function (g) { g.classList.toggle('sel', g.getAttribute(attr) === val); });
+var cls = attr === 'data-pair' ? '.pair-panel' : '.el-panel';
+win.querySelectorAll(cls).forEach(function (p) { p.hidden = p.getAttribute(attr) !== val; });
+}
+win.querySelectorAll('.gedge, .gnode').forEach(function (g) {
+var attr = g.hasAttribute('data-pair') ? 'data-pair' : 'data-el';
+var go = function () { pick(attr, g.getAttribute(attr)); };
+g.addEventListener('click', go);
+g.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+});
+pick('data-pair', 'C-H');
+pick('data-el', 'C');
+})();
+</script>
+</body></html>
