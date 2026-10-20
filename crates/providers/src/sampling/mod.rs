@@ -59,7 +59,11 @@
 //!    (shell → fence)** (`providers::surrogate` module doc): strict mode falls back for geometries
 //!    with that pair in the shell band (the answers used, never fitted) and answers everywhere
 //!    else as before; the fence is structural — it never re-earns by a refit, only a later pass's
-//!    shell check for the pair measures the shell again. A [`rescale`](Sampler::rescale) never
+//!    shell check for the pair measures the shell again. A check is judged only against the
+//!    pass's **own** refit (final review M2): a pass that fits nothing (below Q′, or the refit
+//!    fails) says "could not be judged (…) — the cutoff shell of this pair stays unmeasured"
+//!    rather than take an earlier fit's verdict, and one that ends before its check (cancelled, a
+//!    failed reference) says that ([`pending_shell_checks`](Sampler::pending_shell_checks)). A [`rescale`](Sampler::rescale) never
 //!    drops a pending shell check and never counts it as a fitted point. The pair's further
 //!    points beyond the limit are skipped ("… not solved"), counted in `skipped` and reported. A
 //!    scan of 0.7 … 1.8 r₀ crosses the limit only when r₀ > 2.78 Bohr — LiH's Li–H (≈ 3.0 Bohr),
@@ -740,6 +744,22 @@ impl Sampler {
     /// The pass's shell checks so far (drained; module doc, 3.).
     pub fn take_shell_checks(&mut self) -> Vec<ShellCheck> {
         std::mem::take(&mut self.shell_checks)
+    }
+
+    /// The shell checks still queued — (Z_i, Z_j) of the scanned pair and r (Bohr) — that a pass
+    /// ending now never solves (cancelled, or ended by a failed reference): the caller says the
+    /// pair's cutoff shell stays unmeasured (final review M2).
+    pub fn pending_shell_checks(&self) -> Vec<((u8, u8), f64)> {
+        self.queue
+            .iter()
+            .filter_map(|j| match j {
+                Job::Shell(sc, pair, k) => {
+                    let s = &self.scans[*pair];
+                    Some(((sc.nuclei[s.i].z, sc.nuclei[s.j].z), s.r[*k]))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).

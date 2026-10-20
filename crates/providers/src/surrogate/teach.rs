@@ -945,7 +945,16 @@ impl SurrogateKs {
     /// else as before; the class verdicts are untouched. Never a sample, and never lifted by a
     /// refit's re-judgement (final review C1): only a later pass's shell check for the pair
     /// measures the shell again. Box-affected or unfit answers are reported as not judged.
+    #[cfg(test)]
     pub(super) fn judge_shell_checks(&mut self, shells: Vec<crate::sampling::ShellCheck>) {
+        self.judge_shell_checks_with(shells, None)
+    }
+
+    /// [`judge_shell_checks`](Self::judge_shell_checks) with a `caveat` on the fit it judges against (an untrusted fit, or
+    /// one without this pass's samples — `finish_pass`): the verdict is reached and a failure fenced as before, and each
+    /// note adds "(<caveat>: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)".
+    pub(super) fn judge_shell_checks_with(&mut self, shells: Vec<crate::sampling::ShellCheck>, caveat: Option<&str>) {
+        let tail = caveat.map_or(String::new(), |c| format!(" ({c}: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)"));
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
         for c in shells {
@@ -960,16 +969,19 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = c.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = c.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else { continue };
+            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else {
+                self.leave_shell_checks_unjudged(std::slice::from_ref(&c), "the model cannot predict this geometry");
+                continue;
+            };
             if e <= 1.0 && f <= 1.0 {
                 self.user_notes.push(format!(
-                    "sampling: the model's cutoff holds for {name}: at r = {:.2} Bohr the interaction left is within the tiers (energy {e:.2}× the tier, forces {f:.2}× their bound)",
+                    "sampling: the model's cutoff holds for {name}: at r = {:.2} Bohr the interaction left is within the tiers (energy {e:.2}× the tier, forces {f:.2}× their bound){tail}",
                     c.r
                 ));
             } else {
                 let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c.energy - p.energy);
                 self.user_notes.push(format!(
-                    "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — a structural limitation: geometries with {name} in the cutoff shell ({:.2}–{:.2} Bohr) fall back to DFT (a shell fence); everywhere else the model answers as before",
+                    "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — a structural limitation: geometries with {name} in the cutoff shell ({:.2}–{:.2} Bohr) fall back to DFT (a shell fence); everywhere else the model answers as before{tail}",
                     c.r,
                     c.r_cut,
                     crate::sampling::SCAN_CUTOFF_FRACTION * c.r_cut,
@@ -978,6 +990,20 @@ impl SurrogateKs {
                 let pair = (c.pair.0.min(c.pair.1), c.pair.0.max(c.pair.1));
                 self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
             }
+        }
+    }
+
+    /// The pass's shell checks that are not judged (final review M2): solved, but the pass left no
+    /// fit of its own to judge them against (`why`), so each pair's cutoff shell stays unmeasured —
+    /// said, never a silent drop, and never a verdict of an earlier fit. No fence, no sample.
+    pub(super) fn leave_shell_checks_unjudged(&mut self, shells: &[crate::sampling::ShellCheck], why: &str) {
+        for c in shells {
+            self.user_notes.push(format!(
+                "sampling: the shell check of {}–{} at r = {:.2} Bohr could not be judged ({why}) — the cutoff shell of this pair stays unmeasured",
+                units::elements::symbol(c.pair.0),
+                units::elements::symbol(c.pair.1),
+                c.r
+            ));
         }
     }
 

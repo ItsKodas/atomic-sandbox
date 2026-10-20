@@ -2974,6 +2974,14 @@ mod orbital_viewer {
         assert!(l.contains("smeared nuclei") && l.contains("core"), "{l}");
         assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::NotLoneAtom, 0.3), None);
         assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::Labelled { shell_order_inverted: false }, 1.5), None);
+        // a pseudised species has no core on the grid: water under `All` smears nothing, under `CoresOnly` its H's only
+        // (M7 Task 13 Step 5 check: the note read "Zσ = 1.2" for the pseudo-O)
+        let water = Scene::preset("h2o").unwrap().to_sim().unwrap();
+        let sigma = water.sigma.unwrap_or(water.cell.h);
+        let summary = |z: u8| sim::PseudoSummary { z, z_v: 1.0, f: 1.2, local: String::new(), r_c_max: 1.0, h_req: None, h_eb: None, r_core: 0.5, record: String::new() };
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[]), 8.0 * sigma, "all-electron: the O");
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[summary(8)]), sigma, "pseudo-O: the H's");
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[summary(8), summary(1)]), 0.0, "all pseudised: none");
     }
 
     /// A split below the display's resolution is not announced as a split of 0.00 mHa; the legend
@@ -4299,10 +4307,15 @@ fn the_default_is_accepted_species_and_generation_is_said() {
     assert!(all.contains("accepted species (default)"), "the Physics menu:\n{all}");
     assert!(!all.contains("cores only (default)") && all.contains("cores only") && all.contains("all species"));
     // the status line while H is generated through its dimer gate, and nothing when nothing is
-    let gen = PanelInput { pseudo_generating: Some((1, 12.4, true)), ..input(&scene, None, &cam) };
+    use providers::pseudo::GenerationCost as G;
+    let gen = PanelInput { pseudo_generating: Some((1, 12.4, G::GpuGate)), ..input(&scene, None, &cam) };
     let notes = overlays::chip_notes(&st, &gen);
     assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s"), "{notes:?}");
-    let o = PanelInput { pseudo_generating: Some((8, 3.0, false)), ..input(&scene, None, &cam) };
+    // final review M6: the CPU gate's 40 minutes are said
+    let cpu = PanelInput { pseudo_generating: Some((1, 75.0, G::CpuGate)), ..input(&scene, None, &cam) };
+    let notes = overlays::chip_notes(&st, &cpu);
+    assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 40 min on the CPU: its dimer check (no GPU))… 75 s"), "{notes:?}");
+    let o = PanelInput { pseudo_generating: Some((8, 3.0, G::Seconds)), ..input(&scene, None, &cam) };
     assert!(overlays::chip_notes(&st, &o).iter().any(|(_, t)| t == "generating the O pseudopotential (seconds)… 3 s"));
     assert!(!overlays::chip_notes(&st, &inp).iter().any(|(_, t)| t.starts_with("generating")));
 }
