@@ -39,7 +39,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
 /// O at 57³ on the GPU), `wait=model` shoots once the pass has ended and a model is fitted
 /// (trusted or not: for the trust checklist of a refused model), `training=open` opens the
-/// Activity tab's Training section and waits for the worker's first training views.
+/// Activity tab's Training section and waits for the worker's first training views. `wait=relax`
+/// relaxes the geometry after the first solve (Physics ▸ Relax geometry, FIRE) and shoots the
+/// relaxed scene, printing a "relax summary" line (every distance and every angle at a nucleus);
+/// with `wait=bonds` the bond graph is the relaxed geometry's.
 ///
 /// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
 ///
@@ -85,6 +88,10 @@ pub struct ShotUi {
     pub ptable: Option<String>,
     pub wait_bonds: bool,
     pub wait_model: bool,
+    /// `wait=relax`: relax the geometry (FIRE, Physics ▸ Relax geometry) after the first solve and shoot the relaxed
+    /// scene; prints a "relax summary" line with the distances and the angles at each nucleus (the M7 Task 13 checklist
+    /// shot of relaxed water).
+    pub wait_relax: bool,
     pub training: bool,
     /// `plan=quick|gentle|standard|hot`: the sampling preset of the first pass.
     pub plan: Option<usize>,
@@ -146,7 +153,8 @@ impl ShotUi {
                     }
                     "bonds" => s.wait_bonds = true,
                     "model" => s.wait_model = true,
-                    other => return Err(format!("--ui: wait=sampling|nudge|scan|burst|bonds|model, got {other}")),
+                    "relax" => s.wait_relax = true,
+                    other => return Err(format!("--ui: wait=sampling|nudge|scan|burst|bonds|model|relax, got {other}")),
                 },
                 "ghost" => {
                     s.ghost = Some(match v {
@@ -556,6 +564,9 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     } else if sample {
         wait_for_model(&mut viewer, hl, painter)?;
     }
+    if o.ui.wait_relax {
+        wait_for_relax(&mut viewer, hl, painter)?;
+    }
     if o.ui.wait_bonds {
         wait_for_bonds(&mut viewer, hl, painter)?;
     }
@@ -682,6 +693,59 @@ fn wait_for_orbitals(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) 
             return Err(l);
         }
     }
+}
+
+/// Relaxes the scene (`Action::Relax`, as Physics ▸ Relax geometry) and blocks until the relax has ended and the worker is
+/// idle (`wait=relax`); prints the outcome and the relaxed geometry: every distance (Bohr) and every angle at a nucleus.
+fn wait_for_relax(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    viewer.apply(crate::ui::Action::Relax);
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    loop {
+        let done = viewer.snapshot.as_ref().and_then(|s| s.dynamics.relax.as_ref()).is_some_and(|r| r.converged.is_some());
+        if done && crate::replay::idle(viewer) {
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("the relax did not end within 1800 s".into());
+        }
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+            viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        }
+    }
+    let s = viewer.snapshot.as_ref().ok_or("no snapshot")?;
+    let r = s.dynamics.relax.as_ref().ok_or("no relax progress")?;
+    let p: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+    let d = |a: usize, b: usize| (0..3).map(|k| (p[a][k] - p[b][k]).powi(2)).sum::<f64>().sqrt();
+    let mut geo = Vec::new();
+    for i in 0..p.len() {
+        for j in i + 1..p.len() {
+            geo.push(format!("r{i}{j} {:.4}", d(i, j)));
+        }
+    }
+    for v in 0..p.len() {
+        for a in 0..p.len() {
+            for b in a + 1..p.len() {
+                if a != v && b != v {
+                    let u: [f64; 3] = std::array::from_fn(|k| p[a][k] - p[v][k]);
+                    let w: [f64; 3] = std::array::from_fn(|k| p[b][k] - p[v][k]);
+                    let dot: f64 = (0..3).map(|k| u[k] * w[k]).sum();
+                    geo.push(format!("∠{a}{v}{b} {:.2}°", (dot / (d(a, v) * d(b, v))).clamp(-1.0, 1.0).acos().to_degrees()));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "relax summary: converged {:?}, {} steps, max |F| {:.2e} Ha/Bohr, E {:.6} Ha (ΔE {:+.2e}), note {:?}; {}",
+        r.converged,
+        r.steps,
+        r.max_force,
+        r.energy,
+        r.energy - r.energy_start,
+        r.note,
+        geo.join(", ")
+    );
+    Ok(())
 }
 
 /// Blocks until the snapshot carries a bond graph with every free-atom reference in (`wait=bonds`).
@@ -844,6 +908,14 @@ mod tests {
     }
 
     /// `ghost=on|off` (View ▸ Display aids ▸ show what training is solving) and the stage waits.
+    #[test]
+    fn the_relax_wait_parses_beside_the_bond_wait() {
+        let s = ShotUi::parse("wait=relax;wait=bonds;render=iso").unwrap();
+        assert!(s.wait_relax && s.wait_bonds);
+        assert!(!ShotUi::parse("wait=bonds").unwrap().wait_relax);
+        assert!(ShotUi::parse("wait=relaxed").err().is_some_and(|e| e.contains("relax")));
+    }
+
     #[test]
     fn the_ghost_key_parses() {
         assert_eq!(ShotUi::parse("").unwrap().ghost, None);

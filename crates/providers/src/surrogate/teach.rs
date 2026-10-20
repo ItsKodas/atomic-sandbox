@@ -945,6 +945,7 @@ impl SurrogateKs {
     /// else as before; the class verdicts are untouched. Never a sample, and never lifted by a
     /// refit's re-judgement (final review C1): only a later pass's shell check for the pair
     /// measures the shell again. Box-affected or unfit answers are reported as not judged.
+    #[cfg(test)]
     pub(super) fn judge_shell_checks(&mut self, shells: Vec<crate::sampling::ShellCheck>) {
         self.judge_shell_checks_with(shells, None)
     }
