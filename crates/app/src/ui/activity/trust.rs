@@ -35,12 +35,17 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
     let first = m.trust_checks.iter().position(|c| !c.met);
     let seen = AuditSeen::of(m);
     for (k, c) in m.trust_checks.iter().enumerate() {
-        v.push(Line {
-            met: c.met,
-            why: boxed.is_none() && Some(k) == first,
-            text: words::trust_line(c, seen, m.audit_every),
-            hover: format!("value {:.3e}, limit {:.3e}", c.value, c.limit),
-        });
+        let mut text = words::trust_line(c, seen, m.audit_every);
+        let mut met = c.met;
+        // M8a Task 2 (the Task 1 physics review's I4; fix round 1, review M5): audits whose teacher
+        // answer touched the box walls judged nothing — the line reads "unverified", never a tick
+        // (not the refusal's "this is why": the rule is met, the check could not be made); each is
+        // re-audited at the next answered step
+        if c.key == sim::activity::TrustKey::Audit && c.met && m.audits_box_unjudged > 0 {
+            text = format!("{text} — unverified: {} audits near the cell faces could not judge the model", m.audits_box_unjudged);
+            met = false;
+        }
+        v.push(Line { met, why: boxed.is_none() && Some(k) == first, text, hover: format!("value {:.3e}, limit {:.3e}", c.value, c.limit) });
     }
     if boxed.is_none() && first.is_none() && m.fitted {
         // box-affected samples below the trust floor are fitted, and a model can still pass with

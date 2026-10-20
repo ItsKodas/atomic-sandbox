@@ -315,11 +315,18 @@ fn residuals(t: Option<TrainingResiduals>) -> String {
     t.map_or("—".into(), |t| format!("E/atom {:.2e}, F {:.2e} (bound {:.2e})", t.energy_per_atom, t.force, t.force_bound))
 }
 
-/// The per-class leave-one-out numbers (round 6): "pair n 273, LOO F rms 0.05× max 0.40×, E 0.10×, trusted".
+/// The per-class leave-one-out numbers (round 6) and the calibrated verdict's inputs (M8a Task 2):
+/// "pair n 273, LOO F rms 0.05× max 0.40×, E rms 0.04× max 0.10×, κ 1.41 (3 evidence), trusted".
 fn class_summary(s: &SurrogateKs) -> String {
     s.class_loo()
         .iter()
-        .map(|c| format!("{} n {}, LOO F rms {:.3}× max {:.3}×, E {:.3}×, {}", c.class, c.samples, c.force_rms, c.force_max, c.energy_max, if c.trusted { "trusted" } else { "untrusted" }))
+        .map(|c| {
+            format!(
+                "{} n {}, LOO F rms {:.3}× max {:.3}×, E rms {:.3}× max {:.3}×, κ {:.2} ({} evidence), {}",
+                c.class, c.samples, c.force_rms, c.force_max, c.energy_rms, c.energy_max, c.calibration, c.evidence,
+                if c.trusted { "trusted" } else { "untrusted" }
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -1036,6 +1043,17 @@ const REPRO_CHECK_EVERY: usize = 4;
 /// judged 1 of 87 — 21 of its ~22 checks were box-affected). It runs with the container walls on
 /// (the app's default) at `REPRO_WALL_HALF_WIDTH`, which keeps the nuclei ≥ 2 Bohr inside the
 /// faces' 3h margin region, so its answers are mostly not box-affected and can be judged.
+///
+/// **Two-sided since M8a Task 2 (fix round 1, the controller's ruling A on the physics review):**
+/// the calibrated class verdict refuses the hot run's many-body class when the teacher's error at
+/// the geometries it would answer is beyond the bound, so a hot run may answer nothing — the old
+/// max rule fluctuated open there (32 answers, worst judged 2.7× the bound, z up to 9.8). The floor
+/// is then met the other way round: at least this many **class-refused steps whose would-be model
+/// answers are judged against the teacher** (the refusing model's prediction at the step's geometry
+/// against the teacher's forces the step used) with the rms over them of the per-atom ‖ΔF‖/√3 /
+/// bound **beyond `ENTER`** — "the refusal was warranted". Never a bare "every step was refused":
+/// that would assert nothing about any force. The check fails both ways — a class refusing
+/// geometries the model knows (over-refusal), or a model answering badly.
 const REPRO_MIN_JUDGED_HOT: usize = 10;
 /// The hot run's container walls (Bohr; the 49³ cell's half-extent is 6, its margin 5.25).
 const REPRO_WALL_HALF_WIDTH: f64 = 3.0;
@@ -1209,11 +1227,23 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let mut refitted = false;
     let (mut max_same, mut max_switch, mut max_residual, mut switches) = (0.0f64, 0.0f64, 0.0f64, 0usize);
     let mut stopped = None;
+    // the class-refused steps' would-be answers against the teacher (M8a Task 2 fix round 1): the
+    // per-atom ‖ΔF‖/√3 / bound of the refusing model's prediction, rms per step
+    let mut refused_ratio: Vec<f64> = Vec::new();
     for i in 0..n_steps {
         d.apply(DynCommand::Step(1));
         let tb = !gate && trusted_now(hs);
         let snap = d.tick(f64::INFINITY, &mut never());
         observe(&mut baseline, tb);
+        if snap.source == Source::Fallback && which_rule(&snap.eval.notes) == "rule 4b (class LOO)" {
+            // before the refit below: the model that refused is the one judged
+            let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|x| x.pos).collect();
+            let z: Vec<u8> = snap.scene.nuclei.iter().map(|x| x.z).collect();
+            let pr = hs.lock().unwrap_or_else(|e| e.into_inner()).model().expect("a model refused").predict(&pos, &z, false).expect("predict");
+            let n_at = pos.len() as f64;
+            let ms: f64 = pr.forces.iter().zip(&snap.forces).map(|(fm, ft)| { let (dd, b) = pol.force_residual(fm, ft); (dd / b).powi(2) }).sum::<f64>() / n_at;
+            refused_ratio.push(ms.sqrt());
+        }
         let max = snap.scene.cell.max_coord();
         let worst = snap.scene.nuclei.iter().flat_map(|x| x.pos).fold(0.0f64, |m, x| m.max(x.abs()));
         check!(gate, soft, worst <= max, "{what} step {i}: a published scene is outside the margin ({worst} > {max})");
@@ -1310,11 +1340,18 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         let _ = writeln!(out, "      γ ≤ {cut}: {} judged answers, worst force ratio {worst:.2}", kept.len());
     }
     for b in &bad { let _ = writeln!(out, "    BEYOND THE TIER {b}"); }
+    // the class-refused steps, judged the same way (fix round 1): was the refusal warranted?
+    let refused_rms = if refused_ratio.is_empty() { f64::NAN } else { (refused_ratio.iter().map(|x| x * x).sum::<f64>() / refused_ratio.len() as f64).sqrt() };
+    let _ = writeln!(out, "    class-refused steps' would-be answers against the teacher: {} steps, per-step rms ‖ΔF‖/√3 / bound {} — rms over them {refused_rms:.3} (ENTER {:.3}: the refusal is warranted beyond it)",
+                     refused_ratio.len(), sci(&refused_ratio), providers::surrogate::ENTER);
     println!("{out}");
     out.clear();
     check!(gate, soft, bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
     if hot {
-        check!(gate, soft, checked >= REPRO_MIN_JUDGED_HOT, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected)");
+        // two-sided (the doc of `REPRO_MIN_JUDGED_HOT`): enough answers judged, or enough refusals
+        // judged and warranted — never a bare "everything was refused"
+        let warranted = refused_ratio.len() >= REPRO_MIN_JUDGED_HOT && refused_rms > providers::surrogate::ENTER;
+        check!(gate, soft, checked >= REPRO_MIN_JUDGED_HOT || warranted, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected), and the {} class-refused steps' would-be answers have rms error/bound {refused_rms:.3} (a warranted refusal needs ≥ {REPRO_MIN_JUDGED_HOT} of them beyond ENTER {:.3})", refused_ratio.len(), providers::surrogate::ENTER);
     }
     check!(gate, soft, max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
     if let Some(b) = baseline {
@@ -1387,9 +1424,21 @@ struct TrustBaseline {
     prev_class: Option<[Option<bool>; 2]>,
     prev_model: Option<bool>,
     /// Consecutive-step changes of the class verdict (both steps with a verdict), per class, and
-    /// of the model-level `trusted()`.
+    /// of the model-level `trusted()`; `class_entries` counts those that were untrusted → trusted
+    /// (a class earning trust, which every run must do once; the rest are losses).
     class_flips: [usize; 2],
+    class_entries: [usize; 2],
     model_flips: usize,
+    /// The calibrated verdict's inputs at the last observation (M8a Task 2): per class the
+    /// calibration factor κ, its evidence in points, the LOO force / energy rms ratios and the
+    /// measured force / energy errors (W, W_E; fix round 1).
+    calibration: [(f64, usize, f64, f64, f64, f64); 2],
+    /// Fallback points' z (max over the point's atoms of the class) by refusing rule code, per
+    /// class: the flagged tail the calibrated verdict is validated on (physics review I3).
+    z_by_rule: [std::collections::BTreeMap<u8, Vec<f64>>; 2],
+    /// Every class verdict flip, in words: the step, the class, the direction and the new verdict's
+    /// numbers (what moved it).
+    flip_log: Vec<String>,
     /// z_E = err_energy / pred_energy_std per point, audits and fallbacks apart, and the absolute
     /// |E_teacher − E_model|/N (Ha/atom) beside it.
     z_energy_audit: Vec<f64>,
@@ -1447,7 +1496,11 @@ impl TrustBaseline {
             prev_class: None,
             prev_model: None,
             class_flips: [0; 2],
+            class_entries: [0; 2],
             model_flips: 0,
+            calibration: [(f64::NAN, 0, f64::NAN, f64::NAN, f64::NAN, f64::NAN); 2],
+            z_by_rule: Default::default(),
+            flip_log: Vec::new(),
             z_energy_audit: Vec::new(),
             z_energy_fallback: Vec::new(),
             gap_audit: Vec::new(),
@@ -1495,11 +1548,20 @@ impl TrustBaseline {
                 if let (Some(a), Some(b)) = (prev[c], verdict[c]) {
                     if a != b {
                         self.class_flips[c] += 1;
+                        self.class_entries[c] += (!a && b) as usize;
+                        let l = &loo[c];
+                        self.flip_log.push(format!(
+                            "step {} {}: {} → {} — {:?}; measured F {:.4}× E {:.4}× from {} evidence (κ {:.3}), LOO F rms {:.4}× max {:.2}×, E rms {:.4}× max {:.2}×, {} samples, model gen {}",
+                            self.steps, l.class, if a { "trusted" } else { "untrusted" }, if b { "trusted" } else { "untrusted" }, l.refusal, l.measured, l.measured_energy, l.evidence, l.calibration, l.force_rms, l.force_max, l.energy_rms, l.energy_max, l.samples, s.model_generation()
+                        ));
                     }
                 }
             }
         }
         self.prev_class = Some(verdict);
+        for (c, l) in loo.iter().enumerate().take(2) {
+            self.calibration[c] = (l.calibration, l.evidence, l.force_rms, l.energy_rms, l.measured, l.measured_energy);
+        }
         let trusted = s.trusted();
         if self.prev_model.is_some_and(|p| p != trusted) {
             self.model_flips += 1;
@@ -1573,6 +1635,9 @@ impl TrustBaseline {
             }
             for c in 0..2 {
                 if seen_class[c] {
+                    if let surrogate::history::PointKind::Fallback { rule } = p.kind {
+                        self.z_by_rule[c].entry(rule).or_default().push(point_max[c].1);
+                    }
                     let b = &mut rows[c];
                     b.points += 1;
                     b.z_point.push(point_max[c].1);
@@ -1609,8 +1674,14 @@ impl TrustBaseline {
         let share = |k: usize, n: usize| if n == 0 { f64::NAN } else { 100.0 * k as f64 / n as f64 };
         for (c, name) in providers::surrogate::ENV_CLASSES.iter().enumerate() {
             let b = &self.audit[c];
-            let _ = writeln!(o, "  {name}: in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms, {} with an undefined LOO excluded; over the fits seen {:.2e}–{:.2e}); class verdict flips {} over {} consecutive-step pairs",
-                             b.p99, b.p99_atoms, b.loo_undefined, b.p99_min, b.p99_max, self.class_flips[c], self.steps.saturating_sub(1));
+            let _ = writeln!(o, "  {name}: in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms, {} with an undefined LOO excluded; over the fits seen {:.2e}–{:.2e}); class verdict flips {} over {} consecutive-step pairs ({} of them entries untrusted → trusted, {} losses)",
+                             b.p99, b.p99_atoms, b.loo_undefined, b.p99_min, b.p99_max, self.class_flips[c], self.steps.saturating_sub(1), self.class_entries[c], self.class_flips[c] - self.class_entries[c]);
+            let (kappa, evidence, f_rms, e_rms, w_f, w_e) = self.calibration[c];
+            let _ = writeln!(o, "    calibrated verdict at the last observation (M8a Task 2, fix round 1): measured F {w_f:.4}× the bound, E {w_e:.4}× the tier from {evidence} evidence points (κ {kappa:.3}); LOO F rms {f_rms:.4}× E rms {e_rms:.4}× → the verdict's force value max(LOO, measured) = {:.4}× (enter ≤ {:.3}, stay ≤ {:.1})",
+                             f_rms.max(w_f), providers::surrogate::ENTER, providers::surrogate::LEAVE);
+            for (rule, zs) in &self.z_by_rule[c] {
+                let _ = writeln!(o, "    fallback z per point under {}: {}", providers::surrogate::history_rule_name(*rule), quantiles(zs));
+            }
             for (what, b) in [("audits", &self.audit[c]), ("fallbacks", &self.fallback[c])] {
                 if b.points == 0 {
                     let _ = writeln!(o, "    {what}: none touching the class");
@@ -1622,6 +1693,12 @@ impl TrustBaseline {
                 let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
                 let _ = writeln!(o, "      ‖ΔF‖ per point (max over its atoms), Ha/Bohr: {}; per atom: {} — the audit's force tolerance is max({:.0e}, 10 % |F|) ≤ {:.0e} Ha/Bohr", sci(&b.err_point), sci(&b.err_atom), pol.force_std_abs, providers::surrogate::FORCE_STD_BOUND_MAX);
                 let _ = writeln!(o, "      z = ‖ΔF‖/pred_force_std per point (max over its atoms): {}; per atom: {}", quantiles(&b.z_point), quantiles(&b.z_atom));
+            }
+        }
+        if !self.flip_log.is_empty() {
+            let _ = writeln!(o, "  class verdict flips, each with the new verdict's numbers:");
+            for f in &self.flip_log {
+                let _ = writeln!(o, "    {f}");
             }
         }
         let _ = writeln!(o, "  energy z_E = (E_teacher − E_model)/pred_energy_std — audits: {}; fallbacks: {}", quantiles(&self.z_energy_audit), quantiles(&self.z_energy_fallback));
@@ -1658,7 +1735,7 @@ fn trust_baseline_report() {
     let mut al = TrustBaseline::new(&format!("active_learning_run ({AL_STEPS} steps, audit every {every})"));
     active_learning_run(Some(&mut al), every);
     let mut out = String::new();
-    let _ = writeln!(out, "# M8a trust baseline (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s)\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64());
+    let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 1 — the measured error with the LOO floor; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM);
     let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
     out += &repro.report();
     out += &al.report();

@@ -146,12 +146,13 @@
 //! predictive stds against the teacher's errors, the evidence of a calibration). When the writer's
 //! history is not blank (a point recorded or an `Unrecorded` counter set) the header carries the
 //! key `audit_history` {points, recorded, no_variance, box_affected, draft, unfit (JSON integers)}
-//! right after `arrays`, and the nine history arrays follow the sample tail, last, in the order of
+//! right after `arrays`, and the ten history arrays follow the sample tail, last, in the order of
 //! [`HistoryArrays::NAMES`](crate::history::HistoryArrays::NAMES) — `audit_atoms`,
 //! `audit_model_gen`, `audit_kind`, `audit_energy_std`, `audit_err_energy` (`points` each) and
-//! `audit_classes`, `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (Σ atoms
-//! each; module doc of `crate::history` for the contents and the validation; `audit_kind` and the
-//! `unfit` counter were added in fix round 1 while version 7 was unreleased — no earlier form of
+//! `audit_classes`, `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force`,
+//! `audit_teacher_force` (Σ atoms each; module doc of `crate::history` for the contents and the
+//! validation; `audit_kind` and the `unfit` counter were added in Task 1's fix round and
+//! `audit_teacher_force` in Task 2's, while version 7 was unreleased — no earlier form of
 //! version 7 exists in a file). With a blank history nothing is added:
 //! the file is version 5's bytes under the version-7 magic. The key and the arrays are read for
 //! version 7 only; versions 1 to 5 read with an empty history, version 6 has none (nothing was
@@ -1010,7 +1011,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     }
     // the optional quarantine flags and face densities, in that order (module doc)
     let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
-    // the audit history (version 7, module doc): the key announces the eight arrays, last
+    // the audit history (version 7, module doc): the key announces the ten arrays, last
     let history_counts = if version >= 7 { decode_history_key(&h)? } else { None };
     if let Some((points, _, _)) = &history_counts {
         for (i, name) in HistoryArrays::NAMES.iter().enumerate() {
@@ -1101,7 +1102,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let audit_history = match history_counts {
         None => AuditHistory::default(),
         Some((_, recorded, unrecorded)) => {
-            let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next()]);
+            let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next(), next()]);
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
@@ -1891,6 +1892,7 @@ mod tests {
             pred_force_std_epistemic: (0..n).map(|j| 5e-4 * (1.0 + k + j as f64)).collect(),
             pred_energy_std: 2e-5 * (1.0 + k),
             err_force: (0..n).map(|j| 7e-4 * (1.0 + j as f64) * if i % 2 == 0 { 1.0 } else { 1.5 }).collect(),
+            teacher_force: (0..n).map(|j| 2e-2 * (1.0 + k) + 1e-3 * j as f64).collect(),
             err_energy: if i % 3 == 0 { -1.3e-5 * (1.0 + k) } else { 2.1e-6 * k },
             n_atoms: n,
             model_gen: 3 + i / 7,
@@ -1987,9 +1989,9 @@ mod tests {
         assert!(header7.contains("\"audit_history\":{\"points\":57,\"recorded\":57,\"no_variance\":3,\"box_affected\":2,\"draft\":1,\"unfit\":4}"), "{header7}");
         let n_pts = 57usize;
         let a_sum = hist.to_arrays().classes.len();
-        // the body walk: the history arrays are the last nine (five of `points`, four of Σ atoms)
+        // the body walk: the history arrays are the last ten (five of `points`, five of Σ atoms)
         let per_point = crate::history::HistoryArrays::PER_POINT;
-        let hist_bytes = 9 * 8 + 8 * (per_point * n_pts + 4 * a_sum);
+        let hist_bytes = 10 * 8 + 8 * (per_point * n_pts + 5 * a_sum);
         let hist_at = bytes.len() - hist_bytes;
         let classes_at = hist_at + per_point * (8 + 8 * n_pts) + 8;
         let mut bad_class = bytes.clone();

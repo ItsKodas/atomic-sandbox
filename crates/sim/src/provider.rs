@@ -1084,6 +1084,11 @@ pub struct TrainableStatus {
     /// (never audited), `Some` and `false` (no audit since the last refit: the record is an
     /// earlier fit's), `Some` and `true` (activity Task 3 review I1).
     pub last_audit_this_fit: bool,
+    /// Consecutive audits whose teacher answer was box-affected since the last judged one (M8a
+    /// Task 2, the Task 1 physics review's I4): each is "not judged", leaves no evidence and does
+    /// not satisfy the audit cadence — the next answered step is audited again. The checklist says
+    /// "k audits near the cell faces could not judge the model". 0 after a judged audit.
+    pub audits_box_unjudged: usize,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
     /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
@@ -1162,14 +1167,18 @@ pub struct Readiness {
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
 /// ("pair": every atom has at most one neighbour within r_cut; "many-body": some atom has two or
 /// more), its samples, the LOO per-atom force error over its atoms as a ratio to each atom's
-/// force bound (RMS and max), the largest LOO per-atom energy error as a ratio to the energy
-/// tier, and whether the class is trusted.
+/// force bound (RMS and max), the LOO per-atom energy error as a ratio to the energy tier (RMS
+/// over the class's samples and max), the audit calibration the verdict used, and whether the
+/// class is trusted (`providers::surrogate::calibrate`, M8a Task 2: the calibrated, hysteretic
+/// verdict).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassLoo {
     pub class: &'static str,
     pub samples: usize,
     pub force_rms: f64,
     pub force_max: f64,
+    /// RMS over the class's samples of the LOO per-atom energy error over the tier (M8a Task 2).
+    pub energy_rms: f64,
     pub energy_max: f64,
     pub trusted: bool,
     /// The class rule's verdict in structured form: (the first failing condition, its value, its
@@ -1178,6 +1187,26 @@ pub struct ClassLoo {
     /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
     /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
+    /// κ_c, the audit calibration factor: the teacher's error over the model's predicted std,
+    /// rms over the audit history's points of the class (≥ 1; 1 without any evidence, ∞ when a
+    /// comparison in the evidence was not a number). A readout (M8a Task 2): the verdict decides
+    /// on `measured`.
+    pub calibration: f64,
+    /// The teacher's force error at the geometries this class verdict decides, rms over the
+    /// history's audits and rule-4b fallbacks of the class in units of the policy's per-atom bound,
+    /// inflated by one sigma of its own scatter (`providers::surrogate::calibrate`, W_c); NaN
+    /// without evidence. The verdict's force value is max(`force_rms`, `measured`).
+    pub measured: f64,
+    /// The same for the energy: |E_teacher − E_model|/N over the tier, rms over those points,
+    /// inflated; NaN without evidence.
+    pub measured_energy: f64,
+    /// The evidence behind `calibration`, in points: the audits plus the capped weight of the
+    /// rule-4b fallbacks of the class. Below `providers::surrogate::calibrate::MIN_EVIDENCE` the
+    /// verdict is the uncalibrated rule of before.
+    pub evidence: usize,
+    /// The model generation (`TrainableStatus::model_gen`) since which the class has been trusted
+    /// without interruption — the hysteresis memory; `None` while untrusted.
+    pub trusted_since: Option<u64>,
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
@@ -1187,10 +1216,17 @@ pub enum ClassKey {
     /// Fewer samples of the class than Q′: (samples, Q′).
     Samples,
     /// The leave-one-out force error over the class's atoms: the larger of max and RMS, as a
-    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN).
+    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN). The uncalibrated rule.
     Force,
-    /// The largest leave-one-out per-atom energy error, as a ratio to the tier (limit 1).
+    /// The leave-one-out per-atom energy error as a ratio to the tier: the max (the uncalibrated
+    /// rule, limit 1) or the RMS (the calibrated verdict, limit `ENTER` or `LEAVE`).
     Energy,
+    /// The measured class error — max(LOO force RMS, the teacher's rms force error over the
+    /// class's audited comparisons) in bound units — against the verdict's limit
+    /// (`providers::surrogate::calibrate`: `ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to
+    /// stay); or, while the class has fewer than three comparisons, one atom's measured error
+    /// against `WORST_ATOM` = 3× its bound.
+    Calibrated,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

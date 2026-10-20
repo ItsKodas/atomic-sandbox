@@ -37,6 +37,9 @@ pub use sim::{AuditRecord, AuditVerdict};
 /// | 18 | `Audit` (an audit's own kind is `PointKind::Audit`; the code is for completeness) |
 /// | 19 | `RelaxVerification` |
 /// | 20 | `Pass` (a sampling-pass job; never a step) |
+/// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
+///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
+///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
 pub fn history_rule_code(rule: TeachRule) -> u8 {
     use sim::activity::EnvClass;
     match rule {
@@ -64,6 +67,12 @@ pub fn history_rule_code(rule: TeachRule) -> u8 {
     }
 }
 
+/// The history code of a step the class rule (4b) refused while the variance verdict (rule 6/7)
+/// refused it as well (M8a Task 2): `evaluate` shows the class's note (rules 6–7 yield to the
+/// class's), but the model would not have answered the step had the class been trusted, so the
+/// comparison is not evidence for the class verdict — `calibrate::in_jurisdiction` leaves it out.
+pub const HISTORY_RULE_CLASS_AND_VARIANCE: u8 = 21;
+
 /// The rule a [`history_rule_code`] names, in the decision list's words ("?" for an unknown code).
 pub fn history_rule_name(code: u8) -> &'static str {
     match code {
@@ -88,6 +97,7 @@ pub fn history_rule_name(code: u8) -> &'static str {
         18 => "audit",
         19 => "relax verification",
         20 => "pass",
+        21 => "rule 4b with rule 6/7 failing too",
         _ => "?",
     }
 }
@@ -553,6 +563,8 @@ impl SurrogateKs {
         let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
         let classes = neighbour_counts(pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1)).collect();
         let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
+        // |F_teacher| per atom: the per-atom bound's input (M8a Task 2 fix round 1, review A.1)
+        let teacher_force = forces.iter().map(|t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()).collect();
         // (`push` checks the per-atom lengths and the class codes and panics on a mismatch)
         self.audit_history.push(surrogate::AuditPoint {
             kind,
@@ -561,6 +573,7 @@ impl SurrogateKs {
             pred_force_std_epistemic: force_std_epistemic.to_vec(),
             pred_energy_std: energy_std,
             err_force,
+            teacher_force,
             err_energy: energy - model_energy,
             n_atoms: n,
             model_gen: self.model_gen,
@@ -581,6 +594,7 @@ impl SurrogateKs {
             a.new_generation();
         }
         self.audit_due = false;
+        self.box_audits_unjudged = 0;
         self.audit_flip = false;
         self.last_audit = None;
         self.failed_audits.clear();
@@ -768,7 +782,7 @@ impl SurrogateKs {
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
-                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error; the next answered step is audited again",
                 box_rho.unwrap_or(0.0)
             ),
             // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
@@ -799,6 +813,15 @@ impl SurrogateKs {
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         // the prediction judged above is the current model's, so the stamp is this fit's
         self.last_audit_fit = self.fits;
+        // a box-affected audit judged nothing (M8a Task 2, the Task 1 physics review's I4): it
+        // does not satisfy the cadence — the next answered step dispatches another — and the
+        // checklist counts it; the model's surface and trust are untouched (the gap is the box's)
+        if verdict == AuditVerdict::BoxAffected {
+            self.audit_due = true;
+            self.box_audits_unjudged += 1;
+        } else {
+            self.box_audits_unjudged = 0;
+        }
         // the history's point (M8a Task 1)
         let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),

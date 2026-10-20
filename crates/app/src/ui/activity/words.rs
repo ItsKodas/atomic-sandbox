@@ -284,6 +284,16 @@ pub fn class_line(l: &sim::ClassLoo) -> String {
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
+        // M8a Task 2: the thin-evidence guard (one atom beyond `WORST_ATOM` = 3× its bound) …
+        Some((ClassKey::Calibrated, x, lim)) if lim == providers::surrogate::WORST_ATOM => format!(
+            "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",
+            providers::surrogate::MIN_EVIDENCE
+        ),
+        // … or the calibrated verdict: the error the DFT checks measured where the class answers
+        Some((ClassKey::Calibrated, x, _)) => format!(
+            "{name} — not yet (DFT checks measured its error at {x:.1}× the bound over {} checks; it claimed {:.1}× less)",
+            l.evidence, l.calibration
+        ),
     }
 }
 

@@ -171,7 +171,10 @@ pub(super) fn teach_verdict(classes: &[sim::ClassLoo], still_blocking: bool, out
     }
     let present: Vec<&sim::ClassLoo> = classes.iter().filter(|c| c.samples > 0).collect();
     let loo_fails = |c: &sim::ClassLoo| !(c.force_max <= 1.0 && c.force_rms <= 1.0 && c.energy_max <= 1.0);
-    if still_blocking || out_of_fit || failed > 0 || unjudged > 0 || present.iter().any(|c| loo_fails(c)) {
+    // a class the calibrated verdict refuses (M8a Task 2: its audits found the model off where it
+    // answers) is not accepted either — only a class short of samples is "needs samples"
+    let refused_by_verdict = |c: &sim::ClassLoo| !c.trusted && !matches!(c.refusal, Some((sim::ClassKey::Samples, ..)));
+    if still_blocking || out_of_fit || failed > 0 || unjudged > 0 || present.iter().any(|c| loo_fails(c) || refused_by_verdict(c)) {
         return TeachVerdict::NotAccepted;
     }
     if present.iter().any(|c| !c.trusted) {

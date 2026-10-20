@@ -464,7 +464,7 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)) };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
     }
 }

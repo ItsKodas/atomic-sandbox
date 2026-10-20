@@ -190,8 +190,9 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: Some(1) }],
         last_audit_this_fit: true,
+        audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
         trust_checks: Vec::new(),
         stuck_info: None,
@@ -3802,11 +3803,34 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: refusal.is_none(), refusal };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: 1.4, measured_energy: 0.2, evidence: 12, trusted_since: None };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
         assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
+        // M8a Task 2: the calibrated verdict names the measured error and the calibration
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its error at 1.4× the bound over 12 checks; it claimed 2.1× less)");
+        // the thin-evidence guard: one atom beyond 3× its bound
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 4.2, 3.0)))), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+    }
+
+    /// M8a Task 2 (the Task 1 physics review's I4): audits near the cell faces that could not
+    /// judge the model are said on the checklist's audit line, never worded as a pass.
+    #[test]
+    fn box_affected_audits_are_said_on_the_audit_line() {
+        use activity::trust::lines;
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let mut m = model();
+        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 }];
+        let plain = lines(&m, &scene, &st);
+        assert!(!plain.iter().any(|l| l.text.contains("near the cell faces")), "{plain:?}");
+        m.audits_box_unjudged = 3;
+        m.last_audit.as_mut().unwrap().verdict = sim::AuditVerdict::BoxAffected;
+        let said = lines(&m, &scene, &st);
+        let line = said.iter().find(|l| l.text.starts_with("Last check against DFT")).expect("the audit line");
+        assert!(!line.met && !line.why, "unverified: no tick, and not the refusal's reason either (review M5)");
+        assert!(line.text.contains("box-affected, not judged") && line.text.ends_with("— unverified: 3 audits near the cell faces could not judge the model"), "{}", line.text);
     }
 
     /// Review Focus 4 on the diag-3h fixture: the box line is first and "this is why"; the fit's own

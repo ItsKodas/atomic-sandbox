@@ -31,15 +31,20 @@
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
-//!    - **4b, untrusted class** (M6 Task 11 round 6; per atom since 2026-10-18; "Class-wise
-//!      trust" below): a class among the query's atoms (pair or many-body, by each atom's
-//!      neighbour count within r_cut) is not trusted by the fit's exact leave-one-out errors →
-//!      teacher; sample kept (never thinned while the class is short of Q′ samples — those earn its
-//!      trust; thinned like rule 5 otherwise; never a copy, short or not: `is_label_copy`);
-//!      reported on the teacher's surface (the model's energy there is unvalidated).
-//!      "surrogate: this kind of environment isn't learned well enough yet (many-body: LOO force
-//!      error 3.2× the bound, RMS 0.41×, 45 samples)". Evaluated with the model consulted; when
-//!      rule 5 fires as well its more specific note is shown. Draft mode answers anyway.
+//!    - **4b, untrusted class** (M6 Task 11 round 6; per atom since 2026-10-18; calibrated and
+//!      hysteretic since M8a Task 2; "Class-wise trust" below): a class among the query's atoms
+//!      (pair or many-body, by each atom's neighbour count within r_cut) is not trusted — its
+//!      fit's exact leave-one-out force RMS, scaled by the audit history's calibration factor for
+//!      the class, is beyond the verdict's limit (or, with fewer than three audited comparisons of
+//!      the class, the rule of before: a LOO ratio beyond 1) → teacher; sample kept (never thinned
+//!      while the class is short of Q′ samples — those earn its trust; thinned like rule 5
+//!      otherwise; never a copy, short or not: `is_label_copy`); reported on the teacher's surface
+//!      (the model's energy there is unvalidated); the comparison is a **rule-4b point of the audit
+//!      history**, the evidence that calibrates the class. "surrogate: this kind of environment
+//!      isn't learned well enough yet (pair: calibrated error 1.4× the bound — leave-one-out RMS
+//!      0.41× scaled by 3.5× from 20 audited comparisons, limit 1.00 — 273 samples)". Evaluated
+//!      with the model consulted; when rule 5 fires as well its more specific note is shown.
+//!      Draft mode answers anyway.
 //! 5. **Out of the training envelope** → teacher; sample kept (thinned); reported on the
 //!    teacher's surface (M6 Task 11, "One-surface energy accounting"). This guards the directions
 //!    the variance cannot: a linear model's predictive variance is a leverage in feature space
@@ -428,12 +433,44 @@
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
 //!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
-//! - **Trusted class**: ≥ Q′ samples holding it (the trust rule's minimum count), and over its
-//!   atoms the LOO force error ‖r_F,j‖/√3 against the atom's bound `force_bound(|F_j|)` (the
-//!   variance rule's: max(2e-3, 10 %|F|) capped at 1e-2) has RMS ≤ 1 **and** max ≤ 1, and every
-//!   sample holding it has LOO energy |r_E|/N ≤ `energy_std_per_atom` (the energy is not per atom:
-//!   it counts for every class the sample holds). A sample whose LOO is undefined (I − H_ss
-//!   singular) counts as infinitely off.
+//! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix round 1, spec
+//!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
+//!   `validate/references.md`, "M8a calibrated verdict"): ≥ Q′ samples holding it (the trust
+//!   rule's minimum count), and the error the teacher **measured** where this verdict decides
+//!   within the verdict's limit. The evidence is the audit history's points in the verdict's
+//!   jurisdiction — audits, and the fallbacks rule 4b itself refused (never rule 5/5e's, which
+//!   refuse whatever the class verdict says, nor a class refusal rule 6/7 would have refused as
+//!   well, coded apart as `HISTORY_RULE_CLASS_AND_VARIANCE`) — one draw per point (ΣF = 0: a dimer
+//!   is one draw), a class's rule-4b points weighing together at most as much as its audits (never
+//!   fewer than three). Per class: W_c = rms over those points of the per-atom ‖F_teacher −
+//!   F_model‖/√3 over the atom's bound `force_bound(|F_teacher|)` (the variance rule's: max(2e-3,
+//!   10 %|F|) capped at 1e-2; |F_teacher| is stored per atom in the history for it), W_E,c = rms
+//!   of |E_teacher − E_model|/N over `energy_std_per_atom`, each × (1 + 1/√(2n)) — one sigma of
+//!   the estimate's own scatter over n points; the verdict's force value is max(R_c, W_c), R_c the
+//!   RMS over the class's atoms of the LOO force error ‖r_F,j‖/√3 against its bound — the model is
+//!   never trusted beyond its own leave-one-out — and its energy value W_E,c. κ_c = the rms of
+//!   z = ‖ΔF‖ / the predicted std (floored at 1, inflated the same way) is **reported** as the
+//!   posterior's calibration and decides nothing: a product κ·R overstates the error for a sparse
+//!   class by the leverage ratio and z has no floor on its denominator (the fix round's physics
+//!   review, I1/I2). **Hysteresis**: an untrusted class enters at both values ≤ `ENTER` = 1/√2
+//!   (half the bound's variance) and a trusted one stays while both ≤ `LEAVE` = 1 (the bound
+//!   itself) — a √2 band, equal to the estimate's one-sigma scatter at n = 3 and wider from n = 4,
+//!   so refit-to-refit jitter cannot flip it; the memory is the verdict that stood when the refit
+//!   began (`class_memory`, `ClassLoo::trusted_since`), reset by a forget or an installed model
+//!   (a reload re-enters). **Below three points of evidence** (`MIN_EVIDENCE`) the posterior's
+//!   claims are unverified and the rule of before stands unchanged — RMS ≤ 1 **and** max ≤ 1 on
+//!   the force, LOO energy max ≤ 1 (`trust::class_refusal`) — plus the one guard thin evidence
+//!   gives: an atom measured beyond `WORST_ATOM` = 3× its bound refuses (P(χ²₃/3 > 9) = 5.9e-6 for a
+//!   calibrated posterior at the bound: wrong, not unlucky). Nothing is loosened without
+//!   evidence, and a class the max refuses for one outlier earns the calibrated verdict from its
+//!   own three rule-4b fallbacks (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO max
+//!   1.08×, enters after 10 fallback steps and holds —
+//!   `a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds`). The max over the
+//!   class is gone where evidence exists: the verdict is about the expected error over the
+//!   class's environments (what rule 6's "std ≤ bound" claims per step), measured by the teacher
+//!   at the geometries the class would answer. A sample whose LOO is undefined (I − H_ss singular)
+//!   counts as infinitely off (RMS ∞); a comparison in the evidence that is not a number makes W
+//!   and κ infinite.
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
 //! - **4b fallbacks**: kept unthinned while the class is short of Q′ samples, thinned like rule 5
@@ -445,17 +482,22 @@
 //!   O1H4 scene never visits). Learning at the blockers is the teach-around pass's job ("Teaching
 //!   around the blockers" below).
 //!
-//! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict) are in
+//! The per-class numbers (samples, LOO force RMS and max ratios, energy RMS and max ratios, the
+//! calibration factor and its evidence, the verdict and since when) are in
 //! `TrainableStatus::class_loo` for the Model tab; the readiness readout names the class's worst
-//! sample and its origin. **Costs of the max** (measured, rule 7): one sample alone in its region
-//! decides its class — the GPU repro's kept tail sample at r = 5.125 (LOO force 14.9× its bound)
-//! untrusts the H₂ pair class until the region fills in (all 1600 heating steps fall back), a
-//! first H–He sample (LOO energy 1.1e3× the tier: no other row has an H–He feature) untrusts H₂
-//! with it until H–He is learned (`new_species_falls_back_and_is_learned_at_the_next_refit`:
-//! trusted again with 40 H–He dimers), and the user's water + H₂ file (657 samples, re-judged from
-//! its store on load) is refused at its own scene: pair 179 samples, LOO force 12.0× from #345 (a
-//! lone added H), many-body 587, 10.6× from #438 (a stretched H–H scan point). All are teacher
-//! steps, never wrong answers; the verdict changes only when samples near the blocking one exist.
+//! sample and its origin. **Costs of the max** (measured, rule 7; the uncalibrated rule, which
+//! stands until a class has three audited comparisons): one sample alone in its region decides
+//! its class — the GPU repro's kept tail sample at r = 5.125 (LOO force 14.9× its bound)
+//! untrusts the H₂ pair class until the region fills in (before M8a Task 2 all 1600 heating steps
+//! fell back; the M8a baseline measured those refused steps at z rms 0.86 — the model was right
+//! there — which is what the calibrated verdict now reads), a first H–He sample (LOO energy
+//! 1.1e3× the tier: no other row has an H–He feature) untrusts H₂ with it until H–He is learned
+//! (`new_species_falls_back_and_is_learned_at_the_next_refit`: trusted again with 40 H–He
+//! dimers), and the user's water + H₂ file (657 samples, re-judged from its store on load) is
+//! refused at its own scene: pair 179 samples, LOO force 12.0× from #345 (a lone added H),
+//! many-body 587, 10.6× from #438 (a stretched H–H scan point). All are teacher steps, never
+//! wrong answers; under the calibrated verdict such a class earns trust from its own fallbacks
+//! once three of them show the model within its claims there.
 //!
 //! # Teaching around the blockers (2026-10-18, the physics review's ruling 5)
 //! A targeted pass (`teach` module doc; `Trainable::start_teach`, the app's "Teach around N
@@ -487,7 +529,12 @@
 //! (`the_stuck_escape_repro_is_answered_honestly`) then answered H₃ geometries up to **6.33× the
 //! force bound and 6.2e-3 Ha/atom** off (182 judged; the number of record is 2.7× and 5.2e-4): the
 //! outliers mark where the fit is unreliable *between* samples too, not only next to themselves.
-//! The max rule stands; a calibrated replacement remains the M6 handoff item.
+//! The max rule stood until M8a Task 2's calibrated verdict (above), which differs from that
+//! experiment in both respects that made it fail: the outliers stay in the class's RMS (nothing is
+//! set aside), and a class is trusted beyond the max rule only on **evidence** — audited
+//! comparisons at visited geometries of the class, which is where that experiment's answers were
+//! off (the M8a baseline's many-body fallback points: z rms 12–14) and where a large κ keeps the
+//! class refused.
 //!
 //! **Ruling (shell → fence)** (2026-10-19, the coordinator on the round-4 LiH measurement): a
 //! failed shell check (`sampling` module doc, 3.) is a measured **structural** limitation of the
@@ -813,6 +860,7 @@ use surrogate::{
 use surrogate::sidecar::TeacherSolves;
 
 mod audit;
+pub mod calibrate;
 mod inspect;
 mod ledger;
 mod policy;
@@ -827,7 +875,8 @@ use inspect::StrictVerdict;
 use ledger::*;
 use policy::*;
 use quarantine::*;
-pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict};
+pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
+pub use calibrate::{calibrate, Calibration, ClassCalibration, ClassStats, ClassVerdict, ENTER, LEAVE, MIN_EVIDENCE, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
@@ -889,6 +938,11 @@ struct Handoff {
     /// Report the step on the teacher's surface although the model was consulted (rule 5, the
     /// first evaluation after an edit; module doc, "One-surface energy accounting").
     teacher_surface: bool,
+    /// The audit history's rule code for a consulted-model fallback point (`history_rule_code` of
+    /// the refusing rule before any relax-verification override — the Task 1 re-review's Minor 1 —
+    /// or `HISTORY_RULE_CLASS_AND_VARIANCE` when the class rule refused and rule 6/7 would have
+    /// too; M8a Task 2). Unused for an audit or a gate refusal.
+    history_rule: u8,
 }
 
 /// The surrogate force provider (module doc).
@@ -920,6 +974,12 @@ pub struct SurrogateKs {
     /// Per environment class (pair, many-body): the fit's leave-one-out numbers and verdict
     /// (module doc, "Class-wise trust"); empty before the first fit.
     class_loo: Vec<ClassLoo>,
+    /// The calibrated verdict's hysteresis memory (M8a Task 2, `calibrate`): per class the
+    /// verdict that **stood** when the current refit, install or policy change began — (trusted,
+    /// `trusted_since`) — committed by `commit_class_memory` once that operation is done, so a
+    /// recovery's intermediate fits inside one `refit` neither enter nor leave on their own.
+    /// Cleared by a forget or an install.
+    class_memory: Vec<(bool, Option<u64>)>,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -964,8 +1024,13 @@ pub struct SurrogateKs {
     recovery: Option<String>,
     /// The background auditor (ruling S14), when one was attached.
     auditor: Option<Auditor>,
-    /// An audit fell due while the auditor was busy: dispatched at the next answered step.
+    /// An audit fell due while the auditor was busy, or the last audit's teacher answer was
+    /// box-affected (M8a Task 2: not judged, so the cadence is not satisfied): dispatched — or,
+    /// without an auditor, run in the step — at the next answered step.
     audit_due: bool,
+    /// Consecutive box-affected (unjudged) audits since the last judged one
+    /// (`TrainableStatus::audits_box_unjudged`; M8a Task 2).
+    box_audits_unjudged: usize,
     /// The audit being dispatched is a draft-mode guess the strict policy would have refused
     /// (`AuditJob::draft_guess`); set by `evaluate` right before `dispatch_audit`.
     dispatch_draft_guess: bool,
@@ -1126,6 +1191,7 @@ impl SurrogateKs {
             active_set: None,
             training_residuals: None,
             class_loo: Vec::new(),
+            class_memory: Vec::new(),
             audit_failed: None,
             audit_force: None,
             failed_audits: Vec::new(),
@@ -1149,6 +1215,7 @@ impl SurrogateKs {
             recovery: None,
             auditor: None,
             audit_due: false,
+            box_audits_unjudged: 0,
             dispatch_draft_guess: false,
             audit_flip: false,
             force_teacher: false,
@@ -1334,7 +1401,7 @@ impl SurrogateKs {
         // at the edge of what the rules accept. Not inside a fenced shell band (nothing is judged
         // there, an audit included) and not for a non-finite prediction (no finite stds exist)
         if let Some(m) = h.model.as_ref().filter(|_| !h.audit && !h.shell_fence && h.reason.rule != TeachRule::NonFiniteAnswer) {
-            let kind = surrogate::history::PointKind::Fallback { rule: history_rule_code(h.reason.rule) };
+            let kind = surrogate::history::PointKind::Fallback { rule: h.history_rule };
             self.record_history_point(kind, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
         }
         if h.model.is_some() && !h.audit {
@@ -1411,9 +1478,15 @@ impl SurrogateKs {
                     self.last_audit_fit = self.fits;
                     // the history's point (M8a Task 1): an in-step audit is never a draft guess
                     self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    // a box-affected audit judged nothing: it does not satisfy the cadence — the
+                    // next answered step is audited again — and it is counted for the checklist
+                    // (M8a Task 2, the Task 1 physics review's I4); the step keeps the model's
+                    // energy: the gap is the Dirichlet confinement, not the model's error
+                    self.audit_due = box_rho.is_some();
+                    self.box_audits_unjudged = if box_rho.is_some() { self.box_audits_unjudged + 1 } else { 0 };
                     if let Some(rho) = box_rho {
                         notes.push(format!(
-                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error"
+                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error; the next answered step is audited again"
                         ));
                     }
                 }
@@ -1612,7 +1685,8 @@ impl ForceProvider for SurrogateKs {
                 }
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, model: None, audit: false, teacher_surface: false };
+                let history_rule = history_rule_code(reason.rule);
+                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, model: None, audit: false, teacher_surface: false, history_rule };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -1659,6 +1733,7 @@ impl ForceProvider for SurrogateKs {
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
                 audit: false,
                 teacher_surface: true,
+                history_rule: history_rule_code(TeachRule::NonFiniteAnswer),
             };
             return self.teach(scene, h, t0, should_abort);
         }
@@ -1747,6 +1822,15 @@ impl ForceProvider for SurrogateKs {
             reason: reason.as_ref().map(|r| r.text.clone()),
             atom_envelope: atom_envelope.clone(),
         });
+        // the history's rule code of this step's fallback point, from the rule that fired (before
+        // the relax verification overrides the reason — the Task 1 re-review's Minor 1): a class
+        // refusal the variance verdict would have refused as well is coded apart, since the model
+        // would not have answered it had the class been trusted (M8a Task 2, `calibrate`)
+        let history_rule = match reason.as_ref() {
+            Some(r) if matches!(r.rule, TeachRule::Class(_)) && !variance.accept => HISTORY_RULE_CLASS_AND_VARIANCE,
+            Some(r) => history_rule_code(r.rule),
+            None => history_rule_code(TeachRule::RelaxVerification),
+        };
         if draft {
             reason = None;
         }
@@ -1791,6 +1875,7 @@ impl ForceProvider for SurrogateKs {
                 // and the relax verification keep theirs (module doc, "One-surface energy
                 // accounting")
                 teacher_surface: !audit && !forced && (by_class || by_envelope || post_edit),
+                history_rule,
             };
             return self.teach(scene, h, t0, should_abort);
         }
@@ -2328,6 +2413,7 @@ impl Trainable for SurrogateKs {
             audit_in_flight: self.audit_in_flight(),
             last_audit: self.last_audit().cloned(),
             last_audit_this_fit: self.last_audit_this_fit(),
+            audits_box_unjudged: self.box_audits_unjudged,
             stuck: self.stuck(),
             class_loo: self.class_loo.clone(),
             solves: self.solve_counts(),

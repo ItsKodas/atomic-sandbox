@@ -156,6 +156,7 @@ pub(super) struct FitState {
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
+    pub(super) class_memory: Vec<(bool, Option<u64>)>,
     pub(super) class_worst: Vec<Option<(usize, f64)>>,
     pub(super) class_blockers: Vec<Vec<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
@@ -322,22 +323,26 @@ impl SurrogateKs {
     /// ([`atom_class`]: one neighbour within r_cut → pair, two or more → many-body, none →
     /// exempt). Per class: the samples with at least one atom of that class; the LOO per-atom
     /// force error ‖r_F,j‖/√3 against each atom's bound `force_bound(|F_j|)` over the class's
-    /// atoms (RMS and max), and the largest LOO per-atom energy error against
-    /// `energy_std_per_atom` over the class's samples (the energy is not per atom: it counts for
-    /// every class the sample holds — conservative). Trusted iff the class holds ≥ Q′ samples and
-    /// all three ratios are ≤ 1 (`class_refusal`). A sample whose LOO is undefined (I − H_ss
-    /// singular: it alone determines a direction) counts as infinitely off. Per class also the
-    /// sample of the largest ratio (force or energy) — the readiness readout's worst sample,
-    /// deciding nothing. Held-out draft guesses (`Q_DRAFT`) are excluded like every other excluded
-    /// sample (`surrogate` module doc, "Draft mode"). Empty without a model.
+    /// atoms (RMS and max), and the LOO per-atom energy error against `energy_std_per_atom` over
+    /// the class's samples (RMS and max; the energy is not per atom: it counts for every class the
+    /// sample holds — conservative). The verdict is the **calibrated, hysteretic** one of
+    /// [`super::calibrate`] (M8a Task 2): the LOO force RMS scaled by the audit history's
+    /// calibration factor of the class against `ENTER` / `LEAVE`, with the standing verdict
+    /// (`self.class_loo`) as the hysteresis memory; with fewer than `MIN_EVIDENCE` points of
+    /// evidence it is the rule of before — ≥ Q′ samples and all three ratios ≤ 1
+    /// (`class_refusal`). A sample whose LOO is undefined (I − H_ss singular: it alone determines
+    /// a direction) counts as infinitely off. Per class also the sample of the largest ratio (force
+    /// or energy) — the readiness readout's worst sample, deciding nothing. Held-out draft guesses
+    /// (`Q_DRAFT`) are excluded like every other excluded sample (`surrogate` module doc, "Draft
+    /// mode"). Empty without a model.
     #[allow(clippy::type_complexity)]
     pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
             return (Vec::new(), Vec::new(), Vec::new());
         };
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        // per class: samples, Σ ratio², atoms, max force ratio, max energy ratio
-        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64); 2];
+        // per class: samples, Σ force ratio², atoms, max force ratio, max energy ratio, Σ energy ratio²
+        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64); 2];
         let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
         // per class: the samples beyond 1× (the blockers a teach-around pass may target)
         let mut blockers: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 2];
@@ -355,6 +360,7 @@ impl SurrogateKs {
                 }
                 a.0 += 1;
                 a.4 = max_nan(a.4, e_ratio);
+                a.5 += e_ratio * e_ratio;
                 let mut f_worst = 0.0f64;
                 match l.as_ref() {
                     None => {
@@ -384,15 +390,30 @@ impl SurrogateKs {
                 }
             }
         }
+        // the audit calibration per class (M8a Task 2) — the verdict's evidence
+        let cal = super::calibrate::calibrate(&self.audit_history, &self.policy);
         let loo = acc
             .iter()
             .zip(ENV_CLASSES)
-            .map(|(&(samples, ss, atoms, force_max, energy_max), class)| {
+            .enumerate()
+            .map(|(c, (&(samples, ss, atoms, force_max, energy_max, se), class))| {
                 let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
                 // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
                 let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
-                let refusal = class_refusal(samples, report.q_prime, force_rms, force_max, energy_max);
-                ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal }
+                let energy_rms = if samples > 0 { (se / samples as f64).sqrt() } else { 0.0 };
+                let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
+                // the hysteresis memory is the verdict that stood when this refit, install or
+                // policy change began (`class_memory`; reset by a forget or an install)
+                let (was_trusted, since) = self.class_memory.get(c).copied().unwrap_or((false, None));
+                let st = super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max };
+                let refusal = match cal.class_verdict(c, &st, report.q_prime, was_trusted) {
+                    super::calibrate::ClassVerdict::Trusted => None,
+                    super::calibrate::ClassVerdict::Untrusted { key, value, limit, .. } => Some((key, value, limit)),
+                };
+                let trusted = refusal.is_none();
+                let trusted_since = if trusted { since.or(Some(self.model_gen)) } else { None };
+                let k = cal.per_class[c];
+                ClassLoo { class, samples, force_rms, force_max, energy_rms, energy_max, trusted, refusal, calibration: k.factor, measured: k.measured, measured_energy: k.measured_energy, evidence: k.evidence as usize, trusted_since }
             })
             .collect();
         for b in &mut blockers {
@@ -404,6 +425,13 @@ impl SurrogateKs {
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
     pub fn class_loo(&self) -> &[ClassLoo] {
         &self.class_loo
+    }
+
+    /// Makes the standing class verdicts the calibrated verdict's hysteresis memory
+    /// (`class_memory`; M8a Task 2): called once a refit, an install or a policy change is done,
+    /// never by the intermediate fits inside one of them.
+    pub(super) fn commit_class_memory(&mut self) {
+        self.class_memory = self.class_loo.iter().map(|l| (l.trusted, l.trusted_since)).collect();
     }
 
     /// Per atom of every fitted sample (the accumulated prefix, excluded samples skipped — the same
@@ -450,8 +478,8 @@ impl SurrogateKs {
         if l.trusted {
             return None;
         }
-        // the branch is the class rule's own verdict (`class_refusal`, plan review M3), never a
-        // re-test of the numbers; `None` cannot occur here (`trusted == refusal.is_none()`)
+        // the branch is the class rule's own verdict (`calibrate::class_verdict`, plan review M3),
+        // never a re-test of the numbers; `None` cannot occur here (`trusted == refusal.is_none()`)
         Some(match l.refusal {
             Some((ClassKey::Samples, ..)) => {
                 (refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples)), true)
@@ -463,6 +491,21 @@ impl SurrogateKs {
                     l.class, l.force_max, l.force_rms, l.samples
                 )), false)
             }
+            // the thin-evidence guard (M8a Task 2 fix round 1, review I4): one atom beyond 3× its bound
+            Some((ClassKey::Calibrated, value, limit)) if limit == super::calibrate::WORST_ATOM => (refusal(format!(
+                "surrogate: this kind of environment isn't learned well enough yet ({}: a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while unverified — fewer than {} audited comparisons; {} samples)",
+                l.class, super::calibrate::MIN_EVIDENCE, l.samples
+            )), false),
+            // the calibrated verdict (M8a Task 2): the note names the measured error and the calibration
+            Some((ClassKey::Calibrated, value, limit)) => (refusal(format!(
+                "surrogate: this kind of environment isn't learned well enough yet ({}: measured error {value:.2}× the bound over {} audited comparisons — DFT rms {:.2}×, leave-one-out RMS {:.2}×, the posterior {:.1}× too confident; limit {limit:.2} — {} samples)",
+                l.class, l.evidence, l.measured, l.force_rms, l.calibration, l.samples
+            )), false),
+            // the energy under the calibrated verdict is the measured one against ENTER or LEAVE
+            Some((ClassKey::Energy, value, limit)) if l.evidence >= super::calibrate::MIN_EVIDENCE => (refusal(format!(
+                "surrogate: this kind of environment isn't learned well enough yet ({}: measured energy error {value:.2}× the tier over {} audited comparisons, limit {limit:.2}; {} samples)",
+                l.class, l.evidence, l.samples
+            )), false),
             Some((ClassKey::Energy, ..)) | None => (refusal(format!(
                 "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
                 l.class, l.energy_max, l.samples
@@ -527,6 +570,8 @@ impl SurrogateKs {
             }
         }
         self.rejudge_failed_audits(true);
+        // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
+        self.commit_class_memory();
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
         Ok(report)
     }
@@ -871,6 +916,7 @@ impl SurrogateKs {
             active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
+            class_memory: self.class_memory.clone(),
             class_worst: self.class_worst.clone(),
             class_blockers: self.class_blockers.clone(),
             degree_cap: self.degree_cap,
@@ -888,6 +934,7 @@ impl SurrogateKs {
         self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
+        self.class_memory = s.class_memory;
         self.class_worst = s.class_worst;
         self.class_blockers = s.class_blockers;
         self.degree_cap = s.degree_cap;

@@ -290,6 +290,7 @@ impl SurrogateKs {
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();
         self.refresh_class_loo();
+        self.commit_class_memory();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.

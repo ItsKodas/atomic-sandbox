@@ -96,6 +96,7 @@ impl SurrogateKs {
         self.audit_force = None;
         self.training_residuals = None;
         self.class_loo = Vec::new();
+        self.class_memory = Vec::new();
         self.class_worst = Vec::new();
         self.class_blockers = Vec::new();
         self.teach_rounds.clear();
@@ -347,7 +348,13 @@ impl SurrogateKs {
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
+        // another model's class verdicts are no hysteresis memory for this one (M8a Task 2), so a
+        // saved model whose verdict sat inside the band (ENTER, LEAVE] re-enters on load: it must
+        // reach ENTER again (conservative, documented; the Task 2 physics review's M2)
+        self.class_loo = Vec::new();
+        self.class_memory = Vec::new();
         self.refresh_class_loo();
+        self.commit_class_memory();
         self.rebuild_active_set();
         // round 1, SHOULD-4: the reconstructed fit membership must be the fit's own — a release
         // between a fit and a save (Q_HELD → Q_NONE) shifts the prefix and would give a non-member

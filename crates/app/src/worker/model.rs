@@ -101,6 +101,9 @@ pub struct ModelStatus {
     /// `last_audit` judged the current fit (`sim::TrainableStatus::last_audit_this_fit`): with
     /// `last_audit`, never audited / audited only before the last refit / audited this fit.
     pub last_audit_this_fit: bool,
+    /// Consecutive audits near the cell faces that could not judge the model
+    /// (`sim::TrainableStatus::audits_box_unjudged`; the checklist's audit line says so).
+    pub audits_box_unjudged: usize,
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
@@ -491,6 +494,7 @@ impl Worker {
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
             last_audit_this_fit: st.last_audit_this_fit,
+            audits_box_unjudged: st.audits_box_unjudged,
             stuck: st.stuck,
             class_loo: st.class_loo,
             solves: st.solves,

@@ -82,7 +82,7 @@
 //! "ASAUDIT1"                      8 bytes, magic (the version)
 //! recorded                        u64 LE, every point ever pushed (len() + the evicted)
 //! no_variance, box_affected, draft, unfit   u64 LE each, the Unrecorded counters
-//! array₁ … array₉                 each u64 LE length n, then n f64 LE values — the nine
+//! array₁ … array₁₀                each u64 LE length n, then n f64 LE values — the ten
 //!                                 arrays of [`HistoryArrays::NAMES`] in that order
 //! (end — trailing bytes are an error)
 //! ```
@@ -90,8 +90,10 @@
 //! The arrays, with M points and A = Σ atoms over them: `audit_atoms`, `audit_model_gen`,
 //! `audit_kind` (0 an audit, 1 + rule code a fallback), `audit_energy_std`, `audit_err_energy`
 //! (M each; counts, generations and kinds as exact integral f64), `audit_classes`,
-//! `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (A each; class codes 0, 1, 2
-//! as integral f64). The sidecar embeds the same nine arrays after its sample tail under a header
+//! `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force`, `audit_teacher_force` (A
+//! each; class codes 0, 1, 2 as integral f64; `audit_teacher_force` = |F_teacher| per atom, added
+//! in M8a Task 2's fix round while version 7 was unreleased — the per-atom bound's input). The
+//! sidecar embeds the same ten arrays after its sample tail under a header
 //! key `audit_history` that carries the six counters ([`crate::sidecar`], "Version 7"), so both
 //! forms share [`AuditHistory::to_arrays`] / [`AuditHistory::from_arrays`]. Every length is checked
 //! against the bytes present before anything is allocated; a decode never panics on a corrupt
@@ -162,6 +164,10 @@ pub struct AuditPoint {
     pub pred_energy_std: f64,
     /// Per atom, Ha/Bohr: ‖F_teacher − F_model‖.
     pub err_force: Vec<f64>,
+    /// Per atom, Ha/Bohr: |F_teacher| — what the policy's per-atom force bound
+    /// max(2e-3, 10 % |F|) ≤ 1e-2 is formed from, so a calibration can judge the error in the
+    /// units the policy claims (M8a Task 2 fix round 1, the physics review's A.1).
+    pub teacher_force: Vec<f64>,
     /// Ha: E_teacher − E_model (signed).
     pub err_energy: f64,
     pub n_atoms: usize,
@@ -176,7 +182,7 @@ impl AuditPoint {
         if n == 0 {
             return Err("an audit point of no atoms".into());
         }
-        for (name, len) in [("classes", self.classes.len()), ("pred_force_std", self.pred_force_std.len()), ("pred_force_std_epistemic", self.pred_force_std_epistemic.len()), ("err_force", self.err_force.len())] {
+        for (name, len) in [("classes", self.classes.len()), ("pred_force_std", self.pred_force_std.len()), ("pred_force_std_epistemic", self.pred_force_std_epistemic.len()), ("err_force", self.err_force.len()), ("teacher_force", self.teacher_force.len())] {
             if len != n {
                 return Err(format!("audit point: {name} has {len} entries for {n} atoms"));
             }
@@ -210,7 +216,7 @@ pub struct AuditHistory {
     pub unrecorded: Unrecorded,
 }
 
-/// The nine arrays of the history's serialised form (module doc, "Standalone encoding").
+/// The ten arrays of the history's serialised form (module doc, "Standalone encoding").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistoryArrays {
     pub atoms: Vec<f64>,
@@ -222,17 +228,18 @@ pub struct HistoryArrays {
     pub force_std: Vec<f64>,
     pub force_std_epistemic: Vec<f64>,
     pub err_force: Vec<f64>,
+    pub teacher_force: Vec<f64>,
 }
 
 impl HistoryArrays {
     /// The arrays' names in serialised order (the first [`PER_POINT`](Self::PER_POINT) are per
     /// point, the rest per atom).
-    pub const NAMES: [&'static str; 9] = ["audit_atoms", "audit_model_gen", "audit_kind", "audit_energy_std", "audit_err_energy", "audit_classes", "audit_force_std", "audit_force_std_epistemic", "audit_err_force"];
+    pub const NAMES: [&'static str; 10] = ["audit_atoms", "audit_model_gen", "audit_kind", "audit_energy_std", "audit_err_energy", "audit_classes", "audit_force_std", "audit_force_std_epistemic", "audit_err_force", "audit_teacher_force"];
     /// How many of [`NAMES`](Self::NAMES) are per point.
     pub const PER_POINT: usize = 5;
 
     /// The arrays in [`NAMES`](Self::NAMES) order.
-    pub fn as_slices(&self) -> [(&'static str, &[f64]); 9] {
+    pub fn as_slices(&self) -> [(&'static str, &[f64]); 10] {
         [
             (Self::NAMES[0], &self.atoms),
             (Self::NAMES[1], &self.model_gen),
@@ -243,13 +250,14 @@ impl HistoryArrays {
             (Self::NAMES[6], &self.force_std),
             (Self::NAMES[7], &self.force_std_epistemic),
             (Self::NAMES[8], &self.err_force),
+            (Self::NAMES[9], &self.teacher_force),
         ]
     }
 
-    /// The arrays from nine vectors in [`NAMES`](Self::NAMES) order.
-    pub fn from_vecs(v: [Vec<f64>; 9]) -> HistoryArrays {
-        let [atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force] = v;
-        HistoryArrays { atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force }
+    /// The arrays from ten vectors in [`NAMES`](Self::NAMES) order.
+    pub fn from_vecs(v: [Vec<f64>; 10]) -> HistoryArrays {
+        let [atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force, teacher_force] = v;
+        HistoryArrays { atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force, teacher_force }
     }
 }
 
@@ -301,6 +309,7 @@ impl AuditHistory {
             a.force_std.extend_from_slice(&p.pred_force_std);
             a.force_std_epistemic.extend_from_slice(&p.pred_force_std_epistemic);
             a.err_force.extend_from_slice(&p.err_force);
+            a.teacher_force.extend_from_slice(&p.teacher_force);
         }
         a
     }
@@ -323,7 +332,7 @@ impl AuditHistory {
             }
             total = total.checked_add(n as usize).ok_or("audit_atoms overflow")?;
         }
-        for (name, len) in [("audit_classes", a.classes.len()), ("audit_force_std", a.force_std.len()), ("audit_force_std_epistemic", a.force_std_epistemic.len()), ("audit_err_force", a.err_force.len())] {
+        for (name, len) in [("audit_classes", a.classes.len()), ("audit_force_std", a.force_std.len()), ("audit_force_std_epistemic", a.force_std_epistemic.len()), ("audit_err_force", a.err_force.len()), ("audit_teacher_force", a.teacher_force.len())] {
             if len != total {
                 return Err(format!("{name} has {len} entries, audit_atoms sums to {total}"));
             }
@@ -354,7 +363,8 @@ impl AuditHistory {
                 pred_force_std: a.force_std[r.clone()].to_vec(),
                 pred_force_std_epistemic: a.force_std_epistemic[r.clone()].to_vec(),
                 pred_energy_std: a.energy_std[i],
-                err_force: a.err_force[r].to_vec(),
+                err_force: a.err_force[r.clone()].to_vec(),
+                teacher_force: a.teacher_force[r].to_vec(),
                 err_energy: a.err_energy[i],
                 n_atoms: n,
                 model_gen: a.model_gen[i] as u64,
@@ -414,7 +424,7 @@ impl AuditHistory {
         if at != bytes.len() {
             return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
         }
-        let a = HistoryArrays::from_vecs(arrays.try_into().expect("nine arrays"));
+        let a = HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays"));
         Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit })
     }
 }
@@ -431,6 +441,7 @@ mod tests {
             pred_force_std_epistemic: vec![5e-4; n],
             pred_energy_std: 1e-5,
             err_force: (0..n).map(|j| 1e-4 * j as f64).collect(),
+            teacher_force: (0..n).map(|j| 3e-2 * (1 + j) as f64).collect(),
             err_energy: -2e-6,
             n_atoms: n,
             model_gen: gen,
@@ -479,6 +490,9 @@ mod tests {
         let mut a = good.clone();
         a.err_force.push(0.0);
         assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_err_force"));
+        let mut a = good.clone();
+        a.teacher_force.pop();
+        assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_teacher_force"));
         let mut a = good.clone();
         a.classes[1] = 3.0;
         assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_classes"));
