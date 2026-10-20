@@ -22,14 +22,38 @@
 //! pred_energy_std             = Prediction::energy_std                  the total-energy std, aleatoric floor included
 //! ```
 //!
-//! so for a calibrated posterior z_j = err_force[j] / pred_force_std[j] has E[z_j²] = 1 (z_j² is
-//! χ²₃/3 when the three component stds are equal) and z_E = err_energy / pred_energy_std is a
-//! standard normal — what a calibration measures. The epistemic part is kept beside the total
+//! so for a calibrated posterior z_j = err_force[j] / pred_force_std[j] has E[z_j²] = 1 and
+//! z_E = err_energy / pred_energy_std is a standard normal — what a calibration measures. Only the
+//! second moment is shape-free: z_j² is χ²₃/3 when the three component errors are independent with
+//! equal stds, but for a dimer under a pair model the model's force is exactly radial and the
+//! teacher's transverse force is egg-box noise, so ΔF has one effective component and z_j² ≈ χ²₁
+//! (calibrated median 0.68, p90 1.65, p99 2.58, against χ²₃/3's 0.89, 1.44, 1.95 — the physics
+//! review's check). A calibration should fit the rms per class, not quantiles that assume a shape.
+//! Nor are a point's atoms independent draws: the model's ΣF = 0 exactly and the teacher's ΣF is at
+//! the egg-box level, so a dimer's two atoms are one draw (ΔF₂ = −ΔF₁ to a few e-6 Ha/Bohr and, by
+//! the symmetry of their descriptors, equal stds); N atoms carry N − 1 independent error vectors.
+//! Count evidence per point, or weight a point's atoms by (N − 1)/N. The epistemic part is kept beside the total
 //! because rule 6 (`providers::surrogate`) judges the *epistemic* std against its bound, while the
 //! aleatoric floor 3σ_f² is a property of the fit, not of the geometry: a calibration that inflates
 //! the epistemic part alone needs the two apart, and σ_f at the time of the audit is recoverable
 //! from them (σ_f² = (pred_force_std² − epistemic²)/3). Non-finite values are kept as they were
 //! judged (a NaN gap is a failed audit, `providers::surrogate::audit`); a calibration filters them.
+//!
+//! # What kind of point
+//!
+//! `AuditPoint::kind` says where the comparison came from ([`PointKind`]): an **audit** (the
+//! model answered the step and the teacher checked it: evidence inside the region today's rules
+//! accept), or a **fallback** (the step went to the teacher because a rule refused the model's
+//! answer, and the model's prediction with its variance existed for the geometry — rules 4b, 5,
+//! 5b, 5d, 5e, 6, 7, the quarantine and audit fences, the relax verification, the first step after
+//! an edit: evidence at the edge of that region, where a calibrated verdict decides; fix round 1,
+//! the physics review's I3). A fallback point carries the refusing rule as a `u8` code whose table
+//! the provider owns (`providers::surrogate::history_rule_code`); the history itself never reads
+//! it. What is still censored: steps the gate refused before consulting the model (rules 1–4: no
+//! prediction exists), steps inside a fenced cutoff shell (nothing is judged there — audits
+//! included), non-finite predictions, box-affected teacher answers, unfit teacher answers (cores
+//! overlap, an occupation change) and draft-mode guesses — the last four counted in
+//! [`Unrecorded`].
 //!
 //! # Class numbering
 //!
@@ -42,34 +66,36 @@
 //!
 //! # What is not recorded
 //!
-//! A judged audit always leaves a point when the model carried a variance factor; the
-//! [`Unrecorded`] counters say how many judged audits left none and why: the model had no
-//! variance factor (`Prediction::force_std` was `None`), the teacher's answer was box-affected
-//! (the verdict `BoxAffected`: its gap is the box's confinement as much as the model's error, and
-//! a calibration must not learn the box), or the audit was a draft-mode guess at a geometry strict
-//! mode refuses (not a verdict on the strict model). Audits that are not judged at all (discarded
-//! after a settings change, not judged inside a fenced shell band) are not counted here: they
-//! have their activity events.
+//! A judged audit, and a fallback with the model's prediction, always leaves a point when the
+//! model carried a variance factor; the [`Unrecorded`] counters say how many left none and why:
+//! the model had no variance factor (`Prediction::force_std` was `None`), the teacher's answer was
+//! box-affected (an audit's verdict `BoxAffected`: its gap is the box's confinement as much as the
+//! model's error, and a calibration must not learn the box), the teacher's answer was unfit (cores
+//! overlap or an occupation change: its labels are not the surface the model learns), or the
+//! audit was a draft-mode guess at a geometry strict mode refuses (not a verdict on the strict
+//! model). Audits that are not judged at all (discarded after a settings change, not judged inside
+//! a fenced shell band) are not counted here: they have their activity events.
 //!
 //! # Standalone encoding ([`AuditHistory::encode`])
 //!
 //! ```text
 //! "ASAUDIT1"                      8 bytes, magic (the version)
 //! recorded                        u64 LE, every point ever pushed (len() + the evicted)
-//! no_variance, box_affected, draft   u64 LE each, the Unrecorded counters
-//! array₁ … array₈                 each u64 LE length n, then n f64 LE values — the eight
+//! no_variance, box_affected, draft, unfit   u64 LE each, the Unrecorded counters
+//! array₁ … array₉                 each u64 LE length n, then n f64 LE values — the nine
 //!                                 arrays of [`HistoryArrays::NAMES`] in that order
 //! (end — trailing bytes are an error)
 //! ```
 //!
 //! The arrays, with M points and A = Σ atoms over them: `audit_atoms`, `audit_model_gen`,
-//! `audit_energy_std`, `audit_err_energy` (M each; counts and generations as exact integral f64),
-//! `audit_classes`, `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (A each;
-//! class codes 0, 1, 2 as integral f64). The sidecar embeds the same eight arrays after its
-//! sample tail under a header key `audit_history` that carries the five counters
-//! ([`crate::sidecar`], "Version 7"), so both forms share [`AuditHistory::to_arrays`] /
-//! [`AuditHistory::from_arrays`]. Every length is checked against the bytes present before
-//! anything is allocated; a decode never panics on a corrupt input.
+//! `audit_kind` (0 an audit, 1 + rule code a fallback), `audit_energy_std`, `audit_err_energy`
+//! (M each; counts, generations and kinds as exact integral f64), `audit_classes`,
+//! `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (A each; class codes 0, 1, 2
+//! as integral f64). The sidecar embeds the same nine arrays after its sample tail under a header
+//! key `audit_history` that carries the six counters ([`crate::sidecar`], "Version 7"), so both
+//! forms share [`AuditHistory::to_arrays`] / [`AuditHistory::from_arrays`]. Every length is checked
+//! against the bytes present before anything is allocated; a decode never panics on a corrupt
+//! input.
 
 use std::collections::VecDeque;
 use std::io;
@@ -87,9 +113,45 @@ const MAX_ATOMS: f64 = (1u64 << 24) as f64;
 /// Largest model generation accepted (exact in f64).
 const MAX_GEN: f64 = (1u64 << 53) as f64;
 
-/// One judged audit: the model's prediction against the teacher's answer (module doc).
+/// Where a point's comparison came from (module doc, "What kind of point").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointKind {
+    /// A judged audit: the model answered, the teacher checked.
+    Audit,
+    /// A step the teacher answered because `rule` refused the model's answer (the code table is
+    /// the provider's, `providers::surrogate::history_rule_code`); the model's prediction with its
+    /// variance existed for the geometry.
+    Fallback { rule: u8 },
+}
+
+impl PointKind {
+    /// The serialised code: 0 an audit, 1 + rule a fallback.
+    pub fn code(self) -> u16 {
+        match self {
+            PointKind::Audit => 0,
+            PointKind::Fallback { rule } => 1 + rule as u16,
+        }
+    }
+
+    /// From the serialised code (`None` beyond 256).
+    pub fn from_code(c: u16) -> Option<PointKind> {
+        match c {
+            0 => Some(PointKind::Audit),
+            1..=256 => Some(PointKind::Fallback { rule: (c - 1) as u8 }),
+            _ => None,
+        }
+    }
+
+    pub fn is_audit(self) -> bool {
+        self == PointKind::Audit
+    }
+}
+
+/// One judged comparison — an audit or a fallback step — of the model's prediction against the
+/// teacher's answer (module doc).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditPoint {
+    pub kind: PointKind,
     /// Per atom: 0 isolated, 1 pair, 2 many-body (module doc, "Class numbering").
     pub classes: Vec<u8>,
     /// Per atom, Ha/Bohr: the total predictive force std (`Prediction::force_std`).
@@ -126,15 +188,18 @@ impl AuditPoint {
     }
 }
 
-/// Judged audits that left no point, by reason (module doc, "What is not recorded").
+/// Judged audits and consulted-model fallbacks that left no point, by reason (module doc, "What
+/// is not recorded").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Unrecorded {
-    /// The model had no variance factor when the audit was judged.
+    /// The model had no variance factor when the comparison was made.
     pub no_variance: u64,
-    /// The teacher's answer was box-affected (verdict `BoxAffected`).
+    /// The teacher's answer was box-affected (an audit's verdict `BoxAffected`).
     pub box_affected: u64,
     /// A draft-mode guess at a geometry strict mode refuses.
     pub draft: u64,
+    /// The teacher's answer was unfit (cores overlap, an occupation change: used, never fitted).
+    pub unfit: u64,
 }
 
 /// The ring of the newest [`HISTORY_CAP`] audit points, oldest first (module doc).
@@ -145,11 +210,12 @@ pub struct AuditHistory {
     pub unrecorded: Unrecorded,
 }
 
-/// The eight arrays of the history's serialised form (module doc, "Standalone encoding").
+/// The nine arrays of the history's serialised form (module doc, "Standalone encoding").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HistoryArrays {
     pub atoms: Vec<f64>,
     pub model_gen: Vec<f64>,
+    pub kind: Vec<f64>,
     pub energy_std: Vec<f64>,
     pub err_energy: Vec<f64>,
     pub classes: Vec<f64>,
@@ -159,27 +225,31 @@ pub struct HistoryArrays {
 }
 
 impl HistoryArrays {
-    /// The arrays' names in serialised order (the first four are per point, the last four per atom).
-    pub const NAMES: [&'static str; 8] = ["audit_atoms", "audit_model_gen", "audit_energy_std", "audit_err_energy", "audit_classes", "audit_force_std", "audit_force_std_epistemic", "audit_err_force"];
+    /// The arrays' names in serialised order (the first [`PER_POINT`](Self::PER_POINT) are per
+    /// point, the rest per atom).
+    pub const NAMES: [&'static str; 9] = ["audit_atoms", "audit_model_gen", "audit_kind", "audit_energy_std", "audit_err_energy", "audit_classes", "audit_force_std", "audit_force_std_epistemic", "audit_err_force"];
+    /// How many of [`NAMES`](Self::NAMES) are per point.
+    pub const PER_POINT: usize = 5;
 
     /// The arrays in [`NAMES`](Self::NAMES) order.
-    pub fn as_slices(&self) -> [(&'static str, &[f64]); 8] {
+    pub fn as_slices(&self) -> [(&'static str, &[f64]); 9] {
         [
             (Self::NAMES[0], &self.atoms),
             (Self::NAMES[1], &self.model_gen),
-            (Self::NAMES[2], &self.energy_std),
-            (Self::NAMES[3], &self.err_energy),
-            (Self::NAMES[4], &self.classes),
-            (Self::NAMES[5], &self.force_std),
-            (Self::NAMES[6], &self.force_std_epistemic),
-            (Self::NAMES[7], &self.err_force),
+            (Self::NAMES[2], &self.kind),
+            (Self::NAMES[3], &self.energy_std),
+            (Self::NAMES[4], &self.err_energy),
+            (Self::NAMES[5], &self.classes),
+            (Self::NAMES[6], &self.force_std),
+            (Self::NAMES[7], &self.force_std_epistemic),
+            (Self::NAMES[8], &self.err_force),
         ]
     }
 
-    /// The arrays from eight vectors in [`NAMES`](Self::NAMES) order.
-    pub fn from_vecs(v: [Vec<f64>; 8]) -> HistoryArrays {
-        let [atoms, model_gen, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force] = v;
-        HistoryArrays { atoms, model_gen, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force }
+    /// The arrays from nine vectors in [`NAMES`](Self::NAMES) order.
+    pub fn from_vecs(v: [Vec<f64>; 9]) -> HistoryArrays {
+        let [atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force] = v;
+        HistoryArrays { atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force }
     }
 }
 
@@ -224,6 +294,7 @@ impl AuditHistory {
         for p in &self.ring {
             a.atoms.push(p.n_atoms as f64);
             a.model_gen.push(p.model_gen as f64);
+            a.kind.push(p.kind.code() as f64);
             a.energy_std.push(p.pred_energy_std);
             a.err_energy.push(p.err_energy);
             a.classes.extend(p.classes.iter().map(|&c| c as f64));
@@ -236,10 +307,11 @@ impl AuditHistory {
 
     /// The history from its arrays and counters (module doc): the per-point arrays must agree in
     /// length, the counts be integral and sum to the per-atom arrays' length, the generations
-    /// integral, the class codes 0, 1 or 2. More points than [`HISTORY_CAP`] keep the newest.
+    /// integral, the kinds a [`PointKind`] code, the class codes 0, 1 or 2. More points than
+    /// [`HISTORY_CAP`] keep the newest.
     pub fn from_arrays(a: &HistoryArrays, recorded: u64, unrecorded: Unrecorded) -> Result<AuditHistory, String> {
         let m = a.atoms.len();
-        for (name, len) in [("audit_model_gen", a.model_gen.len()), ("audit_energy_std", a.energy_std.len()), ("audit_err_energy", a.err_energy.len())] {
+        for (name, len) in [("audit_model_gen", a.model_gen.len()), ("audit_kind", a.kind.len()), ("audit_energy_std", a.energy_std.len()), ("audit_err_energy", a.err_energy.len())] {
             if len != m {
                 return Err(format!("{name} has {len} entries for {m} audit points (audit_atoms)"));
             }
@@ -261,6 +333,13 @@ impl AuditHistory {
                 return Err(format!("audit_model_gen[{i}] = {g} is not a generation"));
             }
         }
+        let mut kinds = Vec::with_capacity(m);
+        for (i, &k) in a.kind.iter().enumerate() {
+            match (k.fract() == 0.0 && (0.0..=256.0).contains(&k)).then(|| PointKind::from_code(k as u16)).flatten() {
+                Some(kind) => kinds.push(kind),
+                None => return Err(format!("audit_kind[{i}] = {k} is not a point kind (0 an audit, 1 + rule a fallback)")),
+            }
+        }
         if let Some((i, &c)) = a.classes.iter().enumerate().find(|(_, &c)| !(c == 0.0 || c == 1.0 || c == 2.0)) {
             return Err(format!("audit_classes[{i}] = {c} is not 0, 1 or 2"));
         }
@@ -270,6 +349,7 @@ impl AuditHistory {
             let n = a.atoms[i] as usize;
             let r = at..at + n;
             h.push(AuditPoint {
+                kind: kinds[i],
                 classes: a.classes[r.clone()].iter().map(|&c| c as u8).collect(),
                 pred_force_std: a.force_std[r.clone()].to_vec(),
                 pred_force_std_epistemic: a.force_std_epistemic[r.clone()].to_vec(),
@@ -293,9 +373,9 @@ impl AuditHistory {
         let a = self.to_arrays();
         let slices = a.as_slices();
         let body: usize = slices.iter().map(|(_, v)| 8 + 8 * v.len()).sum();
-        let mut out = Vec::with_capacity(8 + 4 * 8 + body);
+        let mut out = Vec::with_capacity(8 + 5 * 8 + body);
         out.extend_from_slice(MAGIC);
-        for c in [self.recorded, self.unrecorded.no_variance, self.unrecorded.box_affected, self.unrecorded.draft] {
+        for c in [self.recorded, self.unrecorded.no_variance, self.unrecorded.box_affected, self.unrecorded.draft, self.unrecorded.unfit] {
             out.extend_from_slice(&c.to_le_bytes());
         }
         for (_, v) in slices {
@@ -313,16 +393,16 @@ impl AuditHistory {
     }
 
     fn decode_checked(bytes: &[u8]) -> Result<AuditHistory, String> {
-        if bytes.len() < 8 + 4 * 8 {
+        if bytes.len() < 8 + 5 * 8 {
             return Err(format!("{} bytes is too short for a history", bytes.len()));
         }
         if &bytes[..8] != MAGIC {
             return Err("not an audit history (magic is not ASAUDIT1)".into());
         }
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-        let (recorded, no_variance, box_affected, draft) = (u64_at(8), u64_at(16), u64_at(24), u64_at(32));
-        let mut at = 40usize;
-        let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(8);
+        let (recorded, no_variance, box_affected, draft, unfit) = (u64_at(8), u64_at(16), u64_at(24), u64_at(32), u64_at(40));
+        let mut at = 48usize;
+        let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(HistoryArrays::NAMES.len());
         for name in HistoryArrays::NAMES {
             let prefix = bytes.get(at..at + 8).ok_or_else(|| format!("file ends before array {name}"))?;
             let n = u64::from_le_bytes(prefix.try_into().expect("8 bytes"));
@@ -334,8 +414,8 @@ impl AuditHistory {
         if at != bytes.len() {
             return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
         }
-        let a = HistoryArrays::from_vecs(arrays.try_into().expect("eight arrays"));
-        Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft })
+        let a = HistoryArrays::from_vecs(arrays.try_into().expect("nine arrays"));
+        Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit })
     }
 }
 
@@ -345,6 +425,7 @@ mod tests {
 
     fn point(n: usize, gen: u64) -> AuditPoint {
         AuditPoint {
+            kind: if gen % 2 == 0 { PointKind::Audit } else { PointKind::Fallback { rule: (gen % 7) as u8 } },
             classes: (0..n).map(|j| (j % 3) as u8).collect(),
             pred_force_std: vec![1e-3; n],
             pred_force_std_epistemic: vec![5e-4; n],
@@ -366,14 +447,19 @@ mod tests {
         p.err_force[1] = f64::INFINITY;
         h.push(p);
         h.push(point(1, 10));
+        h.push(point(2, 255 + 256));
         h.unrecorded.draft = 4;
+        h.unrecorded.unfit = 2;
         let back = AuditHistory::from_arrays(&h.to_arrays(), h.recorded(), h.unrecorded).unwrap();
-        assert_eq!(back.len(), 2);
+        assert_eq!(back.len(), 3);
         let (a, b) = (back.iter().next().unwrap(), h.iter().next().unwrap());
         assert!(a.err_energy.is_nan() && a.err_force[1] == f64::INFINITY);
-        assert_eq!((a.classes.clone(), a.n_atoms, a.model_gen), (b.classes.clone(), b.n_atoms, b.model_gen));
+        assert_eq!((a.classes.clone(), a.n_atoms, a.model_gen, a.kind), (b.classes.clone(), b.n_atoms, b.model_gen, b.kind));
+        assert_eq!(back.iter().map(|p| p.kind).collect::<Vec<_>>(), vec![PointKind::Fallback { rule: 2 }, PointKind::Audit, PointKind::Fallback { rule: 0 }]);
+        assert_eq!(PointKind::from_code(256), Some(PointKind::Fallback { rule: 255 }));
+        assert_eq!(PointKind::from_code(257), None);
         assert_eq!(back.unrecorded, h.unrecorded);
-        assert_eq!(back.recorded(), 2);
+        assert_eq!(back.recorded(), 3);
         let dec = AuditHistory::decode(&h.encode()).unwrap();
         assert!(dec.iter().next().unwrap().err_energy.is_nan());
     }
@@ -399,6 +485,12 @@ mod tests {
         let mut a = good.clone();
         a.model_gen[0] = -1.0;
         assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_model_gen"));
+        let mut a = good.clone();
+        a.kind[0] = 257.0;
+        assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_kind"));
+        let mut a = good.clone();
+        a.kind[0] = 0.5;
+        assert!(AuditHistory::from_arrays(&a, 1, Unrecorded::default()).unwrap_err().contains("audit_kind"));
         assert!(AuditHistory::from_arrays(&good, 0, Unrecorded::default()).unwrap_err().contains("recorded"));
         assert!(AuditHistory::from_arrays(&good, 1, Unrecorded::default()).is_ok());
     }

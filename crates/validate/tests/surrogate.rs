@@ -1325,62 +1325,87 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
 
 // ---- M8a Task 1: the trust baseline (a measurement, never a gate) ----
 
-/// One environment class's baseline numbers (`TrustBaseline`).
+/// One environment class's baseline numbers for one kind of point (`TrustBaseline`): audits, or
+/// consulted-model fallbacks (fix round 1, I3).
 #[derive(Default)]
 struct ClassBaseline {
-    /// Audit points with at least one atom of the class.
-    audits: usize,
-    /// Atoms of the class audited, those audited while the class verdict was trusted, and those
-    /// while the model as a whole was untrusted before the step (a sanity count: an audit fires
-    /// only when the model answers, so it should stay 0).
+    /// Points with at least one atom of the class, and their atoms of the class.
+    points: usize,
     atoms: usize,
+    /// Atoms of the class whose class verdict was trusted after the step, and whose model was
+    /// untrusted before it (a sanity count for audits: an audit fires only when the model answers).
     atoms_trusted: usize,
     atoms_model_untrusted: usize,
-    /// Audited atoms whose ‖F_teacher − F_model‖ exceeded the fit's in-domain LOO p99 while the
-    /// class verdict was trusted (the brief's "missed large error"), and while it was not.
-    missed: usize,
-    missed_untrusted: usize,
-    /// Consecutive-step changes of the class verdict (both steps with a verdict).
-    flips: usize,
-    /// The in-domain LOO p99 force error of the fit that judged the newest point, the range over
-    /// the fits the audits saw, and the fitted atoms of the class behind the last one.
+    /// Beyond the fit's in-domain LOO p99 of the class: points (any atom of the class) and atoms —
+    /// the atoms while the class verdict was trusted (the brief's "missed large error") and while
+    /// it was not. A point's atoms are not independent draws (the model's ΣF = 0: a dimer's two
+    /// atoms are one draw), so the point count is the honest one (physics review I1).
+    points_beyond: usize,
+    /// Points whose judging fit's p99 was known (a point recorded before a refit that preceded its
+    /// observation has none; `TrustBaseline::points_without_p99`).
+    points_with_p99: usize,
+    atoms_beyond_trusted: usize,
+    atoms_beyond_untrusted: usize,
+    /// The in-domain LOO p99 force error of the fit that judged the newest point (finite LOO errors
+    /// only — physics review M6), the range over the fits seen, the fitted atoms of the class
+    /// behind the last one and how many of them had an undefined (∞) leave-one-out.
     p99: f64,
     p99_min: f64,
     p99_max: f64,
     p99_atoms: usize,
-    /// Per audited atom: err/p99 and the calibration ratio z = err/pred_force_std.
-    err_over_p99: Vec<f64>,
-    z: Vec<f64>,
+    loo_undefined: usize,
+    /// Per audited atom and per point (the max over the point's atoms of the class): err/p99 and
+    /// the calibration ratio z = err/pred_force_std.
+    err_over_p99_atom: Vec<f64>,
+    err_over_p99_point: Vec<f64>,
+    z_atom: Vec<f64>,
+    z_point: Vec<f64>,
+    /// The absolute scale (physics review I2): ‖ΔF‖ per atom and per point (max), Ha/Bohr.
+    err_atom: Vec<f64>,
+    err_point: Vec<f64>,
 }
 
 /// The M8a Task 1 baseline of today's class-wise trust rule (rule 4b), measured through the
 /// provider's audit history after every step of a scenario; `report` words it. Reads only.
 struct TrustBaseline {
     name: String,
-    class: [ClassBaseline; 2],
+    /// Per class (0 pair, 1 many-body): the audit points and the fallback points.
+    audit: [ClassBaseline; 2],
+    fallback: [ClassBaseline; 2],
+    /// Fallback points by refusing rule code (`providers::surrogate::history_rule_code`).
+    fallback_rules: std::collections::BTreeMap<u8, usize>,
     steps: usize,
     points: usize,
     isolated_atoms: usize,
-    /// Fits whose LOO p99 was computed (one per model generation an audit point named).
+    /// Fits whose LOO p99 was computed (one per model generation a point named), and the points
+    /// whose judging fit was no longer current when observed (no p99 for them; z counted).
     fits_seen: usize,
+    points_without_p99: usize,
     p99_gen: Option<u64>,
     /// `recorded()` of the history at the last observation (the new points since are the tail).
     seen: u64,
     prev_class: Option<[Option<bool>; 2]>,
     prev_model: Option<bool>,
+    /// Consecutive-step changes of the class verdict (both steps with a verdict), per class, and
+    /// of the model-level `trusted()`.
+    class_flips: [usize; 2],
     model_flips: usize,
-    /// z_E = err_energy / pred_energy_std per point.
-    z_energy: Vec<f64>,
+    /// z_E = err_energy / pred_energy_std per point, audits and fallbacks apart, and the absolute
+    /// |E_teacher − E_model|/N (Ha/atom) beside it.
+    z_energy_audit: Vec<f64>,
+    z_energy_fallback: Vec<f64>,
+    gap_audit: Vec<f64>,
+    gap_fallback: Vec<f64>,
     unrecorded: surrogate::history::Unrecorded,
     /// The gated assertions that did not hold in this mode, and the runs' summaries.
     notes: Vec<String>,
     runs: String,
 }
 
-/// Nearest-rank quantile of the finite values (sorted ascending; ∞ sorts last and is kept, a
-/// NaN is dropped); NaN of an empty set.
+/// Nearest-rank quantile of the finite values (sorted ascending; ∞ and NaN are dropped — physics
+/// review M6: one undefined LOO must not make the p99 ∞); NaN of an empty set.
 fn quantile(v: &[f64], q: f64) -> f64 {
-    let mut s: Vec<f64> = v.iter().copied().filter(|x| !x.is_nan()).collect();
+    let mut s: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
     if s.is_empty() {
         return f64::NAN;
     }
@@ -1394,25 +1419,39 @@ fn rms(v: &[f64]) -> f64 {
     if f.is_empty() { f64::NAN } else { (f.iter().map(|x| x * x).sum::<f64>() / f.len() as f64).sqrt() }
 }
 
+/// `quantiles` in scientific notation (absolute errors).
+fn sci(v: &[f64]) -> String {
+    let non_finite = v.iter().filter(|x| !x.is_finite()).count();
+    format!("median {:.1e}, p90 {:.1e}, max {:.1e} (n {}{})", quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1.0), v.len(), if non_finite > 0 { format!(", {non_finite} not finite") } else { String::new() })
+}
+
 fn quantiles(v: &[f64]) -> String {
-    format!("median {:.2}, p90 {:.2}, p99 {:.2}, max {:.2}, rms {:.2} (n {})", quantile(v, 0.5), quantile(v, 0.9), quantile(v, 0.99), quantile(v, 1.0), rms(v), v.len())
+    let non_finite = v.iter().filter(|x| !x.is_finite()).count();
+    format!("median {:.2}, p90 {:.2}, max {:.2}, rms {:.2} (n {}{})", quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1.0), rms(v), v.len(), if non_finite > 0 { format!(", {non_finite} not finite") } else { String::new() })
 }
 
 impl TrustBaseline {
     fn new(name: &str) -> TrustBaseline {
         TrustBaseline {
             name: name.to_string(),
-            class: Default::default(),
+            audit: Default::default(),
+            fallback: Default::default(),
+            fallback_rules: Default::default(),
             steps: 0,
             points: 0,
             isolated_atoms: 0,
             fits_seen: 0,
+            points_without_p99: 0,
             p99_gen: None,
             seen: 0,
             prev_class: None,
             prev_model: None,
+            class_flips: [0; 2],
             model_flips: 0,
-            z_energy: Vec::new(),
+            z_energy_audit: Vec::new(),
+            z_energy_fallback: Vec::new(),
+            gap_audit: Vec::new(),
+            gap_fallback: Vec::new(),
             unrecorded: Default::default(),
             notes: Vec::new(),
             runs: String::new(),
@@ -1420,29 +1459,34 @@ impl TrustBaseline {
     }
 
     /// The fit's in-domain LOO p99 force error per class (nearest rank over the fitted atoms of
-    /// the class; with fewer than 100 atoms it is the maximum).
+    /// the class with a finite leave-one-out; with fewer than 100 such atoms it is their maximum),
+    /// stored on both kinds' rows.
     fn refresh_p99(&mut self, s: &SurrogateKs, gen: u64) {
         let errs = s.loo_force_errors();
         for c in 0..2 {
             let v: Vec<f64> = errs.iter().filter(|(k, _)| *k as usize == c + 1).map(|(_, e)| *e).collect();
+            let undefined = v.iter().filter(|e| !e.is_finite()).count();
             let p = quantile(&v, 0.99);
-            let b = &mut self.class[c];
-            b.p99 = p;
-            b.p99_atoms = v.len();
-            if self.fits_seen == 0 {
-                b.p99_min = p;
-                b.p99_max = p;
-            } else if !p.is_nan() {
-                b.p99_min = b.p99_min.min(p);
-                b.p99_max = b.p99_max.max(p);
+            for b in [&mut self.audit[c], &mut self.fallback[c]] {
+                b.p99 = p;
+                b.p99_atoms = v.len();
+                b.loo_undefined = undefined;
+                if self.fits_seen == 0 {
+                    b.p99_min = p;
+                    b.p99_max = p;
+                } else if !p.is_nan() {
+                    b.p99_min = b.p99_min.min(p);
+                    b.p99_max = b.p99_max.max(p);
+                }
             }
         }
         self.p99_gen = Some(gen);
         self.fits_seen += 1;
     }
 
-    /// After a step: the class verdicts (flips), the model's trust, and every audit point the step
-    /// added — each audited atom against the p99 of the fit that judged it (`model_gen`).
+    /// After a step: the class verdicts (flips), the model's trust, and every point the step
+    /// added — each atom against the p99 of the fit that judged it (`model_gen`, asserted to be the
+    /// current one: no refit happens between a step and its observation in either scenario).
     fn observe(&mut self, s: &SurrogateKs, trusted_before: bool) {
         let loo = s.class_loo();
         let verdict: [Option<bool>; 2] = [loo.first().map(|c| c.trusted), loo.get(1).map(|c| c.trusted)];
@@ -1450,7 +1494,7 @@ impl TrustBaseline {
             for c in 0..2 {
                 if let (Some(a), Some(b)) = (prev[c], verdict[c]) {
                     if a != b {
-                        self.class[c].flips += 1;
+                        self.class_flips[c] += 1;
                     }
                 }
             }
@@ -1468,11 +1512,29 @@ impl TrustBaseline {
         self.seen = h.recorded();
         let fresh: Vec<surrogate::AuditPoint> = h.iter().rev().take(new).rev().cloned().collect();
         for p in fresh {
-            if self.p99_gen != Some(p.model_gen) {
+            // the LOO p99 is the judging fit's (physics review M2): read only while that fit is
+            // the current one — a point recorded before a refit that preceded this observation
+            // (the repro's tail sample, recorded at generation 1 and observed after the refit to 2)
+            // has no p99 here and is counted as such; its z needs no fit
+            let p99_known = if self.p99_gen == Some(p.model_gen) {
+                true
+            } else if s.model_generation() == p.model_gen {
                 self.refresh_p99(s, p.model_gen);
-            }
+                true
+            } else {
+                self.points_without_p99 += 1;
+                false
+            };
             self.points += 1;
-            let mut touched = [false; 2];
+            let is_audit = p.kind.is_audit();
+            if let surrogate::history::PointKind::Fallback { rule } = p.kind {
+                *self.fallback_rules.entry(rule).or_default() += 1;
+            }
+            let rows = if is_audit { &mut self.audit } else { &mut self.fallback };
+            let mut seen_class = [false; 2];
+            let mut point_max: [(f64, f64); 2] = [(f64::NEG_INFINITY, f64::NEG_INFINITY); 2];
+            let mut point_err: [f64; 2] = [f64::NEG_INFINITY; 2];
+            let mut point_beyond = [false; 2];
             for j in 0..p.n_atoms {
                 let code = p.classes[j] as usize;
                 if code == 0 {
@@ -1480,51 +1542,90 @@ impl TrustBaseline {
                     continue;
                 }
                 let c = code - 1;
-                touched[c] = true;
-                let p99 = self.class[c].p99;
-                let b = &mut self.class[c];
+                seen_class[c] = true;
+                let b = &mut rows[c];
                 b.atoms += 1;
-                let large = p.err_force[j] > p99;
                 if verdict[c] == Some(true) {
                     b.atoms_trusted += 1;
-                    if large {
-                        b.missed += 1;
-                    }
-                } else if large {
-                    b.missed_untrusted += 1;
                 }
                 if !trusted_before {
                     b.atoms_model_untrusted += 1;
                 }
-                b.err_over_p99.push(p.err_force[j] / p99);
-                b.z.push(p.err_force[j] / p.pred_force_std[j]);
-            }
-            for c in 0..2 {
-                if touched[c] {
-                    self.class[c].audits += 1;
+                let z = p.err_force[j] / p.pred_force_std[j];
+                b.z_atom.push(z);
+                b.err_atom.push(p.err_force[j]);
+                point_max[c].1 = point_max[c].1.max(z);
+                point_err[c] = point_err[c].max(p.err_force[j]);
+                if p99_known {
+                    let large = p.err_force[j] > b.p99;
+                    if verdict[c] == Some(true) {
+                        if large {
+                            b.atoms_beyond_trusted += 1;
+                        }
+                    } else if large {
+                        b.atoms_beyond_untrusted += 1;
+                    }
+                    point_beyond[c] |= large;
+                    let r = p.err_force[j] / b.p99;
+                    b.err_over_p99_atom.push(r);
+                    point_max[c].0 = point_max[c].0.max(r);
                 }
             }
-            self.z_energy.push(p.err_energy / p.pred_energy_std);
+            for c in 0..2 {
+                if seen_class[c] {
+                    let b = &mut rows[c];
+                    b.points += 1;
+                    b.z_point.push(point_max[c].1);
+                    b.err_point.push(point_err[c]);
+                    if p99_known {
+                        b.points_with_p99 += 1;
+                        b.points_beyond += point_beyond[c] as usize;
+                        b.err_over_p99_point.push(point_max[c].0);
+                    }
+                }
+            }
+            let z_e = p.err_energy / p.pred_energy_std;
+            let gap = p.err_energy.abs() / p.n_atoms.max(1) as f64;
+            if is_audit {
+                self.z_energy_audit.push(z_e);
+                self.gap_audit.push(gap);
+            } else {
+                self.z_energy_fallback.push(z_e);
+                self.gap_fallback.push(gap);
+            }
         }
     }
 
     fn report(&self) -> String {
         let mut o = String::new();
         let u = self.unrecorded;
-        let _ = writeln!(o, "{}: {} steps observed, {} audit points recorded ({} isolated atoms among them, no class), {} fits seen by the audits; model-level trusted() flips {}; judged audits without a point: no variance {}, box-affected {}, draft {}",
-                         self.name, self.steps, self.points, self.isolated_atoms, self.fits_seen, self.model_flips, u.no_variance, u.box_affected, u.draft);
+        let pol = FallbackPolicy::default();
+        let _ = writeln!(o, "{}: {} steps observed, {} points recorded ({} audits, {} fallbacks; {} isolated atoms among them, no class), {} fits seen by the points ({} points recorded before a refit that preceded their observation: no p99 for them, z counted); model-level trusted() flips {}; comparisons without a point: no variance {}, box-affected {}, draft {}, unfit {}",
+                         self.name, self.steps, self.points, self.z_energy_audit.len(), self.z_energy_fallback.len(), self.isolated_atoms, self.fits_seen, self.points_without_p99, self.model_flips, u.no_variance, u.box_affected, u.draft, u.unfit);
         o += &self.runs;
-        for (c, name) in providers::surrogate::ENV_CLASSES.iter().enumerate() {
-            let b = &self.class[c];
-            let share = |k: usize, n: usize| if n == 0 { f64::NAN } else { 100.0 * k as f64 / n as f64 };
-            let _ = writeln!(o, "  {name}: {} audits touching the class, {} atoms audited ({} while the class verdict was trusted, {} while the model was untrusted before the step); in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms; over the fits seen {:.2e}–{:.2e})",
-                             b.audits, b.atoms, b.atoms_trusted, b.atoms_model_untrusted, b.p99, b.p99_atoms, b.p99_min, b.p99_max);
-            let _ = writeln!(o, "    missed large errors: {} / {} = {:.1} % of the atoms audited while trusted (err > p99); {} large errors while the class was untrusted; err/p99 {}",
-                             b.missed, b.atoms_trusted, share(b.missed, b.atoms_trusted), b.missed_untrusted, quantiles(&b.err_over_p99));
-            let _ = writeln!(o, "    calibration z = ‖ΔF‖/pred_force_std: {}", quantiles(&b.z));
-            let _ = writeln!(o, "    class verdict flips: {} over {} consecutive-step pairs", b.flips, self.steps.saturating_sub(1));
+        if !self.fallback_rules.is_empty() {
+            let _ = writeln!(o, "  fallback points by rule: {}", self.fallback_rules.iter().map(|(k, n)| format!("{n}× {}", providers::surrogate::history_rule_name(*k))).collect::<Vec<_>>().join("; "));
         }
-        let _ = writeln!(o, "  energy: z_E = (E_teacher − E_model)/pred_energy_std: {}", quantiles(&self.z_energy));
+        let share = |k: usize, n: usize| if n == 0 { f64::NAN } else { 100.0 * k as f64 / n as f64 };
+        for (c, name) in providers::surrogate::ENV_CLASSES.iter().enumerate() {
+            let b = &self.audit[c];
+            let _ = writeln!(o, "  {name}: in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms, {} with an undefined LOO excluded; over the fits seen {:.2e}–{:.2e}); class verdict flips {} over {} consecutive-step pairs",
+                             b.p99, b.p99_atoms, b.loo_undefined, b.p99_min, b.p99_max, self.class_flips[c], self.steps.saturating_sub(1));
+            for (what, b) in [("audits", &self.audit[c]), ("fallbacks", &self.fallback[c])] {
+                if b.points == 0 {
+                    let _ = writeln!(o, "    {what}: none touching the class");
+                    continue;
+                }
+                let _ = writeln!(o, "    {what}: {} points touching the class ({} atoms; {} atoms while the class verdict was trusted, {} while the model was untrusted before the step)", b.points, b.atoms, b.atoms_trusted, b.atoms_model_untrusted);
+                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (the brief's \"missed large error\"), {} while it was not",
+                                 b.points_beyond, b.points_with_p99, share(b.points_beyond, b.points_with_p99), b.points - b.points_with_p99, b.atoms_beyond_trusted, b.atoms_trusted, share(b.atoms_beyond_trusted, b.atoms_trusted), b.atoms_beyond_untrusted);
+                let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
+                let _ = writeln!(o, "      ‖ΔF‖ per point (max over its atoms), Ha/Bohr: {}; per atom: {} — the audit's force tolerance is max({:.0e}, 10 % |F|) ≤ {:.0e} Ha/Bohr", sci(&b.err_point), sci(&b.err_atom), pol.force_std_abs, providers::surrogate::FORCE_STD_BOUND_MAX);
+                let _ = writeln!(o, "      z = ‖ΔF‖/pred_force_std per point (max over its atoms): {}; per atom: {}", quantiles(&b.z_point), quantiles(&b.z_atom));
+            }
+        }
+        let _ = writeln!(o, "  energy z_E = (E_teacher − E_model)/pred_energy_std — audits: {}; fallbacks: {}", quantiles(&self.z_energy_audit), quantiles(&self.z_energy_fallback));
+        let _ = writeln!(o, "  energy |E_teacher − E_model|/N, Ha/atom — audits: {}; fallbacks: {} — the tier is {:.0e} Ha/atom", sci(&self.gap_audit), sci(&self.gap_fallback), pol.energy_std_per_atom);
         if !self.notes.is_empty() {
             let _ = writeln!(o, "  gated assertions that did not hold under these audits ({}):", self.notes.len());
             for n in &self.notes {
@@ -1545,7 +1646,7 @@ fn baseline_audit_every() -> usize {
 /// M8a Task 1, Step 5 — the trust baseline (module doc; `references.md`, "M8a trust baseline"):
 /// `cargo test -p validate --release --test surrogate trust_baseline_report -- --ignored --nocapture`
 /// (`BASELINE_AUDIT_EVERY=10` for the supplementary dense-cadence run). Writes the report to the
-/// gitignored `last-run-trust-baseline.md` as well.
+/// gitignored `last-run-trust-baseline-every<k>.md` as well (one file per cadence, physics review M4).
 #[test]
 #[ignore = "measurement (M8a Task 1): cargo test -p validate --release --test surrogate trust_baseline_report -- --ignored --nocapture"]
 fn trust_baseline_report() {
@@ -1557,13 +1658,13 @@ fn trust_baseline_report() {
     let mut al = TrustBaseline::new(&format!("active_learning_run ({AL_STEPS} steps, audit every {every})"));
     active_learning_run(Some(&mut al), every);
     let mut out = String::new();
-    let _ = writeln!(out, "# M8a trust baseline (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; wall {:.0} s)\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64());
-    let _ = writeln!(out, "Per environment class (rule 4b): audits, the share of missed large errors (an audited atom's ‖F_teacher − F_model‖ beyond the fit's in-domain 99th-percentile leave-one-out force error while the class verdict was trusted), the calibration ratio z = err/pred_std (E[z²] = 1 when calibrated), and the class verdict's consecutive-step flips. A measurement, not a gate.\n");
+    let _ = writeln!(out, "# M8a trust baseline (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s)\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64());
+    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
     out += &repro.report();
     out += &al.report();
     println!("{out}");
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/last-run-trust-baseline.md");
-    std::fs::write(path, &out).unwrap_or_else(|e| panic!("writing {path}: {e}"));
+    let path = format!("{}/last-run-trust-baseline-every{every}.md", env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(&path, &out).unwrap_or_else(|e| panic!("writing {path}: {e}"));
 }
 
 /// M6 Task 11, requirement 6 — a measurement, not a pass/fail gate (run with `--ignored

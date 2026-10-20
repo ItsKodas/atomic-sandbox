@@ -5,8 +5,92 @@
 //! stays in the parent module doc.
 
 use super::*;
+use surrogate::history::PointKind;
 
 pub use sim::{AuditRecord, AuditVerdict};
+
+/// The `u8` code a fallback point of the audit history carries for its refusing rule
+/// (`surrogate::history::PointKind::Fallback`; M8a Task 1 fix round 1). The table is the
+/// provider's: the `surrogate` crate never reads it. Appended only — a code, once given, keeps
+/// its meaning in every history file.
+///
+/// | code | rule |
+/// |---|---|
+/// | 0 | `Cell` (the cell check) |
+/// | 1 | `NoModel` (rule 1) |
+/// | 2 | `NewSpecies` (rule 2) |
+/// | 3 | `OtherSettings` (rule 3) |
+/// | 4 | `Untrusted` (rule 4, the trust rule) |
+/// | 5 | `Class(Pair)` (rule 4b) |
+/// | 6 | `Class(ManyBody)` (rule 4b) |
+/// | 7 | `IsolatedAtom` (rule 5a) |
+/// | 8 | `Coordination` (rule 5b) |
+/// | 9 | `Spread` (rule 5, the envelope) |
+/// | 10 | `NoGrade` (rule 5e, no active set) |
+/// | 11 | `NewEnvironment` (rule 5d) |
+/// | 12 | `UnspannedAtom` (rule 5e at γ = ∞) |
+/// | 13 | `Grade` (rule 5e) |
+/// | 14 | `ForceUncertainty` (rule 6) |
+/// | 15 | `EnergyUncertainty` (rule 7) |
+/// | 16 | `NonFiniteAnswer` (never recorded: no finite prediction) |
+/// | 17 | `NearQuarantine` (the quarantine, audit and shell fences) |
+/// | 18 | `Audit` (an audit's own kind is `PointKind::Audit`; the code is for completeness) |
+/// | 19 | `RelaxVerification` |
+/// | 20 | `Pass` (a sampling-pass job; never a step) |
+pub fn history_rule_code(rule: TeachRule) -> u8 {
+    use sim::activity::EnvClass;
+    match rule {
+        TeachRule::Cell => 0,
+        TeachRule::NoModel => 1,
+        TeachRule::NewSpecies(_) => 2,
+        TeachRule::OtherSettings => 3,
+        TeachRule::Untrusted(_) => 4,
+        TeachRule::Class(EnvClass::Pair) => 5,
+        TeachRule::Class(EnvClass::ManyBody) => 6,
+        TeachRule::IsolatedAtom => 7,
+        TeachRule::Coordination => 8,
+        TeachRule::Spread => 9,
+        TeachRule::NoGrade => 10,
+        TeachRule::NewEnvironment => 11,
+        TeachRule::UnspannedAtom => 12,
+        TeachRule::Grade => 13,
+        TeachRule::ForceUncertainty => 14,
+        TeachRule::EnergyUncertainty => 15,
+        TeachRule::NonFiniteAnswer => 16,
+        TeachRule::NearQuarantine => 17,
+        TeachRule::Audit => 18,
+        TeachRule::RelaxVerification => 19,
+        TeachRule::Pass(_) => 20,
+    }
+}
+
+/// The rule a [`history_rule_code`] names, in the decision list's words ("?" for an unknown code).
+pub fn history_rule_name(code: u8) -> &'static str {
+    match code {
+        0 => "cell check",
+        1 => "rule 1 (no model)",
+        2 => "rule 2 (new species)",
+        3 => "rule 3 (other settings)",
+        4 => "rule 4 (untrusted)",
+        5 => "rule 4b (pair class)",
+        6 => "rule 4b (many-body class)",
+        7 => "rule 5a (isolated atom)",
+        8 => "rule 5b (coordination)",
+        9 => "rule 5 (envelope)",
+        10 => "rule 5e (no grade)",
+        11 => "rule 5d (new environment)",
+        12 => "rule 5e (unspanned atom)",
+        13 => "rule 5e (grade)",
+        14 => "rule 6 (force uncertainty)",
+        15 => "rule 7 (energy uncertainty)",
+        16 => "non-finite answer",
+        17 => "fence (quarantine, audit or shell)",
+        18 => "audit",
+        19 => "relax verification",
+        20 => "pass",
+        _ => "?",
+    }
+}
 
 /// What a background job is for (`surrogate` module doc, "Audit" and "Side densities").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,23 +508,30 @@ impl SurrogateKs {
         self.last_audit.as_ref()
     }
 
-    /// Every judged audit's prediction against the teacher's answer (M8a Task 1,
-    /// `surrogate::history`): the newest `surrogate::HISTORY_CAP` points, oldest first, and the
-    /// counts of judged audits that left none. A record; nothing in the policy reads it.
+    /// Every judged comparison of the model's prediction with the teacher's answer — audits and
+    /// consulted-model fallbacks, by `PointKind` (M8a Task 1, `surrogate::history`): the newest
+    /// `surrogate::HISTORY_CAP` points, oldest first, and the counts of those that left none. A
+    /// record; nothing in the policy reads it.
     pub fn audit_history(&self) -> &surrogate::AuditHistory {
         &self.audit_history
     }
 
-    /// Records a judged audit in the history (`surrogate::history`, M8a Task 1): the model's
-    /// predictive stds at the geometry — `stds` = (total-energy std, per-atom force std, its
-    /// epistemic part) — against the teacher's errors, ‖F_teacher − F_model‖ per atom and the
-    /// signed gap E_teacher − E_model, with each atom's class code (0 isolated, 1 pair, 2
-    /// many-body by its neighbour count within the model's r_cut) and the model generation judged.
-    /// No point, one count, for a box-affected answer (the box's confinement is in the error), a
-    /// draft-mode guess at a geometry strict mode refuses (no verdict on the strict model), or a
-    /// model without a variance factor (`stds` None).
+    /// Records a judged comparison in the history (`surrogate::history`, M8a Task 1) — an audit, or
+    /// (fix round 1, the physics review's I3) a step the teacher answered because a rule refused
+    /// the model's answer, `kind` saying which: the model's predictive stds at the geometry —
+    /// `stds` = (total-energy std, per-atom force std, its epistemic part) — against the teacher's
+    /// errors, ‖F_teacher − F_model‖ per atom and the signed gap E_teacher − E_model, with each
+    /// atom's class code (0 isolated, 1 pair, 2 many-body by its neighbour count within the model's
+    /// r_cut) and the model generation judged. No point, one count, for a box-affected answer (the
+    /// box's confinement is in the error), a draft-mode guess at a geometry strict mode refuses (no
+    /// verdict on the strict model), an unfit teacher answer (cores overlap, an occupation change:
+    /// not the surface the model learns), or a model without a variance factor (`stds` None).
+    ///
+    /// # Panics
+    /// If the shapes disagree with the geometry (a programming error at the call site: every
+    /// judged comparison leaves a point or a count, so nothing is dropped silently).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_audit_point(&mut self, pos: &[[f64; 3]], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool) {
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
         if box_affected {
             self.audit_history.unrecorded.box_affected += 1;
             return;
@@ -449,19 +540,22 @@ impl SurrogateKs {
             self.audit_history.unrecorded.draft += 1;
             return;
         }
+        if unfit {
+            self.audit_history.unrecorded.unfit += 1;
+            return;
+        }
         let Some((energy_std, force_std, force_std_epistemic)) = stds else {
             self.audit_history.unrecorded.no_variance += 1;
             return;
         };
         let n = pos.len();
-        debug_assert!(n > 0 && force_std.len() == n && force_std_epistemic.len() == n && model_forces.len() == n && forces.len() == n, "an audit's shapes agree with its geometry");
-        if n == 0 || force_std.len() != n || force_std_epistemic.len() != n || model_forces.len() != n || forces.len() != n {
-            return;
-        }
+        assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
         let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
         let classes = neighbour_counts(pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1)).collect();
         let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
+        // (`push` checks the per-atom lengths and the class codes and panics on a mismatch)
         self.audit_history.push(surrogate::AuditPoint {
+            kind,
             classes,
             pred_force_std: force_std.to_vec(),
             pred_force_std_epistemic: force_std_epistemic.to_vec(),
@@ -710,7 +804,7 @@ impl SurrogateKs {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_audit_point(&pos, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess);
+        self.record_history_point(PointKind::Audit, &pos, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

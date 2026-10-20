@@ -827,7 +827,7 @@ use inspect::StrictVerdict;
 use ledger::*;
 use policy::*;
 use quarantine::*;
-pub use audit::{AuditRecord, AuditVerdict};
+pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict};
 pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
@@ -860,9 +860,9 @@ struct ModelAnswer {
     energy: f64,
     forces: Vec<[f64; 3]>,
     uncertainty: Option<f64>,
-    /// For an in-step audit: the model's predictive stds at the geometry — (total-energy std,
-    /// per-atom force std, its epistemic part) — the history's point (M8a Task 1,
-    /// `surrogate::history`). `None` on other steps, or when the model has no variance factor.
+    /// The model's predictive stds at the geometry — (total-energy std, per-atom force std, its
+    /// epistemic part) — the history's point (M8a Task 1, `surrogate::history`) of an in-step
+    /// audit or of a consulted-model fallback. `None` when the model has no variance factor.
     stds: Option<(f64, Vec<f64>, Vec<f64>)>,
 }
 
@@ -1329,6 +1329,14 @@ impl SurrogateKs {
         stats.uncertainty = h.model.as_ref().and_then(|m| m.uncertainty);
         // a consulted model that fell back (an audit is not the model failing to answer)
         let boxed = face.filter(|&rho| rho > rule);
+        // the history's fallback point (M8a Task 1 fix round 1, the physics review's I3): the
+        // model's prediction against the teacher's answer at a geometry a rule refused — evidence
+        // at the edge of what the rules accept. Not inside a fenced shell band (nothing is judged
+        // there, an audit included) and not for a non-finite prediction (no finite stds exist)
+        if let Some(m) = h.model.as_ref().filter(|_| !h.audit && !h.shell_fence && h.reason.rule != TeachRule::NonFiniteAnswer) {
+            let kind = surrogate::history::PointKind::Fallback { rule: history_rule_code(h.reason.rule) };
+            self.record_history_point(kind, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
+        }
         if h.model.is_some() && !h.audit {
             self.streak += 1;
             self.streak_reason = Some(h.reason.clone());
@@ -1402,7 +1410,7 @@ impl SurrogateKs {
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
                     // the history's point (M8a Task 1): an in-step audit is never a draft guess
-                    self.record_audit_point(&h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false);
+                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
                     if let Some(rho) = box_rho {
                         notes.push(format!(
                             "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error"
@@ -1749,17 +1757,16 @@ impl ForceProvider for SurrogateKs {
         }
         if reason.is_some() || audit {
             let reason = reason.unwrap_or_else(|| Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None));
-            // the in-step audit's history point (M8a Task 1, `surrogate::history`): the model's stds
-            // at this geometry — the cadence may have reused an earlier verdict, so when the
-            // prediction carries none they are evaluated here (one variance evaluation per in-step
-            // audit, the cost the cadence budgets); `None` without a variance factor (counted)
-            let stds = if audit {
-                match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
-                    (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
-                    _ => self.model.as_ref().and_then(|m| m.predict(&pos, &z, true).ok()).and_then(|p| Some((p.energy_std?, p.force_std?, p.force_std_epistemic?))),
-                }
-            } else {
-                None
+            // the history's point (M8a Task 1, `surrogate::history`) of this in-step audit or
+            // consulted-model fallback: the model's stds at this geometry — the cadence may have
+            // reused an earlier verdict, so when the prediction carries none they are evaluated
+            // here (one variance evaluation, O(N·Q′²), against the teacher solve this step makes);
+            // `None` without a variance factor (counted as such — a `predict` error here is
+            // counted the same way, though it cannot happen: the same model just predicted at
+            // this geometry)
+            let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
+                (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
+                _ => self.model.as_ref().and_then(|m| m.predict(&pos, &z, true).ok()).and_then(|p| Some((p.energy_std?, p.force_std?, p.force_std_epistemic?))),
             };
             let h = Handoff {
                 prov,

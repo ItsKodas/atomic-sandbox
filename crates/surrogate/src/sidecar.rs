@@ -145,12 +145,14 @@
 //! version 5 plus the provider's [`AuditHistory`] (`crate::history`: per judged audit the model's
 //! predictive stds against the teacher's errors, the evidence of a calibration). When the writer's
 //! history is not blank (a point recorded or an `Unrecorded` counter set) the header carries the
-//! key `audit_history` {points, recorded, no_variance, box_affected, draft (JSON integers)} right
-//! after `arrays`, and the eight history arrays follow the sample tail, last, in the order of
+//! key `audit_history` {points, recorded, no_variance, box_affected, draft, unfit (JSON integers)}
+//! right after `arrays`, and the nine history arrays follow the sample tail, last, in the order of
 //! [`HistoryArrays::NAMES`](crate::history::HistoryArrays::NAMES) — `audit_atoms`,
-//! `audit_model_gen`, `audit_energy_std`, `audit_err_energy` (`points` each) and `audit_classes`,
-//! `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (Σ atoms each; module doc of
-//! `crate::history` for the contents and the validation). With a blank history nothing is added:
+//! `audit_model_gen`, `audit_kind`, `audit_energy_std`, `audit_err_energy` (`points` each) and
+//! `audit_classes`, `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force` (Σ atoms
+//! each; module doc of `crate::history` for the contents and the validation; `audit_kind` and the
+//! `unfit` counter were added in fix round 1 while version 7 was unreleased — no earlier form of
+//! version 7 exists in a file). With a blank history nothing is added:
 //! the file is version 5's bytes under the version-7 magic. The key and the arrays are read for
 //! version 7 only; versions 1 to 5 read with an empty history, version 6 has none (nothing was
 //! fitted, so nothing was audited). The bump keeps an older build from misreading the arrays:
@@ -620,6 +622,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
                 ("no_variance", u.no_variance.to_string()),
                 ("box_affected", u.box_affected.to_string()),
                 ("draft", u.draft.to_string()),
+                ("unfit", u.unfit.to_string()),
             ]),
         ));
     }
@@ -1011,7 +1014,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let history_counts = if version >= 7 { decode_history_key(&h)? } else { None };
     if let Some((points, _, _)) = &history_counts {
         for (i, name) in HistoryArrays::NAMES.iter().enumerate() {
-            fixed.push((*name, (i < 4).then_some(*points)));
+            fixed.push((*name, (i < HistoryArrays::PER_POINT).then_some(*points)));
         }
     }
     let arrays = read_arrays(bytes, &declared, &fixed, version)?;
@@ -1098,7 +1101,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let audit_history = match history_counts {
         None => AuditHistory::default(),
         Some((_, recorded, unrecorded)) => {
-            let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next()]);
+            let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next()]);
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
@@ -1119,7 +1122,7 @@ fn decode_history_key(h: &Json) -> Result<Option<(usize, u64, Unrecorded)>, Stri
         return Err(format!("audit_history.points {points} exceeds the ring's {}", crate::history::HISTORY_CAP));
     }
     let recorded = count("recorded")?;
-    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")? };
+    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")? };
     Ok(Some((points, recorded, unrecorded)))
 }
 
@@ -1882,6 +1885,7 @@ mod tests {
     fn history_point(i: u64, n: usize) -> crate::history::AuditPoint {
         let k = i as f64;
         crate::history::AuditPoint {
+            kind: if i % 3 == 0 { crate::history::PointKind::Audit } else { crate::history::PointKind::Fallback { rule: (i % 23) as u8 } },
             classes: (0..n).map(|j| ((i as usize + j) % 3) as u8).collect(),
             pred_force_std: (0..n).map(|j| 1e-3 * (1.0 + k + j as f64)).collect(),
             pred_force_std_epistemic: (0..n).map(|j| 5e-4 * (1.0 + k + j as f64)).collect(),
@@ -1929,6 +1933,7 @@ mod tests {
         hist.unrecorded.no_variance = 3;
         hist.unrecorded.box_affected = 2;
         hist.unrecorded.draft = 1;
+        hist.unrecorded.unfit = 4;
         let path = tmp("history-v7.model");
         write_full_with_history(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -1979,13 +1984,14 @@ mod tests {
         // refused: a class code of 3, an atom count that no longer matches the per-atom arrays
         let hl7 = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header7 = std::str::from_utf8(&bytes[16..16 + hl7]).unwrap();
-        assert!(header7.contains("\"audit_history\":{\"points\":57,\"recorded\":57,\"no_variance\":3,\"box_affected\":2,\"draft\":1}"), "{header7}");
+        assert!(header7.contains("\"audit_history\":{\"points\":57,\"recorded\":57,\"no_variance\":3,\"box_affected\":2,\"draft\":1,\"unfit\":4}"), "{header7}");
         let n_pts = 57usize;
         let a_sum = hist.to_arrays().classes.len();
-        // the body walk: the history arrays are the last eight (four of `points`, four of Σ atoms)
-        let hist_bytes = 8 * 8 + 8 * (4 * n_pts + 4 * a_sum);
+        // the body walk: the history arrays are the last nine (five of `points`, four of Σ atoms)
+        let per_point = crate::history::HistoryArrays::PER_POINT;
+        let hist_bytes = 9 * 8 + 8 * (per_point * n_pts + 4 * a_sum);
         let hist_at = bytes.len() - hist_bytes;
-        let classes_at = hist_at + 4 * (8 + 8 * n_pts) + 8;
+        let classes_at = hist_at + per_point * (8 + 8 * n_pts) + 8;
         let mut bad_class = bytes.clone();
         bad_class[classes_at..classes_at + 8].copy_from_slice(&3.0f64.to_le_bytes());
         let p = tmp("history-bad-class.model");
@@ -2257,7 +2263,7 @@ mod tests {
         let masses_key = ",\"masses\":[[1,1],[1,2]]";
         assert!(header.contains(masses_key), "{header}");
         let as_version = |magic: &[u8; 8]| {
-            let h = header.replacen("ASMODEL7",std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
+            let h = header.replacen("ASMODEL7", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
             let mut v = magic.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
@@ -2473,7 +2479,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
         for (name, magic, strip_masses) in [("v4", MAGIC_V4, false), ("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
-            let mut h = header.replacen("ASMODEL7",std::str::from_utf8(magic).unwrap(), 1);
+            let mut h = header.replacen("ASMODEL7", std::str::from_utf8(magic).unwrap(), 1);
             if magic != MAGIC_V4 {
                 h = h.replacen(",\"ionic\":\"none\"", "", 1);
             }

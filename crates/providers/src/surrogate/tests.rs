@@ -7085,7 +7085,7 @@ fn judged_audits_are_recorded_in_the_history() {
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
-    assert_eq!((p.n_atoms, p.classes.clone(), p.model_gen), (2, vec![1, 1], s.model_gen));
+    assert_eq!((p.kind, p.n_atoms, p.classes.clone(), p.model_gen), (surrogate::history::PointKind::Audit, 2, vec![1, 1], s.model_gen));
     assert_eq!(p.pred_force_std, pred.force_std.clone().unwrap(), "the total predictive force std, per atom");
     assert_eq!(p.pred_force_std_epistemic, pred.force_std_epistemic.clone().unwrap());
     assert_eq!(p.pred_energy_std, pred.energy_std.unwrap());
@@ -7129,6 +7129,60 @@ fn judged_audits_are_recorded_in_the_history() {
     // a forget starts a new model's lifetime
     s.forget();
     assert_eq!(s.audit_history(), &surrogate::AuditHistory::default());
+}
+
+/// M8a Task 1 fix round 1 (the physics review's I3): a step the teacher answers because a rule
+/// refused the model's answer leaves a **fallback** point too — flagged with the refusing rule's
+/// code — with the model's stds at that geometry (evaluated for the point when the cadence had
+/// reused a verdict) against the teacher's errors; a gate refusal before the model is consulted
+/// (no model) leaves nothing; an unfit teacher answer is counted, not recorded. The sidecar carries
+/// the kinds.
+#[test]
+fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
+    use surrogate::history::PointKind;
+    // rule 1: no model → no prediction → nothing
+    let (mut s0, _h0) = trained(1.2, 2.2, 0, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let r = s0.evaluate(&h2(1.5), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert_eq!(s0.audit_history(), &surrogate::AuditHistory::default(), "a gate refusal leaves no point and no count");
+    // the envelope (rule 5): a dimer far outside the trained range
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let near = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!((near.stats.source, s.audit_history().len()), (Source::Surrogate, 0), "an answered step is no comparison");
+    let far = h2(3.4);
+    let (pos, z) = pos_z(&far);
+    let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    let r = s.evaluate(&far, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(s.audit_history().len(), 1, "the fallback is recorded");
+    let p = s.audit_history().iter().next().unwrap();
+    let rule = match p.kind {
+        PointKind::Fallback { rule } => rule,
+        PointKind::Audit => panic!("a fallback point"),
+    };
+    assert_eq!(history_rule_name(rule), "rule 5 (envelope)", "code {rule}: {:?}", r.stats.notes);
+    assert_eq!(history_rule_code(TeachRule::Spread), rule);
+    assert_eq!(p.pred_force_std, pred.force_std.clone().unwrap(), "the model's stds at the refused geometry");
+    assert_eq!(p.pred_energy_std, pred.energy_std.unwrap());
+    assert_eq!(p.err_energy, t.energy - pred.energy);
+    for (j, e) in p.err_force.iter().enumerate() {
+        let d = (0..3).map(|k| (t.forces[j][k] - pred.forces[j][k]).powi(2)).sum::<f64>().sqrt();
+        assert_eq!(*e, d, "atom {j}");
+    }
+    // every code is distinct and named
+    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan)];
+    let codes: std::collections::BTreeSet<u8> = rules.iter().map(|&r| history_rule_code(r)).collect();
+    assert_eq!(codes.len(), rules.len(), "distinct codes");
+    assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
+    assert_eq!(history_rule_name(21), "?");
+    // the sidecar keeps the kind
+    let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(&file.audit_history, s.audit_history());
+    assert_eq!(file.audit_history.iter().next().unwrap().kind, PointKind::Fallback { rule });
 }
 
 /// Final review I2: the fenced pair is the check's own. (a) A check whose point lies at or beyond
