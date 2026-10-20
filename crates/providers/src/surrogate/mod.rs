@@ -1910,6 +1910,7 @@ impl SurrogateKs {
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
         let shells = sampler.take_shell_checks();
+        let unrun = sampler.pending_shell_checks();
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
         if let Some(f) = sampler.take_failed_reference() {
@@ -1927,9 +1928,18 @@ impl SurrogateKs {
         };
         self.teacher.discontinuity();
         let (fittable, q_prime) = self.fittable_and_q_prime();
+        // the shell checks are judged against this pass's own refit only (final review M2): with
+        // no refit the model standing is none or an earlier fit, whose verdict on the shell is
+        // not this pass's measurement
+        let mut unjudged: Option<String> = None;
+        // a check judged against a fit that is not trusted, or holds none of this pass's samples, says so (physics review
+        // of the M7 leftovers, Minor 2): its fence is kept (the safe side) but may be the fit's error, not the cutoff's
+        let mut caveat: Option<&'static str> = None;
         let msg = if self.samples() == 0 {
+            unjudged = Some("the pass fitted no model".into());
             format!("{kind} {how}: no samples to fit")
         } else if fittable < q_prime {
+            unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below Q′ = {q_prime}"));
             // below Q′ the model cannot earn trust (the trust rule needs n ≥ Q′), and the fit
             // with its trust recovery costs seconds on the worker thread (Task 3 fix round 2):
             // keep the samples, skip the refit until there are enough
@@ -1939,9 +1949,13 @@ impl SurrogateKs {
                 Ok(r) => {
                     let coverage = self.compute_pass_coverage();
                     let trust = match (self.untrusted_reason(), coverage.as_ref()) {
-                        (Some(why), _) => format!("untrusted ({why})"),
+                        (Some(why), _) => {
+                            caveat = Some("judged against a fit that is not trusted");
+                            format!("untrusted ({why})")
+                        }
                         // fix (e): never "trusted" for a scene whose own pass is not in the fit
                         (None, Some(c)) if c.fitted == 0 && c.total > 0 => {
+                            caveat = Some("judged against a fit that holds none of this pass's samples");
                             "trusted elsewhere, but NOT for this scene: none of its pass samples is in the fit".to_string()
                         }
                         (None, _) => "trusted".to_string(),
@@ -1957,6 +1971,7 @@ impl SurrogateKs {
                     )
                 }
                 Err(e) => {
+                    unjudged = Some(format!("the pass's refit failed ({e})"));
                     if self.model.is_none() {
                         self.last_fit_error = Some(e.to_string());
                     }
@@ -1966,8 +1981,16 @@ impl SurrogateKs {
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
-        if !shells.is_empty() {
-            self.judge_shell_checks(shells);
+        match unjudged {
+            None => self.judge_shell_checks_with(shells, caveat),
+            Some(why) => self.leave_shell_checks_unjudged(&shells, &why),
+        }
+        for ((za, zb), r) in unrun {
+            self.user_notes.push(format!(
+                "sampling: the pass ended before its shell check of {}–{} at r = {r:.2} Bohr — the cutoff shell of this pair stays unmeasured",
+                units::elements::symbol(za),
+                units::elements::symbol(zb)
+            ));
         }
         match teach {
             Some((targets, holdouts)) => self.finish_teach(&targets, holdouts, &progress),

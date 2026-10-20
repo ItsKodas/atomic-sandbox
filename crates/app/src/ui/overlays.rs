@@ -193,10 +193,10 @@ pub fn teach_prompt<'a>(input: &'a PanelInput<'_>) -> Option<&'a str> {
 }
 
 /// "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s" — the first solve of a scene waits for its tables
-/// (M7 Task 11; controller's cost condition: the minute is said, never silent). Without the gate: "(seconds)".
-pub fn generating_line((z, secs, gated): (u8, f64, bool)) -> String {
-    let what = if gated { "≈ 1 min: its dimer check" } else { "seconds" };
-    format!("generating the {} pseudopotential ({what})… {secs:.0} s", units::isotopes::symbol(z))
+/// (M7 Task 11; controller's cost condition: the minute is said, never silent). Without the gate, or with its answers on
+/// disk: "(seconds)"; the gate on the CPU: "(≈ 40 min on the CPU: its dimer check (no GPU))" (final review M6).
+pub fn generating_line((z, secs, cost): (u8, f64, providers::pseudo::GenerationCost)) -> String {
+    format!("generating the {} pseudopotential ({})… {secs:.0} s", units::isotopes::symbol(z), cost.words())
 }
 
 /// "bond references: O 2/3… (14 s)": the species, the multiplicity being solved of the scan's

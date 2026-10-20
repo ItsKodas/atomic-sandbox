@@ -6901,6 +6901,133 @@ fn a_shell_fence_fallback_drives_the_step_and_is_never_fitted() {
     }
 }
 
+/// Final review M1 (the M7 leftovers): the training views' pair curve — and `would_answer`, which
+/// it composes — refuse a fenced shell band as `evaluate` does, and see an audit fence with no
+/// sample quarantined. A model trained on 1.2–5.0 Bohr is trusted and answers just inside
+/// [5/6 r_cut, r_cut) before the fence (the premise; the LiH case of the review); after a failing H–H shell check every curve point in the band
+/// is refused, by the shell fence where nothing before it in the order refused, the points below
+/// the band are unchanged, and `evaluate` hands the same band point to the teacher. Then an
+/// ordinary audit fence at 1.7 Bohr (no quarantined sample: the old views skipped every fence)
+/// refuses its neighbourhood on the curve.
+#[test]
+fn the_training_curve_refuses_a_fenced_shell_band_as_evaluate_does() {
+    use sim::activity::TeachRule as R;
+    let (mut s, _h) = trained(1.2, 5.0, 80, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let rc = s.model().unwrap().basis.r_cut;
+    let lo = crate::sampling::SCAN_CUTOFF_FRACTION * rc;
+    let in_band = |r: f64| (lo..rc).contains(&r);
+    let v0 = s.training_views().unwrap();
+    let c0 = v0.curves[0].clone();
+    let answered: Vec<usize> = (0..c0.r.len()).filter(|&j| in_band(c0.r[j]) && c0.refused[j].is_none()).collect();
+    eprintln!("band [{lo:.2}, {rc:.2}): {} curve points, {} answered before the fence", c0.r.iter().filter(|&&r| in_band(r)).count(), answered.len());
+    assert!(!answered.is_empty(), "premise: the model answers in the band before the fence: {:?}", c0.refused);
+    assert_eq!(s.quarantined(), 0, "premise: no quarantined sample");
+    // a failing shell check fences H–H (the teacher 0.1 Ha off the model at 5.2 Bohr)
+    let far = in_big_cell(h2(5.2));
+    let (pos, z) = pos_z(&far);
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: rc, scene: far, energy: p.energy + 0.1, forces: p.forces, face: None, unfit: false }]);
+    assert!(s.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "premise: fenced");
+    let v = s.training_views().unwrap();
+    let c = &v.curves[0];
+    let prov = s.model().unwrap().provenance.clone();
+    for (j, &r) in c.r.iter().enumerate() {
+        if in_band(r) {
+            assert!(c.refused[j].is_some(), "r = {r}: the band is refused");
+        } else if r < lo - 0.3 {
+            // well below the band (outside the fence geometry's own quarantine radius): unchanged
+            assert_eq!(c.refused[j], c0.refused[j], "r = {r}");
+        }
+        assert_eq!(c.refused[j], s.would_answer(&dimer_at_x(r), &[1, 1], &prov).err().map(|e| e.0), "r = {r}: the curve is would_answer's");
+    }
+    for &j in &answered {
+        assert_eq!(c.refused[j], Some(R::NearQuarantine), "r = {}: refused by the fence", c.r[j]);
+        // the shell fence names the pair's second atom; the audit fence of the same case names none (physics review Minor 1)
+        assert_eq!(s.would_answer(&dimer_at_x(c.r[j]), &[1, 1], &prov), Err((R::NearQuarantine, Some(1))), "r = {}: the shell fence, not only the case's quarantine radius", c.r[j]);
+    }
+    // evaluate agrees at an answered band point: the teacher answers, the shell fence named
+    let r = c.r[answered[0]];
+    let res = s.evaluate(&h2(r), &mut never()).unwrap();
+    assert_eq!(res.stats.source, Source::Fallback, "r = {r}: {:?}", res.stats.notes);
+    assert!(res.stats.notes.iter().any(|n| n.contains("shell fence")), "{:?}", res.stats.notes);
+    // an ordinary audit fence with nothing quarantined is on the curve too
+    let (mut u, _h) = trained(1.2, 5.0, 80, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let w0 = u.training_views().unwrap().curves[0].clone();
+    let k = w0.r.iter().position(|&r| r >= 1.7).unwrap();
+    assert_eq!(w0.refused[k], None, "premise: answered at 1.7 Bohr");
+    let (pos, z) = pos_z(&in_big_cell(h2(w0.r[k])));
+    let p = u.model().unwrap().predict(&pos, &z, false).unwrap();
+    u.audit_fences.push(FailedAudit { pos, z, energy: p.energy, forces: p.forces, index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    assert_eq!(u.quarantined(), 0);
+    let w = u.training_views().unwrap();
+    assert_eq!(w.curves[0].refused[k], Some(R::NearQuarantine), "the audit fence's own geometry is refused on the curve");
+    let prov = u.model().unwrap().provenance.clone();
+    for (j, &r) in w.curves[0].r.iter().enumerate() {
+        assert_eq!(w.curves[0].refused[j], u.would_answer(&dimer_at_x(r), &[1, 1], &prov).err().map(|e| e.0), "r = {r}");
+    }
+}
+
+/// Final review M2 (the M7 leftovers): a pass's shell checks are judged against that pass's own
+/// refit only, and a check that is not judged is said, never dropped. (a) A pass too small to fit
+/// (below Q′, no model at all): its shell check was solved but is reported "could not be judged
+/// (the pass's refit did not run …) — … stays unmeasured", and nothing is fenced. (b) A pass
+/// cancelled before its shell check (a model standing, the refit runs on the kept samples): "the
+/// pass ended before its shell check of H–H …", nothing fenced and no "holds" verdict.
+#[test]
+fn shell_checks_are_judged_against_the_passs_own_refit_or_said_unmeasured() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    // (a) no model, below Q′
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &off_centre_h2(3.3), &plan, &mut refs).unwrap();
+    assert_eq!(s.pass.as_ref().unwrap().pending_shell_checks().len(), 1, "premise: the 3.3 Bohr scan crosses 5/6 r_cut");
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    println!("{}", notes.join("\n"));
+    let (fittable, q_prime) = s.fittable_and_q_prime();
+    assert!(s.model().is_none() && fittable < q_prime, "premise: below Q′ ({fittable} < {q_prime}), no fit");
+    assert!(
+        notes.iter().any(|n| n.starts_with("sampling: the shell check of H–H at r = ") && n.contains("could not be judged (the pass's refit did not run") && n.ends_with("stays unmeasured")),
+        "{notes:?}"
+    );
+    assert!(!notes.iter().any(|n| n.contains("cutoff holds") || n.contains("still interacts")), "no verdict without the pass's fit");
+    assert!(s.audit_fences.is_empty(), "nothing fenced");
+    // (b) cancelled before the check: the refit runs, the unrun check is said
+    let (mut t, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let _ = Trainable::take_notes(&mut t);
+    Trainable::start_pass(&mut t, &off_centre_h2(3.3), &plan, &mut refs).unwrap();
+    let r = t.pass.as_ref().unwrap().pending_shell_checks()[0].1;
+    Trainable::cancel_pass(&mut t);
+    let notes = Trainable::take_notes(&mut t);
+    println!("{}", notes.join("\n"));
+    assert!(notes.iter().any(|n| n.contains("refit on")), "premise: the cancelled pass refits: {notes:?}");
+    let want = format!("sampling: the pass ended before its shell check of H–H at r = {r:.2} Bohr — the cutoff shell of this pair stays unmeasured");
+    assert!(notes.contains(&want), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("cutoff holds") || n.contains("still interacts")));
+    assert!(t.audit_fences.is_empty());
+    // (c) judged against a fit with a caveat (untrusted, or without this pass's samples): fenced as before, the note says
+    // the verdict may be the fit's (physics review Minor 2)
+    let far = in_big_cell(h2(5.2));
+    let (pos, z) = pos_z(&far);
+    let p = t.model().unwrap().predict(&pos, &z, false).unwrap();
+    let check = crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: p.energy + 0.1, forces: p.forces, face: None, unfit: false };
+    t.judge_shell_checks_with(vec![check], Some("judged against a fit that is not trusted"));
+    let note = t.user_notes.last().unwrap();
+    assert!(note.contains("still interacts") && note.ends_with("(judged against a fit that is not trusted: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)"), "{note}");
+    assert!(t.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "the fence is kept: the safe side");
+}
+
+/// An H₂ at `r` along x whose fixed atom sits at −1.5 − r/2 in the fixture's 33³ cell, so the scan's
+/// moved atom (index 1, +x) stays inside the cell's margin out past 5/6 r_cut (the shell check).
+fn off_centre_h2(r: f64) -> Scene {
+    dimer(r, [1.0, 0.0, 0.0], [-1.5, 0.0, 0.0], 1, 1)
+}
+
+/// The training curve's dimer at distance `r` (Bohr), as `views` builds it.
+fn dimer_at_x(r: f64) -> [[f64; 3]; 2] {
+    [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]]
+}
+
 /// The coordinator's ruling on I1 (2026-10-19): never a fitted band row — the relax verification
 /// and an audit included. A relax verification at a fenced-band geometry is answered by the
 /// teacher (the verification has its answer), not fitted (`ShellNotKept`) and leaves no failed
@@ -7083,3 +7210,4 @@ fn every_blocker_needs_a_judged_check() {
     assert!(outcome.contains("no check near #59 could be judged"), "{outcome}");
     assert!(outcome.contains("1 of 1 check geometries judged"), "{outcome}");
 }
+

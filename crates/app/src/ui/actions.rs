@@ -1267,6 +1267,7 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
         sample_tol: crate::worker::SAMPLE_TOL,
         pseudised: !super::pseudo::pseudised(input).is_empty(),
         vram: &vram,
+        generation_cost: &providers::pseudo::generation_cost,
     };
     super::model_offer::offer(path, &prov, input.scene, &ctx)
 }
