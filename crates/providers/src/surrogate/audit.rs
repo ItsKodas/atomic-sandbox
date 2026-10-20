@@ -424,6 +424,55 @@ impl SurrogateKs {
         self.last_audit.as_ref()
     }
 
+    /// Every judged audit's prediction against the teacher's answer (M8a Task 1,
+    /// `surrogate::history`): the newest `surrogate::HISTORY_CAP` points, oldest first, and the
+    /// counts of judged audits that left none. A record; nothing in the policy reads it.
+    pub fn audit_history(&self) -> &surrogate::AuditHistory {
+        &self.audit_history
+    }
+
+    /// Records a judged audit in the history (`surrogate::history`, M8a Task 1): the model's
+    /// predictive stds at the geometry — `stds` = (total-energy std, per-atom force std, its
+    /// epistemic part) — against the teacher's errors, ‖F_teacher − F_model‖ per atom and the
+    /// signed gap E_teacher − E_model, with each atom's class code (0 isolated, 1 pair, 2
+    /// many-body by its neighbour count within the model's r_cut) and the model generation judged.
+    /// No point, one count, for a box-affected answer (the box's confinement is in the error), a
+    /// draft-mode guess at a geometry strict mode refuses (no verdict on the strict model), or a
+    /// model without a variance factor (`stds` None).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_audit_point(&mut self, pos: &[[f64; 3]], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool) {
+        if box_affected {
+            self.audit_history.unrecorded.box_affected += 1;
+            return;
+        }
+        if draft {
+            self.audit_history.unrecorded.draft += 1;
+            return;
+        }
+        let Some((energy_std, force_std, force_std_epistemic)) = stds else {
+            self.audit_history.unrecorded.no_variance += 1;
+            return;
+        };
+        let n = pos.len();
+        debug_assert!(n > 0 && force_std.len() == n && force_std_epistemic.len() == n && model_forces.len() == n && forces.len() == n, "an audit's shapes agree with its geometry");
+        if n == 0 || force_std.len() != n || force_std_epistemic.len() != n || model_forces.len() != n || forces.len() != n {
+            return;
+        }
+        let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
+        let classes = neighbour_counts(pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1)).collect();
+        let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
+        self.audit_history.push(surrogate::AuditPoint {
+            classes,
+            pred_force_std: force_std.to_vec(),
+            pred_force_std_epistemic: force_std_epistemic.to_vec(),
+            pred_energy_std: energy_std,
+            err_force,
+            err_energy: energy - model_energy,
+            n_atoms: n,
+            model_gen: self.model_gen,
+        });
+    }
+
     /// The last audit judged the current fit: `false` when no audit ran since the last refit
     /// (`last_audit` is then an earlier fit's, or `None` when the model was never audited).
     /// Activity Task 3 review I1: the checklist's audit line must not read an earlier fit's
@@ -566,12 +615,14 @@ impl SurrogateKs {
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        // the model current now is the one to judge (a refit since the dispatch is what counts)
+        // the model current now is the one to judge (a refit since the dispatch is what counts);
+        // with the variance: the history's point needs the model's stds here (M8a Task 1 — one
+        // variance evaluation per audit, within what the cadence budgets)
         let pred = self
             .model
             .as_ref()
             .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
-            .and_then(|m| m.predict(&pos, &z, false).ok());
+            .and_then(|m| m.predict(&pos, &z, true).ok());
         let Some(pred) = pred else {
             let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
@@ -654,6 +705,12 @@ impl SurrogateKs {
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         // the prediction judged above is the current model's, so the stamp is this fit's
         self.last_audit_fit = self.fits;
+        // the history's point (M8a Task 1)
+        let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
+            (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
+            _ => None,
+        };
+        self.record_audit_point(&pos, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess);
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

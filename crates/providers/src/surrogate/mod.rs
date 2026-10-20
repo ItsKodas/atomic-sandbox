@@ -860,6 +860,10 @@ struct ModelAnswer {
     energy: f64,
     forces: Vec<[f64; 3]>,
     uncertainty: Option<f64>,
+    /// For an in-step audit: the model's predictive stds at the geometry — (total-energy std,
+    /// per-atom force std, its epistemic part) — the history's point (M8a Task 1,
+    /// `surrogate::history`). `None` on other steps, or when the model has no variance factor.
+    stds: Option<(f64, Vec<f64>, Vec<f64>)>,
 }
 
 /// One teacher step: why (the note's text, the rule's code and the atom it names), with what
@@ -969,6 +973,10 @@ pub struct SurrogateKs {
     /// Model → Teacher flip at its positions (module doc, "Audit").
     audit_flip: bool,
     last_audit: Option<AuditRecord>,
+    /// Every judged audit's prediction against the teacher (M8a Task 1, `surrogate::history`): the
+    /// evidence of a calibration. Written with the sidecar, installed from it, cleared by a forget.
+    /// A record only; nothing in the policy reads it.
+    audit_history: surrogate::AuditHistory,
     /// Fits installed so far (`fit_store`'s successes and installed sidecars): the fit generation
     /// that `last_audit_fit` is compared with. A readout only; it decides nothing.
     fits: u64,
@@ -1147,6 +1155,7 @@ impl SurrogateKs {
             last_fallback: false,
             pass_busy: 0,
             last_audit: None,
+            audit_history: surrogate::AuditHistory::default(),
             fits: 0,
             last_audit_fit: 0,
             model_gen: 0,
@@ -1392,6 +1401,8 @@ impl SurrogateKs {
                     };
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
+                    // the history's point (M8a Task 1): an in-step audit is never a draft guess
+                    self.record_audit_point(&h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false);
                     if let Some(rho) = box_rho {
                         notes.push(format!(
                             "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error"
@@ -1637,7 +1648,7 @@ impl ForceProvider for SurrogateKs {
                 thin: false,
                 dedup: false,
                 near,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None }),
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
                 audit: false,
                 teacher_surface: true,
             };
@@ -1738,6 +1749,18 @@ impl ForceProvider for SurrogateKs {
         }
         if reason.is_some() || audit {
             let reason = reason.unwrap_or_else(|| Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None));
+            // the in-step audit's history point (M8a Task 1, `surrogate::history`): the model's stds
+            // at this geometry — the cadence may have reused an earlier verdict, so when the
+            // prediction carries none they are evaluated here (one variance evaluation per in-step
+            // audit, the cost the cadence budgets); `None` without a variance factor (counted)
+            let stds = if audit {
+                match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
+                    (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
+                    _ => self.model.as_ref().and_then(|m| m.predict(&pos, &z, true).ok()).and_then(|p| Some((p.energy_std?, p.force_std?, p.force_std_epistemic?))),
+                }
+            } else {
+                None
+            };
             let h = Handoff {
                 prov,
                 pos,
@@ -1754,7 +1777,7 @@ impl ForceProvider for SurrogateKs {
                 thin: (by_envelope || by_class) && !class_short && !forced,
                 dedup: (by_envelope || by_class || by_audit_fence) && !forced,
                 near,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
                 audit,
                 // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)
                 // and the first evaluation after an edit report the teacher's surface; audits

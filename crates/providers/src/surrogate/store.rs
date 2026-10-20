@@ -128,6 +128,7 @@ impl SurrogateKs {
         self.reset_audits();
         // a new model's lifetime starts here (the queued events stay: they happened)
         self.ledger.counts = SolveCounts::default();
+        self.audit_history = surrogate::AuditHistory::default();
     }
 
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
@@ -182,7 +183,8 @@ impl SurrogateKs {
             pair: c.pair,
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
-        surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
+        // and the audit history (version 7, M8a Task 1)
+        surrogate::sidecar::write_full_with_history(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history)
     }
 
     /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
@@ -259,7 +261,7 @@ impl SurrogateKs {
     /// count starting at zero, with a note for the unreadable one), set only once the install
     /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -335,6 +337,8 @@ impl SurrogateKs {
         self.since_kept = THIN_EVERY;
         self.recovery = None;
         self.reset_audits();
+        // the file's audit history is the installed model's (M8a Task 1)
+        self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);
         self.fits += 1;

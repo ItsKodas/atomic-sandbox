@@ -8,6 +8,7 @@ Cargo.lock.orig
 /crates/validate/last-run-tools.md
 /crates/validate/last-run-generation-records.md
 /crates/validate/last-run-pseudo.md
+/crates/validate/last-run-trust-baseline.md
 .DS_Store
 Thumbs.db
 /out

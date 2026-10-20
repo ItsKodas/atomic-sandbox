@@ -21,6 +21,7 @@ pub mod descriptor;
 pub mod envelope;
 pub mod fit;
 pub mod grade;
+pub mod history;
 pub mod linalg;
 pub mod loo;
 pub mod model;
@@ -34,5 +35,6 @@ pub use fit::{
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance};
 pub use grade::ActiveSet;
+pub use history::{AuditHistory, AuditPoint, HISTORY_CAP};
 pub use novelty::NullSpace;
 pub use sidecar::{SampleSet, Sidecar};

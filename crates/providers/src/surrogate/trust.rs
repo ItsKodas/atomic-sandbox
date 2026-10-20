@@ -406,6 +406,31 @@ impl SurrogateKs {
         &self.class_loo
     }
 
+    /// Per atom of every fitted sample (the accumulated prefix, excluded samples skipped — the same
+    /// members as `class_loo`): its class code in the history's numbering (0 isolated, 1 pair,
+    /// 2 many-body) and the leave-one-out force error ‖F_LOO − F_sample‖ (Ha/Bohr; ∞ when the
+    /// sample's LOO is undefined). The in-domain error distribution a measurement compares audit
+    /// errors with (M8a Task 1's trust baseline). A readout; it decides nothing. Empty without a
+    /// model.
+    pub fn loo_force_errors(&self) -> Vec<(u8, f64)> {
+        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else {
+            return Vec::new();
+        };
+        let rc2 = model.basis.r_cut * model.basis.r_cut;
+        let mut out = Vec::new();
+        for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
+            if self.excluded(i) {
+                continue;
+            }
+            let classes = neighbour_counts(&s.pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1));
+            match surrogate::loo::leave_one_out(model, s) {
+                None => out.extend(classes.map(|c| (c, f64::INFINITY))),
+                Some(l) => out.extend(classes.zip(&l.forces).map(|(c, r)| (c, (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()))),
+            }
+        }
+        out
+    }
+
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
     /// neighbour counts `counts`: `None` when every class among its atoms ([`atom_class`]) is
     /// trusted (isolated atoms are exempt), else the first untrusted class's refusal (pair before

@@ -5927,7 +5927,7 @@ fn installed_from(path: &std::path::Path) -> (SurrogateKs, sim::IonicPolicy, Pro
 }
 
 /// The coordinator's requirement (2026-10-18): a model file of the current format (ASMODEL5 since
-/// the shell fence's pair, final review I2; no new sample codes: a store of plain pass and fallback
+/// the shell fence's pair, final review I2, ASMODEL7 since the audit history; no new sample codes: a store of plain pass and fallback
 /// samples, as every file written before the trust
 /// fixes) is re-judged from its stored samples when it is installed — the per-atom classes, the
 /// fenced outliers and the class verdicts recomputed from the geometries and labels, no teacher
@@ -5952,7 +5952,7 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     let path = std::env::temp_dir().join(format!("trust-fix-rejudge-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let magic = std::fs::read(&path).unwrap();
-    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the current format (no new sample codes)");
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V7, "the current format (no new sample codes; version 7 since the audit history, M8a Task 1)");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
     println!("re-judged on load: {:?}", back.class_loo());
@@ -6860,7 +6860,7 @@ fn a_shell_fence_is_never_lifted_by_a_refit_or_an_install() {
     let path = std::env::temp_dir().join(format!("shell-fence-stands-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let magic = std::fs::read(&path).unwrap();
-    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the fence's pair needs format 5");
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V7, "the fence's pair needs format 5 or later (7 since the audit history)");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
     assert_eq!(shell_fences(&back), 1);
@@ -6936,6 +6936,72 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::ShellNotKept));
     assert_eq!(s.samples(), n0, "not kept");
     assert!(s.failed_audits.is_empty() && s.audit_failed.is_none() && s.trusted(), "an audit in the band is no judgement: {:?}", s.untrusted_reason());
+}
+
+/// M8a Task 1: every judged audit leaves an `AuditPoint` in the history (`surrogate::history`) —
+/// the background one (`judge_audit`, which now predicts **with** the variance) and the in-step one
+/// — with the model's per-atom predictive force std (the total and its epistemic part) against
+/// ‖F_teacher − F_model‖, the total-energy std against the signed gap, the atoms' class codes
+/// (0 isolated, 1 pair, 2 many-body) and the model generation judged. A box-affected answer leaves
+/// no point and is counted; the history is written with the sidecar (version 7) and installed
+/// from it; a forget clears it.
+#[test]
+fn judged_audits_are_recorded_in_the_history() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert!(s.audit_history().is_empty());
+    let scene = h2(1.5);
+    let t = MorseDimer::h2().evaluate(&scene, &mut never()).unwrap();
+    let (pos, z) = pos_z(&scene);
+    let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
+    let prov = s.provenance_for(&scene);
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    s.judge_audit(job(), t.energy, t.forces.clone(), None, None, 1.0, Some(10));
+    assert_eq!(s.audit_history().len(), 1);
+    let p = s.audit_history().iter().next().unwrap().clone();
+    assert_eq!((p.n_atoms, p.classes.clone(), p.model_gen), (2, vec![1, 1], s.model_gen));
+    assert_eq!(p.pred_force_std, pred.force_std.clone().unwrap(), "the total predictive force std, per atom");
+    assert_eq!(p.pred_force_std_epistemic, pred.force_std_epistemic.clone().unwrap());
+    assert_eq!(p.pred_energy_std, pred.energy_std.unwrap());
+    assert_eq!(p.err_energy, t.energy - pred.energy, "signed: teacher − model");
+    for (j, e) in p.err_force.iter().enumerate() {
+        let d = (0..3).map(|k| (t.forces[j][k] - pred.forces[j][k]).powi(2)).sum::<f64>().sqrt();
+        assert_eq!(*e, d, "‖F_teacher − F_model‖ of atom {j}");
+    }
+    // a box-affected answer (face density above the rule): judged "not judged", no point, counted
+    s.judge_audit(job(), t.energy, t.forces.clone(), Some(1.0), None, 1.0, Some(10));
+    assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.box_affected), (1, 1));
+    // a draft-mode guess at a geometry strict mode refuses: no point, counted
+    s.judge_audit(AuditJob { draft_guess: true, ..job() }, t.energy, t.forces.clone(), None, None, 1.0, Some(10));
+    assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.draft), (1, 1));
+    // the in-step audit (no auditor attached, audit every 2 answered steps): the second answered
+    // step is audited inside `evaluate`; the cadence had reused the first verdict, so the point's
+    // stds come from a variance evaluation made for the audit
+    let (mut s2, _h2) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 2, ..FallbackPolicy::default() });
+    let a = s2.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!((a.stats.source, s2.audit_history().len()), (Source::Surrogate, 0));
+    let b = s2.evaluate(&h2(1.62), &mut never()).unwrap();
+    assert_eq!(b.stats.source, Source::Fallback, "{:?}", b.stats.notes);
+    assert!(b.stats.notes.iter().any(|n| n.contains("audit")), "{:?}", b.stats.notes);
+    assert_eq!(s2.audit_history().len(), 1, "the in-step audit is recorded");
+    let q = s2.audit_history().iter().next().unwrap();
+    assert_eq!((q.n_atoms, q.classes.clone()), (2, vec![1, 1]));
+    assert!(q.pred_force_std.iter().all(|x| x.is_finite() && *x > 0.0) && q.pred_energy_std > 0.0, "{q:?}");
+    assert!(q.pred_force_std.iter().zip(&q.pred_force_std_epistemic).all(|(t, e)| t > e), "the total exceeds its epistemic part by the σ_f floor: {q:?}");
+    let (pos_b, z_b) = pos_z(&h2(1.62));
+    let pred_b = s2.model().unwrap().predict(&pos_b, &z_b, true).unwrap();
+    assert_eq!(q.pred_force_std, pred_b.force_std.unwrap(), "the same model's stds at the audited geometry");
+    // the history rides with the sidecar (version 7) and is installed from it
+    let path = std::env::temp_dir().join(format!("audit-history-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    assert_eq!(&file.audit_history, s.audit_history());
+    let (mut back, _hb) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    back.install_sidecar(file).unwrap();
+    assert_eq!(back.audit_history(), s.audit_history());
+    let _ = std::fs::remove_file(&path);
+    // a forget starts a new model's lifetime
+    s.forget();
+    assert_eq!(s.audit_history(), &surrogate::AuditHistory::default());
 }
 
 /// Final review I2: the fenced pair is the check's own. (a) A check whose point lies at or beyond
