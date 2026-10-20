@@ -124,19 +124,23 @@ pub fn solve_cell(e: &sim::TeachEvent) -> String {
     match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
         (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
         (Some(n), Some(end)) => format!("{t} · {n} {}", end.word()),
+        (None, Some(sim::ScfEnd::TimeLimit)) => format!("{t} · {}", sim::ScfEnd::TimeLimit.word()),
         (None, _) => t,
     }
 }
 
 /// The solve cell's hover: the iterations and the end in words.
 pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
+    if e.scf_end == Some(sim::ScfEnd::TimeLimit) {
+        return Some("given up at the sampling pass's per-sample time limit (several times the pass's median solve): not kept, like a stalled solve".into());
+    }
     let n = e.scf_steps?;
     let why = match e.scf_end {
         Some(sim::ScfEnd::Converged) => " — converged",
         Some(sim::ScfEnd::Stalled) => " — stalled: the best Δρ did not halve within the stall window, so the solve stopped before the cap",
         Some(sim::ScfEnd::Cap) => " — stopped at the iteration cap without converging",
         Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
-        None => "",
+        Some(sim::ScfEnd::TimeLimit) | None => "",
     };
     Some(format!("{n} SCF iterations{why}"))
 }
@@ -359,7 +363,7 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     col(ui, 4, &words::outcome_label(e.outcome), prop, outcome_colour, Some(outcome_hover));
     col(ui, 5, &gap, mono, theme::INK, gap_hover);
     let solve_colour = match e.scf_end {
-        Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite) => AMBER,
+        Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit) => AMBER,
         _ => theme::INK_DIM,
     };
     col(ui, 6, &solve_cell(e), mono, solve_colour, solve_hover(e));

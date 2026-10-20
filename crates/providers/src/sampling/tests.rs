@@ -2110,3 +2110,164 @@ fn the_ghost_describes_a_teach_around_pass() {
     assert_eq!(g.job, GhostJob::Teach { blocker: 7, index: 1, of: 2, holdout: false });
     assert_eq!(g.atoms.len(), 2);
 }
+
+/// A teacher that fails the two-nucleus solves whose 1-based count `fails` picks (a capped SCF),
+/// counts its resets, and solves everything else as `PairMorse`.
+struct FailsOnCall {
+    inner: PairMorse,
+    calls: usize,
+    fails: fn(usize) -> bool,
+    resets: usize,
+}
+
+impl ForceProvider for FailsOnCall {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 2 {
+            self.calls += 1;
+            if (self.fails)(self.calls) {
+                self.inner.seen.push(scene.clone());
+                return Err(ProviderError::Solver(sim::SolverError::ScfNotConverged(200, 3e-4)));
+            }
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+    fn reset(&mut self) {
+        self.resets += 1;
+    }
+    fn discontinuity(&mut self) {}
+}
+
+/// User report 2026-10-20 (module doc, 4.): a failed hot-burst step restarts the burst from the last
+/// geometry it solved with fresh Maxwell–Boltzmann velocities (the teacher reset) instead of ending
+/// it, so the pass makes its planned evaluations; three failures in a row, or a failed start
+/// geometry, end it as before.
+#[test]
+fn a_failed_burst_step_restarts_the_burst_from_the_last_good_geometry() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 20, scan_points_per_pair: 0, seed: 7, ..SamplingPlan::default() };
+    let run = |fails: fn(usize) -> bool| {
+        let mut teacher = FailsOnCall { inner: PairMorse::h2(), calls: 0, fails, resets: 0 };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap();
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+        let kept: Vec<Vec<[f64; 3]>> = s.store().map_or(Vec::new(), |st| st.samples.iter().filter(|x| x.tag == SampleTag::HotBurst).map(|x| x.pos.clone()).collect());
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), kept, teacher)
+    };
+
+    // the 6th evaluation fails: the burst goes on from the 5th with fresh velocities
+    let (p, notes, events, kept, teacher) = run(|n| n == 6);
+    println!("one failure: {p:?}\n  {notes:?}");
+    assert_eq!((p.done, p.total, p.failed, p.skipped), (21, 21, 1, 0), "the failed step is one of the 20 evaluations; nothing skipped");
+    assert!(p.finished);
+    assert_eq!(kept.len(), 19);
+    assert!(notes.iter().any(|n| n.contains("the burst restarts from the last geometry it solved with fresh Maxwell–Boltzmann velocities at 2000 K (restart 1; 14 evaluations left)")), "{notes:?}");
+    let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::Cap), Some(200)));
+    // the step after the restart is one dt from the 5th solved geometry, not the failed one again
+    let failed_pos: Vec<[f64; 3]> = teacher.inner.seen.iter().filter(|x| x.nuclei.len() == 2).nth(5).expect("the failed geometry").nuclei.iter().map(|n| n.pos).collect();
+    let step = |a: &[[f64; 3]], b: &[[f64; 3]]| (0..a.len()).flat_map(|i| (0..3).map(move |k| (a[i][k] - b[i][k]).abs())).fold(0.0, f64::max);
+    let typical = step(&kept[3], &kept[4]);
+    assert!(step(&kept[4], &kept[5]) < 3.0 * typical, "one dt from the 5th: {} vs {typical}", step(&kept[4], &kept[5]));
+    assert!(step(&failed_pos, &kept[5]) > 1e-9, "not the failed geometry again");
+    // the restart's temperature is the burst's: K exactly the mean at the draw, one Verlet step later
+    let t_after = events.iter().filter(|e| e.outcome.is_kept()).nth(5).and_then(|e| e.burst_t).expect("a burst temperature");
+    assert!((t_after / 2000.0 - 1.0).abs() < 0.2, "T after the restart {t_after:.0} K");
+
+    // the teacher is cold after a failure (one reset more than without it)
+    let (_, _, _, _, t1) = run(|_| false);
+    let (_, _, _, _, t2) = run(|n| n == 6);
+    assert_eq!(t2.resets, t1.resets + 1, "the solve after the failure is cold");
+
+    // three failures in a row end the burst: the 6th, 7th and 8th; 12 evaluations skipped
+    let (p, notes, _, kept, _) = run(|n| (6..=8).contains(&n));
+    assert_eq!((p.done, p.total, p.failed, p.skipped, kept.len()), (21, 21, 3, 12, 5), "{p:?}");
+    assert!(notes.iter().any(|n| n.contains("the burst ends (3 failures in a row), 12 evaluations skipped")), "{notes:?}");
+    // two in a row restart twice, then it goes on
+    let (p, _, _, kept, _) = run(|n| (6..=7).contains(&n));
+    assert_eq!((p.failed, p.skipped, kept.len()), (2, 0, 18));
+    // a failed start geometry has nothing to go back to: the burst ends there
+    let (p, notes, _, kept, _) = run(|n| n == 1);
+    assert_eq!((p.failed, p.skipped, kept.len()), (1, 19, 0));
+    assert!(notes.iter().any(|n| n.contains("the burst ends (its start geometry: no solved geometry to go back to), 19 evaluations skipped")), "{notes:?}");
+    // the last evaluation failing ends nothing
+    let (p, _, _, kept, _) = run(|n| n == 20);
+    assert_eq!((p.failed, p.skipped, kept.len()), (1, 0, 19));
+}
+
+/// A teacher whose two-nucleus solves at separations `slow` picks take `secs` unless aborted first
+/// (polling `should_abort` every millisecond, like the GPU teacher every SCF iteration).
+struct Slow {
+    inner: PairMorse,
+    slow: fn(f64) -> bool,
+    secs: f64,
+}
+
+impl ForceProvider for Slow {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 2 && (self.slow)(dist(scene, 0, 1)) {
+            let t0 = Instant::now();
+            while t0.elapsed().as_secs_f64() < self.secs {
+                if should_abort() {
+                    return Err(ProviderError::Cancelled);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+    fn reset(&mut self) {}
+    fn discontinuity(&mut self) {}
+}
+
+/// User report 2026-10-20 (module doc, "The time limit"): after three successful sample solves, one
+/// that runs past 5× their median (never below the floor — 0.05 s here, for a quick test) is given
+/// up: failed, `ScfEnd::TimeLimit`, never kept, and the stretched scan's further-out points are
+/// skipped as after a stall. Before three solves there is no limit; a user abort is still a cancel.
+#[test]
+fn a_sample_solve_past_the_time_limit_is_given_up_like_a_stall() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |slow: fn(f64) -> bool, secs: f64| {
+        let mut teacher = Slow { inner: PairMorse::h2(), slow, secs };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap().with_time_limit_floor(0.05);
+        let t0 = Instant::now();
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+        let wall = t0.elapsed().as_secs_f64();
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), sampler.time_limit_s(), wall)
+    };
+    // point 9 (1.50 r₀) would take 2 s: given up at the 0.05 s floor; points 10–12 skipped
+    let (p, notes, events, added, limit, wall) = run(|r| r > 1.45 * 1.4 && r < 1.55 * 1.4, 2.0);
+    println!("timed out: {p:?} limit {limit:?} wall {wall:.2} s\n  {notes:?}");
+    assert_eq!(limit, Some(0.05), "5× a microsecond median is under the floor");
+    assert!(wall < 1.0, "given up, not waited out ({wall:.2} s)");
+    assert_eq!((p.done, p.total, p.failed, p.skipped, added), (13, 13, 1, 3, 8));
+    let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::TimeLimit), None));
+    assert!(failed[0].detail.contains("the pass's time limit (5× its median solve of"), "{}", failed[0].detail);
+    assert!(notes.iter().any(|n| n.contains("point 9 of 12 (r = 1.50 r₀) failed (time limit); further-out points skipped")), "{notes:?}");
+    // the first scan point (0.7 r₀) is slow too, but no limit stands before three solves: it is waited out
+    let (p, _, _, added, _, wall) = run(|r| r < 0.75 * 1.4, 0.3);
+    assert_eq!((p.failed, p.skipped, added), (0, 0, 12), "{p:?}");
+    assert!(wall >= 0.3, "{wall:.2} s");
+    // a user abort during a timed solve stays a cancel: the job is kept for the next step
+    let mut teacher = Slow { inner: PairMorse::h2(), slow: |r| r > 1.45 * 1.4, secs: 2.0 };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    for _ in 0..9 {
+        sampler.step(&mut teacher, &mut s, &mut never()).unwrap();
+    }
+    let before = sampler.progress().done;
+    assert!(matches!(sampler.step(&mut teacher, &mut s, &mut || true), Err(ProviderError::Cancelled)));
+    assert_eq!((sampler.progress().done, sampler.progress().failed), (before, 0));
+}

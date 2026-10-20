@@ -69,6 +69,16 @@
 //!    velocities at `hot_burst_t` (2000 K), CSVR-thermostatted at that temperature with
 //!    τ [`HOT_BURST_TAU_FS`] = 5 fs: the first evaluation is the start geometry (the burst needs
 //!    its forces), each later one a Verlet step. Every evaluation is a `HotBurst` sample.
+//!    **A failed step restarts the burst** (user report 2026-10-20: a 149 s capped solve ended the
+//!    burst, and with it the pass): the burst is a sampler of hot geometries, not a physical
+//!    trajectory, so it goes on from the last geometry it solved — its positions and forces kept —
+//!    with fresh Maxwell–Boltzmann velocities at `hot_burst_t` (`Csvr::maxwell_boltzmann`: COM at
+//!    rest, K exactly the mean of the 3N − 3 internal dof; the CSVR restores the canonical spread
+//!    within a few τ) and a cold teacher (`reset`: the failed solve's state is no start). The failed
+//!    step counts as one of the burst's evaluations (`failed`), so the pass still makes its planned
+//!    number. Only [`BURST_RESTARTS_IN_A_ROW`] failures in a row — or a failure of the start
+//!    geometry, which has no earlier geometry to go back to — end the burst as before (the rest
+//!    skipped). Each restart is noted and leaves a `Failed` event naming it.
 //!
 //! **Cell guard**: a generated geometry with a nucleus closer than [`CELL_MARGIN_H`]·h to a
 //! cell face (the providers' own R12 margin) is never sent to the teacher; it is counted in
@@ -76,6 +86,16 @@
 //! skipped). A teacher error on a sample geometry is counted in `failed` with a note and the
 //! pass goes on; a failed reference solve ends the pass with the error (no fit is possible
 //! without it).
+//!
+//! **The time limit** (user report 2026-10-20): once the pass has [`TIME_LIMIT_MIN_SOLVES`]
+//! successful sample solves, a sample solve that runs past [`TIME_LIMIT_FACTOR`] × their median
+//! wall time — never below [`TIME_LIMIT_FLOOR_S`] — is given up (the teacher's `should_abort` says
+//! so at its next poll: every SCF iteration on the GPU, once before the solve on the CPU, so the
+//! CPU teacher is never cut short). It is reported like a stall — `failed`, a `Failed` event with
+//! `ScfEnd::TimeLimit`, never kept — and the rules for a stalled solve apply to it: a stretched
+//! scan point's further-out points are skipped, a burst step restarts the burst. Reference solves
+//! and shell checks are never timed (the fit and the shell fence rest on them); perturbations, scan
+//! points, burst steps and teach-around solves are.
 //!
 //! **A failed scan point ends its scan's stretched tail** (the SCF stall stop, `qm::scf` "The stall
 //! stop"): when a scan point on the stretched side (r > r₀) fails to converge — the stall stop or
@@ -91,8 +111,9 @@
 //! converged stretched point stay unseen, so the model falls back to the teacher there (the
 //! data-driven rules 5b–5e; skip rows never become samples). Points on the compressed side, and every
 //! other scan, are unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to
-//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop and the cap trigger it
-//! (`ScfEnd::Stalled | Cap`): a non-finite Δρ, a numerical failure or "GPU busy" skip nothing.
+//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop, the cap and the
+//! pass's time limit trigger it (`ScfEnd::Stalled | Cap | TimeLimit`): a non-finite Δρ, a
+//! numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
 //! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
@@ -161,6 +182,15 @@ pub const HOT_BURST_DT_FS: f64 = 0.25;
 /// moves, the scan only stops solving where the basis is measured not to represent what the
 /// teacher has there (the physics reviewer rules on the number).
 pub const SCAN_CUTOFF_FRACTION: f64 = 5.0 / 6.0;
+/// Hot-burst failures in a row after which the burst ends instead of restarting (module doc, 4.).
+pub const BURST_RESTARTS_IN_A_ROW: usize = 3;
+/// The pass's per-sample time limit (module doc, "The time limit"): this many times the median wall
+/// time of its successful sample solves…
+pub const TIME_LIMIT_FACTOR: f64 = 5.0;
+/// …never below this (s)…
+pub const TIME_LIMIT_FLOOR_S: f64 = 15.0;
+/// …and only once this many sample solves have succeeded (the first solves include the cold start).
+pub const TIME_LIMIT_MIN_SOLVES: usize = 3;
 /// What a scan point skipped for [`SCAN_CUTOFF_FRACTION`] carries in its note (the skip's tally).
 const SCAN_LIMIT_MARK: &str = "of the model's cutoff";
 
@@ -333,6 +363,10 @@ struct Burst {
     dt: f64,
     /// Positions of the last [`GHOST_TRAIL`] solved evaluations, oldest first (the ghost's trail).
     trail: VecDeque<Vec<[f64; 3]>>,
+    /// Failed evaluations since the last solved one (module doc, 4.: [`BURST_RESTARTS_IN_A_ROW`]).
+    failures_in_a_row: usize,
+    /// Restarts so far (each one noted).
+    restarts: usize,
 }
 
 /// Solved burst geometries the ghost's trail keeps (display only).
@@ -385,6 +419,12 @@ pub struct Sampler {
     failed_reference: Option<FailedReference>,
     /// A references-only pass (`references_only`).
     references_only: bool,
+    /// Wall times (s) of the pass's successful sample solves (module doc, "The time limit").
+    solve_walls: Vec<f64>,
+    /// The last solve was given up at this time limit (s) (module doc, "The time limit").
+    timed_out: Option<f64>,
+    /// The limit's floor (s): [`TIME_LIMIT_FLOOR_S`] (`with_time_limit_floor`).
+    time_limit_floor_s: f64,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -519,6 +559,8 @@ impl Sampler {
             csvr,
             dt: units::fs_to_au_time(HOT_BURST_DT_FS),
             trail: VecDeque::new(),
+            failures_in_a_row: 0,
+            restarts: 0,
         };
 
         let refs_total = species.iter().map(|&z| allowed_multiplicities(z as u32).len()).sum::<usize>();
@@ -564,6 +606,9 @@ impl Sampler {
             r_cut,
             failed_reference: None,
             references_only: false,
+            solve_walls: Vec::new(),
+            timed_out: None,
+            time_limit_floor_s: TIME_LIMIT_FLOOR_S,
         })
     }
 
@@ -590,7 +635,7 @@ impl Sampler {
             queue,
             scans: Vec::new(),
             scan_planned: Vec::new(),
-            burst: Burst { left: 0, scene: base, forces: None, csvr: Csvr::new(300.0, HOT_BURST_TAU_FS, 0), dt: units::fs_to_au_time(HOT_BURST_DT_FS), trail: VecDeque::new() },
+            burst: Burst { left: 0, scene: base, forces: None, csvr: Csvr::new(300.0, HOT_BURST_TAU_FS, 0), dt: units::fs_to_au_time(HOT_BURST_DT_FS), trail: VecDeque::new(), failures_in_a_row: 0, restarts: 0 },
             refs: ReferenceCache::default(),
             progress: SamplingProgress { done: 0, total, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: total == 0, target: first },
             notes: Vec::new(),
@@ -610,6 +655,9 @@ impl Sampler {
             r_cut: Basis::new(&[]).r_cut,
             failed_reference: None,
             references_only: false,
+            solve_walls: Vec::new(),
+            timed_out: None,
+            time_limit_floor_s: TIME_LIMIT_FLOOR_S,
         }
     }
 
@@ -1126,7 +1174,7 @@ impl Sampler {
                 Job::Target(job) => {
                     self.progress.target = Some(job.blocker);
                     let started = Instant::now();
-                    match self.solve(&mut teacher, surrogate, &job.scene, true, should_abort) {
+                    match self.solve(&mut teacher, surrogate, &job.scene, true, true, should_abort) {
                         Err(ProviderError::Cancelled) => {
                             self.queue.push_front(Job::Target(job));
                             return Err(ProviderError::Cancelled);
@@ -1139,7 +1187,7 @@ impl Sampler {
                             ev.detail = note.clone();
                             ev.n_atoms = job.scene.nuclei.len();
                             ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
-                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            (ev.scf_end, ev.scf_steps) = self.failure_log(&e);
                             surrogate.push_event(ev);
                             self.notes.push(note);
                         }
@@ -1172,7 +1220,8 @@ impl Sampler {
                     let (i, j) = (self.scans[pair].i, self.scans[pair].j);
                     let pair_z = (sc.nuclei[i].z, sc.nuclei[j].z);
                     let r = self.scans[pair].r[k];
-                    match self.solve(&mut teacher, surrogate, &sc, fresh, should_abort) {
+                    // never timed: the shell fence rests on this measurement (module doc, "The time limit")
+                    match self.solve(&mut teacher, surrogate, &sc, fresh, false, should_abort) {
                         Err(ProviderError::Cancelled) => {
                             self.queue.push_front(Job::Shell(sc, pair, k));
                             return Err(ProviderError::Cancelled);
@@ -1185,7 +1234,7 @@ impl Sampler {
                             ev.detail = note.clone();
                             ev.n_atoms = sc.nuclei.len();
                             ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
-                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            (ev.scf_end, ev.scf_steps) = self.failure_log(&e);
                             surrogate.push_event(ev);
                             self.notes.push(note);
                         }
@@ -1217,7 +1266,7 @@ impl Sampler {
                             // a non-converged scan point ends its stretched tail (module doc)
                             // only the stall stop and the cap say something about the bond; a non-finite Δρ is a
                             // numerics fault and costs nothing further (review S5)
-                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap), _))) = (solved, self.last_failure) {
+                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap | ScfEnd::TimeLimit), _))) = (solved, self.last_failure) {
                                 self.skip_scan_tail(pair, k, end);
                             }
                             return Ok(Some(self.progress()));
@@ -1228,17 +1277,60 @@ impl Sampler {
         }
     }
 
+    /// The pass's per-sample time limit now (s; module doc, "The time limit"): `None` before
+    /// [`TIME_LIMIT_MIN_SOLVES`] successful sample solves.
+    pub fn time_limit_s(&self) -> Option<f64> {
+        if self.solve_walls.len() < TIME_LIMIT_MIN_SOLVES {
+            return None;
+        }
+        Some((TIME_LIMIT_FACTOR * self.median_solve_s()).max(self.time_limit_floor_s))
+    }
+
+    /// The median wall time (s) of the pass's successful sample solves (NaN before the first).
+    fn median_solve_s(&self) -> f64 {
+        let mut w = self.solve_walls.clone();
+        w.sort_by(f64::total_cmp);
+        match w.len() {
+            0 => f64::NAN,
+            n if n % 2 == 1 => w[n / 2],
+            n => 0.5 * (w[n / 2 - 1] + w[n / 2]),
+        }
+    }
+
+    /// The time limit's floor (s), [`TIME_LIMIT_FLOOR_S`] unless set (the tests' short teachers).
+    pub fn with_time_limit_floor(mut self, floor_s: f64) -> Sampler {
+        self.time_limit_floor_s = floor_s;
+        self
+    }
+
+    /// How a failed solve ended, for its event: the SCF's own end and iterations, or the pass's
+    /// time limit (iterations unknown: the solve was given up from outside).
+    fn failure_log(&self, e: &ProviderError) -> (Option<ScfEnd>, Option<usize>) {
+        match (self.timed_out, e.scf_end()) {
+            (Some(_), _) => (Some(ScfEnd::TimeLimit), None),
+            (None, Some((end, n))) => (Some(end), Some(n)),
+            (None, None) => (None, None),
+        }
+    }
+
     /// The teacher's answer at `scene`, after the warm-state hint (module doc): `reset` when
     /// the nucleus count changed, `discontinuity` for a `fresh` (unrelated) geometry. A result
     /// with the wrong shape or a non-finite number is an error (it must never reach the store).
+    /// A `limited` solve (a sample) is given up at the pass's time limit (module doc, "The time
+    /// limit"): an `Invalid` error that says so, with `timed_out` set; its successful wall times
+    /// are what the limit is the median of.
     fn solve(
         &mut self,
         teacher: &mut Option<&mut dyn ForceProvider>,
         surrogate: &mut SurrogateKs,
         scene: &Scene,
         fresh: bool,
+        limited: bool,
         should_abort: &mut dyn FnMut() -> bool,
     ) -> Result<ForceResult, ProviderError> {
+        self.timed_out = None;
+        let limit = if limited { self.time_limit_s() } else { None };
+        let median = self.median_solve_s();
         let t: &mut dyn ForceProvider = match teacher {
             Some(t) => &mut **t,
             None => surrogate.teacher_mut(),
@@ -1251,7 +1343,33 @@ impl Sampler {
         }
         self.last_n = Some(n);
         self.interrupted = false;
-        let r = t.evaluate(scene, should_abort)?;
+        let started = Instant::now();
+        let mut hit = false;
+        let r = {
+            let mut abort = || {
+                if should_abort() {
+                    return true;
+                }
+                if limit.is_some_and(|l| started.elapsed().as_secs_f64() > l) {
+                    hit = true;
+                    return true;
+                }
+                false
+            };
+            t.evaluate(scene, &mut abort)
+        };
+        let r = match r {
+            Err(ProviderError::Cancelled) if hit => {
+                let l = limit.expect("hit only under a limit");
+                self.timed_out = Some(l);
+                return Err(ProviderError::Invalid(format!(
+                    "given up after {:.0} s, the pass's time limit ({TIME_LIMIT_FACTOR}× its median solve of {median:.1} s, at least {:.0} s)",
+                    started.elapsed().as_secs_f64(),
+                    self.time_limit_floor_s
+                )));
+            }
+            r => r?,
+        };
         if r.forces.len() != n {
             return Err(ProviderError::Invalid(format!("teacher '{}' returned {} forces for {n} nuclei", t.name(), r.forces.len())));
         }
@@ -1259,6 +1377,9 @@ impl Sampler {
             return Err(ProviderError::Invalid(format!("teacher '{}' returned a non-finite energy or force", t.name())));
         }
         self.progress.last_energy = r.energy;
+        if limited {
+            self.solve_walls.push(started.elapsed().as_secs_f64());
+        }
         Ok(r)
     }
 
@@ -1276,7 +1397,7 @@ impl Sampler {
     ) -> Result<bool, ProviderError> {
         let started = Instant::now();
         self.last_failure = None;
-        match self.solve(teacher, surrogate, scene, fresh, should_abort) {
+        match self.solve(teacher, surrogate, scene, fresh, true, should_abort) {
             Ok(r) => {
                 self.record(surrogate, scene, r, tag, None);
                 Ok(true)
@@ -1290,8 +1411,8 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = scene.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
-                self.last_failure = e.scf_end();
-                (ev.scf_end, ev.scf_steps) = self.last_failure.map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                self.last_failure = if self.timed_out.is_some() { Some((ScfEnd::TimeLimit, 0)) } else { e.scf_end() };
+                (ev.scf_end, ev.scf_steps) = self.failure_log(&e);
                 surrogate.push_event(ev);
                 self.notes.push(note);
                 self.mark(GhostOutcome::Failed(self.last_failure.map(|x| x.0)), ghost_atoms(scene));
@@ -1365,7 +1486,8 @@ impl Sampler {
 
     /// One burst evaluation (module doc): the start geometry, or a velocity-Verlet step with
     /// the thermostat after it. `Ok(false)` when the step would leave the cell (the burst ends,
-    /// its remaining evaluations are skipped, no solve happened).
+    /// its remaining evaluations are skipped, no solve happened). A failed step restarts the burst
+    /// from the last solved geometry with fresh velocities (module doc, 4.).
     fn burst_step(&mut self, teacher: &mut Option<&mut dyn ForceProvider>, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<bool, ProviderError> {
         let dt = self.burst.dt;
         let mut work = self.burst.scene.clone();
@@ -1389,8 +1511,9 @@ impl Sampler {
             return Ok(false);
         }
         let started = Instant::now();
-        match self.solve(teacher, surrogate, &work, fresh, should_abort) {
+        match self.solve(teacher, surrogate, &work, fresh, true, should_abort) {
             Ok(r) => {
+                self.burst.failures_in_a_row = 0;
                 let f_new = r.forces.clone();
                 if !fresh {
                     Integrator::half_kick(&mut work, &f_new, dt);
@@ -1415,20 +1538,43 @@ impl Sampler {
             }
             Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
             Err(e) => {
-                // the trajectory has no forces to continue with: the burst ends here
-                let rest = std::mem::take(&mut self.burst.left) - 1;
-                self.progress.done += 1 + rest;
+                let (scf_end, scf_steps) = self.failure_log(&e);
+                // the failed step is one of the burst's evaluations
+                self.progress.done += 1;
                 self.progress.failed += 1;
-                self.progress.skipped += rest;
-                let note = format!("sampling: a hot-burst step failed ({e}); the burst ends, {rest} evaluations skipped");
+                self.burst.left -= 1;
+                self.burst.failures_in_a_row += 1;
+                let note = if self.burst.left == 0 {
+                    format!("sampling: a hot-burst step failed ({e}) — the burst's last evaluation")
+                } else if self.burst.forces.is_some() && self.burst.failures_in_a_row < BURST_RESTARTS_IN_A_ROW {
+                    // a sampler, not a trajectory (module doc, 4.): back to the last solved
+                    // geometry (its forces still hold) with fresh velocities, the teacher cold
+                    self.burst.csvr.maxwell_boltzmann(&mut self.burst.scene);
+                    self.burst.restarts += 1;
+                    self.last_n = None;
+                    format!(
+                        "sampling: a hot-burst step failed ({e}); the burst restarts from the last geometry it solved with fresh Maxwell–Boltzmann velocities at {:.0} K (restart {}; {} evaluations left)",
+                        self.plan.hot_burst_t, self.burst.restarts, self.burst.left
+                    )
+                } else {
+                    let rest = std::mem::take(&mut self.burst.left);
+                    self.progress.done += rest;
+                    self.progress.skipped += rest;
+                    let why = if self.burst.forces.is_none() {
+                        "its start geometry: no solved geometry to go back to".to_string()
+                    } else {
+                        format!("{BURST_RESTARTS_IN_A_ROW} failures in a row")
+                    };
+                    format!("sampling: a hot-burst step failed ({e}); the burst ends ({why}), {rest} evaluations skipped")
+                };
                 let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::HotBurst), TeachOutcome::Failed);
                 ev.detail = note.clone();
                 ev.n_atoms = work.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
-                (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                (ev.scf_end, ev.scf_steps) = (scf_end, scf_steps);
                 surrogate.push_event(ev);
                 self.notes.push(note);
-                self.mark(GhostOutcome::Failed(e.scf_end().map(|x| x.0)), ghost_atoms(&work));
+                self.mark(GhostOutcome::Failed(scf_end), ghost_atoms(&work));
                 Ok(true)
             }
         }
