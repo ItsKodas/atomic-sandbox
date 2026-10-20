@@ -319,6 +319,13 @@ pub fn dots_note(st: &UiState) -> String {
     }
 }
 
+/// The largest Z·σ (σ in Bohr: the scene's, else h) over the nuclei the solve smears — a pseudised species has no core
+/// on the grid, so it is left out (water under `All`: no smeared nucleus at all; found in the M7 Task 13 Step 5 check).
+pub fn largest_smeared_z_sigma(scene: &sim::Scene, pseudised: &[sim::PseudoSummary]) -> f64 {
+    let sigma = scene.sigma.unwrap_or(scene.cell.h);
+    scene.nuclei.iter().filter(|n| !pseudised.iter().any(|p| p.z == n.z)).map(|n| n.z as f64 * sigma).fold(0.0, f64::max)
+}
+
 /// A molecule's list-level note when its heaviest nucleus is smeared (Zσ ≥ `SMEARED_ZSIGMA`, spec
 /// §2 item 5): its core orbitals are not the physical ones. `None` for a lone atom (its 1s row
 /// carries the tag) and below the threshold. `z_sigma` is the largest Z·σ in the scene (σ in Bohr).
@@ -503,12 +510,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.add(egui::Label::new(RichText::new(n).size(11.5).color(super::super::AMBER)).wrap());
         }
     }
-    // the largest Zσ of the scene: the molecule's smeared-core note
-    let z_sigma = input.snapshot.map_or(0.0, |s| {
-        let sc = &s.dynamics.scene;
-        let sigma = sc.sigma.unwrap_or(sc.cell.h);
-        sc.nuclei.iter().map(|n| n.z as f64 * sigma).fold(0.0, f64::max)
-    });
+    // the largest Zσ of the scene's all-electron nuclei: the molecule's smeared-core note
+    let pseudised = super::super::pseudo::pseudised(input);
+    let z_sigma = input.snapshot.map_or(0.0, |s| largest_smeared_z_sigma(&s.dynamics.scene, &pseudised));
     list(ui, st, payload, z_sigma, acts);
 }
 

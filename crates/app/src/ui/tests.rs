@@ -2827,6 +2827,14 @@ mod orbital_viewer {
         assert!(l.contains("smeared nuclei") && l.contains("core"), "{l}");
         assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::NotLoneAtom, 0.3), None);
         assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::Labelled { shell_order_inverted: false }, 1.5), None);
+        // a pseudised species has no core on the grid: water under `All` smears nothing, under `CoresOnly` its H's only
+        // (M7 Task 13 Step 5 check: the note read "Zσ = 1.2" for the pseudo-O)
+        let water = Scene::preset("h2o").unwrap().to_sim().unwrap();
+        let sigma = water.sigma.unwrap_or(water.cell.h);
+        let summary = |z: u8| sim::PseudoSummary { z, z_v: 1.0, f: 1.2, local: String::new(), r_c_max: 1.0, h_req: None, h_eb: None, r_core: 0.5, record: String::new() };
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[]), 8.0 * sigma, "all-electron: the O");
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[summary(8)]), sigma, "pseudo-O: the H's");
+        assert_eq!(orbitals::largest_smeared_z_sigma(&water, &[summary(8), summary(1)]), 0.0, "all pseudised: none");
     }
 
     /// A split below the display's resolution is not announced as a split of 0.00 mHa; the legend
