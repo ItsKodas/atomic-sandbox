@@ -383,6 +383,26 @@ Screenshot and Record buttons at the top right of the 3D view (`crates/app/src/c
   limit and the glow pass refuses an oversized target. The same PowerShell UTF-8 round trip as the
   builder's garbled two files again before the memory note about it was written.
 
+### Camera pop-out view (Oct 20, about 1 h to the first build, one commit)
+
+A second, real OS window that shows exactly what Screenshot / Record take (`crates/app/src/capture/popout.rs`),
+opened from the capture settings' first button or Ctrl K. One Opus session, no subagents; the user
+hand-tested the first build and asked for the merge.
+
+- **What you see is what you get by construction:** the pop-out calls the capture's own `render_capture`
+  into its own offscreen frame at the capture's size (a 4K capture is rendered at 4K and shown scaled), or
+  copies the presented window when the UI is shown, so it cannot drift from the files. It is drawn in the
+  main window's redraw, so it follows the camera live; a recording shows its own fixed size, a red dot and
+  the frame count.
+- **Two traps found by reading before writing:** the capture overlay's egui renderer was shared state; a
+  second egui context through the same renderer would have overwritten its font atlas (both use texture
+  `Managed(0)`), so the painter now keeps one bloom / glow / egui set per offscreen user (`gfx::Fx`).
+  egui's shader expects gamma-encoded textures, so the frame is sampled through a non-sRGB view of the
+  sRGB target (sampling the sRGB view would have darkened it).
+- **Shared-device care:** the second surface's configure runs in a validation error scope (the solver
+  may be submitting; wgpu would otherwise panic), and the pop-out presents in Mailbox when it can, so its
+  vsync never holds the main window's frames.
+
 ---
 
 ## Failures and dead ends

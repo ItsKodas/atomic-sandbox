@@ -736,7 +736,9 @@ mod tests {
                 assert!(!(ea.0 == eb.0 && ea.1 == eb.1 && ea.2 == eb.2), "{} / {}", ea.3, eb.3);
             }
         }
-        assert_eq!(TRIVIAL.len(), 40); // spec §4.3's list and the 2026-10-20 additions (phosphine … dichlorine, propane)
+        // spec §4.3's list, the 2026-10-20 additions (phosphine … dichlorine, propane, propene, cyclopropane)
+        // and the builder's (ethanol, dimethyl ether, acetic acid, methyl formate, benzene)
+        assert_eq!(TRIVIAL.len(), 45);
     }
 
     #[test]

@@ -189,6 +189,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Screenshot", "capture image picture png save frame photo snapshot", Place::View, "v-capture"),
     e("Record video", "capture movie mp4 recording frames time-lapse ffmpeg clip", Place::View, "v-capture"),
     e("Capture settings", "hide UI resolution 1080p 1440p 4K fs per frame simulated time as seen", Place::View, "v-capture"),
+    e("Pop out view", "capture camera preview second window monitor what is recorded screenshot frame", Place::View, "v-capture-popout"),
 ];
 
 /// How long a revealed control stays outlined.
@@ -270,8 +271,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
         // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
         Place::Dock(tab) => st.open_tab(tab),
-        // the buttons are always there; the settings open beside them
-        Place::View => st.capture.open = entry.name == "Capture settings",
+        // the buttons are always there; the settings open beside them (the pop-out's button is in them)
+        Place::View => st.capture.open = entry.anchor == "v-capture-popout" || entry.name == "Capture settings",
     }
     st.search.reveal = Some((entry.anchor, Instant::now(), false));
     st.search.open = false;

@@ -32,6 +32,8 @@ pub enum Icon {
     Stop,
     /// Three sliders (the capture's quick settings).
     Sliders,
+    /// A window with an arrow leaving it (the capture's pop-out view).
+    PopOut,
 }
 
 /// Paints `icon` into `rect` in `colour`.
@@ -163,6 +165,11 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
                 line(&[(4.0, y), (20.0, y)]);
                 p.circle_filled(at(knob, y), 2.4 * s, colour);
             }
+        }
+        Icon::PopOut => {
+            line(&[(10.5, 5.0), (5.0, 5.0), (5.0, 19.0), (19.0, 19.0), (19.0, 13.5)]);
+            line(&[(11.0, 13.0), (19.5, 4.5)]);
+            line(&[(13.5, 4.5), (19.5, 4.5), (19.5, 10.5)]);
         }
     }
 }
