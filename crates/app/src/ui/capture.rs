@@ -178,14 +178,22 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                     ui.set_width(320.0);
                     // the pop-out view (`crate::capture::popout`): a window of its own showing what a capture takes
                     let open = st.capture.popout;
-                    let pop = ui
-                        .add(egui::Button::selectable(open, if open { "Close the pop-out view" } else { "Pop out view" }).min_size(Vec2::new(ui.available_width(), 24.0)))
-                        .on_hover_text("A separate window showing exactly what Screenshot and Record take now: the frame's size and aspect, the capture camera, the look and the labels over it — and a recording's red dot and frame count. Move it to another monitor, resize or maximise it; F11 there for full screen. Closing it changes nothing else.");
+                    let label = RichText::new(if open { "Close the pop-out view" } else { "Pop out view" }).size(13.5).strong().color(theme::ACCENT_INK);
+                    let pop = ui.add(
+                        egui::Button::new(label)
+                            .fill(if open { theme::ACCENT_BG } else { theme::PANEL_3 })
+                            .stroke(Stroke::new(1.0, theme::ACCENT))
+                            .corner_radius(6.0)
+                            .min_size(Vec2::new(ui.available_width(), 32.0)),
+                    );
+                    icons::paint(ui.painter(), Rect::from_center_size(pos2(pop.rect.left() + 20.0, pop.rect.center().y), Vec2::splat(18.0)), icons::Icon::PopOut, theme::ACCENT_INK);
+                    let pop = pop.on_hover_text("A separate window showing exactly what Screenshot and Record take now: the frame's size and aspect, the capture camera, the look and the labels over it — and a recording's red dot and frame count. Move it to another monitor, resize or maximise it; F11 there for full screen. Closing it changes nothing else.");
                     if pop.clicked() {
                         st.capture.popout = !open;
                     }
                     super::search::mark(ui, st, "v-capture-popout", pop.rect);
-                    ui.add_space(2.0);
+                    theme::note(ui, if open { "the capture's frame is shown in its own window (F11 there: full screen)" } else { "see exactly what Screenshot and Record take, in a window of its own (another monitor, full screen…)" });
+                    ui.add_space(4.0);
                     let st_camera_view = st.camera_view;
                     let s = &mut st.capture;
                     theme::section(ui, "Capture");
