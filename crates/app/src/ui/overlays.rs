@@ -242,8 +242,15 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                 frame = frame.stroke(Stroke::new(1.0, RED)).fill(Color32::from_rgba_premultiplied(70, 14, 20, 225));
             }
             frame.show(ui, |ui| {
-                // within the 3D view: one line while it fits, wrapped only when the view is narrower than the row
-                ui.set_max_width((view.width() - 40.0).max(200.0));
+                // within the 3D view and clear of the capture controls at its top right (their buttons,
+                // the recording pill, the notes and the settings popover — last frame's rects): one
+                // line while it fits, wrapped onto more lines when it does not (user request 2026-10-21)
+                let right_edge = ["capture-buttons", "capture-notes", "capture-settings"]
+                    .iter()
+                    .filter_map(|n| ctx.memory(|m| m.area_rect(Id::new(*n))))
+                    .map(|r| r.left())
+                    .fold(view.right(), f32::min);
+                ui.set_max_width((right_edge - view.left() - 12.0 - 12.0 - 28.0).max(200.0));
                 ui.horizontal_wrapped(|ui| {
                     if busy {
                         ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
