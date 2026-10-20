@@ -882,6 +882,21 @@ pub trait Trainable {
     /// Ends a running pass early: what it sampled is kept and refitted once there are enough
     /// samples to fit (Q′; fewer are kept unfitted) — noted either way. No-op without one.
     fn cancel_pass(&mut self);
+    /// The running pass as a checkpoint (`providers::sampling`, "Checkpoints"): text that
+    /// [`resume_pass`](Self::resume_pass) reads back, to be kept with the samples file
+    /// [`save`](Self::save) writes at the same moment. `None` without a running pass, for a pass
+    /// that is not resumable (teach-around, references only), and by default.
+    fn pass_checkpoint(&self) -> Option<String> {
+        None
+    }
+    /// Goes on with the pass a [`pass_checkpoint`](Self::pass_checkpoint) holds, over `scene` —
+    /// which must be the pass's own scene, on the surface the held samples were taught on, with as
+    /// many samples held as when the checkpoint was written (the caller loads that samples file
+    /// first); `refs` seeds the reference cache as in [`start_pass`](Self::start_pass). Err with
+    /// the reason, nothing changed. The default: unsupported.
+    fn resume_pass(&mut self, _scene: &Scene, _checkpoint: &str, _refs: &mut AtomReferences) -> Result<(), String> {
+        Err("this provider has no sampling passes to resume".into())
+    }
     /// A pass is running.
     fn pass_active(&self) -> bool;
     /// The running pass's progress, else the last pass's final state; `None` before any pass and

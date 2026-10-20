@@ -587,6 +587,9 @@ pub struct UiState {
     /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
     /// the user presses Apply.
     pub model_offer: Option<model_offer::ModelOffer>,
+    /// An interrupted training kept on disk (`ResumeOffer`): the Model tab offers to resume or discard it. Set by the
+    /// viewer when it starts a worker; display state.
+    pub resume: Option<ResumeOffer>,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
     /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
@@ -904,6 +907,7 @@ right {}
             builder: Default::default(),
             model_file: None,
             model_offer: None,
+            resume: None,
             status: String::new(),
             status_seq: 0,
             show_cell: true,
@@ -1248,6 +1252,21 @@ pub struct PanelOutput {
     pub actions: Vec<Action>,
     /// A screenshot or the record button (`crate::capture`; display only).
     pub capture: Option<crate::capture::Request>,
+    /// The interrupted training's offer was answered: resume it (true) or discard it (false)
+    /// (`Viewer::resume_training`).
+    pub training: Option<bool>,
+}
+
+/// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
+/// 2026-10-20): the Model tab's "Resume the interrupted training (sample 137 of 158)".
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResumeOffer {
+    /// The pass's own scene (its grid, σ, charge, multiplicity and ionic policy).
+    pub scene: Scene,
+    /// The sample it resumes at is `done + 1` of `total`; the stage of that job.
+    pub done: usize,
+    pub total: usize,
+    pub stage: &'static str,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns

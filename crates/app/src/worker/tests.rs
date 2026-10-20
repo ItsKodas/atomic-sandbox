@@ -3057,3 +3057,66 @@ fn a_running_pass_ships_the_geometry_it_is_solving() {
     let cancelled = snapshot_until(&w, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.cancelled));
     assert!(cancelled.dynamics.ghost.is_none(), "cancelled: the scene returns");
 }
+
+/// Resumable training (user report 2026-10-20; `checkpoint` module doc): with checkpoints on, a
+/// running pass leaves its samples and checkpoint in the folder; a worker shut down mid-pass leaves
+/// them; a new worker resumes from them at the sample it stopped at and the files are removed when
+/// the pass finishes; a cancelled pass removes them too. Analytic teacher, seconds.
+#[test]
+fn an_interrupted_pass_resumes_in_a_new_worker_and_its_files_go_when_it_ends() {
+    use super::checkpoint::{CHECKPOINT_FILE, MODEL_FILE};
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-ckpt-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let spawn = || {
+        SimWorker::spawn_test(
+            h2_33(),
+            Box::new(|| {
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.04 };
+                Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+            }),
+        )
+    };
+    let plan = SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let w = spawn();
+    // the scene's first evaluation is kept as a sample (no model yet): the pass adds to it
+    let before = model(&idle(&w)).samples;
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::Dyn(DynCommand::StartSampling(plan.clone())));
+    // 2.5 s of solves: at least one checkpoint after the first (each ≥ 2 s apart)
+    let s = snapshot_until(&w, "a pass 2.5 s in", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 60));
+    let total = s.dynamics.sampling.as_ref().unwrap().total;
+    assert!(dir.join(MODEL_FILE).exists() && dir.join(CHECKPOINT_FILE).exists(), "the running pass is on disk");
+    assert!(w.retire(Duration::from_secs(10)), "shut down mid-pass");
+    let (_, info) = interrupted_pass(&dir).expect("a shutdown leaves the interrupted pass");
+    eprintln!("interrupted at {}/{} ({}), {} samples", info.done, info.total, info.stage, info.samples);
+    assert_eq!(info.total, total);
+    assert!(info.done >= 1 && info.done < total, "{info:?}");
+    assert_eq!(Scene::from_sim(&info.scene).nuclei.len(), 2);
+
+    // a new worker resumes it where it stood and ends it: the files are removed
+    let w = spawn();
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::ResumeTraining(dir.clone()));
+    let s = snapshot_until(&w, "the resumed pass", |s| s.dynamics.sampling.is_some() || s.dynamics.last_rejection.is_some());
+    assert_eq!(s.dynamics.last_rejection, None, "{:?}", s.dynamics.notes);
+    let p = s.dynamics.sampling.clone().unwrap();
+    assert!(p.done >= info.done && p.total == total, "resumed at {}/{} (checkpoint {}/{})", p.done, p.total, info.done, info.total);
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("sampling pass resumed at sample")), "{:?}", s.dynamics.notes);
+    let s = snapshot_until(&w, "the end of the resumed pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let p = s.dynamics.sampling.clone().unwrap();
+    assert_eq!((p.done, p.total, p.cancelled), (total, total, false));
+    let samples = model(&s).samples;
+    assert_eq!(samples, before + plan.perturbations + plan.hot_burst_steps, "every planned sample, none twice");
+    // removed in the round that published the end
+    assert!(!dir.join(MODEL_FILE).exists() && !dir.join(CHECKPOINT_FILE).exists(), "a finished pass leaves nothing to resume");
+
+    // a cancelled pass removes its files
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    snapshot_until(&w, "a checkpoint", |_| dir.join(CHECKPOINT_FILE).exists());
+    w.send(Command::Dyn(DynCommand::CancelSampling));
+    snapshot_until(&w, "the cancel", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    // removed in the round that published the end
+    assert!(interrupted_pass(&dir).is_none() && !dir.join(MODEL_FILE).exists(), "Cancel discards the interrupted pass");
+    let _ = std::fs::remove_dir_all(&dir);
+}

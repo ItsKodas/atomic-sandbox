@@ -489,7 +489,9 @@ fn main() {
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));
         ui::profile::load_current(&mut viewer.ui);
-        viewer.ui.timings = timings::Timings::load(Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("timings.txt")));
+        viewer.ui.timings = timings::Timings::load(Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("timings.txt")));
+        // a running sampling pass is kept resumable there (`worker::checkpoint`), and offered at the next start
+        viewer.training_dir = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("training"));
     }
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");

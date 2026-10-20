@@ -2090,6 +2090,60 @@ impl Trainable for SurrogateKs {
         }
     }
 
+    fn pass_checkpoint(&self) -> Option<String> {
+        let sampler = self.pass.as_ref()?;
+        let prov = self.provenance_for(sampler.scene());
+        sampler.checkpoint(&prov.describe(), self.samples(), self.pass_start.unwrap_or(0))
+    }
+
+    fn resume_pass(&mut self, scene: &Scene, checkpoint: &str, refs: &mut AtomReferences) -> Result<(), String> {
+        if self.pass.is_some() {
+            return Err("a pass is already running (cancel it first)".into());
+        }
+        let info = crate::sampling::checkpoint_info(checkpoint)?;
+        let want = self.provenance_for(scene).describe();
+        if info.provenance != want {
+            return Err(format!("it was taught at {}, the scene is solved at {want}", info.provenance));
+        }
+        let same = |a: &Scene, b: &Scene| {
+            a.cell == b.cell
+                && a.charge == b.charge
+                && a.multiplicity == b.multiplicity
+                && a.sigma == b.sigma
+                && a.ionic == b.ionic
+                && a.nuclei.len() == b.nuclei.len()
+                && a.nuclei.iter().zip(&b.nuclei).all(|(x, y)| x.z == y.z && x.a == y.a && x.pos == y.pos)
+        };
+        if !same(&info.scene, scene) {
+            return Err("the scene is not the one the interrupted pass was sampling".into());
+        }
+        if info.samples != self.samples() {
+            return Err(format!(
+                "its samples file holds {} samples, the checkpoint was written with {} — they were not saved together",
+                self.samples(),
+                info.samples
+            ));
+        }
+        let sampler = crate::sampling::Sampler::resume(checkpoint)?;
+        for (key, r) in refs.iter() {
+            if self.ref_cache.get(key).is_none() {
+                self.ref_cache.insert(key.clone(), r.clone());
+            }
+        }
+        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
+        self.pass_start = Some(info.pass_start.min(self.samples()));
+        let p = sampler.progress();
+        self.user_notes.push(format!(
+            "sampling pass resumed at sample {} of {} ({}): the {} samples taught before it stopped are kept, the dynamics are paused until it ends",
+            p.done + 1,
+            p.total,
+            p.stage,
+            self.samples().saturating_sub(info.pass_start)
+        ));
+        self.pass = Some(sampler);
+        Ok(())
+    }
+
     fn rescale_pass(&mut self, plan: &SamplingPlan) {
         if let Some(sampler) = &mut self.pass {
             sampler.rescale(plan);

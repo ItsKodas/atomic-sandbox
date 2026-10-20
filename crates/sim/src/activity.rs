@@ -504,13 +504,16 @@ impl TeachOutcome {
 }
 
 /// How a teacher's SCF ended (the solve log's iteration cell): converged, the stall stop
-/// (`qm::scf` "The stall stop"), the iteration cap, or a non-finite Δρ.
+/// (`qm::scf` "The stall stop"), the iteration cap, a non-finite Δρ, or — a sampling pass's solve
+/// only — the pass's per-sample time limit (`providers::sampling`, "The time limit"; the solve was
+/// given up from outside, its iteration count unknown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScfEnd {
     Converged,
     Stalled,
     Cap,
     NonFinite,
+    TimeLimit,
 }
 
 impl ScfEnd {
@@ -520,6 +523,7 @@ impl ScfEnd {
             ScfEnd::Stalled => "stalled",
             ScfEnd::Cap => "cap",
             ScfEnd::NonFinite => "not finite",
+            ScfEnd::TimeLimit => "time limit",
         }
     }
 }

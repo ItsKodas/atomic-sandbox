@@ -389,6 +389,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::TeachAroundBlockers => "teach-around-blockers",
         Action::RetryFit => "retry-fit",
         Action::StartOffered(_) => "start-offered",
+        Action::ResumeTraining => "resume-training",
+        Action::DiscardTraining => "discard-training",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
