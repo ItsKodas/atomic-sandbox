@@ -228,6 +228,23 @@ pub struct Painter {
     dots_seed: u32,
     shimmer: bool,
     dots: DotsLook,
+    /// The colour format the pipelines were built for (the capture's offscreen target matches it).
+    pub format: wgpu::TextureFormat,
+    /// The capture's own bloom chain and Camera-view glow targets (sized to the capture), swapped in
+    /// by [`Painter::paint_offscreen`] so the window's are not reallocated every captured frame, and
+    /// its egui renderer (the capture overlay's context has its own font atlas): one set per
+    /// [`Fx`] (the pop-out view's overlay is another egui context, so it needs its own renderer).
+    capture_fx: [Option<(render::bloom::Bloom, render::glow::GlowPass, egui_wgpu::Renderer)>; 2],
+}
+
+/// Who draws offscreen ([`Painter::paint_offscreen`]): each keeps its own bloom, glow and egui
+/// renderer, sized to its own frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fx {
+    /// Screenshots and recordings (`crate::capture`).
+    Capture = 0,
+    /// The pop-out view (`crate::capture::popout`).
+    Popout = 1,
 }
 
 /// What [`Painter::show_display`] and [`Painter::show_orbitals`] did.
@@ -280,7 +297,40 @@ impl Painter {
             dots_seed: 1,
             shimmer: true,
             dots: DotsLook { colour_by: render::dots::COLOUR_BY_DENSITY, signed: false, tint: [1.0; 4], tint_neg: [1.0; 4] },
+            format,
+            capture_fx: [None, None],
         }
+    }
+
+    /// The 3D view into the capture's offscreen `target` (`crate::capture`) with the capture
+    /// overlay's egui output on top (`overlay`: its context and output; no output: nothing over
+    /// the view, and the context only tessellates nothing): the window's passes, bound for the frame to the target's depth and given the
+    /// capture's own bloom, glow and egui renderer, then rebound to `window_depth`. The caller sets
+    /// the look first ([`Painter::set_view`]). `fx`: whose bloom, glow and egui renderer. Display only.
+    pub fn paint_offscreen(&mut self, ctx: &GpuContext, fx: Fx, target: Target<'_>, world: World<'_>, overlay: (&egui::Context, Option<egui::FullOutput>), window_depth: &wgpu::TextureView) {
+        let format = self.format;
+        let slot = fx as usize;
+        let mut fx = self.capture_fx[slot].take().unwrap_or_else(|| {
+            let options = egui_wgpu::RendererOptions { msaa_samples: 1, ..Default::default() };
+            (
+                render::bloom::Bloom::new(ctx, format),
+                render::glow::GlowPass::new(ctx, format, &self.renderer.camera_uniform),
+                egui_wgpu::Renderer::new(&ctx.device, format, options),
+            )
+        });
+        std::mem::swap(&mut self.bloom, &mut fx.0);
+        std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        std::mem::swap(&mut self.egui, &mut fx.2);
+        self.rebind(ctx, target.depth);
+        // no overlay: an empty output, tessellated by any initialised context
+        let (egui_ctx, out) = overlay;
+        let out = out.unwrap_or(egui::FullOutput { pixels_per_point: 1.0, ..Default::default() });
+        self.paint(ctx, target, world, egui_ctx, out);
+        std::mem::swap(&mut self.bloom, &mut fx.0);
+        std::mem::swap(&mut self.renderer.glow, &mut fx.1);
+        std::mem::swap(&mut self.egui, &mut fx.2);
+        self.capture_fx[slot] = Some(fx);
+        self.rebind(ctx, window_depth);
     }
 
     /// Shows a snapshot's density (`DynSnapshot::display`, ruling R5) through

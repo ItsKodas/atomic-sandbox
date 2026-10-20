@@ -355,6 +355,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().cancel_pass()
     }
 
+    fn pass_checkpoint(&self) -> Option<String> {
+        self.lock().pass_checkpoint()
+    }
+
+    fn resume_pass(&mut self, scene: &Scene, checkpoint: &str, refs: &mut AtomReferences) -> Result<(), String> {
+        self.lock().resume_pass(scene, checkpoint, refs)
+    }
+
     fn pass_active(&self) -> bool {
         self.lock().pass_active()
     }
@@ -389,6 +397,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
 
     fn status(&self, scene: &Scene, forces: &[[f64; 3]]) -> TrainableStatus {
         self.lock().status(scene, forces)
+    }
+
+    fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
+        self.lock().retry_fit(scene, refs)
     }
 
     fn fitted(&self) -> bool {

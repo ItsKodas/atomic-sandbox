@@ -387,23 +387,27 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::CancelModelOffer => "cancel-model-offer",
         Action::Sample { .. } => "sample",
         Action::TeachAroundBlockers => "teach-around-blockers",
+        Action::RetryFit => "retry-fit",
         Action::StartOffered(_) => "start-offered",
+        Action::ResumeTraining => "resume-training",
+        Action::DiscardTraining => "discard-training",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
         Action::SetupPyscf => "setup-pyscf",
         Action::CancelSetup => "cancel-setup",
         Action::Builder(_) => "builder",
+        Action::Screenshot | Action::Record(_) => "capture",
         _ => "action",
     })
 }
 
-/// A skipped recorded save changes nothing the replay checks; any other unreplayable action would
-/// make the replay diverge from the session.
+/// A skipped recorded save (or a capture: display only) changes nothing the replay checks; any
+/// other unreplayable action would make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    // nor does setting up PySCF (a replay never installs software: skipped)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup")
+    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

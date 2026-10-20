@@ -61,6 +61,14 @@ pub enum Command {
         plan: SamplingPlan,
         auto_pass: bool,
     },
+    /// Estimated solver: keep the running sampling pass resumable in this folder (`worker::checkpoint`
+    /// module doc: its samples and checkpoint after its solves, removed when the pass finishes or is
+    /// cancelled); `None` = no checkpoints (the default: headless runs and tests). A worker setting.
+    TrainingCheckpoints(Option<PathBuf>),
+    /// Estimated solver: go on with the interrupted pass kept in this folder (sent instead of
+    /// `EnsureModel`, on the pass's own scene): its samples file is loaded, then its checkpoint
+    /// resumed (`DynCommand::ResumeSampling`); either refusal is the snapshot's `last_rejection`.
+    ResumeTraining(PathBuf),
     /// Estimated solver: the surrogate's audit cadence (`FallbackPolicy::audit_every`, ruling
     /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
     /// The rest of the current policy is kept. Ignored by the other backends.
@@ -138,6 +146,8 @@ impl Command {
             Command::DisplayPartialCore(_) => {}
             Command::Dyn(_)
             | Command::EnsureModel { .. }
+            | Command::TrainingCheckpoints(_)
+            | Command::ResumeTraining(_)
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
@@ -156,9 +166,17 @@ impl Command {
         match self {
             Command::Dyn(c) => matches!(
                 c,
-                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax
+                DynCommand::Play
+                    | DynCommand::Pause
+                    | DynCommand::Step(_)
+                    | DynCommand::StartSampling(_)
+                    | DynCommand::ResumeSampling(_)
+                    | DynCommand::StartTeaching
+                    | DynCommand::RetryFit
+                    | DynCommand::Relax
             ),
             Command::Shutdown
+            | Command::TrainingCheckpoints(_)
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
@@ -181,7 +199,8 @@ impl Command {
                 | Command::SetSigma(_)
                 | Command::SetIonicPolicy(_)
                 | Command::EnsureModel { .. }
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax)
+                | Command::ResumeTraining(_)
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Relax)
         )
     }
 
@@ -192,6 +211,8 @@ impl Command {
         !matches!(
             self,
             Command::EnsureModel { .. }
+                | Command::TrainingCheckpoints(_)
+                | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
                 | Command::SetDraft(_)
                 | Command::SetCloud { .. }
@@ -213,7 +234,9 @@ impl Command {
                     | DynCommand::AddNucleus(_)
                     | DynCommand::RemoveNucleus(_)
                     | DynCommand::StartSampling(_)
+                    | DynCommand::ResumeSampling(_)
                     | DynCommand::StartTeaching
+                    | DynCommand::RetryFit
                     | DynCommand::CancelSampling
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
@@ -225,6 +248,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::TrainingCheckpoints(_)
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
@@ -318,7 +342,7 @@ impl Worker {
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's
-                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::LoadModel(_));
+                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
                 if takes_over {
                     self.pass_offer = None;
@@ -337,6 +361,8 @@ impl Worker {
                 }
             }
             Command::EnsureModel { autoload, plan, auto_pass } => self.ensure_model(autoload, plan, auto_pass),
+            Command::TrainingCheckpoints(dir) => self.checkpoints = dir.map(Checkpoints::new),
+            Command::ResumeTraining(dir) => self.resume_training(&dir),
             Command::SetAudit(n) => {
                 self.audit_every = Some(n);
                 self.apply_audit();

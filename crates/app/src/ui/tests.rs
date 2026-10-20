@@ -200,6 +200,8 @@ pub(crate) fn model() -> ModelStatus {
         solve_s_measured: false,
         pass_eta_s: Some(25.0),
         pass_offer: None,
+        no_model: None,
+        retry_fit: false,
     }
 }
 
@@ -256,7 +258,8 @@ fn toolbar_time_speed_and_dt_send_the_old_commands() {
     let out = act(&mut st, &inp, Action::TogglePlay);
     assert!(out.toggle_play && out.commands.is_empty());
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::Step)), DynCommand::Step(1)));
-    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::Rewind)), DynCommand::Rewind));
+    // the old Rewind (v → −v) is Physics ▸ Reverse velocities since 2026-10-20
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::ReverseVelocities)), DynCommand::Rewind));
     let dt = st.dt_fs;
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SetSpeed(120))), DynCommand::SetSpeed(120)));
     assert_eq!((st.speed, st.dt_fs), (120, dt), "speed changes steps per tick, never dt");
@@ -932,6 +935,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 }
             }
             egui::Popup::close_all(&ctx);
+            // the capture settings popover (its pop-out button)
+            st.capture.open = true;
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+            st.capture.open = false;
             st.search.toggle();
             st.search.query = "therm".into();
             frame(&ctx, &mut st, &inp, w, vec![]);
@@ -1137,6 +1144,35 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample"));
     assert!(matches!(c.as_slice(), [DynCommand::StartSampling(p)] if p.seed == seed), "{c:?}");
     assert_eq!(st.plan.seed, seed + 1);
+}
+
+/// The 2026-10-20 PH₃ data loss: samples held but no model formed — the Model tab shows the reason
+/// and its Retry sends `RetryFit`, and so does the Activity tab's trust group.
+#[test]
+fn a_fit_that_did_not_form_shows_why_and_retries() {
+    let scene = Scene::preset("ph3").unwrap();
+    let cam = camera();
+    let why = "no model yet: the P atom reference did not solve (2 cold attempts: SCF stalled)";
+    let m = ModelStatus { fitted: false, trusted: false, fit: None, samples: 41, no_model: Some(why.into()), retry_fit: true, ..model() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("ph3", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
+    assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
+    // the Activity tab's trust group says the same and retries too
+    st.open_tab(DockTab::Activity);
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
+    assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
 }
 
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the
@@ -2193,7 +2229,7 @@ mod orbital_viewer {
     fn row(spin: Spin, index: usize, track: u32, slot: u8, e: f64, occ: f64, label: OrbitalLabel) -> OrbitalInfo {
         OrbitalInfo {
             spin, index, track, slot, energy: e, eps_range: (e, e), occupation: occ, label, cluster: None, rotated: false,
-            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         }
     }
 
@@ -2346,6 +2382,110 @@ mod orbital_viewer {
             assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
         }
         assert!(Action::parse(&["show", "plasma"]).unwrap_err().contains("density, orbitals, colour or spin"));
+    }
+
+    /// An O-atom-like list: ↑ s + p×3, ↓ s + p (each ↓ sharing its ↑ partner's slot), one
+    /// unoccupied ↑ row; the angular characters known (a lone atom's, pseudised or not).
+    fn atom_rows() -> Vec<OrbitalInfo> {
+        let with_l = |mut r: OrbitalInfo, l: Option<u8>| {
+            r.l = l;
+            r
+        };
+        vec![
+            with_l(row(Spin::Up, 0, 1, 0, -0.9, 1.0, idx(1)), Some(0)),
+            with_l(row(Spin::Up, 1, 2, 1, -0.34, 1.0, idx(2)), Some(1)),
+            with_l(row(Spin::Up, 2, 3, 2, -0.34, 1.0, idx(3)), Some(1)),
+            with_l(row(Spin::Up, 3, 4, 3, -0.34, 1.0, idx(4)), Some(1)),
+            with_l(row(Spin::Up, 4, 7, 4, 0.05, 0.0, idx(5)), Some(0)),
+            with_l(row(Spin::Down, 0, 5, 0, -0.8, 1.0, idx(1)), Some(0)),
+            with_l(row(Spin::Down, 1, 6, 1, -0.2, 1.0, idx(2)), Some(1)),
+        ]
+    }
+
+    /// The quick presets (user request 2026-10-20): each sets the include list from the rows on
+    /// screen and the core flag, keeps the draw look, sends the view, is the one highlighted
+    /// afterwards, and is a script word.
+    #[test]
+    fn colour_presets_set_the_include_list_and_round_trip() {
+        use crate::ui::actions::{preset_active, preset_include};
+        use crate::ui::ColourPreset as P;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let rows = atom_rows();
+        let snap = with_payload(&scene, Backend::Gpu, payload(rows.clone(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Coloured;
+        let look = sim::ColourLook { enclose: Some(75), shell: false, hide_core: false };
+        act(&mut st, &inp, Action::ColourLook(look));
+        assert_eq!(preset_active(&st, &rows), Some(P::Everything), "the default is everything");
+        let set = |v: &[u32]| Some(v.iter().copied().collect::<std::collections::BTreeSet<u32>>());
+        for (p, include, hide_core) in [
+            (P::Valence, None, true),
+            (P::OneSpin, set(&[1, 2, 3, 4]), false),
+            (P::POnly, set(&[2, 3, 4, 6]), false),
+            (P::Everything, None, false),
+        ] {
+            assert_eq!(preset_include(p, &rows), include, "{p:?}");
+            let out = act(&mut st, &inp, Action::ColourPreset(p));
+            let r = match out.commands.as_slice() {
+                [Command::OrbitalView(r)] => r.clone(),
+                c => panic!("{p:?}: {c:?}"),
+            };
+            assert_eq!(st.included, include, "{p:?}");
+            assert_eq!(st.colour_look, sim::ColourLook { hide_core, ..look }, "{p:?}: only the core flag changes");
+            assert_eq!(r.what, OrbitalRequest::AllColoured { include: include.map(|s| s.into_iter().collect()), physical: false, look: st.colour_look });
+            assert_eq!(preset_active(&st, &rows), Some(p), "{p:?} is highlighted");
+        }
+        assert_eq!(preset_include(P::POnly, &h2_rows()), set(&[]), "a molecule has no p rows (the button is off there)");
+        for p in P::ALL {
+            let a = Action::ColourPreset(p);
+            let text = a.describe().expect("a script form");
+            let words: Vec<&str> = text.split(' ').collect();
+            assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
+        }
+        assert!(Action::parse(&["colour-preset", "d"]).unwrap_err().contains("valence, one-spin, p or everything"));
+    }
+
+    /// The coloured legend (user request 2026-10-20): one chip per colour slot — an ↑ orbital and
+    /// its ↓ partner are one — naming the channel when a slot is drawn in one only; a ticked
+    /// unoccupied orbital has a chip only as a boundary surface; an occupied orbital whose
+    /// boundary reaches the box puts the warning under the legend and a tag on its row.
+    #[test]
+    fn the_coloured_legend_has_one_chip_per_pair_and_warns_of_the_box() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Coloured;
+        let colour = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
+        let legend = |rows: Vec<OrbitalInfo>, include: Option<Vec<u32>>, look: sim::ColourLook| {
+            let mut o = payload(rows, OrbitalRequest::AllColoured { include, physical: false, look });
+            o.field = colour.clone();
+            let snap = with_payload(&scene, Backend::Gpu, o);
+            legend_of(&st, &input(&scene, Some(&snap), &cam)).unwrap()
+        };
+        let shell = sim::ColourLook::default();
+        let l = legend(atom_rows(), None, shell);
+        let names: Vec<&str> = l.swatches.iter().map(|s| s.1.as_str()).collect();
+        assert_eq!(names, ["#1", "#2", "#3↑", "#4↑"], "s and the first p are pairs; the other p's are ↑ only");
+        assert!(l.text.contains("boundary surface") && l.text.contains("90 %"), "{}", l.text);
+        assert!(l.warn.is_none());
+        // the unoccupied #5 ticked: a chip as a boundary surface, none by density
+        let l = legend(atom_rows(), Some(vec![1, 7]), shell);
+        assert_eq!(l.swatches.len(), 2);
+        let l = legend(atom_rows(), Some(vec![1, 7]), sim::ColourLook { enclose: None, ..shell });
+        assert_eq!(l.swatches.len(), 1, "by density the unoccupied orbital is not drawn");
+        // the box
+        let mut rows = atom_rows();
+        rows[1].touches_box = true;
+        rows[6].touches_box = true;
+        let l = legend(rows.clone(), None, shell);
+        assert_eq!(l.warn.as_deref(), Some("boundary touches the box: enlarge the box (#2)"), "named once per pair");
+        let v = RowView::of(&rows[1], &Levels::of(&rows));
+        assert!(v.tags.iter().any(|t| t.text == orbitals::TOUCHES_BOX && t.warn), "{:?}", v.tags);
+        // an unoccupied row keeps its own box tag instead
+        rows[4].touches_box = true;
+        assert!(!RowView::of(&rows[4], &Levels::of(&rows)).tags.iter().any(|t| t.text == orbitals::TOUCHES_BOX));
     }
 
     /// `run_settings` carries the orbital view, so a solver switch (a new worker) keeps it.
@@ -2678,7 +2818,14 @@ mod orbital_viewer {
         let inp = input(&scene, Some(&snap), &cam);
         let l = legend_of(&st, &inp).unwrap();
         assert_eq!(l.swatches.len(), 1, "σ_g↑ and σ_g↓ share slot 0; σ_u is unoccupied and not included");
-        assert_eq!(l.text, "each orbital scaled to its own peak");
+        assert_eq!(l.swatches[0].1, "#1", "a pair's chip names no channel");
+        assert_eq!(l.text, "each orbital's boundary surface: the region holding 90 % of it, drawn as a shell");
+        st.colour_look.enclose = None;
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, look: st.colour_look });
+        o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        assert_eq!(legend_of(&st, &inp).unwrap().text, "each orbital scaled to its own peak");
     }
 
     /// The chrome lays out with a payload in every mode and tab, sends nothing without input, and
@@ -4386,4 +4533,126 @@ fn the_docks_state_is_not_recorded() {
     let mut st = UiState::new("h2", &scene);
     let outs = [click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log"), click_widget(&ctx, &mut st, &inp, "dock-chevron-Left")];
     assert!(outs.iter().flatten().all(|o| o.actions.is_empty() && o.commands.is_empty()), "no action, no command");
+}
+
+// ---- the Play snapshot (`ui::rewind`) ----
+
+/// Play from paused stores the scene (velocities and isotopes included), the driver's pins, the
+/// run settings and the time; Play while playing, Play on the estimated solver without a model and
+/// an equal state played again store nothing new; the newest `rewind::KEPT` are kept.
+#[test]
+fn pressing_play_keeps_a_snapshot() {
+    let mut scene = Scene::preset("h2").unwrap();
+    scene.nuclei[0].vel = [1e-4, 0.0, 0.0];
+    scene.nuclei[1].a = Some(2);
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.pins = vec![false, true];
+    snap.dynamics.sim_time = units::fs_to_au_time(12.5);
+    snap.dynamics.step = 50;
+    let inp = input(&scene, Some(&snap), &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.gravity = true;
+    let out = act(&mut st, &inp, Action::TogglePlay);
+    assert!(out.toggle_play && out.commands.is_empty());
+    assert_eq!(st.play_snapshots.len(), 1);
+    let s = &st.play_snapshots[0];
+    assert_eq!(s.state.scene, scene, "positions, velocities and isotopes");
+    assert_eq!(s.state.pins, [false, true]);
+    assert!(s.state.gravity && s.state.walls_on);
+    assert_eq!((s.step, (s.sim_time_fs - 12.5).abs() < 1e-9), (50, true));
+    assert!(matches!(st.activity.timeline.last(), Some(activity::Mark::Snapshot(_, t)) if (t - 12.5).abs() < 1e-9));
+    // the same state played again: no copy
+    act(&mut st, &inp, Action::Play);
+    assert_eq!(st.play_snapshots.len(), 1);
+    // while playing: nothing
+    let mut playing = input(&scene, Some(&snap), &cam);
+    playing.playing = true;
+    let mut moved = scene.clone();
+    moved.nuclei[0].pos[0] += 0.1;
+    playing.scene = &moved;
+    act(&mut st, &playing, Action::TogglePlay);
+    assert_eq!(st.play_snapshots.len(), 1);
+    // the estimated solver without a model refuses Play: nothing
+    let est = snapshot(&moved, Backend::Estimated, None);
+    let inp_est = input(&moved, Some(&est), &cam);
+    let mut st_est = UiState::new("h2", &scene);
+    st_est.backend = Backend::Estimated;
+    act(&mut st_est, &inp_est, Action::Play);
+    assert!(st_est.play_snapshots.is_empty());
+    // newest first, at most KEPT
+    let scenes: Vec<Scene> = (0..rewind::KEPT + 2)
+        .map(|k| {
+            let mut s = scene.clone();
+            s.nuclei[0].pos[0] += 0.01 * (k + 1) as f64;
+            s
+        })
+        .collect();
+    for s in &scenes {
+        act(&mut st, &input(s, None, &cam), Action::TogglePlay);
+    }
+    assert_eq!(st.play_snapshots.len(), rewind::KEPT);
+    assert_eq!(st.play_snapshots[0].state.scene, *scenes.last().unwrap());
+    // playing an older one again makes it the newest (Rewind returns to it), still no copy
+    let older = st.play_snapshots[2].state.scene.clone();
+    act(&mut st, &input(&older, None, &cam), Action::TogglePlay);
+    assert_eq!(st.play_snapshots.len(), rewind::KEPT);
+    assert_eq!(st.play_snapshots[0].state.scene, older);
+}
+
+/// Rewind puts the snapshot back through the scene-replacement path: Pause, SetScene with the
+/// snapshot's velocities first, then the field, COM correction, walls, a changed thermostat and
+/// the pins; the panel's settings follow; the timeline marks it. Without a snapshot it is an
+/// error and sends nothing.
+#[test]
+fn rewind_restores_the_play_snapshot() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    let scene = Scene::preset("h2").unwrap();
+    let out = act(&mut st, &input(&scene, None, &cam), Action::RewindTo(0));
+    assert!(out.commands.is_empty() && out.error.as_deref() == Some(rewind::NONE_YET), "{:?}", out.error);
+
+    let mut at_play = scene.clone();
+    at_play.nuclei[0].vel = [0.0, 2e-4, 0.0];
+    let mut snap = snapshot(&at_play, Backend::Gpu, None);
+    snap.dynamics.pins = vec![true, false];
+    st.walls_on = true;
+    act(&mut st, &input(&at_play, Some(&snap), &cam), Action::TogglePlay);
+    // the run goes on: the scene moves, settings change
+    let mut later = at_play.clone();
+    later.nuclei[0].pos = [3.0, 3.0, 3.0];
+    st.walls_on = false;
+    st.gravity = true;
+    st.thermostat_on = true;
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(0));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let c = &out.commands;
+    assert!(matches!(&c[0], Command::Dyn(DynCommand::Pause)), "{c:?}");
+    assert!(matches!(&c[1], Command::SetScene(s) if *s == at_play), "then the scene, velocities kept: {c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetExternalField(a)) if *a == [0.0; 3])), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetWalls(Some(_))))), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetComCorrection(true)))), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetThermostat(None)))), "the thermostat was off at Play: {c:?}");
+    let pins: Vec<_> = c.iter().filter_map(|c| if let Command::Dyn(DynCommand::Pin(i, on)) = c { Some((*i, *on)) } else { None }).collect();
+    assert_eq!(pins, [(0, true)]);
+    assert!(st.walls_on && !st.gravity && !st.thermostat_on, "the panel follows the snapshot");
+    assert!(matches!(st.activity.timeline.last(), Some(activity::Mark::Restore(..))));
+    assert!(st.status.contains("rewound"), "{}", st.status);
+    // an unchanged thermostat is not re-sent (it would redraw velocities at rest)
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(0));
+    assert!(!out.commands.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetThermostat(_)))), "{:?}", out.commands);
+    // a snapshot that is not there
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(3));
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("1 kept")), "{:?}", out.error);
+}
+
+/// The toolbar's Rewind is disabled until Play was pressed; the old v → −v is Physics ▸ Reverse
+/// velocities and both are found by Ctrl K.
+#[test]
+fn rewind_and_reverse_velocities_have_their_homes() {
+    let names: Vec<&str> = search::ENTRIES.iter().map(|e| e.name).collect();
+    assert!(names.iter().any(|n| n.starts_with("Rewind")));
+    let rev = search::ENTRIES.iter().find(|e| e.name == "Reverse velocities").expect("searchable");
+    assert_eq!(rev.place, search::Place::Menu(menus::MenuId::Physics));
+    assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
 }

@@ -19,6 +19,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         theme::note(ui, "estimated = a model fitted to this scene's DFT; valid only where it has been taught — it falls back to DFT when unsure");
         theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
     });
+    resume_row(ui, st, input, acts);
     if st.backend != Backend::Estimated {
         theme::note(ui, "The estimated solver is not running: pick Estimated in the toolbar's Solver group. Its model, sampling pass and audits show here.");
         return;
@@ -36,6 +37,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         warnbox(ui, &super::super::box_advice(input.scene, st));
     }
     if let Some(m) = m {
+        no_model_row(ui, m, sampling, acts);
         teach_row(ui, m, sampling, acts);
     }
     if let Some(m) = m {
@@ -160,6 +162,27 @@ fn warnbox(ui: &mut Ui, text: &str) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.5).color(AMBER));
         });
+}
+
+/// Samples held but no model formed (`ModelStatus::no_model`; the 2026-10-20 PH₃ session): the
+/// reason in plain words and, when it can help, **Retry** (re-solves a missing isolated-atom
+/// reference, or refits — `Action::RetryFit`). Also in the Activity tab.
+pub fn no_model_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(why) = &m.no_model else { return };
+    warnbox(ui, why);
+    if m.retry_fit || sampling {
+        ui.horizontal_wrapped(|ui| {
+            let b = egui::Button::new(RichText::new("Retry").strong().color(Color32::from_rgb(0x1c, 0x14, 0x05))).fill(AMBER);
+            if super::super::probed("retry-fit", ui.add_enabled(!sampling && m.retry_fit, b))
+                .on_disabled_hover_text("a pass is running")
+                .on_hover_text("solve the missing isolated-atom reference — every allowed multiplicity, each from a cold start (a solve lost to a busy GPU is tried once more) — then fit the samples held (a short pass: pauses the dynamics). With every reference known it fits at once. Not offered when the atom's SCF itself failed: a cold solve is deterministic and would fail the same way.")
+                .clicked()
+            {
+                acts.push(Action::RetryFit);
+            }
+            ui.weak("the samples are kept either way: Save model… writes them");
+        });
+    }
 }
 
 /// The running pass's progress bar and counts (also on the sampling card in the 3D view).
@@ -316,11 +339,20 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
     let m = input.model();
     let sampling = input.sampling();
     let fitted = m.is_some_and(|m| m.fitted);
+    // samples without a fit are saved too (a samples-only file): a fit that did not form must not
+    // lose the DFT taught so far
+    let savable = fitted || m.is_some_and(|m| m.samples > 0);
     let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
     ui.horizontal_wrapped(|ui| {
+        let tip = if fitted {
+            format!("choose where to write the model, its fit and its samples (last: {})", path.display())
+        } else {
+            format!("no model yet: choose where to write the samples taught so far — loading the file fits them once a fit can form (last: {})", path.display())
+        };
         if ui
-            .add_enabled(estimated && fitted, egui::Button::new("Save model…"))
-            .on_hover_text(format!("choose where to write the model, its fit and its samples (last: {})", path.display()))
+            .add_enabled(estimated && savable, egui::Button::new("Save model…"))
+            .on_disabled_hover_text("nothing to save yet: no samples")
+            .on_hover_text(tip)
             .clicked()
         {
             // the File window (`ui::files`): the models folder, with the native dialog one click away there
@@ -587,4 +619,42 @@ fn uncertainty_bar(ui: &mut Ui, u: f64, bound: f64, c: Color32) {
     p.line_segment([egui::pos2(mid, rect.top() - 2.0), egui::pos2(mid, rect.bottom() + 2.0)], egui::Stroke::new(2.0, theme::INK));
     let x = if bound > 0.0 { (u / (2.0 * bound)).clamp(0.0, 1.0) as f32 } else { 1.0 };
     p.circle_filled(egui::pos2(rect.left() + x * rect.width(), rect.center().y), 5.0, c);
+}
+
+/// The interrupted training's offer (`UiState::resume`; user report 2026-10-20): resume the pass
+/// where it stopped, on its own scene and in the estimated solver, or discard it. Shown on every
+/// solver; hidden while a pass runs (a pass must end before another resumes).
+fn resume_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    if input.sampling() {
+        // a running pass owns the folder now (a resumed one, or a new one replacing it)
+        st.resume = None;
+        return;
+    }
+    let Some(o) = st.resume.as_ref() else { return };
+    let z: Vec<u8> = o.scene.nuclei.iter().map(|n| n.z).collect();
+    let what = crate::names::formula(&z, (o.scene.charge != 0).then_some(o.scene.charge));
+    egui::Frame::new().fill(AMBER.gamma_multiply(0.08)).stroke(egui::Stroke::new(1.5, AMBER.gamma_multiply(0.6))).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+        ui.colored_label(
+            AMBER,
+            format!(
+                "An interrupted training: {what} at {}³ × {} Bohr, sample {} of {} ({}). Its samples are on disk.",
+                o.scene.grid_n,
+                o.scene.grid_h,
+                (o.done + 1).min(o.total),
+                o.total,
+                o.stage
+            ),
+        );
+        ui.horizontal(|ui| {
+            let resume = ui
+                .button(RichText::new(format!("Resume the interrupted training (sample {} of {})", (o.done + 1).min(o.total), o.total)).color(AMBER))
+                .on_hover_text("switches to the estimated solver on the pass's own scene (its grid, σ, charge and ionic potential), loads the samples it had taught and goes on with its remaining jobs — the current scene and model are replaced");
+            if resume.clicked() {
+                acts.push(Action::ResumeTraining);
+            }
+            if ui.button("Discard").on_hover_text("removes the interrupted pass's files; a new sampling pass also replaces them").clicked() {
+                acts.push(Action::DiscardTraining);
+            }
+        });
+    });
 }

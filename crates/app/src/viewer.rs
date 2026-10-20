@@ -455,6 +455,15 @@ pub struct Viewer {
     last_play_log: Option<Instant>,
     /// The flash of the last sample the pass finished (`crate::ghost`).
     ghost: crate::ghost::Tracker,
+    /// Screenshots and recordings (`crate::capture`; display only).
+    pub capture: crate::capture::Capture,
+    /// Where an estimated worker keeps a running pass resumable (`worker::checkpoint`): the
+    /// window's `%LOCALAPPDATA%\atomic-sandbox\training`; `None` headless (screenshots, replays,
+    /// tests never write or offer one).
+    pub training_dir: Option<PathBuf>,
+    /// The next estimated worker resumes the interrupted pass in this folder instead of its
+    /// `EnsureModel` ([`Viewer::resume_training`]).
+    resume_next: Option<PathBuf>,
 }
 
 impl Viewer {
@@ -511,6 +520,9 @@ impl Viewer {
             screen: None,
             last_play_log: None,
             ghost: Default::default(),
+            capture: Default::default(),
+            training_dir: None,
+            resume_next: None,
         })
     }
 
@@ -577,15 +589,22 @@ impl Viewer {
         self.drag_target = None;
         self.tool.dragging = false;
         self.side_seq = None; // the new driver numbers its side densities afresh
+        let resume = self.resume_next.take();
+        if resume.is_none() {
+            // an interrupted pass on disk (a crash, a close, a solver switch mid-pass): offered
+            self.refresh_resume_offer();
+        }
         if estimated {
-            let mut teach = vec![
-                Command::EnsureModel {
+            let mut teach: Vec<Command> = self.training_dir.iter().map(|d| Command::TrainingCheckpoints(Some(d.clone()))).collect();
+            teach.push(match resume {
+                Some(dir) => Command::ResumeTraining(dir),
+                None => Command::EnsureModel {
                     autoload: None, // decided when it is sent: the autosave may still be written
                     plan: self.ui.plan.clone(),
                     auto_pass: self.auto_pass,
                 },
-                self.ui.cloud_command(),
-            ];
+            });
+            teach.push(self.ui.cloud_command());
             if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
@@ -595,6 +614,46 @@ impl Viewer {
             self.pending_teach = Some(teach);
             self.poll_retiring();
         }
+    }
+
+    /// The Model tab's offer of an interrupted pass in [`training_dir`](Self::training_dir)
+    /// (`ui::ResumeOffer`), read from its checkpoint's header; none when there is none or it cannot
+    /// be read.
+    pub fn refresh_resume_offer(&mut self) {
+        self.ui.resume = self.training_dir.as_deref().and_then(crate::sim::interrupted_pass).map(|(_, info)| ui::ResumeOffer {
+            scene: Scene::from_sim(&info.scene),
+            done: info.done,
+            total: info.total,
+            stage: info.stage,
+        });
+    }
+
+    /// The offer's Resume (`resume`) or Discard (`ui::Action::ResumeTraining` / `DiscardTraining`):
+    /// Resume puts the pass's own scene in place (its grid, σ, charge, multiplicity and ionic
+    /// policy; the chip says "built <formula>") and starts the estimated solver on it with
+    /// `Command::ResumeTraining` instead of `EnsureModel`; Discard removes the files.
+    pub fn resume_training(&mut self, resume: bool) {
+        let Some(dir) = self.training_dir.clone() else { return };
+        if !resume {
+            crate::sim::discard_interrupted_pass(&dir);
+            self.ui.resume = None;
+            return;
+        }
+        let Some(o) = self.ui.resume.take() else { return };
+        let z: Vec<u8> = o.scene.nuclei.iter().map(|n| n.z).collect();
+        self.ui.source = ui::SceneSource::Built(crate::names::formula(&z, (o.scene.charge != 0).then_some(o.scene.charge)));
+        self.ui.ionic = o.scene.ionic;
+        self.ui.adopt(&o.scene);
+        self.ui.quality_h = o.scene.grid_h;
+        self.ui.quality_slider = o.scene.grid_h;
+        self.ui.wall_half_width = ui::default_wall_half_width(&o.scene);
+        self.tool = ToolState::default();
+        self.drag_target = None;
+        self.scene = o.scene;
+        self.resume_next = Some(dir);
+        self.ui.backend = Backend::Estimated;
+        self.start(Backend::Estimated, self.gpu.clone());
+        self.ui.set_status(format!("resuming the interrupted training at sample {} of {}", (o.done + 1).min(o.total), o.total));
     }
 
     /// A new worker's orbital session (a solver switch, the start): its provider numbers its
@@ -695,6 +754,8 @@ impl Viewer {
         if cmd.is_edit() {
             self.edits_sent += 1;
             self.last_error = None;
+            // a recording never interpolates across an edit
+            self.capture.on_edit();
         }
         let replaces = matches!(
             cmd,
@@ -1049,8 +1110,20 @@ impl Viewer {
         if out.toggle_play {
             self.toggle_play();
         }
+        if let Some(r) = out.capture {
+            let scene = self.ui.source.label();
+            match self.capture.request(r, &self.ui.capture, &scene) {
+                Ok(msg) => self.ui.set_status(msg),
+                Err(e) => self.last_error = Some(format!("capture: {e}")),
+            }
+            self.ui.capture_view = self.capture.view().clone();
+        }
         for cmd in out.commands {
             self.send(cmd);
+        }
+        if let Some(resume) = out.training {
+            // it switches the solver itself (and says so)
+            return self.resume_training(resume);
         }
         if self.ui.backend != self.backend {
             self.start(self.ui.backend, self.gpu.clone());
@@ -1152,7 +1225,11 @@ impl Viewer {
         if !self.playing {
             return;
         }
-        let why = if self.estimated_without_model() {
+        let held = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.no_model.is_some());
+        let why = if self.estimated_without_model() && held {
+            // samples held, the fit did not form (a reference that did not solve): the tab says why
+            Some("paused: the estimated solver has no model yet — the Model tab says why and offers Retry (the samples are kept)")
+        } else if self.estimated_without_model() {
             Some("paused: the estimated solver has no model — load one (File ▸ Open) or Start sampling in the Model tab")
         } else {
             self.snapshot
@@ -1276,6 +1353,9 @@ impl Viewer {
                         let cur = self.motion[1].take();
                         self.motion = [cur, Some(sample)];
                     }
+                    // a simulated-time recording follows the run (nothing while paused)
+                    let pos = s.scene.nuclei.iter().map(|n| n.pos).collect();
+                    self.capture.on_snapshot(s.dynamics.sim_time_fs(), s.dynamics.step, pos, !s.dynamics.paused);
                 }
                 if self
                     .tool
@@ -1876,7 +1956,18 @@ impl Viewer {
     /// the atom trails with View ▸ Display aids ▸ Trails on and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
     /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
     pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
-        let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        let mut lines = self.scene_lines(shown, true, true);
+        lines.extend(self.capture_gizmo());
+        lines
+    }
+
+    /// [`Viewer::overlay_lines`]; `editor` false leaves out the editor's geometry — the cell box,
+    /// the walls, the floor grid, the axes, the placement grid —, `arcs` false the bond-angle arcs
+    /// (their numbers are chrome): a capture with the UI hidden (`crate::capture`; the arcs come
+    /// back with its labels). Bonds, trails, core
+    /// overlaps and the training ghost stay — they are the scene.
+    pub fn scene_lines(&self, shown: &Scene, editor: bool, arcs: bool) -> Vec<render::lines::LineVertex> {
+        let mut lines = if editor { crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode) } else { Vec::new() };
         // while a sampling pass runs the ghost of its job replaces the scene: the cell and the
         // walls stay, the scene's bonds do not
         if let Some(g) = self.ghost_now() {
@@ -1898,7 +1989,7 @@ impl Viewer {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
             lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
         }
-        if let Some((marks, stale)) = self.angle_marks(shown) {
+        if let Some((marks, stale)) = self.angle_marks(shown).filter(|_| arcs) {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
             for m in &marks {
                 lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), stale));
@@ -2121,9 +2212,9 @@ impl Viewer {
     /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
     /// at its centroid as drawn now, faded with the bonds when the graph is an earlier step's;
     /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
-    fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
+    pub(crate) fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport, lv: &LabelView<'_>) {
         // nor over the File window (they are drawn on the foreground layer)
-        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || self.ui.files.open || self.ui.builder.open || self.ui.loading.is_some() {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 || ((self.ui.files.open || self.ui.builder.open) && !lv.capture) || self.ui.loading.is_some() {
             return;
         }
         let ppp = root.pixels_per_point();
@@ -2154,7 +2245,7 @@ impl Viewer {
             let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
             let mut rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
             // below the status chip when they would overlap (a narrow view)
-            if let Some(chip) = self.ui.chip_rect.filter(|c| c.intersects(rect.expand(4.0))) {
+            if let Some(chip) = self.ui.chip_rect.filter(|c| !lv.capture && c.intersects(rect.expand(4.0))) {
                 rect = rect.translate(egui::vec2(0.0, chip.bottom() + 10.0 - rect.top()));
             }
             painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(175));
@@ -2163,12 +2254,12 @@ impl Viewer {
             painter.galley(egui::pos2(cx - main.size().x / 2.0, rect.top() + 6.0 + galley.size().y + 2.0), main, egui::Color32::WHITE);
             return;
         }
-        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
+        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels && lv.names) {
             if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
                 // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
-                let up = self.camera.view().inverse().y_axis.truncate();
-                let mut smooth = self.label_smooth.borrow_mut();
+                let up = lv.camera.view().inverse().y_axis.truncate();
+                let mut smooth = lv.smooth.borrow_mut();
                 smooth.begin_once(root.input(|i| i.time));
                 for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
                     // anchored on the molecule's centre of mass (user request 2026-10-18: the label
@@ -2191,7 +2282,7 @@ impl Viewer {
                     let key = (2, members[0], members.len(), 0);
                     let (anchor, r) = smooth.update(key, com, extent);
                     let lifted = tools::v3(anchor) + up * r as f32;
-                    if let Some(px) = tools::project(&self.camera, lifted, vp) {
+                    if let Some(px) = tools::project(lv.camera, lifted, vp) {
                         let at = to_pos(px) - egui::vec2(0.0, 6.0);
                         pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
                     }
@@ -2201,26 +2292,26 @@ impl Viewer {
         }
         // the bond lengths and angles (Task 13; user request 2026-10-18): smoothed anchors and
         // one-second averaged values, so the labels are readable while the atoms vibrate
-        let mut smooth = self.label_smooth.borrow_mut();
+        let mut smooth = lv.smooth.borrow_mut();
         smooth.begin_once(root.input(|i| i.time));
         let centre = {
             let n = shown.nuclei.len().max(1) as f64;
             let c: [f64; 3] = std::array::from_fn(|k| shown.nuclei.iter().map(|x| x.pos[k]).sum::<f64>() / n);
-            tools::project(&self.camera, tools::v3(c), vp)
+            tools::project(lv.camera, tools::v3(c), vp)
         };
         for l in self.bond_length_labels(shown) {
             let (anchor, r) = smooth.update(l.key, l.anchor, l.value);
-            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+            if let Some(px) = tools::project(lv.camera, tools::v3(anchor), vp) {
                 // beside the bond, on the side away from the molecule's centre (clear of the arcs)
                 let mut at = to_pos(px);
                 if let Some((p, q)) = l.ends {
-                    if let (Some(a), Some(b)) = (tools::project(&self.camera, tools::v3(p), vp), tools::project(&self.camera, tools::v3(q), vp)) {
+                    if let (Some(a), Some(b)) = (tools::project(lv.camera, tools::v3(p), vp), tools::project(lv.camera, tools::v3(q), vp)) {
                         let mut n = egui::vec2(-(b.1 - a.1), b.0 - a.0);
                         if n.length() > 1e-3 {
                             n = n.normalized();
                             // away from the centre, with hysteresis: the side changes only when the
                             // other one is clearly better (|cos| > 0.35), else the label keeps its side
-                            let mut sides = self.label_side.borrow_mut();
+                            let mut sides = lv.sides.borrow_mut();
                             let side = sides.entry(l.key).or_insert(1.0);
                             if let Some(c) = centre {
                                 let out = egui::vec2(px.0 - c.0, px.1 - c.1);
@@ -2240,23 +2331,23 @@ impl Viewer {
         }
         for l in self.angle_labels(shown) {
             let (anchor, rad) = smooth.update(l.key, l.anchor, l.value);
-            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+            if let Some(px) = tools::project(lv.camera, tools::v3(anchor), vp) {
                 pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
             }
         }
         // the partial charges, just below each atom's sphere (the camera's down), the value averaged
         // over the last second like the bond lengths; the label follows the atom
-        let up = self.camera.view().inverse().y_axis.truncate();
+        let up = lv.camera.view().inverse().y_axis.truncate();
         for (i, q, alpha, bg) in self.charge_labels(shown) {
             let n = &shown.nuclei[i];
             let (_, q) = smooth.update((3, i, 0, 0), n.pos, q);
             let below = tools::v3(n.pos) - up * render::elements::radius(n.z);
-            if let Some(px) = tools::project(&self.camera, below, vp) {
+            if let Some(px) = tools::project(lv.camera, below, vp) {
                 pill(to_pos(px) + egui::vec2(0.0, 4.0), egui::Align2::CENTER_TOP, &ui::charge_text(q), ui::charge_colour(q, alpha), bg);
             }
         }
         drop(smooth);
-        if let Some((text, at)) = self.badge(shown) {
+        if let Some((text, at)) = self.badge(shown).filter(|_| !lv.capture) {
             pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
         }
     }
@@ -2296,6 +2387,7 @@ impl Viewer {
         let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;
         let screen_points = raw.screen_rect.map(|r| r.size());
+        self.ui.capture_view = self.capture.view().clone();
         let full = ctx.run_ui(raw, |root| {
             let out = ui::show(
                 root,
@@ -2342,7 +2434,8 @@ impl Viewer {
                     l
                 }),
             );
-            self.label_overlay(root, &shown, viewport);
+            let lv = LabelView { camera: &self.camera, smooth: &self.label_smooth, sides: &self.label_side, capture: false, names: true };
+            self.label_overlay(root, &shown, viewport, &lv);
             self.reference_arrows(root, &shown, viewport);
         });
         self.viewport = viewport;
@@ -2394,6 +2487,17 @@ pub struct AngleLabel {
 pub const LABEL_SMOOTH_S: f64 = 0.35;
 /// The window of the labels' value average (s), as the temperature readout's.
 pub const LABEL_AVG_S: f64 = 1.0;
+
+/// Where [`Viewer::label_overlay`] draws: the window's labels, or a capture's (`crate::capture`:
+/// its own camera and smoothing state, no badge, the molecule names only when the capture's title
+/// does not list them).
+pub struct LabelView<'a> {
+    pub camera: &'a OrbitCamera,
+    pub smooth: &'a std::cell::RefCell<LabelSmoother>,
+    pub sides: &'a std::cell::RefCell<std::collections::HashMap<(u8, usize, usize, usize), f32>>,
+    pub capture: bool,
+    pub names: bool,
+}
 
 /// Readable measurement labels (user request 2026-10-18: bond-length and angle labels bouncing
 /// with the vibrating atoms were hard to read). Each label's world anchor is low-pass filtered with
@@ -3425,7 +3529,7 @@ nucleus 1 {a} {} {}
         use sim::{OrbitalDisplay, OrbitalInfo, OrbitalLabel, OrbitalRequest, Spin};
         let row = |spin, track| OrbitalInfo {
             spin, index: 0, track, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         };
         let payload = |what, rows| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,

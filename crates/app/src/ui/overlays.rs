@@ -22,7 +22,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let chip = status_chip(ctx, view, st, input);
     st.chip_rect = Some(chip);
     bonds_now(ctx, view, st, input, acts);
-    let mut right_y = view.top() + 12.0;
+    // the capture buttons at the top right; the atom card and the offer cards stack under them
+    let mut right_y = super::capture::show(ctx, view, st, input.camera, acts) + 10.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
             let pseudo = input.snapshot.and_then(|s| super::pseudo::of_species(&s.dynamics.eval.pseudised, n.z));
@@ -538,6 +539,8 @@ pub struct Legend {
     pub text: String,
     /// The tooltip: the facts of spec §2 that apply to what is drawn.
     pub tip: String,
+    /// A warning under the text (amber): a boundary surface that reaches the box walls.
+    pub warn: Option<String>,
 }
 
 /// The legend of the orbital layer for the panel's `show` mode and the payload on screen (`None`
@@ -557,33 +560,51 @@ pub fn legend_of(st: &UiState, input: &PanelInput<'_>) -> Option<Legend> {
                 "sign of ψ̃ · only the relative sign of its lobes means anything".into()
             },
             tip: format!("{} {}.", ot::KS_NOTE, ot::SIGN_TIP),
+            warn: None,
         },
         (ShowMode::Orbitals, sim::OrbitalRequest::Orbital { .. }) => Legend {
             swatches: Vec::new(),
             text: "ψ̃²: where an electron in this orbital is likely to be (the density's colour ramp)".into(),
             tip: ot::KS_NOTE.into(),
+            warn: None,
         },
         (ShowMode::Spin, sim::OrbitalRequest::SpinDensity) => Legend {
             swatches: vec![(render::volume::SPIN_UP, "↑ excess".into()), (render::volume::SPIN_DOWN, "↓ excess".into())],
             text: if st.volume_mode == super::VOLUME_ISO { format!("ρ↑ − ρ↓ · iso ±{:.2} of its scale", st.spin_iso) } else { "ρ↑ − ρ↓".into() },
             tip: format!("{} {}", ot::SPIN_NOTE, ot::KS_NOTE),
+            warn: None,
         },
-        (ShowMode::Coloured, sim::OrbitalRequest::AllColoured { include, physical, .. }) => {
-            let mut swatches: Vec<([f32; 3], String)> = Vec::new();
-            let mut slots = Vec::new();
-            for r in o.rows.iter().filter(|r| match include {
-                Some(tracks) => tracks.contains(&r.track),
-                None => r.occupation > 0.0,
-            }) {
-                if slots.contains(&r.slot) {
-                    continue; // a ↓ orbital shares its ↑ partner's colour
+        (ShowMode::Coloured, sim::OrbitalRequest::AllColoured { include, physical, look }) => {
+            let drawn = ot::drawn_rows(&o.rows, include.as_deref(), look);
+            // one chip per colour slot: a ↓ orbital shares its ↑ partner's (one colour per spatial
+            // orbital); a slot drawn in one channel only names it
+            let mut chips: Vec<(u8, String, [bool; 2])> = Vec::new();
+            for r in &drawn {
+                let ch = usize::from(r.spin == sim::Spin::Down);
+                match chips.iter_mut().find(|c| c.0 == r.slot) {
+                    Some(c) => c.2[ch] = true,
+                    None => chips.push((r.slot, r.label.to_string(), [ch == 0, ch == 1])),
                 }
-                slots.push(r.slot);
-                let c = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
-                swatches.push((c, r.label.to_string()));
             }
-            let scale = if *physical { "physical scale: hue = which orbital dominates, opacity = the density" } else { "each orbital scaled to its own peak" };
-            Legend { swatches, text: scale.into(), tip: format!("{} Slots repeat beyond 12 orbitals.", ot::KS_NOTE) }
+            let swatches = chips
+                .into_iter()
+                .map(|(slot, label, spins)| {
+                    let c = providers::orbitals::ORBITAL_PALETTE[slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
+                    let name = match spins {
+                        [true, false] => format!("{label}↑"),
+                        [false, true] => format!("{label}↓"),
+                        _ => label,
+                    };
+                    (c, name)
+                })
+                .collect();
+            let text = match look.enclose {
+                Some(pct) => format!("each orbital's boundary surface: the region holding {pct} % of it{}", if look.shell { ", drawn as a shell" } else { "" }),
+                None if *physical => "physical scale: hue = which orbital dominates, opacity = the density".into(),
+                None => "each orbital scaled to its own peak".into(),
+            };
+            let warn = ot::touching_line(&drawn);
+            Legend { swatches, text, tip: format!("{} One colour per spatial orbital: a ↓ orbital shares its ↑ partner's. Slots repeat beyond 12 orbitals.", ot::KS_NOTE), warn }
         }
         _ => return None,
     })
@@ -610,6 +631,9 @@ fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>)
                         }
                     });
                     ui.add(egui::Label::new(RichText::new(&l.text).size(11.0).color(theme::INK_DIM)).wrap());
+                    if let Some(w) = &l.warn {
+                        ui.add(egui::Label::new(RichText::new(w).size(11.0).color(super::AMBER)).wrap()).on_hover_text(dock::orbitals::TOUCHES_BOX_TIP);
+                    }
                 })
                 .response
                 .on_hover_text(&l.tip);

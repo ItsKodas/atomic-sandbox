@@ -545,9 +545,9 @@ pub fn training(ui: &mut Ui, st: &mut ActivityState, target_t: Option<f64>, draf
 
 /// The event timeline (spec §3.3.6): five lanes over session time.
 pub fn timeline(ui: &mut Ui, st: &ActivityState) {
-    const LANES: [&str; 5] = ["fallbacks", "audits", "refits", "quarantines", "passes"];
+    const LANES: [&str; 6] = ["fallbacks", "audits", "refits", "quarantines", "passes", "snapshots"];
     let lane_h = 15.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), lane_h * 5.0 + 14.0), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), lane_h * LANES.len() as f32 + 14.0), Sense::hover());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 4.0, Color32::from_black_alpha(70));
     let inner = Rect::from_min_max(rect.min + vec2(70.0, 3.0), rect.max - vec2(8.0, 14.0));
@@ -557,7 +557,7 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
         p.line_segment([pos2(inner.left(), y + lane_h), pos2(inner.right(), y + lane_h)], Stroke::new(1.0, theme::LINE_SOFT));
     }
     let start_of = |m: &Mark| match *m {
-        Mark::Fallback(t) | Mark::Audit(t, _) | Mark::Refit(t, _) | Mark::Quarantine(t, _) | Mark::Pass(t, _, _) => t,
+        Mark::Fallback(t) | Mark::Audit(t, _) | Mark::Refit(t, _) | Mark::Quarantine(t, _) | Mark::Pass(t, _, _) | Mark::Snapshot(t, _) | Mark::Restore(t, _) => t,
     };
     let Some(t0) = st.timeline.iter().map(start_of).min() else {
         p.text(inner.center(), Align2::CENTER_CENTER, "events appear here as they happen", FontId::proportional(11.0), theme::INK_FAINT);
@@ -630,12 +630,25 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
                 };
                 spots.push((r.center(), format!("sampling pass from {} {what}", clock(s))));
             }
+            Mark::Snapshot(t, fs) => {
+                // a flag: Play pressed, the state kept
+                let at = pos2(x_of(t), lane_mid(5));
+                p.line_segment([pos2(at.x, at.y + 5.0), pos2(at.x, at.y - 5.0)], Stroke::new(1.0, GREEN));
+                p.add(Shape::convex_polygon(vec![pos2(at.x, at.y - 5.0), pos2(at.x + 5.0, at.y - 2.5), pos2(at.x, at.y)], GREEN, Stroke::NONE));
+                spots.push((at, format!("snapshot at t = {fs:.1} fs (Play pressed at {})", clock(t))));
+            }
+            Mark::Restore(t, fs) => {
+                // a left arrow: back to a snapshot
+                let at = pos2(x_of(t), lane_mid(5));
+                p.add(Shape::convex_polygon(vec![pos2(at.x - 4.0, at.y), pos2(at.x + 3.0, at.y - 4.0), pos2(at.x + 3.0, at.y + 4.0)], AMBER, Stroke::NONE));
+                spots.push((at, format!("rewound to the snapshot at t = {fs:.1} fs (at {})", clock(t))));
+            }
         }
     }
     small(&p, pos2(inner.left(), rect.bottom() - 1.0), Align2::LEFT_BOTTOM, &clock(t0), theme::INK_FAINT);
     small(&p, pos2(inner.right(), rect.bottom() - 1.0), Align2::RIGHT_BOTTOM, &clock(t1), theme::INK_FAINT);
     if let Some(pos) = resp.hover_pos().filter(|q| inner.expand(3.0).contains(*q)) {
-        let lane = (((pos.y - inner.top()) / lane_h) as usize).min(4);
+        let lane = (((pos.y - inner.top()) / lane_h) as usize).min(LANES.len() - 1);
         if lane == 0 {
             let c = ((pos.x - inner.left()) as usize).min(cols - 1);
             if fall[c] > 0 {

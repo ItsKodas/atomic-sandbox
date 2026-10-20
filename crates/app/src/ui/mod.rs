@@ -22,6 +22,7 @@
 //! (rule 8).
 pub mod actions;
 pub mod activity;
+mod capture;
 mod dock;
 mod files;
 pub mod profile;
@@ -32,6 +33,7 @@ pub mod model_offer;
 mod overlays;
 pub mod pseudo;
 pub mod ptable;
+mod rewind;
 mod sampling_presets;
 pub mod search;
 pub mod theme;
@@ -320,6 +322,51 @@ impl ShowMode {
     }
 }
 
+/// The Orbitals tab's quick presets for All orbitals coloured (user request 2026-10-20): each sets
+/// the include list and `ColourLook::hide_core` (the draw look — shell, filled or density, the
+/// enclosed share — stays), resolved against the rows on screen when applied
+/// (`ui::actions::preset_include`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColourPreset {
+    /// Every occupied orbital but the core ones (`hide_core`).
+    Valence,
+    /// The occupied ↑ orbitals only.
+    OneSpin,
+    /// The occupied orbitals of p character (`OrbitalInfo::l` = 1: a lone atom's, pseudised or
+    /// not; a molecule's orbitals have none).
+    POnly,
+    /// Every occupied orbital, core included: the default.
+    Everything,
+}
+
+impl ColourPreset {
+    pub const ALL: [ColourPreset; 4] = [ColourPreset::Valence, ColourPreset::OneSpin, ColourPreset::POnly, ColourPreset::Everything];
+
+    /// The button's text.
+    pub fn title(self) -> &'static str {
+        match self {
+            ColourPreset::Valence => "valence only",
+            ColourPreset::OneSpin => "one spin",
+            ColourPreset::POnly => "p only",
+            ColourPreset::Everything => "everything",
+        }
+    }
+
+    /// The word a replay script and `--ui preset=` use.
+    pub fn word(self) -> &'static str {
+        match self {
+            ColourPreset::Valence => "valence",
+            ColourPreset::OneSpin => "one-spin",
+            ColourPreset::POnly => "p",
+            ColourPreset::Everything => "everything",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<ColourPreset> {
+        ColourPreset::ALL.into_iter().find(|p| p.word() == w)
+    }
+}
+
 /// `UiState::orbital_pick` before the user has picked a row: a track no producer has issued, so
 /// the provider's selection fallback shows the HOMO (and the payload says which).
 pub const HOMO_TRACK: u32 = sim::TRACK_HOMO;
@@ -540,6 +587,9 @@ pub struct UiState {
     /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
     /// the user presses Apply.
     pub model_offer: Option<model_offer::ModelOffer>,
+    /// An interrupted training kept on disk (`ResumeOffer`): the Model tab offers to resume or discard it. Set by the
+    /// viewer when it starts a worker; display state.
+    pub resume: Option<ResumeOffer>,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
     /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
@@ -698,10 +748,17 @@ pub struct UiState {
     pub log_filter: LogFilter,
     /// The Ctrl K control search, and the control it last revealed.
     pub search: search::SearchState,
+    /// The capture's quick settings (the popover by the Screenshot / Record buttons; display state)
+    /// and what the buttons show (`crate::capture::Capture::view`, refreshed by the viewer).
+    pub capture: crate::capture::Settings,
+    pub capture_view: crate::capture::View,
     /// The open Help window.
     pub help: Option<HelpTopic>,
     /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
     pub activity: activity::ActivityState,
+    /// The Play snapshots, newest first (at most `rewind::KEPT`): the toolbar's Rewind returns to
+    /// one (`ui::rewind`).
+    pub play_snapshots: std::collections::VecDeque<rewind::PlaySnapshot>,
     /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
     pub compare: crate::reference::Compare,
 }
@@ -850,6 +907,7 @@ right {}
             builder: Default::default(),
             model_file: None,
             model_offer: None,
+            resume: None,
             status: String::new(),
             status_seq: 0,
             show_cell: true,
@@ -930,8 +988,11 @@ right {}
             log: LogBook::default(),
             log_filter: LogFilter::All,
             search: search::SearchState::default(),
+            capture: Default::default(),
+            capture_view: Default::default(),
             help: None,
             activity: activity::ActivityState::new(),
+            play_snapshots: std::collections::VecDeque::new(),
             compare: Default::default(),
         }
     }
@@ -1190,6 +1251,23 @@ pub struct PanelOutput {
     /// queued from the 3D view, which the recorder already has as input events): what
     /// `--record` writes as `action` lines (`crate::replay::Recorder`).
     pub actions: Vec<Action>,
+    /// A screenshot or the record button (`crate::capture`; display only).
+    pub capture: Option<crate::capture::Request>,
+    /// The interrupted training's offer was answered: resume it (true) or discard it (false)
+    /// (`Viewer::resume_training`).
+    pub training: Option<bool>,
+}
+
+/// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
+/// 2026-10-20): the Model tab's "Resume the interrupted training (sample 137 of 158)".
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResumeOffer {
+    /// The pass's own scene (its grid, σ, charge, multiplicity and ionic policy).
+    pub scene: Scene,
+    /// The sample it resumes at is `done + 1` of `total`; the stage of that job.
+    pub done: usize,
+    pub total: usize,
+    pub stage: &'static str,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns

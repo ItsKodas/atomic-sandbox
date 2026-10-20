@@ -13,6 +13,8 @@ pub enum Place {
     SceneChip,
     Menu(super::menus::MenuId),
     Dock(DockTab),
+    /// The buttons over the 3D view (top right: the capture's).
+    View,
 }
 
 /// One searchable control: its name (and other words it answers to), where it lives, and the
@@ -37,7 +39,7 @@ pub const ENTRIES: &[Entry] = &[
     // toolbar
     e("Play / Pause", "space run start stop", Toolbar, "tb-time"),
     e("Step", "advance one time step", Toolbar, "tb-time"),
-    e("Rewind", "reverse velocities v to −v", Toolbar, "tb-time"),
+    e("Rewind (to the Play snapshot)", "back undo restore snapshot when I pressed play broke reset", Toolbar, "tb-time"),
     e("Speed (steps per tick)", "slider fast slow", Toolbar, "tb-speed"),
     e("Watchable speed", "preset vibration", Toolbar, "tb-speed"),
     e("Measured fs/s", "rate simulated femtoseconds per second tick", Toolbar, "tb-speed"),
@@ -111,6 +113,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),
     e("Time step dt (Physics menu)", "fs", Menu(M::Physics), "m-dt"),
+    e("Reverse velocities", "time reversal v to −v flip retrace rewind", Menu(M::Physics), "m-reverse"),
     e("Drag pull (drag force)", "pull force strength wheel spring tug drag reset", Menu(M::Physics), "m-drag"),
     e("Draft mode", "guess instead of falling back unsafe estimated", Menu(M::Physics), "m-draft"),
     e("Relax geometry (FIRE)", "minimise optimise relaxation stop", Menu(M::Physics), "m-relax"),
@@ -182,6 +185,11 @@ pub const ENTRIES: &[Entry] = &[
     e("Show the atom card", "schematic Bohr", Dock(D::Selection), "d-card"),
     // Log
     e("Log", "errors refused notes status history messages", Dock(D::Log), "d-log"),
+    // the 3D view's capture buttons (top right)
+    e("Screenshot", "capture image picture png save frame photo snapshot", Place::View, "v-capture"),
+    e("Record video", "capture movie mp4 recording frames time-lapse ffmpeg clip", Place::View, "v-capture"),
+    e("Capture settings", "hide UI resolution 1080p 1440p 4K fs per frame simulated time as seen", Place::View, "v-capture"),
+    e("Pop out view", "capture camera preview second window monitor what is recorded screenshot frame", Place::View, "v-capture-popout"),
 ];
 
 /// How long a revealed control stays outlined.
@@ -263,6 +271,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
         // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
         Place::Dock(tab) => st.open_tab(tab),
+        // the buttons are always there; the settings open beside them (the pop-out's button is in them)
+        Place::View => st.capture.open = entry.anchor == "v-capture-popout" || entry.name == "Capture settings",
     }
     st.search.reveal = Some((entry.anchor, Instant::now(), false));
     st.search.open = false;
@@ -362,6 +372,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                             format!("dock › {} (pick Estimated first)", DockTab::Activity.title())
                         }
                         Place::Dock(t) => format!("dock › {}", t.title()),
+                        Place::View => "3D view › top right".to_string(),
                     };
                     let r = ui.add(
                         egui::Button::selectable(

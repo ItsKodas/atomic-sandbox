@@ -23,8 +23,10 @@ pub enum Action {
     Pause,
     /// Pause and advance one time step.
     Step,
-    /// v → −v.
-    Rewind,
+    /// Physics ▸ Reverse velocities: v → −v (`DynCommand::Rewind`; time reversal).
+    ReverseVelocities,
+    /// The toolbar's Rewind: back to Play snapshot i (0 = the newest; `ui::rewind`).
+    RewindTo(usize),
     /// Steps per tick (the slider, the typed field, the watchable preset). Never dt (rule 8).
     SetSpeed(u32),
     /// The time step (fs).
@@ -99,8 +101,17 @@ pub enum Action {
     /// "Teach around N blockers": a teach-around pass (`DynCommand::StartTeaching`; the surrogate's
     /// "Teaching around the blockers"). Recorded like Sample, not replayable (it solves).
     TeachAroundBlockers,
+    /// The Model tab's Retry when no model formed (`DynCommand::RetryFit`: re-solves a missing
+    /// isolated-atom reference, or refits). Recorded like Sample, not replayable (it solves).
+    RetryFit,
     /// The automatic first pass's "Start anyway" with the plan it offered.
     StartOffered(SamplingPlan),
+    /// The Model tab's "Resume" of an interrupted training (`UiState::resume`; the viewer switches to
+    /// the estimated solver on the pass's scene and resumes it: `Viewer::resume_training`). Recorded,
+    /// not replayable (it reads the user's data folder and solves).
+    ResumeTraining,
+    /// The same offer's "Discard": its files are removed. Recorded, not replayable.
+    DiscardTraining,
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
     /// The estimated solver's audit cadence (answered steps; 0 = never).
@@ -156,6 +167,9 @@ pub enum Action {
     Include { track: u32, on: bool },
     /// All orbitals coloured: back to the default, every occupied orbital.
     IncludeAllOccupied,
+    /// All orbitals coloured: a quick preset (`ui::ColourPreset`) — the include list resolved
+    /// against the rows on screen ([`preset_include`]) and whether the core is hidden.
+    ColourPreset(super::ColourPreset),
     /// All orbitals coloured: additive (emission only) or weighted blend — a render setting, no
     /// request to the worker.
     ColourBlend { additive: bool },
@@ -183,25 +197,38 @@ pub enum Action {
     /// accepted, then Relax. Recorded as `# not replayable: builder` (a script does not carry the
     /// drawing).
     Builder(crate::builder::Handoff),
+    /// The capture's Screenshot button (`crate::capture`; display only, writes a file — not
+    /// replayable).
+    Screenshot,
+    /// The capture's Record (true) / Stop (false) button (display only, not replayable).
+    Record(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
 pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
-        Action::TogglePlay => out.toggle_play = true,
+        Action::TogglePlay => {
+            if starts_play(st, input) {
+                super::rewind::take(st, input);
+            }
+            out.toggle_play = true;
+        }
         Action::Play => {
             // estimated with no model: nothing to play on (the viewer's toggle refuses the same)
-            let no_model = st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling();
-            if no_model {
+            if no_model(st, input) {
                 out.error = Some("the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into());
             } else {
+                if starts_play(st, input) {
+                    super::rewind::take(st, input);
+                }
                 out.commands.push(dyn_(DynCommand::Play));
             }
         }
         Action::Pause => out.commands.push(dyn_(DynCommand::Pause)),
         Action::Step => out.commands.push(dyn_(DynCommand::Step(1))),
-        Action::Rewind => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::ReverseVelocities => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::RewindTo(i) => super::rewind::restore(st, i, out),
         Action::SetSpeed(n) => {
             st.speed = n;
             out.commands.push(dyn_(DynCommand::SetSpeed(n)));
@@ -448,7 +475,21 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::CancelSampling => out.commands.push(dyn_(DynCommand::CancelSampling)),
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
+        Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
+        Action::ResumeTraining => {
+            if input.sampling() {
+                out.error = Some("a sampling pass is running: cancel it first, then resume the interrupted one".into());
+            } else if st.resume.is_some() {
+                out.training = Some(true);
+            }
+        }
+        Action::DiscardTraining => {
+            if st.resume.take().is_some() {
+                out.training = Some(false);
+                st.set_status("the interrupted training was discarded");
+            }
+        }
         Action::SampleAfterRefusal => {
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
             st.plan.seed += 1;
@@ -564,6 +605,13 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 send_orbital_view(st, out);
             }
         }
+        Action::ColourPreset(p) => {
+            st.included = preset_include(p, payload_rows(input));
+            st.colour_look.hide_core = p == super::ColourPreset::Valence;
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
         Action::ColourBlend { additive } => st.colour_additive = additive,
         Action::Builder(h) => builder_hand_off(st, input, h, out),
         Action::ColourScale { physical } => {
@@ -573,6 +621,8 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::WarpFields(on) => st.warp_fields = on,
+        Action::Screenshot => out.capture = Some(crate::capture::Request::Screenshot),
+        Action::Record(on) => out.capture = Some(if on { crate::capture::Request::StartRecording } else { crate::capture::Request::StopRecording }),
         Action::ColourLook(look) => {
             st.colour_look = look;
             if st.show == ShowMode::Coloured {
@@ -646,6 +696,24 @@ fn send_orbital_view(st: &UiState, out: &mut PanelOutput) {
 /// The newest orbital payload's rows, if any.
 fn payload_rows<'a>(input: &'a PanelInput<'_>) -> &'a [sim::OrbitalInfo] {
     input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()).map_or(&[][..], |o| &o.rows[..])
+}
+
+/// The include list of a preset for these rows (`None` = every occupied orbital): one spin keeps
+/// the occupied ↑ rows, p only the occupied rows of p character (`OrbitalInfo::l`).
+pub fn preset_include(p: super::ColourPreset, rows: &[sim::OrbitalInfo]) -> Option<std::collections::BTreeSet<u32>> {
+    use super::ColourPreset as P;
+    let keep = |f: &dyn Fn(&sim::OrbitalInfo) -> bool| Some(rows.iter().filter(|r| r.occupation > 0.0 && f(r)).map(|r| r.track).collect());
+    match p {
+        P::Valence | P::Everything => None,
+        P::OneSpin => keep(&|r| r.spin == sim::Spin::Up),
+        P::POnly => keep(&|r| r.l == Some(1)),
+    }
+}
+
+/// The preset the state now matches, for these rows (the highlighted button), if any.
+pub fn preset_active(st: &UiState, rows: &[sim::OrbitalInfo]) -> Option<super::ColourPreset> {
+    use super::ColourPreset as P;
+    P::ALL.into_iter().find(|&p| st.colour_look.hide_core == (p == P::Valence) && st.included == preset_include(p, rows))
 }
 
 /// The tracks of the occupied orbitals on screen (the include set's default).
@@ -735,7 +803,9 @@ impl Action {
             Play => "play".into(),
             Pause => "pause".into(),
             Step => "step".into(),
-            Rewind => "rewind".into(),
+            ReverseVelocities => "reverse-velocities".into(),
+            RewindTo(0) => "rewind".into(),
+            RewindTo(i) => format!("rewind {i}"),
             SetSpeed(n) => format!("speed {n}"),
             SetDt(dt) => format!("dt {dt}"),
             Tool(m) => format!("tool {}", tool_word(*m)),
@@ -780,6 +850,7 @@ impl Action {
             Unoccupied(m) => format!("unoccupied {m}"),
             Include { track, on: o } => format!("orbital-include {track} {}", on(*o)),
             IncludeAllOccupied => "orbital-include-reset".into(),
+            ColourPreset(p) => format!("colour-preset {}", p.word()),
             ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
             WarpFields(on) => format!("warp-fields {on}"),
@@ -803,7 +874,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 
@@ -827,14 +898,14 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
+            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
                     "play" => Play,
                     "pause" => Pause,
                     "step" => Step,
-                    "rewind" => Rewind,
+                    "reverse-velocities" => ReverseVelocities,
                     "deselect" => Deselect,
                     "focus" => Focus,
                     "forget" => Forget,
@@ -846,6 +917,11 @@ impl Action {
                     _ => StopRelax,
                 }
             }
+            "rewind" => match args {
+                [] => RewindTo(0),
+                [i] => RewindTo(num(head, i)?),
+                _ => return Err(format!("action rewind takes 0 or 1 arguments (the snapshot, 0 = the newest), got {}", args.len())),
+            },
             "speed" => {
                 want(1)?;
                 SetSpeed(num(head, args[0])?)
@@ -980,6 +1056,10 @@ impl Action {
                     Some(h) => h,
                     None => num(head, args[0])?,
                 })
+            }
+            "colour-preset" => {
+                want(1)?;
+                ColourPreset(super::ColourPreset::from_word(args[0]).ok_or_else(|| format!("action colour-preset: valence, one-spin, p or everything, got '{}'", args[0]))?)
             }
             "show" => {
                 want(1)?;
@@ -1194,7 +1274,18 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
 
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the
 /// backend's solver count and the budget): refused before the worker allocates anything.
-fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
+/// The estimated solver with no fitted model and no pass that will make one: nothing to play on.
+fn no_model(st: &UiState, input: &PanelInput<'_>) -> bool {
+    st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling()
+}
+
+/// Play from paused that the driver will run (not during a pass or a relax, which refuse it): the
+/// moment a Play snapshot is taken (`ui::rewind`).
+fn starts_play(st: &UiState, input: &PanelInput<'_>) -> bool {
+    !input.playing && !no_model(st, input) && !input.sampling() && !input.relaxing()
+}
+
+pub(super) fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
     crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget())
 }
 

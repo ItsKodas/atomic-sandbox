@@ -5,6 +5,14 @@
 // enclosure_hist: one dispatch per orbital — a BINS-bin histogram of log10(ψ̃²/peak) over
 // [−DECADES, 0] (point counts, u32 atomics) into hist[term·BINS ..]; values below 10^−DECADES of
 // the peak carry < 1e-8 of it per point and are left out.
+// The same pass keeps the largest ψ̃²/peak in the outer L/6 of the box (a point whose nearer
+// face, the Dirichlet wall at index −1 or n, is at most (n + 1)/6 grid units away: the region
+// `qm::orbitals`' box rule weighs) in face[term] (the f32's bits: for v ≥ 0 they order as the
+// values, so atomicMax on u32 is the max): the boundary surface reaches that zone, where the
+// walls bend the orbital, when it is ≥ the level (the caller compares them after one readback;
+// user request 2026-10-20). Not the outermost plane: ψ = 0 on the walls keeps it small there
+// even in a box that visibly squeezes the orbital (a lone O at 33³ × 0.15: HOMO −0.10 Ha against
+// −0.34 in the 12 Bohr box, no outermost-plane value near its 90 % level).
 // enclosure_level: one thread per orbital — the probability per bin is its count × the bin's centre
 // value (bins 1/32 decade wide: ≤ 3.7 % off per point), summed from the top bin down; the lower
 // edge of the bin where the sum reaches `share` × the total is the level (relative to the peak),
@@ -19,6 +27,7 @@ struct HistParams { n: u32, p: u32, term: u32, inv_peak: f32 }
 @group(0) @binding(0) var<uniform> H: HistParams;
 @group(0) @binding(1) var<storage, read> psi: array<f32>;
 @group(0) @binding(2) var<storage, read_write> hist: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> face: array<atomic<u32>>;
 
 @compute @workgroup_size(256)
 fn enclosure_hist(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
@@ -32,6 +41,10 @@ fn enclosure_hist(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wo
         let q = (i + 4u) + H.p * ((j + 4u) + H.p * (k + 4u));
         let s = psi[q];
         let v = s * s * H.inv_peak;
+        let near = min(min(min(i + 1u, n - i), min(j + 1u, n - j)), min(k + 1u, n - k));
+        if (f32(near) <= f32(n + 1u) / 6.0) {
+            atomicMax(&face[H.term], bitcast<u32>(v));
+        }
         if (v > 1e-8) {
             let x = (log2(v) / LOG2_10 + DECADES) / DECADES * f32(BINS);
             let b = u32(clamp(x, 0.0, f32(BINS - 1u)));

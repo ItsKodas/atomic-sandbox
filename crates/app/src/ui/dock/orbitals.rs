@@ -48,6 +48,12 @@ pub const LONE_INVERTED: &str = "shell order inverted by the smeared nucleus —
 /// Defined here, used by the M7 core rows (plan Task 8): a frozen core drawn from the generator's atom.
 #[allow(dead_code)] // Task 8 (M7-gated) is the first user; the tooltip test pins the string now
 pub const CORE_TAG: &str = "core: reconstructed for display";
+/// A drawn orbital's boundary surface reaches the box walls (user request 2026-10-20).
+pub const TOUCHES_BOX: &str = "boundary touches the box: enlarge the box";
+/// Its tooltip.
+pub const TOUCHES_BOX_TIP: &str = "the surface that encloses the chosen share of this orbital reaches the outer sixth of the simulation box, where its walls (ψ = 0 on them) bend the orbital: the box squeezes it, so its shape and energy are not the free atom's or molecule's. Enlarge the box (Scene ▸ grid), or lower the enclosed share to see whether only the outer tail is affected";
+/// The tooltip of an unoccupied row's include box.
+pub const UNOCC_INCLUDE_TIP: &str = "include this unoccupied orbital: drawn only as a boundary surface (draw: shell or filled), at full weight — it holds no electrons, so by density there is nothing to draw. An eigenstate of the ground-state potential, not an excited state";
 /// §2 item 7: a lone atom's shell is split by the grid, not by physics.
 pub const GRID_SPLIT_TIP: &str = "a lone atom's shell is degenerate in physics; the grid splits it by sampling the smeared nucleus at a position-dependent offset (the egg-box effect), by an amount that depends on where the atom sits relative to the grid. The members shown are eigenfunctions to within half this";
 
@@ -271,6 +277,9 @@ impl RowView {
         if r.smeared_1s {
             tags.push(tag("smeared nucleus: wider than the physical 1s", SMEARED_TIP, false));
         }
+        if r.touches_box && r.occupation > 0.0 {
+            tags.push(tag(TOUCHES_BOX, TOUCHES_BOX_TIP, true));
+        }
         RowView {
             spin: r.spin,
             track: r.track,
@@ -423,6 +432,35 @@ pub fn swatch(c: [f32; 3]) -> Color32 {
         (y * 255.0).round() as u8
     };
     Color32::from_rgb(enc(c[0]), enc(c[1]), enc(c[2]))
+}
+
+/// The rows the colour view draws for an include list (`None` = every occupied orbital) and look,
+/// as the provider resolves them (`providers::orbitals::ViewState::pick`): an included unoccupied
+/// row only as a boundary surface, and without the core rows (more than `sim::CORE_GAP` below the
+/// highest occupied one) when they are hidden.
+pub fn drawn_rows<'a>(rows: &'a [OrbitalInfo], include: Option<&[u32]>, look: &sim::ColourLook) -> Vec<&'a OrbitalInfo> {
+    let homo = rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.energy).fold(f64::NEG_INFINITY, f64::max);
+    rows.iter()
+        .filter(|r| match include {
+            Some(tracks) => tracks.contains(&r.track) && (r.occupation > 0.0 || look.enclose.is_some()),
+            None => r.occupation > 0.0,
+        })
+        .filter(|r| !look.hide_core || r.energy >= homo - sim::CORE_GAP)
+        .collect()
+}
+
+/// The legend's warning when a drawn occupied orbital's boundary reaches the box walls, naming them
+/// once per pair ("boundary touches the box: enlarge the box (#2, #3)"); unoccupied rows carry
+/// their own box tag instead.
+pub fn touching_line(drawn: &[&OrbitalInfo]) -> Option<String> {
+    let mut names: Vec<String> = Vec::new();
+    for r in drawn.iter().filter(|r| r.touches_box && r.occupation > 0.0) {
+        let n = r.label.to_string();
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    (!names.is_empty()).then(|| format!("{TOUCHES_BOX} ({})", names.join(", ")))
 }
 
 /// Whether the include checkbox of a row is on (default: every occupied orbital).
@@ -578,6 +616,10 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, wai
             if look != st.colour_look {
                 acts.push(Action::ColourLook(look));
             }
+            // the presets only where they act (they would push the list down in the other modes)
+            if st.show == ShowMode::Coloured {
+                presets(ui, st, payload, acts);
+            }
             ui.horizontal(|ui| {
                 ui.label("blend");
                 if let Some(a) = theme::segmented(ui, st.colour_additive, &[(true, "additive", "emission only: inner shells shine through the outer ones"), (false, "weighted", "emission–absorption: the front shell hides what is behind it")]) {
@@ -613,6 +655,46 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, wai
             }
         });
     });
+}
+
+/// The quick presets (user request 2026-10-20): one button each, the one the state matches
+/// highlighted; "p only" needs rows of p character (a lone atom's), so it is off for a molecule.
+fn presets(ui: &mut Ui, st: &UiState, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+    let rows = payload.map_or(&[][..], |o| &o.rows[..]);
+    let active = super::super::actions::preset_active(st, rows);
+    let has_p = rows.iter().any(|r| r.occupation > 0.0 && r.l == Some(1));
+    let has_up = rows.iter().any(|r| r.occupation > 0.0 && r.spin == Spin::Up);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("quick");
+        for p in super::super::ColourPreset::ALL {
+            use super::super::ColourPreset as P;
+            let enabled = match p {
+                P::POnly => has_p,
+                P::OneSpin => has_up,
+                P::Valence | P::Everything => true,
+            };
+            let r = ui.add_enabled(enabled, egui::Button::selectable(active == Some(p), p.title()));
+            let r = if enabled { r.on_hover_text(preset_tip(p)) } else { r.on_disabled_hover_text(if p == P::POnly && !rows.is_empty() { P_ONLY_OFF } else { "needs a DFT step" }) };
+            super::super::probe(&format!("preset-{}", p.word()), &r);
+            if r.clicked() {
+                acts.push(Action::ColourPreset(p));
+            }
+        }
+    });
+}
+
+/// "p only" without p rows.
+pub const P_ONLY_OFF: &str = "p only needs orbitals of p character about one nucleus: a lone atom's. A molecule's orbitals mix angular momenta about each nucleus, so none is a p orbital — tick the rows by hand";
+
+/// What a preset includes.
+pub fn preset_tip(p: super::super::ColourPreset) -> String {
+    use super::super::ColourPreset as P;
+    match p {
+        P::Valence => format!("every occupied orbital but the core ones (more than {} Ha below the highest occupied: Li's 1s; a pseudised atom has none)", sim::CORE_GAP),
+        P::OneSpin => "the occupied ↑ orbitals only: a closed shell's ↓ orbitals are the same shapes".into(),
+        P::POnly => "the occupied orbitals of p character (both spins: a pair shares one colour)".into(),
+        P::Everything => "every occupied orbital of both spins, core included (the default). Unoccupied orbitals are drawn only when ticked".into(),
+    }
 }
 
 /// The list: a heading per channel, a line per orbital and its tags, then the notes.
@@ -685,7 +767,7 @@ fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, levels: &Levels, picked: 
         resp.on_hover_text(if st.show == ShowMode::Coloured { "this orbital's colour in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)" } else { "this orbital's colour in All orbitals coloured" });
         if st.show == ShowMode::Coloured {
             let mut on = included(st, r);
-            let cb = ui.checkbox(&mut on, "").on_hover_text("include this orbital in the colour volume");
+            let cb = ui.checkbox(&mut on, "").on_hover_text(if r.occupation > 0.0 { "include this orbital in the colour volume" } else { UNOCC_INCLUDE_TIP });
             super::super::probe(&format!("include-{}", r.track), &cb);
             if cb.changed() {
                 acts.push(Action::Include { track: r.track, on });

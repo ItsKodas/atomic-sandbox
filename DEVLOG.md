@@ -339,6 +339,95 @@ builder's CPU unit tests, seconds; `cargo test -p app --release --bin app` once 
   The first build waited behind other sessions' suites; the user chose a low-priority `-j 4` build
   instead, which took 30 s.
 
+### Orbital colour follow-ups (Oct 20, about 3 h including two waits for other sessions' GPU suites)
+
+The user compared All orbitals coloured with a textbook viewer (three clean p dumbbells) and found ours
+cluttered. One Opus session, no subagents; the user hand-tested the build.
+
+- **Root cause of "two colours per orbital"**: colour slots were already shared across spins, but only
+  when a *new* ↓ track overlapped an ↑ row by ≥ 0.9. A pseudised O's ↓ p set was rotated independently of
+  its ↑ set, so one ↓ p had no partner above 0.9 and got a fifth colour (legend `#1 #2 #3 #4 #3`). A
+  degenerate ↓ set now rotates onto the ↑ rows it lies within, and ↓ rows re-pair with their ↑ partner at
+  every update.
+- **Pseudised atoms are now aligned to the cell axes** like labelled ones (their rows stay `#k`), and every
+  row carries its angular character `l`, which the new **p only** preset reads (off for molecules).
+- **Presets** (valence only, one spin, p only, everything), **ticked unoccupied orbitals** drawn as boundary
+  surfaces, and a **box warning**.
+- **Failure worth remembering**: the box warning was first specified as "the 90 % surface reaches the
+  outermost grid plane". It never fired: ψ = 0 on the Dirichlet walls keeps the outermost plane tiny even
+  in a 33³ × 0.15 box that pushed O's HOMO from −0.34 to −0.10 Ha. A screenshot of exactly that case caught
+  it; the test now uses the box rule's outer-L/6 zone, verified to fire there and to stay quiet in the
+  default boxes (O atom, water).
+
+### Viewer capture (Oct 20, first commit 08:44, last 09:33, about 2 h with the build)
+
+Screenshot and Record buttons at the top right of the 3D view (`crates/app/src/capture/`,
+`ui/capture.rs`). One Opus session, no subagents, the user hand-testing each commit in the app.
+
+- **Recording by simulated time** (the user's request that morning): a DFT run advances a few fs per wall
+  second, so wall-clock frames would give minutes of stillness. Frames are taken per slice of simulated
+  time (0.5 fs by default) with positions interpolated between snapshots and played at 30 fps; nothing is
+  recorded while paused. When the snapshots are too far apart to interpolate (the estimated solver at full
+  speed) the frame is taken at the snapshot and the button says so; when the capture falls behind it
+  doubles the slice rather than skipping, so the video stays evenly spaced. An "as seen" mode keeps 30
+  wall fps. Nothing waits on the GPU or the disk: a readback pool, PNG writer threads behind a bounded
+  queue, and a finish thread that fills skipped slots and encodes with ffmpeg when it is on PATH.
+- **The user's hand-tests reshaped it five times in under an hour:** the notes moved out of the button card
+  (a long path pushed the buttons aside); hidden-UI captures dropped the cell box and the other editor
+  geometry; aspect ratios with a guide frame over the view, an overlay of labels, a molecule title, the
+  time and a scale bar (drawn by a second egui context at the frame's size, its labels smoothed on the
+  video's clock), and a fixed or orbiting capture camera with dials and a gizmo in the view; the rig was
+  then anchored to the cell's centre (it followed the window's pan); and an optional stop-at length.
+- **Failures worth remembering:** the first frame-size code let a 4K 21:9 capture in the Camera view ask
+  the supersampled glow pass for a 10080 px texture (limit 8192) and the app panicked; frames now fit the
+  limit and the glow pass refuses an oversized target. The same PowerShell UTF-8 round trip as the
+  builder's garbled two files again before the memory note about it was written.
+
+### Camera pop-out view (Oct 20, about 1 h to the first build, one commit)
+
+A second, real OS window that shows exactly what Screenshot / Record take (`crates/app/src/capture/popout.rs`),
+opened from the capture settings' first button or Ctrl K. One Opus session, no subagents; the user
+hand-tested the first build and asked for the merge.
+
+- **What you see is what you get by construction:** the pop-out calls the capture's own `render_capture`
+  into its own offscreen frame at the capture's size (a 4K capture is rendered at 4K and shown scaled), or
+  copies the presented window when the UI is shown, so it cannot drift from the files. It is drawn in the
+  main window's redraw, so it follows the camera live; a recording shows its own fixed size, a red dot and
+  the frame count.
+- **Two traps found by reading before writing:** the capture overlay's egui renderer was shared state; a
+  second egui context through the same renderer would have overwritten its font atlas (both use texture
+  `Managed(0)`), so the painter now keeps one bloom / glow / egui set per offscreen user (`gfx::Fx`).
+  egui's shader expects gamma-encoded textures, so the frame is sampled through a non-sRGB view of the
+  sRGB target (sampling the sRGB view would have darkened it).
+- **Shared-device care:** the second surface's configure runs in a validation error scope (the solver
+  may be submitting; wgpu would otherwise panic), and the pop-out presents in Mailbox when it can, so its
+  vsync never holds the main window's frames.
+
+### Training-pass robustness and resumable training (Oct 20, about 3 h, four commits + docs)
+
+The user's report: a hot-burst solve hit the SCF cap after 149 s "and the entire training failed", and could
+the active training be saved to disk and resumed after a crash or close. One Opus session; one physics-reviewer
+pass on the sampler changes; the user hand-tested and asked for the merge.
+
+- **The diagnosis was in the code, not the logs:** a failed burst step had no forces to continue with, so the
+  burst ended — and the burst is the pass's last stage. Now a failed step restarts the burst from the last solved
+  geometry with fresh Maxwell–Boltzmann velocities and a cold teacher (a sampler, not a trajectory); three failures
+  in a row end it.
+- **A per-sample time limit** (5× the pass's median solve, at least 15 s, after three solves) gives a hopeless
+  geometry up in seconds; it is logged as *time limit* and treated like a stall. The review caught a real bug
+  before it shipped: an abandoned GPU solve parks its half-converged state as the next warm start, so the solve
+  after a time-out has to be cold — without that, one time-out could cascade. It also asked for the limit to
+  double per time-out in a row (a GPU shared with another job), and for a time-out never to skip a pair's
+  shell check. Still open: measuring the restart's cold solve against a warm-dominated median on a big grid.
+- **Resumable passes:** the pass state (queued jobs with their geometries, counters, the burst's positions,
+  velocities and forces, solved shell checks) is a line-based text checkpoint written with the samples file to
+  `%LOCALAPPDATA%tomic-sandbox	raining` at most every 2 s; the Model tab offers Resume / Discard at the next
+  start. The one thing that cannot be saved is the thermostat's random stream (`StdRng` has no stable state), so
+  a resumed burst reseeds it. A test resumes after every solve of a pass and checks the teacher is asked about
+  the same remaining geometries.
+- **Process:** the session's own tool trouble was bash heredocs with apostrophes failing to parse; edits went
+  through small Python scripts that keep each file's CRLF line endings.
+
 ---
 
 ## Failures and dead ends
