@@ -3255,6 +3255,20 @@ gain (`app::ui::activity::jobs::STALL_TAG_FROM`, half of W, above the measured 1
 above L (below it the stop does not apply, so there is no countdown). In the pass a stretched scan point that fails
 skips its scan's further-out points (`providers::sampling` module doc); here 1.8 r₀ is the scan's last point.
 
+## Sampling pass: burst restart and the time limit (2026-10-20; `providers::sampling` module doc 4. and "The time limit")
+
+Sampling-design constants, not tolerances: no trust or acceptance bound moves.
+
+| constant | value | why |
+|---|---|---|
+| `BURST_RESTARTS_IN_A_ROW` | 3 | a failed burst step restarts from the last solved geometry with fresh Maxwell–Boltzmann velocities (`Csvr::maxwell_boltzmann`: COM at rest, K = K̄ for 3N − 3 dof — the draw the burst starts with) and a cold teacher; three failures in a row from one geometry say the burst is stuck there |
+| `TIME_LIMIT_FACTOR` | 5× the median wall time of the pass's successful sample solves | the SCF stall-stop table above: converging pass solves take 10–22 iterations cold, the cap is 200 (the user's case: 149 s at the cap), so a capped warm + cold-retry solve is ≳ 10× a typical one; 5× gives a slow but converging solve room |
+| `TIME_LIMIT_FLOOR_S` | 15 s | small grids (H₂ 81³: 0.3–0.5 s a solve) would otherwise cut at ~2 s, inside GPU-contention noise |
+| `TIME_LIMIT_MIN_SOLVES` | 3 | the first solves include the cold start |
+| doubling | ×2 per time-out in a row | physics review SHOULD-1: a GPU slowed by another job mid-pass would otherwise time out every later solve (the median holds only quiet successes) |
+
+Exempt: reference solves (no fit without them) and shell checks (the shell fence rests on them; a time-out also never skips a pair's shell check). The solve after a time-out is cold (review MUST-1: an abandoned GPU solve parks its half-converged state as the next warm start). Wall time, not iterations: the iteration count is not visible through `ForceProvider`, and the CPU teacher polls `should_abort` once before its solve, so it is never cut short. **Not measured yet** (review SHOULD-3): the restart solves' cost (cold, hot geometry) against a late-burst median dominated by warm, extrapolated solves on a large grid — 5× has margin at H₂O 97³ (3.6 s cold vs 1.8 s warm), larger systems are unmeasured.
+
 ## M7 oracles (Task 10; recipe `m7-tm-kb-nlcc-4`, `tests/pseudo_oracles.rs`)
 
 **The pinned literature digits (Step 1; review S8).** Source: NIST Computational Chemistry Comparison and Benchmark
