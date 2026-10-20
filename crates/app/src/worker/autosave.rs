@@ -1,16 +1,18 @@
 //! The session autosave with ownership (the parent module doc, "The estimated solver",
 //! "Autosave"): the model is written to the autosave path at shutdown — only once this worker owns
-//! the file — or the file removed when there is no model. Split out of `app/src/sim.rs` in M6
+//! the file — or the file removed when there is nothing to keep (samples taught before a fit formed are kept). Split out of `app/src/sim.rs` in M6
 //! Task 1.
 
 use super::*;
 
 impl Worker {
-    /// Writes the surrogate's model to `path` (a fitted model), or removes `path` (none); the
-    /// error message on failure.
+    /// Writes the surrogate's model to `path` (a fitted model, or the samples taught before a fit
+    /// formed: a samples-only file, `surrogate::sidecar` version 6 — the 2026-10-20 PH₃ session
+    /// lost minutes of DFT when its P reference did not solve and this removed the unfitted
+    /// state), or removes `path` (nothing held); the error message on failure.
     pub(super) fn save_model_to(&mut self, path: &std::path::Path) -> Result<bool, String> {
         let Some(s) = trainable(&mut self.dy) else { return Ok(false) };
-        if s.fitted() {
+        if s.fitted() || s.samples() > 0 {
             s.save(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
             Ok(true)
         } else {

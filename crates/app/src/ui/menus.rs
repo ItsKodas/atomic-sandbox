@@ -315,6 +315,13 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                     acts.push(Action::LoadScene { sidecar: true });
                 }
             }
+            super::SceneSource::Built(_) => {
+                if let Some(h) = st.builder.last_replace.clone() {
+                    if probed("reset", ui.button("Reset")).on_hover_text("the molecule builder's geometry again, unrelaxed (pauses; time restarts)").clicked() {
+                        acts.push(Action::Builder(crate::builder::Handoff { relax: false, ..h }));
+                    }
+                }
+            }
         }
     });
 }
@@ -332,6 +339,10 @@ fn file_windows(ui: &mut Ui, st: &mut UiState) {
     }
     if ui.add(Button::new(RichText::new("Save…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("save the scene, the model, or both").clicked() {
         super::files::open_save(st);
+        ui.close();
+    }
+    if ui.add(Button::new(RichText::new("Builder…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("the molecule builder: sketch a structural formula and put it into the scene (Replace or Insert)").clicked() {
+        crate::builder::ui::open(st);
         ui.close();
     }
     ui.separator();
@@ -1043,6 +1054,17 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         theme::note(ui, format!("Also in the toolbar. Above {DT_WARN_FS} fs the field turns amber and the warning appears in Readouts."));
     });
     ui.separator();
+    // the toolbar's Rewind before 2026-10-20: time reversal (the Rewind button now returns to the Play snapshot)
+    anchored(ui, st, "m-reverse", |ui, _| {
+        ui.horizontal(|ui| {
+            theme::section(ui, "Time reversal");
+            theme::info(ui, REVERSE_TIP);
+        });
+        if probed("reverse-velocities", ui.button("Reverse velocities")).on_hover_text(REVERSE_TIP).clicked() {
+            acts.push(Action::ReverseVelocities);
+        }
+    });
+    ui.separator();
     anchored(ui, st, "m-drag", |ui, st| drag_controls(ui, st, acts));
     ui.separator();
     // Q1 of Appendix B (M5b): draft mode.
@@ -1084,6 +1106,9 @@ fn relax_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
         }
     }
 }
+
+/// Physics ▸ Reverse velocities' tooltip.
+pub const REVERSE_TIP: &str = "reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself. To go back to when you pressed Play, use Rewind in the toolbar";
 
 /// The drag pull's tooltip (Physics ▸ Drag pull, the Select tool, the cursor label's meaning).
 pub const DRAG_TIP: &str = "how hard a drag pulls while playing: the spring's force cap. The wheel while dragging an atom (Select tool) sets it, ×1.25 per notch, 0.01–1 Ha/Bohr; it stays for the next drag. Stronger pulls tear bonds faster and heat the molecule more (all of it booked as tool work); the spring's stiffness and damping, and dt, never change";
@@ -1162,7 +1187,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Place an atom", "tool Place (or pick an element chip), left-click: it lands on the camera's focus plane (the blue placement grid)"),
     ("Move an atom", "tool Select, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring whose force is capped at the pull — 0.1 Ha/Bohr by default; the wheel while dragging sets it (×1.25 per notch, 0.01–1 Ha/Bohr, shown next to the cursor; Physics ▸ Drag pull resets it) — the orange ring marks the target. Targets and placements stay at least 3 grid steps inside the cell; faint lines show distances to nearby atoms in Bohr and Å"),
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
-    ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
+    ("Time", "Step advances one time step; Rewind goes back to when you last pressed Play (each Play keeps a snapshot of the scene, velocities and settings; right-click or ▾ for the last five; the estimated model is not rolled back); Physics ▸ Reverse velocities flips every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
     ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–18 can be placed (Z > 10 run on a generated pseudopotential, or are refused with a reason), heavier elements need the next pseudopotential stage (ONCV, semicore); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
     ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force. Bond angles: an arc and a degree label between each pair of drawn bonds at an atom (more than three bonds at an atom: select or hover it)"),

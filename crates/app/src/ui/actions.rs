@@ -23,8 +23,10 @@ pub enum Action {
     Pause,
     /// Pause and advance one time step.
     Step,
-    /// v → −v.
-    Rewind,
+    /// Physics ▸ Reverse velocities: v → −v (`DynCommand::Rewind`; time reversal).
+    ReverseVelocities,
+    /// The toolbar's Rewind: back to Play snapshot i (0 = the newest; `ui::rewind`).
+    RewindTo(usize),
     /// Steps per tick (the slider, the typed field, the watchable preset). Never dt (rule 8).
     SetSpeed(u32),
     /// The time step (fs).
@@ -99,6 +101,9 @@ pub enum Action {
     /// "Teach around N blockers": a teach-around pass (`DynCommand::StartTeaching`; the surrogate's
     /// "Teaching around the blockers"). Recorded like Sample, not replayable (it solves).
     TeachAroundBlockers,
+    /// The Model tab's Retry when no model formed (`DynCommand::RetryFit`: re-solves a missing
+    /// isolated-atom reference, or refits). Recorded like Sample, not replayable (it solves).
+    RetryFit,
     /// The automatic first pass's "Start anyway" with the plan it offered.
     StartOffered(SamplingPlan),
     /// "Forget it and sample this scene" (after a refused autoload).
@@ -181,25 +186,43 @@ pub enum Action {
     SetupPyscf,
     /// Stop the setup at its current step.
     CancelSetup,
+    /// The molecule builder's Replace scene / Insert into scene (`crate::builder`, spec §6): the
+    /// built nuclei as `SetScene` or `AddNucleus` + `SetCharge`, the enlarged grid first when one was
+    /// accepted, then Relax. Recorded as `# not replayable: builder` (a script does not carry the
+    /// drawing).
+    Builder(crate::builder::Handoff),
+    /// The capture's Screenshot button (`crate::capture`; display only, writes a file — not
+    /// replayable).
+    Screenshot,
+    /// The capture's Record (true) / Stop (false) button (display only, not replayable).
+    Record(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
 pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
-        Action::TogglePlay => out.toggle_play = true,
+        Action::TogglePlay => {
+            if starts_play(st, input) {
+                super::rewind::take(st, input);
+            }
+            out.toggle_play = true;
+        }
         Action::Play => {
             // estimated with no model: nothing to play on (the viewer's toggle refuses the same)
-            let no_model = st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling();
-            if no_model {
+            if no_model(st, input) {
                 out.error = Some("the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into());
             } else {
+                if starts_play(st, input) {
+                    super::rewind::take(st, input);
+                }
                 out.commands.push(dyn_(DynCommand::Play));
             }
         }
         Action::Pause => out.commands.push(dyn_(DynCommand::Pause)),
         Action::Step => out.commands.push(dyn_(DynCommand::Step(1))),
-        Action::Rewind => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::ReverseVelocities => out.commands.push(dyn_(DynCommand::Rewind)),
+        Action::RewindTo(i) => super::rewind::restore(st, i, out),
         Action::SetSpeed(n) => {
             st.speed = n;
             out.commands.push(dyn_(DynCommand::SetSpeed(n)));
@@ -446,6 +469,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::CancelSampling => out.commands.push(dyn_(DynCommand::CancelSampling)),
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
+        Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
         Action::SampleAfterRefusal => {
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
@@ -570,6 +594,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::ColourBlend { additive } => st.colour_additive = additive,
+        Action::Builder(h) => builder_hand_off(st, input, h, out),
         Action::ColourScale { physical } => {
             st.colour_physical = physical;
             if st.show == ShowMode::Coloured {
@@ -577,11 +602,69 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::WarpFields(on) => st.warp_fields = on,
+        Action::Screenshot => out.capture = Some(crate::capture::Request::Screenshot),
+        Action::Record(on) => out.capture = Some(if on { crate::capture::Request::StartRecording } else { crate::capture::Request::StopRecording }),
         Action::ColourLook(look) => {
             st.colour_look = look;
             if st.show == ShowMode::Coloured {
                 send_orbital_view(st, out);
             }
+        }
+    }
+}
+
+/// The molecule builder's hand-off (spec §6). Replace: a new scene of the built nuclei with the
+/// drawing's charge, multiplicity auto, σ and the ionic policy kept (the grid too, unless enlarged);
+/// the walls follow an enlarged cell. Insert: the enlarged grid first, then one `AddNucleus` per
+/// atom and one `SetCharge` with the new total. Both pass the GPU memory guard first; Relax after
+/// is refused during a sampling pass like the button.
+fn builder_hand_off(st: &mut UiState, input: &PanelInput<'_>, h: crate::builder::Handoff, out: &mut PanelOutput) {
+    use crate::scene::SceneNucleus;
+    let now = (input.scene.grid_n, input.scene.grid_h);
+    let enlarged = h.grid.filter(|&g| g != now);
+    let what = format!("{} ({} atom{})", h.label, h.nuclei.len(), if h.nuclei.len() == 1 { "" } else { "s" });
+    if h.replace {
+        let s = crate::builder::replace_scene(input.scene, &h);
+        if let Err(e) = vram_check(st, &s) {
+            out.error = Some(e);
+            return;
+        }
+        st.source = super::SceneSource::Built(h.label.clone());
+        st.adopt(&s);
+        if enlarged.is_some() {
+            st.wall_half_width = super::default_wall_half_width(&s);
+        }
+        out.commands.push(Command::SetScene(s));
+        if st.walls_on {
+            out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+        }
+        st.builder.last_replace = Some(h.clone());
+        st.set_status(format!("the builder replaced the scene with {what}"));
+    } else {
+        let (n, gh) = enlarged.unwrap_or(now);
+        let mut s = Scene { grid_n: n, grid_h: gh, charge: input.scene.charge + h.charge, ..input.scene.clone() };
+        s.nuclei.extend(h.nuclei.iter().map(|&(z, pos)| SceneNucleus { z, a: None, pos, vel: [0.0; 3] }));
+        if let Err(e) = vram_check(st, &s) {
+            out.error = Some(e);
+            return;
+        }
+        if enlarged.is_some() {
+            (st.grid_n, st.grid_h) = (n, gh);
+            st.box_len = (n as f64 - 1.0) * gh;
+            out.commands.push(Command::SetGrid { n, h: gh });
+            if st.walls_on {
+                st.wall_half_width = super::default_wall_half_width(&s);
+                out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+            }
+        }
+        out.commands.extend(crate::builder::insert_commands(input.scene, &h));
+        st.set_status(format!("the builder inserted {what} into the scene"));
+    }
+    if h.relax {
+        if input.sampling() {
+            st.set_status(super::RELAX_REFUSED_SAMPLING);
+        } else {
+            out.commands.push(Command::Dyn(DynCommand::Relax));
         }
     }
 }
@@ -701,7 +784,9 @@ impl Action {
             Play => "play".into(),
             Pause => "pause".into(),
             Step => "step".into(),
-            Rewind => "rewind".into(),
+            ReverseVelocities => "reverse-velocities".into(),
+            RewindTo(0) => "rewind".into(),
+            RewindTo(i) => format!("rewind {i}"),
             SetSpeed(n) => format!("speed {n}"),
             SetDt(dt) => format!("dt {dt}"),
             Tool(m) => format!("tool {}", tool_word(*m)),
@@ -770,7 +855,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | CompareReference { .. } | SetupPyscf | CancelSetup => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 
@@ -794,14 +879,14 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
+            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
                     "play" => Play,
                     "pause" => Pause,
                     "step" => Step,
-                    "rewind" => Rewind,
+                    "reverse-velocities" => ReverseVelocities,
                     "deselect" => Deselect,
                     "focus" => Focus,
                     "forget" => Forget,
@@ -813,6 +898,11 @@ impl Action {
                     _ => StopRelax,
                 }
             }
+            "rewind" => match args {
+                [] => RewindTo(0),
+                [i] => RewindTo(num(head, i)?),
+                _ => return Err(format!("action rewind takes 0 or 1 arguments (the snapshot, 0 = the newest), got {}", args.len())),
+            },
             "speed" => {
                 want(1)?;
                 SetSpeed(num(head, args[0])?)
@@ -1164,7 +1254,18 @@ fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path)
 
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the
 /// backend's solver count and the budget): refused before the worker allocates anything.
-fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
+/// The estimated solver with no fitted model and no pass that will make one: nothing to play on.
+fn no_model(st: &UiState, input: &PanelInput<'_>) -> bool {
+    st.backend == Backend::Estimated && !input.model().is_some_and(|m| m.fitted) && !input.sampling()
+}
+
+/// Play from paused that the driver will run (not during a pass or a relax, which refuse it): the
+/// moment a Play snapshot is taken (`ui::rewind`).
+fn starts_play(st: &UiState, input: &PanelInput<'_>) -> bool {
+    !input.playing && !no_model(st, input) && !input.sampling() && !input.relaxing()
+}
+
+pub(super) fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
     crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget())
 }
 

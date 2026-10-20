@@ -901,13 +901,25 @@ pub trait Trainable {
     /// Drops the model, its samples and references (a running pass is cancelled without a refit;
     /// the reference cache survives): the provider is a pass-through to its teacher again. Noted.
     fn forget(&mut self);
-    /// Writes the full model file (the `.model` sidecar). `InvalidInput` with nothing fitted.
+    /// Writes the full model file (the `.model` sidecar) — or, before any fit formed, the samples
+    /// taught so far (a samples-only file, `surrogate::sidecar` version 6: a first fit that never
+    /// formed must not lose minutes of DFT). `InvalidInput` with no samples at all.
     fn save(&self, path: &std::path::Path) -> std::io::Result<()>;
     /// Reads a model file and installs it if it was taught on `scene`'s Kohn-Sham surface (grid,
     /// h, σ, charge, multiplicity, teacher and tolerance); `Err` with the message for the user
     /// otherwise (a provenance refusal is noted too) and nothing changes. Refused while a pass
-    /// runs.
+    /// runs. A samples-only file installs its samples and refits when it can; when it cannot (a
+    /// reference missing, too few samples) they are kept unfitted and
+    /// [`TrainableStatus::no_model`] says why.
     fn load(&mut self, path: &std::path::Path, scene: &Scene) -> Result<(), String>;
+    /// The Retry of a model whose fit did not form ([`TrainableStatus::no_model`]): `Ok(true)` when
+    /// it started a pass that re-solves the missing isolated-atom references on `scene` (driven by
+    /// `pass_step` like any pass, refitted at its end; `refs` seeds its cache), `Ok(false)` when it
+    /// refitted at once, `Err` with the reason when neither can help (too few samples: sample more).
+    /// The default refits.
+    fn retry_fit(&mut self, _scene: &Scene, _refs: &mut AtomReferences) -> Result<bool, String> {
+        self.refit().map(|_| false)
+    }
     /// The teacher, for work the model must not see (the pass's solves, the reference atoms).
     fn teacher_mut(&mut self) -> &mut dyn ForceProvider;
     /// The readouts at `scene` (whose settings the model's provenance is compared with) and the
@@ -1080,6 +1092,12 @@ pub struct TrainableStatus {
     /// What a teach-around pass would do now (`providers::surrogate`, "Teaching around the
     /// blockers"): `None` when no class is blocked by teachable samples.
     pub teach_offer: Option<TeachOffer>,
+    /// Samples are held but no model formed, in plain words for the Model and Activity tabs ("no
+    /// model yet: the P atom reference did not solve …"); `None` with a model or without samples.
+    pub no_model: Option<String>,
+    /// [`Trainable::retry_fit`] can help now (a missing reference to re-solve, or enough samples
+    /// for a fit that failed or is pending); false while a pass runs or when only more samples can.
+    pub retry_fit: bool,
 }
 
 /// A teach-around offer (`TrainableStatus::teach_offer`).

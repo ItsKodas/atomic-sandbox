@@ -1424,6 +1424,47 @@ fn a_worker_shut_down_before_ensure_model_leaves_the_autosave_alone() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The 2026-10-20 PH₃ data loss: samples taught before any fit formed survive the session
+/// autosave. An estimated worker that owns the autosave (`EnsureModel` with nothing to load, no
+/// automatic pass) and holds unfitted DFT answers — the construction's first evaluation and a
+/// teleport's, kept by rule 1 — writes them at shutdown as a samples-only file instead of
+/// removing it; the next worker's autoload brings them back, still unfitted, with the reason.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn the_autosave_keeps_samples_taught_before_a_fit_formed() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let path = std::env::temp_dir().join(format!("atomic-sandbox-test-{}-unfitted.model", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx.clone()), Vec::new(), Some(path.clone()));
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan(), auto_pass: false });
+    let s = teleport_h2(&w, 1.5);
+    let held = model(&s).samples;
+    assert!(held >= 2, "the DFT answers (the first evaluation, the teleport) are kept without a model: {held}");
+    assert!(!model(&s).fitted);
+    let why = model(&s).no_model.clone().expect("samples without a model say why");
+    eprintln!("unfitted: {why}");
+    assert!(why.contains("H atom reference is not solved yet") && why.contains("sample more"), "{why}");
+    assert!(!model(&s).retry_fit, "too few samples: a pass, not the Retry, is the remedy");
+    assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
+    let bytes = std::fs::read(&path).expect("the autosave was written, not removed");
+    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V6, "a samples-only file");
+    // the next worker restores them
+    let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx), Vec::new(), Some(path.clone()));
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan(), auto_pass: false });
+    let s = snapshot_until(&w, "the restored samples", |s| !s.working && s.commands >= 1 && model(s).samples == held);
+    assert_eq!(model(&s).samples, held, "the autosaved samples replace the new worker's own first answer");
+    assert!(!model(&s).fitted && model(&s).no_model.is_some());
+    assert!(model(&s).autoload_refused.is_none());
+    drop(w);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Plays (speed 1: one step per snapshot) until `steps` more steps have run; the snapshots.
 fn play_steps(w: &SimWorker, steps: u64) -> Vec<Snapshot> {
     let s0 = snapshot_until(w, "a playing step", |s| !s.dynamics.paused && s.dynamics.step > 0);

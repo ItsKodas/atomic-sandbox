@@ -25,6 +25,13 @@ pub enum Icon {
     ChevronLeft,
     ChevronRight,
     Search,
+    /// A camera (the capture's Screenshot).
+    Camera,
+    /// A filled dot (Record) and a filled square (Stop).
+    Record,
+    Stop,
+    /// Three sliders (the capture's quick settings).
+    Sliders,
 }
 
 /// Paints `icon` into `rect` in `colour`.
@@ -140,6 +147,22 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
         Icon::Search => {
             p.circle_stroke(at(11.0, 11.0), 6.0 * s, stroke);
             line(&[(15.5, 15.5), (20.0, 20.0)]);
+        }
+        Icon::Camera => {
+            closed(&[(3.5, 8.0), (8.0, 8.0), (9.5, 5.5), (14.5, 5.5), (16.0, 8.0), (20.5, 8.0), (20.5, 19.0), (3.5, 19.0)]);
+            p.circle_stroke(at(12.0, 13.2), 3.6 * s, stroke);
+        }
+        Icon::Record => {
+            p.circle_filled(at(12.0, 12.0), 6.5 * s, colour);
+        }
+        Icon::Stop => {
+            p.rect_filled(Rect::from_min_max(at(6.5, 6.5), at(17.5, 17.5)), 1.5 * s, colour);
+        }
+        Icon::Sliders => {
+            for (y, knob) in [(6.0, 15.0), (12.0, 8.0), (18.0, 13.0)] {
+                line(&[(4.0, y), (20.0, y)]);
+                p.circle_filled(at(knob, y), 2.4 * s, colour);
+            }
         }
     }
 }

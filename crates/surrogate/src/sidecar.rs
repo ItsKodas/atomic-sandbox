@@ -125,6 +125,21 @@
 //! complete; versions 1 to 4 are still read as before, and a version-4 file that holds a
 //! shell-check case is refused by the `pair` rule (it cannot have one).
 //!
+//! **Version 6** (samples without a fit, 2026-10-20: a PH₃ session whose first fit never formed —
+//! its P reference did not solve — could not be saved, and the session autosave deleted the
+//! minutes of DFT it had taught): written only by [`write_samples`], only when there is no fitted
+//! model; a fitted model is still written as version 5, byte for byte as before. The header keeps
+//! `format`, `created_by`, `provenance` (as version 5), `reference_rule`, `samples`, `arrays` and the
+//! optional `teacher_solves`, and adds `references` — [[Z, E], …], the isolated-atom energies the
+//! writer had (Hartree, strictly ascending Z; a species without one is absent: what a failed
+//! reference leaves). There is no `basis`, `model`, `fit`, `accumulator` or `failed_audits` key
+//! (nothing was fitted, so nothing was audited). The arrays are the sample ones only, in the same
+//! order and with the same optional tail:
+//! `sample_atoms, sample_tag, sample_weight, sample_energy, sample_z, sample_pos, sample_forces`
+//! [, `sample_quarantine`] [, `sample_face_density`]. [`read`] refuses a version-6 file (it has no
+//! model); [`read_any`] reads every version; [`read_provenance`] reads its header like any other.
+//! A build older than version 6 refuses it as "newer than this build" — never misreads it.
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
@@ -154,6 +169,9 @@ pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
 pub const MAGIC_V4: &[u8; 8] = b"ASMODEL4";
 /// The first eight bytes of a version-5 file (the shell fence's species pair; what this build writes).
 pub const MAGIC_V5: &[u8; 8] = b"ASMODEL5";
+/// The first eight bytes of a version-6 file: training samples without a fit ([`write_samples`];
+/// module doc, "Version 6").
+pub const MAGIC_V6: &[u8; 8] = b"ASMODEL6";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -188,6 +206,34 @@ pub struct Sidecar {
     pub teacher_solves_note: Option<String>,
     /// The failed audits the writer still held (header key "failed_audits"; empty when absent).
     pub failed_audits: Vec<AuditCase>,
+}
+
+/// What a version-6 file holds: training samples taught before any fit formed (module doc,
+/// "Version 6").
+#[derive(Clone, Debug)]
+pub struct SampleSet {
+    /// The settings the samples were produced at (the store's).
+    pub provenance: Provenance,
+    pub samples: Vec<Sample>,
+    /// Isolated-atom energies the writer had, (Z, Hartree), strictly ascending Z; a species
+    /// without one (a reference that did not solve) is absent.
+    pub references: Vec<(u8, f64)>,
+    /// How `references` were made ([`REFERENCE_RULE`] or `None`).
+    pub reference_rule: Option<String>,
+    /// As [`Sidecar::quarantine`].
+    pub quarantine: Vec<u8>,
+    /// As [`Sidecar::face_density`].
+    pub face_density: Vec<f64>,
+    pub teacher_solves: Option<TeacherSolves>,
+    pub teacher_solves_note: Option<String>,
+    pub created_by: String,
+}
+
+/// Any sidecar: a fitted model (versions 1 to 5) or samples without a fit (version 6).
+#[derive(Clone, Debug)]
+pub enum Contents {
+    Fitted(Box<Sidecar>),
+    Samples(SampleSet),
 }
 
 /// One failed audit carried by the file (header key "failed_audits"; module doc): the audited
@@ -279,11 +325,37 @@ pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, rep
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
     let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits)?;
+    write_atomic(path, &bytes)
+}
+
+/// Writes a version-6 file (module doc, "Version 6"): training samples without a fit, through a
+/// temporary file renamed into place like [`write_full_with_audits`]. `InvalidInput` for an empty
+/// set, flags of the wrong length, or references that are not finite and strictly ascending in Z.
+pub fn write_samples(path: &Path, set: &SampleSet) -> io::Result<()> {
+    let bytes = encode_samples(set)?;
+    write_atomic(path, &bytes)
+}
+
+/// Reads any sidecar (module doc): a fitted model, or a version-6 set of samples without a fit.
+pub fn read_any(path: &Path) -> io::Result<Contents> {
+    let bytes = std::fs::read(path)?;
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let version = parse_header(&bytes).map_err(invalid)?.0;
+    if version == 6 {
+        decode_samples_file(&bytes).map(Contents::Samples).map_err(invalid)
+    } else {
+        decode(&bytes).map(|s| Contents::Fitted(Box::new(s))).map_err(invalid)
+    }
+}
+
+/// `bytes` to `path` through `<name>.tmp` renamed into place (a failed write never leaves a
+/// truncated file behind).
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -400,22 +472,11 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             return Err(invalid_input(format!("sidecar: {name} has {len} entries, expected {want}")));
         }
     }
-    for (i, smp) in samples.iter().enumerate() {
-        if smp.pos.len() != smp.z.len() || smp.pos.len() != smp.forces.len() || smp.pos.is_empty() {
-            return Err(invalid_input(format!("sidecar: sample {i} has inconsistent shapes")));
-        }
-    }
+    let [s_atoms, s_tag, s_weight, s_energy, s_z, s_pos, s_forces] = sample_arrays(samples)?;
 
     // arrays, in format order
     let coeffs: Vec<f64> = model.coeffs.iter().flatten().copied().collect();
     let chol: &[f64] = model.sigma_inv_chol.as_deref().unwrap_or(&[]);
-    let s_atoms: Vec<f64> = samples.iter().map(|x| x.pos.len() as f64).collect();
-    let s_tag: Vec<f64> = samples.iter().map(|x| tag_code(x.tag)).collect();
-    let s_weight: Vec<f64> = samples.iter().map(|x| x.weight).collect();
-    let s_energy: Vec<f64> = samples.iter().map(|x| x.energy).collect();
-    let s_z: Vec<f64> = samples.iter().flat_map(|x| x.z.iter().map(|&z| z as f64)).collect();
-    let s_pos: Vec<f64> = samples.iter().flat_map(|x| x.pos.iter().flatten().copied()).collect();
-    let s_forces: Vec<f64> = samples.iter().flat_map(|x| x.forces.iter().flatten().copied()).collect();
     let terms: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
     // the compensated totals (`Accumulator::sums`; read back with a zero compensation)
     let sums = acc.sums();
@@ -445,29 +506,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     if body3 {
         arrays.push(("body3_terms", &terms));
     }
-    if let Some(&q) = quarantine.iter().find(|&&q| q > 3) {
-        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2 or 3)")));
-    }
-    let q_flags: Vec<f64> = quarantine.iter().map(|&q| q as f64).collect();
-    if quarantine.iter().any(|&q| q != 0) {
-        arrays.push(("sample_quarantine", &q_flags));
-    }
-    if !face_density.is_empty() {
-        arrays.push(("sample_face_density", face_density));
-    }
+    let q_flags = quarantine_values(quarantine)?;
+    push_sample_tail(&mut arrays, &q_flags, face_density);
 
-    let pr = &model.provenance;
-    let provenance = obj(&[
-        ("grid_n", pr.grid_n.to_string()),
-        ("h", num(pr.h)),
-        ("sigma", num(pr.sigma)),
-        ("tol", num(pr.tol)),
-        ("charge", pr.charge.to_string()),
-        ("multiplicity", pr.multiplicity.map_or("null".into(), |m| m.to_string())),
-        ("teacher", string(&pr.teacher)),
-        ("ionic", string(&pr.ionic)),
-        ("masses", format!("[{}]", pr.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","))),
-    ]);
+    let provenance = provenance_json(&model.provenance);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
     let basis_json = obj(&[
         ("n_max", basis.n_max.to_string()),
@@ -518,10 +560,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("energy_per_atom", acc.energy_per_atom.map_or("null".into(), |b| b.to_string())),
         ("envelope_count", format!("[{}]", env.count.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","))),
     ]);
-    let arrays_json = format!(
-        "[{}]",
-        arrays.iter().map(|(n, a)| format!("[{},{}]", string(n), a.len())).collect::<Vec<_>>().join(",")
-    );
+    let arrays_json = arrays_json(&arrays);
     let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
         ("created_by", string(CREATED_BY)),
@@ -538,17 +577,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     ];
     // optional (module doc): absent, the header is byte-identical to the older writer's
     if let Some(t) = solves {
-        pairs.push((
-            "teacher_solves",
-            obj(&[
-                ("pass", t.pass.to_string()),
-                ("fallback", t.fallback.to_string()),
-                ("audit", t.audit.to_string()),
-                ("verification", t.verification.to_string()),
-                ("kept", t.kept.to_string()),
-                ("complete", t.complete.to_string()),
-            ]),
-        ));
+        pairs.push(("teacher_solves", solves_json(t)));
     }
     if !audits.is_empty() {
         for a in audits {
@@ -585,8 +614,11 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             .collect();
         pairs.push(("failed_audits", format!("[{}]", list.join(","))));
     }
-    let header = obj(&pairs);
+    Ok(assemble(magic, &obj(&pairs), &arrays))
+}
 
+/// The file's bytes: magic, header length, header, then each array as its length and values.
+fn assemble(magic: &[u8; 8], header: &str, arrays: &[(&str, &[f64])]) -> Vec<u8> {
     let body: usize = arrays.iter().map(|(_, a)| 8 + 8 * a.len()).sum();
     let mut out = Vec::with_capacity(16 + header.len() + body);
     out.extend_from_slice(magic);
@@ -594,11 +626,124 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     out.extend_from_slice(header.as_bytes());
     for (_, a) in arrays {
         out.extend_from_slice(&(a.len() as u64).to_le_bytes());
-        for x in a {
+        for x in *a {
             out.extend_from_slice(&x.to_le_bytes());
         }
     }
-    Ok(out)
+    out
+}
+
+/// The header's `arrays` list, [[name, length], …].
+fn arrays_json(arrays: &[(&str, &[f64])]) -> String {
+    format!("[{}]", arrays.iter().map(|(n, a)| format!("[{},{}]", string(n), a.len())).collect::<Vec<_>>().join(","))
+}
+
+/// The seven per-sample arrays in format order (atoms, tag, weight, energy, z, pos, forces);
+/// `InvalidInput` for a sample whose shapes disagree or that has no atoms.
+fn sample_arrays(samples: &[Sample]) -> io::Result<[Vec<f64>; 7]> {
+    for (i, smp) in samples.iter().enumerate() {
+        if smp.pos.len() != smp.z.len() || smp.pos.len() != smp.forces.len() || smp.pos.is_empty() {
+            return Err(invalid_input(format!("sidecar: sample {i} has inconsistent shapes")));
+        }
+    }
+    Ok([
+        samples.iter().map(|x| x.pos.len() as f64).collect(),
+        samples.iter().map(|x| tag_code(x.tag)).collect(),
+        samples.iter().map(|x| x.weight).collect(),
+        samples.iter().map(|x| x.energy).collect(),
+        samples.iter().flat_map(|x| x.z.iter().map(|&z| z as f64)).collect(),
+        samples.iter().flat_map(|x| x.pos.iter().flatten().copied()).collect(),
+        samples.iter().flat_map(|x| x.forces.iter().flatten().copied()).collect(),
+    ])
+}
+
+/// The quarantine codes as array values (checked 0 to 3).
+fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
+    if let Some(&q) = quarantine.iter().find(|&&q| q > 3) {
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2 or 3)")));
+    }
+    Ok(quarantine.iter().map(|&q| q as f64).collect())
+}
+
+/// The optional sample tail (module doc): the quarantine flags when one is set, then the face
+/// densities when given.
+fn push_sample_tail<'a>(arrays: &mut Vec<(&'a str, &'a [f64])>, q_flags: &'a [f64], face_density: &'a [f64]) {
+    if q_flags.iter().any(|&q| q != 0.0) {
+        arrays.push(("sample_quarantine", q_flags));
+    }
+    if !face_density.is_empty() {
+        arrays.push(("sample_face_density", face_density));
+    }
+}
+
+/// The header's `provenance` object.
+fn provenance_json(pr: &Provenance) -> String {
+    obj(&[
+        ("grid_n", pr.grid_n.to_string()),
+        ("h", num(pr.h)),
+        ("sigma", num(pr.sigma)),
+        ("tol", num(pr.tol)),
+        ("charge", pr.charge.to_string()),
+        ("multiplicity", pr.multiplicity.map_or("null".into(), |m| m.to_string())),
+        ("teacher", string(&pr.teacher)),
+        ("ionic", string(&pr.ionic)),
+        ("masses", format!("[{}]", pr.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","))),
+    ])
+}
+
+/// The optional `teacher_solves` record.
+fn solves_json(t: &TeacherSolves) -> String {
+    obj(&[
+        ("pass", t.pass.to_string()),
+        ("fallback", t.fallback.to_string()),
+        ("audit", t.audit.to_string()),
+        ("verification", t.verification.to_string()),
+        ("kept", t.kept.to_string()),
+        ("complete", t.complete.to_string()),
+    ])
+}
+
+/// A version-6 file's bytes (module doc, "Version 6").
+fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
+    let n = set.samples.len();
+    if n == 0 {
+        return Err(invalid_input("sidecar: a samples-only file needs at least one sample".into()));
+    }
+    if !set.quarantine.is_empty() && set.quarantine.len() != n {
+        return Err(invalid_input(format!("sidecar: {} quarantine flags for {n} samples", set.quarantine.len())));
+    }
+    if !set.face_density.is_empty() && set.face_density.len() != n {
+        return Err(invalid_input(format!("sidecar: {} face densities for {n} samples", set.face_density.len())));
+    }
+    if set.references.windows(2).any(|w| w[0].0 >= w[1].0) || set.references.iter().any(|&(z, e)| z == 0 || !e.is_finite()) {
+        return Err(invalid_input("sidecar: references must be finite energies in strictly ascending Z ≥ 1".into()));
+    }
+    let [s_atoms, s_tag, s_weight, s_energy, s_z, s_pos, s_forces] = sample_arrays(&set.samples)?;
+    let mut arrays: Vec<(&str, &[f64])> = vec![
+        ("sample_atoms", &s_atoms),
+        ("sample_tag", &s_tag),
+        ("sample_weight", &s_weight),
+        ("sample_energy", &s_energy),
+        ("sample_z", &s_z),
+        ("sample_pos", &s_pos),
+        ("sample_forces", &s_forces),
+    ];
+    let q_flags = quarantine_values(&set.quarantine)?;
+    push_sample_tail(&mut arrays, &q_flags, &set.face_density);
+    let references = format!("[{}]", set.references.iter().map(|&(z, e)| format!("[{z},{}]", num(e))).collect::<Vec<_>>().join(","));
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("format", string(std::str::from_utf8(MAGIC_V6).expect("ASCII"))),
+        ("created_by", string(CREATED_BY)),
+        ("provenance", provenance_json(&set.provenance)),
+        ("references", references),
+        ("reference_rule", set.reference_rule.as_deref().map_or("null".to_string(), string)),
+        ("samples", n.to_string()),
+        ("arrays", arrays_json(&arrays)),
+    ];
+    if let Some(t) = &set.teacher_solves {
+        pairs.push(("teacher_solves", solves_json(t)));
+    }
+    Ok(assemble(MAGIC_V6, &obj(&pairs), &arrays))
 }
 
 /// `{"k":v,…}` from already-encoded values.
@@ -655,10 +800,11 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         m if m == MAGIC_V3 => 3,
         m if m == MAGIC_V4 => 4,
         m if m == MAGIC_V5 => 5,
+        m if m == MAGIC_V6 => 6,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to 5)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 6)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL5)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL6)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -675,7 +821,8 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         2 => MAGIC_V2,
         3 => MAGIC_V3,
         4 => MAGIC_V4,
-        _ => MAGIC_V5,
+        5 => MAGIC_V5,
+        _ => MAGIC_V6,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
@@ -685,19 +832,12 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
 
 fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let (version, h) = parse_header(bytes)?;
+    if version == 6 {
+        return Err("the file holds training samples without a fitted model (format version 6): there is no model to read".into());
+    }
     let created_by = h.get("created_by")?.str()?.to_string();
-    let reference_rule = match h.get("reference_rule") {
-        Err(_) | Ok(Json::Null) => None,
-        Ok(r) => Some(r.str()?.to_string()),
-    };
-    // optional and lenient (plan review S17): an unreadable record is a note, never a refused file
-    let (teacher_solves, teacher_solves_note) = match h.get("teacher_solves") {
-        Err(_) | Ok(Json::Null) => (None, None),
-        Ok(t) => match decode_teacher_solves(t) {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(format!("the model file's \"teacher_solves\" record is unreadable ({e}); its earlier solves count as unrecorded"))),
-        },
-    };
+    let reference_rule = decode_reference_rule(&h)?;
+    let (teacher_solves, teacher_solves_note) = decode_solves_lenient(&h);
 
     // optional, strict (module doc): a failed audit dropped would loosen trust
     let failed_audits = match h.get("failed_audits") {
@@ -786,15 +926,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let n_stored = h.get("samples")?.usize()?;
 
     // arrays: the header's list must be the format's, with the lengths the basis implies
-    let declared: Vec<(String, usize)> = h
-        .get("arrays")?
-        .arr()?
-        .iter()
-        .map(|e| match e.arr()? {
-            [n, l] => Ok((n.str()?.to_string(), l.usize()?)),
-            _ => Err("arrays entries are [name, length]".to_string()),
-        })
-        .collect::<Result<_, String>>()?;
+    let declared = declared_arrays(&h)?;
     let sp = s * p;
     let mut fixed: Vec<(&str, Option<usize>)> = vec![
         ("coeffs", Some(sp)),
@@ -824,49 +956,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
     // the optional quarantine flags and face densities, in that order (module doc)
-    let extra: Vec<&str> = declared.iter().skip(fixed.len()).map(|(n, _)| n.as_str()).collect();
-    let has_quarantine = extra.first() == Some(&"sample_quarantine");
-    if has_quarantine {
-        fixed.push(("sample_quarantine", Some(n_stored)));
-    }
-    let has_face = extra.get(usize::from(has_quarantine)) == Some(&"sample_face_density");
-    if has_face {
-        fixed.push(("sample_face_density", Some(n_stored)));
-    }
-    if declared.len() != fixed.len() {
-        return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
-    }
-    // `parse_header` bounded the length by the file
-    let header_end = 16 + u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
-    let mut at = header_end;
-    let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(fixed.len());
-    for ((name, len), (want_name, want_len)) in declared.iter().zip(&fixed) {
-        let (want_name, want_len) = (*want_name, *want_len);
-        if name != want_name {
-            return Err(format!("array {name:?} where the format has {want_name:?}"));
-        }
-        if let Some(w) = want_len {
-            if *len != w {
-                return Err(format!("array {name} has {len} entries, the basis implies {w}"));
-            }
-        }
-        let prefix = bytes.get(at..at + 8).ok_or_else(|| format!("file ends before array {name}"))?;
-        let n = u64::from_le_bytes(prefix.try_into().expect("8 bytes"));
-        if n != *len as u64 {
-            return Err(format!("array {name}: length prefix {n} differs from the header's {len}"));
-        }
-        at += 8;
-        let end = len
-            .checked_mul(8)
-            .and_then(|b| b.checked_add(at))
-            .filter(|&e| e <= bytes.len())
-            .ok_or_else(|| format!("file ends inside array {name}"))?;
-        arrays.push(bytes[at..end].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes"))).collect());
-        at = end;
-    }
-    if at != bytes.len() {
-        return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
-    }
+    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let arrays = read_arrays(bytes, &declared, &fixed, version)?;
     let mut it = arrays.into_iter();
     let mut next = || it.next().expect("every declared array read");
     let finite = |name: &str, v: &[f64]| -> Result<(), String> {
@@ -936,6 +1027,170 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
 
     let (atoms, tags, weights, energies) = (next(), next(), next(), next());
     let (zs, pos, forces) = (next(), next(), next());
+    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    if has_terms {
+        let stored = next();
+        let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
+        if stored != expect {
+            let at = stored.iter().zip(&expect).position(|(a, b)| a != b).unwrap_or(0);
+            return Err(format!("body3_terms differ from this build's layout for the basis (first at entry {at}: term {}, field {})", at / 5, at % 5));
+        }
+    }
+    let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
+    let face_density = if has_face { next() } else { Vec::new() };
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits })
+}
+
+/// A version-6 file (module doc, "Version 6").
+fn decode_samples_file(bytes: &[u8]) -> Result<SampleSet, String> {
+    let (version, h) = parse_header(bytes)?;
+    if version != 6 {
+        return Err(format!("format version {version} is not a samples-only file"));
+    }
+    let created_by = h.get("created_by")?.str()?.to_string();
+    let reference_rule = decode_reference_rule(&h)?;
+    let (teacher_solves, teacher_solves_note) = decode_solves_lenient(&h);
+    let provenance = decode_provenance(h.get("provenance")?, version)?;
+    let mut references: Vec<(u8, f64)> = Vec::new();
+    for r in h.get("references")?.arr()? {
+        let (z, e) = match r.arr()? {
+            [z, e] => (z.u64()?, e.f64()?),
+            _ => return Err("references entries are [Z, E]".into()),
+        };
+        let z = u8::try_from(z).ok().filter(|&z| z >= 1).ok_or_else(|| format!("reference Z {z} outside 1..=255"))?;
+        if !e.is_finite() || references.last().is_some_and(|&(p, _)| p >= z) {
+            return Err(format!("reference of Z = {z}: energies must be finite, in strictly ascending Z"));
+        }
+        references.push((z, e));
+    }
+    let n_stored = h.get("samples")?.usize()?;
+    if n_stored == 0 {
+        return Err("a samples-only file without samples".into());
+    }
+    let declared = declared_arrays(&h)?;
+    let mut fixed: Vec<(&str, Option<usize>)> = vec![
+        ("sample_atoms", Some(n_stored)),
+        ("sample_tag", Some(n_stored)),
+        ("sample_weight", Some(n_stored)),
+        ("sample_energy", Some(n_stored)),
+        ("sample_z", None),
+        ("sample_pos", None),
+        ("sample_forces", None),
+    ];
+    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let mut it = read_arrays(bytes, &declared, &fixed, version)?.into_iter();
+    let mut next = || it.next().expect("every declared array read");
+    let (atoms, tags, weights, energies) = (next(), next(), next(), next());
+    let (zs, pos, forces) = (next(), next(), next());
+    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
+    let face_density = if has_face { next() } else { Vec::new() };
+    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, created_by })
+}
+
+/// The header's `reference_rule` (a missing key reads as null).
+fn decode_reference_rule(h: &Json) -> Result<Option<String>, String> {
+    Ok(match h.get("reference_rule") {
+        Err(_) | Ok(Json::Null) => None,
+        Ok(r) => Some(r.str()?.to_string()),
+    })
+}
+
+/// The optional `teacher_solves` record, lenient (plan review S17): an unreadable record is a
+/// note, never a refused file.
+fn decode_solves_lenient(h: &Json) -> (Option<TeacherSolves>, Option<String>) {
+    match h.get("teacher_solves") {
+        Err(_) | Ok(Json::Null) => (None, None),
+        Ok(t) => match decode_teacher_solves(t) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(format!("the model file's \"teacher_solves\" record is unreadable ({e}); its earlier solves count as unrecorded"))),
+        },
+    }
+}
+
+/// The header's `arrays` list as (name, length).
+fn declared_arrays(h: &Json) -> Result<Vec<(String, usize)>, String> {
+    h.get("arrays")?
+        .arr()?
+        .iter()
+        .map(|e| match e.arr()? {
+            [n, l] => Ok((n.str()?.to_string(), l.usize()?)),
+            _ => Err("arrays entries are [name, length]".to_string()),
+        })
+        .collect()
+}
+
+/// The optional quarantine flags and face densities after the `fixed` arrays, in that order
+/// (module doc): appended to `fixed` when declared; (quarantine present, face densities present).
+fn sample_tail(declared: &[(String, usize)], fixed: &mut Vec<(&str, Option<usize>)>, n_stored: usize) -> (bool, bool) {
+    let extra: Vec<&str> = declared.iter().skip(fixed.len()).map(|(n, _)| n.as_str()).collect();
+    let has_quarantine = extra.first() == Some(&"sample_quarantine");
+    let has_face = extra.get(usize::from(has_quarantine)) == Some(&"sample_face_density");
+    if has_quarantine {
+        fixed.push(("sample_quarantine", Some(n_stored)));
+    }
+    if has_face {
+        fixed.push(("sample_face_density", Some(n_stored)));
+    }
+    (has_quarantine, has_face)
+}
+
+/// The arrays after the header: the declared list must be `fixed` (names in order, lengths where
+/// fixed), each length prefix must match, and nothing may trail the last one.
+fn read_arrays(bytes: &[u8], declared: &[(String, usize)], fixed: &[(&str, Option<usize>)], version: u8) -> Result<Vec<Vec<f64>>, String> {
+    if declared.len() != fixed.len() {
+        return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
+    }
+    // `parse_header` bounded the length by the file
+    let header_end = 16 + u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
+    let mut at = header_end;
+    let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(fixed.len());
+    for ((name, len), (want_name, want_len)) in declared.iter().zip(fixed) {
+        let (want_name, want_len) = (*want_name, *want_len);
+        if name != want_name {
+            return Err(format!("array {name:?} where the format has {want_name:?}"));
+        }
+        if let Some(w) = want_len {
+            if *len != w {
+                return Err(format!("array {name} has {len} entries, the basis implies {w}"));
+            }
+        }
+        let prefix = bytes.get(at..at + 8).ok_or_else(|| format!("file ends before array {name}"))?;
+        let n = u64::from_le_bytes(prefix.try_into().expect("8 bytes"));
+        if n != *len as u64 {
+            return Err(format!("array {name}: length prefix {n} differs from the header's {len}"));
+        }
+        at += 8;
+        let end = len
+            .checked_mul(8)
+            .and_then(|b| b.checked_add(at))
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| format!("file ends inside array {name}"))?;
+        arrays.push(bytes[at..end].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes"))).collect());
+        at = end;
+    }
+    if at != bytes.len() {
+        return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
+    }
+    Ok(arrays)
+}
+
+/// The `sample_quarantine` array's codes (each 0, 1, 2 or 3).
+fn decode_quarantine(v: &[f64]) -> Result<Vec<u8>, String> {
+    v.iter()
+        .enumerate()
+        .map(|(i, &q)| if q == 0.0 || q == 1.0 || q == 2.0 || q == 3.0 { Ok(q as u8) } else { Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2 or 3")) })
+        .collect()
+}
+
+/// The samples from their seven arrays (module doc): every count, code, charge and weight checked.
+fn decode_sample_list(atoms: &[f64], tags: &[f64], weights: &[f64], energies: &[f64], zs: &[f64], pos: &[f64], forces: &[f64]) -> Result<Vec<Sample>, String> {
+    let finite = |name: &str, v: &[f64]| -> Result<(), String> {
+        match v.iter().position(|x| !x.is_finite()) {
+            Some(i) => Err(format!("array {name}[{i}] is not finite")),
+            None => Ok(()),
+        }
+    };
     let integral = |x: f64, lo: f64, hi: f64| x.fract() == 0.0 && x >= lo && x <= hi;
     let mut total = 0usize;
     for (i, &n) in atoms.iter().enumerate() {
@@ -952,9 +1207,9 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             forces.len()
         ));
     }
-    finite("sample_energy", &energies)?;
-    finite("sample_pos", &pos)?;
-    finite("sample_forces", &forces)?;
+    finite("sample_energy", energies)?;
+    finite("sample_pos", pos)?;
+    finite("sample_forces", forces)?;
     let mut samples = Vec::with_capacity(atoms.len());
     let mut k = 0usize;
     for i in 0..atoms.len() {
@@ -975,28 +1230,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             z.push(zz as u8);
         }
         let triples = |v: &[f64]| -> Vec<[f64; 3]> { v[3 * k..3 * (k + n)].chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() };
-        samples.push(Sample { pos: triples(&pos), z, energy: energies[i], forces: triples(&forces), tag: TAGS[tag as usize], weight: w });
+        samples.push(Sample { pos: triples(pos), z, energy: energies[i], forces: triples(forces), tag: TAGS[tag as usize], weight: w });
         k += n;
     }
-    if has_terms {
-        let stored = next();
-        let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
-        if stored != expect {
-            let at = stored.iter().zip(&expect).position(|(a, b)| a != b).unwrap_or(0);
-            return Err(format!("body3_terms differ from this build's layout for the basis (first at entry {at}: term {}, field {})", at / 5, at % 5));
-        }
-    }
-    let mut quarantine = Vec::new();
-    if has_quarantine {
-        for (i, &q) in next().iter().enumerate() {
-            if !(q == 0.0 || q == 1.0 || q == 2.0 || q == 3.0) {
-                return Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2 or 3"));
-            }
-            quarantine.push(q as u8);
-        }
-    }
-    let face_density = if has_face { next() } else { Vec::new() };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits })
+    Ok(samples)
 }
 
 /// One "failed_audits" record (module doc); every field is required inside it.
@@ -1660,6 +1897,65 @@ mod tests {
         }
     }
 
+    /// Version 6 (2026-10-20, the PH₃ data loss): samples without a fit round-trip bit-exactly with
+    /// their flags, partial references and solve record; `read` refuses the file (no model),
+    /// `read_provenance` and `read_any` read it, and a fitted file still reads as `Fitted`.
+    #[test]
+    fn samples_without_a_fit_round_trip_as_version_6() {
+        let orig = random_sidecar(31, false);
+        let n = orig.samples.len();
+        let set = SampleSet {
+            provenance: orig.model.provenance.clone(),
+            samples: orig.samples.clone(),
+            // H solved, P did not: only H's energy is known
+            references: vec![(1, -0.4581234567891)],
+            reference_rule: Some(REFERENCE_RULE.into()),
+            quarantine: (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect(),
+            face_density: (0..n).map(|i| if i % 3 == 0 { f64::NAN } else { 1e-6 * i as f64 }).collect(),
+            teacher_solves: Some(TeacherSolves { pass: 40, fallback: 3, audit: 0, verification: 0, kept: 43, complete: true }),
+            teacher_solves_note: None,
+            created_by: CREATED_BY.into(),
+        };
+        let p = tmp("unfitted-v6.model");
+        write_samples(&p, &set).unwrap();
+        assert_eq!(&std::fs::read(&p).unwrap()[..8], MAGIC_V6);
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!("a samples-only file reads as Samples") };
+        assert_eq!(back.provenance, set.provenance);
+        assert_eq!(back.references.len(), 1);
+        assert_eq!((back.references[0].0, back.references[0].1.to_bits()), (1, set.references[0].1.to_bits()));
+        assert_eq!(back.reference_rule.as_deref(), Some(REFERENCE_RULE));
+        assert_eq!(back.quarantine, set.quarantine);
+        assert_eq!(bits(&back.face_density), bits(&set.face_density));
+        assert_eq!(back.teacher_solves, set.teacher_solves);
+        assert_eq!(back.samples.len(), n);
+        for (a, b) in back.samples.iter().zip(&set.samples) {
+            assert_eq!((a.z.clone(), a.tag, a.weight.to_bits(), a.energy.to_bits()), (b.z.clone(), b.tag, b.weight.to_bits(), b.energy.to_bits()));
+            assert_eq!(bits(&a.pos.concat()), bits(&b.pos.concat()));
+            assert_eq!(bits(&a.forces.concat()), bits(&b.forces.concat()));
+        }
+        assert_eq!(read_provenance(&p).unwrap(), set.provenance);
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("without a fitted model"), "{e}");
+        // nothing optional: no flags, no densities, no references
+        let bare = SampleSet { quarantine: Vec::new(), face_density: Vec::new(), references: Vec::new(), teacher_solves: None, reference_rule: None, ..set.clone() };
+        write_samples(&p, &bare).unwrap();
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
+        assert!(back.quarantine.is_empty() && back.face_density.is_empty() && back.references.is_empty() && back.teacher_solves.is_none());
+        // refused on write: no samples, misshapen flags, unsorted references
+        assert!(write_samples(&p, &SampleSet { samples: Vec::new(), quarantine: Vec::new(), face_density: Vec::new(), ..set.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { quarantine: vec![0; n - 1], ..set.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { references: vec![(15, -6.4), (1, -0.45)], ..set.clone() }).is_err());
+        // a truncated samples-only file is an error, never a panic
+        write_samples(&p, &set).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        std::fs::write(&p, &bytes[..bytes.len() - 5]).unwrap();
+        assert!(read_any(&p).is_err());
+        // a fitted file through `read_any`
+        let q = tmp("fitted-any.model");
+        write(&q, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        assert!(matches!(read_any(&q).unwrap(), Contents::Fitted(_)));
+    }
+
     fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
         let path = tmp(name);
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
@@ -2051,9 +2347,9 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL6".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL7".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 6 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 7 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)

@@ -156,7 +156,7 @@ impl Command {
         match self {
             Command::Dyn(c) => matches!(
                 c,
-                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax
+                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Relax
             ),
             Command::Shutdown
             | Command::SetAudit(_)
@@ -181,7 +181,7 @@ impl Command {
                 | Command::SetSigma(_)
                 | Command::SetIonicPolicy(_)
                 | Command::EnsureModel { .. }
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Relax)
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Relax)
         )
     }
 
@@ -214,6 +214,7 @@ impl Command {
                     | DynCommand::RemoveNucleus(_)
                     | DynCommand::StartSampling(_)
                     | DynCommand::StartTeaching
+                    | DynCommand::RetryFit
                     | DynCommand::CancelSampling
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
@@ -318,7 +319,7 @@ impl Worker {
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's
-                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::LoadModel(_));
+                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
                 if takes_over {
                     self.pass_offer = None;

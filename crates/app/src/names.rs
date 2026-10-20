@@ -132,6 +132,11 @@ pub enum Signature {
     CarbonRing,
     /// The carbons' C–C bonds form no ring (propene, the chain isomer of C₃H₆).
     CarbonChain,
+    /// At least one C–C bond (ethanol and acetic acid, against their isomers dimethyl ether and
+    /// methyl formate, whose carbons are joined only through oxygen).
+    CarbonCarbonBond,
+    /// No C–C bond (dimethyl ether, methyl formate).
+    NoCarbonCarbonBond,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,6 +376,12 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
     (&[(7, 1), (8, 2)], 0, Signature::Any, "nitrogen dioxide"),
     (&[(7, 2), (8, 1)], 0, Signature::Any, "nitrous oxide"),
     (&[(17, 2)], 0, Signature::Any, "dichlorine"),
+    // the molecule builder's success cases (spec 2026-10-20 §1) and their isomers
+    (&[(1, 6), (6, 2), (8, 1)], 0, Signature::CarbonCarbonBond, "ethanol"),
+    (&[(1, 6), (6, 2), (8, 1)], 0, Signature::NoCarbonCarbonBond, "dimethyl ether"),
+    (&[(1, 4), (6, 2), (8, 2)], 0, Signature::CarbonCarbonBond, "acetic acid"),
+    (&[(1, 4), (6, 2), (8, 2)], 0, Signature::NoCarbonCarbonBond, "methyl formate"),
+    (&[(1, 6), (6, 6)], 0, Signature::CarbonRing, "benzene"),
 ];
 
 /// The common name of a composition (each element's count, any order) and charge, from
@@ -445,7 +456,14 @@ fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8
         Signature::CarbonOxygenBond => (0..z.len()).any(|i| z[i] == 6 && adj[i].iter().any(|&j| z[j] == 8)),
         Signature::CarbonRing => carbon_ring(z, adj),
         Signature::CarbonChain => !carbon_ring(z, adj),
+        Signature::CarbonCarbonBond => carbon_carbon_bond(z, adj),
+        Signature::NoCarbonCarbonBond => !carbon_carbon_bond(z, adj),
     }
+}
+
+/// Some C–C bond.
+fn carbon_carbon_bond(z: &[u8], adj: &[Vec<usize>]) -> bool {
+    (0..z.len()).any(|i| z[i] == 6 && adj[i].iter().any(|&j| z[j] == 6))
 }
 
 /// The C–C bonds close a ring: as many of them as carbons or more (the carbons connected, so a
@@ -951,5 +969,23 @@ mod tests {
         assert_eq!(classify(&[2, 1, 1], &[(0, 1), (0, 2)], Some(0)).label(), "HeH₂ — helium dihydride (systematic)");
         assert_eq!(classify(&[1], &[], Some(0)).label(), "H");
         assert_eq!(classify(&[1], &[], Some(0)).tooltip(), "H");
+    }
+
+    /// The molecule builder's success cases (spec 2026-10-20 §1) are named, and their isomers are told
+    /// apart by the C–C bond.
+    #[test]
+    fn ethanol_acetic_acid_and_benzene_are_named_apart_from_their_isomers() {
+        // C0–C1–O2, H's on C0 ×3, C1 ×2, O2 ×1
+        let ethanol = classify(&[6, 6, 8, 1, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (0, 5), (1, 6), (1, 7), (2, 8)], Some(0));
+        assert_eq!(ethanol.label(), "C₂H₆O — ethanol");
+        let ether = classify(&[6, 8, 6, 1, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (0, 5), (2, 6), (2, 7), (2, 8)], Some(0));
+        assert_eq!(ether.label(), "C₂H₆O — dimethyl ether");
+        // CH3–C(=O)–O–H and H–C(=O)–O–CH3
+        let acid = classify(&[6, 6, 8, 8, 1, 1, 1, 1], &[(0, 1), (1, 2), (1, 3), (3, 4), (0, 5), (0, 6), (0, 7)], Some(0));
+        assert_eq!(acid.label(), "C₂H₄O₂ — acetic acid");
+        let formate = classify(&[6, 8, 8, 6, 1, 1, 1, 1], &[(0, 1), (0, 2), (2, 3), (0, 4), (3, 5), (3, 6), (3, 7)], Some(0));
+        assert_eq!(formate.label(), "C₂H₄O₂ — methyl formate");
+        let ring: Vec<(usize, usize)> = (0..6).map(|i| (i, (i + 1) % 6)).chain((0..6).map(|i| (i, i + 6))).collect();
+        assert_eq!(classify(&[6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1], &ring, Some(0)).label(), "C₆H₆ — benzene");
     }
 }
