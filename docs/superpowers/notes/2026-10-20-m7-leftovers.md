@@ -77,7 +77,7 @@ Tests: `pseudo::tests::the_generation_cost_names_the_cpu_gate`,
 `ui::model_offer::tests::the_ionic_row_names_a_cpu_dimer_gate_before_apply`, and the CPU line in
 `ui::tests::the_default_is_accepted_species_and_generation_is_said`.
 
-## Task 13 Step 5 — water under `All`: the angle overlay and the lone pairs — **shot, awaiting the user's verdict**
+## Task 13 Step 5 — water under `All`: the angle overlay and the lone pairs — **verified** (the user's visual verdict, 2026-10-20)
 
 Recorded in `docs/superpowers/notes/2026-10-13-m2-viewer-checklist.md` ("M7 Task 13"). In short:
 
