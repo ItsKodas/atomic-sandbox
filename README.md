@@ -229,6 +229,26 @@ Every equation in the code is hand-written from the literature below; each deriv
 - Drautz, *Phys. Rev. B* 99, 014104 (2019) — the atomic cluster expansion: body-ordered invariants on a species-channelled atomic basis; `crates/surrogate/src/descriptor.rs`.
 - Bishop, *Pattern Recognition and Machine Learning* (Springer 2006), §3.3–3.5 — Bayesian linear regression, the evidence framework and predictive variance; MacKay, *Neural Comput.* 4, 415 (1992) — evidence maximisation for the ridge and noise levels; `crates/surrogate/src/fit.rs`.
 
+**More methods behind the code**
+- Troullier & Martins, *Phys. Rev. B* 43, 1993 (1991) — the norm-conserving pseudopotential construction; Kleinman & Bylander, *Phys. Rev. Lett.* 48, 1425 (1982) — the separable nonlocal form; Louie, Froyen & Cohen, *Phys. Rev. B* 26, 1738 (1982) — the nonlinear core correction; `crates/qm/src/radial/`.
+- Podryabinkin & Shapeev, *Comput. Mater. Sci.* 140, 171 (2017) — active learning with the D-optimality / MaxVol extrapolation grade the estimated solver's rule 5e uses; `crates/surrogate/src/grade.rs`.
+- Neumaier, *ZAMM* 54, 39 (1974) — compensated summation in the energy reductions and the fit's normal equations.
+- Jimenez, "Next Generation Post Processing in Call of Duty: Advanced Warfare" (SIGGRAPH 2014) — the 13-tap downsample of the bloom pass; Quílez, "Smooth minimum" (iquilezles.org) — the polynomial smooth minimum behind the Camera view's smooth surface. Display only.
+
+**Data**
+- NIST Computational Chemistry Comparison and Benchmark Database (CCCBDB) — the experimental geometries of the shipped scenes in `scenes/` and the LSDA reference geometries and frequencies the oracles check against.
+- PubChem (CID 2244) — the 3-D conformer of the aspirin scene.
+- Cordero et al., *Dalton Trans.* 2832 (2008) — covalent radii used **only** by the 2D molecule builder to place a starting geometry (and capping hydrogens), never in the physics (the user's rule-1 sign-off, `docs/superpowers/specs/2026-10-20-molecule-builder-design.md`).
+
+**Prior work and inspiration**
+Interactive quantum chemistry has a history this project builds on in spirit (none of its code is used): Markus Reiher's group at ETH Zürich (haptic, real-time quantum chemistry since 2009; SCINE Sparrow and Heron), Todd Martínez's group at Stanford (ab initio interactive molecular dynamics on GPUs, Luehr, Jin & Martínez, *J. Chem. Theory Comput.* 11, 4536 (2015); InteraChem), and David Glowacki's group (Narupa / NanoVer interactive molecular dynamics in VR). The glowing-dots look of the density view was inspired by the "Quantum-Atom" web simulator. How this project compares, with citations: `reports/Atomic Sandbox novelty check.md`.
+
+**Software**
+Built in Rust on [wgpu](https://github.com/gfx-rs/wgpu) (the GPU), [egui](https://github.com/emilk/egui) with egui-wgpu / egui-winit (the interface), [winit](https://github.com/rust-windowing/winit) (windows), [glam](https://github.com/bitshifter/glam-rs) and [nalgebra](https://nalgebra.org) (vectors and small dense linear algebra), [rand](https://github.com/rust-random/rand), [bytemuck](https://github.com/Lokathor/bytemuck), [pollster](https://github.com/zesterer/pollster), [png](https://github.com/image-rs/image-png), [rfd](https://github.com/PolyMeilex/rfd) (file dialogs), [winresource](https://github.com/BenjaminRi/winresource) and [windows-sys](https://github.com/microsoft/windows-rs) (the Windows icon and window frame). The optional *Compare with reference* panel runs [PySCF](https://pyscf.org) in a separate process when it is installed (nothing of it is linked). Plumbing only — every physics kernel is hand-written (CLAUDE.md rule 2).
+
+**How it was built**
+Designed and directed by Dakoda Lancelot ([ItsKodas](https://github.com/ItsKodas)); the code, derivations and reviews were written with AI assistance (Anthropic's Claude, through Claude Code), with every physics change gated by the validation suites in `crates/validate`.
+
 **Where the physics is documented honestly**
 - Approximation gaps (LSDA vs exact atoms, the smearing shift in vibration frequencies, the water geometry at the default grid, box confinement): [`crates/validate/references.md`](crates/validate/references.md) and the milestone handoff notes in `docs/superpowers/notes/`.
 - Design decisions and the reasoning behind each ruling: `docs/superpowers/specs/` and `docs/superpowers/plans/`.
