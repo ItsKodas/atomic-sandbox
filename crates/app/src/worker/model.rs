@@ -132,6 +132,11 @@ pub struct ModelStatus {
     pub pass_eta_s: Option<f64>,
     /// The automatic first pass is waiting for "Start anyway" ([`PassOffer`]).
     pub pass_offer: Option<PassOffer>,
+    /// Samples are held but no model formed: why, in plain words (`sim::TrainableStatus::no_model`;
+    /// the Model tab's warning and the Activity tab's headline).
+    pub no_model: Option<String>,
+    /// The Retry can help now (`sim::TrainableStatus::retry_fit`): the Model tab's Retry button.
+    pub retry_fit: bool,
 }
 
 /// The box keeps the model untrusted (diag-3h, a user's H₂ + H at the Accurate grid's 12 Bohr cell:
@@ -496,6 +501,8 @@ impl Worker {
             solve_s_measured,
             pass_eta_s,
             pass_offer,
+            no_model: st.no_model,
+            retry_fit: st.retry_fit,
         })
     }
 

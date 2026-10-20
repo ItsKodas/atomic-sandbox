@@ -33,6 +33,7 @@ pub mod model_offer;
 mod overlays;
 pub mod pseudo;
 pub mod ptable;
+mod rewind;
 mod sampling_presets;
 pub mod search;
 pub mod theme;
@@ -707,6 +708,9 @@ pub struct UiState {
     pub help: Option<HelpTopic>,
     /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
     pub activity: activity::ActivityState,
+    /// The Play snapshots, newest first (at most `rewind::KEPT`): the toolbar's Rewind returns to
+    /// one (`ui::rewind`).
+    pub play_snapshots: std::collections::VecDeque<rewind::PlaySnapshot>,
     /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
     pub compare: crate::reference::Compare,
 }
@@ -939,6 +943,7 @@ right {}
             capture_view: Default::default(),
             help: None,
             activity: activity::ActivityState::new(),
+            play_snapshots: std::collections::VecDeque::new(),
             compare: Default::default(),
         }
     }

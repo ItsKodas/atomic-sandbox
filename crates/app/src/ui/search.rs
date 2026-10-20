@@ -39,7 +39,7 @@ pub const ENTRIES: &[Entry] = &[
     // toolbar
     e("Play / Pause", "space run start stop", Toolbar, "tb-time"),
     e("Step", "advance one time step", Toolbar, "tb-time"),
-    e("Rewind", "reverse velocities v to −v", Toolbar, "tb-time"),
+    e("Rewind (to the Play snapshot)", "back undo restore snapshot when I pressed play broke reset", Toolbar, "tb-time"),
     e("Speed (steps per tick)", "slider fast slow", Toolbar, "tb-speed"),
     e("Watchable speed", "preset vibration", Toolbar, "tb-speed"),
     e("Measured fs/s", "rate simulated femtoseconds per second tick", Toolbar, "tb-speed"),
@@ -113,6 +113,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),
     e("Time step dt (Physics menu)", "fs", Menu(M::Physics), "m-dt"),
+    e("Reverse velocities", "time reversal v to −v flip retrace rewind", Menu(M::Physics), "m-reverse"),
     e("Drag pull (drag force)", "pull force strength wheel spring tug drag reset", Menu(M::Physics), "m-drag"),
     e("Draft mode", "guess instead of falling back unsafe estimated", Menu(M::Physics), "m-draft"),
     e("Relax geometry (FIRE)", "minimise optimise relaxation stop", Menu(M::Physics), "m-relax"),

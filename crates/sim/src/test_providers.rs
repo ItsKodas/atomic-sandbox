@@ -391,6 +391,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().status(scene, forces)
     }
 
+    fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
+        self.lock().retry_fit(scene, refs)
+    }
+
     fn fitted(&self) -> bool {
         Trainable::fitted(&*self.lock())
     }

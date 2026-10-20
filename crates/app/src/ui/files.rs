@@ -234,9 +234,10 @@ fn fit(
 /// A Load that changed nothing in this long is over (refused, or its settings card cancelled).
 const LOAD_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// The model in force, as (samples, epoch); `None` without a fitted one.
+/// The model in force, as (samples, epoch); `None` without a fitted one or samples (a samples-only
+/// file loads samples without a model when its fit cannot form).
 fn model_sig(input: &PanelInput<'_>) -> Option<(usize, u64)> {
-    input.model().filter(|m| m.fitted).map(|m| (m.samples, m.epoch))
+    input.model().filter(|m| m.fitted || m.samples > 0).map(|m| (m.samples, m.epoch))
 }
 
 /// Follows a Load in flight to its end, and forgets the loaded file once the model moves on.
@@ -932,7 +933,9 @@ pub fn show_save(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, 
         return;
     }
     let estimated = st.backend == Backend::Estimated;
-    let fitted = estimated && input.model().is_some_and(|m| m.fitted);
+    // a model, or samples taught before one formed (written as a samples-only file)
+    let fitted = estimated && input.model().is_some_and(|m| m.fitted || m.samples > 0);
+    let unfitted = fitted && !input.model().is_some_and(|m| m.fitted);
     if !fitted && st.files.save_kind != SaveKind::Scene {
         st.files.save_kind = SaveKind::Scene; // no model to save
     }
@@ -950,7 +953,7 @@ pub fn show_save(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, 
             ui.set_width(150.0 * 3.0 + 2.0 * 12.0);
             ui.label(RichText::new("Save").size(17.0).strong());
             ui.add_space(8.0);
-            let model_tip = "no fitted model: train one in the Estimated solver first";
+            let model_tip = "no model and no samples: train one in the Estimated solver first";
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let k = st.files.save_kind;
@@ -963,7 +966,12 @@ pub fn show_save(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, 
                 let r = kind_button(ui, k == SaveKind::Model, fitted, "Model", |p, r| {
                     super::icons::paint(p, egui::Rect::from_center_size(r.center(), Vec2::splat(54.0)), super::icons::Icon::Model, theme::ACCENT_INK)
                 });
-                if r.on_hover_text(if fitted { "the estimated solver's model, its fit and its samples" } else { model_tip }).clicked() && fitted {
+                let what = if unfitted {
+                    "no model yet: the samples taught so far (loading the file fits them once a fit can form)"
+                } else {
+                    "the estimated solver's model, its fit and its samples"
+                };
+                if r.on_hover_text(if fitted { what } else { model_tip }).clicked() && fitted {
                     st.files.save_kind = SaveKind::Model;
                 }
                 let r = kind_button(ui, k == SaveKind::Both, fitted, "Both", |p, r| {

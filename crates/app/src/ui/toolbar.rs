@@ -26,7 +26,6 @@ const SPEED_TIP: &str = "time steps attempted per ≈16 ms tick; never changes d
 const RATE_TIP: &str = "simulated femtoseconds per wall second: over the last 2 s of play (what you see), and over the last tick alone (a DFT step and a surrogate tick differ by 10⁴)";
 const SAMPLING_TIP: &str = "a sampling pass is running: the dynamics stay paused until it ends (or Cancel it)";
 const RELAXING_TIP: &str = "relaxing: the dynamics stay paused until the relax ends (or Stop it)";
-const REWIND_TIP: &str = "reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself";
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
 const ORBIT_TIP: &str = "Inspect: look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
@@ -153,7 +152,8 @@ impl Widths {
         let c_rate = rate(&mono, " fs/s");
         let c_solver_row = segs(&[btn("CPU"), btn("GPU"), btn("Est.")]);
         let mut widths = Widths {
-            time: max(&[caps("Time", false), 28.0 + sp + play + sp + 28.0 + sp + relax, kbd + sp + w("play / pause", &sub)]) + PAD,
+            // Rewind, its ▾ (`ui::rewind::button`), Play, Step, Relax
+            time: max(&[caps("Time", false), 28.0 + sp + 14.0 + sp + play + sp + 28.0 + sp + relax, kbd + sp + w("play / pause", &sub)]) + PAD,
             speed: max(&[
                 caps("Speed · steps per tick", true),
                 80.0 + sp + speed_field + sp + rate_full + sp + w("fs/s", &body),
@@ -308,9 +308,9 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let w = Widths::measure(ui);
     let sampling = input.sampling();
     let d = input.snapshot.map(|s| &s.dynamics);
-    group(ui, st, "tb-time", "Time", None, w.time, |ui, _| {
+    group(ui, st, "tb-time", "Time", None, w.time, |ui, st| {
         row(ui, |ui| {
-            time_buttons(ui, input, sampling, false, acts);
+            time_buttons(ui, st, input, sampling, false, acts);
             super::relax_toggle(ui, input, Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
         });
         ui.horizontal(|ui| match d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
@@ -423,7 +423,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let w = Widths::measure(ui);
     let sampling = input.sampling();
-    let r = slot(ui, w.c_time, |ui| time_buttons(ui, input, sampling, true, acts));
+    let r = slot(ui, w.c_time, |ui| time_buttons(ui, st, input, sampling, true, acts));
     mark(ui, st, "tb-time", r.response.rect, w.c_time);
     ui.separator();
     let r = slot(ui, w.c_speed, |ui| {
@@ -504,13 +504,12 @@ pub(crate) fn fs_per_s(r: f64) -> String {
     ">1P".into()
 }
 
-fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bool, acts: &mut Vec<Action>) {
+fn time_buttons(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, sampling: bool, compact: bool, acts: &mut Vec<Action>) {
     // a relax is a tool mode like a pass: Play and Step wait for it (the driver refuses them)
     let relaxing = input.relaxing();
     let sampling = sampling || relaxing;
-    if icons::button(ui, Icon::Rewind, 28.0, false, true).on_hover_text(REWIND_TIP).clicked() {
-        acts.push(Action::Rewind);
-    }
+    // back to the Play snapshot (right-click or ▾: an older one); v → −v is Physics ▸ Reverse velocities
+    super::rewind::button(ui, st, compact, acts);
     let (icon, label) = if input.playing { (Icon::Pause, "Pause") } else { (Icon::Play, "Play") };
     // estimated with no model: nothing to play on (Pause stays available while playing)
     let no_model = !input.playing && input.snapshot.is_some_and(|s| s.backend == crate::sim::Backend::Estimated) && !input.model().is_some_and(|m| m.fitted) && !input.sampling();

@@ -1165,7 +1165,11 @@ impl Viewer {
         if !self.playing {
             return;
         }
-        let why = if self.estimated_without_model() {
+        let held = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.no_model.is_some());
+        let why = if self.estimated_without_model() && held {
+            // samples held, the fit did not form (a reference that did not solve): the tab says why
+            Some("paused: the estimated solver has no model yet — the Model tab says why and offers Retry (the samples are kept)")
+        } else if self.estimated_without_model() {
             Some("paused: the estimated solver has no model — load one (File ▸ Open) or Start sampling in the Model tab")
         } else {
             self.snapshot
