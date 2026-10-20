@@ -14,6 +14,8 @@
 //!   ([`crate::gfx::Painter::paint_offscreen`]); with the UI shown the frame is the window as
 //!   presented (its size; the surface must allow copies). Simulated-time frames are always the 3D
 //!   view alone: the chrome shows wall-clock state, not the frame's instant.
+//! - **Pop-out view** ([`popout`]): a second window showing what a capture takes now, drawn by the
+//!   same offscreen path ([`crate::viewer::Viewer::render_capture`]) or a copy of the window's frame.
 //!
 //! Nothing here waits on the GPU or the disk: copies are read back by [`readback::Pool`] a frame or
 //! two later, PNGs are written on writer threads behind a bounded queue, and the finish (gap
@@ -22,6 +24,7 @@
 pub mod camera;
 pub mod clock;
 pub mod overlay;
+pub mod popout;
 pub mod readback;
 pub mod writer;
 
@@ -109,6 +112,9 @@ pub struct Settings {
     pub stop_after_s: f64,
     /// The popover is open.
     pub open: bool,
+    /// The pop-out view's window is wanted ([`popout`]: the window follows this flag; closing the
+    /// window clears it).
+    pub popout: bool,
 }
 
 impl Default for Settings {
@@ -124,6 +130,7 @@ impl Default for Settings {
             stop_on: false,
             stop_after_s: 10.0,
             open: false,
+            popout: false,
         }
     }
 }
@@ -242,13 +249,17 @@ impl Plan {
 pub struct Offscreen {
     pub colour: wgpu::Texture,
     pub view: wgpu::TextureView,
+    /// The colour without sRGB decoding (egui samples gamma-encoded textures: the pop-out view).
+    pub raw: wgpu::TextureView,
     pub depth: wgpu::TextureView,
     pub size: (u32, u32),
     pub format: wgpu::TextureFormat,
 }
 
 impl Offscreen {
-    fn new(ctx: &gpu::GpuContext, size: (u32, u32), format: wgpu::TextureFormat) -> Offscreen {
+    pub fn new(ctx: &gpu::GpuContext, size: (u32, u32), format: wgpu::TextureFormat) -> Offscreen {
+        let raw_format = format.remove_srgb_suffix();
+        let raw_formats = [raw_format];
         let extent = wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 };
         let colour = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture colour"),
@@ -257,10 +268,12 @@ impl Offscreen {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            // COPY_DST: the pop-out view copies the window's frame into its own (a capture with the UI)
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: if raw_format != format { &raw_formats } else { &[] },
         });
         let view = colour.create_view(&Default::default());
+        let raw = colour.create_view(&wgpu::TextureViewDescriptor { format: Some(raw_format), ..Default::default() });
         let depth = ctx
             .device
             .create_texture(&wgpu::TextureDescriptor {
@@ -274,7 +287,7 @@ impl Offscreen {
                 view_formats: &[],
             })
             .create_view(&Default::default());
-        Offscreen { colour, view, depth, size, format }
+        Offscreen { colour, view, raw, depth, size, format }
     }
 }
 
@@ -650,6 +663,7 @@ impl Capture {
 }
 
 /// The window's frame as painted, before it is presented.
+#[derive(Clone, Copy)]
 pub struct SurfaceFrame<'a> {
     pub texture: &'a wgpu::Texture,
     pub size: (u32, u32),
@@ -667,8 +681,7 @@ impl crate::viewer::Viewer {
         let mut cap = std::mem::take(&mut self.capture);
         let view_px = (self.viewport.size[0].round() as u32, self.viewport.size[1].round() as u32);
         let window_px = surface.as_ref().map_or(view_px, |s| s.size);
-        // the frame's longest side: the texture limit, halved for the Camera view's supersampled glow
-        let max_side = if self.ui.camera_view { render::glow::max_target_side(ctx) } else { ctx.device.limits().max_texture_dimension_2d };
+        let max_side = self.capture_max_side(ctx);
         let plan = cap.plan(Instant::now(), view_px, window_px, max_side);
         if let Some(tag) = plan.surface {
             match surface.as_ref().filter(|_| copyable) {
@@ -685,7 +698,7 @@ impl crate::viewer::Viewer {
         }
         for job in plan.offscreen {
             let target = cap.target(ctx, job.size, painter.format).clone();
-            self.render_capture(ctx, painter, &target, &job, &mut cap.labels, window_depth);
+            self.render_capture(ctx, painter, crate::gfx::Fx::Capture, &target, &job, &mut cap.labels, window_depth);
             let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture copy") });
             let ok = cap.copy_target(ctx, &mut enc, job.tag.clone());
             ctx.queue.submit([enc.finish()]);
@@ -703,6 +716,11 @@ impl crate::viewer::Viewer {
                 self.ui.set_status(text);
             }
         }
+    }
+
+    /// A frame's longest side: the texture limit, halved for the Camera view's supersampled glow.
+    pub fn capture_max_side(&self, ctx: &gpu::GpuContext) -> u32 {
+        if self.ui.camera_view { render::glow::max_target_side(ctx) } else { ctx.device.limits().max_texture_dimension_2d }
     }
 
     /// The capture camera for a frame of aspect `frame_ratio` at video time `t_video`
@@ -740,7 +758,7 @@ impl crate::viewer::Viewer {
     /// capture camera, without the chrome, the editor geometry or the selection highlight; with the
     /// overlay (labels, title, time, scale) when it is on. Motion blur and the Camera view's
     /// shutter are wall-clock effects: a simulated-time frame is one instant.
-    fn render_capture(&self, ctx: &gpu::GpuContext, painter: &mut crate::gfx::Painter, t: &Offscreen, job: &Job, labels: &mut overlay::LabelState, window_depth: &wgpu::TextureView) {
+    fn render_capture(&self, ctx: &gpu::GpuContext, painter: &mut crate::gfx::Painter, fx: crate::gfx::Fx, t: &Offscreen, job: &Job, labels: &mut overlay::LabelState, window_depth: &wgpu::TextureView) {
         let at = job.at.as_ref();
         let now = Instant::now();
         let mut shown = self.shown_scene(now);
@@ -783,7 +801,7 @@ impl crate::viewer::Viewer {
         };
         let target = crate::gfx::Target { colour: &t.view, depth: &t.depth, size: [w, h], sampleable: true };
         if !o.on {
-            painter.paint_offscreen(ctx, target, world, (&self.egui_ctx, None), window_depth);
+            painter.paint_offscreen(ctx, fx, target, world, (&self.egui_ctx, None), window_depth);
             return;
         }
         // the overlay at the size it has in the window: the frame's height over what it shows of the view
@@ -807,7 +825,7 @@ impl crate::viewer::Viewer {
             }
             overlay::draw_hud(c, &hud, Some(scale));
         });
-        painter.paint_offscreen(ctx, target, world, (&octx, Some(out)), window_depth);
+        painter.paint_offscreen(ctx, fx, target, world, (&octx, Some(out)), window_depth);
     }
 
     /// The overlay's corner text for `job`: the molecules (title), the scene and solver, the time

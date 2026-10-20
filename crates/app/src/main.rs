@@ -91,6 +91,8 @@ struct App {
     focused: bool,
     /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
     frames: FrameStats,
+    /// The pop-out view's window (`capture::popout`), while `ui.capture.popout` asks for it.
+    popout: Option<capture::popout::Popout>,
 }
 
 /// `--record`: the path until the window opens, then the recorder, and whether the worker was idle
@@ -544,6 +546,7 @@ fn main() {
         closing: false,
         focused: true,
         frames: FrameStats::default(),
+        popout: None,
     };
     event_loop.run_app(&mut app).expect("run");
     // the estimated solver's session autosave is for this session only
@@ -635,10 +638,18 @@ impl ApplicationHandler for App {
         window.set_visible(true);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if self.popout.as_ref().is_some_and(|p| p.window.id() == id) {
+            self.popout_event(event);
+            window.request_redraw(); // it is drawn with the main window's frame
+            return;
+        }
+        if id != window.id() {
+            return; // a window already closed
+        }
         let consumed = match &mut self.egui_state {
             Some(s) => s.on_window_event(&window, &event).consumed,
             None => false,
@@ -682,6 +693,7 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
+        self.sync_popout(el);
         let got = self.drain_sim();
         // `--record`: a `wait idle` each time the worker goes idle after something was sent
         if let Some(r) = &mut self.record {
@@ -699,10 +711,12 @@ impl ApplicationHandler for App {
             self.egui_repaint_at = None;
         }
         // the floating dots drift by themselves: keep drawing while they are shown and the window has focus
-        let floating = self.focused && self.viewer.dots_floating();
+        let floating = (self.focused || self.popout.as_ref().is_some_and(|p| p.focused)) && self.viewer.dots_floating();
         // a capture in progress keeps the frames coming (its readbacks land a frame or two later)
         let capturing = self.viewer.capture.active();
-        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due || floating || capturing;
+        // the pop-out shows an orbiting capture camera turning (as the view's gizmo previews it)
+        let orbiting = self.popout.is_some() && self.viewer.ui.capture.camera.mode == capture::camera::CameraMode::Orbit;
+        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due || floating || capturing || orbiting;
         // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
         // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
         // (no vsync) would pace the loop and a solve would spin a core. Poll instead.
@@ -723,6 +737,56 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Opens or closes the pop-out view's window to match `ui.capture.popout`.
+    fn sync_popout(&mut self, el: &ActiveEventLoop) {
+        let want = self.viewer.ui.capture.popout;
+        if !want {
+            self.popout = None;
+            return;
+        }
+        let (Some(g), None) = (&self.gfx, &self.popout) else { return };
+        let v = &self.viewer;
+        let view_px = (v.viewport.size[0].round() as u32, v.viewport.size[1].round() as u32);
+        let window_px = (g.surface.config.width, g.surface.config.height);
+        let frame = capture::popout::frame(&v.ui.capture, &v.ui.capture_view, view_px, window_px, v.capture_max_side(&g.ctx));
+        match capture::popout::Popout::open(el, &g.ctx, Some(frame)) {
+            Ok(p) => {
+                eprintln!("pop-out view opened ({} × {} frame)", frame.size.0, frame.size.1);
+                self.popout = Some(p);
+                self.viewer.ui.set_status("pop-out view: the capture's frame in its own window (F11: full screen)".to_string());
+            }
+            Err(e) => {
+                self.viewer.ui.capture.popout = false;
+                self.viewer.last_error = Some(format!("pop-out view: {e}"));
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// The pop-out window's events: closing it clears the flag; F11 toggles full screen, Esc
+    /// leaves it. Anything else only asks for a frame (it is drawn with the main window's).
+    fn popout_event(&mut self, event: WindowEvent) {
+        let Some(p) = &mut self.popout else { return };
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                self.popout = None;
+                self.viewer.ui.capture.popout = false;
+            }
+            WindowEvent::Focused(f) => p.focused = f,
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !event.repeat => {
+                use winit::keyboard::{Key, NamedKey};
+                match event.logical_key {
+                    Key::Named(NamedKey::F11) => p.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) => p.leave_fullscreen(),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn drain_sim(&mut self) -> bool {
         let Some(g) = &mut self.gfx else { return false };
         self.viewer
@@ -829,8 +893,15 @@ impl App {
             copyable: g.surface.copyable,
         };
         self.viewer.capture_after_paint(&g.ctx, &mut g.painter, &g.surface.depth, Some(surface));
+        // the pop-out view: its frame through the capture's path (or a copy of this one), before this one is presented
+        if let Some(p) = &mut self.popout {
+            p.prepare(&self.viewer, &g.ctx, &mut g.painter, &g.surface.depth, Some(surface));
+        }
         window.pre_present_notify();
         g.ctx.queue.present(frame);
+        if let Some(p) = &mut self.popout {
+            p.present(&g.ctx);
+        }
         self.frames.frame(self.viewer.playing);
     }
 }

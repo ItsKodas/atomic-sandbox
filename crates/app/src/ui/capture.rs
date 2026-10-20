@@ -3,7 +3,8 @@
 //! frame's resolution and aspect with its guide over the view, the capture camera — the view's, a
 //! fixed angle or an orbit, drawn in the view as a gizmo —, record mode, fs per frame). While
 //! recording, a red dot with the frames, the simulated time covered and the video's length; after
-//! it, the finish's state and the last note. Screenshot and Record go through [`Action`]; the
+//! it, the finish's state and the last note. The popover's first button opens the pop-out view
+//! (`crate::capture::popout`, `Settings::popout`). Screenshot and Record go through [`Action`]; the
 //! settings are display state written to `UiState::capture` directly.
 use super::{icons, theme, Action, UiState, RED};
 use crate::capture::camera::{self, Aspect, CameraMode, CameraSettings};
@@ -175,6 +176,16 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
             theme::card().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::LINE)).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
                     ui.set_width(320.0);
+                    // the pop-out view (`crate::capture::popout`): a window of its own showing what a capture takes
+                    let open = st.capture.popout;
+                    let pop = ui
+                        .add(egui::Button::selectable(open, if open { "Close the pop-out view" } else { "Pop out view" }).min_size(Vec2::new(ui.available_width(), 24.0)))
+                        .on_hover_text("A separate window showing exactly what Screenshot and Record take now: the frame's size and aspect, the capture camera, the look and the labels over it — and a recording's red dot and frame count. Move it to another monitor, resize or maximise it; F11 there for full screen. Closing it changes nothing else.");
+                    if pop.clicked() {
+                        st.capture.popout = !open;
+                    }
+                    super::search::mark(ui, st, "v-capture-popout", pop.rect);
+                    ui.add_space(2.0);
                     let st_camera_view = st.camera_view;
                     let s = &mut st.capture;
                     theme::section(ui, "Capture");

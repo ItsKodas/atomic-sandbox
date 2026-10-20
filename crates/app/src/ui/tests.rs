@@ -935,6 +935,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 }
             }
             egui::Popup::close_all(&ctx);
+            // the capture settings popover (its pop-out button)
+            st.capture.open = true;
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+            st.capture.open = false;
             st.search.toggle();
             st.search.query = "therm".into();
             frame(&ctx, &mut st, &inp, w, vec![]);
