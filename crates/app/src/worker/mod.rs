@@ -173,6 +173,9 @@
 //! panic the driver is rebuilt from the last snapshot (time restarts, the settings are kept).
 mod activity;
 mod autosave;
+mod checkpoint;
+pub use checkpoint::{discard_interrupted_pass, interrupted_pass};
+use checkpoint::Checkpoints;
 mod commands;
 mod model;
 
@@ -578,6 +581,8 @@ struct Worker {
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
     owns_autosave: bool,
+    /// The running pass is kept resumable here (`checkpoint` module doc; `Command::TrainingCheckpoints`).
+    checkpoints: Option<Checkpoints>,
     /// The audit cadence set by [`Command::SetAudit`] and draft mode by [`Command::SetDraft`]
     /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
@@ -788,6 +793,7 @@ fn worker(
         refits: 0,
         autoload_refused: None,
         owns_autosave: false,
+        checkpoints: None,
         audit_every: None,
         draft: None,
         last_gap: None,
@@ -926,6 +932,7 @@ impl Worker {
             let d = self.dy.snapshot();
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
+        self.checkpoint_round(&snap);
         self.cloud_jobs(&snap);
         self.side_charges(&mut snap);
         self.orbital_retry(&snap);

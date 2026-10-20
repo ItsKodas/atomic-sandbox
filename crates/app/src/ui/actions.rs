@@ -106,6 +106,12 @@ pub enum Action {
     RetryFit,
     /// The automatic first pass's "Start anyway" with the plan it offered.
     StartOffered(SamplingPlan),
+    /// The Model tab's "Resume" of an interrupted training (`UiState::resume`; the viewer switches to
+    /// the estimated solver on the pass's scene and resumes it: `Viewer::resume_training`). Recorded,
+    /// not replayable (it reads the user's data folder and solves).
+    ResumeTraining,
+    /// The same offer's "Discard": its files are removed. Recorded, not replayable.
+    DiscardTraining,
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
     /// The estimated solver's audit cadence (answered steps; 0 = never).
@@ -471,6 +477,19 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
         Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
+        Action::ResumeTraining => {
+            if input.sampling() {
+                out.error = Some("a sampling pass is running: cancel it first, then resume the interrupted one".into());
+            } else if st.resume.is_some() {
+                out.training = Some(true);
+            }
+        }
+        Action::DiscardTraining => {
+            if st.resume.take().is_some() {
+                out.training = Some(false);
+                st.set_status("the interrupted training was discarded");
+            }
+        }
         Action::SampleAfterRefusal => {
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
             st.plan.seed += 1;
@@ -855,7 +874,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 

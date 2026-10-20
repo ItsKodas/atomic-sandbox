@@ -457,6 +457,13 @@ pub struct Viewer {
     ghost: crate::ghost::Tracker,
     /// Screenshots and recordings (`crate::capture`; display only).
     pub capture: crate::capture::Capture,
+    /// Where an estimated worker keeps a running pass resumable (`worker::checkpoint`): the
+    /// window's `%LOCALAPPDATA%\atomic-sandbox\training`; `None` headless (screenshots, replays,
+    /// tests never write or offer one).
+    pub training_dir: Option<PathBuf>,
+    /// The next estimated worker resumes the interrupted pass in this folder instead of its
+    /// `EnsureModel` ([`Viewer::resume_training`]).
+    resume_next: Option<PathBuf>,
 }
 
 impl Viewer {
@@ -514,6 +521,8 @@ impl Viewer {
             last_play_log: None,
             ghost: Default::default(),
             capture: Default::default(),
+            training_dir: None,
+            resume_next: None,
         })
     }
 
@@ -580,15 +589,22 @@ impl Viewer {
         self.drag_target = None;
         self.tool.dragging = false;
         self.side_seq = None; // the new driver numbers its side densities afresh
+        let resume = self.resume_next.take();
+        if resume.is_none() {
+            // an interrupted pass on disk (a crash, a close, a solver switch mid-pass): offered
+            self.refresh_resume_offer();
+        }
         if estimated {
-            let mut teach = vec![
-                Command::EnsureModel {
+            let mut teach: Vec<Command> = self.training_dir.iter().map(|d| Command::TrainingCheckpoints(Some(d.clone()))).collect();
+            teach.push(match resume {
+                Some(dir) => Command::ResumeTraining(dir),
+                None => Command::EnsureModel {
                     autoload: None, // decided when it is sent: the autosave may still be written
                     plan: self.ui.plan.clone(),
                     auto_pass: self.auto_pass,
                 },
-                self.ui.cloud_command(),
-            ];
+            });
+            teach.push(self.ui.cloud_command());
             if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
@@ -598,6 +614,46 @@ impl Viewer {
             self.pending_teach = Some(teach);
             self.poll_retiring();
         }
+    }
+
+    /// The Model tab's offer of an interrupted pass in [`training_dir`](Self::training_dir)
+    /// (`ui::ResumeOffer`), read from its checkpoint's header; none when there is none or it cannot
+    /// be read.
+    pub fn refresh_resume_offer(&mut self) {
+        self.ui.resume = self.training_dir.as_deref().and_then(crate::sim::interrupted_pass).map(|(_, info)| ui::ResumeOffer {
+            scene: Scene::from_sim(&info.scene),
+            done: info.done,
+            total: info.total,
+            stage: info.stage,
+        });
+    }
+
+    /// The offer's Resume (`resume`) or Discard (`ui::Action::ResumeTraining` / `DiscardTraining`):
+    /// Resume puts the pass's own scene in place (its grid, σ, charge, multiplicity and ionic
+    /// policy; the chip says "built <formula>") and starts the estimated solver on it with
+    /// `Command::ResumeTraining` instead of `EnsureModel`; Discard removes the files.
+    pub fn resume_training(&mut self, resume: bool) {
+        let Some(dir) = self.training_dir.clone() else { return };
+        if !resume {
+            crate::sim::discard_interrupted_pass(&dir);
+            self.ui.resume = None;
+            return;
+        }
+        let Some(o) = self.ui.resume.take() else { return };
+        let z: Vec<u8> = o.scene.nuclei.iter().map(|n| n.z).collect();
+        self.ui.source = ui::SceneSource::Built(crate::names::formula(&z, (o.scene.charge != 0).then_some(o.scene.charge)));
+        self.ui.ionic = o.scene.ionic;
+        self.ui.adopt(&o.scene);
+        self.ui.quality_h = o.scene.grid_h;
+        self.ui.quality_slider = o.scene.grid_h;
+        self.ui.wall_half_width = ui::default_wall_half_width(&o.scene);
+        self.tool = ToolState::default();
+        self.drag_target = None;
+        self.scene = o.scene;
+        self.resume_next = Some(dir);
+        self.ui.backend = Backend::Estimated;
+        self.start(Backend::Estimated, self.gpu.clone());
+        self.ui.set_status(format!("resuming the interrupted training at sample {} of {}", (o.done + 1).min(o.total), o.total));
     }
 
     /// A new worker's orbital session (a solver switch, the start): its provider numbers its
@@ -1064,6 +1120,10 @@ impl Viewer {
         }
         for cmd in out.commands {
             self.send(cmd);
+        }
+        if let Some(resume) = out.training {
+            // it switches the solver itself (and says so)
+            return self.resume_training(resume);
         }
         if self.ui.backend != self.backend {
             self.start(self.ui.backend, self.gpu.clone());
