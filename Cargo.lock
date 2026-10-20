@@ -96,6 +96,7 @@ dependencies = [
  "glam",
  "gpu",
  "png",
+ "pollster 1.0.1",
  "providers",
  "qm",
  "qm-gpu",

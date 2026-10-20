@@ -13,6 +13,8 @@ providers = { path = "../providers" }
 surrogate = { path = "../surrogate" }
 units = { path = "../units" }
 wgpu = { workspace = true }
+# the pop-out view's surface configure is checked in an error scope (plumbing)
+pollster = { workspace = true }
 winit = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
