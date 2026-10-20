@@ -7,6 +7,7 @@
 mod atom_card;
 mod badge;
 mod builder;
+mod capture;
 mod cloud;
 mod frame;
 mod icon;
@@ -699,7 +700,9 @@ impl ApplicationHandler for App {
         }
         // the floating dots drift by themselves: keep drawing while they are shown and the window has focus
         let floating = self.focused && self.viewer.dots_floating();
-        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due || floating;
+        // a capture in progress keeps the frames coming (its readbacks land a frame or two later)
+        let capturing = self.viewer.capture.active();
+        let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got || due || floating || capturing;
         // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
         // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
         // (no vsync) would pace the loop and a solve would spin a core. Poll instead.
@@ -818,6 +821,14 @@ impl App {
             warp_from: warp_from.as_deref(),
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
+        // screenshots and recordings: the window as painted, or the 3D view offscreen (display only)
+        let surface = capture::SurfaceFrame {
+            texture: &frame.texture,
+            size: (g.surface.config.width, g.surface.config.height),
+            format: g.surface.config.format,
+            copyable: g.surface.copyable,
+        };
+        self.viewer.capture_after_paint(&g.ctx, &mut g.painter, &g.surface.depth, Some(surface));
         window.pre_present_notify();
         g.ctx.queue.present(frame);
         self.frames.frame(self.viewer.playing);

@@ -14,6 +14,11 @@ const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// (smooth outlines and intersection lines; a solid ball's edge cannot be blended in place).
 pub const SS: u32 = 2;
 
+/// The largest colour target the pass can draw into: the device's 2D texture limit over [`SS`].
+pub fn max_target_side(ctx: &GpuContext) -> u32 {
+    ctx.device.limits().max_texture_dimension_2d / SS
+}
+
 pub struct GlowPass {
     glow: wgpu::RenderPipeline,
     /// The balls' depth for one instant (solidity > 0).
@@ -186,8 +191,15 @@ impl GlowPass {
     }
 
     /// The float and depth targets at [`SS`] × the colour target's size (made or remade on a resize).
+    /// A size whose supersampled targets would exceed the device's texture limit gets none (the
+    /// atoms are then not drawn) instead of a validation panic; the capture keeps its frames within
+    /// [`max_target_side`].
     pub fn ensure(&mut self, ctx: &GpuContext, size: [u32; 2]) {
         if self.accum.as_ref().is_some_and(|a| a.2 == size) || size[0] == 0 || size[1] == 0 {
+            return;
+        }
+        if size[0].max(size[1]) > max_target_side(ctx) {
+            self.accum = None;
             return;
         }
         let extent = wgpu::Extent3d { width: size[0] * SS, height: size[1] * SS, depth_or_array_layers: 1 };

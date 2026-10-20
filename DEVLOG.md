@@ -339,6 +339,30 @@ builder's CPU unit tests, seconds; `cargo test -p app --release --bin app` once 
   The first build waited behind other sessions' suites; the user chose a low-priority `-j 4` build
   instead, which took 30 s.
 
+### Viewer capture (Oct 20, first commit 08:44, last 09:33, about 2 h with the build)
+
+Screenshot and Record buttons at the top right of the 3D view (`crates/app/src/capture/`,
+`ui/capture.rs`). One Opus session, no subagents, the user hand-testing each commit in the app.
+
+- **Recording by simulated time** (the user's request that morning): a DFT run advances a few fs per wall
+  second, so wall-clock frames would give minutes of stillness. Frames are taken per slice of simulated
+  time (0.5 fs by default) with positions interpolated between snapshots and played at 30 fps; nothing is
+  recorded while paused. When the snapshots are too far apart to interpolate (the estimated solver at full
+  speed) the frame is taken at the snapshot and the button says so; when the capture falls behind it
+  doubles the slice rather than skipping, so the video stays evenly spaced. An "as seen" mode keeps 30
+  wall fps. Nothing waits on the GPU or the disk: a readback pool, PNG writer threads behind a bounded
+  queue, and a finish thread that fills skipped slots and encodes with ffmpeg when it is on PATH.
+- **The user's hand-tests reshaped it five times in under an hour:** the notes moved out of the button card
+  (a long path pushed the buttons aside); hidden-UI captures dropped the cell box and the other editor
+  geometry; aspect ratios with a guide frame over the view, an overlay of labels, a molecule title, the
+  time and a scale bar (drawn by a second egui context at the frame's size, its labels smoothed on the
+  video's clock), and a fixed or orbiting capture camera with dials and a gizmo in the view; the rig was
+  then anchored to the cell's centre (it followed the window's pan); and an optional stop-at length.
+- **Failures worth remembering:** the first frame-size code let a 4K 21:9 capture in the Camera view ask
+  the supersampled glow pass for a 10080 px texture (limit 8192) and the app panicked; frames now fit the
+  limit and the glow pass refuses an oversized target. The same PowerShell UTF-8 round trip as the
+  builder's garbled two files again before the memory note about it was written.
+
 ---
 
 ## Failures and dead ends

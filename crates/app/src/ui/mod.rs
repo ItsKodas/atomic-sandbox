@@ -22,6 +22,7 @@
 //! (rule 8).
 pub mod actions;
 pub mod activity;
+mod capture;
 mod dock;
 mod files;
 pub mod profile;
@@ -699,6 +700,10 @@ pub struct UiState {
     pub log_filter: LogFilter,
     /// The Ctrl K control search, and the control it last revealed.
     pub search: search::SearchState,
+    /// The capture's quick settings (the popover by the Screenshot / Record buttons; display state)
+    /// and what the buttons show (`crate::capture::Capture::view`, refreshed by the viewer).
+    pub capture: crate::capture::Settings,
+    pub capture_view: crate::capture::View,
     /// The open Help window.
     pub help: Option<HelpTopic>,
     /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
@@ -934,6 +939,8 @@ right {}
             log: LogBook::default(),
             log_filter: LogFilter::All,
             search: search::SearchState::default(),
+            capture: Default::default(),
+            capture_view: Default::default(),
             help: None,
             activity: activity::ActivityState::new(),
             play_snapshots: std::collections::VecDeque::new(),
@@ -1194,6 +1201,8 @@ pub struct PanelOutput {
     /// queued from the 3D view, which the recorder already has as input events): what
     /// `--record` writes as `action` lines (`crate::replay::Recorder`).
     pub actions: Vec<Action>,
+    /// A screenshot or the record button (`crate::capture`; display only).
+    pub capture: Option<crate::capture::Request>,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns

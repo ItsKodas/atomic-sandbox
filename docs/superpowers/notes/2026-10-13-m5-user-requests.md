@@ -575,7 +575,7 @@ User: "some quick calculation assist with creating your own molecules, when I go
 
 ## Also queued (2026-10-19, after the reset)
 
-- Viewer capture: Screenshot and Record buttons at the top right of the 3D view → a `captures/` folder; quick settings hide-UI and resolution (offscreen render); Record as a PNG sequence unless an encoder is added. The atom card (top right) moves down by the buttons' height.
+- Viewer capture: Screenshot and Record buttons at the top right of the 3D view → a `captures/` folder; quick settings hide-UI and resolution (offscreen render); Record as a PNG sequence unless an encoder is added. The atom card (top right) moves down by the buttons' height. **Done 2026-10-20** (branch `viewer-capture`, `crates/app/src/capture/`, `ui/capture.rs`): recording by simulated time (one frame per fs-per-frame slice, positions interpolated between snapshots, 30 fps playback; user request 2026-10-20 — a DFT run is only a few fs/s) or as seen (30 wall fps); ffmpeg → MP4 when on PATH, else the PNG sequence and the command; from the hand-tests: no editor geometry in a hidden-UI capture, aspect ratios with a guide frame, labels / molecule title / time / scale overlay, a fixed or orbiting capture camera anchored to the cell's centre, an optional stop-at length.
 - Camera view: a smooth-union solid surface (smooth-min of the atoms' distance fields, ray-marched) with a smoothness slider — the soft neck between bonded atoms instead of a crease, and no rim artefacts.
 - ~~Raise the speed cap (`sim::dynamics::MAX_SPEED` = 1000 steps per tick) to ~10 000: the 16 ms tick budget already stops a tick early.~~ Done 2026-10-20 (branch `small-items-speed-eigensolve-vram`; `2026-10-20-small-items-how-to-test.md`).
 

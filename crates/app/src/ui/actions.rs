@@ -188,6 +188,11 @@ pub enum Action {
     /// accepted, then Relax. Recorded as `# not replayable: builder` (a script does not carry the
     /// drawing).
     Builder(crate::builder::Handoff),
+    /// The capture's Screenshot button (`crate::capture`; display only, writes a file — not
+    /// replayable).
+    Screenshot,
+    /// The capture's Record (true) / Stop (false) button (display only, not replayable).
+    Record(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -587,6 +592,8 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::WarpFields(on) => st.warp_fields = on,
+        Action::Screenshot => out.capture = Some(crate::capture::Request::Screenshot),
+        Action::Record(on) => out.capture = Some(if on { crate::capture::Request::StartRecording } else { crate::capture::Request::StopRecording }),
         Action::ColourLook(look) => {
             st.colour_look = look;
             if st.show == ShowMode::Coloured {
@@ -819,7 +826,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 
