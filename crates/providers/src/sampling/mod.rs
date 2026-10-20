@@ -93,9 +93,14 @@
 //! so at its next poll: every SCF iteration on the GPU, once before the solve on the CPU, so the
 //! CPU teacher is never cut short). It is reported like a stall — `failed`, a `Failed` event with
 //! `ScfEnd::TimeLimit`, never kept — and the rules for a stalled solve apply to it: a stretched
-//! scan point's further-out points are skipped, a burst step restarts the burst. Reference solves
-//! and shell checks are never timed (the fit and the shell fence rest on them); perturbations, scan
-//! points, burst steps and teach-around solves are.
+//! scan point's further-out points are skipped (but not the pair's shell check: a time-out says
+//! nothing about the bond further out), a burst step restarts the burst. The next solve is cold
+//! (`reset`): the abandoned solve parks its half-converged state as the teacher's warm start. Each
+//! time-out in a row doubles the limit, so a GPU that another job slows down mid-pass still gets
+//! solves through. Reference solves and shell checks are never timed (the fit and the shell fence
+//! rest on them); perturbations, scan points, burst steps and teach-around solves are. Wall time,
+//! not iterations: the teacher's iteration count is not visible through `ForceProvider`, and what
+//! the user waits for is time.
 //!
 //! **A failed scan point ends its scan's stretched tail** (the SCF stall stop, `qm::scf` "The stall
 //! stop"): when a scan point on the stretched side (r > r₀) fails to converge — the stall stop or
@@ -156,6 +161,16 @@
 //! A solve the teacher abandons (`ProviderError::Cancelled`) leaves the job queued: the next
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
 //! caller does (a partial pass refits like a full one).
+//!
+//! # Checkpoints
+//!
+//! A regular pass can also outlive the process (user report 2026-10-20: "save the active training
+//! to disk … and resume training from where it was"): [`Sampler::checkpoint`] writes its state as
+//! text and [`Sampler::resume`] builds the same pass from it — the same queued jobs with the same
+//! geometries, the same counters, the burst where it stood; [`checkpoint_info`] reads the header
+//! for an offer. The format and what it leaves out are the `checkpoint` module's doc. The caller
+//! keeps the surrogate's samples next to it (`SurrogateKs`'s `Trainable::resume_pass` refuses a
+//! checkpoint whose sample count or surface differs from what it holds).
 
 use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::sampling::{GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost};
@@ -425,6 +440,8 @@ pub struct Sampler {
     timed_out: Option<f64>,
     /// The limit's floor (s): [`TIME_LIMIT_FLOOR_S`] (`with_time_limit_floor`).
     time_limit_floor_s: f64,
+    /// Sample solves given up in a row: each doubles the limit (module doc, "The time limit").
+    timeouts_in_a_row: usize,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -609,6 +626,7 @@ impl Sampler {
             solve_walls: Vec::new(),
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
+            timeouts_in_a_row: 0,
         })
     }
 
@@ -658,6 +676,7 @@ impl Sampler {
             solve_walls: Vec::new(),
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
+            timeouts_in_a_row: 0,
         }
     }
 
@@ -733,6 +752,11 @@ impl Sampler {
     /// next pass).
     pub fn take_references(&mut self) -> ReferenceCache {
         std::mem::take(&mut self.refs)
+    }
+
+    /// The scene the pass samples (its base: no velocities, no field).
+    pub fn scene(&self) -> &Scene {
+        &self.scene
     }
 
     pub fn progress(&self) -> SamplingProgress {
@@ -1283,7 +1307,10 @@ impl Sampler {
         if self.solve_walls.len() < TIME_LIMIT_MIN_SOLVES {
             return None;
         }
-        Some((TIME_LIMIT_FACTOR * self.median_solve_s()).max(self.time_limit_floor_s))
+        // each time-out in a row doubles it: a GPU shared with another job slows every solve, and
+        // a median of the quiet ones alone would never let one through again (review SHOULD-1)
+        let widen = 2f64.powi(self.timeouts_in_a_row.min(16) as i32);
+        Some((TIME_LIMIT_FACTOR * self.median_solve_s()).max(self.time_limit_floor_s) * widen)
     }
 
     /// The median wall time (s) of the pass's successful sample solves (NaN before the first).
@@ -1362,8 +1389,13 @@ impl Sampler {
             Err(ProviderError::Cancelled) if hit => {
                 let l = limit.expect("hit only under a limit");
                 self.timed_out = Some(l);
+                self.timeouts_in_a_row += 1;
+                // the abandoned solve parks its half-converged state as the next warm start
+                // (`providers::ks`): this geometry is never solved again, so the next one is cold
+                // (physics review MUST-1)
+                self.last_n = None;
                 return Err(ProviderError::Invalid(format!(
-                    "given up after {:.0} s, the pass's time limit ({TIME_LIMIT_FACTOR}× its median solve of {median:.1} s, at least {:.0} s)",
+                    "given up after {:.1} s, the pass's time limit ({TIME_LIMIT_FACTOR}× its median solve of {median:.1} s, at least {} s, doubled for each time-out in a row)",
                     started.elapsed().as_secs_f64(),
                     self.time_limit_floor_s
                 )));
@@ -1379,6 +1411,7 @@ impl Sampler {
         self.progress.last_energy = r.energy;
         if limited {
             self.solve_walls.push(started.elapsed().as_secs_f64());
+            self.timeouts_in_a_row = 0;
         }
         Ok(r)
     }
@@ -1601,6 +1634,11 @@ impl Sampler {
         let r = scan.r.clone();
         let mut n = 0;
         for job in self.queue.iter_mut() {
+            // a time-out says nothing about the bond further out, only about time: the pair's
+            // shell check — never timed, the fence rests on it — stays queued (review SHOULD-2)
+            if end == ScfEnd::TimeLimit && matches!(job, Job::Shell(..)) {
+                continue;
+            }
             if let Job::Scan(_, p, kk) | Job::Shell(_, p, kk) = *job {
                 if p == pair && r[kk] > rk {
                     *job = Job::Skip("scans", Some((pair, kk)), Some(note.clone()));
@@ -1695,6 +1733,9 @@ pub fn run_sampling(
     progress(s.progress());
     Ok(s.samples_added())
 }
+
+mod checkpoint;
+pub use checkpoint::{checkpoint_info, CheckpointInfo, CHECKPOINT_MAGIC};
 
 #[cfg(test)]
 mod tests;

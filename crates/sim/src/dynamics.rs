@@ -669,6 +669,11 @@ pub enum DynCommand {
     /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
     /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
     StartSampling(SamplingPlan),
+    /// Go on with an interrupted sampling pass from its checkpoint text
+    /// (`Trainable::resume_pass`; `providers::sampling`, "Checkpoints"): like `StartSampling`, it
+    /// pauses the dynamics until the pass ends; refused when the checkpoint is not the current
+    /// scene's or does not match the samples held. Surrogate only.
+    ResumeSampling(String),
     /// Start a teach-around pass (`Trainable::start_teach`): like `StartSampling`, a pass that
     /// pauses the dynamics until it ends. Surrogate only.
     StartTeaching,
@@ -1211,7 +1216,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
@@ -1431,6 +1436,7 @@ impl Dynamics {
                 self.drop_bonds();
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
+            DynCommand::ResumeSampling(text) => self.resume_sampling(&text),
             DynCommand::StartTeaching => self.start_teaching(),
             DynCommand::RetryFit => self.retry_fit(),
             DynCommand::CancelSampling => self.cancel_sampling(),
@@ -1909,6 +1915,30 @@ impl Dynamics {
         // the driver's references seed the pass (a species solved here costs the pass no solve)
         if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
             return self.reject(format!("sampling plan: {e}"));
+        }
+        let p = t.progress();
+        self.paused = true;
+        self.pending_steps = 0;
+        self.take_provider_notes();
+        self.sampling = p;
+        self.refresh_ghost();
+    }
+
+    /// An interrupted pass resumed from its checkpoint (`DynCommand::ResumeSampling`):
+    /// `start_sampling`'s bookkeeping around `Trainable::resume_pass`.
+    fn resume_sampling(&mut self, checkpoint: &str) {
+        let Some(t) = self.provider.as_trainable() else {
+            return self.no_surrogate("resume the interrupted training");
+        };
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::sampling::EMPTY_SCENE.into());
+        }
+        if t.pass_active() {
+            return self.reject("resume the interrupted training: a pass is already running (cancel it first)".into());
+        }
+        if let Err(e) = t.resume_pass(&self.scene, checkpoint, &mut self.refs) {
+            self.take_provider_notes();
+            return self.reject(format!("resume the interrupted training: {e}"));
         }
         let p = t.progress();
         self.paused = true;

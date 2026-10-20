@@ -2205,6 +2205,7 @@ struct Slow {
     inner: PairMorse,
     slow: fn(f64) -> bool,
     secs: f64,
+    resets: usize,
 }
 
 impl ForceProvider for Slow {
@@ -2223,7 +2224,9 @@ impl ForceProvider for Slow {
     fn name(&self) -> &'static str {
         "pair morse"
     }
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.resets += 1;
+    }
     fn discontinuity(&mut self) {}
 }
 
@@ -2237,31 +2240,49 @@ fn a_sample_solve_past_the_time_limit_is_given_up_like_a_stall() {
     let scene = pair(1, 1, 1.4, cell(49));
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
     let run = |slow: fn(f64) -> bool, secs: f64| {
-        let mut teacher = Slow { inner: PairMorse::h2(), slow, secs };
+        let mut teacher = Slow { inner: PairMorse::h2(), slow, secs, resets: 0 };
         let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
         let mut sampler = Sampler::new(&scene, &plan).unwrap().with_time_limit_floor(0.05);
         let t0 = Instant::now();
         while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
         let wall = t0.elapsed().as_secs_f64();
-        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), sampler.time_limit_s(), wall)
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), sampler.time_limit_s(), wall, teacher.resets)
     };
     // point 9 (1.50 r₀) would take 2 s: given up at the 0.05 s floor; points 10–12 skipped
-    let (p, notes, events, added, limit, wall) = run(|r| r > 1.45 * 1.4 && r < 1.55 * 1.4, 2.0);
+    let (p, notes, events, added, limit, wall, resets) = run(|r| r > 1.45 * 1.4 && r < 1.55 * 1.4, 2.0);
     println!("timed out: {p:?} limit {limit:?} wall {wall:.2} s\n  {notes:?}");
-    assert_eq!(limit, Some(0.05), "5× a microsecond median is under the floor");
-    assert!(wall < 1.0, "given up, not waited out ({wall:.2} s)");
+    assert_eq!(limit, Some(0.1), "5× a microsecond median is under the floor, doubled by the time-out (the last solve)");
+    assert_eq!(resets, 2, "the reference and the first scan point: nothing is solved after the time-out");
+    assert!(wall < 1.5, "given up, not waited out ({wall:.2} s; wall clock, loose for a loaded machine)");
     assert_eq!((p.done, p.total, p.failed, p.skipped, added), (13, 13, 1, 3, 8));
     let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
     assert_eq!(failed.len(), 1);
     assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::TimeLimit), None));
     assert!(failed[0].detail.contains("the pass's time limit (5× its median solve of"), "{}", failed[0].detail);
     assert!(notes.iter().any(|n| n.contains("point 9 of 12 (r = 1.50 r₀) failed (time limit); further-out points skipped")), "{notes:?}");
+    // a time-out at r₀ (point 4) skips nothing, and the solve after it is cold (review MUST-1): the
+    // reference, the first scan point and point 5 reset the teacher; a success clears the doubling
+    let (p, _, events, added, limit, _, resets) = run(|r| (r / 1.4 - 1.0).abs() < 0.01, 2.0);
+    assert_eq!((p.failed, p.skipped, added, resets), (1, 0, 11, 3), "{p:?}");
+    assert_eq!(limit, Some(0.05));
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::TimeLimit)));
+    // a time-out says nothing about the bond further out: H–H at r₀ = 3 Bohr reaches past 5/6 r_cut,
+    // and its shell check (1.7 r₀ = 5.1 Bohr) is still solved after a time-out at 1.2 r₀ (review SHOULD-2)
+    let wide = pair(1, 1, 3.0, cell(49));
+    let mut teacher = Slow { inner: PairMorse::h2(), slow: |r| (r / 3.0 - 1.2).abs() < 0.01, secs: 2.0, resets: 0 };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&wide, &plan).unwrap().with_time_limit_floor(0.05);
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let checks = sampler.take_shell_checks();
+    assert_eq!(checks.len(), 1, "the shell check is kept and solved");
+    assert!((checks[0].r - 5.1).abs() < 1e-9, "{}", checks[0].r);
+    assert_eq!(sampler.progress().failed, 1);
     // the first scan point (0.7 r₀) is slow too, but no limit stands before three solves: it is waited out
-    let (p, _, _, added, _, wall) = run(|r| r < 0.75 * 1.4, 0.3);
+    let (p, _, _, added, _, wall, _) = run(|r| r < 0.75 * 1.4, 0.3);
     assert_eq!((p.failed, p.skipped, added), (0, 0, 12), "{p:?}");
     assert!(wall >= 0.3, "{wall:.2} s");
     // a user abort during a timed solve stays a cancel: the job is kept for the next step
-    let mut teacher = Slow { inner: PairMorse::h2(), slow: |r| r > 1.45 * 1.4, secs: 2.0 };
+    let mut teacher = Slow { inner: PairMorse::h2(), slow: |r| r > 1.45 * 1.4, secs: 2.0, resets: 0 };
     let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
     for _ in 0..9 {
@@ -2270,4 +2291,118 @@ fn a_sample_solve_past_the_time_limit_is_given_up_like_a_stall() {
     let before = sampler.progress().done;
     assert!(matches!(sampler.step(&mut teacher, &mut s, &mut || true), Err(ProviderError::Cancelled)));
     assert_eq!((sampler.progress().done, sampler.progress().failed), (before, 0));
+}
+
+/// The geometries a teacher was asked about, as flat coordinate lists.
+fn seen_positions(t: &PairMorse) -> Vec<Vec<f64>> {
+    t.seen.iter().map(|s| s.nuclei.iter().flat_map(|n| n.pos).collect()).collect()
+}
+
+/// User report 2026-10-20 (module doc, "Checkpoints"): a pass checkpointed after any solve and
+/// resumed from the text asks the teacher about exactly the geometries the uninterrupted pass would
+/// have — every queued perturbation, scan point and shell check bit for bit, and the burst's next
+/// evaluation (the thermostat's later kicks come from a fresh stream) — with the same counters; the
+/// text of a resumed pass is the text it was resumed from.
+#[test]
+fn a_checkpointed_pass_resumes_with_the_same_remaining_jobs() {
+    // three nuclei (three scans, one of them reaching the shell), a burst, a cell-guard skip or two
+    let scene = Scene {
+        nuclei: vec![Nucleus::new(1, [-1.5, 0.0, 0.0]), Nucleus::new(1, [1.5, 0.0, 0.0]), Nucleus::new(1, [0.0, 1.3, 0.0])],
+        cell: cell(49),
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic: sim::IonicPolicy::None,
+    };
+    let plan = SamplingPlan { perturbations: 5, hot_burst_steps: 8, scan_points_per_pair: 6, seed: 11, ..SamplingPlan::default() };
+    let new_surrogate = || SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    // the uninterrupted pass
+    let mut whole = PairMorse::h2();
+    let mut s = new_surrogate();
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let mut texts = Vec::new();
+    loop {
+        texts.push((whole.seen.len(), sampler.checkpoint("prov", 0, 0).expect("a running regular pass checkpoints"), sampler.progress()));
+        if sampler.step(&mut whole, &mut s, &mut never()).unwrap().is_none() {
+            break;
+        }
+    }
+    let end = sampler.progress();
+    assert!(sampler.checkpoint("prov", 0, 0).is_none(), "a finished pass has nothing to resume");
+    let all = seen_positions(&whole);
+    let burst_start = all.len() - plan.hot_burst_steps;
+    println!("{} solves, {} checkpoints, burst from solve {burst_start}", all.len(), texts.len());
+    for (k, (solved, text, progress)) in texts.iter().enumerate() {
+        let mut resumed = Sampler::resume(text).unwrap_or_else(|e| panic!("checkpoint {k}: {e}"));
+        assert_eq!(resumed.checkpoint("prov", 0, 0).as_deref(), Some(text.as_str()), "checkpoint {k} round-trips");
+        let p = resumed.progress();
+        let restarted_refs = progress.stage == "references" && progress.done > 0;
+        if !restarted_refs {
+            // (the stage: the resumed pass names the next job, the running one the job it last ran)
+            assert_eq!((p.done, p.total, p.skipped, p.failed), (progress.done, progress.total, progress.skipped, progress.failed), "checkpoint {k}");
+        }
+        let mut t = PairMorse::h2();
+        let mut s2 = new_surrogate();
+        while resumed.step(&mut t, &mut s2, &mut never()).unwrap().is_some() {}
+        let rest = seen_positions(&t);
+        let want: Vec<Vec<f64>> = all[*solved..].iter().filter(|g| g.len() > 3).cloned().collect();
+        let got: Vec<Vec<f64>> = rest.iter().filter(|g| g.len() > 3).cloned().collect();
+        assert_eq!(got.len(), want.len(), "checkpoint {k}: the same number of molecule solves left");
+        // every non-burst job bit for bit, and the burst's next evaluation
+        let non_burst = all[(*solved).min(burst_start)..burst_start].iter().filter(|g| g.len() > 3).count();
+        let exact = (non_burst + 1).min(want.len());
+        assert_eq!(got[..exact], want[..exact], "checkpoint {k}: the remaining jobs");
+        let q = resumed.progress();
+        assert_eq!((q.done, q.total, q.skipped, q.failed, q.finished), (end.done, end.total, end.skipped, end.failed, true), "checkpoint {k}");
+        assert_eq!(resumed.samples_added(), sampler.samples_added(), "checkpoint {k}");
+    }
+    // a damaged or truncated file is refused, never half-read
+    let text = &texts[texts.len() / 2].1;
+    assert!(Sampler::resume(&text[..text.len() / 2]).is_err());
+    assert!(Sampler::resume(&text.replacen("plan ", "plan x ", 1)).is_err());
+    assert!(checkpoint_info("hello").is_err());
+}
+
+/// The surrogate's side (`Trainable::pass_checkpoint` / `resume_pass`): the samples file and the
+/// checkpoint written together resume the pass in a new surrogate, which ends with the samples the
+/// uninterrupted pass would have; a checkpoint is refused on another scene, with another sample
+/// count, or while a pass runs.
+#[test]
+fn a_pass_resumes_in_a_new_surrogate_from_its_samples_and_checkpoint() {
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 12, hot_burst_steps: 10, scan_points_per_pair: 8, seed: 2, ..SamplingPlan::default() };
+    let mut a = surrogate_over(&Shared::new(PairMorse::h2()));
+    let mut refs = AtomReferences::default();
+    Trainable::start_pass(&mut a, &scene, &plan, &mut refs).unwrap();
+    for _ in 0..15 {
+        Trainable::pass_step(&mut a, &mut never()).unwrap();
+    }
+    let text = Trainable::pass_checkpoint(&a).expect("a running pass");
+    let path = tmp("resume.model");
+    Trainable::save(&a, &path).unwrap();
+    let held = a.samples();
+    // the uninterrupted pass, for comparison
+    while Trainable::pass_step(&mut a, &mut never()).unwrap().is_some() {}
+    let info = checkpoint_info(&text).unwrap();
+    assert_eq!((info.samples, info.pass_start, info.done, info.total), (held, 0, 15, Trainable::progress(&a).unwrap().total));
+
+    let mut b = surrogate_over(&Shared::new(PairMorse::h2()));
+    Trainable::load(&mut b, &path, &scene).unwrap();
+    // another scene, another count, a running pass: refused, nothing changed
+    let mut moved = scene.clone();
+    moved.nuclei[1].pos[0] += 0.1;
+    assert!(Trainable::resume_pass(&mut b, &moved, &text, &mut refs).unwrap_err().contains("not the one"));
+    let mut c = surrogate_over(&Shared::new(PairMorse::h2()));
+    assert!(Trainable::resume_pass(&mut c, &scene, &text, &mut refs).unwrap_err().contains("not saved together"));
+    assert!(!Trainable::pass_active(&b));
+    Trainable::resume_pass(&mut b, &scene, &text, &mut refs).unwrap();
+    assert!(Trainable::resume_pass(&mut b, &scene, &text, &mut refs).unwrap_err().contains("already running"));
+    assert!(Trainable::take_notes(&mut b).iter().any(|n| n.contains("sampling pass resumed at sample 16 of")));
+    while Trainable::pass_step(&mut b, &mut never()).unwrap().is_some() {}
+    assert_eq!(b.samples(), a.samples(), "the resumed pass ends with the uninterrupted one's samples");
+    assert_eq!(Trainable::fitted(&b), Trainable::fitted(&a));
+    let tags = |s: &SurrogateKs| tag_counts(s);
+    assert_eq!(tags(&b), tags(&a));
+    let _ = std::fs::remove_file(&path);
 }
