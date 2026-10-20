@@ -403,6 +403,31 @@ hand-tested the first build and asked for the merge.
   may be submitting; wgpu would otherwise panic), and the pop-out presents in Mailbox when it can, so its
   vsync never holds the main window's frames.
 
+### Training-pass robustness and resumable training (Oct 20, about 3 h, four commits + docs)
+
+The user's report: a hot-burst solve hit the SCF cap after 149 s "and the entire training failed", and could
+the active training be saved to disk and resumed after a crash or close. One Opus session; one physics-reviewer
+pass on the sampler changes; the user hand-tested and asked for the merge.
+
+- **The diagnosis was in the code, not the logs:** a failed burst step had no forces to continue with, so the
+  burst ended — and the burst is the pass's last stage. Now a failed step restarts the burst from the last solved
+  geometry with fresh Maxwell–Boltzmann velocities and a cold teacher (a sampler, not a trajectory); three failures
+  in a row end it.
+- **A per-sample time limit** (5× the pass's median solve, at least 15 s, after three solves) gives a hopeless
+  geometry up in seconds; it is logged as *time limit* and treated like a stall. The review caught a real bug
+  before it shipped: an abandoned GPU solve parks its half-converged state as the next warm start, so the solve
+  after a time-out has to be cold — without that, one time-out could cascade. It also asked for the limit to
+  double per time-out in a row (a GPU shared with another job), and for a time-out never to skip a pair's
+  shell check. Still open: measuring the restart's cold solve against a warm-dominated median on a big grid.
+- **Resumable passes:** the pass state (queued jobs with their geometries, counters, the burst's positions,
+  velocities and forces, solved shell checks) is a line-based text checkpoint written with the samples file to
+  `%LOCALAPPDATA%tomic-sandbox	raining` at most every 2 s; the Model tab offers Resume / Discard at the next
+  start. The one thing that cannot be saved is the thermostat's random stream (`StdRng` has no stable state), so
+  a resumed burst reseeds it. A test resumes after every solve of a pass and checks the teacher is asked about
+  the same remaining geometries.
+- **Process:** the session's own tool trouble was bash heredocs with apostrophes failing to parse; edits went
+  through small Python scripts that keep each file's CRLF line endings.
+
 ---
 
 ## Failures and dead ends
