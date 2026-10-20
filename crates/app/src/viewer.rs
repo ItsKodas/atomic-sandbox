@@ -3469,7 +3469,7 @@ nucleus 1 {a} {} {}
         use sim::{OrbitalDisplay, OrbitalInfo, OrbitalLabel, OrbitalRequest, Spin};
         let row = |spin, track| OrbitalInfo {
             spin, index: 0, track, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         };
         let payload = |what, rows| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,

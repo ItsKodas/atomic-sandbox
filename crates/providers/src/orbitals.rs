@@ -457,6 +457,14 @@ impl ViewState {
         track.checked_sub(self.base)
     }
 
+    /// Marks the payload's rows whose boundary surface reaches the box (`touching`: the producer's
+    /// raw tracks, `qm_gpu::orbitals::ViewUpdate::touching`) — `OrbitalInfo::touches_box`.
+    pub fn mark_touching(&self, payload: &mut OrbitalDisplay, touching: &[u32]) {
+        for r in &mut payload.rows {
+            r.touches_box = self.raw(r.track).is_some_and(|t| touching.contains(&t));
+        }
+    }
+
     /// Resolves the request against an update's rows (module doc, "The selection fallback").
     pub fn pick(&self, out: &qo::UpdateOutput) -> Pick {
         let export = |t: u32| t + self.base;
@@ -539,6 +547,8 @@ impl ViewState {
             smeared_1s: r.smeared_1s,
             residual: r.residual,
             not_converged: r.not_converged,
+            l: r.l,
+            touches_box: false,
         }).collect();
         if let Some(m) = rows.iter().map(|r| r.track + 1).max() {
             self.next = self.next.max(m);
@@ -732,12 +742,11 @@ impl CpuView {
         let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
         // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows, `PSEUDO_LABELS_NOTE`)
         let lone = nuclei.len() == 1 && state.ionic.is_none();
+        // one nucleus (pseudised too): the moments give the rows' angular character (`Row::l`)
+        let one = nuclei.len() == 1;
         let refs = |ch: usize| -> Vec<&[f64]> { raw[ch].clone() };
-        let (ms, rp) = if lone {
-            ([0, 1].map(|ch| qo::moments_many(grid, &refs(ch), pos[0])), [0, 1].map(|ch| qo::radial_profiles(grid, &refs(ch), pos[0])))
-        } else {
-            ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()])
-        };
+        let ms = if one { [0, 1].map(|ch| qo::moments_many(grid, &refs(ch), pos[0])) } else { [Vec::new(), Vec::new()] };
+        let rp = if lone { [0, 1].map(|ch| qo::radial_profiles(grid, &refs(ch), pos[0])) } else { [Vec::new(), Vec::new()] };
         let fs = [0, 1].map(|ch| raw[ch].iter().map(|p| qo::first_sign_functionals(grid, p, &pos)).collect::<Vec<_>>());
         let mx = [0, 1].map(|ch| raw[ch].iter().map(|p| p.iter().fold(0.0f64, |a, v| a.max(v.abs()))).collect::<Vec<_>>());
         let ow = [0, 1].map(|ch| raw[ch].iter().map(|p| qo::outer_weight(grid, p)).collect::<Vec<_>>());
@@ -763,6 +772,7 @@ impl CpuView {
             overlaps_prev: [overlaps[0].as_ref(), overlaps[1].as_ref()],
             cross: cross.as_ref(),
             moments: lone.then(|| [&ms[0][..], &ms[1][..]]),
+            character: one.then(|| [&ms[0][..], &ms[1][..]]),
             radial: lone.then(|| [&rp[0][..], &rp[1][..]]),
             first_sign: [&fs[0], &fs[1]],
             max_abs: [&mx[0], &mx[1]],
@@ -938,7 +948,7 @@ mod tests {
     fn row(spin: qo::Spin, index: usize, track: u32, energy: f64, occupation: f64) -> qo::Row {
         qo::Row {
             spin, index, track, slot: 0, energy, eps_range: (energy, energy), occupation, label: qo::Label::Index(index + 1), cluster: None, rotated: false,
-            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None,
         }
     }
 

@@ -626,7 +626,7 @@ fn cpu_step_on_gpu_scalars_matches_the_cpu_pipeline() {
         let occ = [vec![1.0; n_occ[0]], vec![1.0; n_occ[1]]];
         let input = cpu::UpdateInput {
             evals: [&state.evals_up, &state.evals_dn], occupations: [&occ[0], &occ[1]], overlaps_prev: [None, None], cross: cross.as_ref(),
-            moments: lone.then(|| [&ms[0][..], &ms[1][..]]), radial: lone.then(|| [&rp[0][..], &rp[1][..]]),
+            moments: lone.then(|| [&ms[0][..], &ms[1][..]]), character: lone.then(|| [&ms[0][..], &ms[1][..]]), radial: lone.then(|| [&rp[0][..], &rp[1][..]]),
             first_sign: [&fs[0], &fs[1]], max_abs: [&mx[0], &mx[1]], outer_weight: [&ow[0], &ow[1]],
             n_occ, n_computed: n_occ, n_core: [0; 4], z_sigma: lone.then(|| nuclei[0].z as f64 * state.sigma), tol_scf: settings.tol, unoccupied: None, face_limit: f64::INFINITY,
         };
@@ -764,7 +764,7 @@ fn diag_orbital_update_phases_at(ctx: &GpuContext, n: usize) {
             let input = cpu::UpdateInput {
                 evals: [&state.evals_up, &state.evals_dn], occupations: [&occ[0], &occ[1]],
                 overlaps_prev: [sc.overlaps_prev[0].as_ref(), sc.overlaps_prev[1].as_ref()], cross: sc.cross.as_ref(),
-                moments: lone.then(|| [&sc.moments[0][..], &sc.moments[1][..]]), radial: sc.radial.as_ref().map(|r| [&r[0][..], &r[1][..]]),
+                moments: lone.then(|| [&sc.moments[0][..], &sc.moments[1][..]]), character: lone.then(|| [&sc.moments[0][..], &sc.moments[1][..]]), radial: sc.radial.as_ref().map(|r| [&r[0][..], &r[1][..]]),
                 first_sign: [&sc.first_sign[0], &sc.first_sign[1]], max_abs: [&sc.max_abs[0], &sc.max_abs[1]], outer_weight: [&sc.outer_weight[0], &sc.outer_weight[1]],
                 n_occ: [5, 5], n_computed: [5, 5], n_core: [0; 4], z_sigma: None, tol_scf: 1e-5, unoccupied: None, face_limit: f64::INFINITY,
             };
@@ -1175,4 +1175,73 @@ fn unoccupied_uses_the_pseudo_hamiltonian() {
         }
     }
     assert!(compared >= 4, "at least the first two per channel converged on both sides ({compared})");
+}
+
+/// Boundary surfaces (user request 2026-10-20). (a) The box test: per drawn orbital the level
+/// enclosing the share and the largest ψ̃²/peak in the outer L/6 of the box come back in one more
+/// readback; a compact 1s (ζ = 2) stays clear of a ±4.5 Bohr box's wall zone, a diffuse one
+/// (ζ = 0.3: its largest value there is 3.2× its 90 % level) reaches it — as an f64 reference of the same test on the displayed fields
+/// says, each with a wide margin so the histogram's 1/32-decade bins cannot decide it. (b) An
+/// included unoccupied orbital is drawn at full weight as a boundary surface and not at all by
+/// density (it holds no electrons).
+#[test]
+fn boundary_surfaces_report_the_box_and_draw_ticked_unoccupied_orbitals() {
+    let Some(ctx) = ctx() else { return };
+    let grid = Grid::cube(31, 0.3);
+    let s = GpuSolver::new(ctx, &grid);
+    let c = [0.05, -0.03, 0.02];
+    let nuclei = [nucleus(c, 1)];
+    let up = vec![hydrogenic(&grid, c, 2.0, "1s"), hydrogenic(&grid, c, 0.3, "1s"), hydrogenic(&grid, c, 4.0, "2px")];
+    let dn = vec![hydrogenic(&grid, c, 2.0, "1s")];
+    let (mut state, _) = synthetic_state(&s, &up, &dn, &[-2.0, -0.5, -0.3], &[-2.0]);
+    state.occ_up[2] = 0.0; // the 2p_x: unoccupied
+    let mut view = OrbitalView::new(&s);
+    let vol = ColourVolume3D::new(&s.ctx, [31; 3]);
+    let probe = view.update(&s, &state, &nuclei, 1e-6, Product::None);
+    let track = |ch: Spin, i: usize| probe.out.rows.iter().find(|r| r.spin == ch && r.index == i).expect("row").track;
+    let (compact, diffuse, unocc, down) = (track(Spin::Up, 0), track(Spin::Up, 1), track(Spin::Up, 2), track(Spin::Down, 0));
+    let share = 0.9;
+    let boundary = Some(Boundary { share: share as f32, shell: false });
+
+    // (a) the occupied ones
+    let occupied = [compact, diffuse, down];
+    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &occupied, physical: false, boundary, out: &vol });
+    assert_eq!(upd.readbacks, 2, "the scalars, then the levels and face maxima");
+    // the f64 reference on the displayed fields: the level enclosing `share`, the largest value
+    // where the nearer wall is at most (n + 1)/6 grid units away
+    let n = grid.n[0];
+    let near = |q: usize| (q + 1).min(n - q);
+    let in_zone = |p: usize| {
+        let (i, j, k) = (p % n, (p / n) % n, p / (n * n));
+        near(i).min(near(j)).min(near(k)) as f64 <= (n + 1) as f64 / 6.0
+    };
+    let shown: [Vec<Vec<f64>>; 2] = [0, 1].map(|ch| view.prev[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect());
+    let mut want = Vec::new();
+    for r in upd.out.rows.iter().filter(|r| occupied.contains(&r.track)) {
+        let psi = &shown[r.spin.index()][r.index];
+        let peak = upd.out.scale[r.spin.index()][r.index].powi(2);
+        let mut v: Vec<f64> = psi.iter().map(|x| x * x / peak).collect();
+        let face = (0..grid.len()).filter(|&p| in_zone(p)).map(|p| v[p]).fold(0.0, f64::max);
+        v.sort_by(|a, b| b.total_cmp(a));
+        let total: f64 = v.iter().sum();
+        let mut cum = 0.0;
+        let level = v.iter().copied().find(|x| { cum += x; cum >= share * total }).expect("a level");
+        println!("track {}: level {level:.3e} of the peak, wall-zone max {face:.3e} (ratio {:.2})", r.track, face / level);
+        assert!(!(0.8..=1.25).contains(&(face / level)), "track {}: the reference is too close to call ({:.2})", r.track, face / level);
+        if face >= level { want.push(r.track); }
+    }
+    let mut got = upd.touching.clone();
+    got.sort_unstable();
+    assert_eq!(got, want, "the GPU's box test against the f64 reference");
+    assert_eq!(want, vec![diffuse], "the diffuse 1s reaches the walls' zone, the compact ones do not");
+
+    // (b) the ticked unoccupied 2p_x: drawn as a boundary surface, not by density
+    let alpha = |v: &[[f32; 4]]| v.iter().map(|t| t[3]).fold(0.0f32, f32::max);
+    let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &[unocc], physical: false, boundary, out: &vol });
+    let a = alpha(&vol.read_back(&s.ctx).expect("readback"));
+    assert!((a - 1.0).abs() < 1e-3, "full weight inside its boundary: max alpha {a}");
+    assert!(upd.touching.is_empty(), "the 2p_x (ζ 4) stays inside");
+    view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &[unocc], physical: false, boundary: None, out: &vol });
+    let a = alpha(&vol.read_back(&s.ctx).expect("readback"));
+    assert_eq!(a, 0.0, "by density an unoccupied orbital has nothing to draw");
 }

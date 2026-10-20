@@ -322,6 +322,51 @@ impl ShowMode {
     }
 }
 
+/// The Orbitals tab's quick presets for All orbitals coloured (user request 2026-10-20): each sets
+/// the include list and `ColourLook::hide_core` (the draw look — shell, filled or density, the
+/// enclosed share — stays), resolved against the rows on screen when applied
+/// (`ui::actions::preset_include`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColourPreset {
+    /// Every occupied orbital but the core ones (`hide_core`).
+    Valence,
+    /// The occupied ↑ orbitals only.
+    OneSpin,
+    /// The occupied orbitals of p character (`OrbitalInfo::l` = 1: a lone atom's, pseudised or
+    /// not; a molecule's orbitals have none).
+    POnly,
+    /// Every occupied orbital, core included: the default.
+    Everything,
+}
+
+impl ColourPreset {
+    pub const ALL: [ColourPreset; 4] = [ColourPreset::Valence, ColourPreset::OneSpin, ColourPreset::POnly, ColourPreset::Everything];
+
+    /// The button's text.
+    pub fn title(self) -> &'static str {
+        match self {
+            ColourPreset::Valence => "valence only",
+            ColourPreset::OneSpin => "one spin",
+            ColourPreset::POnly => "p only",
+            ColourPreset::Everything => "everything",
+        }
+    }
+
+    /// The word a replay script and `--ui preset=` use.
+    pub fn word(self) -> &'static str {
+        match self {
+            ColourPreset::Valence => "valence",
+            ColourPreset::OneSpin => "one-spin",
+            ColourPreset::POnly => "p",
+            ColourPreset::Everything => "everything",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<ColourPreset> {
+        ColourPreset::ALL.into_iter().find(|p| p.word() == w)
+    }
+}
+
 /// `UiState::orbital_pick` before the user has picked a row: a track no producer has issued, so
 /// the provider's selection fallback shows the HOMO (and the payload says which).
 pub const HOMO_TRACK: u32 = sim::TRACK_HOMO;

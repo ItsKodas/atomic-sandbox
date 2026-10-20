@@ -2454,7 +2454,7 @@ impl Orbiting {
         log.payloads += 1;
         let row = OrbitalInfo {
             spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         };
         // a view with unoccupied orbitals: a status, saying "interrupted" for the next
         // `interrupt_next` payloads (Task 4 re-review N2)
@@ -2684,7 +2684,7 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
     let side = |job: u64, what: OrbitalRequest, tracks: &[u32], unocc: u8| -> SideDisplay {
         let rows = tracks.iter().enumerate().map(|(i, &t)| OrbitalInfo {
             spin: Spin::Up, index: i, track: t, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(i + 1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
         }).collect();
         let unoccupied = (unocc > 0).then(|| UnoccupiedStatus { requested: unocc, ..Default::default() });
         let o = OrbitalDisplay {

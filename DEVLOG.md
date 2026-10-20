@@ -339,6 +339,26 @@ builder's CPU unit tests, seconds; `cargo test -p app --release --bin app` once 
   The first build waited behind other sessions' suites; the user chose a low-priority `-j 4` build
   instead, which took 30 s.
 
+### Orbital colour follow-ups (Oct 20, about 3 h including two waits for other sessions' GPU suites)
+
+The user compared All orbitals coloured with a textbook viewer (three clean p dumbbells) and found ours
+cluttered. One Opus session, no subagents; the user hand-tested the build.
+
+- **Root cause of "two colours per orbital"**: colour slots were already shared across spins, but only
+  when a *new* ↓ track overlapped an ↑ row by ≥ 0.9. A pseudised O's ↓ p set was rotated independently of
+  its ↑ set, so one ↓ p had no partner above 0.9 and got a fifth colour (legend `#1 #2 #3 #4 #3`). A
+  degenerate ↓ set now rotates onto the ↑ rows it lies within, and ↓ rows re-pair with their ↑ partner at
+  every update.
+- **Pseudised atoms are now aligned to the cell axes** like labelled ones (their rows stay `#k`), and every
+  row carries its angular character `l`, which the new **p only** preset reads (off for molecules).
+- **Presets** (valence only, one spin, p only, everything), **ticked unoccupied orbitals** drawn as boundary
+  surfaces, and a **box warning**.
+- **Failure worth remembering**: the box warning was first specified as "the 90 % surface reaches the
+  outermost grid plane". It never fired: ψ = 0 on the Dirichlet walls keeps the outermost plane tiny even
+  in a 33³ × 0.15 box that pushed O's HOMO from −0.34 to −0.10 Ha. A screenshot of exactly that case caught
+  it; the test now uses the box rule's outer-L/6 zone, verified to fire there and to stay quiet in the
+  default boxes (O atom, water).
+
 ### Viewer capture (Oct 20, first commit 08:44, last 09:33, about 2 h with the build)
 
 Screenshot and Record buttons at the top right of the 3D view (`crates/app/src/capture/`,

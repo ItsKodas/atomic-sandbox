@@ -936,6 +936,7 @@ impl GpuKs {
         // the eigensolver tolerance the converged step ran at: the effective one (grid-aware)
         let noise = u.spin.noise_l1(settings.tol, solver.profile().eig_tol_used);
         let mut payload = orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, noise, pick, field, status);
+        orb.mark_touching(&mut payload, &u.touching);
         if state.ionic.is_some() && nuclei.len() == 1 {
             payload.notes.push(crate::orbitals::PSEUDO_LABELS_NOTE.into());
         }

@@ -102,7 +102,7 @@ const SPECS: &[Spec] = &[
         shader: "colour_accumulate",
         bindings: &[(0, U), (1, R), (2, R), (3, R), (4, R), (5, R), (6, R), (7, RW), (8, TW), (9, R)],
     },
-    Spec { entry: "enclosure_hist", shader: "enclosure", bindings: &[(0, U), (1, R), (2, RW)] },
+    Spec { entry: "enclosure_hist", shader: "enclosure", bindings: &[(0, U), (1, R), (2, RW), (3, RW)] },
     Spec { entry: "enclosure_level", shader: "enclosure", bindings: &[(4, U), (5, R), (6, RW)] },
     Spec { entry: "sample_density", shader: "sample", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
     // M7 Task 8a (shaders/ionic.wgsl, `ionic`; the occupation-weighted density in pointwise.wgsl)
