@@ -428,6 +428,30 @@ pass on the sampler changes; the user hand-tested and asked for the merge.
 - **Process:** the session's own tool trouble was bash heredocs with apostrophes failing to parse; edits went
   through small Python scripts that keep each file's CRLF line endings.
 
+### M7 leftovers (Oct 20, about 7 h wall clock including a pause and three waits for other sessions' GPU suites)
+
+The last items before M8: the four minors the M7 final review parked, and the plan's unfinished visual check
+(Task 13 Step 5). One Opus session; one physics-reviewer pass on the shell-fence and shell-check changes
+(verdict: ship); the user gave the visual verdict on the screenshots and asked for the merge.
+
+- **Fixed with tests:** the Activity tab's pair curves now refuse a fenced shell band as strict mode does (and
+  show an audit fence with nothing quarantined, which they had skipped too); a pass's shell checks are judged only
+  against that pass's own refit, otherwise said "stays unmeasured" (before: a silent drop, or an earlier fit's
+  verdict); a run without a GPU says the CPU dimer check's ≈ 40 min in the status line and on the model offer's
+  row before Apply (it said ≈ 1 min).
+- **Ruled, not changed:** the provenance tag keeps hashing the dimer gate's procedure rather than its verdict.
+  Every existing model file loads or is refused as before. The premise (each verdict outside the GPU-vs-CPU
+  spread: nearest today 0.0037 Bohr against 0.0025) is now asserted by the GPU dimer-gate test.
+- **The visual check:** relaxed water under `All` (a new screenshot key `wait=relax`) at 104.36°, the arc and
+  label at O. The lone-pair oracle as written ("two lobes on the O isosurface at the published threshold") could
+  not pass: design §8 publishes no threshold, and the total density has no lobes at any of 0.05–0.4 × max. The
+  lobes are in the HOMO 1b₁, recorded that way and accepted by the user. The shots also caught a display bug: the
+  Orbitals tab told the pseudo-O its core was smeared (Zσ = 1.2).
+- **Process:** one honesty catch before it landed: a first draft attributed the 0.45° gap to the oracle's 104.8°
+  to "the stopping rule"; the oracle was at a different grid too, so the record now says it is not attributed by
+  a run. The merge of main met main's resumable passes in the same function (`finish_pass`); a cancelled pass
+  deletes its checkpoint, so "the pass ended before its shell check" stays true.
+
 ---
 
 ## Failures and dead ends
