@@ -27,14 +27,58 @@
 //!    ‖ΔF_j‖ / pred_force_std_j, E[z²] = 1 for a calibrated posterior — the spec's "predicted
 //!    uncertainty vs measured error", reported as the calibration factor κ_c.
 //!
+//! # The evidence window (fix round 2: evidence ages by model generation)
+//!
+//! A history point is a measurement of the model that judged it (`AuditPoint::model_gen`). Once a
+//! refit has taught the model at the geometries a point measured — every fallback and audit answer
+//! is a training sample — that point describes a model that no longer answers, and the ring would
+//! otherwise keep it for 4096 points: a class refused on its audits receives only rule-4b
+//! fallbacks afterwards, capped at the audits' weight, so perfect fallbacks of every later model
+//! could never bring W below the refusing audits' share (the task review's I4: 8 audits at 1.46×
+//! leave W ≥ 1.03 > LEAVE), and one 3× atom would block the entry guard below for the ring's
+//! lifetime. So per class the evidence is a **window of whole generations**: walking the class's
+//! jurisdiction points from the newest generation back, generations are taken until they hold at
+//! least [`WINDOW_POINTS`] = 300 points; older points are aged out (`ClassCalibration::aged`).
+//! With fewer than 300 points in the ring nothing ages. A generation is never split: the points one
+//! model produced are judged together.
+//!
+//! What this does, both ways: evidence produced by a model **does not age while that model
+//! stands** — more fallbacks under the refused model are added to the same window as the refusing
+//! audits, capped, and cannot outvote them; after a refit (which has the failing geometries in its
+//! training set) the newer models' own comparisons accumulate, and once they reach 300 points the
+//! verdict computed at the following refit reads them alone. Released after a teaching refit and
+//! the newer models' own evidence, blocked until then (`evidence_ages_by_model_generation_both_ways`,
+//! `a_class_refused_on_its_evidence_reenters_after_a_teaching_refit`) — and never after more than
+//! 300 newer points, where the whole ring kept the refusing points for 4096.
+//!
+//! Why 300: the window feeds two statistics with two requirements, and the stricter one sets it.
+//! (1) The rms must not be noisier than the hysteresis band tolerates: the rms of n χ²₁-like draws
+//! scatters by 1/√(2n) relative (below), and two sigma of that inside the band √2 − 1 = 0.414 needs
+//! n ≥ 11.7. (2) The worst-atom guard must be able to **see a tail**: a window free of 3× atoms has
+//! to make a 3× tail at the rate the audited runs measured unlikely — fix round 1 measured 1 judged
+//! answer of 67 beyond 3× the bound (1.5 %) on a many-body class whose rms sat inside the bound;
+//! for a tail rate p = 1 % a window of n points shows none with probability 0.99ⁿ, ≤ 5 % from
+//! n = 298 → 300. Consecutive MD points are correlated, so the effective n is smaller than the
+//! count (the window errs on the side of seeing too little); that is what the hysteresis and the
+//! per-step rules 6/8 are for. The first fix-round-2 draft used 12 (requirement 1 alone) and the
+//! gated repro measured why that is wrong: the many-body class's bad first rule-4b points (NVE run,
+//! per-step rms up to 2.1× the bound) aged out behind 12 benign newer ones, the class entered on 3
+//! points, and — the run's audits off — no comparison of its answers ever reached the window, so it
+//! answered the hot run (673 steps; 27 judged answers beyond 3× the force bound or the energy tier,
+//! up to 5.4× and 3.4e-3 Ha/atom). Generation numbers are monotone within a provider and an install
+//! moves the provider's generation past every generation in the installed history
+//! (`install_sidecar`), so "newer" is a comparison of numbers.
+//!
 //! # The statistics
 //!
-//! Per class c, over its jurisdiction points p (weights w_p below; n_c = the number of points):
+//! Per class c, over its jurisdiction points p in the window (weights w_p below; n_c = the number
+//! of points):
 //!
 //! ```text
 //! W_c    = √( Σ_p w_p w̄_p² / Σ_p w_p ),   w̄_p² = mean over the point's atoms of class c of (‖ΔF_j‖/√3 / b_j)²     the measured force error, in bound units
 //! W_E,c  = √( Σ_p w_p (|ΔE_p|/N_p / tier)² / Σ_p w_p )                                                        the measured energy error, in tier units
 //! κ_c    = max(1, ẑ_c) · (1 + 1/√(2 n_c)),   ẑ_c² = Σ_p w_p z̄_p² / Σ_p w_p,  z̄_p² = mean of z_j² over the class atoms   the calibration factor (a readout)
+//! A_c    = max over the window's points and their class atoms of ‖ΔF_j‖/√3 / b_j                       (ClassLoo::worst_atom)      the worst atom
 //! R_c    = RMS over the class's fitted atoms of ‖r_F,j‖/√3 / b_j      (ClassLoo::force_rms)       the LOO force error
 //! R_E,c  = RMS over the class's samples of |r_E|/N / tier               (ClassLoo::energy_rms)      the LOO energy error
 //! V_c    = max( R_c,  W_c · (1 + 1/√(2 n_c)) )                          (ClassLoo::measured for the second term)   the verdict's force value
@@ -59,17 +103,20 @@
 //! together at most max(n_audits, [`MIN_EVIDENCE`]) — spread evenly — so one class refusal
 //! repeated over a heating run (3313 near-identical pair points in the baseline) is worth one
 //! class's evidence and never outweighs the audits (controller ruling), yet a refused class with
-//! no audits can still be calibrated by its own fallbacks. Points refused by rules 5/5b/5d/5e/6/7
-//! or the fences are not evidence: those rules refuse whatever the class verdict says, and their
-//! errors (z rms 12–54 in the baseline: the posterior extrapolating) argue for *those* rules, not
-//! about the model inside their reach — including a class refusal the variance verdict would have
+//! no audits can still be calibrated by its own fallbacks. The evidence count n_a + min(n_f, cap)
+//! is formed in integers (fix round 2, the task review's I1: as n_a + (min(n_f, cap)/n_f)·n_f it
+//! came out 2.9999999999999996 at n_f = 47, 94, 147, … and silently dropped the class to the max
+//! rule — a refit-time knife-edge from rounding). Points refused by rules 5/5b/5d/5e/6/7 or the
+//! fences are not evidence: those rules refuse whatever the class verdict says, and their errors
+//! (z rms 12–54 in the baseline: the posterior extrapolating) argue for *those* rules, not about
+//! the model inside their reach — including a class refusal the variance verdict would have
 //! refused as well, which `evaluate` codes apart (`super::HISTORY_RULE_CLASS_AND_VARIANCE`). The
 //! **inflation** (1 + 1/√(2n)) is one sigma of the estimate's own scatter — the rms of n draws of a
 //! χ²₁-like variable (a dimer's error has one effective component; Var = 2) scatters by ≈ 1/√(2n)
 //! relative: ×1.41 at 3 points, ×1.14 at 26, ×1.04 at 336. It is applied with n = the number of
 //! points (the scatter is a property of the draws), while the weights settle influence (review
 //! M1). The energy is judged by its measured error, never by z_E (biased: +1.7 σ_E median at n 26,
-//! Task 1 review M5). A comparison that is not a number (NaN or ∞) makes W and κ infinite: the
+//! Task 1 review M5). A comparison that is not a number (NaN or ∞) makes W, A and κ infinite: the
 //! worst evidence, never dropped (the activity Task 3b ruling). R_c stays as the floor — the model
 //! is never trusted beyond its own leave-one-out; robust, being an RMS over hundreds of atoms.
 //!
@@ -77,34 +124,48 @@
 //!
 //! A class with fewer than Q′ samples is untrusted (`ClassKey::Samples`, as before). Otherwise:
 //!
+//! - **The worst-atom guard** ([`WORST_ATOM`] = 3; `ClassKey::WorstAtom`): an untrusted class does
+//!   not **enter** while any point in its window has an atom measured beyond 3× its bound — at
+//!   every evidence count (fix round 2, the controller's ruling on the entry question); while the
+//!   class has fewer than [`MIN_EVIDENCE`] points such an atom also makes a trusted class leave.
+//!   For a calibrated posterior at std = bound, P(χ²₃/3 > 9) = 5.9e-6 per atom: such an error is a
+//!   posterior that is wrong somewhere the class would answer, not an unlucky draw (the repro
+//!   test's own derivation). Why at entry and at every n: the many-body error is heavy-tailed
+//!   (refused-step max/rms 4–6 against ≈ 1.9 for a calibrated Gaussian), so an rms over the
+//!   benign early points of a refused class — at any n — admitted it before the compact
+//!   collisions that followed reached 3–5× (the fix-round-1 measurement). A trusted class with
+//!   evidence keeps being judged by its rms (rule 8's audits fail a trusted model's 3× answer per
+//!   step and the window then holds the failing audit). The window ages the guard's points too.
 //! - **calibrated** (n_c ≥ [`MIN_EVIDENCE`] = 3 points): untrusted → trusted when V_c ≤ [`ENTER`]
 //!   = 1/√2 and V_E,c ≤ ENTER; trusted → stays while V_c ≤ [`LEAVE`] = 1 and V_E,c ≤ LEAVE. The
 //!   class is never trusted with its measured rms error beyond the bound — the tolerance rules 6
 //!   and 8 use — and enters only once that error is clearly inside: the band is a factor √2 in
 //!   error (2 in variance), equal to the estimate's one-sigma scatter at n = 3 and wider from n = 4
-//!   (review M3), so refit-to-refit jitter of W and R does not flip the verdict.
+//!   (review M3), so refit-to-refit jitter of W and R does not flip the verdict. The refusal names
+//!   which term decided: the measured error (`ClassKey::Calibrated`), the leave-one-out floor
+//!   (`ClassKey::LooFloor`) or the measured energy (`ClassKey::MeasuredEnergy`).
 //! - **uncalibrated** (fewer than 3 points): the rule of before, unchanged — LOO force max ≤ 1 and
-//!   rms ≤ 1, LOO energy max ≤ 1 (`super::trust::class_refusal`) — **plus one guard the evidence
-//!   gives even when thin** (review I4): a class is refused (does not enter, and leaves) while any
-//!   jurisdiction point has an atom's error beyond [`WORST_ATOM`] = 3× its bound — for a
-//!   calibrated posterior at std = bound, P(χ²₃/3 > 9) = 5.9e-6 per atom, so such an error is a
-//!   posterior that is wrong, not unlucky (the repro test's own derivation). Without evidence
-//!   nothing is loosened; the fallbacks a refused class produces are themselves evidence (rule-4b
-//!   points), so a class the max rule refuses for one outlier earns the calibrated verdict after
-//!   three teacher steps of its own and a refit. A class whose only recent comparisons were
-//!   box-affected has no evidence from them (they leave no point): unverified, never passing by
-//!   calibration.
+//!   rms ≤ 1, LOO energy max ≤ 1 (`super::trust::class_refusal`) — plus the worst-atom guard both
+//!   ways. Without evidence nothing is loosened; the fallbacks a refused class produces are
+//!   themselves evidence (rule-4b points), so a class the max rule refuses for one outlier earns
+//!   the calibrated verdict after three teacher steps of its own and a refit. A class whose only
+//!   recent comparisons were box-affected has no evidence from them (they leave no point):
+//!   unverified, never passing by calibration.
 //!
 //! Three is the smallest count from which an rms can be told from a single draw — the count the
 //! audit burst already uses after a cleared failure ([`super::AUDIT_BURST`]). The hysteresis state
 //! is the verdict that stood when the refit, install or policy change began (`class_memory`,
 //! committed once it is done) and the generation it was entered at (`ClassLoo::trusted_since`);
-//! it is reset by a forget or an installed model (another model's verdict is no memory for this
-//! one — so a saved model with a verdict inside the band re-enters on load: review M2, documented,
-//! conservative). Numbers of record: `validate/references.md`, "M8a calibrated verdict".
+//! it is reset by a forget, and **saved with the model** (the sidecar's `class_memory` header key,
+//! fix round 2, the task review's M4): a reload, the worker's re-spawn with its carried model and a
+//! resumed training keep a verdict that sat inside the band, instead of re-entering. The refusal's
+//! words are [`refusal_words`], one function for the verdict and the provider's Log note (fix
+//! round 2, the task review's M2). Numbers of record: `validate/references.md`, "M8a calibrated
+//! verdict".
 
 use sim::activity::{EnvClass, TeachRule};
 use sim::ClassKey;
+use std::collections::BTreeMap;
 use surrogate::history::{AuditHistory, PointKind};
 
 use super::FallbackPolicy;
@@ -117,10 +178,16 @@ pub const LEAVE: f64 = 1.0;
 /// Evidence points (audits plus the capped rule-4b fallback weight) a class needs before the
 /// calibrated verdict judges it; below it the rule of before stands, with the [`WORST_ATOM`] guard.
 pub const MIN_EVIDENCE: usize = 3;
-/// With fewer than [`MIN_EVIDENCE`] points, one jurisdiction point with an atom's measured force
-/// error beyond this many times its bound refuses the class (review I4): P(χ²₃/3 > 9) = 5.9e-6 per
-/// atom for a calibrated posterior at std = bound.
+/// One jurisdiction point in the window with an atom's measured force error beyond this many
+/// times its bound keeps an untrusted class from entering (at every evidence count) and, with
+/// fewer than [`MIN_EVIDENCE`] points, makes a trusted one leave: P(χ²₃/3 > 9) = 5.9e-6 per atom
+/// for a calibrated posterior at std = bound.
 pub const WORST_ATOM: f64 = 3.0;
+/// The evidence window (module doc, "The evidence window"): the newest whole generations of a
+/// class's jurisdiction points holding at least this many points — enough that a window with no
+/// atom beyond [`WORST_ATOM`] makes a 3× tail at 1 % unlikely (0.99ⁿ ≤ 5 %: n ≥ 298), which also
+/// keeps two sigma of the rms's own scatter, 2/√(2n), far inside the hysteresis band √2 − 1.
+pub const WINDOW_POINTS: usize = 300;
 
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
@@ -130,14 +197,21 @@ pub struct ClassCalibration {
     /// κ_c: measured over predicted, ≥ 1 (1 without any evidence; ∞ when a comparison in the
     /// evidence was not a number). A readout; it decides nothing.
     pub factor: f64,
-    /// Audit points of the class in the evidence.
+    /// Audit points of the class in the window.
     pub audits: usize,
-    /// Rule-4b fallback points of the class in the evidence (before the weight cap).
+    /// Rule-4b fallback points of the class in the window (before the weight cap).
     pub fallbacks: usize,
-    /// n_c = Σw: the audits plus the capped fallback weight, in points.
-    pub evidence: f64,
-    /// The jurisdiction points of the class (audits + fallbacks): what the inflation counts.
+    /// n_c = Σw: the audits plus the capped fallback weight, in points — an integer, formed
+    /// exactly (module doc).
+    pub evidence: usize,
+    /// The jurisdiction points of the class in the window (audits + fallbacks): what the
+    /// inflation counts.
     pub points: usize,
+    /// The class's jurisdiction points older than the window (aged out; module doc).
+    pub aged: usize,
+    /// The oldest model generation in the window, `None` when the window is the whole ring
+    /// (fewer than [`WINDOW_POINTS`] points of the class held) or there is no evidence.
+    pub window_from: Option<u64>,
     /// ẑ_c before the floor and the inflation (NaN without evidence).
     pub z_rms: f64,
     /// W_c · (1 + 1/√(2n)): the measured force error in bound units, inflated (NaN without
@@ -146,15 +220,16 @@ pub struct ClassCalibration {
     /// W_E,c · (1 + 1/√(2n)): the measured energy error in tier units, inflated (NaN without
     /// evidence).
     pub measured_energy: f64,
-    /// The largest per-atom measured force error over the jurisdiction points, in bound units
-    /// (the [`WORST_ATOM`] guard's input; 0 without evidence).
+    /// A_c: the largest per-atom measured force error over the window's points, in bound units
+    /// (the [`WORST_ATOM`] guard's input; 0 without evidence, ∞ for a comparison that is not a
+    /// number).
     pub worst_atom: f64,
 }
 
 impl ClassCalibration {
     /// Enough evidence for the calibrated verdict ([`MIN_EVIDENCE`]).
     pub fn calibrated(&self) -> bool {
-        self.evidence >= MIN_EVIDENCE as f64
+        self.evidence >= MIN_EVIDENCE
     }
 }
 
@@ -181,7 +256,8 @@ pub struct ClassStats {
 pub enum ClassVerdict {
     Trusted,
     /// The first failing condition (its key, value and limit — `ClassLoo::refusal`) and the reason
-    /// in the refusal's words (the part after "isn't learned well enough yet (<class>: ").
+    /// in the refusal's words ([`refusal_words`]: the part after "isn't learned well enough yet
+    /// (<class>: ").
     Untrusted { key: ClassKey, value: f64, limit: f64, reason: String },
 }
 
@@ -200,24 +276,42 @@ fn sq(x: f64) -> f64 {
     if x.is_finite() { x * x } else { f64::INFINITY }
 }
 
-/// Per point and class: (w̄², z̄², the energy term, the worst atom ratio).
+/// Per point and class: (w̄², z̄², the energy term, the worst atom ratio), its generation and kind.
 struct PointEvidence {
+    gen: u64,
+    audit: bool,
     w2: f64,
     z2: f64,
     e2: f64,
     worst: f64,
 }
 
+/// The oldest generation of the window (module doc, "The evidence window"): from the newest
+/// generation back, whole generations until they hold [`WINDOW_POINTS`]; `None` = every point.
+fn window_from(points: &[PointEvidence]) -> Option<u64> {
+    let mut per_gen: BTreeMap<u64, usize> = BTreeMap::new();
+    for p in points {
+        *per_gen.entry(p.gen).or_default() += 1;
+    }
+    let mut held = 0usize;
+    for (&gen, &n) in per_gen.iter().rev() {
+        held += n;
+        if held >= WINDOW_POINTS {
+            return Some(gen);
+        }
+    }
+    None
+}
+
 /// The calibration per class from the history and the policy's bounds (module doc).
 pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration {
-    let mut audits: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
-    let mut fallbacks: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
+    let mut classes: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
     let tier = policy.energy_std_per_atom;
     for p in history.iter() {
         if !in_jurisdiction(p.kind) {
             continue;
         }
-        for c in 0..2 {
+        for (c, list) in classes.iter_mut().enumerate() {
             let code = c as u8 + 1;
             let (mut w2, mut z2, mut worst, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
             for j in 0..p.n_atoms {
@@ -234,32 +328,80 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
             if n == 0 {
                 continue;
             }
-            let ev = PointEvidence { w2: w2 / n as f64, z2: z2 / n as f64, e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier), worst };
-            match p.kind {
-                PointKind::Audit => audits[c].push(ev),
-                PointKind::Fallback { .. } => fallbacks[c].push(ev),
-            }
+            list.push(PointEvidence { gen: p.model_gen, audit: p.kind.is_audit(), w2: w2 / n as f64, z2: z2 / n as f64, e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier), worst });
         }
     }
     let per_class = std::array::from_fn(|c| {
-        let (n_a, n_f) = (audits[c].len(), fallbacks[c].len());
-        let cap = n_a.max(MIN_EVIDENCE) as f64;
-        // the fallbacks of the class together weigh at most the audits (never fewer than three)
-        let w_f = if n_f == 0 { 0.0 } else { (n_f as f64).min(cap) / n_f as f64 };
-        let den = n_a as f64 + w_f * n_f as f64;
-        if den == 0.0 {
-            return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0.0, points: 0, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0 };
-        }
-        let sum = |f: &dyn Fn(&PointEvidence) -> f64| audits[c].iter().map(f).sum::<f64>() + w_f * fallbacks[c].iter().map(f).sum::<f64>();
+        let all = &classes[c];
+        let from = window_from(all);
+        let inside = |e: &&PointEvidence| from.is_none_or(|g| e.gen >= g);
+        let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).collect();
+        let fallbacks: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| !e.audit).collect();
+        let (n_a, n_f) = (audits.len(), fallbacks.len());
         let points = n_a + n_f;
+        let aged = all.len() - points;
+        if points == 0 {
+            return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0 };
+        }
+        // the fallbacks of the class together weigh at most the audits (never fewer than three);
+        // the count in integers (review I1), the per-point weight only for the sums
+        let cap = n_a.max(MIN_EVIDENCE);
+        let evidence = n_a + n_f.min(cap);
+        let w_f = if n_f == 0 { 0.0 } else { n_f.min(cap) as f64 / n_f as f64 };
+        let den = evidence as f64;
+        let sum = |f: &dyn Fn(&PointEvidence) -> f64| audits.iter().map(|e| f(e)).sum::<f64>() + w_f * fallbacks.iter().map(|e| f(e)).sum::<f64>();
         let inflation = 1.0 + 1.0 / (2.0 * points as f64).sqrt();
         let z_rms = (sum(&|e| e.z2) / den).sqrt();
         let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
         let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
-        let worst_atom = audits[c].iter().chain(&fallbacks[c]).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-        ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence: den, points, z_rms, measured, measured_energy, worst_atom }
+        let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
+        ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom }
     });
     Calibration { per_class }
+}
+
+/// What the refusal's words read (a `ClassLoo` holds all of it; `class_verdict` passes its own).
+pub struct WordsInput {
+    pub samples: usize,
+    pub force_rms: f64,
+    pub force_max: f64,
+    pub energy_max: f64,
+    /// The measured force / energy errors (inflated), `None` without evidence.
+    pub measured: Option<f64>,
+    pub measured_energy: Option<f64>,
+    /// The evidence count and the calibration factor κ.
+    pub evidence: usize,
+    pub calibration: f64,
+}
+
+/// The words of a class refusal (key, value, limit): the part after "isn't learned well enough yet
+/// (<class>: " — the verdict's `reason` and the provider's Log note alike (one wording, review M2).
+/// The uncalibrated keys keep their words of before (pinned byte for byte by the refusal-string
+/// tests).
+pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> String {
+    let n = w.samples;
+    // "the model's own uncertainty was κ× too small" only when it says something (κ is floored at
+    // 1 and ∞ when a comparison failed: review I3)
+    let posterior = if w.calibration.is_finite() && w.calibration > 1.05 { format!("; the model's own uncertainty was {:.1}× too small there", w.calibration) } else { String::new() };
+    let over = format!("{} DFT comparison{}", w.evidence, if w.evidence == 1 { "" } else { "s" });
+    match key {
+        ClassKey::Samples => format!("{n} samples < Q′ {limit:.0}"),
+        ClassKey::Force => {
+            let energy = if w.energy_max > 1.0 { format!(", energy {:.1}× the tier", w.energy_max) } else { String::new() };
+            format!("LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {n} samples", w.force_max, w.force_rms)
+        }
+        ClassKey::Energy => format!("LOO energy error {:.1}× the tier, {n} samples", w.energy_max),
+        ClassKey::WorstAtom if w.evidence < MIN_EVIDENCE => {
+            format!("a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while fewer than {MIN_EVIDENCE} comparisons judge the class; {n} samples")
+        }
+        ClassKey::WorstAtom => format!("a DFT check found an atom's force {value:.1}× its bound — the class does not enter while its recent evidence holds an atom beyond {limit:.0}×; {n} samples"),
+        ClassKey::Calibrated => format!("DFT-measured force error {value:.2}× the bound over {over}, limit {limit:.2} (leave-one-out RMS {:.2}×){posterior}; {n} samples", w.force_rms),
+        ClassKey::LooFloor => format!(
+            "leave-one-out force RMS {value:.2}× the bound, limit {limit:.2} (DFT-measured {} over {over}); {n} samples",
+            w.measured.map_or("—".to_string(), |m| format!("{m:.2}×"))
+        ),
+        ClassKey::MeasuredEnergy => format!("DFT-measured energy error {value:.2}× the tier over {over}, limit {limit:.2}; {n} samples"),
+    }
 }
 
 impl Calibration {
@@ -267,53 +409,45 @@ impl Calibration {
     /// Q′ and the standing verdict `was_trusted` (the hysteresis; module doc, "The verdict").
     #[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
     pub fn class_verdict(&self, class: usize, st: &ClassStats, q_prime: usize, was_trusted: bool) -> ClassVerdict {
-        if st.samples < q_prime {
-            return ClassVerdict::Untrusted { key: ClassKey::Samples, value: st.samples as f64, limit: q_prime as f64, reason: format!("{} samples < Q′ {q_prime}", st.samples) };
-        }
         let cal = self.per_class[class];
+        let finite = |x: f64| (!x.is_nan()).then_some(x);
+        let words = WordsInput {
+            samples: st.samples,
+            force_rms: st.force_rms,
+            force_max: st.force_max,
+            energy_max: st.energy_max,
+            measured: if cal.points > 0 { finite(cal.measured) } else { None },
+            measured_energy: if cal.points > 0 { finite(cal.measured_energy) } else { None },
+            evidence: cal.evidence,
+            calibration: cal.factor,
+        };
+        let untrusted = |key: ClassKey, value: f64, limit: f64| ClassVerdict::Untrusted { key, value, limit, reason: refusal_words(key, value, limit, &words) };
+        if st.samples < q_prime {
+            return untrusted(ClassKey::Samples, st.samples as f64, q_prime as f64);
+        }
+        // the worst-atom guard: on entry at every evidence count, both ways while unverified
+        if (!was_trusted || !cal.calibrated()) && !(cal.worst_atom <= WORST_ATOM) {
+            return untrusted(ClassKey::WorstAtom, cal.worst_atom, WORST_ATOM);
+        }
         if !cal.calibrated() {
-            // the rule of before, unchanged — no evidence loosens nothing — plus the thin-evidence
-            // guard: an atom measured beyond 3× its bound is a posterior that is wrong (review I4)
-            if !(cal.worst_atom <= WORST_ATOM) {
-                return ClassVerdict::Untrusted {
-                    key: ClassKey::Calibrated,
-                    value: cal.worst_atom,
-                    limit: WORST_ATOM,
-                    reason: format!("a DFT check found an atom's force {:.1}× its bound (limit {WORST_ATOM:.0}× while unverified: {} of {MIN_EVIDENCE} comparisons), {} samples", cal.worst_atom, cal.points, st.samples),
-                };
-            }
+            // the rule of before, unchanged — no evidence loosens nothing
             return match super::trust::class_refusal(st.samples, q_prime, st.force_rms, st.force_max, st.energy_max) {
                 None => ClassVerdict::Trusted,
-                Some((ClassKey::Force, value, limit)) => {
-                    let energy = if st.energy_max > 1.0 { format!(", energy {:.1}× the tier", st.energy_max) } else { String::new() };
-                    ClassVerdict::Untrusted { key: ClassKey::Force, value, limit, reason: format!("LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples; unverified — {} of {MIN_EVIDENCE} comparisons", st.force_max, st.force_rms, st.samples, cal.points) }
-                }
-                Some((key, value, limit)) => ClassVerdict::Untrusted { key, value, limit, reason: format!("LOO energy error {:.1}× the tier, {} samples; unverified — {} of {MIN_EVIDENCE} comparisons", st.energy_max, st.samples, cal.points) },
+                Some((key, value, limit)) => untrusted(key, value, limit),
             };
         }
         let limit = if was_trusted { LEAVE } else { ENTER };
-        let gate = if was_trusted { "stays while ≤" } else { "enters at ≤" };
-        let evidence = format!("{} audits and {} class fallbacks", cal.audits, cal.fallbacks);
-        // the force: the measured error with the leave-one-out as the floor (NaN fails either way)
-        let v = if cal.measured.is_nan() || st.force_rms.is_nan() { f64::NAN } else { cal.measured.max(st.force_rms) };
-        if !(v <= limit) {
-            return ClassVerdict::Untrusted {
-                key: ClassKey::Calibrated,
-                value: v,
-                limit,
-                reason: format!(
-                    "measured error {v:.2}× the bound over {evidence} (DFT rms {:.2}×, leave-one-out RMS {:.2}×; the posterior {:.1}× too confident; {gate} {limit:.2}), {} samples",
-                    cal.measured, st.force_rms, cal.factor, st.samples
-                ),
-            };
+        // the force: the measured error with the leave-one-out as the floor (NaN fails either way);
+        // the key names the term that decided
+        let (w, r) = (cal.measured, st.force_rms);
+        if !(w <= limit) && !(w < r) {
+            return untrusted(ClassKey::Calibrated, w, limit);
+        }
+        if !(r <= limit) {
+            return untrusted(ClassKey::LooFloor, r, limit);
         }
         if !(cal.measured_energy <= limit) {
-            return ClassVerdict::Untrusted {
-                key: ClassKey::Energy,
-                value: cal.measured_energy,
-                limit,
-                reason: format!("measured energy error {:.2}× the tier over {evidence} ({gate} {limit:.2}), {} samples", cal.measured_energy, st.samples),
-            };
+            return untrusted(ClassKey::MeasuredEnergy, cal.measured_energy, limit);
         }
         ClassVerdict::Trusted
     }

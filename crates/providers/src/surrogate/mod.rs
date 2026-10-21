@@ -32,19 +32,23 @@
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
 //!    - **4b, untrusted class** (M6 Task 11 round 6; per atom since 2026-10-18; calibrated and
-//!      hysteretic since M8a Task 2; "Class-wise trust" below): a class among the query's atoms
-//!      (pair or many-body, by each atom's neighbour count within r_cut) is not trusted — its
-//!      fit's exact leave-one-out force RMS, scaled by the audit history's calibration factor for
-//!      the class, is beyond the verdict's limit (or, with fewer than three audited comparisons of
-//!      the class, the rule of before: a LOO ratio beyond 1) → teacher; sample kept (never thinned
-//!      while the class is short of Q′ samples — those earn its trust; thinned like rule 5
-//!      otherwise; never a copy, short or not: `is_label_copy`); reported on the teacher's surface
-//!      (the model's energy there is unvalidated); the comparison is a **rule-4b point of the audit
-//!      history**, the evidence that calibrates the class. "surrogate: this kind of environment
-//!      isn't learned well enough yet (pair: calibrated error 1.4× the bound — leave-one-out RMS
-//!      0.41× scaled by 3.5× from 20 audited comparisons, limit 1.00 — 273 samples)". Evaluated
-//!      with the model consulted; when rule 5 fires as well its more specific note is shown.
-//!      Draft mode answers anyway.
+//!      hysteretic since M8a Task 2; "Class-wise trust" below, [`calibrate`]): a class among the
+//!      query's atoms (pair or many-body, by each atom's neighbour count within r_cut) is not
+//!      trusted — with three or more DFT comparisons of the class in its evidence window (audits
+//!      and rule-4b fallbacks of the newest model generations, ≥ 300 points), max(its fit's
+//!      leave-one-out force RMS, the force error the teacher measured there, rms in bound units)
+//!      or the measured energy error is beyond the verdict's limit (1/√2 to enter, 1 to stay), or,
+//!      entering, one atom of the window was measured beyond 3× its bound; with fewer comparisons,
+//!      the rule of before (a LOO ratio beyond 1) or one measured atom beyond 3× → teacher; sample
+//!      kept (never thinned while the class is short of Q′ samples — those earn its trust; thinned
+//!      like rule 5 otherwise; never a copy, short or not: `is_label_copy`); reported on the
+//!      teacher's surface (the model's energy there is unvalidated); the comparison is a **rule-4b
+//!      point of the audit history**, the evidence that calibrates the class. "surrogate: this
+//!      kind of environment isn't learned well enough yet (pair: DFT-measured force error 1.40×
+//!      the bound over 20 DFT comparisons, limit 1.00 (leave-one-out RMS 0.41×); the model's own
+//!      uncertainty was 3.5× too small there; 273 samples)" (`calibrate::refusal_words`, the one
+//!      wording of the verdict and this note). Evaluated with the model consulted; when rule 5
+//!      fires as well its more specific note is shown. Draft mode answers anyway.
 //! 5. **Out of the training envelope** → teacher; sample kept (thinned); reported on the
 //!    teacher's surface (M6 Task 11, "One-surface energy accounting"). This guards the directions
 //!    the variance cannot: a linear model's predictive variance is a leverage in feature space
@@ -433,7 +437,7 @@
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
 //!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
-//! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix round 1, spec
+//! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
 //!   `validate/references.md`, "M8a calibrated verdict"): ≥ Q′ samples holding it (the trust
 //!   rule's minimum count), and the error the teacher **measured** where this verdict decides
@@ -442,7 +446,15 @@
 //!   refuse whatever the class verdict says, nor a class refusal rule 6/7 would have refused as
 //!   well, coded apart as `HISTORY_RULE_CLASS_AND_VARIANCE`) — one draw per point (ΣF = 0: a dimer
 //!   is one draw), a class's rule-4b points weighing together at most as much as its audits (never
-//!   fewer than three). Per class: W_c = rms over those points of the per-atom ‖F_teacher −
+//!   fewer than three; the count formed in integers, fix round 2). **The evidence ages by model
+//!   generation** (fix round 2): per class the window is the newest whole generations holding ≥
+//!   `WINDOW_POINTS` = 300 of its points — a point measures the model that judged it, and once the
+//!   newer models' own comparisons fill a window the older model's are aged out (a class refused
+//!   on its audits re-enters after a teaching refit and 300 newer comparisons instead of after 4096
+//!   later points; more fallbacks of the refusing model never outvote its audits). 300 so that a
+//!   window free of 3× atoms makes a 1 % tail of them unlikely (0.99³⁰⁰ < 5 %) — a 12-point
+//!   window aged a refused many-body class's bad first points out behind benign ones and let it
+//!   answer the gated repro's hot run 27 times beyond 3× the bound (`calibrate`, "Why 300"). Per class: W_c = rms over those points of the per-atom ‖F_teacher −
 //!   F_model‖/√3 over the atom's bound `force_bound(|F_teacher|)` (the variance rule's: max(2e-3,
 //!   10 %|F|) capped at 1e-2; |F_teacher| is stored per atom in the history for it), W_E,c = rms
 //!   of |E_teacher − E_model|/N over `energy_std_per_atom`, each × (1 + 1/√(2n)) — one sigma of
@@ -456,12 +468,15 @@
 //!   (half the bound's variance) and a trusted one stays while both ≤ `LEAVE` = 1 (the bound
 //!   itself) — a √2 band, equal to the estimate's one-sigma scatter at n = 3 and wider from n = 4,
 //!   so refit-to-refit jitter cannot flip it; the memory is the verdict that stood when the refit
-//!   began (`class_memory`, `ClassLoo::trusted_since`), reset by a forget or an installed model
-//!   (a reload re-enters). **Below three points of evidence** (`MIN_EVIDENCE`) the posterior's
-//!   claims are unverified and the rule of before stands unchanged — RMS ≤ 1 **and** max ≤ 1 on
-//!   the force, LOO energy max ≤ 1 (`trust::class_refusal`) — plus the one guard thin evidence
-//!   gives: an atom measured beyond `WORST_ATOM` = 3× its bound refuses (P(χ²₃/3 > 9) = 5.9e-6 for a
-//!   calibrated posterior at the bound: wrong, not unlucky). Nothing is loosened without
+//!   began (`class_memory`, `ClassLoo::trusted_since`), reset by a forget and **saved with the
+//!   model** (the sidecar's `class_memory`, fix round 2: a reload, a worker re-spawn and a resumed
+//!   training keep a band verdict). **The worst-atom guard** (`WORST_ATOM` = 3; fix round 2 at
+//!   every n): an untrusted class does not enter while an atom of its window was measured beyond
+//!   3× its bound (P(χ²₃/3 > 9) = 5.9e-6 for a calibrated posterior at the bound: wrong, not
+//!   unlucky) — an rms over a heavy-tailed error's benign early points does not bound its tail.
+//!   **Below three points of evidence** (`MIN_EVIDENCE`) the posterior's claims are unverified and
+//!   the rule of before stands unchanged — RMS ≤ 1 **and** max ≤ 1 on the force, LOO energy max ≤
+//!   1 (`trust::class_refusal`) — and the guard refuses both ways. Nothing is loosened without
 //!   evidence, and a class the max refuses for one outlier earns the calibrated verdict from its
 //!   own three rule-4b fallbacks (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO max
 //!   1.08×, enters after 10 fallback steps and holds —
@@ -470,7 +485,11 @@
 //!   class's environments (what rule 6's "std ≤ bound" claims per step), measured by the teacher
 //!   at the geometries the class would answer. A sample whose LOO is undefined (I − H_ss singular)
 //!   counts as infinitely off (RMS ∞); a comparison in the evidence that is not a number makes W
-//!   and κ infinite.
+//!   and κ infinite. The refusal names the term that decided (`ClassKey::Calibrated` the measured
+//!   force, `LooFloor` the leave-one-out floor, `MeasuredEnergy`, `WorstAtom`; the uncalibrated
+//!   `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
+//!   H₃⁺): a many-body class the max rule refuses for one compressed trimer (LOO max 1.57×)
+//!   enters on its own rule-4b comparisons and holds (`a_compressed_trimer_does_not_flip_the_many_body_verdict`).
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
 //! - **4b fallbacks**: kept unthinned while the class is short of Q′ samples, thinned like rule 5
@@ -483,7 +502,8 @@
 //!   around the blockers" below).
 //!
 //! The per-class numbers (samples, LOO force RMS and max ratios, energy RMS and max ratios, the
-//! calibration factor and its evidence, the verdict and since when) are in
+//! calibration factor, the measured errors, the worst measured atom and the evidence, the verdict
+//! and since when) are in
 //! `TrainableStatus::class_loo` for the Model tab; the readiness readout names the class's worst
 //! sample and its origin. **Costs of the max** (measured, rule 7; the uncalibrated rule, which
 //! stands until a class has three audited comparisons): one sample alone in its region decides
@@ -531,10 +551,10 @@
 //! outliers mark where the fit is unreliable *between* samples too, not only next to themselves.
 //! The max rule stood until M8a Task 2's calibrated verdict (above), which differs from that
 //! experiment in both respects that made it fail: the outliers stay in the class's RMS (nothing is
-//! set aside), and a class is trusted beyond the max rule only on **evidence** — audited
+//! set aside), and a class is trusted beyond the max rule only on **evidence** — the teacher's
 //! comparisons at visited geometries of the class, which is where that experiment's answers were
-//! off (the M8a baseline's many-body fallback points: z rms 12–14) and where a large κ keeps the
-//! class refused.
+//! off (the M8a baseline's many-body fallback points: z rms 12–14) and where a measured error
+//! beyond the limit, or one atom beyond 3× its bound, keeps the class refused.
 //!
 //! **Ruling (shell → fence)** (2026-10-19, the coordinator on the round-4 LiH measurement): a
 //! failed shell check (`sampling` module doc, 3.) is a measured **structural** limitation of the
@@ -557,7 +577,8 @@
 //! (4.2e-3 > 2.4e-3 Ha/Bohr), energy −6.2e-4 Ha (0.31× the tier); at the preset's 57³ × 0.25 it
 //! is box-affected (its density reaches the faces) and not judged.
 //!
-//! **The knife edge (open, the M6 handoff item; documented, not changed).** Under the max rule one
+//! **The knife edge (the M6 handoff item; closed by M8a Task 2's calibrated verdict, above — the
+//! record of what it was).** Under the max rule one
 //! sample decides its class, and the verdict has no hysteresis: in the user's live water + 2 H
 //! session (2026-10-18, the preview build) a model trusted for ~16 min kept one audit sample, the
 //! refit moved the many-body class's worst leave-one-out to 1.0× — #251, a pass scan point with
@@ -566,9 +587,10 @@
 //! it. The class rule is not changed here; what is: the pass no longer fits the outer sixth of the
 //! cutoff (`sampling` module doc, 3., `SCAN_CUTOFF_FRACTION` — where such chronic outliers came
 //! from) and measures it instead with one shell check per crossing pair, and consecutive class-rule fallbacks far from the blocker prompt the teach-around offer
-//! (`teach::TEACH_PROMPT_STREAK`; one click, never automatic). A calibrated class verdict (a
-//! margin, hysteresis, or a robust statistic with its false-trust rate measured on the stuck-escape
-//! repro) remains open.
+//! (`teach::TEACH_PROMPT_STREAK`; one click, never automatic). The calibrated class verdict that
+//! closes it (hysteresis, the measured error, evidence by generation) is M8a Task 2's, above;
+//! its false-trust rate on the stuck-escape repro is in `validate/references.md`, "M8a calibrated
+//! verdict".
 //!
 //! # Trust recovery and quarantine (ruling S15, Task 8 fix round 3)
 //!
@@ -876,7 +898,7 @@ use ledger::*;
 use policy::*;
 use quarantine::*;
 pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
-pub use calibrate::{calibrate, Calibration, ClassCalibration, ClassStats, ClassVerdict, ENTER, LEAVE, MIN_EVIDENCE, WORST_ATOM};
+pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{

@@ -86,8 +86,15 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
             why: false,
             text: words::class_line(l),
             hover: format!(
-                "{} samples, leave-one-out force RMS {:.2}× / max {:.2}× the bound, energy {:.2}× the tier; {CLASS_HELP}",
-                l.samples, l.force_rms, l.force_max, l.energy_max
+                "{} samples, leave-one-out force RMS {:.2}× / max {:.2}× the bound, energy {:.2}× the tier{}; {CLASS_HELP}",
+                l.samples,
+                l.force_rms,
+                l.force_max,
+                l.energy_max,
+                match (l.measured, l.measured_energy) {
+                    (Some(f), Some(e)) => format!("; DFT checks measured force {f:.2}× the bound, energy {e:.2}× the tier over {} comparisons", l.evidence),
+                    _ => "; no DFT comparisons yet".to_string(),
+                }
             ),
         });
     }

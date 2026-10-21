@@ -71,10 +71,10 @@ fn audit_fails(audit_failed: Option<f64>) -> bool {
     audit_failed.is_some()
 }
 
-/// The class rule for one class (module doc, "Class-wise trust"): the first failing condition
-/// (too few samples, the LOO force error, the LOO energy error) as (key, value, limit), `None`
-/// when the class is trusted. `ClassLoo::trusted` and `class_untrusted`'s wording both read it
-/// (plan review M3). The force and energy tests are written as `!(x <= 1)`, so a NaN ratio
+/// The uncalibrated class rule for one class (module doc, "Class-wise trust"; since M8a Task 2
+/// the rule `calibrate::class_verdict` applies while a class has fewer than three DFT
+/// comparisons): the first failing condition (too few samples, the LOO force error, the LOO
+/// energy error) as (key, value, limit), `None` when the class passes (plan review M3). The force and energy tests are written as `!(x <= 1)`, so a NaN ratio
 /// fails, exactly as the old `trusted`'s `<=` made it fail. The force value is the larger ratio,
 /// or NaN when either is NaN (`f64::max` would drop the NaN and show a failing check with a
 /// value inside its limit).
@@ -326,11 +326,12 @@ impl SurrogateKs {
     /// atoms (RMS and max), and the LOO per-atom energy error against `energy_std_per_atom` over
     /// the class's samples (RMS and max; the energy is not per atom: it counts for every class the
     /// sample holds — conservative). The verdict is the **calibrated, hysteretic** one of
-    /// [`super::calibrate`] (M8a Task 2): the LOO force RMS scaled by the audit history's
-    /// calibration factor of the class against `ENTER` / `LEAVE`, with the standing verdict
-    /// (`self.class_loo`) as the hysteresis memory; with fewer than `MIN_EVIDENCE` points of
-    /// evidence it is the rule of before — ≥ Q′ samples and all three ratios ≤ 1
-    /// (`class_refusal`). A sample whose LOO is undefined (I − H_ss singular: it alone determines
+    /// [`super::calibrate`] (M8a Task 2): max(the LOO force RMS, the DFT-measured force error over
+    /// the class's evidence window) and the DFT-measured energy error against `ENTER` / `LEAVE`,
+    /// with the worst-atom guard on entry, and the standing verdict (`self.class_memory`) as the
+    /// hysteresis memory; with fewer than `MIN_EVIDENCE` points of evidence it is the rule of
+    /// before — ≥ Q′ samples and all three ratios ≤ 1 (`class_refusal`) — plus the worst-atom
+    /// guard both ways. A sample whose LOO is undefined (I − H_ss singular: it alone determines
     /// a direction) counts as infinitely off. Per class also the sample of the largest ratio (force
     /// or energy) — the readiness readout's worst sample, deciding nothing. Held-out draft guesses
     /// (`Q_DRAFT`) are excluded like every other excluded sample (`surrogate` module doc, "Draft
@@ -413,7 +414,23 @@ impl SurrogateKs {
                 let trusted = refusal.is_none();
                 let trusted_since = if trusted { since.or(Some(self.model_gen)) } else { None };
                 let k = cal.per_class[c];
-                ClassLoo { class, samples, force_rms, force_max, energy_rms, energy_max, trusted, refusal, calibration: k.factor, measured: k.measured, measured_energy: k.measured_energy, evidence: k.evidence as usize, trusted_since }
+                let some = |x: f64| (k.points > 0).then_some(x);
+                ClassLoo {
+                    class,
+                    samples,
+                    force_rms,
+                    force_max,
+                    energy_rms,
+                    energy_max,
+                    trusted,
+                    refusal,
+                    calibration: k.factor,
+                    measured: some(k.measured),
+                    measured_energy: some(k.measured_energy),
+                    worst_atom: some(k.worst_atom),
+                    evidence: k.evidence,
+                    trusted_since,
+                }
             })
             .collect();
         for b in &mut blockers {
@@ -478,39 +495,24 @@ impl SurrogateKs {
         if l.trusted {
             return None;
         }
-        // the branch is the class rule's own verdict (`calibrate::class_verdict`, plan review M3),
-        // never a re-test of the numbers; `None` cannot occur here (`trusted == refusal.is_none()`)
-        Some(match l.refusal {
-            Some((ClassKey::Samples, ..)) => {
-                (refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples)), true)
-            }
-            Some((ClassKey::Force, ..)) => {
-                let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
-                (refusal(format!(
-                    "surrogate: this kind of environment isn't learned well enough yet ({}: LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples)",
-                    l.class, l.force_max, l.force_rms, l.samples
-                )), false)
-            }
-            // the thin-evidence guard (M8a Task 2 fix round 1, review I4): one atom beyond 3× its bound
-            Some((ClassKey::Calibrated, value, limit)) if limit == super::calibrate::WORST_ATOM => (refusal(format!(
-                "surrogate: this kind of environment isn't learned well enough yet ({}: a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while unverified — fewer than {} audited comparisons; {} samples)",
-                l.class, super::calibrate::MIN_EVIDENCE, l.samples
-            )), false),
-            // the calibrated verdict (M8a Task 2): the note names the measured error and the calibration
-            Some((ClassKey::Calibrated, value, limit)) => (refusal(format!(
-                "surrogate: this kind of environment isn't learned well enough yet ({}: measured error {value:.2}× the bound over {} audited comparisons — DFT rms {:.2}×, leave-one-out RMS {:.2}×, the posterior {:.1}× too confident; limit {limit:.2} — {} samples)",
-                l.class, l.evidence, l.measured, l.force_rms, l.calibration, l.samples
-            )), false),
-            // the energy under the calibrated verdict is the measured one against ENTER or LEAVE
-            Some((ClassKey::Energy, value, limit)) if l.evidence >= super::calibrate::MIN_EVIDENCE => (refusal(format!(
-                "surrogate: this kind of environment isn't learned well enough yet ({}: measured energy error {value:.2}× the tier over {} audited comparisons, limit {limit:.2}; {} samples)",
-                l.class, l.evidence, l.samples
-            )), false),
-            Some((ClassKey::Energy, ..)) | None => (refusal(format!(
-                "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
-                l.class, l.energy_max, l.samples
-            )), false),
-        })
+        // the class rule's own verdict (`calibrate::class_verdict`, plan review M3), never a re-test
+        // of the numbers, in the verdict's own words (`calibrate::refusal_words`: one wording for
+        // the verdict and this note, the M8a Task 2 review's M2); `None` cannot occur here
+        // (`trusted == refusal.is_none()`) and is worded as the uncalibrated force rule
+        let (key, value, limit) = l.refusal.unwrap_or((ClassKey::Force, l.force_max.max(l.force_rms), 1.0));
+        let words = super::calibrate::WordsInput {
+            samples: l.samples,
+            force_rms: l.force_rms,
+            force_max: l.force_max,
+            energy_max: l.energy_max,
+            measured: l.measured,
+            measured_energy: l.measured_energy,
+            evidence: l.evidence,
+            calibration: l.calibration,
+        };
+        let limit = if key == ClassKey::Samples { q as f64 } else { limit };
+        let text = format!("surrogate: this kind of environment isn't learned well enough yet ({}: {})", l.class, super::calibrate::refusal_words(key, value, limit, &words));
+        Some((refusal(text), key == ClassKey::Samples))
     }
 
     /// Rebuild the model from the samples (`surrogate` module doc): the accumulator takes the samples added

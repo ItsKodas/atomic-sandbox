@@ -154,7 +154,13 @@
 //! validation; `audit_kind` and the `unfit` counter were added in Task 1's fix round and
 //! `audit_teacher_force` in Task 2's, while version 7 was unreleased — no earlier form of
 //! version 7 exists in a file). With a blank history nothing is added:
-//! the file is version 5's bytes under the version-7 magic. The key and the arrays are read for
+//! the file is version 5's bytes under the version-7 magic. A fitted provider also writes the key
+//! `class_memory` (M8a Task 2 fix round 2, while version 7 was unreleased): the calibrated class
+//! verdict's hysteresis memory, one object per environment class (pair, many-body) {trusted (JSON
+//! bool), since (the model generation it was entered at, a JSON integer, or null)} — so a reload
+//! keeps a verdict that sat inside the hysteresis band (`providers::surrogate::calibrate`); absent,
+//! the loader starts without a memory (a band verdict re-enters). Optional and strict like
+//! `audit_history` when present. The keys and the arrays are read for
 //! version 7 only; versions 1 to 5 read with an empty history, version 6 has none (nothing was
 //! fitted, so nothing was audited). The bump keeps an older build from misreading the arrays:
 //! it refuses the file as "newer than this build".
@@ -232,6 +238,10 @@ pub struct Sidecar {
     /// The writer's audit history (version 7; module doc). Empty for a file of an earlier version
     /// or one written with a blank history.
     pub audit_history: AuditHistory,
+    /// The calibrated class verdict's hysteresis memory per environment class (pair, many-body):
+    /// (trusted, the model generation it was entered at) — header key `class_memory` (version 7;
+    /// module doc). Empty when absent.
+    pub class_memory: Vec<(bool, Option<u64>)>,
 }
 
 /// What a version-6 file holds: training samples taught before any fit formed (module doc,
@@ -351,13 +361,20 @@ pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, rep
 /// written only when `history` is not blank — module doc, "Version 7").
 #[allow(clippy::too_many_arguments)]
 pub fn write_full_with_history(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory) -> io::Result<()> {
+    write_full_with_memory(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, &[])
+}
+
+/// [`write_full_with_history`] with the calibrated class verdict's hysteresis memory (header key
+/// `class_memory`, written only when `memory` is not empty — module doc, "Version 7").
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(bool, Option<u64>)]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history)?;
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory)?;
     write_atomic(path, &bytes)
 }
 
@@ -463,7 +480,7 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(bool, Option<u64>)]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
     let magic: &[u8; 8] = MAGIC_V7;
@@ -626,6 +643,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
                 ("unfit", u.unfit.to_string()),
             ]),
         ));
+    }
+    if !memory.is_empty() {
+        let list: Vec<String> = memory.iter().map(|&(t, since)| obj(&[("trusted", t.to_string()), ("since", since.map_or("null".to_string(), |g| g.to_string()))])).collect();
+        pairs.push(("class_memory", format!("[{}]", list.join(","))));
     }
     // optional (module doc): absent, the header is byte-identical to the older writer's
     if let Some(t) = solves {
@@ -1013,6 +1034,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
     // the audit history (version 7, module doc): the key announces the ten arrays, last
     let history_counts = if version >= 7 { decode_history_key(&h)? } else { None };
+    let class_memory = if version >= 7 { decode_class_memory(&h)? } else { Vec::new() };
     if let Some((points, _, _)) = &history_counts {
         for (i, name) in HistoryArrays::NAMES.iter().enumerate() {
             fixed.push((*name, (i < HistoryArrays::PER_POINT).then_some(*points)));
@@ -1106,7 +1128,29 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history })
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory })
+}
+
+/// The version-7 header key `class_memory` (module doc): per class (trusted, since), empty when
+/// absent or null; strict when present (at most the two environment classes, every field typed).
+fn decode_class_memory(h: &Json) -> Result<Vec<(bool, Option<u64>)>, String> {
+    let list = match h.get("class_memory") {
+        Err(_) | Ok(Json::Null) => return Ok(Vec::new()),
+        Ok(k) => k.arr().map_err(|e| format!("class_memory: {e}"))?,
+    };
+    if list.len() > 2 {
+        return Err(format!("class_memory has {} entries (two environment classes)", list.len()));
+    }
+    list.iter()
+        .map(|e| {
+            let trusted = e.get("trusted")?.bool().map_err(|x| format!("class_memory.trusted: {x}"))?;
+            let since = match e.get("since")? {
+                Json::Null => None,
+                g => Some(g.usize().map_err(|x| format!("class_memory.since: {x}"))? as u64),
+            };
+            Ok((trusted, since))
+        })
+        .collect()
 }
 
 /// The version-7 header key `audit_history` (module doc): (points, recorded, the unrecorded
@@ -1814,7 +1858,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new() }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.
@@ -1924,6 +1968,36 @@ mod tests {
     /// back equal (the unrecorded counters included); a version-5 file reads with an empty history;
     /// the standalone `encode`/`decode` pair (Task 3's `history.bin`) round-trips the same ring,
     /// bit for bit; a history with a class code beyond 2 or misshapen arrays is refused.
+    /// Version 7's `class_memory` key (M8a Task 2 fix round 2): the calibrated class verdict's
+    /// hysteresis memory round-trips; absent, it reads empty; a malformed key is refused.
+    #[test]
+    fn sidecar_round_trips_the_class_memory() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(48, false);
+        let path = tmp("memory-v7.model");
+        let memory = vec![(true, Some(41u64)), (false, None)];
+        write_full_with_memory(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &memory).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string();
+        assert!(header.contains("\"class_memory\":[{\"trusted\":true,\"since\":41},{\"trusted\":false,\"since\":null}]"), "{header}");
+        assert_eq!(read(&path).unwrap().class_memory, memory);
+        // absent: empty
+        let plain = tmp("memory-none.model");
+        write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        assert!(read(&plain).unwrap().class_memory.is_empty());
+        // malformed: refused, naming the key
+        let bad = header.replacen("\"trusted\":true", "\"trusted\":1", 1);
+        let mut b = bytes[..8].to_vec();
+        b.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+        b.extend_from_slice(bad.as_bytes());
+        b.extend_from_slice(&bytes[16 + hl..]);
+        let pb = tmp("memory-bad.model");
+        std::fs::write(&pb, b).unwrap();
+        let e = read(&pb).unwrap_err().to_string();
+        assert!(e.contains("class_memory"), "{e}");
+    }
+
     #[test]
     fn sidecar_round_trips_the_history() {
         use crate::history::{AuditHistory, HISTORY_CAP};

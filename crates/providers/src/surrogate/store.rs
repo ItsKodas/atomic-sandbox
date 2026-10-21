@@ -184,8 +184,9 @@ impl SurrogateKs {
             pair: c.pair,
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
-        // and the audit history (version 7, M8a Task 1)
-        surrogate::sidecar::write_full_with_history(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history)
+        // and the audit history (version 7, M8a Task 1) with the class verdict's hysteresis memory
+        // (M8a Task 2 fix round 2: a reload keeps a verdict inside the band)
+        surrogate::sidecar::write_full_with_memory(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory)
     }
 
     /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
@@ -262,7 +263,7 @@ impl SurrogateKs {
     /// count starting at zero, with a note for the unreadable one), set only once the install
     /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -338,21 +339,26 @@ impl SurrogateKs {
         self.since_kept = THIN_EVERY;
         self.recovery = None;
         self.reset_audits();
-        // the file's audit history is the installed model's (M8a Task 1)
+        // the file's audit history is the installed model's (M8a Task 1); its points' generations
+        // and the saved verdicts' `trusted_since` are the writer's, so this provider's generation
+        // moves past all of them — the calibrated verdict's evidence window compares generations
+        // as numbers (`calibrate`, "The evidence window"; M8a Task 2 fix round 2)
+        let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.1)).max().unwrap_or(0);
         self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);
         self.fits += 1;
         // readouts (activity Task 4 review): the views' cache key and their `Fitted`
-        self.model_gen += 1;
+        self.model_gen = self.model_gen.max(newest) + 1;
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
-        // another model's class verdicts are no hysteresis memory for this one (M8a Task 2), so a
-        // saved model whose verdict sat inside the band (ENTER, LEAVE] re-enters on load: it must
-        // reach ENTER again (conservative, documented; the Task 2 physics review's M2)
+        // the hysteresis memory is the file's own, saved with the model (M8a Task 2 fix round 2,
+        // the task review's M4): a reload, the worker's re-spawn with its carried model and a
+        // resumed training keep a verdict that sat inside the band (ENTER, LEAVE]; a file without
+        // one (or of another shape) starts without a memory and a band verdict re-enters
         self.class_loo = Vec::new();
-        self.class_memory = Vec::new();
+        self.class_memory = if class_memory.len() == ENV_CLASSES.len() { class_memory } else { Vec::new() };
         self.refresh_class_loo();
         self.commit_class_memory();
         self.rebuild_active_set();

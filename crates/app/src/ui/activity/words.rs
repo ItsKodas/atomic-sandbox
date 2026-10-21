@@ -275,25 +275,30 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
 }
 
 /// The class line from the class's own verdict (`ClassLoo::refusal`, plan review M3): an
-/// energy-only failure is an energy error.
+/// energy-only failure is an energy error, and each number is named by what measured it — "DFT
+/// checks measured" only for the error the teacher measured, "leave-one-out" only for the fit's own
+/// left-out error (M8a Task 2 review I3).
 pub fn class_line(l: &sim::ClassLoo) -> String {
     use sim::ClassKey;
     let name = if l.class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" };
+    let checks = |n: usize| format!("{n} DFT check{}", if n == 1 { "" } else { "s" });
     match l.refusal {
         None => format!("{name} — learned"),
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
-        // M8a Task 2: the thin-evidence guard (one atom beyond `WORST_ATOM` = 3× its bound) …
-        Some((ClassKey::Calibrated, x, lim)) if lim == providers::surrogate::WORST_ATOM => format!(
+        // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound
+        Some((ClassKey::WorstAtom, x, _)) if l.evidence < providers::surrogate::MIN_EVIDENCE => format!(
             "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",
             providers::surrogate::MIN_EVIDENCE
         ),
-        // … or the calibrated verdict: the error the DFT checks measured where the class answers
-        Some((ClassKey::Calibrated, x, _)) => format!(
-            "{name} — not yet (DFT checks measured its error at {x:.1}× the bound over {} checks; it claimed {:.1}× less)",
-            l.evidence, l.calibration
-        ),
+        Some((ClassKey::WorstAtom, x, lim)) => format!("{name} — not yet (a recent DFT check found an atom's force {x:.1}× its bound; it starts answering only without one beyond {lim:.0}×)"),
+        // the calibrated verdict: the error the DFT checks measured where the class answers …
+        Some((ClassKey::Calibrated, x, lim)) => format!("{name} — not yet (DFT checks measured its force error at {x:.2}× the bound over {}, limit {lim:.2}×)", checks(l.evidence)),
+        // … its floor, the fit's own left-out error …
+        Some((ClassKey::LooFloor, x, lim)) => format!("{name} — not yet (leave-one-out force error {x:.2}× the bound on average, limit {lim:.2}×)"),
+        // … and the energy the DFT checks measured
+        Some((ClassKey::MeasuredEnergy, x, lim)) => format!("{name} — not yet (DFT checks measured its energy error at {x:.2}× the tier over {}, limit {lim:.2}×)", checks(l.evidence)),
     }
 }
 

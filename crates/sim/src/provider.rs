@@ -1188,21 +1188,26 @@ pub struct ClassLoo {
     /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
     /// κ_c, the audit calibration factor: the teacher's error over the model's predicted std,
-    /// rms over the audit history's points of the class (≥ 1; 1 without any evidence, ∞ when a
+    /// rms over the evidence window's points of the class (≥ 1; 1 without any evidence, ∞ when a
     /// comparison in the evidence was not a number). A readout (M8a Task 2): the verdict decides
     /// on `measured`.
     pub calibration: f64,
     /// The teacher's force error at the geometries this class verdict decides, rms over the
-    /// history's audits and rule-4b fallbacks of the class in units of the policy's per-atom bound,
-    /// inflated by one sigma of its own scatter (`providers::surrogate::calibrate`, W_c); NaN
-    /// without evidence. The verdict's force value is max(`force_rms`, `measured`).
-    pub measured: f64,
+    /// evidence window's audits and rule-4b fallbacks of the class in units of the policy's
+    /// per-atom bound, inflated by one sigma of its own scatter (`providers::surrogate::calibrate`,
+    /// W_c); `None` without evidence. The calibrated verdict's force value is max(`force_rms`,
+    /// `measured`).
+    pub measured: Option<f64>,
     /// The same for the energy: |E_teacher − E_model|/N over the tier, rms over those points,
-    /// inflated; NaN without evidence.
-    pub measured_energy: f64,
-    /// The evidence behind `calibration`, in points: the audits plus the capped weight of the
-    /// rule-4b fallbacks of the class. Below `providers::surrogate::calibrate::MIN_EVIDENCE` the
-    /// verdict is the uncalibrated rule of before.
+    /// inflated; `None` without evidence.
+    pub measured_energy: Option<f64>,
+    /// The largest single-atom measured force error over the evidence window, in bound units (the
+    /// worst-atom guard's input, `WORST_ATOM` = 3); `None` without evidence.
+    pub worst_atom: Option<f64>,
+    /// The evidence behind `measured`, in points: the window's audits plus the capped weight of
+    /// its rule-4b fallbacks of the class (an integer). Below
+    /// `providers::surrogate::calibrate::MIN_EVIDENCE` the verdict is the uncalibrated rule of
+    /// before.
     pub evidence: usize,
     /// The model generation (`TrainableStatus::model_gen`) since which the class has been trusted
     /// without interruption — the hysteresis memory; `None` while untrusted.
@@ -1210,23 +1215,33 @@ pub struct ClassLoo {
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
-/// the class rule tests them (`providers::surrogate`, "Class-wise trust").
+/// the class rule tests them (`providers::surrogate`, "Class-wise trust"; the calibrated verdict:
+/// `providers::surrogate::calibrate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassKey {
     /// Fewer samples of the class than Q′: (samples, Q′).
     Samples,
-    /// The leave-one-out force error over the class's atoms: the larger of max and RMS, as a
-    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN). The uncalibrated rule.
+    /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its
+    /// bound: (that ratio, 3). It keeps an untrusted class from entering at every evidence count,
+    /// and makes a trusted one leave while the class has fewer than three comparisons.
+    WorstAtom,
+    /// The uncalibrated rule (fewer than three comparisons): the leave-one-out force error over
+    /// the class's atoms — the larger of max and RMS, as a ratio to each atom's bound (limit 1;
+    /// NaN when either ratio is NaN).
     Force,
-    /// The leave-one-out per-atom energy error as a ratio to the tier: the max (the uncalibrated
-    /// rule, limit 1) or the RMS (the calibrated verdict, limit `ENTER` or `LEAVE`).
+    /// The uncalibrated rule: the leave-one-out per-atom energy error's max as a ratio to the tier
+    /// (limit 1).
     Energy,
-    /// The measured class error — max(LOO force RMS, the teacher's rms force error over the
-    /// class's audited comparisons) in bound units — against the verdict's limit
-    /// (`providers::surrogate::calibrate`: `ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to
-    /// stay); or, while the class has fewer than three comparisons, one atom's measured error
-    /// against `WORST_ATOM` = 3× its bound.
+    /// The calibrated verdict, decided by the DFT-measured force error (`ClassLoo::measured`, in
+    /// bound units) against its limit (`ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to stay).
     Calibrated,
+    /// The calibrated verdict, decided by its floor: the leave-one-out force RMS beyond the limit
+    /// while the measured error is below it — the model is never trusted beyond its own
+    /// leave-one-out.
+    LooFloor,
+    /// The calibrated verdict, decided by the DFT-measured energy error (`ClassLoo::measured_energy`,
+    /// in tier units) against its limit.
+    MeasuredEnergy,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

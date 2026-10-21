@@ -4137,7 +4137,7 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None };
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
     let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
@@ -4353,7 +4353,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -4365,7 +4365,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                     assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
-                ClassKey::Calibrated => unreachable!("the uncalibrated rule never names the calibration"),
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
@@ -5780,7 +5780,7 @@ fn a_draft_guess_audit_is_held_out_and_never_untrusts_the_strict_model() {
     assert_eq!((last, s.held_out()), (SampleTag::DraftAudit, 1));
     s.refit().unwrap();
     assert_eq!(s.report().unwrap().n_samples, 40, "held out of the fit");
-    assert_eq!(comparable_loo(s.class_loo()), comparable_loo(&loo0), "and of the class leave-one-out");
+    assert_eq!(s.class_loo(), &loo0[..], "and of the class leave-one-out");
     // the teacher drifts: a failed guess audit is recorded, the strict model stays trusted
     h.lock().unwrap().d *= 1.1;
     let n_audits = s.solve_counts().audit;
@@ -5982,13 +5982,12 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     println!("re-judged on load: {:?}", back.class_loo());
     assert_eq!(back.samples(), s.samples(), "no sample added or dropped");
     assert_eq!(back.class_loo()[0].samples, 80 + 30, "per atom: the far H₂ of every mixed sample is pair evidence");
-    // the same verdicts and numbers; `trusted_since` is the installing provider's own model
-    // generation (M8a Task 2: the hysteresis memory starts afresh on an install), not a verdict
-    // (`measured` is NaN without evidence on both sides: NaN ≠ NaN, so it is masked too)
-    let verdicts = |l: &[sim::ClassLoo]| l.iter().map(|c| sim::ClassLoo { trusted_since: None, measured: 0.0, measured_energy: 0.0, ..c.clone() }).collect::<Vec<_>>();
-    assert!(back.class_loo().iter().chain(s.class_loo()).all(|c| c.measured.is_nan() && c.evidence == 0), "no evidence on either side");
-    assert_eq!(verdicts(back.class_loo()), verdicts(s.class_loo()), "the same verdicts as the fit that wrote the file");
-    assert!(back.class_loo().iter().all(|c| c.trusted_since == Some(back.model_generation())), "entered at the install's generation");
+    // the same verdicts and numbers, `trusted_since` included: the hysteresis memory is saved with
+    // the model since M8a Task 2 fix round 2 (the sidecar's `class_memory`), so the installed
+    // verdicts carry the writer's generations, all behind the installing provider's own
+    assert!(back.class_loo().iter().chain(s.class_loo()).all(|c| c.measured.is_none() && c.evidence == 0), "no evidence on either side");
+    assert_eq!(back.class_loo(), s.class_loo(), "the same verdicts as the fit that wrote the file, since when included");
+    assert!(back.class_loo().iter().all(|c| c.trusted_since.is_none_or(|g| g < back.model_generation())), "the writer's generations precede the install's");
     assert!(back.trusted());
 }
 
@@ -6547,9 +6546,9 @@ fn a_short_class_is_never_an_acceptance() {
     use teach::tests_api::{teach_verdict, TeachVerdict};
     let class = |samples: usize, q: usize, f: f64, e: f64| {
         let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
-        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None }
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None }
     };
-    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
     assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
     assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
     assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
@@ -6922,7 +6921,7 @@ fn a_shell_fence_fallback_drives_the_step_and_is_never_fitted() {
     }
     assert_eq!(calls(&h) - calls0, 6, "the teacher answered every step");
     assert!(!s.pending_refit, "nothing to refit");
-    assert_eq!(comparable_loo(s.class_loo()), comparable_loo(&loo0), "class trust unchanged");
+    assert_eq!(s.class_loo(), &loo0[..], "class trust unchanged");
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
     let ev: Vec<_> = s.ledger.events.iter().rev().take(6).map(|e| e.outcome).collect();
     assert!(ev.iter().all(|o| !o.is_kept()), "{ev:?}");
@@ -7330,11 +7329,6 @@ fn w_of(z: f64) -> f64 {
     z * 1e-3 / 3f64.sqrt() / 2e-3
 }
 
-/// Class verdicts for an equality assertion: `measured` / `measured_energy` are NaN without
-/// evidence (NaN ≠ NaN), so they are compared by their bits (M8a Task 2 fix round 1).
-fn comparable_loo(l: &[sim::ClassLoo]) -> Vec<(sim::ClassLoo, u64, u64)> {
-    l.iter().map(|c| (sim::ClassLoo { measured: 0.0, measured_energy: 0.0, ..c.clone() }, c.measured.to_bits(), c.measured_energy.to_bits())).collect()
-}
 
 /// Step 1 (the brief): a history whose measured errors are 3× the predicted stds gives a
 /// calibration factor ≥ 2.5 (3 × (1 + 1/√40) = 3.47 from 20 audit points) and makes a previously
@@ -7356,7 +7350,7 @@ fn calibration_widens_when_audits_disagree() {
     let c = cal.per_class[0];
     println!("{c:?}");
     assert!(c.factor >= 2.5, "{c:?}");
-    assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (20, 0, 20.0, 20));
+    assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (20, 0, 20, 20));
     let infl = 1.0 + 1.0 / 40f64.sqrt();
     assert!((c.z_rms - 3.0).abs() < 1e-12 && (c.factor - 3.0 * infl).abs() < 1e-12, "{c:?}");
     assert!((c.measured - w_of(3.0) * infl).abs() < 1e-12 && c.measured > LEAVE, "{c:?}");
@@ -7364,7 +7358,7 @@ fn calibration_widens_when_audits_disagree() {
         ClassVerdict::Untrusted { key, value, limit, reason } => {
             assert_eq!((key, limit), (ClassKey::Calibrated, LEAVE));
             assert!((value - c.measured).abs() < 1e-12, "{value}");
-            assert!(reason.contains("measured error 1.00× the bound over 20 audits") && reason.contains("3.5× too confident"), "{reason}");
+            assert!(reason.contains("DFT-measured force error 1.00× the bound over 20 DFT comparisons") && reason.contains("uncertainty was 3.5× too small"), "{reason}");
         }
         v => panic!("{v:?}"),
     }
@@ -7379,9 +7373,9 @@ fn calibration_widens_when_audits_disagree() {
     assert_eq!(cal.class_verdict(0, &class, 29, true), ClassVerdict::Trusted);
     assert_eq!(cal.class_verdict(0, &class, 29, false), ClassVerdict::Trusted);
     // the LOO floor: a class whose own leave-one-out RMS is beyond ENTER does not enter on good audits
-    assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 0.8, ..class }, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, value, .. } if value == 0.8));
+    assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 0.8, ..class }, 29, false), ClassVerdict::Untrusted { key: ClassKey::LooFloor, value, .. } if value == 0.8));
     // the many-body class saw no evidence: the rule of before (max 0.9 ≤ 1 → trusted; max 1.5 → not)
-    assert_eq!((cal.per_class[1].evidence, cal.per_class[1].factor), (0.0, 1.0));
+    assert_eq!((cal.per_class[1].evidence, cal.per_class[1].factor), (0, 1.0));
     assert!(cal.per_class[1].measured.is_nan());
     assert_eq!(cal.class_verdict(1, &class, 29, false), ClassVerdict::Trusted);
     assert!(matches!(cal.class_verdict(1, &ClassStats { force_max: 1.5, ..class }, 29, true), ClassVerdict::Untrusted { key: ClassKey::Force, .. }));
@@ -7428,7 +7422,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     }
     let cal = calibrate(&he, &pol);
     assert!((cal.per_class[0].measured_energy - 0.9).abs() < 1e-9, "{:?}", cal.per_class[0]);
-    assert!(matches!(cal.class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Energy, value, limit, .. } if (value - 0.9).abs() < 1e-9 && limit == ENTER));
+    assert!(matches!(cal.class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::MeasuredEnergy, value, limit, .. } if (value - 0.9).abs() < 1e-9 && limit == ENTER));
     assert_eq!(cal.class_verdict(0, &st, 29, true), ClassVerdict::Trusted);
     // per point: one trimer with z = 3 on every atom and three dimer audits at z = 1 → ẑ² = (9 + 3)/4
     let mut h = surrogate::AuditHistory::default();
@@ -7437,7 +7431,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
         h.push(history_point(PointKind::Audit, 2, 1, 1.0));
     }
     let c = calibrate(&h, &pol).per_class[0];
-    assert!((c.z_rms - 3f64.sqrt()).abs() < 1e-12 && c.evidence == 4.0 && c.points == 4, "{c:?} (per atom it would be √(33/9))");
+    assert!((c.z_rms - 3f64.sqrt()).abs() < 1e-12 && c.evidence == 4 && c.points == 4, "{c:?} (per atom it would be √(33/9))");
     // per rule: 3000 rule-4b fallbacks at z = 5 beside 10 audits at z = 1 weigh as 10 points:
     // ẑ² = (10 + 10·25)/20 = 13; the same 3000 points under rule 5 are not evidence at all
     for other in [false, true] {
@@ -7450,9 +7444,9 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
         }
         let c = calibrate(&h, &pol).per_class[0];
         if other {
-            assert_eq!((c.audits, c.fallbacks, c.evidence, c.points, c.z_rms), (10, 0, 10.0, 10, 1.0), "{c:?}");
+            assert_eq!((c.audits, c.fallbacks, c.evidence, c.points, c.z_rms), (10, 0, 10, 10, 1.0), "{c:?}");
         } else {
-            assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (10, 3000, 20.0, 3010), "{c:?}");
+            assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (10, 3000, 20, 3010), "{c:?}");
             assert!((c.z_rms - 13f64.sqrt()).abs() < 1e-9, "{c:?}");
             assert!((c.measured - 13f64.sqrt() * w_of(1.0) * (1.0 + 1.0 / 6020f64.sqrt())).abs() < 1e-9, "the inflation counts the 3010 points: {c:?}");
         }
@@ -7464,7 +7458,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
         h.push(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.8));
     }
     let c = calibrate(&h, &pol).per_class[0];
-    assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (0, 50, MIN_EVIDENCE as f64, 50));
+    assert_eq!((c.audits, c.fallbacks, c.evidence, c.points), (0, 50, MIN_EVIDENCE, 50));
     assert!(c.calibrated() && (c.factor - (1.0 + 1.0 / 100f64.sqrt())).abs() < 1e-12, "floored at 1, inflated for 50 points: {c:?}");
     // two of them are not enough: the rule of before (force_max 3.0 → refused)
     let mut h2 = surrogate::AuditHistory::default();
@@ -7481,7 +7475,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     let fine = ClassStats { force_max: 0.5, energy_max: 0.5, ..st };
     assert!((cal3.per_class[0].worst_atom - w_of(12.0)).abs() < 1e-12 && cal3.per_class[0].worst_atom > WORST_ATOM);
     for was in [false, true] {
-        assert!(matches!(cal3.class_verdict(0, &fine, 29, was), ClassVerdict::Untrusted { key: ClassKey::Calibrated, value, limit, .. } if limit == WORST_ATOM && (value - w_of(12.0)).abs() < 1e-12), "{was}");
+        assert!(matches!(cal3.class_verdict(0, &fine, 29, was), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, .. } if limit == WORST_ATOM && (value - w_of(12.0)).abs() < 1e-12), "{was}");
     }
     let mut h4 = surrogate::AuditHistory::default();
     h4.push(history_point(PointKind::Audit, 2, 1, 9.0)); // 2.6: inside the guard
@@ -7503,7 +7497,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     p.classes = vec![0, 1, 2];
     h.push(p);
     let cal = calibrate(&h, &pol);
-    assert_eq!((cal.per_class[0].evidence, cal.per_class[1].evidence), (1.0, 1.0));
+    assert_eq!((cal.per_class[0].evidence, cal.per_class[1].evidence), (1, 1));
     // the per-atom bound follows the teacher's force: at |F| = 0.05 the bound is 5e-3, the same error weighs 2.5× less
     let mut hb = surrogate::AuditHistory::default();
     let mut q = history_point(PointKind::Audit, 2, 1, 3.0);
@@ -7589,14 +7583,14 @@ fn the_hysteresis_memory_is_the_verdict_that_stood_when_the_refit_began() {
     s.class_memory = vec![(true, Some(7)), (false, None)];
     s.refresh_class_loo();
     let l = &s.class_loo()[0];
-    assert!(l.trusted && l.trusted_since == Some(7) && (l.measured - 0.85).abs() < 1e-9, "stays: {l:?}");
+    assert!(l.trusted && l.trusted_since == Some(7) && (l.measured.unwrap() - 0.85).abs() < 1e-9, "stays: {l:?}");
     s.class_memory = vec![(false, None), (false, None)];
     s.refresh_class_loo();
     let l = s.class_loo()[0].clone();
     assert!(!l.trusted && l.trusted_since.is_none(), "does not enter: {l:?}");
     assert!(matches!(l.refusal, Some((sim::ClassKey::Calibrated, v, lim)) if (v - 0.85).abs() < 1e-9 && lim == ENTER), "{l:?}");
     let (r2, _) = s.class_untrusted(&[1, 1]).expect("refused");
-    assert!(r2.text.contains("measured error 0.85× the bound over 3 audited comparisons") && r2.text.contains("limit 0.71"), "{}", r2.text);
+    assert!(r2.text.contains("DFT-measured force error 0.85× the bound over 3 DFT comparisons, limit 0.71"), "{}", r2.text);
     // through refit(): the memory is read at the start and committed at the end
     s.refit().unwrap();
     assert!(!s.class_loo()[0].trusted, "untrusted memory, band value: still untrusted after the refit");
@@ -7649,7 +7643,7 @@ fn a_class_refusal_the_variance_would_also_refuse_is_not_the_verdicts_evidence()
     assert_eq!(p.kind, PointKind::Fallback { rule: HISTORY_RULE_CLASS_AND_VARIANCE });
     assert_eq!(history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE), "rule 4b with rule 6/7 failing too");
     let c = calibrate::calibrate(s.audit_history(), s.policy()).per_class[0];
-    assert_eq!((c.fallbacks, c.evidence), (1, 1.0), "the second point is not evidence: {c:?}");
+    assert_eq!((c.fallbacks, c.evidence), (1, 1), "the second point is not evidence: {c:?}");
     // the relax verification over a class refusal keeps the class's code
     s.force_teacher_next();
     let r = s.evaluate(&h2(1.58), &mut never()).unwrap();
@@ -7663,3 +7657,257 @@ fn a_class_refusal_the_variance_would_also_refuse_is_not_the_verdicts_evidence()
     assert_eq!(r.stats.source, Source::Fallback);
     assert_eq!(t.audit_history().iter().last().unwrap().kind, PointKind::Fallback { rule: history_rule_code(TeachRule::RelaxVerification) });
 }
+
+// ---- M8a Task 2 fix round 2: the exact evidence count, the evidence window, the entry guard,
+// the persisted hysteresis memory, the #344 repro ----
+
+/// The task review's I1: the evidence count n_a + min(n_f, cap) is formed in integers. As
+/// n_a + (min(n_f, cap)/n_f)·n_f it was 2.9999999999999996 at n_f = 47 (and 94, 147, 173, 188, …),
+/// below `MIN_EVIDENCE`: the class silently fell back to the max rule at those counts.
+#[test]
+fn the_evidence_count_is_exact_at_47_fallbacks() {
+    use calibrate::{calibrate, MIN_EVIDENCE};
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
+    let float_form = |n_f: usize| (n_f as f64).min(3.0) / n_f as f64 * n_f as f64;
+    assert!(float_form(47) < 3.0, "the premise: the float form rounds below three at 47 ({:e})", float_form(47));
+    for n_f in [3usize, 47, 94, 147, 173, 188, 4096] {
+        let mut h = surrogate::AuditHistory::default();
+        for _ in 0..n_f {
+            h.push(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.8));
+        }
+        let c = calibrate(&h, &pol).per_class[0];
+        assert_eq!((c.evidence, c.points), (MIN_EVIDENCE, n_f), "{n_f}: {c:?}");
+        assert!(c.calibrated(), "{n_f}: {c:?}");
+    }
+}
+
+/// Fix round 2, the controller's rulings on the lockout (the task review's I4) and on the entry
+/// question: evidence ages by model generation, both ways. A class refused on 8 audits at 1.46×
+/// its bound (the cadence-10 loss) stays refused while the model that produced them stands — 40
+/// good fallbacks of the same generation are capped at the audits' weight — and while the newer
+/// model has fewer than `WINDOW_POINTS` (300) comparisons; with 300 the window holds the newer
+/// model alone and the class enters. The worst-atom guard: one atom at 3.46× its bound among 100 good
+/// comparisons keeps an untrusted class out although the rms would enter, leaves a trusted class
+/// trusted (its rms judges it), and ages with its generation.
+#[test]
+fn evidence_ages_by_model_generation_both_ways() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, LEAVE, WINDOW_POINTS, WORST_ATOM};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
+    let at = |p: surrogate::AuditPoint, gen: u64| surrogate::AuditPoint { model_gen: gen, ..p };
+    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 0.5 };
+    let z_bad = 1.46 / w_of(1.0);
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..8 {
+        h.push(at(history_point(PointKind::Audit, 2, 1, z_bad), 1));
+    }
+    assert!(matches!(calibrate(&h, &pol).class_verdict(0, &st, 29, true), ClassVerdict::Untrusted { key: ClassKey::Calibrated, limit, .. } if limit == LEAVE), "leaves on its audits");
+    // blocked while the refusing model stands: its own later fallbacks are capped at the audits
+    for _ in 0..40 {
+        h.push(at(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.2), 1));
+    }
+    let c = calibrate(&h, &pol).per_class[0];
+    println!("generation 1 only: {c:?}");
+    assert_eq!((c.audits, c.fallbacks, c.evidence, c.aged, c.window_from), (8, 40, 16, 0, None), "fewer than WINDOW_POINTS held: the whole ring");
+    assert!(matches!(calibrate(&h, &pol).class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, value, .. } if value > LEAVE), "blocked: {c:?}");
+    // the refit (generation 2): its comparisons supersede the old ones only once they fill a window
+    for k in 1..=WINDOW_POINTS {
+        h.push(at(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.2), 2));
+        let cal = calibrate(&h, &pol);
+        let c = cal.per_class[0];
+        let v = cal.class_verdict(0, &st, 29, false);
+        if k < WINDOW_POINTS {
+            assert!(c.aged == 0 && c.window_from != Some(2), "{k}: {c:?}");
+            assert!(matches!(v, ClassVerdict::Untrusted { key: ClassKey::Calibrated, .. }), "{k}: still blocked: {v:?}");
+        } else {
+            println!("generation 2 fills the window: {c:?}");
+            assert_eq!((c.window_from, c.aged, c.audits, c.fallbacks, c.evidence), (Some(2), 48, 0, WINDOW_POINTS, 3), "{c:?}");
+            assert!(c.measured < ENTER, "{c:?}");
+            assert_eq!(v, ClassVerdict::Trusted, "released by the newer model's own evidence");
+        }
+    }
+    // the worst-atom guard on entry, at every evidence count, aged by generation
+    let fine = ClassStats { force_max: 0.5, ..st };
+    let mut g = surrogate::AuditHistory::default();
+    g.push(at(history_point(PointKind::Audit, 2, 1, 12.0), 1)); // 3.46× its bound
+    for _ in 0..100 {
+        g.push(at(history_point(PointKind::Audit, 2, 1, 0.5), 1));
+    }
+    let cal = calibrate(&g, &pol);
+    let c = cal.per_class[0];
+    assert!(c.calibrated() && c.measured < ENTER && c.worst_atom > WORST_ATOM, "the premise: the rms alone would enter: {c:?}");
+    assert!(
+        matches!(cal.class_verdict(0, &fine, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, .. } if limit == WORST_ATOM && (value - w_of(12.0)).abs() < 1e-12),
+        "does not enter"
+    );
+    assert_eq!(cal.class_verdict(0, &fine, 29, true), ClassVerdict::Trusted, "a trusted class with evidence is judged by its rms");
+    for _ in 0..WINDOW_POINTS {
+        g.push(at(history_point(PointKind::Audit, 2, 1, 0.5), 2));
+    }
+    let cal = calibrate(&g, &pol);
+    assert!(cal.per_class[0].worst_atom < 1.0 && cal.per_class[0].aged == 101, "{:?}", cal.per_class[0]);
+    assert_eq!(cal.class_verdict(0, &fine, 29, false), ClassVerdict::Trusted, "the guard aged with its generation");
+}
+
+/// The lockout through the provider (fix round 2): a pair class its audits refused is refused by
+/// the refit that follows them even with 40 good fallbacks of the same model beside them, stays
+/// refused while the refitted model has fewer than `WINDOW_POINTS` (300) comparisons of its own,
+/// and enters at the next refit once its own rule-4b fallbacks — the teacher steps the refusal
+/// makes — show it within the bound. Under fix round 1's whole-ring evidence it stayed refused
+/// until 4096 later points had evicted the audits.
+#[test]
+fn a_class_refused_on_its_evidence_reenters_after_a_teaching_refit() {
+    use calibrate::{ENTER, LEAVE, WINDOW_POINTS};
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert!(s.class_loo()[0].trusted, "premise: {:?}", s.class_loo());
+    let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
+    let g0 = s.model_generation();
+    // the standing model's audits measured 1.46× the bound; 40 good fallbacks of the same model
+    for _ in 0..8 {
+        s.audit_history.push(surrogate::AuditPoint { model_gen: g0, ..history_point(PointKind::Audit, 2, 1, 1.46 / w_of(1.0)) });
+    }
+    for _ in 0..40 {
+        s.audit_history.push(surrogate::AuditPoint { model_gen: g0, ..history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.2) });
+    }
+    s.refit().unwrap();
+    let l = s.class_loo()[0].clone();
+    println!("the refit after the failing audits: {l:?}");
+    assert!(!l.trusted && matches!(l.refusal, Some((sim::ClassKey::Calibrated, v, lim)) if v > LEAVE && lim == LEAVE), "leaves, blocked by its own generation: {l:?}");
+    // the refitted model answers nothing of the class: its steps are rule-4b points
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut step = |s: &mut SurrogateKs, k: usize| {
+        let r = 1.65 + 0.25 * (k as f64 / 5.0).sin();
+        let out = s.evaluate(&dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1), &mut never()).unwrap();
+        assert_eq!(out.stats.source, Source::Fallback, "{:?}", out.stats.notes);
+        assert_eq!(s.audit_history().iter().last().unwrap().kind, PointKind::Fallback { rule: code_4b });
+    };
+    for k in 0..WINDOW_POINTS - 1 {
+        step(&mut s, k);
+    }
+    // a verdict while the new model has fewer than WINDOW_POINTS comparisons: the old generation still counts
+    s.refresh_class_loo();
+    assert!(!s.class_loo()[0].trusted, "blocked until the refitted model's evidence fills a window: {:?}", s.class_loo()[0]);
+    for k in WINDOW_POINTS - 1..WINDOW_POINTS + 20 {
+        step(&mut s, k);
+    }
+    s.refit().unwrap();
+    let l = s.class_loo()[0].clone();
+    println!("the next refit, on the refitted model's {} comparisons: {l:?}", WINDOW_POINTS + 20);
+    assert!(l.trusted && l.measured.is_some_and(|m| m < ENTER) && l.evidence >= calibrate::MIN_EVIDENCE, "re-entered: {l:?}");
+    assert!(l.worst_atom.is_some_and(|w| w < 1.0), "{l:?}");
+}
+
+/// The task review's M4, the controller's ruling: the hysteresis memory is saved with the model
+/// (the sidecar's `class_memory`), so a reload — and the worker's re-spawn with its carried model
+/// and a resumed training, which load the same file — keep a class verdict that sat inside the band
+/// (ENTER, LEAVE]; a file without the memory re-enters (must reach ENTER again).
+#[test]
+fn a_band_verdict_survives_a_save_and_reload() {
+    use calibrate::{ENTER, LEAVE};
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let z = 0.85 / (w_of(1.0) * (1.0 + 1.0 / 6f64.sqrt()));
+    s.audit_history = surrogate::AuditHistory::default();
+    for _ in 0..3 {
+        s.audit_history.push(history_point(PointKind::Audit, 2, 1, z));
+    }
+    let since = s.model_generation() - 1;
+    s.class_memory = vec![(true, Some(since)), (false, None)];
+    s.refresh_class_loo();
+    s.commit_class_memory();
+    let l = s.class_loo()[0].clone();
+    assert!(l.trusted && l.trusted_since == Some(since) && (l.measured.unwrap() - 0.85).abs() < 1e-9 && 0.85 > ENTER && 0.85 <= LEAVE, "premise, in the band: {l:?}");
+    let path = std::env::temp_dir().join(format!("band-verdict-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let b = back.class_loo()[0].clone();
+    println!("reloaded: {b:?}");
+    assert!(b.trusted && b.trusted_since == Some(since), "kept through the reload: {b:?}");
+    assert_eq!(back.class_memory, s.class_memory);
+    assert!(back.model_generation() > since && back.model_generation() > back.audit_history().iter().map(|p| p.model_gen).max().unwrap(), "generations stay monotone across the install");
+    // a file without the memory (as written before fix round 2): the band verdict re-enters
+    s.class_memory = Vec::new();
+    s.save_sidecar(&path).unwrap();
+    let (fresh, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    let f = fresh.class_loo()[0].clone();
+    assert!(!f.trusted && matches!(f.refusal, Some((sim::ClassKey::Calibrated, _, lim)) if lim == ENTER), "without a memory: must reach ENTER: {f:?}");
+}
+
+/// An H₃ triangle with sides `a` (B–C), `b` (A–C), `c` (A–B), centred, in a random orientation.
+fn triangle(a: f64, b: f64, c: f64, rng: &mut StdRng) -> Scene {
+    let x = (b * b + c * c - a * a) / (2.0 * c);
+    let y = (b * b - x * x).max(0.0).sqrt();
+    let flat = [[0.0, 0.0, 0.0], [c, 0.0, 0.0], [x, y, 0.0]];
+    let centre: [f64; 3] = std::array::from_fn(|k| flat.iter().map(|p| p[k]).sum::<f64>() / 3.0);
+    // a random orthonormal frame (Gram–Schmidt of two random directions)
+    let u = unit_vector(rng);
+    let w = unit_vector(rng);
+    let d = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    let v0: [f64; 3] = std::array::from_fn(|k| w[k] - d * u[k]);
+    let nv = (v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2]).sqrt();
+    let v = v0.map(|x| x / nv);
+    let nuclei = flat.iter().map(|p| Nucleus::new(1, std::array::from_fn(|k| (p[0] - centre[0]) * u[k] + (p[1] - centre[1]) * v[k]))).collect();
+    in_big_cell(Scene { nuclei, ..h2(1.4) })
+}
+
+/// The #344 fixture: training triangles, their shortest taught side and the compressed sample's
+/// shortest H–H (Bohr). Measured on this fixture (seed 344): with the compressed sample at 1.2 /
+/// 1.0 / 0.9 Bohr the fit's leave-one-out predicts it within the bound (max 0.08 / 0.42 / 0.84×),
+/// at 0.8 Bohr no longer (max 1.57×, RMS 0.10×, energy max 1.31×): the knife-edge premise.
+const TRIMER_SAMPLES: usize = 150;
+const TRIMER_MIN: f64 = 1.6;
+const TRIMER_COMPRESSED: f64 = 0.8;
+
+/// Spec §4.1's second repro case, the user's #344 (compressed H–H in H₃⁺) on an analytic teacher
+/// (the pair-additive Morse, so an H₃ triangle is many-body by the class rule: every atom has two
+/// neighbours within r_cut): triangles taught with sides 1.6–2.1 Bohr plus one sample whose
+/// shortest H–H is compressed below the taught minimum. Under the max rule that one sample's
+/// leave-one-out refuses the many-body class everywhere (the premise); over 200 steps of a
+/// triangle breathing inside the taught window, refitting every 10 steps while samples are pending,
+/// the verdict changes at most once (untrusted → trusted), and it is judged by its evidence — the
+/// rule-4b comparisons of those steps — with the compressed sample still in the fit.
+#[test]
+fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
+    use surrogate::history::PointKind;
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(344);
+    for _ in 0..TRIMER_SAMPLES {
+        let sc = triangle(rng.gen_range(TRIMER_MIN..2.1), rng.gen_range(TRIMER_MIN..2.1), rng.gen_range(TRIMER_MIN..2.1), &mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    let sc = triangle(TRIMER_COMPRESSED, 1.8, 1.8, &mut rng);
+    s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    s.refit().unwrap();
+    let mb = s.class_loo()[1].clone();
+    println!("after the fit with the compressed trimer: {mb:?}");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(!mb.trusted && mb.force_max > 1.0 && mb.force_rms < calibrate::ENTER, "premise: refused by the max alone: {mb:?}");
+    let mut verdicts = Vec::new();
+    let mut answered = 0;
+    for k in 0..200 {
+        let t = k as f64 / 10.0;
+        let sc = triangle(1.8 + 0.15 * t.sin(), 1.8 + 0.15 * (1.3 * t).cos(), 1.8 + 0.12 * (0.7 * t).sin(), &mut rng);
+        let out = s.evaluate(&sc, &mut never()).unwrap();
+        answered += (out.stats.source == Source::Surrogate) as usize;
+        if k % 10 == 9 && s.pending_refit() {
+            s.refit().unwrap();
+        }
+        verdicts.push(s.class_loo()[1].trusted);
+    }
+    let flips = verdicts.windows(2).filter(|w| w[0] != w[1]).count();
+    let l = s.class_loo()[1].clone();
+    let rule_4b = s.audit_history().iter().filter(|p| p.kind == PointKind::Fallback { rule: history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody)) }).count();
+    println!("verdict flips {flips}, first trusted after step {:?}, {answered}/200 answered, {rule_4b} rule-4b many-body points; {l:?}", verdicts.iter().position(|&t| t));
+    assert!(flips <= 1, "the verdict flipped {flips} times: {verdicts:?}");
+    assert!(l.trusted && l.evidence >= calibrate::MIN_EVIDENCE && l.measured.is_some(), "judged by its evidence: {l:?}");
+    assert!(l.force_max > 1.0, "the compressed sample is still in the fit: {l:?}");
+    assert!(answered >= 100, "{answered} answered");
+}
+

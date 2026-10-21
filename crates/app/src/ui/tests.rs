@@ -190,7 +190,7 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: Some(1) }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1) }],
         last_audit_this_fit: true,
         audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
@@ -3803,15 +3803,26 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: 1.4, measured_energy: 0.2, evidence: 12, trusted_since: None };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
         assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
-        // M8a Task 2: the calibrated verdict names the measured error and the calibration
-        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its error at 1.4× the bound over 12 checks; it claimed 2.1× less)");
-        // the thin-evidence guard: one atom beyond 3× its bound
-        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 4.2, 3.0)))), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        // M8a Task 2 (fix round 2, review I3): each number named by what measured it — the DFT
+        // checks' measured error, the fit's leave-one-out floor, the measured energy
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
+        assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
+        assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom] {
+            for cal in [1.0, f64::INFINITY] {
+                let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
+                assert!(!t.contains("less") && !t.contains("inf"), "{t}");
+            }
+        }
     }
 
     /// M8a Task 2 (the Task 1 physics review's I4): audits near the cell faces that could not

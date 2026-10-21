@@ -446,7 +446,7 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
 }
 
 /// The hover text of the "learned classes" rows.
-pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. One badly predicted sample is enough to keep its whole class on DFT until the region around it is learned.";
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at three or more geometries of a class, one badly predicted sample is enough to keep the whole class on DFT; from then on the class is judged by the error those DFT checks measured (on average, with a margin to start answering), with the left-out average as a floor.";
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
 pub fn class_line(c: &sim::ClassLoo) -> String {
@@ -464,7 +464,7 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: f64::NAN, measured_energy: f64::NAN, evidence: 0, trusted_since: None };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
     }
 }
