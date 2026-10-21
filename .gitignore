@@ -22,3 +22,6 @@ target-shot/
 /dist
 # viewer capture output (screenshots, recordings)
 /captures
+
+# the shared collections (M8a Task 4b): the user's own training data
+models/collections/

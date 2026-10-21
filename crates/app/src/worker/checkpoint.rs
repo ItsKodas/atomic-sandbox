@@ -10,6 +10,13 @@
 //! removed; a shutdown or a solver switch leaves them, which is the point. [`Command::ResumeTraining`]
 //! loads the samples file and resumes the checkpoint on the pass's own scene (the viewer sets it
 //! first, `Viewer::resume_training`). One folder, one interrupted pass: a new pass replaces it.
+//!
+//! # Collection mode (M8a Task 4b; Task 4a review concern 6)
+//! A pass that learns into a shared collection has its samples saved by the collection as they are
+//! kept, so only [`CHECKPOINT_FILE`] is written (a stale [`MODEL_FILE`] is removed). Its provenance
+//! line names the collection and its counts are the collection's (`SurrogateKs::checkpoint_counts`):
+//! the resume attaches the scene's collection and goes on when the collection still holds the
+//! samples it held at the checkpoint; jobs whose geometry it already holds are not solved again.
 
 use super::*;
 
@@ -39,12 +46,15 @@ impl Checkpoints {
 
 /// The interrupted pass in `dir`, if there is one that can be read: its checkpoint text and header.
 pub fn interrupted_pass(dir: &std::path::Path) -> Option<(String, providers::sampling::CheckpointInfo)> {
-    if !dir.join(MODEL_FILE).exists() {
-        return None;
-    }
     let text = std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).ok()?;
     let info = providers::sampling::checkpoint_info(&text).ok()?;
-    Some((text, info))
+    // a per-scene pass needs its samples file; a collection's pass has its samples in the collection
+    (dir.join(MODEL_FILE).exists() || is_collection_checkpoint(&info)).then_some((text, info))
+}
+
+/// The checkpoint was written in collection mode (module doc, "Collection mode").
+pub fn is_collection_checkpoint(info: &providers::sampling::CheckpointInfo) -> bool {
+    info.provenance.starts_with("shared collection ")
 }
 
 /// Removes the interrupted pass's files from `dir` (the offer's Discard; a pass that ended).
@@ -90,6 +100,7 @@ impl Worker {
     /// Writes the samples file and the checkpoint (module doc); `Ok(false)` for a pass that is not
     /// resumable (teach-around, references only).
     fn write_checkpoint(&mut self, dir: &std::path::Path) -> Result<bool, String> {
+        let shared = self.in_collection();
         let Some(t) = trainable(&mut self.dy) else { return Ok(false) };
         let Some(text) = t.pass_checkpoint() else { return Ok(false) };
         if t.samples() == 0 {
@@ -98,6 +109,16 @@ impl Worker {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (model, ckpt) = (dir.join(MODEL_FILE), dir.join(CHECKPOINT_FILE));
         let tmp = |p: &std::path::Path| p.with_extension(format!("{}.tmp", p.extension().and_then(|x| x.to_str()).unwrap_or("")));
+        if shared {
+            // the collection holds the samples (module doc, "Collection mode")
+            match std::fs::remove_file(&model) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", model.display())),
+                _ => {}
+            }
+            std::fs::write(tmp(&ckpt), text).map_err(|e| format!("{}: {e}", ckpt.display()))?;
+            std::fs::rename(tmp(&ckpt), &ckpt).map_err(|e| format!("{}: {e}", ckpt.display()))?;
+            return Ok(true);
+        }
         t.save(&tmp(&model)).map_err(|e| format!("{}: {e}", model.display()))?;
         std::fs::write(tmp(&ckpt), text).map_err(|e| format!("{}: {e}", ckpt.display()))?;
         std::fs::rename(tmp(&model), &model).map_err(|e| format!("{}: {e}", model.display()))?;
@@ -114,9 +135,16 @@ impl Worker {
             Ok(t) => t,
             Err(e) => return self.error(format!("resume the interrupted training: {}: {e}", dir.join(CHECKPOINT_FILE).display())),
         };
-        self.dy.apply(DynCommand::LoadModel(dir.join(MODEL_FILE)));
-        if self.dy.snapshot().last_rejection.is_some() {
-            return;
+        if dir.join(MODEL_FILE).exists() {
+            self.dy.apply(DynCommand::LoadModel(dir.join(MODEL_FILE)));
+            if self.dy.snapshot().last_rejection.is_some() {
+                return;
+            }
+            self.use_collection = false;
+        } else {
+            // a collection's pass (module doc, "Collection mode"): its samples are in the collection
+            self.use_collection = true;
+            self.sync_collection();
         }
         self.owns_autosave = true;
         self.pass_offer = None;

@@ -65,6 +65,18 @@ pub enum Command {
     /// module doc: its samples and checkpoint after its solves, removed when the pass finishes or is
     /// cancelled); `None` = no checkpoints (the default: headless runs and tests). A worker setting.
     TrainingCheckpoints(Option<PathBuf>),
+    /// Estimated solver: the folder of the shared collections (M8a Task 4b; controller ruling P6 —
+    /// the window's `scene::collections_dir()`, `models/collections`): with one set, `EnsureModel`
+    /// attaches the collection of the scene's solver surface and the worker keeps it attached across
+    /// scene changes (`model` module doc, "The shared collection"); `None` = per-scene models only (the
+    /// default: headless runs and tests keep today's behaviour bit for bit). A worker setting.
+    Collections(Option<PathBuf>),
+    /// Estimated solver: learn into the shared collection of the scene's surface, or switch to a
+    /// model file (a specialised, per-scene model: `DynCommand::LoadModel`). The Model tab's switch.
+    UseModel(ModelChoice),
+    /// Estimated solver: import a `.model` file's samples into the attached collection
+    /// (`Trainable::import_model`); the outcome is `ModelStatus::last_import`. Never an edit.
+    ImportModel(PathBuf),
     /// Estimated solver: go on with the interrupted pass kept in this folder (sent instead of
     /// `EnsureModel`, on the pass's own scene): its samples file is loaded, then its checkpoint
     /// resumed (`DynCommand::ResumeSampling`); either refusal is the snapshot's `last_rejection`.
@@ -147,6 +159,9 @@ impl Command {
             Command::Dyn(_)
             | Command::EnsureModel { .. }
             | Command::TrainingCheckpoints(_)
+            | Command::Collections(_)
+            | Command::UseModel(_)
+            | Command::ImportModel(_)
             | Command::ResumeTraining(_)
             | Command::SetAudit(_)
             | Command::SetDraft(_)
@@ -177,6 +192,8 @@ impl Command {
             ),
             Command::Shutdown
             | Command::TrainingCheckpoints(_)
+            | Command::Collections(_)
+            | Command::ImportModel(_)
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
@@ -212,6 +229,9 @@ impl Command {
             self,
             Command::EnsureModel { .. }
                 | Command::TrainingCheckpoints(_)
+                | Command::Collections(_)
+                | Command::UseModel(_)
+                | Command::ImportModel(_)
                 | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
                 | Command::SetDraft(_)
@@ -249,6 +269,8 @@ impl Command {
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
             | Command::TrainingCheckpoints(_)
+            | Command::Collections(_)
+            | Command::ImportModel(_)
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
@@ -284,6 +306,17 @@ impl Command {
     }
 }
 
+/// What the estimated solver learns into ([`Command::UseModel`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelChoice {
+    /// The shared collection of the scene's solver surface (needs [`Command::Collections`]).
+    Collection,
+    /// A model file, as a specialised per-scene model. (The window's switch goes through Load
+    /// model, whose provenance check offers the file's settings first: `ui::Action::LoadModel`.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    File(PathBuf),
+}
+
 /// Which solver the worker's driver runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -316,6 +349,7 @@ impl Worker {
                     self.dy.apply(DynCommand::ReplaceScene(new));
                     // the step count restarts: a new run (`worker::activity`, "Runs")
                     self.activity.new_run();
+                    self.sync_collection();
                 }
                 Err(e) => self.error(e),
             },
@@ -339,11 +373,17 @@ impl Worker {
             Command::SetGrid { n, h } => self.replace(|s| s.cell = sim::Cell { n, h }),
             Command::SetSigma(x) => self.replace(|s| s.sigma = x),
             Command::SetIonicPolicy(p) => self.replace(|s| s.ionic = p),
+            Command::Collections(dir) => self.collections = dir,
+            Command::UseModel(choice) => self.use_model(choice),
+            Command::ImportModel(path) => self.import_model(&path),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's
                 let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
+                // a model file or a forget is the user's choice against the shared collection: it is
+                // not attached again on a scene change until the Model tab's switch says so
+                let leaves_collection = matches!(c, DynCommand::ForgetModel | DynCommand::LoadModel(_));
                 if takes_over {
                     self.pass_offer = None;
                 }
@@ -353,6 +393,9 @@ impl Worker {
                 }
                 self.dy.apply(c);
                 if takes_over && self.dy.snapshot().last_rejection.is_none() && trainable(&mut self.dy).is_some() {
+                    if leaves_collection {
+                        self.use_collection = false;
+                    }
                     self.autoload_refused = None;
                     self.owns_autosave = true;
                     if forget {
@@ -426,5 +469,8 @@ impl Worker {
         f(&mut s);
         self.dy.apply(DynCommand::ReplaceScene(s));
         self.activity.new_run();
+        // a charge, multiplicity, h, σ or ionic policy change may leave or change the surface
+        // (`model` module doc, "The shared collection")
+        self.sync_collection();
     }
 }

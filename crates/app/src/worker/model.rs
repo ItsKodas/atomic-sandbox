@@ -3,6 +3,23 @@
 //! and its one re-sizing from the median of its first solves, [`pass_resize`]), the
 //! active-learning refits and the per-solve cost estimate. The provider is reached only through
 //! `sim::Trainable`. Split out of `app/src/sim.rs` in M6 Task 1.
+//!
+//! # The shared collection (M8a Task 4b; spec §4.2; controller rulings P6, P13)
+//! With a collections folder set ([`Command::Collections`]: the window's `models/collections`;
+//! headless runs and tests set none and keep per-scene models bit for bit), `EnsureModel` attaches
+//! the collection of the scene's solver surface (`Trainable::attach_collection`: one folder per h,
+//! σ, ionic policy, teacher and tolerance — every box and every species of that surface learn into
+//! it) unless the session's autosave restores a per-scene model on a neutral scene (the user had
+//! chosen a file). While the user's choice is the collection ([`ModelChoice::Collection`], the
+//! default) every scene replacement re-attaches ([`Worker::sync_collection`]): a change of h, σ or
+//! the ionic policy moves to that surface's collection; a charged scene or a forced multiplicity
+//! (collections are neutral until M9) **leaves** it — the model is forgotten for that scene (the
+//! collection stays on disk, nothing of it is lost) with a note, so the scene learns per-scene —
+//! and the collection comes back when the scene is neutral again (Task 4a review ⚠️ 2). A model
+//! file (Load model, the switch) or Forget ends that choice until the switch picks the collection
+//! again. The autosave writes a per-scene model only (`autosave` module doc); a collection saves
+//! itself. A pass's checkpoint in collection mode is the checkpoint alone (`checkpoint` module
+//! doc, "Collection mode").
 
 use super::*;
 
@@ -140,7 +157,32 @@ pub struct ModelStatus {
     pub no_model: Option<String>,
     /// The Retry can help now (`sim::TrainableStatus::retry_fit`): the Model tab's Retry button.
     pub retry_fit: bool,
+    /// Where the model comes from (`sim::TrainableStatus::model_source`): the shared collection, a
+    /// file, or neither (the Model tab's source line, [`source_line`]).
+    pub source: sim::ModelSource,
+    /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
+    pub collections: bool,
+    /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
+    pub last_import: Option<Result<sim::ImportSummary, String>>,
 }
+
+/// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
+/// "read-only — open in another window" when another process holds the collection), "file:
+/// <name>", or a per-scene model's line.
+pub fn source_line(m: &ModelStatus) -> String {
+    match &m.source {
+        sim::ModelSource::Collection { slug, samples, read_only } => {
+            let ro = if *read_only { " · read-only — open in another window" } else { "" };
+            format!("model: shared — {slug} · {samples} samples{ro}")
+        }
+        sim::ModelSource::File(p) => format!("file: {}", p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())),
+        sim::ModelSource::None if m.collections => "model: this scene only (not shared)".into(),
+        sim::ModelSource::None => "model: this session only".into(),
+    }
+}
+
+/// The import's honest caveat (Task 4a review ⚠️ 3): a file carries no isolated-atom references.
+pub const IMPORT_REFERENCES_NOTE: &str = "imported species are fitted only after a sampling pass on a scene that contains them: their isolated-atom references come from passes, never from a file";
 
 /// The box keeps the model untrusted (diag-3h, a user's H₂ + H at the Accurate grid's 12 Bohr cell:
 /// 130 of 145 samples box-affected, refused as "max training energy residual 2.2e-3" — the same
@@ -331,6 +373,14 @@ impl Worker {
                 self.autoload_refused = Some(r);
                 return;
             }
+            // the session's per-scene model is back: on a neutral scene it was the user's file (the
+            // collection is never autosaved), on a charged one the per-scene model it kept
+            let sc = self.dy.snapshot().scene;
+            if sc.charge == 0 && sc.multiplicity.is_none() {
+                self.use_collection = false;
+            }
+        } else {
+            self.sync_collection();
         }
         self.owns_autosave = true;
         // an empty scene needs no model (module doc, "The empty scene"): no pass, no offer
@@ -341,6 +391,68 @@ impl Worker {
         if auto_pass && !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
         }
+    }
+
+    /// Keeps the provider on the shared collection of the current scene's surface while the user's
+    /// choice is the collection and a folder is set (module doc, "The shared collection"): attaches
+    /// it (a no-op when attached; another surface's after an h, σ or ionic change), or — for a
+    /// charged scene or a forced multiplicity — lets an attached one go with a note. A refusal is a
+    /// note, never an error.
+    pub(super) fn sync_collection(&mut self) {
+        let Some(root) = self.collections.clone().filter(|_| self.use_collection) else { return };
+        let snap = self.dy.snapshot();
+        let scene = snap.scene;
+        let Some(t) = trainable(&mut self.dy) else { return };
+        let attached = match t.status(&scene, &snap.forces).model_source {
+            sim::ModelSource::Collection { slug, .. } => Some(slug),
+            _ => None,
+        };
+        let note = if scene.charge != 0 || scene.multiplicity.is_some() {
+            attached.map(|slug| {
+                t.forget();
+                let why = if scene.charge != 0 { format!("charge {:+}", scene.charge) } else { format!("multiplicity {} forced", scene.multiplicity.unwrap_or(0)) };
+                format!("this scene ({why}) cannot learn into the shared collection {slug} — collections are neutral until M9 — so it learns per-scene; the collection stays on disk and comes back when the scene is neutral again")
+            })
+        } else {
+            t.attach_collection(&root, &scene).err().map(|e| format!("shared collection not attached: {e}"))
+        };
+        if let Some(n) = note {
+            self.dy.add_note(n);
+        }
+    }
+
+    /// [`Command::UseModel`]: the Model tab's switch.
+    pub(super) fn use_model(&mut self, choice: ModelChoice) {
+        if trainable(&mut self.dy).is_none() {
+            return;
+        }
+        match choice {
+            ModelChoice::File(path) => self.apply(Command::Dyn(DynCommand::LoadModel(path))),
+            ModelChoice::Collection => {
+                if self.collections.is_none() {
+                    self.dy.add_note("no shared collections folder in this run (headless runs keep per-scene models)".into());
+                    return;
+                }
+                self.use_collection = true;
+                self.pass_offer = None;
+                self.autoload_refused = None;
+                self.sync_collection();
+                self.owns_autosave = true;
+            }
+        }
+    }
+
+    /// [`Command::ImportModel`]: a `.model` file's samples into the attached collection, the
+    /// outcome kept for the Model tab and noted.
+    pub(super) fn import_model(&mut self, path: &std::path::Path) {
+        let Some(t) = trainable(&mut self.dy) else { return };
+        let r = t.import_model(path);
+        let note = match &r {
+            Ok(s) => format!("imported {}: {} samples taken, {} refused — {IMPORT_REFERENCES_NOTE}", path.display(), s.imported, s.refused.len()),
+            Err(e) => format!("import {}: {e}", path.display()),
+        };
+        self.last_import = Some(r);
+        self.dy.add_note(note);
     }
 
     /// The automatic first pass (Task 9 item 4): the panel's plan, re-sized to [`PASS_TARGET_S`]
@@ -454,6 +566,7 @@ impl Worker {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
+        let (collections, last_import) = (self.collections.is_some(), self.last_import.clone());
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
         // no record (never audited, forgotten, a model loaded): no step either
@@ -507,6 +620,9 @@ impl Worker {
             pass_offer,
             no_model: st.no_model,
             retry_fit: st.retry_fit,
+            source: st.model_source,
+            collections,
+            last_import,
         })
     }
 

@@ -112,6 +112,14 @@ pub enum Action {
     ResumeTraining,
     /// The same offer's "Discard": its files are removed. Recorded, not replayable.
     DiscardTraining,
+    /// The Model tab's switch, "shared collection": learn into the shared collection of the scene's
+    /// solver surface (`Command::UseModel(ModelChoice::Collection)`; M8a Task 4b). The other side of
+    /// the switch is a model file (`LoadModel`). Recorded, not replayable (it opens the user's
+    /// collection folder).
+    UseCollection,
+    /// The Model tab's "Import a model file…": the chosen `.model` file's samples into the attached
+    /// collection (`Command::ImportModel`). Recorded, not replayable (it reads a file).
+    ImportModel(std::path::PathBuf),
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
     /// The estimated solver's audit cadence (answered steps; 0 = never).
@@ -482,6 +490,18 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 out.error = Some("a sampling pass is running: cancel it first, then resume the interrupted one".into());
             } else if st.resume.is_some() {
                 out.training = Some(true);
+            }
+        }
+        Action::UseCollection => {
+            out.commands.push(Command::UseModel(crate::sim::ModelChoice::Collection));
+            st.set_status("learning into the shared collection of this scene's solver surface");
+        }
+        Action::ImportModel(path) => {
+            if input.sampling() {
+                out.error = Some("a sampling pass is running: cancel it first, then import".into());
+            } else {
+                st.set_status(format!("importing {} into the shared collection", path.display()));
+                out.commands.push(Command::ImportModel(path));
             }
         }
         Action::DiscardTraining => {
@@ -874,7 +894,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 

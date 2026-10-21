@@ -391,6 +391,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::StartOffered(_) => "start-offered",
         Action::ResumeTraining => "resume-training",
         Action::DiscardTraining => "discard-training",
+        Action::UseCollection => "use-collection",
+        Action::ImportModel(_) => "import-model",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",

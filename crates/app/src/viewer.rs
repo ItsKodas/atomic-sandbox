@@ -461,6 +461,10 @@ pub struct Viewer {
     /// window's `%LOCALAPPDATA%\atomic-sandbox\training`; `None` headless (screenshots, replays,
     /// tests never write or offer one).
     pub training_dir: Option<PathBuf>,
+    /// The shared collections' folder (M8a Task 4b; ruling P6): the window's `models/collections`
+    /// (`scene::collections_dir`); `None` headless (screenshots, replays, tests keep per-scene
+    /// models). Sent to every estimated worker before its `EnsureModel` (`Command::Collections`).
+    pub collections_dir: Option<PathBuf>,
     /// The next estimated worker resumes the interrupted pass in this folder instead of its
     /// `EnsureModel` ([`Viewer::resume_training`]).
     resume_next: Option<PathBuf>,
@@ -522,6 +526,7 @@ impl Viewer {
             ghost: Default::default(),
             capture: Default::default(),
             training_dir: None,
+            collections_dir: None,
             resume_next: None,
         })
     }
@@ -596,6 +601,9 @@ impl Viewer {
         }
         if estimated {
             let mut teach: Vec<Command> = self.training_dir.iter().map(|d| Command::TrainingCheckpoints(Some(d.clone()))).collect();
+            if let Some(d) = &self.collections_dir {
+                teach.push(Command::Collections(Some(d.clone())));
+            }
             teach.push(match resume {
                 Some(dir) => Command::ResumeTraining(dir),
                 None => Command::EnsureModel {

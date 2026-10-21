@@ -485,6 +485,8 @@ fn main() {
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
     // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
     viewer.auto_pass = false;
+    // the estimated solver learns into the shared collection of the scene's solver surface (M8a Task 4b)
+    viewer.collections_dir = scene::collections_dir();
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));

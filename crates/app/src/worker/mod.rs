@@ -583,6 +583,13 @@ struct Worker {
     owns_autosave: bool,
     /// The running pass is kept resumable here (`checkpoint` module doc; `Command::TrainingCheckpoints`).
     checkpoints: Option<Checkpoints>,
+    /// The shared collections' folder ([`Command::Collections`]), whether the user's choice is the
+    /// shared collection (true until a model file is loaded or the model forgotten; the Model tab's
+    /// switch sets it back), and the last import's outcome (`model` module doc, "The shared
+    /// collection").
+    collections: Option<PathBuf>,
+    use_collection: bool,
+    last_import: Option<Result<sim::ImportSummary, String>>,
     /// The audit cadence set by [`Command::SetAudit`] and draft mode by [`Command::SetDraft`]
     /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
@@ -794,6 +801,9 @@ fn worker(
         autoload_refused: None,
         owns_autosave: false,
         checkpoints: None,
+        collections: None,
+        use_collection: true,
+        last_import: None,
         audit_every: None,
         draft: None,
         last_gap: None,
@@ -1184,6 +1194,8 @@ impl Worker {
             Ok(d) => {
                 self.dy = d;
                 self.apply_audit();
+                // a collection-mode model is not carried by the autosave: the collection holds it
+                self.sync_collection();
                 let s = self.dy.snapshot();
                 self.publish(s);
                 true

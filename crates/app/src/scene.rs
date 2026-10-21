@@ -300,6 +300,15 @@ pub fn models_dir() -> Option<std::path::PathBuf> {
     [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
 }
 
+/// The shared collections' folder (M8a Task 4b; ruling P6): `collections` inside [`models_dir`],
+/// created on first use; `None` without a `models` folder or when it cannot be created. Only the
+/// window sets it (`Viewer::collections_dir`): headless runs keep per-scene models.
+pub fn collections_dir() -> Option<std::path::PathBuf> {
+    let dir = models_dir()?.join("collections");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// The `scenes` folder, found like [`models_dir`] (the dist folder's has the presets as files).
 pub fn scenes_dir() -> Option<std::path::PathBuf> {
     let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("scenes")));

@@ -127,6 +127,10 @@ pub(super) struct SharedCollection {
     pub(super) box_refs: BTreeMap<(u8, usize), f64>,
     /// A write failed (or the collection is read-only): said once.
     write_noted: bool,
+    /// The collection's sample count when the running (or last) sampling pass started: its
+    /// checkpoint's `pass_start` in collection mode (M8a Task 4b, the resume rule —
+    /// [`SurrogateKs::checkpoint_counts`]).
+    pub(super) pass_start: Option<usize>,
 }
 
 /// The store's provenance in collection mode: the key's settings, any box (`grid_n` 0), neutral,
@@ -231,6 +235,7 @@ impl SurrogateKs {
             box_n: c.samples.iter().map(|x| x.grid_n).collect(),
             box_refs: c.references.iter().map(|(&k, r)| (k, r.energy)).collect(),
             write_noted: false,
+            pass_start: None,
             coll: c,
         });
         // the fit's energies: each sample against its own box's references (module doc)
@@ -314,6 +319,30 @@ impl SurrogateKs {
             Link::In(k) => Some(*k),
             _ => None,
         }
+    }
+
+    /// What a pass checkpoint records (M8a Task 4b; Task 4a review concern 6): its provenance line
+    /// and the (samples, pass start) counts. Per scene: the store's provenance and size, as before
+    /// (the samples file beside the checkpoint must hold as many). In collection mode the collection
+    /// saves the pass's samples itself, so the line names the collection and the counts are the
+    /// collection's — its size now and when the pass started; a resume needs the collection to hold
+    /// at least that many ([`collection_resume_refusal`](Self::collection_resume_refusal)). A
+    /// per-scene checkpoint never resumes into a collection, nor the reverse: the lines differ.
+    pub(super) fn checkpoint_counts(&self, scene: &Scene) -> (String, usize, usize) {
+        let prov = self.provenance_for(scene).describe();
+        match &self.shared {
+            Some(s) => (format!("shared collection {}: {prov}", s.coll.key.slug()), s.coll.samples.len(), s.pass_start.unwrap_or(0)),
+            None => (prov, self.samples(), self.pass_start.unwrap_or(0)),
+        }
+    }
+
+    /// The collection-mode resume rule (module doc of `checkpoint_counts`): `None` when the attached
+    /// collection still holds the `samples` the checkpoint was written with (the collection is
+    /// append-only, so it may hold more: another session added to it), else why not.
+    pub(super) fn collection_resume_refusal(&self, samples: usize) -> Option<String> {
+        let s = self.shared.as_ref()?;
+        let held = s.coll.samples.len();
+        (held < samples).then(|| format!("the shared collection {} holds {held} samples, the checkpoint was written when it held {samples} — not the collection the pass learned into", s.coll.key.slug()))
     }
 
     /// Where the model comes from (`TrainableStatus::model_source`).

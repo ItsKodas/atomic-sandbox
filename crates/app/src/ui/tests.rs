@@ -203,6 +203,9 @@ pub(crate) fn model() -> ModelStatus {
         pass_offer: None,
         no_model: None,
         retry_fit: false,
+        source: sim::ModelSource::None,
+        collections: false,
+        last_import: None,
     }
 }
 
@@ -1174,6 +1177,45 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     }
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
+}
+
+/// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
+/// the import's outcome line; the tab draws them (and the switch) without sending anything; the
+/// switch's and the import's actions send their commands and are recorded as not replayable.
+#[test]
+fn the_model_tab_says_where_the_model_learns() {
+    use crate::sim::source_line;
+    let coll = |read_only| sim::ModelSource::Collection { slug: "h0.15-auto-accepted-gpu-1e-6".into(), samples: 412, read_only };
+    let m = ModelStatus { source: coll(false), collections: true, ..model() };
+    assert_eq!(source_line(&m), "model: shared — h0.15-auto-accepted-gpu-1e-6 · 412 samples");
+    assert_eq!(source_line(&ModelStatus { source: coll(true), ..m.clone() }), "model: shared — h0.15-auto-accepted-gpu-1e-6 · 412 samples · read-only — open in another window");
+    assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::File("C:/m/h2o.model".into()), ..m.clone() }), "file: h2o.model");
+    assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::None, ..m.clone() }), "model: this scene only (not shared)");
+    let r = sim::ImportSummary { imported: 30, refused: vec![(Some(4), "box status unknown".into()), (None, "another solver surface".into())], notes: vec![] };
+    assert_eq!(super::dock::model::import_line(&r), "last import: imported 30, refused 2");
+    // drawn (with an import's outcome) without sending anything
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus { last_import: Some(Ok(r)), ..m };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    // the actions
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::UseCollection, &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::UseModel(crate::sim::ModelChoice::Collection)]), "{:?}", out.commands);
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportModel("x.model".into()), &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::ImportModel(p)] if p.ends_with("x.model")), "{:?}", out.commands);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::UseCollection), Some("use-collection"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ImportModel("x.model".into())), Some("import-model"));
 }
 
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the

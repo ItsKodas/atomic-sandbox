@@ -9,7 +9,7 @@ use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
 use crate::scene::model_path;
-use crate::sim::{Backend, ModelStatus, FIT_VS_HELD_HELP};
+use crate::sim::{source_line, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
 use egui::{Color32, RichText, Ui};
 use sim::SamplingPlan;
 
@@ -28,6 +28,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let d = snap.map(|s| &s.dynamics);
     let m: Option<&ModelStatus> = input.model();
     let sampling = input.sampling();
+    super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, acts));
     super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
             readouts(ui, d, m, input.scene, st);
@@ -152,6 +153,68 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         super::super::menus::draft_control(ui, st, acts);
     });
 }
+
+/// Where the model learns (M8a Task 4b): the source line ([`source_line`]), the switch between the
+/// shared collection and a model file (offered when a collections folder is set), and "Import a
+/// model file…" with the last import's outcome.
+fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(m) = m else { return };
+    let shared = matches!(m.source, sim::ModelSource::Collection { .. });
+    let read_only = matches!(m.source, sim::ModelSource::Collection { read_only: true, .. });
+    let line = RichText::new(source_line(m)).size(12.5).color(if read_only { AMBER } else { theme::INK });
+    super::super::probed("model-source", ui.label(line)).on_hover_text(SOURCE_LINE_TIP);
+    if !m.collections {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(!sampling, egui::RadioButton::new(shared, "shared collection")).on_hover_text("learn into the one model of this solver surface (h, σ, ionic potential, teacher): every scene and box at these settings adds to it, and it saves itself as it learns (models/collections)").clicked() && !shared {
+            acts.push(Action::UseCollection);
+        }
+        if ui.add_enabled(!sampling, egui::RadioButton::new(!shared, "a model file…")).on_hover_text("switch to a model file as a specialised model for this scene (per-scene; Save model writes it)").clicked() {
+            let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+            if let Some(p) = model_dialog(&last).pick_file() {
+                st.model_file = Some(p);
+                acts.push(Action::LoadModel);
+            }
+        }
+    });
+    let can_import = shared && !read_only && !sampling;
+    if super::super::probed("import-model", ui.add_enabled(can_import, egui::Button::new("Import a model file…")))
+        .on_disabled_hover_text("needs the shared collection attached and writable, and no pass running")
+        .on_hover_text(format!("add a .model file's samples to the shared collection — each one checked (the same solver surface, box status known, not a duplicate); what is refused is listed with the reason. {IMPORT_REFERENCES_NOTE}"))
+        .clicked()
+    {
+        let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+        if let Some(p) = model_dialog(&last).pick_file() {
+            acts.push(Action::ImportModel(p));
+        }
+    }
+    match &m.last_import {
+        Some(Ok(r)) => {
+            ui.label(RichText::new(import_line(r)).size(11.5));
+            for (i, why) in r.refused.iter().take(5) {
+                ui.weak(format!("  {}: {why}", i.map_or("the file".to_string(), |i| format!("sample #{i}"))));
+            }
+            if r.refused.len() > 5 {
+                ui.weak(format!("  … and {} more refused", r.refused.len() - 5));
+            }
+            for n in r.notes.iter().take(3) {
+                ui.weak(n);
+            }
+            ui.label(RichText::new(IMPORT_REFERENCES_NOTE).size(11.0).color(theme::INK_DIM));
+        }
+        Some(Err(e)) => warnbox(ui, &format!("import refused: {e}")),
+        None => {}
+    }
+}
+
+/// "imported N, refused M" of an import (the Model tab).
+pub fn import_line(r: &sim::ImportSummary) -> String {
+    format!("last import: imported {}, refused {}", r.imported, r.refused.len())
+}
+
+/// The source line's hover text.
+const SOURCE_LINE_TIP: &str = "where the estimated solver's model comes from: the shared collection of this solver surface (one folder in models/collections per h, σ, ionic potential, teacher and tolerance — every scene at those settings learns into it), a model file (a specialised per-scene model), or this scene only (a charged scene or a forced multiplicity keeps a per-scene model: collections are neutral until M9)";
 
 fn warnbox(ui: &mut Ui, text: &str) {
     egui::Frame::new()

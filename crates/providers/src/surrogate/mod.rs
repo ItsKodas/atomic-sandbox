@@ -2247,6 +2247,9 @@ impl Trainable for SurrogateKs {
         }
         let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
         self.pass_start = Some(self.samples());
+        if let Some(sh) = self.shared.as_mut() {
+            sh.pass_start = Some(sh.coll.samples.len());
+        }
         let p = sampler.progress();
         self.user_notes.push(format!(
             "sampling pass started: {} jobs ({} pair scans), the dynamics are paused until it ends",
@@ -2305,8 +2308,8 @@ impl Trainable for SurrogateKs {
 
     fn pass_checkpoint(&self) -> Option<String> {
         let sampler = self.pass.as_ref()?;
-        let prov = self.provenance_for(sampler.scene());
-        sampler.checkpoint(&prov.describe(), self.samples(), self.pass_start.unwrap_or(0))
+        let (prov, samples, start) = self.checkpoint_counts(sampler.scene());
+        sampler.checkpoint(&prov, samples, start)
     }
 
     fn resume_pass(&mut self, scene: &Scene, checkpoint: &str, refs: &mut AtomReferences) -> Result<(), String> {
@@ -2314,7 +2317,7 @@ impl Trainable for SurrogateKs {
             return Err("a pass is already running (cancel it first)".into());
         }
         let info = crate::sampling::checkpoint_info(checkpoint)?;
-        let want = self.provenance_for(scene).describe();
+        let (want, _, _) = self.checkpoint_counts(scene);
         if info.provenance != want {
             return Err(format!("it was taught at {}, the scene is solved at {want}", info.provenance));
         }
@@ -2330,7 +2333,12 @@ impl Trainable for SurrogateKs {
         if !same(&info.scene, scene) {
             return Err("the scene is not the one the interrupted pass was sampling".into());
         }
-        if info.samples != self.samples() {
+        if self.shared.is_some() {
+            // collection mode: the collection kept the pass's samples (`checkpoint_counts`)
+            if let Some(why) = self.collection_resume_refusal(info.samples) {
+                return Err(why);
+            }
+        } else if info.samples != self.samples() {
             return Err(format!(
                 "its samples file holds {} samples, the checkpoint was written with {} — they were not saved together",
                 self.samples(),
@@ -2345,6 +2353,9 @@ impl Trainable for SurrogateKs {
         }
         let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
         self.pass_start = Some(info.pass_start.min(self.samples()));
+        if let Some(sh) = self.shared.as_mut() {
+            sh.pass_start = Some(info.pass_start);
+        }
         let p = sampler.progress();
         self.user_notes.push(format!(
             "sampling pass resumed at sample {} of {} ({}): the {} samples taught before it stopped are kept, the dynamics are paused until it ends",

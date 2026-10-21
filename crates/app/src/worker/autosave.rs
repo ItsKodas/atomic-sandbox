@@ -11,8 +11,11 @@ impl Worker {
     /// lost minutes of DFT when its P reference did not solve and this removed the unfitted
     /// state), or removes `path` (nothing held); the error message on failure.
     pub(super) fn save_model_to(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        // a shared collection saves itself (ruling P13: the autosave is a per-scene model's only; a
+        // stale one of a file chosen earlier is removed, so the next worker attaches the collection)
+        let shared = self.in_collection();
         let Some(s) = trainable(&mut self.dy) else { return Ok(false) };
-        if s.fitted() || s.samples() > 0 {
+        if !shared && (s.fitted() || s.samples() > 0) {
             s.save(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
             Ok(true)
         } else {
@@ -21,6 +24,12 @@ impl Worker {
                 _ => Ok(false),
             }
         }
+    }
+
+    /// The provider learns into a shared collection (`sim::ModelSource::Collection`).
+    pub(super) fn in_collection(&mut self) -> bool {
+        let snap = self.dy.snapshot();
+        trainable(&mut self.dy).is_some_and(|t| matches!(t.status(&snap.scene, &snap.forces).model_source, sim::ModelSource::Collection { .. }))
     }
 
     /// Shutdown (`worker` module doc, "Autosave"): the model to the autosave path — only if this worker
