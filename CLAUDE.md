@@ -17,12 +17,12 @@ Interactive 3D sandbox simulating matter from the atomic level up with real phys
 
 ## Model assignment
 
-Tag every plan task: **Fable 5.1** (`claude-fable-5-1`) for solver math, integrators, force derivations, numerical-stability debugging, validation oracles, physics review — anything where a wrong answer still looks plausible; **Opus 5.5** (`claude-opus-5-5`) for GPU plumbing, UI, rendering, tooling, tests with pinned values, refactors. Agents in `.claude/agents/`: `physics-reviewer` (Fable, read-only), `solver-implementer` (Fable, TDD against CPU f64 references), `gpu-kernel-engineer` (Opus, WGSL + dispatch), `validation-runner` (Opus, runs suites, never edits physics).
+Tag every plan task and dispatch subagents accordingly: **Fable 5.1** (`claude-fable-5-1`) for solver math, integrators, force derivations, numerical-stability debugging, validation oracles, physics review — anything where a wrong answer still looks plausible; **Opus 5.5** (`claude-opus-5-5`) for GPU plumbing, UI, rendering, tooling, tests with pinned values, refactors. Agents in `.claude/agents/`: `physics-reviewer` (Fable, read-only; reviews derivations, units, signs, conservation before solver/dynamics code lands), `solver-implementer` (Fable, TDD against CPU f64 references), `gpu-kernel-engineer` (Opus, WGSL kernels + Rust dispatch against a given spec and CPU reference), `validation-runner` (Opus, runs suites, never edits physics).
 
 ## Workflow
 
 - Superpowers skills apply: brainstorm → spec → plan → TDD implementation → review → verify before claiming done.
-- **Keep `README.md` current** (user instruction): whenever user-facing behaviour, controls, presets, performance numbers, milestone status or the crate layout change, update the README in the same commit or milestone merge.
+- **Keep `README.md` current** (user instruction): whenever user-facing behaviour, controls, presets, performance numbers, milestone status or the crate layout change, update the README in the same commit or milestone merge. It is the public face of the repo; the spec/plans/notes stay the engineering record.
 - Commit the spec/plan changes alongside code. Commit messages end with the Claude attribution line.
 - When a fact here or in `docs/dev-reference.md` changes, update it there; keep this file short (it is loaded into every session and every subagent).
 
