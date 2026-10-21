@@ -462,7 +462,17 @@ const TAGS: [SampleTag; 9] = [
 ];
 
 fn tag_code(t: SampleTag) -> f64 {
-    TAGS.iter().position(|&x| x == t).expect("every tag is listed") as f64
+    tag_index(t) as f64
+}
+
+/// A tag's code (the sidecar's `sample_tag` value; `crate::collection` writes the same code).
+pub(crate) fn tag_index(t: SampleTag) -> u8 {
+    TAGS.iter().position(|&x| x == t).expect("every tag is listed") as u8
+}
+
+/// The tag of a code, `None` for a code this build does not know.
+pub(crate) fn tag_from_index(code: u8) -> Option<SampleTag> {
+    TAGS.get(code as usize).copied()
 }
 
 /// Largest n_max a file may declare (the default is 8; the bound only keeps a hostile header
@@ -1742,7 +1752,7 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::envelope::Envelope;
     use rand::rngs::StdRng;
@@ -1760,7 +1770,7 @@ mod tests {
 
     /// A random model, accumulator, report and samples with awkward values (subnormal-free but
     /// spread over 16 decades, −0.0, a non-finite condition estimate).
-    fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
+    pub(crate) fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;

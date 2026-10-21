@@ -17,6 +17,7 @@
 //! isotope mass; everything element-specific is learned).
 
 pub mod basis;
+pub mod collection;
 pub mod descriptor;
 pub mod envelope;
 pub mod fit;
@@ -26,6 +27,7 @@ pub mod linalg;
 pub mod loo;
 pub mod model;
 pub mod novelty;
+pub mod quarantine;
 pub mod sidecar;
 
 pub use descriptor::{describe, describe_values, AtomDescriptor, Basis, Body3Term, DescribeError};
@@ -33,7 +35,8 @@ pub use envelope::Envelope;
 pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError, Sums,
 };
-pub use model::{energy_and_forces, Model, Prediction, Provenance};
+pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
+pub use collection::{Collection, CollectionSample, ImportReport, OpenReport};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, HISTORY_CAP};
 pub use novelty::NullSpace;

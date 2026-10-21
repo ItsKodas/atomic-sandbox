@@ -183,6 +183,164 @@ impl Provenance {
             }
         }
     }
+
+    /// The solver surface these settings put a sample on ([`SurfaceKey`]): everything a sample's
+    /// energy depends on — h, σ, the SCF tolerance, the teacher, the ionic tag and the functional
+    /// (`"lsda"`, the only one this solver has) — and NOT the box (`grid_n`), the charge or the
+    /// multiplicity (spec §4.2: a collection's admission rules handle those, `crate::collection`).
+    pub fn surface_key(&self) -> SurfaceKey {
+        SurfaceKey {
+            functional: FUNCTIONAL_LSDA.to_string(),
+            h: self.h,
+            sigma: self.sigma,
+            tol: self.tol,
+            teacher: self.teacher.clone(),
+            ionic: self.ionic.clone(),
+        }
+    }
+}
+
+/// The exchange-correlation functional of every surface this solver has produced (LSDA; PBE
+/// arrives with its own milestone and its own key).
+pub const FUNCTIONAL_LSDA: &str = "lsda";
+
+/// One solver surface (spec `2026-10-20-m8-shared-model-and-sandbox-design.md` §4.2): the solve
+/// settings a sample's energy depends on, so samples with equal keys can share one fit whatever
+/// box they were solved in. Compared exactly (f64 `==`, like [`Provenance`]); the box size
+/// (`grid_n`), the charge and the multiplicity are not part of it — a shared collection refuses
+/// charged and spin-forced samples instead, and the box rule keeps box-affected ones out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceKey {
+    /// The exchange-correlation functional ([`FUNCTIONAL_LSDA`]).
+    pub functional: String,
+    /// Grid spacing, Bohr.
+    pub h: f64,
+    /// Nuclear smearing width σ, Bohr.
+    pub sigma: f64,
+    /// SCF tolerance of the teacher's solves.
+    pub tol: f64,
+    /// The teacher's kind (`ForceProvider::name`, e.g. "Kohn-Sham (GPU)").
+    pub teacher: String,
+    /// The ionic surface tag ([`Provenance::ionic`]).
+    pub ionic: String,
+}
+
+/// FNV-1a, 64 bit: a short, platform-independent fingerprint of a string for [`SurfaceKey::slug`]
+/// (not a security hash: a slug collision is caught by `key.txt`, `crate::collection`).
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Lower-case ASCII letters, digits, `.`, `+` and `-` are kept; every other run of characters
+/// becomes one `-` (and none leads or trails).
+fn slug_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '+' {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push('x');
+    }
+    out
+}
+
+impl SurfaceKey {
+    /// A filesystem-safe folder name for this key, the same on every run and platform: the
+    /// functional, h, σ and the tolerance (each f64 in Rust's shortest round-trip form, so two
+    /// different values never share a spelling), the teacher, and the ionic tag — `none` as it is,
+    /// any other tag as its policy word plus a 12-hex-digit FNV-1a hash of the whole tag (the full
+    /// tags run to ~60 characters with `/`). A teacher name over 32 characters is shortened the same
+    /// way. Only `[a-z0-9.+_-]`; e.g. `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_none`.
+    pub fn slug(&self) -> String {
+        let hashed = |s: &str, head: &str| format!("{}-{:012x}", slug_part(head), fnv1a64(s.as_bytes()) & 0xffff_ffff_ffff);
+        let teacher = slug_part(&self.teacher);
+        let teacher = if teacher.len() > 32 { hashed(&self.teacher, &teacher[..20]) } else { teacher };
+        let ionic = if self.ionic == "none" { "none".to_string() } else { hashed(&self.ionic, self.ionic.split('/').next().unwrap_or("")) };
+        format!(
+            "{}_h{}_s{}_tol{}_{}_{}",
+            slug_part(&self.functional),
+            slug_part(&format!("{:?}", self.h)),
+            slug_part(&format!("{:?}", self.sigma)),
+            slug_part(&format!("{:?}", self.tol)),
+            teacher,
+            ionic
+        )
+    }
+
+    /// The first field where `other` differs from `self`, worded for a refusal:
+    /// "h 0.25 (the collection's 0.15)"; `None` when the keys are equal.
+    pub fn difference(&self, other: &SurfaceKey) -> Option<String> {
+        if self.functional != other.functional {
+            return Some(format!("functional {} (the collection's {})", other.functional, self.functional));
+        }
+        if self.h != other.h {
+            return Some(format!("h {:?} (the collection's {:?})", other.h, self.h));
+        }
+        if self.sigma != other.sigma {
+            return Some(format!("σ {:?} (the collection's {:?})", other.sigma, self.sigma));
+        }
+        if self.tol != other.tol {
+            return Some(format!("tol {:?} (the collection's {:?})", other.tol, self.tol));
+        }
+        if self.teacher != other.teacher {
+            return Some(format!("teacher '{}' (the collection's '{}')", other.teacher, self.teacher));
+        }
+        if self.ionic != other.ionic {
+            return Some(format!("ionic {} (the collection's {})", other.ionic, self.ionic));
+        }
+        None
+    }
+
+    /// One line for messages and the README: "lsda, h 0.15 Bohr, σ 0.15 Bohr, tol 1e-6, teacher
+    /// 'Kohn-Sham (GPU)', ionic none".
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, h {:?} Bohr, σ {:?} Bohr, tol {:?}, teacher '{}', ionic {}",
+            self.functional, self.h, self.sigma, self.tol, self.teacher, self.ionic
+        )
+    }
+
+    /// The `key.txt` form: one `name value` line per field, floats in shortest round-trip form
+    /// (read back bit-exactly by [`from_text`](Self::from_text)); `#` lines are comments.
+    pub fn to_text(&self) -> String {
+        format!(
+            "# Atomic Sandbox collection: the solver surface every sample here was solved on\nfunctional {}\nh {:?}\nsigma {:?}\ntol {:?}\nteacher {}\nionic {}\n",
+            self.functional, self.h, self.sigma, self.tol, self.teacher, self.ionic
+        )
+    }
+
+    /// Reads [`to_text`](Self::to_text)'s form; every field is required, once.
+    pub fn from_text(text: &str) -> Result<SurfaceKey, String> {
+        let mut fields: [Option<&str>; 6] = [None; 6];
+        const NAMES: [&str; 6] = ["functional", "h", "sigma", "tol", "teacher", "ionic"];
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (name, value) = line.split_once(' ').ok_or_else(|| format!("line '{line}' is not 'name value'"))?;
+            let k = NAMES.iter().position(|&n| n == name).ok_or_else(|| format!("unknown field '{name}'"))?;
+            if fields[k].replace(value).is_some() {
+                return Err(format!("field '{name}' appears twice"));
+            }
+        }
+        let get = |k: usize| fields[k].ok_or_else(|| format!("field '{}' is missing", NAMES[k]));
+        let num = |k: usize| -> Result<f64, String> { get(k)?.parse::<f64>().map_err(|e| format!("field '{}': {e}", NAMES[k])) };
+        Ok(SurfaceKey { functional: get(0)?.to_string(), h: num(1)?, sigma: num(2)?, tol: num(3)?, teacher: get(4)?.to_string(), ionic: get(5)?.to_string() })
+    }
 }
 
 /// A fitted linear model. All fields are public: `fit` (Task 3) builds it, the sidecar (Task 5)

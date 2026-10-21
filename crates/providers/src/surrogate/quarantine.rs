@@ -36,23 +36,20 @@ pub const FENCE_VOTES: usize = 3;
 /// not learn it from what it was given).
 pub const FENCE_VOTE_LIMIT: u32 = 3;
 
-/// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values).
-pub(super) const Q_NONE: u8 = 0;
+/// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values): aliases of the
+/// `surrogate` crate's [`surrogate::quarantine`] codes, their one source of truth since M8a Task 3
+/// (ruling P4; the meaning of each is documented there). Values unchanged.
+pub(super) const Q_NONE: u8 = surrogate::quarantine::Q_NONE;
 
-pub(super) const Q_HELD: u8 = 1;
+pub(super) const Q_HELD: u8 = surrogate::quarantine::Q_HELD;
 
-pub(super) const Q_SUPERSEDED: u8 = 2;
+pub(super) const Q_SUPERSEDED: u8 = surrogate::quarantine::Q_SUPERSEDED;
 
-/// A box-affected sample (its face density above the box rule) taken while the model was still
-/// being built, excluded from the fit once the trust floor is met without it (Task 9 fix round
-/// 1, S1): never a quarantine candidate, never fencing.
-pub(super) const Q_BOX: u8 = 3;
+/// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
+pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 
-/// A draft-mode audit's answer at a geometry the strict policy refused (fix (b), 2026-10-18;
-/// `SampleTag::DraftAudit`): held out of the strict fit — not fitted, not in the envelope, the
-/// grade or the leave-one-out, never fencing. Not written to the sidecar's quarantine array (the
-/// tag carries it; `install_sidecar` restores the code from the tag).
-pub(super) const Q_DRAFT: u8 = 4;
+/// A draft-mode audit's answer held out of the strict fit ([`surrogate::quarantine::Q_DRAFT`]).
+pub(super) const Q_DRAFT: u8 = surrogate::quarantine::Q_DRAFT;
 
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
