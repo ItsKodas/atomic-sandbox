@@ -827,6 +827,9 @@ Reading it:
   260 s (Q′ 1232). The plan's spectrally truncated Σ (top-r eigenpairs, behind a setting, with the
   calibration's coverage measured) is the remedy for the variance; the refit needs the evidence
   search on the reduced system too. Not done in Task 9 (re-scoped); recorded for the handoff.
+  *(M8a Task 5: the refit part is done for a collection's body-4 basis — spectral search and warm
+  refit, "M8a body-4" below; the truncated Σ was measured and not adopted — it cannot be both
+  honest and useful, same section.)*
 
 #### The viewer's estimated mode (H₂, RX 7900 XTX, release)
 
@@ -3926,3 +3929,40 @@ The leave-one-out pass is linear in the samples and quadratic in Q′ (3N + 1 ro
 **Before / after on the user's collection** (the test; the live state = the collection's 8 held + cap 6): before, Q′ 51, n 570, worst 2.6e-2 Ha/atom, untrusted, and the old refit left it unchanged; after one refit, default basis Q′ 29, n 540, worst **6.8e-4** Ha/atom (allowed 1.0e-3), trusted, **38 held** (8 before, 30 this refit): the stretched H₂ #293/#294/#575 (5.2–5.6 Bohr), the compressed H₂ #360/#361 (0.82–0.88 Bohr, 81³) and #573/#574 (0.69 Bohr, 101³), the H₃ scan points #431–#435 (0.195–1.09 Bohr), and H₂/H₃ fallbacks among #288–#392 and #541–#564 (the H₃ ones at 1.3–2.6 Bohr with residuals up to 5.8e-2 Ha/atom).
 
 **What stays approximate (rule 7).** The capped basis with only #575 held would be trusted with 1 sample held; the recovery cannot find that one sample under the cap (the spread misfit names none) and takes the default basis with 38 held instead. Geometries within `QUARANTINE_FRACTION` of a held one fall back; a later refit releases any held sample the model then reproduces. The stretched singlet labels themselves are the teacher's physics (lowest-spin automatic multiplicity, LSDA), not corrected.
+
+## M8a body-4 (Task 5, 2026-10-22; `surrogate::descriptor` "Body-4 features", `surrogate::fit` "The large-basis path"; release, Ryzen 7 9800X3D, CPU; the user's app open)
+
+**Basis.** A shared collection's basis carries the body-4 Gaunt contractions (`Basis::body4`, on exactly when a collection is attached, `SurrogateKs::fit_basis`); per-scene models keep body-2 + body-3 bit for bit (sidecar version 7 unchanged; a body-4 sidecar is version 8). Degree cap D₄ = min(degree_cap, 2): Q′ 38 / 284 / 1 032 / 2 688 for S = 1–4 (body-3 alone 29 / 176 / 543 / 1 232; D₄ = 3 → 5 344 and D₄ = 4 → 10 592 at S = 4, a 0.2–0.9 GB Gram per matrix — not taken). Checks (`surrogate` lib tests): rotation invariance 5.6e-13 relative worst over five random rotations of a six-atom H/C/O cluster (bound 1e-10); descriptor gradients and hot-path forces against central differences (step 1e-5 Bohr) 8.1e-11 and 9.1e-11 of the largest force (bound 1e-6); the Gaunt table's (0,0,0) = 1 and (l,l,0) = 1/(2l+1) to 5e-14 (a 200-point exact quadrature). What body-4 buys in accuracy is the transfer test's to measure (Task 6), not claimed here.
+
+**Refit at 10 000 samples** (`surrogate_perf` `refit_is_interactive_at_ten_thousand_samples`, `#[ignore]`d measurement; S = 4 H/C/N/O, 6-atom clusters of the synthetic Morse teacher with a 1e-5 Ha / 1e-4 Ha/Bohr scatter; Q′ 2 688, P 684, P₄ 364):
+
+| step | wall |
+|---|---|
+| accumulate 10 000 samples (batched compensated block per sample, threaded) | 98.9 s (9.9 ms/sample) |
+| first refit: spectral search, 7 rounds, converged | 96.0 s |
+| **one sample added + `Accumulator::refit` (warm)** | **167, 172, 173 ms** (bound 1 s: met) |
+| the provider's post-fit null space at this Q′ (Householder–QL) | 10.0 s (28 directions) |
+| the provider's leave-one-out, per 6-atom sample | 122.9 ms (× 10 000 = 1 229 s per refit) |
+
+(A first draft without the step control in ln ρ searched in 6 rounds, 26.6 s, on this fixture — and cycled without converging on a collection fixture; the profile check costs ≈ 3 spectra per round.)
+
+For scale: the reference search took 639 s for one refit at Q′ 1 232 (Task 4a) and ≈ 2.4 Q′³ per evaluation × hundreds; at Q′ 250 the spectral search took 128 ms (10 rounds) against the reference's 3 681 ms (8 rounds), landing on the same optimum (λ 1.4583e-1 vs 1.4587e-1, σ_E 1.7698e-4 vs 1.7670e-4, σ_F 1.3163e-3 vs 1.3165e-3, ln p 1.128695e4 both; `large_basis_search_finds_the_reference_search_optimum`). The warm refit is the exact posterior at the standing hyperparameters: factor backward error 0.5–1.3e-15, held-out predictions within 3.2e-4 σ of a fresh factorisation — the same spread as two fresh factorisations against each other (2.1e-4 σ; κ(A) 6.1e12), γ_E/γ_F to 3e-6 relative (`warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters`). Every search starts from the data's own levels, never an earlier search's, so a search is a function of the statistics alone: a reopened collection's first fit equals the session's last search bit for bit (`a_reopened_collection_reproduces_the_same_fit`, whose session fit is now a search — a warm model depends on when the last search ran).
+
+**Not interactive yet at the provider level for S = 4 (recorded for the follow-up):** the class-wise leave-one-out runs over every fitted sample at every refit (`SurrogateKs::refresh_class_loo`): 122.9 ms per sample at Q′ 2 688 is 20 minutes per refit at 10 000 samples — the model refit is 0.17 s of it; and a search every ×1.25 of growth is 96 s. At the user's collection (S = 2, Q′ 284, ≈ 1 300 samples) the same count scales to ≈ (284/2688)² × 123 ms ≈ 1.4 ms per sample, ≈ 2 s per refit.
+
+**The user's stuck collection under body-4** (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`, report phase; `crates/providers/testdata/stuck-h-collection`, its live state: 8 held, recovery cap 6): body-3 (the repro, pinned to it) recovers on the default basis with 38 held; the collection's body-4 basis at the cap (Q′ 60) starts untrusted on a force residual (2.7e-2 Ha/Bohr) and its refit's quarantine recovers it **with 9 held** (worst E/atom 6.8e-4, F 1.9e-3 Ha/Bohr; trusted) — 29 labels fewer held out than body-3's recovery (which ones was not listed; the capacity gain on this H-only collection, not a transfer claim). An incremental leave-one-out (only the samples a new row's leverage reaches) is the remedy; not in Task 5.
+
+**The truncated covariance (the M5 handoff's remedy for the O(N·Q′²) variance), measured and not adopted** (`spectral_truncation_of_the_covariance_is_measured_and_floored`; S = 2 body-4, Q′ 284, 400 samples, held-out energy and force rows of 40 samples): T = Σ_{k<K} s_k u_k u_kᵀ + s_min I with s_min = s_K is never below Σ (T − Σ ⪰ 0; asserted, min ratio ≥ 1 at every K), but Σ's spectrum is topped by the prior 1/λ on the directions no sample spans (54 of 284 above half the prior's variance), so the floor is the prior variance until K passes them:
+
+| K | floored: ratio truncated/exact min / median / max | unfloored: min / median |
+|---|---|---|
+| 25 | 9.1e8 / 1.8e10 / 7.6e11 | 2.4e-10 / 0.000 |
+| 50 | 6.2e8 / 1.2e10 / 5.1e11 | 2.4e-4 / 0.004 |
+| 100 | 3.3e5 / 6.7e6 / 2.8e8 | 0.063 / 0.189 |
+| 200 | 39 / 764 / 3.2e4 | 0.29 / 0.63 |
+
+Honest (floored) it refuses everything; useful (unfloored) it claims 1.6–250× too little variance. The exact posterior factor stays (rule 6 and the calibrated verdict rest on it); the variance's per-step cost at large Q′ stays the cadence's problem (k = 4).
+
+**Fence voting (the user's compressed-H₂ log, 2026-10-21: "fallback · fence · not kept: fence" every vibration period, residuals 1.39–1.66 mHa, never a vote).** Not the vote limit and not a pending vote: the consistency test compared the votes' *raw* teacher answers, and three fence entries of a vibrating, turning H₂ are different geometries — on the inner wall (k ≈ 0.34 Ha/Bohr², |F| ≈ 0.08 Ha/Bohr at r ≈ 1.2) answers 0.03 Bohr apart differ by ≈ 2 mHa per atom and 0.01 Ha/Bohr per component, and a 20° turn between periods (H₂ at 300 K turns ≈ 0.34 rad per 8 fs period) moves the force vectors by more than the 10 % bound — while the residuals teacher − model agree. Fixed: votes compare residuals, the per-atom force residuals by magnitude (rotation-invariant) (`quarantine::votes_agree`; test `a_vibrating_turning_molecule_in_a_fence_still_votes`: three visits at 1.900/1.906/1.903 Bohr turned by 40° — the old rule gives FenceDisagrees ×3, the new one keeps the third). The next refit's verdict on the kept answer (`judge_votes`) is unchanged.
+
+**κ = 136.65 (the user's readout).** κ_c is a readout (`ClassLoo::calibration`, decides nothing): the rms of z = ‖ΔF‖/σ_pred over the class's evidence, whose denominator has no floor. On the live collection (copy of 2026-10-22, `kappa_tail_of_a_collection_history`): pair κ 3.53 — one point at z̄ 12.3 carries 69 % of Σz̄² (ẑ without it 1.74, median z̄ 1.51); many-body κ 10.24 — one point at z̄ 59.3 (‖ΔF‖ 3.2e-2 Ha/Bohr over a std of 4.6e-4: 4.6× its bound) carries 98 % (ẑ without it 1.60). Tail-dominated, as the Task 2 review's I2 said: one confident miss sets it; 136.65 was such a point in the window then. The verdict decides on the measured error W_c (pair 0.28, many-body 0.83 of the bound; both trusted), not on κ. **What decides per step is the inflation λ_c** (rules 6/7), and it is large: pair 24.9 (223 on the copy of 2026-10-21), many-body 18.9 — the measured error (≈ 0.2–0.8 of the bound, mostly the fit's misfit at σ_F level) over the *epistemic* std alone (≈ 1e-6–1e-5 Ha/Bohr where the class is well sampled). The effect is conservative — rule 6 then refuses an atom whose epistemic std exceeds bound/λ, i.e. a few times the class's typical one — never a loosening; not changed here (a decision rule, physics review). Recorded as a question for it: comparing the measured error with the epistemic std after removing the fit's own aleatoric 3σ_F² (or against the total std) would make λ_c measure the posterior's miscalibration rather than the misfit floor.

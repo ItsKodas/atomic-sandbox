@@ -8371,6 +8371,11 @@ fn a_reopened_collection_reproduces_the_same_fit() {
         let (mut s, _) = pair_student();
         s.attach_collection(&dir, &h2(1.4)).unwrap();
         teach_h2_then_h2_he(&mut s);
+        // a collection's body-4 basis refits warm between searches (`surrogate::fit`, "The
+        // large-basis path"): a warm model depends on when the last search ran, a search only on
+        // the statistics — so the session's fit compared here is a search over all of them (a
+        // rebuild), as the reopened provider's first fit is (M8a Task 5)
+        s.species_dirty = true;
         let rep = s.refit().unwrap();
         let m = s.model().unwrap();
         let p: Vec<_> = probes.iter().chain(&probes_he).map(|sc| {
@@ -9045,6 +9050,10 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
     let live_codes = c.quarantine.clone();
     assert_eq!((c.samples.len(), live_codes.iter().filter(|&&q| q == Q_HELD).count()), (578, 8), "the user's collection");
     let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    // the live session's basis was body-3 (before M8a Task 5): the repro keeps it — under the
+    // collection's body-4 basis the capped fit misses the same labels on their forces instead
+    // (2.7e-2 Ha/Bohr) and names its offenders, so this mechanism is not what recovers it
+    s.body4_off = true;
     s.attach(c).unwrap();
     // the live session's state: the collection's codes, the cap an earlier recovery set
     s.quarantine = live_codes.clone();
@@ -9087,4 +9096,23 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
     drop(s);
     let (again, _) = surrogate::Collection::open(&dir, &key).unwrap();
     assert_eq!((0..578).filter(|&i| again.quarantine[i] == Q_HELD).collect::<Vec<_>>(), held);
+    drop(again);
+    // the same live state under the collection's basis since M8a Task 5 (body-4): reported
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.attach(c).unwrap();
+    s.quarantine = live_codes.clone();
+    s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+    s.species_dirty = true;
+    s.fit_store().unwrap();
+    let before = (s.report().unwrap().q_prime, s.untrusted_reason());
+    let rep = s.refit().unwrap();
+    let t = s.training_residuals().unwrap();
+    println!(
+        "body-4: the live state Q′ {} {:?}; after the refit: cap {:?}, Q′ {}, n {}, worst E/atom {:.1e}, F {:.1e}, trusted {} {:?}; held {}",
+        before.0, before.1, s.degree_cap, rep.q_prime, rep.n_samples, t.energy_per_atom, t.force, s.trusted(), s.untrusted_reason(), s.quarantined()
+    );
+    // measured (references.md "M8a body-4"): trusted at the cap with 9 held where body-3 needed
+    // the default basis and 38
+    assert!(s.trusted() && s.quarantined() < 38, "{:?}, {} held", s.untrusted_reason(), s.quarantined());
 }

@@ -692,7 +692,8 @@
 //! its force bound (`quarantine::votes_agree`; M8a Task 5: before, the raw answers were compared,
 //! and the votes of a vibration entering a fence once per period — different geometries on a steep
 //! wall, the molecule turned in between — never agreed although the model's error did) — the
-//! third is kept (tag Fallback) and the next refit decides: if the new model reproduces the kept answer it stays in the fit — the fenced glitch is then released if
+//! third is kept (tag Fallback) and the next refit decides: if the new model reproduces the kept
+//! answer it stays in the fit — the fenced glitch is then released if
 //! the model reproduces it too, or superseded by the next fresh answer, which now agrees; if the
 //! model cannot reproduce the kept answer, it is quarantined itself and its region takes no
 //! further vote (an unrepresentable region — a dimer beyond the cutoff — costs one sample, not a
@@ -1223,6 +1224,10 @@ pub struct SurrogateKs {
     /// The shared collection this provider learns into (M8a Task 4a; `shared` module doc), if
     /// attached: the process's one writable handle of it.
     shared: Option<shared::SharedCollection>,
+    /// Tests only: a collection fitted without the body-4 block (the basis collections had before
+    /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
+    #[cfg(test)]
+    body4_off: bool,
     /// Why the collection refused the sample just stored (taken by `keep_sample` for the step's
     /// note; `shared::SurrogateKs::take_collection_note`).
     collection_note: Vec<String>,
@@ -1340,6 +1345,8 @@ impl SurrogateKs {
             pass_start: None,
             pass_coverage: None,
             shared: None,
+            #[cfg(test)]
+            body4_off: false,
             collection_note: Vec::new(),
             source_file: None,
             ref_jobs: Vec::new(),
@@ -2220,11 +2227,31 @@ impl SurrogateKs {
         let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         species.sort_unstable();
         species.dedup();
-        let mut b = Basis::new(&species);
+        (n, self.fit_basis(&species).column_classes().len())
+    }
+
+    /// The basis a fit of these species is built on: the default (`Basis::new`), the recovery
+    /// degree cap when one stands, and the body-4 block exactly when a shared collection is
+    /// attached (M8a Task 5: the collection's capacity; a per-scene model keeps its basis bit for
+    /// bit, `surrogate::descriptor` "Body-4 features").
+    pub(super) fn fit_basis(&self, species: &[u8]) -> Basis {
+        let mut b = self.default_basis(species);
         if let Some(d) = self.degree_cap.filter(|_| b.body3) {
             b.degree_cap = d;
         }
-        (n, b.column_classes().len())
+        b
+    }
+
+    /// [`fit_basis`](Self::fit_basis) without the recovery degree cap: `Basis::new` with body-4
+    /// exactly when a shared collection is attached (the trust floor's and the no-model cap's count).
+    pub(super) fn default_basis(&self, species: &[u8]) -> Basis {
+        let mut b = Basis::new(species);
+        b.body4 = self.shared.is_some();
+        #[cfg(test)]
+        {
+            b.body4 &= !self.body4_off;
+        }
+        b
     }
 
     /// The model's provenance against `scene`'s, for the readouts (`TrainableStatus`).

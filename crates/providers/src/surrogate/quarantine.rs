@@ -183,7 +183,7 @@ impl SurrogateKs {
         let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         species.sort_unstable();
         species.dedup();
-        Some(Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize)
+        Some(self.default_basis(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize)
     }
 
     /// Once the store holds enough other samples for the trust floor (Q′ + 30), the box-affected
@@ -751,6 +751,6 @@ impl SurrogateKs {
         }
         species.sort_unstable();
         species.dedup();
-        NO_MODEL_SAMPLE_FACTOR * Basis::new(&species).column_classes().len()
+        NO_MODEL_SAMPLE_FACTOR * self.default_basis(&species).column_classes().len()
     }
 }

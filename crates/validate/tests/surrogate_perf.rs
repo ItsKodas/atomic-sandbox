@@ -243,3 +243,73 @@ fn surrogate_perf_table() {
     }
     write_section(&md);
 }
+
+/// M8a Task 5: a shared collection's refit at 10 000 stored samples, S = 4 (H, C, N, O), the
+/// collection's body-4 basis (Q′ 2 688). Synthetic CPU samples (the Morse teacher above, 6-atom
+/// clusters). Measured: the accumulation, the first (spectral) search, then three times "one
+/// sample added + `Accumulator::refit`" — the warm refit (`surrogate::fit`, "The large-basis
+/// path"), which must stay under 1 s (asserted: the brief's interactive bound). Also reported,
+/// not asserted: what the provider does after a fit at this Q′ (the null space and one sample's
+/// leave-one-out), the parts that are not yet incremental.
+#[test]
+#[ignore = "measurement (CPU, minutes): cargo test -p validate --release --test surrogate_perf refit_is_interactive -- --ignored --nocapture"]
+fn refit_is_interactive_at_ten_thousand_samples() {
+    assert!(!cfg!(debug_assertions), "timings in a debug build mean nothing: run with --release");
+    use surrogate::{Accumulator, Basis, FitOptions, NullSpace, Provenance, RefitKind};
+    let mut basis = Basis::new(&SPECIES);
+    basis.body4 = true;
+    let q = basis.n_independent_columns();
+    let refs = vec![-0.5; SPECIES.len()];
+    let opts = FitOptions::default();
+    let prov = Provenance { grid_n: 97, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "synthetic".into(), masses: Vec::new(), ionic: "none".into() };
+    let mut rng = StdRng::seed_from_u64(2026);
+    let mut acc = Accumulator::new(&basis);
+    let t = Instant::now();
+    let total = 10_000;
+    for i in 0..total {
+        let (smp, _) = sample(&mut rng, 6, 4, SampleTag::Scan);
+        acc.add(&smp, &basis, &refs, &opts).unwrap();
+        if (i + 1) % 2000 == 0 {
+            println!("  accumulated {} samples, {:.0} s", i + 1, t.elapsed().as_secs_f64());
+        }
+    }
+    let t_acc = t.elapsed();
+    let t = Instant::now();
+    let (model, rep) = acc.refit(&opts, &prov, &refs).unwrap();
+    let t_first = t.elapsed();
+    let rounds = match acc.last_refit() {
+        RefitKind::Spectral { rounds } => rounds,
+        k => panic!("the first refit is a search, got {k:?}"),
+    };
+    println!(
+        "Q′ {q} (P {}, P₄ {}); accumulate {total}: {:.1} s ({:.1} ms/sample); first refit (spectral search, {rounds} rounds, converged {}): {:.1} s; λ {:.3e} σ_E {:.2e} σ_F {:.2e}",
+        basis.n_features(), basis.n_body4(), t_acc.as_secs_f64(), t_acc.as_secs_f64() * 1e3 / total as f64, rep.converged, t_first.as_secs_f64(), rep.lambda, rep.sigma_e, rep.sigma_f
+    );
+    let mut worst = Duration::ZERO;
+    for k in 0..3 {
+        let (smp, _) = sample(&mut rng, 6, 4, SampleTag::Fallback);
+        let t = Instant::now();
+        acc.add(&smp, &basis, &refs, &opts).unwrap();
+        let t_add = t.elapsed();
+        let (_, r) = acc.refit(&opts, &prov, &refs).unwrap();
+        let t_all = t.elapsed();
+        assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 1 });
+        println!("  + 1 sample #{k}: add {:.0} ms, add + warm refit {:.0} ms (γ {:.1}, residual dof E {:.0} F {:.0})", t_add.as_secs_f64() * 1e3, t_all.as_secs_f64() * 1e3, r.dof_eff, r.residual_dof_e, r.residual_dof_f);
+        worst = worst.max(t_all);
+    }
+    // the provider's post-fit work at this Q′, reported (not part of the model refit)
+    let t = Instant::now();
+    let null = NullSpace::of(&acc, &model.scale);
+    let t_null = t.elapsed();
+    let (smp, _) = sample(&mut rng, 6, 4, SampleTag::Scan);
+    let t = Instant::now();
+    for _ in 0..5 {
+        std::hint::black_box(surrogate::loo::leave_one_out(&model, &smp));
+    }
+    let t_loo = t.elapsed() / 5;
+    println!(
+        "worst add + warm refit {:.0} ms; provider post-fit at Q′ {q}: null space {:.1} s ({} directions), leave-one-out {:.1} ms per 6-atom sample (× {total} = {:.0} s per refit)",
+        worst.as_secs_f64() * 1e3, t_null.as_secs_f64(), null.dimension(), t_loo.as_secs_f64() * 1e3, t_loo.as_secs_f64() * total as f64
+    );
+    assert!(worst < Duration::from_secs(1), "a refit after one added sample took {worst:?} (the interactive bound is 1 s)");
+}

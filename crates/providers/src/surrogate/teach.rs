@@ -455,6 +455,7 @@ impl SurrogateKs {
         species.dedup();
         let mut rich = Basis::new(&species);
         rich.degree_cap = RECOVERY_DEGREE_CAP;
+        rich.body4 = b.body4;
         let q = rich.column_classes().len();
         let short: Vec<String> = self.class_loo.iter().enumerate().filter(|(_, c)| c.samples > 0 && c.samples < q).map(|(k, c)| format!("{} have {}", CLASS_WORDS[k], c.samples)).collect();
         (!short.is_empty()).then(|| {

@@ -96,7 +96,7 @@
 //! Cost: one `describe` plus 3N + 1 triangular solves of size Q′ (the independent columns,
 //! `Basis::n_independent_columns`), O(Q′²) each.
 
-use crate::descriptor::{describe, pair_geometry, AtomicBasisScratch, Basis, DescribeError};
+use crate::descriptor::{describe, gaunt, pair_geometry, t4_channels, AtomicBasisScratch, Basis, Body4Term, DescribeError, Gaunt};
 use crate::basis::radial;
 use crate::linalg::cholesky_quad_form;
 use std::sync::OnceLock;
@@ -600,7 +600,7 @@ pub fn energy_and_forces(
             }
         }
     }
-    if basis.body3 {
+    if basis.body3 || basis.body4 {
         body3_energy_and_forces(basis, &c_tilde, &s, pos, &mut energy, &mut forces);
     }
     Ok((energy.sum(), forces))
@@ -620,6 +620,8 @@ fn body3_energy_and_forces(
     let n_max = basis.n_max;
     let p2 = basis.n_body2();
     let terms = basis.body3_terms();
+    let p4 = p2 + terms.len();
+    let terms4: Vec<(Body4Term, &[Gaunt])> = basis.body4_terms().into_iter().map(|t| (t, gaunt(t.l))).collect();
     let mut sc = AtomicBasisScratch::new(basis, n);
     let nlm = sc.nlm;
     let mut w = vec![0.0; basis.n_body2() * nlm];
@@ -657,6 +659,25 @@ fn body3_energy_and_forces(
                 w[c2 * nlm + lm] += c * a1;
             }
             e3.add(c * dot);
+        }
+        // Body-4 (descriptor module doc): E += c Σ G A₁A₂A₃, W_f += c Σ G ∏_{other two} A.
+        let ci4 = &c_tilde[s[i]][p4..];
+        for (q, (t, entries)) in terms4.iter().enumerate() {
+            let c = ci4[q];
+            if c == 0.0 {
+                continue;
+            }
+            let ch = t4_channels(basis, t);
+            let mut val = 0.0;
+            for e in entries.iter() {
+                let a = [sc.a[ch[0] * nlm + e.lm[0]], sc.a[ch[1] * nlm + e.lm[1]], sc.a[ch[2] * nlm + e.lm[2]]];
+                val += e.g * a[0] * a[1] * a[2];
+                let cg = c * e.g;
+                w[ch[0] * nlm + e.lm[0]] += cg * a[1] * a[2];
+                w[ch[1] * nlm + e.lm[1]] += cg * a[0] * a[2];
+                w[ch[2] * nlm + e.lm[2]] += cg * a[0] * a[1];
+            }
+            e3.add(c * val);
         }
         energy.add(e3.sum());
         // Forces: ∂E_i/∂r_j = Σ_{n,lm} W_{(s_j,n),lm} ∇φ_{n,lm}(d_ij).

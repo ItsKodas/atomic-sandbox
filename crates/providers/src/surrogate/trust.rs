@@ -967,16 +967,16 @@ impl SurrogateKs {
         let opts = FitOptions { sigma_f_min: force_noise_prior(&provenance.ionic), ..FitOptions::default() };
         // (Re)build the accumulator: from scratch after a species or reference change, else
         // only the samples added since the last refit.
-        let rebuild = self.accumulator.is_none() || self.species_dirty || self.refs_dirty;
+        // (a collection attached or let go changes the basis: body-4 follows `shared`)
+        let rebuild = self.accumulator.is_none()
+            || self.species_dirty
+            || self.refs_dirty
+            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != self.default_basis(&[]).body4);
         let basis = if rebuild {
             let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
             species.sort_unstable();
             species.dedup();
-            let mut b = Basis::new(&species);
-            if let Some(d) = self.degree_cap.filter(|_| b.body3) {
-                b.degree_cap = d;
-            }
-            b
+            self.fit_basis(&species)
         } else {
             self.accumulator.as_ref().expect("checked").basis.clone()
         };
@@ -1004,7 +1004,9 @@ impl SurrogateKs {
             }
             accumulated += 1;
         }
-        let solved = acc.solve(&opts, &provenance, &refs);
+        // `refit` = `solve` for a basis without body-4, bit for bit; the warm or spectral path for a
+        // collection's body-4 basis (`surrogate::fit`, "The large-basis path")
+        let solved = acc.refit(&opts, &provenance, &refs);
         let (model, report) = match solved {
             Ok(x) => x,
             Err(e) => {

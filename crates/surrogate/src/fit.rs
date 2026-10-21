@@ -170,6 +170,80 @@
 //! `force_std[j]` is the expected ‖δF_j‖, floor √3·s_F — a per-component threshold such as C5's
 //! 2e-3 Ha/Bohr compares against force_std/√3.
 //!
+//! # The large-basis path (M8a Task 5: a shared collection's body-4 basis)
+//!
+//! A body-4 basis (`Basis::body4`, a shared collection's) has Q′ up to 2 688 at four species, where
+//! the search above — a few hundred factorisations and inverses of Q′, ≈ 2.4 Q′³ each — took 639 s
+//! already at Q′ 1 232. [`Accumulator::refit`] (what the provider calls) therefore solves a body-4
+//! basis by two exact reformulations; every other basis goes through [`Accumulator::solve`]
+//! unchanged, bit for bit.
+//!
+//! **Spectral search.** Write ρ = s_F²/s_E² and t = s_F². Then
+//!
+//!   A = G̃_E/s_E² + G̃_F/s_F² + λ_eff I = (H_ρ + μ I)/t,   H_ρ = G̃_F + ρ G̃_E,   μ = λ_eff·t,
+//!
+//! so one eigen-decomposition H_ρ = U diag(h) Uᵀ gives, for every (λ, t) at that ratio, with
+//! ĉ = Uᵀ(b̃_F + ρ b̃_E) and m̂_k = ĉ_k/(h_k + μ) (m = U m̂ does not depend on t at fixed μ):
+//!
+//!   ln det A = Σ_k ln((h_k + μ)/t),   ‖m‖² = Σ_k m̂_k²,   γ = Σ_k h_k/(h_k + μ),
+//!   RSS_E/s_E² + RSS_F/s_F² = (ρ yᵀWy_E + yᵀWy_F − 2 m̂·ĉ + Σ_k h_k m̂_k²)/t,
+//!
+//! i.e. the whole evidence (the formula above, with the nominal λ in (Q′/2) ln λ and λ‖m‖²) in O(Q′)
+//! per evaluation. No eigenvectors are formed: H_ρ is reduced to tridiagonal form by Householder
+//! reflections (`linalg::Tridiagonal`, 2Q′³) and diagonalised by implicit QL, the reflections and
+//! rotations applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
+//! golden section, now O(Q′) per point) and — with neither noise level pinned — the common scale t
+//! by MacKay's β update at fixed ρ, t = ρRSS_E + RSS_F over n_E + n_F − γ (stationarity in t:
+//! d ln p/dt = [−(n_E + n_F) + γ]/(2t) + (ρRSS_E + RSS_F)/(2t²)), alternated to 1e-6; then one
+//! exact factorisation and inverse at (λ, s_E², s_F²) (the vectorised kernels, ≈ Q′³) gives
+//! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the direction of
+//! the next ρ: a step in ln ρ, halved until the profile E(ρ) = max_{λ,t} ln p does not decrease
+//! (the bare fixed point cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection
+//! fixture; at a maximum of E the per-kind conditions hold, so the stopping point is the same).
+//! The stopping test, the floors, the pins and `sigma_f_min` are the reference search's; the
+//! returned posterior is factored at the final levels. A numerical failure of the spectral search
+//! falls back to the reference search. Measured on a Q′ 250 body-4 fixture
+//! (`large_basis_search_finds_the_reference_search_optimum`): λ, σ_E, σ_F within 0.2 % of the
+//! reference search, ln p equal to 7 digits, 128 ms against 3 681 ms; at Q′ 2 688 and 10 000
+//! samples a search takes 96 s (7 rounds, ≈ 3 spectra per round; `references.md` "M8a body-4").
+//!
+//! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
+//! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1
+//! whitened rows √w Dφ/s_κ. The upper factor R = Lᵀ is updated by k rank-one Givens updates
+//! (`linalg::cholesky_update_upper`, O(Q′²) each), the mean solved with it, and γ carried exactly
+//! by Woodbury: with V = ΣU and C = I + UᵀV (k×k),
+//!
+//!   Σ' = Σ − V C⁻¹ Vᵀ,   tr Σ' = tr Σ − tr(C⁻¹ VᵀV),
+//!   tr(Σ' G̃_E') = tr(Σ G̃_E) − tr(C⁻¹ Vᵀ G̃_E V) + s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀),   M = UᵀV,
+//!
+//! (G̃_E the energy Gram before the sample, M₀ the energy row's column; the last term is the new
+//! energy row's own w ẽᵀΣ'ẽ), γ_E = tr(Σ G̃_E)/s_E², γ = Q′ − λ_eff tr Σ, γ_F = γ − γ_E. The result
+//! is the exact posterior at those hyperparameters — not an approximation of it:
+//! `warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters` finds the factor's backward
+//! error at 0.5–1.3e-15 and predictions within the spread of two fresh factorisations (both are
+//! determined only to κ(A)·ε, κ ~ 6e12 there). What it does not do is re-choose λ and the noise
+//! levels; the search runs again once the store has grown by [`WARM_GROWTH`] (×1.25) since the
+//! last one, after more than [`WARM_MAX_PENDING`] (64) samples at once, when the options change, or
+//! when the accumulator is rebuilt. Every search starts from the data's own levels (never from an
+//! earlier search's), so it is a function of the accumulated statistics alone: the warm refit is
+//! where the evidence is "warm", and a reopened collection's first fit equals the session's last
+//! search bit for bit. The report of a warm refit carries the search's
+//! `condition_estimate` and `converged` and 0 `hyper_iterations`. At Q′ 2 688 and 10 000 samples a
+//! sample's add + warm refit takes 0.17 s (`surrogate_perf`, `refit_is_interactive_at_ten_thousand_samples`).
+//!
+//! **The accumulation** of a body-4 basis sums a sample's 3N force rows into one block first and
+//! adds that compensated (one Neumaier step per entry per sample, not per row; threaded over the
+//! Gram's rows): the block's own plain sum of ≤ 3N terms is a few ε relative, the totals stay
+//! compensated (CLAUDE.md rule 4).
+//!
+//! **No truncated Σ.** The predictive variance keeps the exact posterior factor. The M5 handoff's
+//! truncation Σ ≈ Σ_{k<K} s_k u_k u_kᵀ + s_min I is conservative with s_min = s_K (T − Σ ⪰ 0) but
+//! measured useless with it — on a collection-sized body-4 fit (Q′ 284) the floored variance is
+//! 39–3·10⁴× the exact one at K = 200 and 10⁹–10¹¹× at K = 50, because the top of Σ's spectrum is
+//! the prior's 1/λ on the directions no sample spans (54 of 284 there) — and biased low without
+//! it (median ratio 0.004 at K = 50, 0.63 at K = 200):
+//! `spectral_truncation_of_the_covariance_is_measured_and_floored`.
+//!
 //! # Accuracy notes
 //!
 //! * RSS from the statistics cancels to ~ε·yᵀWy, so `Accumulator::solve` cannot report an RMSE
@@ -186,7 +260,8 @@
 use crate::descriptor::{describe, Basis, DescribeError};
 use crate::envelope::Envelope;
 use crate::linalg::{
-    cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, mat_vec,
+    cholesky_in_place, cholesky_in_place_fast, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot,
+    inverse_from_lower_inverse, lower_inverse_transposed, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve, Tridiagonal,
 };
 use crate::model::{energy_and_forces, Model, Provenance};
 use std::fmt;
@@ -480,6 +555,12 @@ pub struct Accumulator {
     classes: Vec<Vec<usize>>,
     /// Neumaier compensations of gram_e, rhs_e, yy_e, gram_f, rhs_f, yy_f (struct doc).
     comp: Compensation,
+    /// The large-basis path (module doc): the warm state of the last search, the rows of the
+    /// samples added since the last refit (kept only while a warm state stands), how the last
+    /// refit went.
+    warm: Option<Box<WarmState>>,
+    pending: Vec<PendingRows>,
+    last_refit: RefitKind,
     // Scratch buffers reused across `add` calls.
     phi: Vec<f64>,
     rows: Vec<f64>,
@@ -523,6 +604,9 @@ impl Accumulator {
                 rhs_f: vec![0.0; qr],
                 yy_f: 0.0,
             },
+            warm: None,
+            pending: Vec::new(),
+            last_refit: RefitKind::None,
             phi: vec![0.0; qr],
             rows: Vec::new(),
             support: Vec::with_capacity(qr),
@@ -627,15 +711,31 @@ impl Accumulator {
                 }
             }
         }
-        for j in 0..n {
-            for a in 0..3 {
-                let f = sample.forces[j][a];
-                let row = &rows[(3 * j + a) * qr..(3 * j + a + 1) * qr];
-                rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+        if self.basis.body4 {
+            // the large-basis path (module doc): the sample's 3N rows summed into one block first,
+            // which is then added compensated — one Neumaier step per entry per sample instead of
+            // per row, threaded over the Gram's rows
+            let ys: Vec<f64> = sample.forces.iter().flat_map(|f| f.iter().copied()).collect();
+            batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &rows[..3 * n * qr], &ys, w);
+            for &f in &ys {
                 neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                 self.n_f += 1;
                 self.sum_log_w_f += w.ln();
             }
+        } else {
+            for j in 0..n {
+                for a in 0..3 {
+                    let f = sample.forces[j][a];
+                    let row = &rows[(3 * j + a) * qr..(3 * j + a + 1) * qr];
+                    rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+                    neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
+                    self.n_f += 1;
+                    self.sum_log_w_f += w.ln();
+                }
+            }
+        }
+        if self.warm.is_some() {
+            self.pending.push(PendingRows { w, e: self.phi.clone(), f: rows[..3 * n * qr].to_vec() });
         }
         self.rows = rows;
         self.n_samples += 1;
@@ -649,25 +749,37 @@ impl Accumulator {
         provenance: &Provenance,
         ref_energy: &[f64],
     ) -> Result<(Model, FitReport), FitError> {
+        let (scale, d, problem) = self.prepare(ref_energy, None)?;
+        let (hyper, sol) = problem.estimate(opts)?;
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let condition = condition_estimate(&sol.a, &sol.chol, self.q_prime);
+        self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)
+    }
+
+    /// The standardisation (from the energy rows, or `frozen` = a warm state's (scale, d)) and the
+    /// standardised two-noise problem (module doc). Refuses an empty or non-finite accumulator.
+    fn prepare(&self, ref_energy: &[f64], frozen: Option<(&[f64], &[f64])>) -> Result<(Vec<f64>, Vec<f64>, TwoNoise), FitError> {
         if self.n_samples == 0 || self.n_e == 0 {
             return Err(FitError::NoSamples);
         }
         check_references(&self.basis, ref_energy)?;
-        let basis = &self.basis;
-        let p = basis.n_features();
-        let n_s = basis.n_species();
+        let p = self.basis.n_features();
         let q = self.q_prime;
         let n_e = self.n_e as f64;
         let n_f = self.n_f as f64;
-        let n_rows = self.n_e + self.n_f;
-
-        // Scale from the energy rows; D per representative column through k = q_full mod P.
-        let scale: Vec<f64> = self
-            .sumsq
-            .iter()
-            .map(|&ss| if ss > 0.0 { (ss / n_e).sqrt() } else { 1.0 })
-            .collect();
-        let d: Vec<f64> = self.classes.iter().map(|c| 1.0 / scale[c[0] % p]).collect();
+        let (scale, d) = match frozen {
+            Some((s, d)) => (s.to_vec(), d.to_vec()),
+            None => {
+                // Scale from the energy rows; D per representative column through k = q_full mod P.
+                let scale: Vec<f64> = self
+                    .sumsq
+                    .iter()
+                    .map(|&ss| if ss > 0.0 { (ss / n_e).sqrt() } else { 1.0 })
+                    .collect();
+                let d: Vec<f64> = self.classes.iter().map(|c| 1.0 / scale[c[0] % p]).collect();
+                (scale, d)
+            }
+        };
         let standardise = |g: &[f64]| -> Vec<f64> {
             let mut out = vec![0.0; q * q];
             for i in 0..q {
@@ -702,10 +814,34 @@ impl Accumulator {
                 f64::MIN_POSITIVE
             },
         };
-        let (hyper, sol) = problem.estimate(opts)?;
+        Ok((scale, d, problem))
+    }
+
+    /// The model and the report from a solve (module doc): the reduced solution expanded over the
+    /// column classes, every non-finite outcome refused.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        &self,
+        opts: &FitOptions,
+        provenance: &Provenance,
+        ref_energy: &[f64],
+        scale: &[f64],
+        d: &[f64],
+        hyper: &Hyper,
+        sol: &Solved,
+        log_evidence: f64,
+        condition: f64,
+    ) -> Result<(Model, FitReport), FitError> {
+        let basis = &self.basis;
+        let p = basis.n_features();
+        let n_s = basis.n_species();
+        let q = self.q_prime;
+        let n_e = self.n_e as f64;
+        let n_f = self.n_f as f64;
+        let n_rows = self.n_e + self.n_f;
+        let finite = |v: &[f64]| v.iter().all(|x| x.is_finite());
         let sigma_e = hyper.s_e2.sqrt();
         let sigma_f = hyper.s_f2.sqrt();
-        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
 
         // Expand the reduced solution: raw θ̃ = θ/scale_rep, split equally over the class, and
         // re-standardise each full column by its own feature scale (`Model::coeffs` contract).
@@ -734,7 +870,7 @@ impl Accumulator {
             basis: basis.clone(),
             coeffs,
             mean: vec![0.0; p],
-            scale,
+            scale: scale.to_vec(),
             ref_energy: ref_energy.to_vec(),
             sigma_e,
             sigma_f,
@@ -760,11 +896,256 @@ impl Accumulator {
             n_rows,
             n_samples: self.n_samples,
             q_prime: q,
-            condition_estimate: condition_estimate(&sol.a, &sol.chol, q),
+            condition_estimate: condition,
             hyper_iterations: hyper.iterations,
             converged: hyper.converged,
         };
         Ok((model, report))
+    }
+}
+
+/// How the last [`Accumulator::refit`] solved (module doc, "The large-basis path").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefitKind {
+    /// Not refitted yet.
+    None,
+    /// A basis without body-4 (every per-scene model): [`Accumulator::solve`], bit for bit.
+    Full,
+    /// A body-4 basis: the hyperparameters searched spectrally, `rounds` outer rounds (one
+    /// tridiagonalisation and one factorisation each).
+    Spectral { rounds: usize },
+    /// A body-4 basis: the samples added since the last refit folded into the posterior at the
+    /// standing hyperparameters and standardisation by rank-one updates of its factor.
+    Warm { samples: usize },
+}
+
+/// A warm refit searches the hyperparameters again once the stored samples have grown by this
+/// factor since the last search (module doc, "The large-basis path").
+pub const WARM_GROWTH: f64 = 1.25;
+/// … or when more than this many samples arrived since the last refit (each costs ≈ (3N+1)·8Q′²
+/// flops warm; a search costs ≈ 3Q′³ per round).
+pub const WARM_MAX_PENDING: usize = 64;
+
+/// What a warm refit continues from (module doc, "The large-basis path"): the last search's
+/// standardisation and hyperparameters, the upper factor R = Lᵀ of the posterior precision at
+/// them, tr Σ and tr(Σ G̃_E) (γ by Sherman–Morrison–Woodbury), and the bookkeeping of the search.
+#[derive(Clone, Debug)]
+struct WarmState {
+    scale: Vec<f64>,
+    d: Vec<f64>,
+    lambda: f64,
+    lambda_eff: f64,
+    s_e2: f64,
+    s_f2: f64,
+    r: Vec<f64>,
+    tr_sigma: f64,
+    tr_sigma_ge: f64,
+    opts: FitOptions,
+    n_search: usize,
+    converged: bool,
+    condition: f64,
+}
+
+/// One sample's raw rows on the Q′ columns, kept for the next warm refit: the energy row (÷ N
+/// when per atom) and its 3N force rows (row-major), with the sample weight.
+#[derive(Clone, Debug)]
+struct PendingRows {
+    w: f64,
+    e: Vec<f64>,
+    f: Vec<f64>,
+}
+
+impl Accumulator {
+    /// The refit the provider calls (module doc, "The large-basis path"): [`Accumulator::solve`]
+    /// for a basis without body-4 (bit for bit); for a body-4 basis a warm refit when one is
+    /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
+    /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
+    pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        if !self.basis.body4 {
+            self.warm = None;
+            self.pending.clear();
+            self.last_refit = RefitKind::Full;
+            return self.solve(opts, provenance, ref_energy);
+        }
+        let pending = self.pending.len();
+        let warm_ok = self.warm.as_ref().is_some_and(|w| {
+            w.opts == *opts && (self.n_samples as f64) < WARM_GROWTH * w.n_search as f64 && pending <= WARM_MAX_PENDING
+        });
+        if warm_ok {
+            if let Ok(out) = self.solve_warm(opts, provenance, ref_energy) {
+                self.last_refit = RefitKind::Warm { samples: pending };
+                return Ok(out);
+            }
+        }
+        match self.solve_spectral(opts, provenance, ref_energy) {
+            Ok(out) => Ok(out),
+            // the reference search as the fallback (slow at a large Q′, never wrong): a spectral
+            // failure is numerical, not the data's verdict
+            Err(FitError::Singular) => {
+                self.last_refit = RefitKind::Full;
+                self.solve(opts, provenance, ref_energy)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// How the last [`refit`](Self::refit) solved.
+    pub fn last_refit(&self) -> RefitKind {
+        self.last_refit
+    }
+
+    /// The spectral search (module doc), from the data's own starting levels — never from an
+    /// earlier search's, so a search is a function of the accumulated statistics alone (a
+    /// reopened collection's first fit equals the session's last search, bit for bit); leaves a
+    /// warm state for the next refit.
+    fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let start = None;
+        self.warm = None;
+        self.pending.clear();
+        let (scale, d, problem) = self.prepare(ref_energy, None)?;
+        let (hyper, sol, extra) = problem.estimate_spectral(opts, start)?;
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let q = self.q_prime;
+        let condition = condition_estimate(&sol.a, &sol.chol, q);
+        let out = self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)?;
+        let mut r = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..=i {
+                r[j * q + i] = sol.chol[i * q + j];
+            }
+        }
+        self.warm = Some(Box::new(WarmState {
+            scale,
+            d,
+            lambda: hyper.lambda,
+            lambda_eff: extra.lambda_eff,
+            s_e2: hyper.s_e2,
+            s_f2: hyper.s_f2,
+            r,
+            tr_sigma: extra.tr_sigma,
+            tr_sigma_ge: extra.tr_sigma_ge,
+            opts: opts.clone(),
+            n_search: self.n_samples,
+            converged: hyper.converged,
+            condition,
+        }));
+        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations };
+        Ok(out)
+    }
+
+    /// The warm refit (module doc): every pending sample's rows folded into R by rank-one updates,
+    /// tr Σ and tr(Σ G̃_E) carried by Woodbury, the mean solved with the updated factor. On any
+    /// failure the warm state is dropped (the caller searches).
+    fn solve_warm(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let mut w = self.warm.take().expect("refit checked the warm state");
+        let pending = std::mem::take(&mut self.pending);
+        let (_, _, problem) = self.prepare(ref_energy, Some((&w.scale, &w.d)))?;
+        let q = self.q_prime;
+        let (ie, i_f) = (1.0 / w.s_e2, 1.0 / w.s_f2);
+        // the standardised energy rows of the pending samples: G̃_E before sample j is the
+        // accumulator's minus the rows of samples j.. (they are already in its sums)
+        let e_rows: Vec<Vec<f64>> = pending.iter().map(|ps| (0..q).map(|i| w.d[i] * ps.e[i]).collect()).collect();
+        let mut tr_s = w.tr_sigma;
+        let mut t_e = w.tr_sigma_ge;
+        let mut gv = vec![0.0; q];
+        for (j, ps) in pending.iter().enumerate() {
+            let n3 = ps.f.len() / q;
+            let k = 1 + n3;
+            // U: the whitened rows (A += Σ u uᵀ)
+            let (se, sf) = ((ps.w * ie).sqrt(), (ps.w * i_f).sqrt());
+            let mut u: Vec<Vec<f64>> = Vec::with_capacity(k);
+            u.push(e_rows[j].iter().map(|x| x * se).collect());
+            for rr in 0..n3 {
+                u.push((0..q).map(|i| w.d[i] * ps.f[rr * q + i] * sf).collect());
+            }
+            // V = Σ U, C = I + UᵀV (k×k, symmetric positive definite)
+            let v: Vec<Vec<f64>> = u
+                .iter()
+                .map(|x| {
+                    let mut y = x.clone();
+                    upper_solve(&w.r, q, &mut y);
+                    y
+                })
+                .collect();
+            let mut c = vec![0.0; k * k];
+            for a in 0..k {
+                for b in a..k {
+                    let m = 0.5 * (dot(&u[a], &v[b]) + dot(&u[b], &v[a]));
+                    c[a * k + b] = m + if a == b { 1.0 } else { 0.0 };
+                    c[b * k + a] = c[a * k + b];
+                }
+            }
+            let mut cl = c.clone();
+            cholesky_in_place(&mut cl, k).map_err(|_| FitError::Singular)?;
+            // tr(C⁻¹ X) for a symmetric k×k X
+            let tr_cinv = |x: &[f64]| -> f64 {
+                let mut t = 0.0;
+                let mut col = vec![0.0; k];
+                for b in 0..k {
+                    for a in 0..k {
+                        col[a] = x[a * k + b];
+                    }
+                    cholesky_solve(&cl, k, &mut col);
+                    t += col[b];
+                }
+                t
+            };
+            // tr Σ' = tr Σ − tr(C⁻¹ VᵀV)
+            let mut vtv = vec![0.0; k * k];
+            for a in 0..k {
+                for b in a..k {
+                    vtv[a * k + b] = dot(&v[a], &v[b]);
+                    vtv[b * k + a] = vtv[a * k + b];
+                }
+            }
+            tr_s -= tr_cinv(&vtv);
+            // tr(Σ' G̃_pre) = tr(Σ G̃_pre) − tr(C⁻¹ Vᵀ G̃_pre V), G̃_pre = G̃_E − Σ_{i ≥ j} w_i ẽ_i ẽ_iᵀ
+            let ve: Vec<Vec<f64>> = (j..pending.len()).map(|i| v.iter().map(|vb| dot(vb, &e_rows[i])).collect()).collect();
+            let mut vgv = vec![0.0; k * k];
+            for b in 0..k {
+                mat_vec_fast(&problem.g_e, q, &v[b], &mut gv);
+                for a in 0..=b {
+                    let mut x = dot(&v[a], &gv);
+                    for (ii, row) in ve.iter().enumerate() {
+                        x -= pending[j + ii].w * row[a] * row[b];
+                    }
+                    vgv[a * k + b] = x;
+                    vgv[b * k + a] = x;
+                }
+            }
+            t_e -= tr_cinv(&vgv);
+            // + w ẽᵀ Σ' ẽ = s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀), M = UᵀV = C − I, M₀ its first column
+            let m0: Vec<f64> = (0..k).map(|a| c[a * k] - if a == 0 { 1.0 } else { 0.0 }).collect();
+            let mut x = m0.clone();
+            cholesky_solve(&cl, k, &mut x);
+            t_e += w.s_e2 * (m0[0] - dot(&m0, &x));
+            // fold the rows into the factor
+            for mut col in u {
+                cholesky_update_upper(&mut w.r, q, &mut col);
+            }
+        }
+        let mut m: Vec<f64> = (0..q).map(|i| problem.b_e[i] * ie + problem.b_f[i] * i_f).collect();
+        upper_solve(&w.r, q, &mut m);
+        let rss_e = residual_ss(&problem.g_e, &problem.b_e, problem.yy_e, q, &m);
+        let rss_f = residual_ss(&problem.g_f, &problem.b_f, problem.yy_f, q, &m);
+        let gamma_e = t_e * ie;
+        let gamma = q as f64 - w.lambda_eff * tr_s;
+        let mut chol = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..=i {
+                chol[i * q + j] = w.r[j * q + i];
+            }
+        }
+        let logdet = cholesky_logdet(&chol, q);
+        let m_norm2 = m.iter().map(|v| v * v).sum();
+        let sol = Solved { a: Vec::new(), chol, m, rss_e, rss_f, gamma_e, gamma_f: gamma - gamma_e, logdet, m_norm2 };
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: w.converged };
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let out = self.assemble(opts, provenance, ref_energy, &w.scale, &w.d, &hyper, &sol, log_evidence, w.condition)?;
+        w.tr_sigma = tr_s;
+        w.tr_sigma_ge = t_e;
+        self.warm = Some(w);
+        Ok(out)
     }
 }
 
@@ -845,6 +1226,65 @@ fn rank1_update(
             neumaier_add(&mut gram[k], &mut gc[k], wi * v[j]);
         }
     }
+}
+
+/// G += w Σ_r v_r v_rᵀ, b += w Σ_r y_r v_r for the k rows v_r of `rows` (k×q row-major): the block
+/// summed plainly over its k rows (k ≤ 3N: a few ε relative per entry), then added to each entry
+/// with one compensated step (`neumaier_add`) — the large-basis path's form of [`rank1_update`],
+/// threaded over the rows of G (each entry written by one thread; G stays exactly symmetric,
+/// the block's (i, j) and (j, i) being the same commutative sums).
+#[allow(clippy::too_many_arguments)]
+fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64], q: usize, rows: &[f64], ys: &[f64], w: f64) {
+    let k = ys.len();
+    debug_assert_eq!(rows.len(), k * q);
+    let support: Vec<usize> = (0..q).filter(|&i| (0..k).any(|r| rows[r * q + i] != 0.0)).collect();
+    if support.is_empty() {
+        return;
+    }
+    // column-major copy of the support: t[s] = (rows[r][support[s]])_r, contiguous in r
+    let t: Vec<Vec<f64>> = support.iter().map(|&i| (0..k).map(|r| rows[r * q + i]).collect()).collect();
+    for (s, &i) in support.iter().enumerate() {
+        neumaier_add(&mut rhs[i], &mut bc[i], w * crate::linalg::dot(&t[s], ys));
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1);
+    let per = support.len().div_ceil(threads);
+    // each thread owns whole rows i of G: split the rows of the support among them
+    let mut row_ids: Vec<Vec<usize>> = support.chunks(per).map(|c| c.to_vec()).collect();
+    let mut work: Vec<Vec<(usize, &mut [f64], &mut [f64])>> = (0..row_ids.len()).map(|_| Vec::new()).collect();
+    {
+        let mut owner = vec![usize::MAX; q];
+        for (c, ids) in row_ids.iter().enumerate() {
+            for &i in ids {
+                owner[i] = c;
+            }
+        }
+        for (i, (g_row, c_row)) in gram.chunks_mut(q).zip(gc.chunks_mut(q)).enumerate() {
+            if owner[i] != usize::MAX {
+                work[owner[i]].push((i, g_row, c_row));
+            }
+        }
+    }
+    row_ids.clear();
+    let index: Vec<usize> = {
+        let mut ix = vec![usize::MAX; q];
+        for (s, &i) in support.iter().enumerate() {
+            ix[i] = s;
+        }
+        ix
+    };
+    let (t, support, index) = (&t, &support, &index);
+    std::thread::scope(|scope| {
+        for chunk in work {
+            scope.spawn(move || {
+                for (i, g_row, c_row) in chunk {
+                    let ti = &t[index[i]];
+                    for (sj, &j) in support.iter().enumerate() {
+                        neumaier_add(&mut g_row[j], &mut c_row[j], w * crate::linalg::dot(ti, &t[sj]));
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// yᵀWy − 2 mᵀb + mᵀGm, clamped at 0 (cancellation).
@@ -1037,71 +1477,7 @@ impl TwoNoise {
                 Err(_) => f64::NEG_INFINITY,
             }
         };
-        let half_decade = 10f64.sqrt();
-        let mut grid: Vec<(f64, f64)> = Vec::new(); // (ln λ, evidence)
-        let mut lambda = LAMBDA_GRID_LO;
-        while lambda <= LAMBDA_GRID_HI * 1.0001 {
-            grid.push((lambda.ln(), at(lambda)));
-            lambda *= half_decade;
-        }
-        if grid.iter().all(|g| g.1 == f64::NEG_INFINITY) {
-            return Err(FitError::Singular);
-        }
-        let best_index = |g: &[(f64, f64)]| {
-            g.iter()
-                .enumerate()
-                .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-                .unwrap()
-        };
-        loop {
-            let i = best_index(&grid);
-            if i == grid.len() - 1 && grid[i].0.exp() < LAMBDA_EXTEND_HI {
-                let l = grid[i].0.exp() * half_decade;
-                grid.push((l.ln(), at(l)));
-            } else if i == 0 && grid[0].0.exp() > LAMBDA_EXTEND_LO {
-                let l = grid[0].0.exp() / half_decade;
-                grid.insert(0, (l.ln(), at(l)));
-            } else {
-                break;
-            }
-        }
-        let i = best_index(&grid);
-        let (mut lo, mut hi) = (
-            grid[i.saturating_sub(1)].0,
-            grid[(i + 1).min(grid.len() - 1)].0,
-        );
-        let mut best = grid[i];
-        if hi > lo {
-            let phi = 0.5 * (3.0 - 5f64.sqrt());
-            let mut x1 = lo + phi * (hi - lo);
-            let mut x2 = hi - phi * (hi - lo);
-            let mut f1 = at(x1.exp());
-            let mut f2 = at(x2.exp());
-            // 20 steps resolve ln λ to 0.618²⁰·2.3 ≈ 1.5e-4, below the outer tolerance (the
-            // alternation cannot converge if the λ search is coarser than its own test).
-            for _ in 0..20 {
-                if f1 > f2 {
-                    hi = x2;
-                    x2 = x1;
-                    f2 = f1;
-                    x1 = lo + phi * (hi - lo);
-                    f1 = at(x1.exp());
-                } else {
-                    lo = x1;
-                    x1 = x2;
-                    f1 = f2;
-                    x2 = hi - phi * (hi - lo);
-                    f2 = at(x2.exp());
-                }
-            }
-            for (x, f) in [(x1, f1), (x2, f2)] {
-                if f > best.1 {
-                    best = (x, f);
-                }
-            }
-        }
-        Ok(best.0.exp())
+        lambda_search_with(at)
     }
 
     /// [`estimate_free`](Self::estimate_free), then — when `FitOptions::sigma_f_min` is set and the estimated
@@ -1190,6 +1566,326 @@ impl TwoNoise {
             last.expect("at least one round"),
         ))
     }
+}
+
+/// What the large-basis solve adds to [`Solved`] for a warm state: λ_eff, tr Σ and tr(Σ G̃_E).
+struct LargeExtra {
+    lambda_eff: f64,
+    tr_sigma: f64,
+    tr_sigma_ge: f64,
+}
+
+/// The spectrum of H_ρ = G̃_F + ρ G̃_E for one noise ratio ρ = s_F²/s_E² (module doc, "The
+/// large-basis path"): eigenvalues h_k and ĉ = Uᵀ(b̃_F + ρ b̃_E), with the floor μ of λ_eff·s_F².
+struct Spectrum {
+    rho: f64,
+    h: Vec<f64>,
+    c: Vec<f64>,
+    mu_floor: f64,
+}
+
+impl Spectrum {
+    /// (evidence, ρ·RSS_E + RSS_F, γ) at (λ, s_F² = t, s_E² = t/ρ); `None` when a shifted
+    /// eigenvalue is not positive (the spectral twin of a failed factorisation).
+    fn at(&self, tn: &TwoNoise, lambda: f64, t: f64) -> Option<(f64, f64, f64)> {
+        let mu = (lambda * t).max(self.mu_floor);
+        let (mut mc, mut hm2, mut mn2, mut logdet, mut gamma) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (&h, &c) in self.h.iter().zip(&self.c) {
+            let den = h + mu;
+            if !(den > 0.0) {
+                return None;
+            }
+            let mk = c / den;
+            mc += mk * c;
+            hm2 += h * mk * mk;
+            mn2 += mk * mk;
+            logdet += (den / t).ln();
+            gamma += h / den;
+        }
+        let comb = (self.rho * tn.yy_e + tn.yy_f - 2.0 * mc + hm2).max(0.0);
+        let (s_e2, s_f2) = (t / self.rho, t);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let ev = -0.5 * tn.n_e * (two_pi * s_e2).ln() - 0.5 * tn.n_f * (two_pi * s_f2).ln() + 0.5 * tn.q as f64 * lambda.ln() - 0.5 * logdet - 0.5 * comb / t - 0.5 * lambda * mn2 + 0.5 * tn.sum_log_w;
+        Some((ev, comb, gamma))
+    }
+}
+
+impl TwoNoise {
+    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ and an implicit QL
+    /// iteration that carries Qᵀc along (no eigenvectors are formed).
+    fn spectrum(&self, rho: f64) -> Result<Spectrum, FitError> {
+        let q = self.q;
+        let mut h = vec![0.0; q * q];
+        let mut max_diag = 0.0f64;
+        for i in 0..q {
+            for j in 0..q {
+                h[i * q + j] = self.g_f[i * q + j] + rho * self.g_e[i * q + j];
+            }
+            max_diag = max_diag.max(h[i * q + i]);
+        }
+        let tri = Tridiagonal::of(&h, q);
+        let mut c: Vec<f64> = (0..q).map(|i| self.b_f[i] + rho * self.b_e[i]).collect();
+        tri.apply_qt(&mut c);
+        let (mut d, mut e) = (tri.d.clone(), tri.e.clone());
+        tridiagonal_ql(&mut d, &mut e, |i, cc, ss| {
+            let (x, y) = (c[i], c[i + 1]);
+            c[i] = cc * x - ss * y;
+            c[i + 1] = ss * x + cc * y;
+        })
+        .map_err(|_| FitError::Singular)?;
+        Ok(Spectrum { rho, h: d, c, mu_floor: 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag })
+    }
+
+    /// [`TwoNoise::solve`] with the large-basis kernels (the vectorised Cholesky and the
+    /// triangular inverse: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
+    fn solve_large(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<(Solved, LargeExtra), FitError> {
+        let q = self.q;
+        let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
+        let mut a = vec![0.0; q * q];
+        let mut max_diag = 0.0f64;
+        for i in 0..q {
+            for j in 0..q {
+                a[i * q + j] = self.g_e[i * q + j] * ie + self.g_f[i * q + j] * i_f;
+            }
+            max_diag = max_diag.max(a[i * q + i]);
+        }
+        let lambda_eff = lambda.max(4.0 * q.max(1) as f64 * f64::EPSILON * max_diag);
+        for i in 0..q {
+            a[i * q + i] += lambda_eff;
+        }
+        let mut chol = a.clone();
+        cholesky_in_place_fast(&mut chol, q).map_err(|_| FitError::Singular)?;
+        let mut m: Vec<f64> = (0..q).map(|i| self.b_e[i] * ie + self.b_f[i] * i_f).collect();
+        cholesky_solve(&chol, q, &mut m);
+        let rss_e = residual_ss(&self.g_e, &self.b_e, self.yy_e, q, &m);
+        let rss_f = residual_ss(&self.g_f, &self.b_f, self.yy_f, q, &m);
+        let inv = inverse_from_lower_inverse(&lower_inverse_transposed(&chol, q), q);
+        let tr_sigma_ge = trace_product(&inv, &self.g_e, q);
+        let gamma_e = tr_sigma_ge * ie;
+        let gamma_f = trace_product(&inv, &self.g_f, q) * i_f;
+        let tr_sigma = (0..q).map(|i| inv[i * q + i]).sum();
+        let logdet = cholesky_logdet(&chol, q);
+        let m_norm2 = m.iter().map(|v| v * v).sum();
+        Ok((Solved { a, chol, m, rss_e, rss_f, gamma_e, gamma_f, logdet, m_norm2 }, LargeExtra { lambda_eff, tr_sigma, tr_sigma_ge }))
+    }
+
+    /// [`TwoNoise::estimate`] on the large-basis path: the same stationarity conditions and
+    /// tolerances, the same `sigma_f_min` rule.
+    fn estimate_spectral(&self, opts: &FitOptions, start: Option<(f64, f64, f64)>) -> Result<(Hyper, Solved, LargeExtra), FitError> {
+        assert!(opts.sigma_f_min >= 0.0 && opts.sigma_f_min.is_finite(), "FitOptions::sigma_f_min must be ≥ 0");
+        let free = self.estimate_spectral_free(opts, start)?;
+        if opts.sigma_f.is_none() && self.n_f > 0.0 && free.0.s_f2 < opts.sigma_f_min * opts.sigma_f_min {
+            return self.estimate_spectral_free(&FitOptions { sigma_f: Some(opts.sigma_f_min), ..opts.clone() }, start);
+        }
+        Ok(free)
+    }
+
+    /// The search over the noise ratio ρ (module doc, "The large-basis path"). The profile
+    /// E(ρ) = max over λ and — with neither level pinned — the common scale t = s_F² of ln p, each
+    /// from one spectrum of H_ρ (λ by the grid-and-golden search, t by MacKay's β update
+    /// t = (ρ RSS_E + RSS_F)/(n − γ), alternated to 1e-6; with a pinned level t follows the pin).
+    /// At the profile's point one exact solve gives RSS_κ and γ_κ per kind, and the per-kind fixed
+    /// points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ — taken as a step in ln ρ, halved until the profile
+    /// does not decrease (the bare fixed point can cycle: ρ 460 → 2.1e4 → 1.4e3 → 460 on a
+    /// near-noise-free collection fixture). Converged when λ, s_E² and s_F² all move by less than
+    /// 1e-3 (the original alternation's test); the returned solve is at the final levels.
+    fn estimate_spectral_free(&self, opts: &FitOptions, start: Option<(f64, f64, f64)>) -> Result<(Hyper, Solved, LargeExtra), FitError> {
+        let pin_e = opts.sigma_e.is_some();
+        let pin_f = opts.sigma_f.is_some();
+        for (name, v) in [("sigma_e", opts.sigma_e), ("sigma_f", opts.sigma_f)] {
+            if let Some(v) = v {
+                assert!(v > 0.0 && v.is_finite(), "FitOptions::{name} must be positive");
+            }
+        }
+        if let Some(l) = opts.lambda {
+            assert!(l >= 0.0 && l.is_finite(), "FitOptions::lambda must be ≥ 0");
+        }
+        let start = start.filter(|(l, e, f)| l.is_finite() && *l > 0.0 && e.is_finite() && *e > 0.0 && f.is_finite() && *f > 0.0);
+        let s_e2_0 = opts
+            .sigma_e
+            .map(|s| s * s)
+            .or(start.map(|s| s.1 * s.1))
+            .unwrap_or(self.yy_e / self.n_e)
+            .max(self.floor_e2);
+        let s_f2_0 = opts
+            .sigma_f
+            .map(|s| s * s)
+            .or(start.map(|s| s.2 * s.2))
+            .unwrap_or(if self.n_f > 0.0 { self.yy_f / self.n_f } else { 1.0 })
+            .max(self.floor_f2);
+        if let (Some(lambda), true, true) = (opts.lambda, pin_e, pin_f) {
+            let (sol, extra) = self.solve_large(lambda, s_e2_0, s_f2_0)?;
+            return Ok((Hyper { lambda, s_e2: s_e2_0, s_f2: s_f2_0, iterations: 0, converged: true }, sol, extra));
+        }
+        let floored = |rss: f64, dof: f64, floor: f64| {
+            let v = rss / dof.max(1.0);
+            if v < 100.0 * floor {
+                floor
+            } else {
+                v
+            }
+        };
+        let n_all = self.n_e + self.n_f;
+        // the profile at ρ: (λ, t, ln p); `t0` starts the β update
+        let profile = |rho: f64, t0: f64| -> Result<(f64, f64, f64), FitError> {
+            let spec = self.spectrum(rho)?;
+            let t_floor = self.floor_f2.max(rho * self.floor_e2);
+            let mut t = match (pin_e, pin_f) {
+                (_, true) => s_f2_0,
+                (true, false) => (rho * s_e2_0).max(self.floor_f2),
+                (false, false) => t0.max(t_floor),
+            };
+            let mut lambda = opts.lambda.unwrap_or(1.0);
+            for _ in 0..NOISE_STEPS {
+                lambda = match opts.lambda {
+                    Some(l) => l,
+                    None => lambda_search_with(|l| spec.at(self, l, t).map_or(f64::NEG_INFINITY, |x| x.0))?,
+                };
+                if pin_e || pin_f {
+                    break;
+                }
+                let (_, comb, gamma) = spec.at(self, lambda, t).ok_or(FitError::Singular)?;
+                let t_new = floored(comb, n_all - gamma, t_floor);
+                let done = rel_change(t_new, t) <= self.resolution_tol(NOISE_TOL, rho * self.yy_e + self.yy_f, comb);
+                t = t_new;
+                if done {
+                    break;
+                }
+            }
+            let ev = spec.at(self, lambda, t).ok_or(FitError::Singular)?.0;
+            Ok((lambda, t, ev))
+        };
+        let mut rho = s_f2_0 / s_e2_0;
+        let (mut lambda, mut t, mut ev) = profile(rho, s_f2_0)?;
+        let levels = |rho: f64, t: f64| -> (f64, f64) {
+            match (pin_e, pin_f) {
+                (true, _) => (s_e2_0, t),
+                (false, _) => ((t / rho).max(self.floor_e2), t),
+            }
+        };
+        let mut lambda_prev: Option<f64> = None;
+        let mut iterations = 0;
+        let mut converged = false;
+        for round in 0..OUTER_ROUNDS {
+            iterations = round + 1;
+            let (s_e2, s_f2) = levels(rho, t);
+            let (sol, _) = self.solve_large(lambda, s_e2, s_f2)?;
+            let next_e = if pin_e { s_e2 } else { floored(sol.rss_e, self.n_e - sol.gamma_e, self.floor_e2) };
+            let next_f = if pin_f { s_f2 } else { floored(sol.rss_f, self.n_f - sol.gamma_f, self.floor_f2) };
+            let noise_ok = rel_change(next_e, s_e2) <= self.resolution_tol(OUTER_TOL, self.yy_e, sol.rss_e)
+                && rel_change(next_f, s_f2) <= self.resolution_tol(OUTER_TOL, self.yy_f, sol.rss_f);
+            let lambda_change = match (opts.lambda, lambda_prev) {
+                (Some(_), _) => 0.0,
+                (None, Some(prev)) => rel_change(lambda, prev),
+                (None, None) => f64::INFINITY,
+            };
+            lambda_prev = Some(lambda);
+            if noise_ok && lambda_change <= OUTER_TOL {
+                converged = true;
+                break;
+            }
+            if noise_ok && (pin_e && pin_f) {
+                converged = true;
+                break;
+            }
+            // the step in ln ρ the per-kind fixed points ask for, halved until the profile holds
+            let step = (next_f / next_e).ln() - rho.ln();
+            let mut alpha = 1.0;
+            let mut moved = false;
+            for _ in 0..12 {
+                let rho_try = rho * (alpha * step).exp();
+                let t_try = if pin_e || pin_f { t } else { next_f };
+                match profile(rho_try, t_try) {
+                    Ok((l2, t2, ev2)) if ev2 >= ev - 1e-12 * ev.abs().max(1.0) => {
+                        (rho, lambda, t, ev) = (rho_try, l2, t2, ev2);
+                        moved = true;
+                        break;
+                    }
+                    _ => alpha *= 0.5,
+                }
+            }
+            if !moved {
+                // no ascent along the fixed points' direction within 2⁻¹² of the step: the profile
+                // is at its maximum to the resolution the evidence carries (λ re-checked next round)
+                if lambda_change <= OUTER_TOL {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+        let (s_e2, s_f2) = levels(rho, t);
+        let (sol, extra) = self.solve_large(lambda, s_e2, s_f2)?;
+        Ok((Hyper { lambda, s_e2, s_f2, iterations, converged }, sol, extra))
+    }
+}
+
+/// The λ search of [`TwoNoise::lambda_search`] over an evidence `at(λ)` (−∞ where a solve fails).
+fn lambda_search_with(at: impl Fn(f64) -> f64) -> Result<f64, FitError> {
+    let half_decade = 10f64.sqrt();
+    let mut grid: Vec<(f64, f64)> = Vec::new(); // (ln λ, evidence)
+    let mut lambda = LAMBDA_GRID_LO;
+    while lambda <= LAMBDA_GRID_HI * 1.0001 {
+        grid.push((lambda.ln(), at(lambda)));
+        lambda *= half_decade;
+    }
+    if grid.iter().all(|g| g.1 == f64::NEG_INFINITY) {
+        return Err(FitError::Singular);
+    }
+    let best_index = |g: &[(f64, f64)]| {
+        g.iter()
+            .enumerate()
+            .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    loop {
+        let i = best_index(&grid);
+        if i == grid.len() - 1 && grid[i].0.exp() < LAMBDA_EXTEND_HI {
+            let l = grid[i].0.exp() * half_decade;
+            grid.push((l.ln(), at(l)));
+        } else if i == 0 && grid[0].0.exp() > LAMBDA_EXTEND_LO {
+            let l = grid[0].0.exp() / half_decade;
+            grid.insert(0, (l.ln(), at(l)));
+        } else {
+            break;
+        }
+    }
+    let i = best_index(&grid);
+    let (mut lo, mut hi) = (
+        grid[i.saturating_sub(1)].0,
+        grid[(i + 1).min(grid.len() - 1)].0,
+    );
+    let mut best = grid[i];
+    if hi > lo {
+        let phi = 0.5 * (3.0 - 5f64.sqrt());
+        let mut x1 = lo + phi * (hi - lo);
+        let mut x2 = hi - phi * (hi - lo);
+        let mut f1 = at(x1.exp());
+        let mut f2 = at(x2.exp());
+        // 20 steps resolve ln λ to 0.618²⁰·2.3 ≈ 1.5e-4, below the outer tolerance (the
+        // alternation cannot converge if the λ search is coarser than its own test).
+        for _ in 0..20 {
+            if f1 > f2 {
+                hi = x2;
+                x2 = x1;
+                f2 = f1;
+                x1 = lo + phi * (hi - lo);
+                f1 = at(x1.exp());
+            } else {
+                lo = x1;
+                x1 = x2;
+                f1 = f2;
+                x2 = hi - phi * (hi - lo);
+                f2 = at(x2.exp());
+            }
+        }
+        for (x, f) in [(x1, f1), (x2, f2)] {
+            if f > best.1 {
+                best = (x, f);
+            }
+        }
+    }
+    Ok(best.0.exp())
 }
 
 fn rel_change(a: f64, b: f64) -> f64 {
@@ -1818,6 +2514,311 @@ mod tests {
         assert!(e_out >= 5.0 * e_in, "energy std out/in = {}", e_out / e_in);
         // Inside the window the std is at the noise floor (within a factor 2).
         assert!(f_in < 2.0 * 3f64.sqrt() * report.sigma_f, "in-window force std {f_in:e}");
+    }
+
+    /// A smooth non-linear teacher for the large-basis tests: pairwise Morse terms whose depth
+    /// depends on the pair's species, plus a three-body bend term at the H–O–H vertex; exact forces.
+    fn morse_bend(pos: &[[f64; 3]], z: &[u8]) -> (f64, Vec<[f64; 3]>) {
+        let n = pos.len();
+        let mut e = z.iter().map(|&zz| if zz == H { -0.478 } else { -74.8 }).sum::<f64>();
+        let mut f = vec![[0.0; 3]; n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let d: [f64; 3] = std::array::from_fn(|a| pos[j][a] - pos[i][a]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let depth = if z[i] == z[j] { 0.05 } else { 0.17 };
+                let x = (-(r - 1.8)).exp();
+                e += depth * ((1.0 - x) * (1.0 - x) - 1.0);
+                let de = 2.0 * depth * (1.0 - x) * x;
+                for a in 0..3 {
+                    f[i][a] += de * d[a] / r;
+                    f[j][a] -= de * d[a] / r;
+                }
+            }
+        }
+        // bend: k (cos θ − cos θ₀)² at every O vertex over its H pairs within 3 Bohr, by central
+        // differences of this term alone (smooth; the test needs a non-pair surface, not its gradient analytically)
+        let bend = |p: &[[f64; 3]]| -> f64 {
+            let mut eb = 0.0;
+            for c in 0..n {
+                if z[c] != O {
+                    continue;
+                }
+                for a in 0..n {
+                    for b in a + 1..n {
+                        if z[a] != H || z[b] != H {
+                            continue;
+                        }
+                        let u: [f64; 3] = std::array::from_fn(|k| p[a][k] - p[c][k]);
+                        let v: [f64; 3] = std::array::from_fn(|k| p[b][k] - p[c][k]);
+                        let (ru, rv) = ((u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt(), (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                        let w = (-(ru - 1.8).powi(2)).exp() * (-(rv - 1.8).powi(2)).exp();
+                        let cos = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (ru * rv);
+                        eb += 0.02 * w * (cos + 0.25).powi(2);
+                    }
+                }
+            }
+            eb
+        };
+        e += bend(pos);
+        let h = 1e-6;
+        for j in 0..n {
+            for a in 0..3 {
+                let mut p = pos.to_vec();
+                p[j][a] += h;
+                let up = bend(&p);
+                p[j][a] -= 2.0 * h;
+                let dn = bend(&p);
+                f[j][a] -= (up - dn) / (2.0 * h);
+            }
+        }
+        (e, f)
+    }
+
+    /// `n` noisy morse-bend samples of 5-atom H/O clusters (1e-5 Ha, 1e-4 Ha/Bohr scatter).
+    fn morse_bend_samples(rng: &mut StdRng, n: usize) -> Vec<Sample> {
+        (0..n)
+            .map(|_| {
+                let (pos, z) = random_cluster(rng, 5, 3.2);
+                let (mut e, mut f) = morse_bend(&pos, &z);
+                e += 1e-5 * normal(rng);
+                for fj in &mut f {
+                    for a in 0..3 {
+                        fj[a] += 1e-4 * normal(rng);
+                    }
+                }
+                Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 }
+            })
+            .collect()
+    }
+
+    /// A small body-4 basis for the large-basis path tests (Q′ in the low hundreds).
+    fn small_body4_basis() -> Basis {
+        let mut b = Basis::new(&[H, O]);
+        b.body4 = true;
+        b.n_max = 4;
+        b.l_max = 2;
+        b
+    }
+
+    /// The large-basis path (module doc) on a body-4 basis: the spectral search lands on the
+    /// reference search's evidence maximum (both stop at 1e-3 relative), and its posterior is the
+    /// reference's at that maximum.
+    #[test]
+    fn large_basis_search_finds_the_reference_search_optimum() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 150) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        let t = std::time::Instant::now();
+        let (m_ref, r_ref) = acc.solve(&opts, &provenance(), &refs).unwrap();
+        let t_ref = t.elapsed();
+        let t = std::time::Instant::now();
+        let (m_sp, r_sp) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        let t_sp = t.elapsed();
+        let rounds = match acc.last_refit() {
+            RefitKind::Spectral { rounds } => rounds,
+            k => panic!("expected a spectral search, got {k:?}"),
+        };
+        eprintln!(
+            "Q′ {}: reference λ {:.4e} σ_E {:.4e} σ_F {:.4e} ln p {:.6e} γ {:.2}/{:.2} ({} rounds, {:.0} ms); spectral λ {:.4e} σ_E {:.4e} σ_F {:.4e} ln p {:.6e} γ {:.2}/{:.2} ({rounds} rounds, {:.0} ms)",
+            r_ref.q_prime, r_ref.lambda, r_ref.sigma_e, r_ref.sigma_f, r_ref.log_evidence, r_ref.gamma_e, r_ref.gamma_f, r_ref.hyper_iterations, t_ref.as_secs_f64() * 1e3,
+            r_sp.lambda, r_sp.sigma_e, r_sp.sigma_f, r_sp.log_evidence, r_sp.gamma_e, r_sp.gamma_f, t_sp.as_secs_f64() * 1e3
+        );
+        assert!(r_ref.converged && r_sp.converged);
+        // both searches stop when λ and the noise levels move by < 1e-3 per round: the optima agree
+        // to a few times that
+        for (what, a, b) in [("λ", r_ref.lambda, r_sp.lambda), ("σ_E²", r_ref.sigma_e.powi(2), r_sp.sigma_e.powi(2)), ("σ_F²", r_ref.sigma_f.powi(2), r_sp.sigma_f.powi(2))] {
+            assert!(rel_change(a, b) < 1e-2, "{what}: reference {a:e} vs spectral {b:e}");
+        }
+        // the evidence at the two optima: equal to the curvature of a flat maximum
+        assert!((r_ref.log_evidence - r_sp.log_evidence).abs() < 1e-6 * r_ref.log_evidence.abs().max(1.0), "{} vs {}", r_ref.log_evidence, r_sp.log_evidence);
+        // predictions and stds on held-out clusters agree far below the noise levels
+        for s in morse_bend_samples(&mut rng, 20) {
+            let (a, b) = (m_ref.predict(&s.pos, &s.z, true).unwrap(), m_sp.predict(&s.pos, &s.z, true).unwrap());
+            assert!((a.energy - b.energy).abs() < 0.05 * r_ref.sigma_e * 5.0, "energy {} vs {}", a.energy, b.energy);
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    assert!((fa[k] - fb[k]).abs() < 0.05 * r_ref.sigma_f, "force {} vs {}", fa[k], fb[k]);
+                }
+            }
+            for (x, y) in a.force_std.unwrap().iter().zip(b.force_std.unwrap()) {
+                assert!(rel_change(*x, y) < 1e-2, "force std {x} vs {y}");
+            }
+        }
+    }
+
+    /// The warm refit (module doc) is the exact posterior at the standing hyperparameters and
+    /// standardisation: after samples arrive, its mean, factor, γ_E and γ_F equal a fresh
+    /// factorisation's to rounding; growth beyond `WARM_GROWTH` searches again.
+    #[test]
+    fn warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters() {
+        let mut rng = StdRng::seed_from_u64(78);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 120) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert!(matches!(acc.last_refit(), RefitKind::Spectral { .. }));
+        for round in 0..3 {
+            for s in morse_bend_samples(&mut rng, 3 + round) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            let (m_w, r_w) = acc.refit(&opts, &provenance(), &refs).unwrap();
+            assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 3 + round });
+            // the reference: a fresh dense solve at the warm state's frozen standardisation and
+            // hyperparameters
+            let w = acc.warm.as_ref().unwrap();
+            let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+            let (sol, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+            assert_eq!(extra.lambda_eff, w.lambda_eff, "noisy data: λ is far above the floor");
+            let q = acc.q_prime;
+            // the factor: backward error of L Lᵀ against the fresh precision A (the factor itself is
+            // only determined to κ(A)·ε in its weak directions — κ ~ 1e9 here — like the mean)
+            let chol = m_w.sigma_inv_chol.as_ref().unwrap();
+            let amax = sol.a.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+            let mut worst_a: f64 = 0.0;
+            for i in 0..q {
+                for j in 0..=i {
+                    let llt = dot(&chol[i * q..i * q + j + 1], &chol[j * q..j * q + j + 1]);
+                    worst_a = worst_a.max((llt - sol.a[i * q + j]).abs() / amax);
+                }
+            }
+            // the fresh model at the same hyperparameters and standardisation
+            let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+            let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+            let (mut worst_e, mut worst_f, mut worst_std): (f64, f64, f64) = (0.0, 0.0, 0.0);
+            for s in morse_bend_samples(&mut StdRng::seed_from_u64(500 + round as u64), 10) {
+                let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+                worst_e = worst_e.max((a.energy - b.energy).abs() / (5.0 * r_w.sigma_e));
+                for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                    for k in 0..3 {
+                        worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                    }
+                }
+                for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                    worst_std = worst_std.max(rel_change(*x, y));
+                }
+                worst_std = worst_std.max(rel_change(a.energy_std.unwrap(), b.energy_std.unwrap()));
+            }
+            eprintln!(
+                "warm round {round}: Q′ {q}, κ(A) {:.1e}, backward error of LLᵀ {worst_a:.1e}, held-out |ΔE|/(Nσ_E) {worst_e:.1e} |ΔF|/σ_F {worst_f:.1e}, std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}",
+                r_w.condition_estimate, r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f
+            );
+            // two backward-stable factorisations of the same A (κ ~ 6e12 on this fixture) give
+            // solutions that differ by up to ~κ(A)·ε relative — the reference path's own Cholesky
+            // against the vectorised one differs by as much (printed) — so the prediction bound
+            // is 10 κ ε in noise units, the std's 1e-5 (a quadratic form: far less sensitive)
+            let (m_old, _) = {
+                let sol_old = problem.solve(w.lambda, w.s_e2, w.s_f2).unwrap();
+                acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol_old, 0.0, 1.0).unwrap()
+            };
+            let mut spread: f64 = 0.0;
+            for s in morse_bend_samples(&mut StdRng::seed_from_u64(500 + round as u64), 10) {
+                let (a, b) = (m_old.predict(&s.pos, &s.z, false).unwrap(), m_f.predict(&s.pos, &s.z, false).unwrap());
+                for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                    for k in 0..3 {
+                        spread = spread.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                    }
+                }
+            }
+            let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+            eprintln!("  the two fresh Cholesky kernels against each other: |ΔF|/σ_F {spread:.1e}; bound 10κε = {bound:.1e}");
+            assert!(worst_a < 1e-13, "backward error {worst_a:e}");
+            assert!(worst_e < bound && worst_f < bound && worst_std < 1e-5, "predictions {worst_e:e} {worst_f:e} {worst_std:e} (bound {bound:e})");
+            assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+            assert!(rel_change(r_w.rmse_force, (sol.rss_f / problem.n_f).sqrt()) < 1e-6);
+        }
+        // past the growth bound the hyperparameters are searched again
+        let n_now = acc.n_samples;
+        for s in morse_bend_samples(&mut rng, (n_now as f64 * (WARM_GROWTH - 1.0)) as usize + 1) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert!(matches!(acc.last_refit(), RefitKind::Spectral { .. }), "{:?}", acc.last_refit());
+        // a basis without body-4 never takes the large-basis path
+        let mut plain = Accumulator::new(&h2_basis(4));
+        let mut rng2 = StdRng::seed_from_u64(3);
+        for s in morse_store(&mut rng2, 1.0, 3.0, 40, Some((1e-5, 1e-4))).samples {
+            plain.add(&s, &h2_basis(4), &[E_ATOM_H], &opts).unwrap();
+        }
+        let (a, _) = plain.refit(&opts, &provenance(), &[E_ATOM_H]).unwrap();
+        let (b, _) = plain.solve(&opts, &provenance(), &[E_ATOM_H]).unwrap();
+        assert_eq!(plain.last_refit(), RefitKind::Full);
+        assert_eq!(a.coeffs, b.coeffs);
+    }
+
+    /// The spectral truncation of the posterior covariance Σ ≈ Σ_{k<K} s_k u_k u_kᵀ + s_min I
+    /// (the M5 handoff's remedy for the O(N·Q′²) variance; M8a Task 5 ruling: measure what it does
+    /// to the calibration, floor it so it never claims more confidence than Σ). With s_min = s_K —
+    /// the largest dropped eigenvalue — T − Σ = Σ_{k<K} s_K u_k u_kᵀ + Σ_{k≥K} (s_K − s_k) u_k u_kᵀ ⪰ 0,
+    /// so the truncated variance is never below the exact one (asserted on held-out rows); without
+    /// the floor it is biased low. Printed: the ratios on the held-out design rows of a collection-
+    /// sized body-4 fit (S = 2, Q′ 284) — the numbers of record in `references.md` ("M8a body-4").
+    #[test]
+    fn spectral_truncation_of_the_covariance_is_measured_and_floored() {
+        let mut rng = StdRng::seed_from_u64(91);
+        let mut basis = Basis::new(&[H, O]);
+        basis.body4 = true;
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 400) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        let (model, report) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        let q = report.q_prime;
+        let l = model.sigma_inv_chol.as_ref().unwrap();
+        let sigma = inverse_from_lower_inverse(&lower_inverse_transposed(l, q), q);
+        let (s, u) = crate::linalg::symmetric_eigen_householder(&sigma, q);
+        let mut order: Vec<usize> = (0..q).collect();
+        order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+        let prior = 1.0 / report.lambda;
+        let at_prior = s.iter().filter(|&&v| v > 0.5 * prior).count();
+        // held-out design rows (energy and force rows, standardised as the fit's)
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for smp in morse_bend_samples(&mut rng, 40) {
+            let (e, f) = crate::loo::design_rows(&model, &smp.pos, &smp.z).unwrap();
+            rows.push(e);
+            rows.extend(f);
+        }
+        let proj: Vec<Vec<f64>> = rows.iter().map(|r| order.iter().map(|&k| (0..q).map(|i| u[i * q + k] * r[i]).sum::<f64>()).collect()).collect();
+        let sorted: Vec<f64> = order.iter().map(|&k| s[k]).collect();
+        eprintln!("Q′ {q}, λ {:.3e} (prior variance {prior:.3e}); eigenvalues of Σ above half the prior's: {at_prior}; s_1 {:.3e}, s_50 {:.3e}, s_100 {:.3e}, s_Q′ {:.3e}", report.lambda, sorted[0], sorted[49], sorted[99], sorted[q - 1]);
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        for k_keep in [25usize, 50, 100, 200] {
+            let s_min = sorted[k_keep];
+            let (mut floored, mut bare) = (Vec::new(), Vec::new());
+            for p in &proj {
+                let exact: f64 = p.iter().zip(&sorted).map(|(x, s)| s * x * x).sum();
+                let kept: f64 = p[..k_keep].iter().zip(&sorted).map(|(x, s)| s * x * x).sum();
+                let norm2: f64 = p.iter().map(|x| x * x).sum();
+                if exact > 0.0 {
+                    floored.push((kept + s_min * norm2) / exact);
+                    bare.push(kept / exact);
+                }
+            }
+            let min_f = floored.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(min_f >= 1.0 - 1e-9, "K {k_keep}: the floored truncation claimed more confidence than Σ ({min_f})");
+            eprintln!(
+                "K {k_keep}: floored (s_min = s_K {s_min:.2e}) variance ratio truncated/exact min {min_f:.3} median {:.3} p95 {:.3e} max {:.3e}; unfloored min {:.3e} median {:.3}",
+                pct(&mut floored.clone(), 0.5),
+                pct(&mut floored.clone(), 0.95),
+                pct(&mut floored, 1.0),
+                pct(&mut bare.clone(), 0.0),
+                pct(&mut bare, 0.5)
+            );
+        }
     }
 
     #[test]

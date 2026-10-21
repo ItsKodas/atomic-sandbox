@@ -3,11 +3,12 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1 to 7; this build writes a fitted model as version 7 — for a body-2 or a
-//! body-3 basis alike — and samples without a fit as version 6, and reads every version)
+//! # Format (versions 1 to 8; this build writes a fitted model as version 7 — for a body-2 or a
+//! body-3 basis alike — or as version 8 for a body-4 basis, samples without a fit as version 6,
+//! and reads every version)
 //!
 //! ```text
-//! "ASMODEL1" … "ASMODEL7"          8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL8"          8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -169,6 +170,16 @@
 //! fitted, so nothing was audited). The bump keeps an older build from misreading the arrays:
 //! it refuses the file as "newer than this build".
 //!
+//! **Version 8** (M8a Task 5): version 7 with a body-4 basis (`Basis::body4`, a shared
+//! collection's). The basis object carries two more keys, `body4` (true) and `body4_cap` (the
+//! body-4 degree cap D₄ the layout was built with, `Basis::body4_cap`); the reader regenerates the
+//! body-4 terms from the basis and refuses a file whose `body4_cap` is not its own D₄ (the layout
+//! would differ) or whose `body4` is not true. Everything else, the arrays included, is version
+//! 7's; every array length follows from the larger P and Q′. A basis without body-4 is still
+//! written as version 7, bit for bit — so every per-scene sidecar is unchanged — and a build
+//! before this one refuses a version-8 file as "newer than this build" instead of misreading its
+//! arrays.
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
@@ -205,6 +216,9 @@ pub const MAGIC_V6: &[u8; 8] = b"ASMODEL6";
 /// The first eight bytes of a version-7 file (the audit history; what this build writes for a
 /// fitted model — module doc, "Version 7").
 pub const MAGIC_V7: &[u8; 8] = b"ASMODEL7";
+/// The first eight bytes of a version-8 file: version 7 with a body-4 basis (module doc, "Version
+/// 8"; M8a Task 5). A basis without body-4 is still written as version 7, bit for bit.
+pub const MAGIC_V8: &[u8; 8] = b"ASMODEL8";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -502,8 +516,8 @@ fn invalid_input(msg: String) -> io::Error {
 fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(bool, Option<u64>)]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = MAGIC_V7;
-    if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
+    let magic: &[u8; 8] = if basis.body4 { MAGIC_V8 } else { MAGIC_V7 };
+    if (body3 || basis.body4) && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
     if acc.basis != *basis {
@@ -585,14 +599,21 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
 
     let provenance = provenance_json(&model.provenance);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
-    let basis_json = obj(&[
+    let mut basis_pairs = vec![
         ("n_max", basis.n_max.to_string()),
         ("l_max", basis.l_max.to_string()),
         ("r_cut", num(basis.r_cut)),
         ("degree_cap", basis.degree_cap.to_string()),
         ("body3", basis.body3.to_string()),
         ("species", species.clone()),
-    ]);
+    ];
+    // version 8 only (module doc): the body-4 flag and its degree cap, which the reader checks
+    // against its own layout
+    if basis.body4 {
+        basis_pairs.push(("body4", "true".into()));
+        basis_pairs.push(("body4_cap", basis.body4_cap().to_string()));
+    }
+    let basis_json = obj(&basis_pairs);
     let model_json = obj(&[
         ("sigma_e", num(model.sigma_e)),
         ("sigma_f", num(model.sigma_f)),
@@ -900,10 +921,11 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         m if m == MAGIC_V5 => 5,
         m if m == MAGIC_V6 => 6,
         m if m == MAGIC_V7 => 7,
+        m if m == MAGIC_V8 => 8,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to 7)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 8)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL7)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL8)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -922,7 +944,8 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         4 => MAGIC_V4,
         5 => MAGIC_V5,
         6 => MAGIC_V6,
-        _ => MAGIC_V7,
+        7 => MAGIC_V7,
+        _ => MAGIC_V8,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
@@ -973,14 +996,32 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if body3 && species.len() > MAX_SPECIES_V2 {
         return Err(format!("body-3 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
     }
+    // version 8 (module doc): the body-4 flag, present exactly then
+    let body4 = version >= 8 && b.get("body4")?.bool()?;
+    if version >= 8 && !body4 {
+        return Err("a version-8 file has a body-4 basis (body4 is false)".into());
+    }
+    if body4 && l_max > crate::basis::L_MAX_SUPPORTED {
+        return Err(format!("basis l_max {l_max} exceeds the supported {}", crate::basis::L_MAX_SUPPORTED));
+    }
+    if body4 && species.len() > MAX_SPECIES_V2 {
+        return Err(format!("body-4 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
+    }
     let basis = Basis {
         n_max,
         l_max,
         r_cut,
         degree_cap: b.get("degree_cap")?.usize()?,
         body3,
+        body4,
         species,
     };
+    if body4 {
+        let cap = b.get("body4_cap")?.usize()?;
+        if cap != basis.body4_cap() {
+            return Err(format!("body4_cap {cap} differs from this build's layout for the basis ({})", basis.body4_cap()));
+        }
+    }
     let s = basis.n_species();
     let p = basis.n_features();
     let q = basis.n_independent_columns();
@@ -1793,10 +1834,15 @@ pub(crate) mod tests {
     /// A random model, accumulator, report and samples with awkward values (subnormal-free but
     /// spread over 16 decades, −0.0, a non-finite condition estimate).
     pub(crate) fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
+        random_sidecar_with(seed, body3, false)
+    }
+
+    pub(crate) fn random_sidecar_with(seed: u64, body3: bool, body4: bool) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;
-        if body3 {
+        basis.body4 = body4;
+        if body3 || body4 {
             // C = 9 channels, 45 unordered pairs × 3 l (D = 10 never binds at n_max 3, l_max 2):
             // P = 9 + 135, Q′ = 18 + 3·135
             basis.n_max = 3;
@@ -2284,6 +2330,34 @@ pub(crate) mod tests {
         assert!(matches!(read_any(&q).unwrap(), Contents::Fitted(_)));
     }
 
+    /// A body-4 basis (M8a Task 5) is written as version 8 and reads back bit for bit; a body-4-free
+    /// basis is still version 7; a version-8 header whose body-4 cap is not this build's layout,
+    /// or that says body4 false, is refused.
+    #[test]
+    fn a_body4_basis_round_trips_as_version_8() {
+        let orig = random_sidecar_with(37, true, true);
+        assert!(orig.model.basis.n_body4() > 0);
+        round_trip(orig.clone(), "round-trip-v8.model", "bare-v8.model", MAGIC_V8);
+        round_trip(random_sidecar_with(37, true, false), "round-trip-v7b3.model", "bare-v7b3.model", MAGIC_V7);
+        let path = tmp("body4-cap.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap().to_string();
+        assert!(header.contains("\"body4\":true,\"body4_cap\":2"), "{header}");
+        for (what, from, to) in [("cap", "\"body4_cap\":2", "\"body4_cap\":3"), ("flag", "\"body4\":true", "\"body4\":false")] {
+            let h2 = header.replacen(from, to, 1);
+            let mut b2 = bytes[..8].to_vec();
+            b2.extend_from_slice(&(h2.len() as u64).to_le_bytes());
+            b2.extend_from_slice(h2.as_bytes());
+            b2.extend_from_slice(&bytes[16 + header_len..]);
+            let p2 = tmp(&format!("body4-{what}.model"));
+            std::fs::write(&p2, b2).unwrap();
+            let e = read(&p2).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}");
+        }
+    }
+
     fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
         let path = tmp(name);
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
@@ -2675,9 +2749,9 @@ pub(crate) mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL8".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL9".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 8 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 9 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)

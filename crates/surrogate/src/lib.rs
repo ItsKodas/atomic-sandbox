@@ -30,10 +30,10 @@ pub mod novelty;
 pub mod quarantine;
 pub mod sidecar;
 
-pub use descriptor::{describe, describe_values, AtomDescriptor, Basis, Body3Term, DescribeError};
+pub use descriptor::{describe, describe_values, AtomDescriptor, Basis, Body3Term, Body4Term, DescribeError, BODY4_DEGREE_CAP};
 pub use envelope::Envelope;
 pub use fit::{
-    fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError, Sums,
+    fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
 pub use collection::{Collection, CollectionReference, CollectionSample, ImportReport, OpenReport, ReferenceOutcome};
