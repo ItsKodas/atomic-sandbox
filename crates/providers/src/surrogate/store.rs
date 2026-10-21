@@ -195,6 +195,7 @@ impl SurrogateKs {
                 reference_rule: rule.map(str::to_string),
                 quarantine: flags,
                 face_density: face,
+                sample_box: Vec::new(),
                 teacher_solves: Some(solves),
                 teacher_solves_note: None,
                 created_by: surrogate::sidecar::CREATED_BY.to_string(),

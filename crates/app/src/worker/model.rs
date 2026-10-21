@@ -6,20 +6,27 @@
 //!
 //! # The shared collection (M8a Task 4b; spec §4.2; controller rulings P6, P13)
 //! With a collections folder set ([`Command::Collections`]: the window's `models/collections`;
-//! headless runs and tests set none and keep per-scene models bit for bit), `EnsureModel` attaches
-//! the collection of the scene's solver surface (`Trainable::attach_collection`: one folder per h,
-//! σ, ionic policy, teacher and tolerance — every box and every species of that surface learn into
-//! it) unless the session's autosave restores a per-scene model on a neutral scene (the user had
-//! chosen a file). While the user's choice is the collection ([`ModelChoice::Collection`], the
-//! default) every scene replacement re-attaches ([`Worker::sync_collection`]): a change of h, σ or
-//! the ionic policy moves to that surface's collection; a charged scene or a forced multiplicity
-//! (collections are neutral until M9) **leaves** it — the model is forgotten for that scene (the
-//! collection stays on disk, nothing of it is lost) with a note, so the scene learns per-scene —
-//! and the collection comes back when the scene is neutral again (Task 4a review ⚠️ 2). A model
-//! file (Load model, the switch) or Forget ends that choice until the switch picks the collection
-//! again. The autosave writes a per-scene model only (`autosave` module doc); a collection saves
-//! itself. A pass's checkpoint in collection mode is the checkpoint alone (`checkpoint` module
-//! doc, "Collection mode").
+//! headless runs and tests set none and keep per-scene models bit for bit) the shared collection is
+//! **the default and stays the default** (user request, M8a Task 4b fix round 1): `EnsureModel`
+//! attaches the collection of the scene's solver surface (`Trainable::attach_collection`: one
+//! folder per h, σ, ionic policy, teacher and tolerance — every box and every species of that
+//! surface learn into it), and while the user's choice is the collection ([`ModelChoice::Collection`])
+//! every scene replacement re-attaches ([`Worker::sync_collection`]): a change of h, σ or the ionic
+//! policy moves to that surface's collection; a charged scene or a forced multiplicity (collections
+//! are neutral until M9) **leaves** it — the model is forgotten for that scene (the collection stays
+//! on disk, nothing of it is lost) with a note, so the scene learns per-scene — and the collection
+//! comes back when the scene is neutral again (Task 4a review ⚠️ 2).
+//!
+//! **Only a model file the user picked** (Load model, the Model tab's "a model file…") ends that
+//! choice, until the switch picks the collection again. **Forget** in collection mode drops this
+//! session's own samples (the session-only ones) and keeps the collection attached: its samples are
+//! permanent ([`Worker::forget_keeps_collection`]). A **worker re-spawn** (a solver switch) attaches
+//! the collection again: the session autosave of collection mode holds only the session-only samples
+//! (`autosave` module doc; ruling P13), which are put back beside it (`Trainable::load_session_only`)
+//! — never a switch to a model file. An autosave that is a per-scene model on a neutral scene is
+//! the file the user had picked (File mode), restored as such; on a charged scene it is that
+//! scene's per-scene model. A pass's checkpoint in collection mode is the checkpoint alone
+//! (`checkpoint` module doc, "Collection mode").
 
 use super::*;
 
@@ -164,18 +171,36 @@ pub struct ModelStatus {
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
     pub last_import: Option<Result<sim::ImportSummary, String>>,
+    /// The user's choice is the shared collection (a folder is set, and no model file was picked
+    /// since): the Model tab's switch shows it, also while a charged scene learns per-scene.
+    pub use_collection: bool,
+    /// The model file in use is this session's autosave (restored after a solver switch): the
+    /// source line names the file the user picked instead (review Minor 2).
+    pub source_is_autosave: bool,
 }
 
 /// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
 /// "read-only — open in another window" when another process holds the collection), "file:
 /// <name>", or a per-scene model's line.
+#[cfg(test)]
 pub fn source_line(m: &ModelStatus) -> String {
+    source_line_with(m, None)
+}
+
+/// [`source_line`], naming `user_file` (the file the user picked, the Model tab's memory) when the
+/// model in use is this session's autosave of it (review Minor 2).
+pub fn source_line_with(m: &ModelStatus, user_file: Option<&std::path::Path>) -> String {
+    let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
     match &m.source {
         sim::ModelSource::Collection { slug, samples, read_only } => {
             let ro = if *read_only { " · read-only — open in another window" } else { "" };
             format!("model: shared — {slug} · {samples} samples{ro}")
         }
-        sim::ModelSource::File(p) => format!("file: {}", p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())),
+        sim::ModelSource::File(_) if m.source_is_autosave => match user_file {
+            Some(u) => format!("file: {}", name(u)),
+            None => "file: the model file picked earlier in this session".into(),
+        },
+        sim::ModelSource::File(p) => format!("file: {}", name(p)),
         sim::ModelSource::None if m.collections => "model: this scene only (not shared)".into(),
         sim::ModelSource::None => "model: this session only".into(),
     }
@@ -366,21 +391,35 @@ impl Worker {
         if trainable(&mut self.dy).is_none() {
             return;
         }
-        if let Some(path) = autoload.filter(|p| p.exists()) {
+        // a collection's session-only samples (`autosave` module doc): `grid_n` 0, "any box"
+        let session_only = autoload.as_ref().filter(|p| p.exists()).is_some_and(|p| surrogate::sidecar::read_provenance(p).is_ok_and(|pr| pr.grid_n == 0));
+        if let Some(path) = autoload.clone().filter(|p| p.exists() && !session_only) {
             self.dy.apply(DynCommand::LoadModel(path));
             if let Some(r) = self.dy.snapshot().last_rejection {
-                // not ours: the file stays for a later worker on the settings it fits
+                // not ours: the file stays for a later worker on the settings it fits; the scene's
+                // collection is attached all the same (review Minor 3)
                 self.autoload_refused = Some(r);
+                self.sync_collection();
                 return;
             }
-            // the session's per-scene model is back: on a neutral scene it was the user's file (the
-            // collection is never autosaved), on a charged one the per-scene model it kept
+            // the session's per-scene model is back: on a neutral scene it was the user's file (a
+            // collection's autosave is session-only samples), on a charged one the per-scene model
+            // it kept
             let sc = self.dy.snapshot().scene;
             if sc.charge == 0 && sc.multiplicity.is_none() {
                 self.use_collection = false;
             }
         } else {
             self.sync_collection();
+            if let Some(path) = autoload.filter(|_| session_only) {
+                let Some(t) = trainable(&mut self.dy) else { return };
+                if let Err(e) = t.load_session_only(&path) {
+                    // kept on disk for a later worker that attaches its collection (a charged scene
+                    // has none): this worker does not own the autosave
+                    self.dy.add_note(format!("this session's session-only samples were not put back ({e}); they stay in {}", path.display()));
+                    return;
+                }
+            }
         }
         self.owns_autosave = true;
         // an empty scene needs no model (module doc, "The empty scene"): no pass, no offer
@@ -418,6 +457,20 @@ impl Worker {
         };
         if let Some(n) = note {
             self.dy.add_note(n);
+        }
+    }
+
+    /// After a Forget the driver accepted (module doc, "The shared collection"): in collection mode the
+    /// collection is attached again — what was forgotten is this session's own samples; the
+    /// collection's are permanent — and that is said.
+    pub(super) fn forget_keeps_collection(&mut self) {
+        if !self.use_collection || self.collections.is_none() {
+            return;
+        }
+        self.sync_collection();
+        let Some(t) = trainable(&mut self.dy) else { return };
+        if let sim::ModelSource::Collection { slug, samples, .. } = t.model_source() {
+            self.dy.add_note(format!("forgotten: this session's own samples; the shared collection {slug} keeps its {samples} samples (they are permanent) and stays attached"));
         }
     }
 
@@ -566,9 +619,11 @@ impl Worker {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
-        let (collections, last_import) = (self.collections.is_some(), self.last_import.clone());
+        let (collections, last_import, use_collection) = (self.collections.is_some(), self.last_import.clone(), self.use_collection && self.collections.is_some());
+        let autosave = self.autosave.clone();
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
+        let source_is_autosave = matches!((&st.model_source, &autosave), (sim::ModelSource::File(p), Some(a)) if p == a);
         // no record (never audited, forgotten, a model loaded): no step either
         if st.last_audit.is_none() {
             self.activity.last_audit_step = None;
@@ -623,6 +678,8 @@ impl Worker {
             source: st.model_source,
             collections,
             last_import,
+            use_collection,
+            source_is_autosave,
         })
     }
 

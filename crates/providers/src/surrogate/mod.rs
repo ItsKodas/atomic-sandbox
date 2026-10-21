@@ -916,6 +916,7 @@ mod ledger;
 mod policy;
 mod quarantine;
 mod shared;
+pub use shared::COLLECTION_CHECKPOINT_PREFIX;
 mod store;
 mod teach;
 mod trust;
@@ -2501,6 +2502,18 @@ impl Trainable for SurrogateKs {
 
     fn attach_collection(&mut self, root: &std::path::Path, scene: &Scene) -> Result<(), String> {
         self.attach_collection_at(root, scene)
+    }
+
+    fn model_source(&self) -> sim::ModelSource {
+        SurrogateKs::model_source(self)
+    }
+
+    fn save_session_only(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        SurrogateKs::save_session_only(self, path)
+    }
+
+    fn load_session_only(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        SurrogateKs::load_session_only(self, path)
     }
 
     fn import_model(&mut self, path: &std::path::Path) -> Result<sim::ImportSummary, String> {

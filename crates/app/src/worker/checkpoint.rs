@@ -17,6 +17,10 @@
 //! line names the collection and its counts are the collection's (`SurrogateKs::checkpoint_counts`):
 //! the resume attaches the scene's collection and goes on when the collection still holds the
 //! samples it held at the checkpoint; jobs whose geometry it already holds are not solved again.
+//! A **read-only** collection (another process holds its lock) keeps nothing of the pass, so its
+//! pass is not resumable: no checkpoint is written (review I1). Samples a writable collection
+//! refuses (box-affected ones) stay session-only and are not in the checkpoint; the autosave keeps
+//! them at a solver switch or a close (`autosave` module doc), a crash loses them.
 
 use super::*;
 
@@ -54,7 +58,7 @@ pub fn interrupted_pass(dir: &std::path::Path) -> Option<(String, providers::sam
 
 /// The checkpoint was written in collection mode (module doc, "Collection mode").
 pub fn is_collection_checkpoint(info: &providers::sampling::CheckpointInfo) -> bool {
-    info.provenance.starts_with("shared collection ")
+    info.provenance.starts_with(providers::surrogate::COLLECTION_CHECKPOINT_PREFIX)
 }
 
 /// Removes the interrupted pass's files from `dir` (the offer's Discard; a pass that ended).
@@ -101,6 +105,9 @@ impl Worker {
     /// resumable (teach-around, references only).
     fn write_checkpoint(&mut self, dir: &std::path::Path) -> Result<bool, String> {
         let shared = self.in_collection();
+        if shared && self.collection_read_only() {
+            return Ok(false); // nothing of the pass is durable (module doc, "Collection mode")
+        }
         let Some(t) = trainable(&mut self.dy) else { return Ok(false) };
         let Some(text) = t.pass_checkpoint() else { return Ok(false) };
         if t.samples() == 0 {

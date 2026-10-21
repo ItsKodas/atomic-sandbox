@@ -84,7 +84,9 @@
 //!   model or forgot it. A worker shut down before its `EnsureModel` ran (a quick radio toggle
 //!   during the cold first evaluation), or whose autoload was refused (another provenance), leaves
 //!   the file as it found it — so a timed-out, detached old worker can never delete a model the
-//!   session still has.
+//!   session still has. In shared-collection mode the file holds only the session-only samples
+//!   (`autosave` module doc; M8a Task 4b fix round 1), and a worker that could not put them back
+//!   (no collection attached) leaves it too.
 //!
 //! # The orbital view (orbital-viewer spec §4.3, §7; plan Task 3)
 //! [`Command::OrbitalView`] sets what the orbital view shows. It is display only: never an edit,
@@ -359,13 +361,24 @@ impl SimWorker {
     /// clone): [`SimWorker::probe`] returns it.
     #[cfg(test)]
     pub fn spawn_test_with(initial: Scene, probe: Arc<sim::ActivityProbe>, make: MakeProvider) -> SimWorker {
+        SimWorker::spawn_test_full(initial, probe, make, None)
+    }
+
+    /// [`SimWorker::spawn_test`] with the session `autosave` path (module doc, "Autosave").
+    #[cfg(test)]
+    pub fn spawn_test_saving(initial: Scene, make: MakeProvider, autosave: PathBuf) -> SimWorker {
+        SimWorker::spawn_test_full(initial, sim::ActivityProbe::new(), make, Some(autosave))
+    }
+
+    #[cfg(test)]
+    fn spawn_test_full(initial: Scene, probe: Arc<sim::ActivityProbe>, make: MakeProvider, autosave: Option<PathBuf>) -> SimWorker {
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
         let pending = Arc::new(AtomicUsize::new(0));
         let (p, q) = (probe.clone(), pending.clone());
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make), p, q))
+            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, autosave, Some(make), p, q))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,

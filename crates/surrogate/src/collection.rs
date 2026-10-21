@@ -1580,7 +1580,7 @@ mod tests {
     }
 
     fn set(prov: Provenance, samples: Vec<Sample>, quarantine: Vec<u8>, face: Vec<f64>) -> SampleSet {
-        SampleSet { provenance: prov, samples, references: vec![(1, -0.478)], reference_rule: Some(REFERENCE_RULE.into()), quarantine, face_density: face, teacher_solves: None, teacher_solves_note: None, created_by: sidecar::CREATED_BY.into() }
+        SampleSet { provenance: prov, samples, references: vec![(1, -0.478)], reference_rule: Some(REFERENCE_RULE.into()), quarantine, face_density: face, sample_box: Vec::new(), teacher_solves: None, teacher_solves_note: None, created_by: sidecar::CREATED_BY.into() }
     }
 
     #[test]

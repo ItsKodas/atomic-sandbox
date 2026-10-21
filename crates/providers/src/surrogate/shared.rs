@@ -97,6 +97,11 @@ use std::path::{Path, PathBuf};
 use surrogate::collection::{CollectionReference, ImportReport, ReferenceOutcome, REFUSE_BOX_UNKNOWN};
 use surrogate::{Collection, CollectionSample, SurfaceKey};
 
+/// How a collection-mode pass checkpoint's provenance line begins ([`SurrogateKs::checkpoint_counts`]):
+/// the app tells a collection checkpoint (no samples file beside it) from a per-scene one by it
+/// (M8a Task 4b fix round 1, review Minor 1: one constant for both sides).
+pub const COLLECTION_CHECKPOINT_PREFIX: &str = "shared collection ";
+
 /// Where a stored sample stands in the attached collection (parallel to the store).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Link {
@@ -346,7 +351,7 @@ impl SurrogateKs {
     pub(super) fn checkpoint_counts(&self, scene: &Scene) -> (String, usize, usize) {
         let prov = self.provenance_for(scene).describe();
         match &self.shared {
-            Some(s) => (format!("shared collection {}: {prov}", s.coll.key.slug()), s.coll.samples.len(), s.pass_start.unwrap_or(0)),
+            Some(s) => (format!("{COLLECTION_CHECKPOINT_PREFIX}{}: {prov}", s.coll.key.slug()), s.coll.samples.len(), s.pass_start.unwrap_or(0)),
             None => (prov, self.samples(), self.pass_start.unwrap_or(0)),
         }
     }
@@ -851,6 +856,121 @@ impl SurrogateKs {
         self.user_notes.push(format!("shared collection {slug}: {} imported from {}, {} refused", report.imported, path.display(), report.refused.len()));
         self.flush_collection();
         Ok(report)
+    }
+
+    /// The session-only samples (M8a Task 4b fix round 1; ruling P13; `Trainable::save_session_only`):
+    /// every stored sample the attached collection does not hold — refused (box-affected, box
+    /// status unknown, read-only) or a draft guess still waiting — written to `path` as a
+    /// samples-only file (`surrogate::sidecar` version 6) with the teacher's own energy, its box
+    /// (`sample_box`), face density and quarantine flag, under the collection's provenance (any
+    /// box). `Ok(0)`, nothing written, when there are none or no collection is attached. The
+    /// references are not written: the collection's are used at the reload, and a sample whose box
+    /// has none waits for them as before.
+    pub fn save_session_only(&self, path: &Path) -> std::io::Result<usize> {
+        let (Some(sh), Some(store)) = (&self.shared, &self.store) else { return Ok(0) };
+        let keep: Vec<usize> = (0..store.len()).filter(|&i| !matches!(sh.link.get(i), Some(Link::In(_)))).collect();
+        if keep.is_empty() {
+            return Ok(0);
+        }
+        let set = surrogate::SampleSet {
+            provenance: store.provenance.clone(),
+            samples: keep
+                .iter()
+                .map(|&i| {
+                    let mut s = store.samples[i].clone();
+                    if let Some(&raw) = sh.raw.get(i).filter(|e| e.is_finite()) {
+                        s.energy = raw;
+                    }
+                    s
+                })
+                .collect(),
+            references: Vec::new(),
+            reference_rule: Some(surrogate::sidecar::REFERENCE_RULE.to_string()),
+            // provider-only codes are not file codes: a draft guess's tag carries it, a waiting
+            // sample waits again at the reload
+            quarantine: keep.iter().map(|&i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT && q != Q_REF_WAIT).unwrap_or(Q_NONE)).collect(),
+            face_density: keep.iter().map(|&i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect(),
+            sample_box: keep.iter().map(|&i| sh.box_n.get(i).copied().unwrap_or(0)).collect(),
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: surrogate::sidecar::CREATED_BY.to_string(),
+        };
+        surrogate::sidecar::write_samples(path, &set)?;
+        Ok(keep.len())
+    }
+
+    /// Puts a [`save_session_only`](Self::save_session_only) file's samples back beside the
+    /// attached collection, as session-only samples (`Link::Out`: never offered to it — they were
+    /// refused, or the collection was read-only), each against its own box's references (or
+    /// waiting for them); a sample the collection holds by now is skipped. The number taken. `Err`
+    /// without an attached collection of the file's surface, for any other file, or while a pass
+    /// runs; nothing changes then.
+    pub fn load_session_only(&mut self, path: &Path) -> Result<usize, String> {
+        if self.pass.is_some() {
+            return Err("session-only samples: cancel the running sampling pass first".into());
+        }
+        let sh = self.shared.as_ref().ok_or("session-only samples: no shared collection is attached")?;
+        let set = match surrogate::sidecar::read_any(path).map_err(|e| format!("session-only samples: {e}"))? {
+            surrogate::sidecar::Contents::Samples(set) => set,
+            surrogate::sidecar::Contents::Fitted(_) => return Err(format!("{}: a fitted model, not a collection's session-only samples", path.display())),
+        };
+        let slug = sh.coll.key.slug();
+        if set.provenance.grid_n != 0 || set.sample_box.len() != set.samples.len() {
+            return Err(format!("{}: not a collection's session-only samples (a per-scene samples file)", path.display()));
+        }
+        if let Err(why) = sh.coll.admit_provenance(&set.provenance) {
+            return Err(format!("{}: its samples are not of the surface of the shared collection {slug} ({why})", path.display()));
+        }
+        let prov = sh.prov.clone();
+        let mut taken = 0;
+        for (i, mut s) in set.samples.into_iter().enumerate() {
+            let b = set.sample_box[i];
+            if self.shared.as_ref().expect("checked").coll.holds_answer(&s) {
+                continue;
+            }
+            let n = self.store.as_ref().map_or(0, |st| st.len());
+            let raw = s.energy;
+            let offset = self.box_offset(&s.z, b);
+            if let Some(o) = offset {
+                s.energy = raw - o;
+            }
+            let draft = s.tag == SampleTag::DraftAudit;
+            let z = s.z.clone();
+            let store = self.store.get_or_insert_with(|| SampleStore::new(prov.clone()));
+            if store.push(s).is_err() {
+                continue;
+            }
+            let q = match (offset, set.quarantine.get(i).copied().unwrap_or(Q_NONE)) {
+                (None, _) => Q_REF_WAIT,
+                (Some(_), Q_NONE) if draft => Q_DRAFT,
+                (Some(_), q) => q,
+            };
+            if !self.quarantine.is_empty() || q != Q_NONE {
+                self.quarantine.resize(n, Q_NONE);
+                self.quarantine.push(q);
+            }
+            self.face.resize(n, f64::NAN);
+            self.face.push(set.face_density.get(i).copied().unwrap_or(f64::NAN));
+            let sh = self.shared.as_mut().expect("checked");
+            sh.link.resize(n, Link::Out);
+            sh.link.push(Link::Out);
+            sh.raw.resize(n, f64::NAN);
+            sh.raw.push(raw);
+            sh.box_n.resize(n, 0);
+            sh.box_n.push(b);
+            if self.accumulator.as_ref().is_some_and(|acc| z.iter().any(|&zi| acc.basis.species_index(zi).is_none())) {
+                self.species_dirty = true;
+            }
+            taken += 1;
+        }
+        if let Some(st) = self.store.as_mut() {
+            st.provenance.record_masses(&set.provenance.masses);
+        }
+        if taken > 0 {
+            self.pending_refit = true;
+            self.user_notes.push(format!("shared collection {slug}: {taken} session-only samples of this session are back (kept beside the collection, never added to it)"));
+        }
+        Ok(taken)
     }
 
     /// The model file this provider's model was loaded from (`load`), for the readouts.

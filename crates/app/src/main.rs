@@ -487,6 +487,9 @@ fn main() {
     viewer.auto_pass = false;
     // the estimated solver learns into the shared collection of the scene's solver surface (M8a Task 4b)
     viewer.collections_dir = scene::collections_dir();
+    if viewer.collections_dir.is_none() {
+        eprintln!("note: no models folder beside the exe or in the working directory: the estimated solver keeps this session's model only (no shared collection)");
+    }
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));

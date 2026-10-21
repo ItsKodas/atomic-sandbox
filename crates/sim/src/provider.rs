@@ -962,6 +962,26 @@ pub trait Trainable {
     fn import_model(&mut self, _path: &std::path::Path) -> Result<ImportSummary, String> {
         Err("this provider does not learn".into())
     }
+    /// Where the model comes from (`TrainableStatus::model_source`, without building the
+    /// readouts). The default: [`ModelSource::None`].
+    fn model_source(&self) -> ModelSource {
+        ModelSource::None
+    }
+    /// With a shared collection attached, writes the samples it does not hold — the
+    /// **session-only** ones (refused by it: box-affected, box status unknown, read-only; a held-out
+    /// draft guess) — to `path` as a samples-only file and returns how many (M8a Task 4b fix round
+    /// 1, ruling P13: the session autosave keeps them); `Ok(0)` writes nothing (none held, or no
+    /// collection attached). The default: `Ok(0)`.
+    fn save_session_only(&self, _path: &std::path::Path) -> std::io::Result<usize> {
+        Ok(0)
+    }
+    /// Puts the samples of a [`save_session_only`](Self::save_session_only) file back beside the
+    /// attached collection as session-only samples (never offered to it), the number taken; `Err`
+    /// without an attached collection of the file's surface, for another kind of file, or while a
+    /// pass runs. The default refuses.
+    fn load_session_only(&mut self, _path: &std::path::Path) -> Result<usize, String> {
+        Err("this provider does not learn".into())
+    }
     /// The teacher, for work the model must not see (the pass's solves, the reference atoms).
     fn teacher_mut(&mut self) -> &mut dyn ForceProvider;
     /// The readouts at `scene` (whose settings the model's provenance is compared with) and the

@@ -3298,3 +3298,142 @@ fn an_interrupted_collection_pass_resumes_from_its_collection() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+// ---- the shared collection stays the default (M8a Task 4b fix round 1) ----
+
+/// A per-scene model file of `scene`, taught by a headless worker (no collections folder).
+fn per_scene_file(scene: Scene, path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let w = SimWorker::spawn_test(scene, clean_morse(0.005));
+    ensure(&w);
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() })));
+    snapshot_until(&w, "the pass's end", pass_done);
+    w.send(Command::Dyn(DynCommand::SaveModel(path.to_path_buf())));
+    snapshot_until(&w, "the model file", |_| path.exists());
+    drop(w);
+}
+
+/// The user's request (fix round 1) and review I2: Forget in collection mode drops only the
+/// session's own samples and keeps the collection attached; a model file the user picked survives a
+/// scene change (no re-attach) until the switch picks the collection again; an h or σ change
+/// re-attaches another surface's collection. (The ionic policy is the third key: changing it on H₂
+/// needs the H pseudopotential's dimer gate — ≈ 1 min on the GPU, ≈ 40 min on the CPU — so it is
+/// not exercised here; `sync_collection` treats it like h and σ, through the same `replace`.)
+#[test]
+fn forget_keeps_the_collection_and_only_a_picked_file_leaves_it() {
+    let root = collection_root("file");
+    let file = std::env::temp_dir().join(format!("atomic-sandbox-coll-file-{}.model", std::process::id()));
+    per_scene_file(h2_33(), &file);
+    let plan = SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() };
+    let w = collection_worker(h2_33(), &root, 0.005);
+    ensure(&w);
+    let s = snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    let (slug, _) = shared(&s).unwrap();
+    assert!(model(&s).use_collection, "the default");
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    let s = snapshot_until(&w, "the pass's end", pass_done);
+    let (_, n1) = shared(&s).unwrap();
+    assert!(n1 >= 8, "{n1}");
+
+    // Forget: the collection stays, with its samples (they are permanent)
+    w.send(Command::Dyn(DynCommand::ForgetModel));
+    let s = snapshot_until(&w, "the forget's note", |s| !s.working && s.dynamics.notes.iter().any(|n| n.contains("stays attached")));
+    assert_eq!(shared(&s), Some((slug.clone(), n1)), "{:?}", s.dynamics.notes);
+    assert_eq!(model(&s).samples, n1, "only the collection's samples are held");
+    assert!(model(&s).use_collection);
+
+    // a picked file leaves the collection, and a new scene does not bring it back
+    w.send(Command::UseModel(ModelChoice::File(file.clone())));
+    let s = snapshot_until(&w, "the file in use", |s| !s.working && model(s).source == sim::ModelSource::File(file.clone()));
+    assert!(!model(&s).use_collection, "the switch shows the file");
+    let mut moved = h2_33();
+    moved.nuclei[1].pos[0] += 0.1;
+    w.send(Command::SetScene(moved));
+    let s = idle(&w);
+    assert_eq!(model(&s).source, sim::ModelSource::File(file.clone()), "a picked file survives SetScene");
+    assert!(!model(&s).use_collection);
+    // the switch picks the collection again
+    w.send(Command::UseModel(ModelChoice::Collection));
+    let s = snapshot_until(&w, "the collection back", |s| !s.working && shared(s).is_some());
+    assert_eq!(shared(&s).unwrap().0, slug);
+    assert!(model(&s).use_collection);
+
+    // another h, another σ: another surface's collection each
+    w.send(Command::SetGrid { n: 33, h: 0.3 });
+    let s = snapshot_until(&w, "the h change", |s| !s.working && shared(s).is_some_and(|(x, _)| x != slug));
+    let slug_h = shared(&s).unwrap().0;
+    w.send(Command::SetSigma(Some(0.4)));
+    let s = snapshot_until(&w, "the σ change", |s| !s.working && shared(s).is_some_and(|(x, _)| x != slug_h && x != slug));
+    let slug_s = shared(&s).unwrap().0;
+    eprintln!("slugs: {slug} → {slug_h} → {slug_s}");
+    let folders = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).count();
+    assert_eq!(folders, 3, "three surfaces, three collections");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&file);
+}
+
+/// Review I1 (ruling P13) and the user's request: in collection mode the session autosave holds
+/// only the session-only samples (here every answer of a read-only collection: another worker of
+/// this process holds the writable handle) and the next worker — a solver switch — attaches the
+/// collection again and puts them back beside it (no switch to a file); a Forget then drops them,
+/// and the autosave is removed. In File mode the autosave is the full per-scene model and a solver
+/// switch keeps the file, named by the user's pick on the Model tab.
+#[test]
+fn a_solver_switch_reattaches_the_collection_and_the_autosave_follows_the_mode() {
+    let root = collection_root("switch");
+    let auto = std::env::temp_dir().join(format!("atomic-sandbox-coll-switch-{}.model", std::process::id()));
+    let _ = std::fs::remove_file(&auto);
+    let restore = |path: &std::path::Path| {
+        let w = SimWorker::spawn_test_saving(h2_33(), clean_morse(0.005), path.to_path_buf());
+        w.send(Command::Collections(Some(root.clone())));
+        w.send(Command::EnsureModel { autoload: Some(path.to_path_buf()), plan: test_plan(), auto_pass: false });
+        w
+    };
+    // the writable handle elsewhere: this worker's collection is read-only
+    let owner = collection_worker(h2_33(), &root, 0.005);
+    ensure(&owner);
+    snapshot_until(&owner, "the owner attached", |s| shared(s).is_some());
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the read-only collection", |s| matches!(model(s).source, sim::ModelSource::Collection { read_only: true, .. }));
+    let (slug, _) = shared(&s).unwrap();
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() })));
+    let s = snapshot_until(&w, "the pass's end", pass_done);
+    let k = model(&s).samples;
+    assert!(k >= 8 && shared(&s) == Some((slug.clone(), 0)), "session-only: {k} held, the collection {:?}", shared(&s));
+    assert!(w.retire(Duration::from_secs(10)));
+    let prov = surrogate::sidecar::read_provenance(&auto).expect("the session-only samples were autosaved");
+    assert_eq!(prov.grid_n, 0, "a collection's session-only samples (any box)");
+    drop(owner);
+
+    // the solver switch: the collection again (writable now), the session-only samples beside it
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the samples back", |s| !s.working && shared(s).is_some() && model(s).samples == k);
+    assert_eq!(shared(&s).map(|x| x.0), Some(slug.clone()), "re-attached, not a file");
+    assert!(model(&s).use_collection && model(&s).autoload_refused.is_none());
+    // Forget drops them, the collection stays; the autosave goes (nothing session-only)
+    w.send(Command::Dyn(DynCommand::ForgetModel));
+    let s = snapshot_until(&w, "the forget", |s| !s.working && s.dynamics.notes.iter().any(|n| n.contains("stays attached")));
+    assert_eq!((shared(&s).map(|x| x.0), model(&s).samples), (Some(slug.clone()), 0));
+    assert!(w.retire(Duration::from_secs(10)));
+    assert!(!auto.exists(), "collection mode with nothing session-only: the autosave is removed");
+
+    // File mode: the full per-scene model is autosaved, and a solver switch keeps the file
+    let file = std::env::temp_dir().join(format!("atomic-sandbox-coll-switch-file-{}.model", std::process::id()));
+    per_scene_file(h2_33(), &file);
+    let w = restore(&auto);
+    snapshot_until(&w, "attached", |s| shared(s).is_some());
+    w.send(Command::UseModel(ModelChoice::File(file.clone())));
+    snapshot_until(&w, "the file in use", |s| !s.working && model(s).source == sim::ModelSource::File(file.clone()));
+    assert!(w.retire(Duration::from_secs(10)));
+    assert_eq!(surrogate::sidecar::read_provenance(&auto).expect("the per-scene model was autosaved").grid_n, 33);
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the file restored", |s| !s.working && matches!(model(s).source, sim::ModelSource::File(_)));
+    assert!(!model(&s).use_collection && model(&s).source_is_autosave, "File mode survives the solver switch");
+    assert_eq!(crate::sim::source_line_with(model(&s), Some(&file)), format!("file: {}", file.file_name().unwrap().to_string_lossy()));
+    drop(w);
+    for p in [&auto, &file] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -206,6 +206,8 @@ pub(crate) fn model() -> ModelStatus {
         source: sim::ModelSource::None,
         collections: false,
         last_import: None,
+        use_collection: false,
+        source_is_autosave: false,
     }
 }
 
@@ -1191,6 +1193,10 @@ fn the_model_tab_says_where_the_model_learns() {
     assert_eq!(source_line(&ModelStatus { source: coll(true), ..m.clone() }), "model: shared — h0.15-auto-accepted-gpu-1e-6 · 412 samples · read-only — open in another window");
     assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::File("C:/m/h2o.model".into()), ..m.clone() }), "file: h2o.model");
     assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::None, ..m.clone() }), "model: this scene only (not shared)");
+    // fix round 1 (review Minor 2): this session's autosave of a picked file is named by the pick
+    let auto = ModelStatus { source: sim::ModelSource::File("C:/t/atomic-sandbox-42-1.model".into()), source_is_autosave: true, ..m.clone() };
+    assert_eq!(crate::sim::source_line_with(&auto, Some(std::path::Path::new("C:/m/water.model"))), "file: water.model");
+    assert_eq!(source_line(&auto), "file: the model file picked earlier in this session");
     let r = sim::ImportSummary { imported: 30, refused: vec![(Some(4), "box status unknown".into()), (None, "another solver surface".into())], notes: vec![] };
     assert_eq!(super::dock::model::import_line(&r), "last import: imported 30, refused 2");
     // drawn (with an import's outcome) without sending anything

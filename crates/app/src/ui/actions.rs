@@ -493,8 +493,12 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::UseCollection => {
-            out.commands.push(Command::UseModel(crate::sim::ModelChoice::Collection));
-            st.set_status("learning into the shared collection of this scene's solver surface");
+            if input.sampling() {
+                out.error = Some("a sampling pass is running: cancel it first, then switch to the shared collection".into());
+            } else {
+                out.commands.push(Command::UseModel(crate::sim::ModelChoice::Collection));
+                st.set_status("learning into the shared collection of this scene's solver surface");
+            }
         }
         Action::ImportModel(path) => {
             if input.sampling() {

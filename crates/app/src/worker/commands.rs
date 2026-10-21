@@ -381,9 +381,10 @@ impl Worker {
                 // the user's own model actions make the session's model this worker's
                 let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
-                // a model file or a forget is the user's choice against the shared collection: it is
-                // not attached again on a scene change until the Model tab's switch says so
-                let leaves_collection = matches!(c, DynCommand::ForgetModel | DynCommand::LoadModel(_));
+                // a model file the user picked is the one choice against the shared collection: it
+                // is not attached again on a scene change until the Model tab's switch says so; a
+                // forget keeps it (`model` module doc, "The shared collection")
+                let leaves_collection = matches!(c, DynCommand::LoadModel(_));
                 if takes_over {
                     self.pass_offer = None;
                 }
@@ -400,6 +401,7 @@ impl Worker {
                     self.owns_autosave = true;
                     if forget {
                         self.last_gap = None;
+                        self.forget_keeps_collection();
                     }
                 }
             }

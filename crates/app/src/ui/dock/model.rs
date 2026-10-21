@@ -9,7 +9,7 @@ use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
 use crate::scene::model_path;
-use crate::sim::{source_line, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
+use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
 use egui::{Color32, RichText, Ui};
 use sim::SamplingPlan;
 
@@ -159,9 +159,12 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 /// model file…" with the last import's outcome.
 fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
     let Some(m) = m else { return };
-    let shared = matches!(m.source, sim::ModelSource::Collection { .. });
+    // the switch shows the user's choice (a charged scene learns per-scene under it); Import needs
+    // the collection attached
+    let shared = m.use_collection;
+    let attached = matches!(m.source, sim::ModelSource::Collection { .. });
     let read_only = matches!(m.source, sim::ModelSource::Collection { read_only: true, .. });
-    let line = RichText::new(source_line(m)).size(12.5).color(if read_only { AMBER } else { theme::INK });
+    let line = RichText::new(source_line_with(m, st.model_file.as_deref())).size(12.5).color(if read_only { AMBER } else { theme::INK });
     super::super::probed("model-source", ui.label(line)).on_hover_text(SOURCE_LINE_TIP);
     if !m.collections {
         return;
@@ -178,7 +181,7 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
             }
         }
     });
-    let can_import = shared && !read_only && !sampling;
+    let can_import = attached && !read_only && !sampling;
     if super::super::probed("import-model", ui.add_enabled(can_import, egui::Button::new("Import a model file…")))
         .on_disabled_hover_text("needs the shared collection attached and writable, and no pass running")
         .on_hover_text(format!("add a .model file's samples to the shared collection — each one checked (the same solver surface, box status known, not a duplicate); what is refused is listed with the reason. {IMPORT_REFERENCES_NOTE}"))
@@ -432,13 +435,23 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         }
         let armed = forget_armed(st);
         let samples = m.map_or(0, |m| m.samples);
-        let forget = if armed {
-            egui::Button::new(RichText::new(format!("Click again to forget {samples} samples")).color(RED))
+        // in collection mode only this session's own samples go: the collection's are permanent
+        let in_collection = m.and_then(|m| match m.source {
+            sim::ModelSource::Collection { samples: k, .. } => Some(k),
+            _ => None,
+        });
+        let forget = match (armed, in_collection) {
+            (true, Some(k)) => egui::Button::new(RichText::new(format!("Click again to forget {} session-only samples", samples.saturating_sub(k))).color(RED)),
+            (true, None) => egui::Button::new(RichText::new(format!("Click again to forget {samples} samples")).color(RED)),
+            (false, _) => egui::Button::new(RichText::new("Forget model…").color(theme::DANGER_INK)),
+        };
+        let tip = if in_collection.is_some() {
+            "drop this session's own samples — the ones the shared collection did not take (two clicks within 4 s); the shared collection stays attached and keeps its samples: they are permanent, nothing forgets them"
         } else {
-            egui::Button::new(RichText::new("Forget model…").color(theme::DANGER_INK))
+            "drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass"
         };
         if super::super::probed("forget", ui.add_enabled(estimated && (m.is_some_and(|m| m.samples > 0 || m.fitted) || sampling), forget))
-            .on_hover_text("drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass")
+            .on_hover_text(tip)
             .clicked()
         {
             acts.push(Action::Forget);

@@ -137,8 +137,12 @@
 //! (nothing was fitted, so nothing was audited). The arrays are the sample ones only, in the same
 //! order and with the same optional tail:
 //! `sample_atoms, sample_tag, sample_weight, sample_energy, sample_z, sample_pos, sample_forces`
-//! [, `sample_quarantine`] [, `sample_face_density`]. [`read`] refuses a version-6 file (it has no
-//! model); [`read_any`] reads every version; [`read_provenance`] reads its header like any other.
+//! [, `sample_quarantine`] [, `sample_face_density`]. An optional header key `sample_box` (M8a
+//! Task 4b fix round 1: a JSON array of one box size per sample, grid points per side) records the
+//! box of each sample when they differ — a shared collection's session-only samples, whose
+//! `provenance.grid_n` is 0 (any box); a reader that predates it ignores the key. [`read`] refuses a
+//! version-6 file (it has no model); [`read_any`] reads every version; [`read_provenance`] reads its
+//! header like any other.
 //! A build older than version 6 refuses it as "newer than this build" — never misreads it.
 //!
 //! **Version 7** (M8a Task 1, the audit history; what this build writes for a fitted model):
@@ -260,6 +264,11 @@ pub struct SampleSet {
     pub quarantine: Vec<u8>,
     /// As [`Sidecar::face_density`].
     pub face_density: Vec<f64>,
+    /// The box (grid points per side) each sample was solved in, when the samples come from more
+    /// than one box (a shared collection's session-only samples, M8a Task 4b fix round 1: the
+    /// provider's `save_session_only`); empty = every sample at `provenance.grid_n`. Header key
+    /// `sample_box` (module doc, "Version 6").
+    pub sample_box: Vec<usize>,
     pub teacher_solves: Option<TeacherSolves>,
     pub teacher_solves_note: Option<String>,
     pub created_by: String,
@@ -801,6 +810,9 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     if set.references.windows(2).any(|w| w[0].0 >= w[1].0) || set.references.iter().any(|&(z, e)| z == 0 || !e.is_finite()) {
         return Err(invalid_input("sidecar: references must be finite energies in strictly ascending Z ≥ 1".into()));
     }
+    if !set.sample_box.is_empty() && set.sample_box.len() != n {
+        return Err(invalid_input(format!("sidecar: {} sample boxes for {n} samples", set.sample_box.len())));
+    }
     let [s_atoms, s_tag, s_weight, s_energy, s_z, s_pos, s_forces] = sample_arrays(&set.samples)?;
     let mut arrays: Vec<(&str, &[f64])> = vec![
         ("sample_atoms", &s_atoms),
@@ -825,6 +837,9 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     ];
     if let Some(t) = &set.teacher_solves {
         pairs.push(("teacher_solves", solves_json(t)));
+    }
+    if !set.sample_box.is_empty() {
+        pairs.push(("sample_box", format!("[{}]", set.sample_box.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))));
     }
     Ok(assemble(MAGIC_V6, &obj(&pairs), &arrays))
 }
@@ -1225,7 +1240,14 @@ fn decode_samples_file(bytes: &[u8]) -> Result<SampleSet, String> {
     let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
     let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, created_by })
+    let sample_box = match h.get("sample_box") {
+        Err(_) | Ok(Json::Null) => Vec::new(),
+        Ok(b) => b.arr()?.iter().map(Json::usize).collect::<Result<Vec<_>, _>>()?,
+    };
+    if !sample_box.is_empty() && sample_box.len() != samples.len() {
+        return Err(format!("{} sample boxes for {} samples", sample_box.len(), samples.len()));
+    }
+    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, sample_box, teacher_solves, teacher_solves_note, created_by })
 }
 
 /// The header's `reference_rule` (a missing key reads as null).
@@ -2210,6 +2232,7 @@ pub(crate) mod tests {
             reference_rule: Some(REFERENCE_RULE.into()),
             quarantine: (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect(),
             face_density: (0..n).map(|i| if i % 3 == 0 { f64::NAN } else { 1e-6 * i as f64 }).collect(),
+            sample_box: Vec::new(),
             teacher_solves: Some(TeacherSolves { pass: 40, fallback: 3, audit: 0, verification: 0, kept: 43, complete: true }),
             teacher_solves_note: None,
             created_by: CREATED_BY.into(),
@@ -2239,6 +2262,13 @@ pub(crate) mod tests {
         write_samples(&p, &bare).unwrap();
         let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
         assert!(back.quarantine.is_empty() && back.face_density.is_empty() && back.references.is_empty() && back.teacher_solves.is_none());
+        assert!(back.sample_box.is_empty());
+        // the boxes of a collection's session-only samples (M8a Task 4b fix round 1) round-trip
+        let boxes = SampleSet { sample_box: (0..n).map(|i| 41 + 2 * (i % 3)).collect(), ..set.clone() };
+        write_samples(&p, &boxes).unwrap();
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
+        assert_eq!(back.sample_box, boxes.sample_box);
+        assert!(write_samples(&p, &SampleSet { sample_box: vec![41; n + 1], ..set.clone() }).is_err());
         // refused on write: no samples, misshapen flags, unsorted references
         assert!(write_samples(&p, &SampleSet { samples: Vec::new(), quarantine: Vec::new(), face_density: Vec::new(), ..set.clone() }).is_err());
         assert!(write_samples(&p, &SampleSet { quarantine: vec![0; n - 1], ..set.clone() }).is_err());
