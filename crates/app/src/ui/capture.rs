@@ -179,13 +179,18 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                     // the pop-out view (`crate::capture::popout`): a window of its own showing what a capture takes
                     let open = st.capture.popout;
                     let label = RichText::new(if open { "Close the pop-out view" } else { "Pop out view" }).size(13.5).strong().color(theme::ACCENT_INK);
-                    let pop = ui.add(
-                        egui::Button::new(label)
-                            .fill(if open { theme::ACCENT_BG } else { theme::PANEL_3 })
-                            .stroke(Stroke::new(1.0, theme::ACCENT))
-                            .corner_radius(6.0)
-                            .min_size(Vec2::new(ui.available_width(), 32.0)),
-                    );
+                    // a button's text follows the layout's alignment: centred, it clears the icon painted at the left
+                    let pop = ui
+                        .vertical_centered_justified(|ui| {
+                            ui.add(
+                                egui::Button::new(label)
+                                    .fill(if open { theme::ACCENT_BG } else { theme::PANEL_3 })
+                                    .stroke(Stroke::new(1.0, theme::ACCENT))
+                                    .corner_radius(6.0)
+                                    .min_size(Vec2::new(ui.available_width(), 32.0)),
+                            )
+                        })
+                        .inner;
                     icons::paint(ui.painter(), Rect::from_center_size(pos2(pop.rect.left() + 20.0, pop.rect.center().y), Vec2::splat(18.0)), icons::Icon::PopOut, theme::ACCENT_INK);
                     let pop = pop.on_hover_text("A separate window showing exactly what Screenshot and Record take now: the frame's size and aspect, the capture camera, the look and the labels over it — and a recording's red dot and frame count. Move it to another monitor, resize or maximise it; F11 there for full screen. Closing it changes nothing else.");
                     if pop.clicked() {
