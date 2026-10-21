@@ -208,6 +208,8 @@ pub(crate) fn model() -> ModelStatus {
         last_import: None,
         use_collection: false,
         source_is_autosave: false,
+        specialised: Vec::new(),
+        model_species: Vec::new(),
     }
 }
 
@@ -1222,6 +1224,19 @@ fn the_model_tab_says_where_the_model_learns() {
     assert!(matches!(out.commands.as_slice(), [Command::ImportModel(p)] if p.ends_with("x.model")), "{:?}", out.commands);
     assert_eq!(crate::replay::unreplayable_kind(&Action::UseCollection), Some("use-collection"));
     assert_eq!(crate::replay::unreplayable_kind(&Action::ImportModel("x.model".into())), Some("import-model"));
+    // M8a Task 7: "Save a specialised model…" — the scene's species preselected by the drawn tab,
+    // the action sends the picker's species, nothing ticked is an error; a loaded one says so
+    assert_eq!(st.specialise.0, vec![1], "H₂'s species preselected");
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::SaveSpecialised("hc.model".into()), &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::SaveSpecialised { path, species }] if path.ends_with("hc.model") && species == &vec![1]), "{:?}", out.commands);
+    st.specialise.0.clear();
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::SaveSpecialised("hc.model".into()), &mut out);
+    assert!(out.commands.is_empty() && out.error.is_some());
+    assert_eq!(crate::replay::unreplayable_kind(&Action::SaveSpecialised("x.model".into())), Some("specialised"));
+    let spec = ModelStatus { source: sim::ModelSource::File("C:/m/hc.model".into()), specialised: vec![1, 6], ..model() };
+    assert_eq!(source_line(&spec), "file: hc.model (specialised)");
 }
 
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the

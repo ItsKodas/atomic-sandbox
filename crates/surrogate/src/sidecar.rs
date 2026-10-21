@@ -143,7 +143,14 @@
 //! box of each sample when they differ — a shared collection's session-only samples, whose
 //! `provenance.grid_n` is 0 (any box); a reader that predates it ignores the key. [`read`] refuses a
 //! version-6 file (it has no model); [`read_any`] reads every version; [`read_provenance`] reads its
-//! header like any other.
+//! header like any other. Two more optional keys (M8a Task 7, ruling P8) mark a **specialised
+//! model** cut from a shared collection (`Collection::specialise`): `specialised`, the species it
+//! was cut for (strictly ascending Z; [`read_specialised`]), and `box_references`, [[Z, n, E], …]
+//! — the isolated-atom energy of each species per box (grid points per side, strictly ascending
+//! (Z, n)) — so each sample (whose box `sample_box` records; required with `specialised`) is
+//! fitted against its own box's references, as in the collection. Its `provenance.grid_n` is 0
+//! (any box): the loader accepts it for any neutral scene of the same surface key. Older readers
+//! ignore both keys (and then refuse the any-box provenance as another surface).
 //! A build older than version 6 refuses it as "newer than this build" — never misreads it.
 //!
 //! **Version 7** (M8a Task 1, the audit history; what this build writes for a fitted model):
@@ -283,6 +290,14 @@ pub struct SampleSet {
     /// provider's `save_session_only`); empty = every sample at `provenance.grid_n`. Header key
     /// `sample_box` (module doc, "Version 6").
     pub sample_box: Vec<usize>,
+    /// A **specialised model** (M8a Task 7, ruling P8; module doc, "Version 6"): the species it was
+    /// cut for from a shared collection (`Collection::specialise`), sorted unique; empty = not
+    /// specialised. Header key `specialised`.
+    pub specialised: Vec<u8>,
+    /// Isolated-atom energies per (species, box) — (Z, grid points per side, Hartree), sorted by
+    /// (Z, n) — so the samples of several boxes are fitted each against its own box (as in the
+    /// collection); empty = none. Header key `box_references`.
+    pub box_references: Vec<(u8, usize, f64)>,
     pub teacher_solves: Option<TeacherSolves>,
     pub teacher_solves_note: Option<String>,
     pub created_by: String,
@@ -442,6 +457,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// here and is refused by [`read`]. Used by the viewer to compare a model with the scene before
 /// loading it (user request 2026-10-18).
 pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let (version, h) = read_header(path)?;
+    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
+}
+
+/// The species a **specialised model** was cut for (M8a Task 7; header key `specialised`, module
+/// doc "Version 6"), from the header alone like [`read_provenance`]; empty = not specialised (any
+/// other file, of any version).
+pub fn read_specialised(path: &Path) -> io::Result<Vec<u8>> {
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let (version, h) = read_header(path)?;
+    if version != 6 {
+        return Ok(Vec::new());
+    }
+    decode_specialised(&h).map_err(invalid)
+}
+
+/// The magic's version and the parsed header, reading only `16 + header_len` bytes ([`read_provenance`]).
+fn read_header(path: &Path) -> io::Result<(u8, Json)> {
     use std::io::Read;
     let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
     let mut f = std::fs::File::open(path)?;
@@ -458,8 +492,7 @@ pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
     bytes.extend_from_slice(&head);
     bytes.resize(16 + len, 0);
     f.read_exact(&mut bytes[16..]).map_err(|e| invalid(format!("header unreadable: {e}")))?;
-    let (version, h) = parse_header(&bytes).map_err(invalid)?;
-    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
+    parse_header(&bytes).map_err(invalid)
 }
 
 /// Reads and validates a sidecar (module doc).
@@ -834,6 +867,15 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     if !set.sample_box.is_empty() && set.sample_box.len() != n {
         return Err(invalid_input(format!("sidecar: {} sample boxes for {n} samples", set.sample_box.len())));
     }
+    if set.specialised.windows(2).any(|w| w[0] >= w[1]) || set.specialised.contains(&0) {
+        return Err(invalid_input("sidecar: a specialised model's species must be strictly ascending Z ≥ 1".into()));
+    }
+    if !set.specialised.is_empty() && set.sample_box.len() != n {
+        return Err(invalid_input("sidecar: a specialised model records every sample's box".into()));
+    }
+    if set.box_references.windows(2).any(|w| (w[0].0, w[0].1) >= (w[1].0, w[1].1)) || set.box_references.iter().any(|&(z, n, e)| z == 0 || n == 0 || !e.is_finite()) {
+        return Err(invalid_input("sidecar: box references must be finite energies in strictly ascending (Z ≥ 1, n ≥ 1)".into()));
+    }
     let [s_atoms, s_tag, s_weight, s_energy, s_z, s_pos, s_forces] = sample_arrays(&set.samples)?;
     let mut arrays: Vec<(&str, &[f64])> = vec![
         ("sample_atoms", &s_atoms),
@@ -861,6 +903,12 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     }
     if !set.sample_box.is_empty() {
         pairs.push(("sample_box", format!("[{}]", set.sample_box.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))));
+    }
+    if !set.specialised.is_empty() {
+        pairs.push(("specialised", format!("[{}]", set.specialised.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","))));
+    }
+    if !set.box_references.is_empty() {
+        pairs.push(("box_references", format!("[{}]", set.box_references.iter().map(|&(z, n, e)| format!("[{z},{n},{}]", num(e))).collect::<Vec<_>>().join(","))));
     }
     Ok(assemble(MAGIC_V6, &obj(&pairs), &arrays))
 }
@@ -1288,7 +1336,47 @@ fn decode_samples_file(bytes: &[u8]) -> Result<SampleSet, String> {
     if !sample_box.is_empty() && sample_box.len() != samples.len() {
         return Err(format!("{} sample boxes for {} samples", sample_box.len(), samples.len()));
     }
-    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, sample_box, teacher_solves, teacher_solves_note, created_by })
+    let specialised = decode_specialised(&h)?;
+    let mut box_references: Vec<(u8, usize, f64)> = Vec::new();
+    match h.get("box_references") {
+        Err(_) | Ok(Json::Null) => {}
+        Ok(list) => {
+            for r in list.arr()? {
+                let (z, n, e) = match r.arr()? {
+                    [z, n, e] => (z.u64()?, n.usize()?, e.f64()?),
+                    _ => return Err("box_references entries are [Z, n, E]".into()),
+                };
+                let z = u8::try_from(z).ok().filter(|&z| z >= 1).ok_or_else(|| format!("box reference Z {z} outside 1..=255"))?;
+                if n == 0 || !e.is_finite() || box_references.last().is_some_and(|&(pz, pn, _)| (pz, pn) >= (z, n)) {
+                    return Err(format!("box reference of Z = {z}, n = {n}: energies must be finite, in strictly ascending (Z, n ≥ 1)"));
+                }
+                box_references.push((z, n, e));
+            }
+        }
+    }
+    if !specialised.is_empty() && sample_box.len() != samples.len() {
+        return Err("a specialised model records every sample's box".into());
+    }
+    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, sample_box, specialised, box_references, teacher_solves, teacher_solves_note, created_by })
+}
+
+/// The header key `specialised` (module doc, "Version 6"): strictly ascending Z ≥ 1; absent or
+/// null = not specialised.
+fn decode_specialised(h: &Json) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    match h.get("specialised") {
+        Err(_) | Ok(Json::Null) => {}
+        Ok(list) => {
+            for z in list.arr()? {
+                let z = u8::try_from(z.u64()?).ok().filter(|&z| z >= 1).ok_or("specialised species outside 1..=255")?;
+                if out.last().is_some_and(|&p| p >= z) {
+                    return Err("specialised species must be strictly ascending".into());
+                }
+                out.push(z);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The header's `reference_rule` (a missing key reads as null).
@@ -2279,6 +2367,8 @@ pub(crate) mod tests {
             quarantine: (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect(),
             face_density: (0..n).map(|i| if i % 3 == 0 { f64::NAN } else { 1e-6 * i as f64 }).collect(),
             sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
             teacher_solves: Some(TeacherSolves { pass: 40, fallback: 3, audit: 0, verification: 0, kept: 43, complete: true }),
             teacher_solves_note: None,
             created_by: CREATED_BY.into(),
@@ -2315,6 +2405,16 @@ pub(crate) mod tests {
         let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
         assert_eq!(back.sample_box, boxes.sample_box);
         assert!(write_samples(&p, &SampleSet { sample_box: vec![41; n + 1], ..set.clone() }).is_err());
+        assert!(read_specialised(&p).unwrap().is_empty(), "not specialised");
+        // a specialised model's keys (M8a Task 7) round-trip; it needs every sample's box
+        let spec = SampleSet { specialised: vec![1, 15], box_references: vec![(1, 41, -0.47), (1, 43, -0.471), (15, 41, -6.4)], ..boxes.clone() };
+        write_samples(&p, &spec).unwrap();
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
+        assert_eq!((back.specialised.clone(), back.box_references.clone()), (spec.specialised.clone(), spec.box_references.clone()));
+        assert_eq!(read_specialised(&p).unwrap(), vec![1, 15]);
+        assert!(write_samples(&p, &SampleSet { sample_box: Vec::new(), ..spec.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { box_references: vec![(15, 41, -6.4), (1, 41, -0.47)], ..spec.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { specialised: vec![15, 1], ..spec }).is_err());
         // refused on write: no samples, misshapen flags, unsorted references
         assert!(write_samples(&p, &SampleSet { samples: Vec::new(), quarantine: Vec::new(), face_density: Vec::new(), ..set.clone() }).is_err());
         assert!(write_samples(&p, &SampleSet { quarantine: vec![0; n - 1], ..set.clone() }).is_err());

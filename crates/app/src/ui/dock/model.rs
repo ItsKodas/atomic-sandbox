@@ -28,7 +28,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let d = snap.map(|s| &s.dynamics);
     let m: Option<&ModelStatus> = input.model();
     let sampling = input.sampling();
-    super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, acts));
+    let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+    super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, &scene_z, acts));
     super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
             readouts(ui, d, m, input.scene, st);
@@ -157,7 +158,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 /// Where the model learns (M8a Task 4b): the source line ([`source_line`]), the switch between the
 /// shared collection and a model file (offered when a collections folder is set), and "Import a
 /// model file…" with the last import's outcome.
-fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
+fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, scene_z: &[u8], acts: &mut Vec<Action>) {
     let Some(m) = m else { return };
     // the switch shows the user's choice (a charged scene learns per-scene under it); Import needs
     // the collection attached
@@ -181,6 +182,9 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
             }
         }
     });
+    if attached {
+        specialise_row(ui, st, m, scene_z, acts);
+    }
     let can_import = attached && !read_only && !sampling;
     if super::super::probed("import-model", ui.add_enabled(can_import, egui::Button::new("Import a model file…")))
         .on_disabled_hover_text("needs the shared collection attached and writable, and no pass running")
@@ -209,6 +213,44 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
         Some(Err(e)) => warnbox(ui, &format!("import refused: {e}")),
         None => {}
     }
+}
+
+/// "Save a specialised model…" (M8a Task 7; spec §4.2): a species picker — the scene's species
+/// preselected, plus every species the shared model knows — and the file dialog; the save is
+/// `Action::SaveSpecialised`. The file loads through "a model file…" (any neutral scene of this
+/// solver surface, whatever its box).
+fn specialise_row(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, scene_z: &[u8], acts: &mut Vec<Action>) {
+    let mut scene: Vec<u8> = scene_z.to_vec();
+    scene.sort_unstable();
+    scene.dedup();
+    if st.specialise.1 != scene {
+        st.specialise = (scene.clone(), scene.clone());
+    }
+    let mut offered: Vec<u8> = scene.iter().copied().chain(m.model_species.iter().copied()).collect();
+    offered.sort_unstable();
+    offered.dedup();
+    egui::CollapsingHeader::new(RichText::new("Save a specialised model…").size(12.5)).id_salt("specialise").show(ui, |ui| {
+        ui.weak("a model fitted only on the shared samples made of these species: smaller and faster; it loads as a model file in any scene of this solver surface");
+        ui.horizontal_wrapped(|ui| {
+            for z in &offered {
+                let mut on = st.specialise.0.contains(z);
+                if ui.checkbox(&mut on, units::elements::symbol(*z)).changed() {
+                    st.specialise.0.retain(|x| x != z);
+                    if on {
+                        st.specialise.0.push(*z);
+                        st.specialise.0.sort_unstable();
+                    }
+                }
+            }
+        });
+        let can = !st.specialise.0.is_empty();
+        if super::super::probed("save-specialised", ui.add_enabled(can, egui::Button::new("Save…"))).on_disabled_hover_text("tick at least one species").clicked() {
+            let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+            if let Some(p) = model_dialog(&last).save_file() {
+                acts.push(Action::SaveSpecialised(p));
+            }
+        }
+    });
 }
 
 /// "imported N, refused M" of an import (the Model tab).

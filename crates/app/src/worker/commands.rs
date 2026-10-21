@@ -77,6 +77,10 @@ pub enum Command {
     /// Estimated solver: import a `.model` file's samples into the attached collection
     /// (`Trainable::import_model`); the outcome is `ModelStatus::last_import`. Never an edit.
     ImportModel(PathBuf),
+    /// Estimated solver: "Save a specialised model…" (M8a Task 7): the attached collection's samples
+    /// made only of `species` written to `path` (`Trainable::save_specialised`); noted, an error
+    /// when refused. Never an edit (a file write).
+    SaveSpecialised { path: PathBuf, species: Vec<u8> },
     /// Estimated solver: go on with the interrupted pass kept in this folder (sent instead of
     /// `EnsureModel`, on the pass's own scene): its samples file is loaded, then its checkpoint
     /// resumed (`DynCommand::ResumeSampling`); either refusal is the snapshot's `last_rejection`.
@@ -162,6 +166,7 @@ impl Command {
             | Command::Collections(_)
             | Command::UseModel(_)
             | Command::ImportModel(_)
+            | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
             | Command::SetAudit(_)
             | Command::SetDraft(_)
@@ -194,6 +199,7 @@ impl Command {
             | Command::TrainingCheckpoints(_)
             | Command::Collections(_)
             | Command::ImportModel(_)
+            | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
@@ -232,6 +238,7 @@ impl Command {
                 | Command::Collections(_)
                 | Command::UseModel(_)
                 | Command::ImportModel(_)
+                | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
                 | Command::SetDraft(_)
@@ -271,6 +278,7 @@ impl Command {
             | Command::TrainingCheckpoints(_)
             | Command::Collections(_)
             | Command::ImportModel(_)
+            | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
@@ -376,6 +384,7 @@ impl Worker {
             Command::Collections(dir) => self.collections = dir,
             Command::UseModel(choice) => self.use_model(choice),
             Command::ImportModel(path) => self.import_model(&path),
+            Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's

@@ -1079,6 +1079,47 @@ impl Collection {
         self.references.range((z, 0)..=(z, usize::MAX)).next_back().map(|(&(_, n), &r)| (n, r))
     }
 
+    /// A **specialised model**'s samples (M8a Task 7; spec §4.2 "Specialised models", ruling P8):
+    /// the stored samples whose atoms are all of `species` and that the fit would use today —
+    /// current status [`Q_NONE`] (not quarantined, held, superseded or box-affected) and whose box
+    /// has a reference of each of their species (a sample still waiting for one is left out) —
+    /// with the teacher's raw energy and its box (`sample_box`), and every per-box reference of
+    /// those species (`box_references`) so the loader fits each sample against its own box, as the
+    /// collection does. `references` holds each species' largest-box (display) reference;
+    /// `provenance` is the collection's (any box: `grid_n` 0, neutral, automatic multiplicity).
+    /// Written with [`sidecar::write_samples`]; fitted on load. An empty result (no sample within
+    /// the species) is the caller's to report — `write_samples` refuses it. Reads only.
+    pub fn specialise(&self, species: &[u8]) -> sidecar::SampleSet {
+        let mut want: Vec<u8> = species.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        let has_ref = |z: u8, n: usize| self.references.contains_key(&(z, n));
+        let keep: Vec<usize> = (0..self.samples.len())
+            .filter(|&i| self.quarantine.get(i).copied().unwrap_or(Q_NONE) == Q_NONE)
+            .filter(|&i| {
+                let c = &self.samples[i];
+                c.sample.tag != SampleTag::Reference && c.sample.z.iter().all(|&z| want.binary_search(&z).is_ok() && has_ref(z, c.grid_n))
+            })
+            .collect();
+        let box_references: Vec<(u8, usize, f64)> = self.references.iter().filter(|((z, _), _)| want.binary_search(z).is_ok()).map(|(&(z, n), r)| (z, n, r.energy)).collect();
+        let references: Vec<(u8, f64)> = want.iter().filter_map(|&z| self.largest_box_reference(z).map(|(_, r)| (z, r.energy))).collect();
+        let k = &self.key;
+        sidecar::SampleSet {
+            provenance: Provenance { grid_n: 0, h: k.h, sigma: k.sigma, tol: k.tol, charge: 0, multiplicity: None, teacher: k.teacher.clone(), masses: Vec::new(), ionic: k.ionic.clone() },
+            samples: keep.iter().map(|&i| self.samples[i].sample.clone()).collect(),
+            references,
+            reference_rule: Some(sidecar::REFERENCE_RULE.to_string()),
+            quarantine: Vec::new(),
+            face_density: Vec::new(),
+            sample_box: keep.iter().map(|&i| self.samples[i].grid_n).collect(),
+            specialised: want,
+            box_references,
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: sidecar::CREATED_BY.to_string(),
+        }
+    }
+
     /// Writes [`history`](Self::history) to `history.bin`.
     pub fn save_history(&self) -> Result<(), String> {
         self.writable()?;
@@ -1580,7 +1621,7 @@ mod tests {
     }
 
     fn set(prov: Provenance, samples: Vec<Sample>, quarantine: Vec<u8>, face: Vec<f64>) -> SampleSet {
-        SampleSet { provenance: prov, samples, references: vec![(1, -0.478)], reference_rule: Some(REFERENCE_RULE.into()), quarantine, face_density: face, sample_box: Vec::new(), teacher_solves: None, teacher_solves_note: None, created_by: sidecar::CREATED_BY.into() }
+        SampleSet { provenance: prov, samples, references: vec![(1, -0.478)], reference_rule: Some(REFERENCE_RULE.into()), quarantine, face_density: face, sample_box: Vec::new(), specialised: Vec::new(), box_references: Vec::new(), teacher_solves: None, teacher_solves_note: None, created_by: sidecar::CREATED_BY.into() }
     }
 
     #[test]
@@ -1750,6 +1791,46 @@ mod tests {
         moved[1][0] = f64::from_bits(moved[1][0].to_bits() + 1);
         assert!(!c.holds_geometry(&s.z, &moved));
         assert!(!c.holds_geometry(&[1, 2], &s.pos));
+    }
+
+    /// M8a Task 7: a specialised model takes the samples whose atoms are all within the species,
+    /// in the fit today (status 0, every reference of their box known), with their boxes and the
+    /// species' per-box references; it round-trips as a samples-only file.
+    #[test]
+    fn specialise_keeps_only_samples_within_the_species() {
+        let dir = root("specialise");
+        let key = prov().surface_key();
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        let mol = |i: usize, z: Vec<u8>, n: usize| {
+            let pos: Vec<[f64; 3]> = (0..z.len()).map(|k| [1.3 * k as f64, 0.1 * i as f64, 0.0]).collect();
+            let forces = vec![[0.0, 0.01 * i as f64, 0.0]; z.len()];
+            CollectionSample { sample: Sample { pos, z, energy: -1.0 - 1e-3 * i as f64, forces, tag: SampleTag::Scan, weight: 1.0 }, grid_n: n, multiplicity_forced: false, multiplicity: None, scene: "mixed".into() }
+        };
+        c.append(mol(0, vec![1, 1], 49)).unwrap(); // H₂: kept
+        c.append(mol(1, vec![6, 1, 1], 57)).unwrap(); // CH₂: kept (another box)
+        c.append(mol(2, vec![8, 1, 1], 49)).unwrap(); // H₂O: has O
+        c.append(mol(3, vec![6, 8], 49)).unwrap(); // CO: has O
+        c.append(mol(4, vec![6, 6], 49)).unwrap(); // C₂: held → left out
+        c.append(mol(5, vec![6, 1], 65)).unwrap(); // CH in a box with no references → waiting, left out
+        c.set_status(4, Q_HELD).unwrap();
+        for (z, n, e) in [(1u8, 49usize, -0.47), (1, 57, -0.471), (6, 49, -37.4), (6, 57, -37.41), (8, 49, -74.5)] {
+            c.set_reference(z, CollectionReference { energy: e, grid_n: Some(n), face_density: Some(0.0) }).unwrap();
+        }
+        let set = c.specialise(&[6, 1, 6]);
+        assert_eq!(set.specialised, vec![1, 6]);
+        assert!(set.samples.iter().all(|s| s.z.iter().all(|&z| z != 8)), "no O atom in any sample");
+        assert_eq!(set.samples.len(), 2, "H₂ and CH₂ only");
+        assert_eq!(set.sample_box, vec![49, 57]);
+        assert_eq!(set.samples[1].energy, -1.001, "the teacher's raw energy");
+        assert_eq!(set.box_references, vec![(1, 49, -0.47), (1, 57, -0.471), (6, 49, -37.4), (6, 57, -37.41)]);
+        assert_eq!(set.references, vec![(1, -0.471), (6, -37.41)], "each species' largest box");
+        assert_eq!((set.provenance.grid_n, set.provenance.charge, set.provenance.multiplicity), (0, 0, None));
+        assert_eq!(set.provenance.surface_key(), key);
+        let p = dir.join("hc.model");
+        sidecar::write_samples(&p, &set).unwrap();
+        let sidecar::Contents::Samples(back) = sidecar::read_any(&p).unwrap() else { panic!("a samples-only file") };
+        assert_eq!((back.samples, back.sample_box, back.box_references, back.specialised), (set.samples, set.sample_box, set.box_references, set.specialised));
+        assert!(c.specialise(&[2]).samples.is_empty(), "nothing within He");
     }
 
     #[test]

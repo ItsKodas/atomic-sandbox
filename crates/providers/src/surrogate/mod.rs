@@ -1233,6 +1233,9 @@ pub struct SurrogateKs {
     collection_note: Vec<String>,
     /// The model file the model was loaded from (`TrainableStatus::model_source`).
     source_file: Option<std::path::PathBuf>,
+    /// The species of the specialised model loaded from `source_file` (M8a Task 7,
+    /// `shared::SurrogateKs::load_specialised`); empty otherwise. Cleared with `source_file`.
+    specialised: Vec<u8>,
     /// The isolated-atom reference jobs queued on or running in the auditor, one per (Z, box n),
     /// with who asked (the driver, whose answers are always handed on, or the provider itself) and
     /// the collection the requesting scene shared (`shared` module doc, "References per box").
@@ -1349,6 +1352,7 @@ impl SurrogateKs {
             body4_off: false,
             collection_note: Vec::new(),
             source_file: None,
+            specialised: Vec::new(),
             ref_jobs: Vec::new(),
             offset_jump: 0.0,
         }
@@ -2473,6 +2477,7 @@ impl Trainable for SurrogateKs {
         }
         let sc = match surrogate::sidecar::read_any(path).map_err(|e| format!("load model: {e}"))? {
             surrogate::sidecar::Contents::Fitted(sc) => *sc,
+            surrogate::sidecar::Contents::Samples(set) if !set.specialised.is_empty() => return self.load_specialised(path, set, scene),
             surrogate::sidecar::Contents::Samples(set) => return self.load_samples(path, set, scene),
         };
         let want = self.provenance_for(scene);
@@ -2540,6 +2545,18 @@ impl Trainable for SurrogateKs {
 
     fn save_session_only(&self, path: &std::path::Path) -> std::io::Result<usize> {
         SurrogateKs::save_session_only(self, path)
+    }
+
+    fn save_specialised(&self, path: &std::path::Path, species: &[u8]) -> Result<usize, String> {
+        SurrogateKs::save_specialised(self, path, species)
+    }
+
+    fn specialised(&self) -> Vec<u8> {
+        self.specialised.clone()
+    }
+
+    fn model_species(&self) -> Vec<u8> {
+        self.basis().map_or_else(Vec::new, |b| b.species.clone())
     }
 
     fn load_session_only(&mut self, path: &std::path::Path) -> Result<usize, String> {

@@ -95,6 +95,7 @@ impl SurrogateKs {
         // every scene of its surface (`shared` module doc)
         self.detach_collection();
         self.source_file = None;
+        self.specialised.clear();
         self.collection_note.clear();
         self.offset_jump = 0.0;
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
@@ -196,6 +197,8 @@ impl SurrogateKs {
                 quarantine: flags,
                 face_density: face,
                 sample_box: Vec::new(),
+                specialised: Vec::new(),
+                box_references: Vec::new(),
                 teacher_solves: Some(solves),
                 teacher_solves_note: None,
                 created_by: surrogate::sidecar::CREATED_BY.to_string(),

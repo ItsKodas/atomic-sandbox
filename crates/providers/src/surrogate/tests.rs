@@ -8858,6 +8858,53 @@ fn a_model_file_switches_off_the_collection_and_imports_join_it() {
     assert_eq!(c.samples.len(), 43);
 }
 
+/// M8a Task 7 (ruling P8): "Save a specialised model…" cuts the collection's H-only samples into a
+/// file marked specialised; it loads into a scene of **another box** at the same surface (the box is
+/// not compared), each sample on that box's references, and fits there — while a charged scene
+/// refuses it, and a box the file has no references of loads with the offset named.
+#[test]
+fn a_specialised_model_loads_in_another_box_and_fits() {
+    let dir = collection_root("specialise");
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let (h2_steps, all) = teach_h2_then_h2_he(&mut s);
+    let file = dir.join("h-only.model");
+    assert_eq!(Trainable::save_specialised(&s, &file, &[1]).unwrap(), h2_steps, "the H₂ samples only");
+    assert!(Trainable::save_specialised(&s, &dir.join("x.model"), &[8]).unwrap_err().contains("holds no sample"));
+    assert_eq!(surrogate::sidecar::read_specialised(&file).unwrap(), vec![1]);
+    let surrogate::sidecar::Contents::Samples(set) = surrogate::sidecar::read_any(&file).unwrap() else { panic!("samples-only") };
+    assert!(set.samples.iter().all(|x| x.z.iter().all(|&z| z == 1)) && set.sample_box.iter().all(|&b| b == 33));
+    assert_eq!(set.box_references.iter().map(|&(z, n, _)| (z, n)).collect::<Vec<_>>(), vec![(1, 33), (1, 41)]);
+    drop(s);
+    // a charged scene refuses it
+    let (mut q, _) = pair_student();
+    let mut charged = in_cell(h2(1.4), 41);
+    charged.charge = 1;
+    assert!(Trainable::load(&mut q, &file, &charged).unwrap_err().contains("charge +1"));
+    // another box (41³; the samples are 33³): accepted, on the 41³ references, and fitted
+    let (mut p, _) = pair_student();
+    let scene = in_cell(h2(1.4), 41);
+    Trainable::load(&mut p, &file, &scene).unwrap();
+    assert!(p.collection().is_none());
+    assert_eq!(p.samples(), h2_steps);
+    assert!(p.fitted(), "fitted on load: {:?}", p.no_model());
+    assert_eq!(p.basis().unwrap().species, vec![1]);
+    assert_eq!(Trainable::specialised(&p), vec![1]);
+    let st = Trainable::status(&p, &scene, &[[0.0; 3]; 2]);
+    assert_eq!(st.model_source, sim::ModelSource::File(file.clone()));
+    assert_eq!(st.provenance_mismatch, None, "the store is the scene's own (41³)");
+    assert!(p.user_notes.iter().any(|n| n.contains("specialised model (H)") && n.contains("33³")), "{:?}", p.user_notes);
+    assert!(!p.user_notes.iter().any(|n| n.contains("no isolated-atom references")), "41³ has them");
+    // a box the file has no references of (49³): loads on the largest box's, the offset named
+    let (mut b, _) = pair_student();
+    Trainable::load(&mut b, &file, &in_cell(h2(1.4), 49)).unwrap();
+    assert!(b.user_notes.iter().any(|n| n.contains("no isolated-atom references of this scene's box (49³)")), "{:?}", b.user_notes);
+    // a later load of another file clears the mark
+    Trainable::forget(&mut p);
+    assert!(Trainable::specialised(&p).is_empty());
+    let _ = all;
+}
+
 /// Measurement (M8a Task 4a, the controller's ask; reported, not asserted): the cost of the class
 /// rule's leave-one-out pass (`compute_class_loo_full`, run by every refit) and of the refit itself
 /// at collection sizes, two species (H, He: Q′ 176) on the [`SpeciesMorse`] teacher; `LOO_S4=1` adds

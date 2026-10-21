@@ -120,6 +120,10 @@ pub enum Action {
     /// The Model tab's "Import a model file…": the chosen `.model` file's samples into the attached
     /// collection (`Command::ImportModel`). Recorded, not replayable (it reads a file).
     ImportModel(std::path::PathBuf),
+    /// The Model tab's "Save a specialised model…" (M8a Task 7): the attached collection's samples
+    /// made only of the picker's species (`UiState::specialise`) written to the chosen file
+    /// (`Command::SaveSpecialised`). Recorded, not replayable (it writes a file).
+    SaveSpecialised(std::path::PathBuf),
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
     /// The estimated solver's audit cadence (answered steps; 0 = never).
@@ -498,6 +502,15 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             } else {
                 out.commands.push(Command::UseModel(crate::sim::ModelChoice::Collection));
                 st.set_status("learning into the shared collection of this scene's solver surface");
+            }
+        }
+        Action::SaveSpecialised(path) => {
+            let species = st.specialise.0.clone();
+            if species.is_empty() {
+                out.error = Some("a specialised model needs at least one species ticked".into());
+            } else {
+                st.set_status(format!("saving a specialised model ({}) to {}", crate::sim::species_names(&species), path.display()));
+                out.commands.push(Command::SaveSpecialised { path, species });
             }
         }
         Action::ImportModel(path) => {
@@ -898,7 +911,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
         })
     }
 
@@ -1282,7 +1295,11 @@ pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> SampleButton {
 /// The offer for loading `path` into the scene in force (`ui::model_offer`): `None` when the model's
 /// settings match the scene's, or when its header cannot be read (the driver's own refusal then says why).
 fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path) -> Option<super::model_offer::ModelOffer> {
-    let prov = surrogate::sidecar::read_provenance(path).ok()?;
+    let mut prov = surrogate::sidecar::read_provenance(path).ok()?;
+    // a specialised model (M8a Task 7, ruling P8) serves any box of its surface: its grid is the scene's
+    if prov.grid_n == 0 && surrogate::sidecar::read_specialised(path).is_ok_and(|s| !s.is_empty()) {
+        prov.grid_n = input.scene.grid_n;
+    }
     // the teacher the session has: the provider's name when a model is up, else what the machine decides
     let teacher = input.model().map_or(if st.gpu_available { "Kohn-Sham (GPU)" } else { "Kohn-Sham (CPU)" }, |m| m.teacher);
     let vram = |s: &Scene| vram_check(st, s);

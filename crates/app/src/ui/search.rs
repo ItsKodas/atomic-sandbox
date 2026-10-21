@@ -161,6 +161,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
     e("Shared collection / model file", "model source shared collection learn one big model file specialised switch", Dock(D::Model), "d-model-source"),
     e("Import a model file", "import .model samples into shared collection merge", Dock(D::Model), "d-model-source"),
+    e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
     // Activity

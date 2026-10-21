@@ -177,6 +177,12 @@ pub struct ModelStatus {
     /// The model file in use is this session's autosave (restored after a solver switch): the
     /// source line names the file the user picked instead (review Minor 2).
     pub source_is_autosave: bool,
+    /// The model in use is a specialised model (M8a Task 7; `Trainable::specialised`): the species
+    /// it was cut for; empty otherwise. The source line adds "(specialised)".
+    pub specialised: Vec<u8>,
+    /// The species the model in use knows (`Trainable::model_species`): the specialised-model
+    /// picker offers them beside the scene's.
+    pub model_species: Vec<u8>,
 }
 
 /// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
@@ -191,19 +197,25 @@ pub fn source_line(m: &ModelStatus) -> String {
 /// model in use is this session's autosave of it (review Minor 2).
 pub fn source_line_with(m: &ModelStatus, user_file: Option<&std::path::Path>) -> String {
     let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let spec = if m.specialised.is_empty() { "" } else { " (specialised)" };
     match &m.source {
         sim::ModelSource::Collection { slug, samples, read_only } => {
             let ro = if *read_only { " · read-only — open in another window" } else { "" };
             format!("model: shared — {slug} · {samples} samples{ro}")
         }
         sim::ModelSource::File(_) if m.source_is_autosave => match user_file {
-            Some(u) => format!("file: {}", name(u)),
-            None => "file: the model file picked earlier in this session".into(),
+            Some(u) => format!("file: {}{spec}", name(u)),
+            None => format!("file: the model file picked earlier in this session{spec}"),
         },
-        sim::ModelSource::File(p) => format!("file: {}", name(p)),
+        sim::ModelSource::File(p) => format!("file: {}{spec}", name(p)),
         sim::ModelSource::None if m.collections => "model: this scene only (not shared)".into(),
         sim::ModelSource::None => "model: this session only".into(),
     }
+}
+
+/// "H, C, O": element symbols of `species`, in order.
+pub fn species_names(species: &[u8]) -> String {
+    species.iter().map(|&z| units::elements::symbol(z)).collect::<Vec<_>>().join(", ")
 }
 
 /// The import's honest caveat (Task 4a review ⚠️ 3): a file carries no isolated-atom references.
@@ -519,6 +531,16 @@ impl Worker {
         self.dy.add_note(note);
     }
 
+    /// [`Command::SaveSpecialised`]: the attached collection's samples within `species` to `path`
+    /// (`Trainable::save_specialised`); a note when written, an error when refused.
+    pub(super) fn save_specialised(&mut self, path: &std::path::Path, species: &[u8]) {
+        let Some(t) = trainable(&mut self.dy) else { return };
+        match t.save_specialised(path, species) {
+            Ok(n) => self.dy.add_note(format!("specialised model saved to {}: {n} samples ({}) — load it with \"a model file…\"", path.display(), species_names(species))),
+            Err(e) => self.error(format!("save specialised model {}: {e}", path.display())),
+        }
+    }
+
     /// The automatic first pass (Task 9 item 4): the panel's plan, re-sized to [`PASS_TARGET_S`]
     /// after its first [`PASS_SIZING_SOLVES`] solves ([`size_pass`](Self::size_pass)); or —
     /// when even the fewest solves that can earn trust take longer at the scene's cold
@@ -693,6 +715,8 @@ impl Worker {
             last_import,
             use_collection,
             source_is_autosave,
+            specialised: s.specialised(),
+            model_species: s.model_species(),
         })
     }
 

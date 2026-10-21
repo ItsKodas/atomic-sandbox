@@ -975,6 +975,24 @@ pub trait Trainable {
     fn save_session_only(&self, _path: &std::path::Path) -> std::io::Result<usize> {
         Ok(0)
     }
+    /// "Save a specialised model…" (M8a Task 7; spec §4.2): writes the attached collection's samples
+    /// made only of `species` (with their boxes and per-box references) to `path` as a model file
+    /// marked specialised, and returns how many. A loaded one is accepted for any neutral scene of
+    /// the same solver surface, whatever its box. `Err` without an attached collection or when no
+    /// sample lies within the species. The default refuses.
+    fn save_specialised(&self, _path: &std::path::Path, _species: &[u8]) -> Result<usize, String> {
+        Err("this provider does not learn".into())
+    }
+    /// The species of the specialised model in use (loaded from a file marked specialised; empty
+    /// otherwise — the Model tab's "(specialised)"). The default: empty.
+    fn specialised(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// The species the model in use is fitted on (its basis; empty without a fit). The default:
+    /// empty.
+    fn model_species(&self) -> Vec<u8> {
+        Vec::new()
+    }
     /// Puts the samples of a [`save_session_only`](Self::save_session_only) file back beside the
     /// attached collection as session-only samples (never offered to it), the number taken; `Err`
     /// without an attached collection of the file's surface, for another kind of file, or while a

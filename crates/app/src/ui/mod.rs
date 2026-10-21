@@ -583,6 +583,10 @@ pub struct UiState {
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
     pub model_file: Option<std::path::PathBuf>,
+    /// The Model tab's "Save a specialised model…" species picker (M8a Task 7): the species ticked,
+    /// and the scene species they were preselected from (re-preselected when the scene's species
+    /// change). Display state; the save is `Action::SaveSpecialised`.
+    pub specialise: (Vec<u8>, Vec<u8>),
     /// A picked model file whose settings differ from the scene's (`model_offer`): the card over the 3D view offers to
     /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
     /// the user presses Apply.
@@ -906,6 +910,7 @@ right {}
             files: Default::default(),
             builder: Default::default(),
             model_file: None,
+            specialise: Default::default(),
             model_offer: None,
             resume: None,
             status: String::new(),
