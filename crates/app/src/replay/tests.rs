@@ -525,7 +525,10 @@ fn viewer_input_is_the_only_path() {
     assert_eq!(key_event(&Key::Named(NamedKey::Space), ElementState::Pressed, false), Some(Event::Key { key: KeyName::Space, down: true }));
     assert_eq!(key_event(&Key::Named(NamedKey::Space), ElementState::Pressed, true), None, "auto-repeat");
     assert_eq!(key_event(&Key::Named(NamedKey::Delete), ElementState::Released, false), Some(Event::Key { key: KeyName::Delete, down: false }));
-    assert_eq!(key_event(&Key::Character("a".into()), ElementState::Pressed, false), None);
+    // the clipboard letters map (with Ctrl as its own key, or as their control characters); others do not
+    assert_eq!(key_event(&Key::Character("a".into()), ElementState::Pressed, false), Some(Event::Key { key: KeyName::A, down: true }));
+    assert_eq!(key_event(&Key::Character("\u{16}".into()), ElementState::Pressed, false), Some(Event::Key { key: KeyName::V, down: true }));
+    assert_eq!(key_event(&Key::Character("q".into()), ElementState::Pressed, false), None);
     // what egui consumed is recorded only when the 3D view still acts on it
     assert!(recordable(&Event::Cursor { x: 0.0, y: 0.0 }, true));
     assert!(recordable(&Event::Button { which: Button::Left, down: false }, true));

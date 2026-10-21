@@ -116,6 +116,13 @@ pub enum KeyName {
     Shift,
     /// Clears the selection.
     Escape,
+    /// Held for the clipboard and select-all shortcuts.
+    Control,
+    /// With Control: copy, paste, duplicate, select all (the Edit tool's clipboard).
+    C,
+    V,
+    D,
+    A,
 }
 
 /// One input event of the 3D view. `Cursor` is in view coordinates (module doc), `Resize` in
@@ -245,6 +252,11 @@ impl Event {
                     KeyName::Delete => "delete",
                     KeyName::Shift => "shift",
                     KeyName::Escape => "escape",
+                    KeyName::Control => "ctrl",
+                    KeyName::C => "c",
+                    KeyName::V => "v",
+                    KeyName::D => "d",
+                    KeyName::A => "a",
                 },
                 updown(*down)
             ),
@@ -278,7 +290,12 @@ impl Event {
                     "delete" => KeyName::Delete,
                     "shift" => KeyName::Shift,
                     "escape" => KeyName::Escape,
-                    _ => return Err(format!("key space, delete, shift or escape, got '{k}'")),
+                    "ctrl" => KeyName::Control,
+                    "c" => KeyName::C,
+                    "v" => KeyName::V,
+                    "d" => KeyName::D,
+                    "a" => KeyName::A,
+                    _ => return Err(format!("key space, delete, shift, escape, ctrl, c, v, d or a, got '{k}'")),
                 },
                 down: down(d)?,
             },
@@ -538,6 +555,15 @@ pub fn key_event(key: &winit::keyboard::Key, state: winit::event::ElementState, 
         Key::Named(NamedKey::Delete) => KeyName::Delete,
         Key::Named(NamedKey::Shift) => KeyName::Shift,
         Key::Named(NamedKey::Escape) => KeyName::Escape,
+        Key::Named(NamedKey::Control) => KeyName::Control,
+        // a letter (or, with Ctrl held on some layouts, its control character: ETX, SYN, EOT, SOH)
+        Key::Character(c) => match c.as_str() {
+            "c" | "C" | "\u{3}" => KeyName::C,
+            "v" | "V" | "\u{16}" => KeyName::V,
+            "d" | "D" | "\u{4}" => KeyName::D,
+            "a" | "A" | "\u{1}" => KeyName::A,
+            _ => return None,
+        },
         _ => return None,
     };
     Some(Event::Key { key, down: state.is_pressed() })

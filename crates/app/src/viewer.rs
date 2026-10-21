@@ -314,6 +314,13 @@ fn edit_overlay(painter: &egui::Painter, camera: &OrbitCamera, scene: &Scene, to
         let (col, fill) = if lit(h) { (yellow, 0.45) } else { (colours[k], 0.2) };
         painter.add(egui::Shape::convex_polygon(pts, col.gamma_multiply(fill), Stroke::new(1.0, col)));
     }
+    for k in 0..3 {
+        let pts: Option<Vec<egui::Pos2>> = tools::ring_points(c, l, k).iter().map(|p| tools::project(camera, *p, vp).map(to_pos)).collect();
+        let Some(pts) = pts else { continue };
+        let h = tools::Handle::Ring(k);
+        let (col, w) = if lit(h) { (yellow, 3.0) } else { (colours[k].gamma_multiply(0.85), 1.6) };
+        painter.add(egui::Shape::line(pts, Stroke::new(w, col)));
+    }
     let o = to_pos(c_px);
     for k in 0..3 {
         let Some(tip) = tools::project(camera, c + tools::axis(k) * l, vp) else { continue };
@@ -339,6 +346,7 @@ fn edit_overlay(painter: &egui::Painter, camera: &OrbitCamera, scene: &Scene, to
                 let (a, b) = (((k + 1) % 3).min((k + 2) % 3), ((k + 1) % 3).max((k + 2) % 3));
                 format!("Δ{} {:+.3}  Δ{} {:+.3} Å", names[a], d[a], names[b], d[b])
             }
+            tools::Handle::Ring(k) => format!("θ{} {:+.1}°", names[k], g.angle.to_degrees()),
         };
         if g.resume {
             text += "  · paused while held";
@@ -360,6 +368,8 @@ pub struct Mouse {
     pub pos: (f32, f32),
     /// Shift is held (the Edit tool adds to its selection).
     pub shift: bool,
+    /// Control is held (the clipboard and select-all shortcuts).
+    pub ctrl: bool,
     pub left: bool,
     pub right: bool,
     pub middle: bool,
@@ -834,6 +844,7 @@ impl Viewer {
             }
             Event::FocusLost => {
                 self.mouse.shift = false;
+                self.mouse.ctrl = false;
                 self.release_all();
             }
             Event::Button { ref which, down } => {
@@ -867,6 +878,22 @@ impl Viewer {
                 }
             }
             Event::Key { key: KeyName::Shift, down } => self.mouse.shift = down,
+            Event::Key { key: KeyName::Control, down } => self.mouse.ctrl = down,
+            // the clipboard (user request 2026-10-21): copy, paste, duplicate, select all
+            Event::Key { key: KeyName::C, down: true } if !consumed && self.mouse.ctrl => self.copy_selection(),
+            Event::Key { key: KeyName::V, down: true } if !consumed && self.mouse.ctrl => self.paste(),
+            Event::Key { key: KeyName::D, down: true } if !consumed && self.mouse.ctrl => {
+                self.copy_selection();
+                self.paste();
+            }
+            Event::Key { key: KeyName::A, down: true } if !consumed && self.mouse.ctrl => {
+                let n = self.scene.nuclei.len();
+                if n > 0 {
+                    self.ui.mode = ui::ToolMode::Edit;
+                    self.tool.group = (0..n).collect();
+                    self.tool.selected = Some(n - 1);
+                }
+            }
             Event::Key { key: KeyName::Escape, down: true } if !consumed => self.tool.clear_selection(),
             Event::Key { key: KeyName::Space, down: true } if !consumed => self.apply(ui::Action::TogglePlay),
             Event::Resize { w, h } => self.resize_viewport(w as f32, h as f32),
@@ -954,13 +981,14 @@ impl Viewer {
         let handle = centroid(&set, &self.scene.nuclei).and_then(|c| tools::gizmo_hit(&self.camera, vp, c, px, py).map(|h| (h, c)));
         if let Some((h, c)) = handle {
             let Some(start) = tools::handle_point(&self.camera, vp, px, py, h, c) else { return };
+            let start_angle = tools::project(&self.camera, c, vp).map_or(0.0, |c_px| tools::screen_angle(c_px, px, py));
             let resume = self.playing;
             if resume {
                 self.send(Command::Dyn(DynCommand::Pause));
             }
             // paused already: the mirror is the driver's state; playing: read after the Pause lands
             let base = if resume { Vec::new() } else { set.iter().map(|&i| (i, self.scene.nuclei[i].pos)).collect() };
-            self.tool.gizmo = Some(tools::GizmoDrag { handle: h, base, centre: c, start, resume, delta: [0.0; 3] });
+            self.tool.gizmo = Some(tools::GizmoDrag { handle: h, base, centre: c, start, resume, delta: [0.0; 3], start_angle, angle: 0.0 });
         } else if let Some(i) = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei) {
             if self.mouse.shift {
                 let mut g = set;
@@ -997,6 +1025,33 @@ impl Viewer {
         }
         let (px, py) = self.mouse.pos;
         let Some(g) = self.tool.gizmo.as_ref() else { return };
+        // a ring turns the group about its axis through the group's centroid (rigid; velocities are
+        // left as they were, like a move)
+        if let tools::Handle::Ring(k) = handle {
+            let Some(c_px) = tools::project(&self.camera, g.centre, self.viewport) else { return };
+            let mut d = tools::screen_angle(c_px, px, py) - g.start_angle;
+            d = (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            let pos: Vec<[f64; 3]> = g.base.iter().map(|b| b.1).collect();
+            let c = tools::mean(&pos);
+            // the turn continues past half a revolution: unwrap against the last applied angle
+            let mut angle = tools::ring_turn(&self.camera, g.centre, k, d);
+            let tau = std::f64::consts::TAU;
+            angle += tau * ((g.angle - angle) / tau).round();
+            if (angle - g.angle).abs() < 1e-4 {
+                return;
+            }
+            let moves: Vec<(usize, [f64; 3])> = g.base.iter().map(|&(i, p)| (i, tools::rotate_about(p, c, k, angle))).collect();
+            // a turn that would put a nucleus outside the cell's margin is not applied
+            let lim = sim::Cell { n: self.scene.grid_n, h: self.scene.grid_h }.max_coord() - 0.5 * self.scene.grid_h;
+            if moves.iter().any(|(_, p)| p.iter().any(|x| x.abs() > lim)) {
+                return;
+            }
+            if let Some(g) = self.tool.gizmo.as_mut() {
+                g.angle = angle;
+            }
+            self.send(Command::MoveNuclei { moves });
+            return;
+        }
         let Some(now) = tools::handle_point(&self.camera, self.viewport, px, py, handle, g.centre) else { return };
         let d = tools::clamp_delta(&g.base, tools::handle_delta(handle, g.start, now), &self.scene);
         if d == g.delta {
@@ -1007,6 +1062,68 @@ impl Viewer {
             g.delta = d;
         }
         self.send(Command::MoveNuclei { moves });
+    }
+
+    /// Ctrl C: the selected nuclei (Z, isotope, position relative to their centroid) to the
+    /// clipboard; nothing selected keeps the clipboard as it was.
+    fn copy_selection(&mut self) {
+        let set = self.tool.set(self.scene.nuclei.len());
+        if set.is_empty() {
+            return;
+        }
+        let pos: Vec<[f64; 3]> = set.iter().map(|&i| self.scene.nuclei[i].pos).collect();
+        let c = tools::mean(&pos);
+        self.tool.clipboard = set
+            .iter()
+            .map(|&i| {
+                let n = &self.scene.nuclei[i];
+                (n.z, n.a, [n.pos[0] - c[0], n.pos[1] - c[1], n.pos[2] - c[2]])
+            })
+            .collect();
+        self.ui.set_status(format!("copied {} atom{} — Ctrl V pastes them under the cursor", set.len(), if set.len() == 1 { "" } else { "s" }));
+    }
+
+    /// Ctrl V: the clipboard's atoms added at rest — centred on the focus-plane point under the cursor
+    /// (or, with the cursor off the view, beside where they were copied from), kept inside the cell
+    /// as a group — then selected in the Edit tool so the handles move them.
+    fn paste(&mut self) {
+        if self.tool.clipboard.is_empty() {
+            self.ui.set_status("nothing to paste — select atoms and press Ctrl C first");
+            return;
+        }
+        let clip = self.tool.clipboard.clone();
+        let extent = clip.iter().map(|(_, _, r)| (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()).fold(0.0f64, f64::max);
+        let target = match self.tool.cursor.and_then(|(x, y)| tools::place_point(&self.camera, x, y, self.viewport)) {
+            Some(p) => p,
+            None => {
+                // beside the copied group's spot: along the camera's right by twice its extent + 2 Bohr
+                let set = self.tool.set(self.scene.nuclei.len());
+                let pos: Vec<[f64; 3]> = set.iter().map(|&i| self.scene.nuclei[i].pos).collect();
+                let c = if pos.is_empty() { [0.0; 3] } else { tools::mean(&pos) };
+                let fwd = (self.camera.target - self.camera.eye()).normalize_or_zero();
+                let right = fwd.cross(Vec3::Y).normalize_or_zero();
+                let s = 2.0 * extent + 2.0;
+                [c[0] + right.x as f64 * s, c[1] + right.y as f64 * s, c[2] + right.z as f64 * s]
+            }
+        };
+        let base: Vec<(usize, [f64; 3])> = clip.iter().enumerate().map(|(k, (_, _, r))| (k, *r)).collect();
+        let d = tools::clamp_delta(&base, target, &self.scene);
+        let first = self.scene.nuclei.len();
+        let mut overlap = false;
+        for (z, a, r) in &clip {
+            let pos = [r[0] + d[0], r[1] + d[1], r[2] + d[2]];
+            overlap |= self.scene.nuclei.iter().any(|n| (0..3).map(|k| (n.pos[k] - pos[k]).powi(2)).sum::<f64>() < 1.0);
+            self.send(Command::AddNucleus { z: *z, a: *a, pos });
+        }
+        let n = self.scene.nuclei.len();
+        self.ui.mode = ui::ToolMode::Edit;
+        self.tool.group = (first..n).collect();
+        self.tool.selected = n.checked_sub(1);
+        self.ui.set_status(if overlap {
+            format!("pasted {} atom{} — some sit within 1 Bohr of an existing atom: move them with the handles before playing", clip.len(), if clip.len() == 1 { "" } else { "s" })
+        } else {
+            format!("pasted {} atom{} (selected: drag the handles to place them)", clip.len(), if clip.len() == 1 { "" } else { "s" })
+        });
     }
 
     /// The left button is up: a held handle lets go (Play resumes if the press paused it), a box
