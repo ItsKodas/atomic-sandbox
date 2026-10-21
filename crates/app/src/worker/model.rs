@@ -167,6 +167,9 @@ pub struct ModelStatus {
     /// Where the model comes from (`sim::TrainableStatus::model_source`): the shared collection, a
     /// file, or neither (the Model tab's source line, [`source_line`]).
     pub source: sim::ModelSource,
+    /// Atoms with no neighbour within the model's cutoff (`sim::TrainableStatus::lone_note`): the
+    /// Model tab's amber note by Start sampling and the pass offer.
+    pub lone_note: Option<String>,
     /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
@@ -711,6 +714,7 @@ impl Worker {
             no_model: st.no_model,
             retry_fit: st.retry_fit,
             source: st.model_source,
+            lone_note: st.lone_note,
             collections,
             last_import,
             use_collection,

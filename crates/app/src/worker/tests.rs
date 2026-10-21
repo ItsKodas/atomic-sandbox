@@ -1025,7 +1025,8 @@ fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
 /// throttle would matter only if step 1 fell back too, and a slower GPU would then need fewer
 /// steps, not more). Step 1's worst atom uncertainty is 0.015 of its bound (printed). The bound
 /// is the measured count × 2 (M6 spec §9); the R = 8 answer is still box-affected at 49³ (face
-/// density 6.3e-4 > 2e-5) and not trained on.
+/// density 6.3e-4 > 2e-5) and not trained on — and, since the M8a user test, refused before the box
+/// rule by the lone-atom rule (no atom has a neighbour within the 6 Bohr cutoff).
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -1040,7 +1041,9 @@ fn after_a_far_drag_the_surrogate_answers_again() {
     let m = model(&far);
     eprintln!("R = 8: {:?}, trusted {}, samples {n0} → {}, notes {:?}", far.dynamics.source, m.trusted, m.samples, far.dynamics.eval.notes);
     assert_eq!(far.dynamics.source, sim::Source::Fallback);
-    assert!(far.dynamics.eval.notes.iter().any(|n| n.contains("box-affected")), "{:?}", far.dynamics.eval.notes);
+    // since the M8a user test the lone-atom rule refuses it first: at R = 8 neither atom has a
+    // neighbour within the 6 Bohr cutoff, so it is never kept (before, the box rule refused it)
+    assert!(far.dynamics.eval.notes.iter().any(|n| n.contains("lone atoms")), "{:?}", far.dynamics.eval.notes);
     assert!(m.trusted && m.samples == n0, "the box-affected answer must not be trained on: {m:?}");
     let s = teleport_h2(&w, 3.3);
     let refits0 = model(&s).refits;

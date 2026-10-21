@@ -183,7 +183,7 @@ use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
 use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
-use crate::surrogate::{box_affected_face_density, SurrogateKs, MIN_RESIDUAL_DOF};
+use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::VecDeque;
@@ -1569,6 +1569,26 @@ impl Sampler {
             self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
             return;
         }
+        // a geometry in which no atom has a neighbour within r_cut (a hot burst that flew apart)
+        // teaches nothing and is never kept (`surrogate::no_neighbours`)
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        if no_neighbours(&pos, surrogate.cutoff()) {
+            let note = format!("sampling: a {} geometry was not kept (no atom has a neighbour within the model's cutoff — lone atoms, nothing to learn)", self.progress.stage);
+            self.progress.done += 1;
+            self.progress.skipped += 1;
+            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::LoneNotKept);
+            ev.face_density = face;
+            ev.n_atoms = scene.nuclei.len();
+            ev.solve_ms = r.stats.solve_ms as f64;
+            ev.scf_steps = Some(r.stats.scf_steps);
+            ev.scf_end = converged(r.stats.scf_steps);
+            ev.burst_t = burst_t;
+            ev.detail = note.clone();
+            surrogate.push_event(ev);
+            self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
+            return;
+        }
         let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
         let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {
@@ -1805,7 +1825,11 @@ pub fn run_sampling(
     progress: &mut dyn FnMut(SamplingProgress),
     should_abort: &mut dyn FnMut() -> bool,
 ) -> Result<usize, ProviderError> {
-    let r_cut = surrogate.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
+    let r_cut = surrogate.cutoff();
+    let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    if !pos.is_empty() && no_neighbours(&pos, r_cut) {
+        return Err(ProviderError::Invalid(lone_pass_refusal(r_cut)));
+    }
     let mut s = Sampler::with_cutoff(scene, plan, r_cut).map_err(ProviderError::Invalid)?;
     loop {
         if should_abort() {

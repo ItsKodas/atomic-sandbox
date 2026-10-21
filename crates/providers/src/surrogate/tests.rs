@@ -967,12 +967,11 @@ fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
 /// envelope rule fired first there, the near-quarantine check was skipped, every 10th
 /// answer was kept and quarantined in turn until the 10 % cap untrusted the model for good.
 /// Now 600 teacher steps beyond the cutoff (R 7–10), with a refit every 25 as the worker
-/// does, keep the trust, and R = 1.6 is the model's. Since Task 9 fix round 1 (fence voting,
-/// I3) the store grows by exactly one sample: the first three mutually consistent answers
-/// that disagree with the model are a vote, the next refit cannot reproduce the voted sample,
-/// quarantines it and closes the region to further votes — the chain stays bounded.
+/// does, keep the trust, and R = 1.6 is the model's. Since the M8a user test (a lone atom is never
+/// trained on) the store does not grow at all: no atom has a neighbour within the cutoff, so no
+/// answer is kept (before it, Task 9 fix round 1's fence vote kept one and quarantined it).
 #[test]
-fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_model() {
+fn a_molecule_parked_beyond_the_cutoff_is_never_kept_and_never_untrusts_the_model() {
     let long = MorseDimer { a: 0.3, ..MorseDimer::h2() };
     let teacher = Shared::new(MorseDimer { a: 0.3, ..MorseDimer::h2() });
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
@@ -985,27 +984,21 @@ fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_mod
     }
     s.refit().unwrap();
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
-    // the first answer beyond the cutoff: kept (far from everything), then quarantined (a 49³
-    // cell: the 33³ one's margin refuses |x| > 3.25 since the surrogate checks the cell)
-    let r = s.evaluate(&in_big_cell(h2(8.0)), &mut never()).unwrap();
-    assert_eq!(r.stats.source, Source::Fallback);
-    s.refit().unwrap();
-    let (n1, q1) = (s.samples(), s.quarantined());
-    println!("after R = 8: {n1} samples, {q1} quarantined, trusted {}, note {:?}", s.trusted(), s.recovery_note());
-    assert!(s.trusted() && q1 == 1, "{:?}", s.untrusted_reason());
-    let mut rejected_vote = false;
+    // beyond the cutoff no atom has a neighbour the model sees: every answer drives its step and
+    // is never kept (`LoneNotKept`, user test M8a — before it, one vote was kept and quarantined)
+    // (a 49³ cell: the 33³ one's margin refuses |x| > 3.25 since the surrogate checks the cell)
+    let n1 = s.samples();
     for k in 0..600 {
         let r = 7.0 + 3.0 * ((k as f64) * 0.37).sin().abs();
         let ev = s.evaluate(&in_big_cell(h2(r)), &mut never()).unwrap();
         assert_eq!(ev.stats.source, Source::Fallback, "R = {r} beyond the cutoff");
+        assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::LoneNotKept));
         if k % 25 == 24 && s.pending_refit() {
             s.refit().unwrap();
-            rejected_vote |= s.recovery_note().is_some_and(|n| n.contains("1 voted samples quarantined"));
         }
     }
     println!("after 600 steps beyond the cutoff: {} samples, {} quarantined, trusted {}", s.samples(), s.quarantined(), s.trusted());
-    assert!(rejected_vote, "the refit judged the vote");
-    assert_eq!((s.samples(), s.quarantined()), (n1 + 1, q1 + 1), "one vote, quarantined; nothing more kept");
+    assert_eq!((s.samples(), s.quarantined()), (n1, 0), "nothing kept, nothing quarantined");
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
     assert_eq!(s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap().stats.source, Source::Surrogate);
 }
@@ -2137,7 +2130,7 @@ fn gpu_round_trip(ctx: gpu::GpuContext, n_grid: usize) -> (f64, f64, f64) {
         let r = s.evaluate(&sc, &mut never()).expect("GPU teacher");
         assert_eq!(r.stats.source, Source::Fallback);
     }
-    assert_eq!(s.samples(), n + 1);
+    assert_eq!(s.samples(), n, "the lone atom's answer is used, never kept (user test, M8a)");
     let t_scan = t0.elapsed().as_secs_f64();
     let rep = s.refit().expect("refit");
     println!("GPU H₂ {n_grid}³: E_H = {e_h:+.6} Ha; {} samples in {t_scan:.1} s; fit rmse E/atom {:.2e} Ha, F {:.2e} Ha/Bohr; s_E {:.1e} s_F {:.1e} λ {:.3e}; dof_E {:.1} dof_F {:.1}; trusted {}",
@@ -3562,7 +3555,13 @@ fn fnv1a(text: &str) -> u64 {
 /// class's measured energy error over its 3 comparisons reads 4.07× the tier against LEAVE 1, so
 /// the scripted "audit 5" step falls back instead of waiting for the next refit (one more teacher
 /// call). Diffed against HEAD 78da699 with the species words masked: those 2 lines, nothing else.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xa314_5688_9292_d627;
+/// **Re-pinned for the M8a lone-atom fix** (0xa314_5688_9292_d627 → below; the traces of this tree
+/// with and without the rule, diffed by script): step 61's H₂ at R = 6.3 Bohr (beyond the cutoff: no
+/// atom has a neighbour the model sees) is used for its step and no longer kept (its note says so),
+/// so every later sample count reads one fewer, the step-79 refit no longer quarantines it (its
+/// recovery note and the quarantine count go) and the step-84 one counts one quarantined sample
+/// fewer. Every answer, source, fit number and the background auditor's section are unchanged.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x5c56_a109_42ac_bc80;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -9448,4 +9447,72 @@ fn between_refits_an_untrusted_class_enters_only_on_a_full_window() {
     s.class_memory = [(hk_pair(), (false, None))].into();
     s.refresh_class_loo();
     assert!(s.class_loo()[0].trusted, "the refit's judgement: {:?}", s.class_loo()[0]);
+}
+
+/// User test (M8a): a lone atom has no neighbour within r_cut, so every descriptor is empty and it
+/// teaches nothing (the per-box references cover it). A pass on one is refused and appends nothing —
+/// so is one on two atoms farther apart than the cutoff.
+#[test]
+fn a_pass_on_a_lone_atom_is_refused_and_appends_nothing() {
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut one = h2(1.45);
+    one.nuclei.truncate(1);
+    let mut refs = sim::AtomReferences::default();
+    let e = Trainable::start_pass(&mut s, &one, &SamplingPlan::default(), &mut refs).unwrap_err();
+    assert_eq!(e, "a lone atom has nothing to learn — the model learns from neighbours within 6 Bohr; train a molecule (e.g. H₂)");
+    assert!(Trainable::pass_step(&mut s, &mut never()).unwrap().is_none(), "no pass started");
+    let far = in_big_cell(h2(7.0));
+    let e = Trainable::start_pass(&mut s, &far, &SamplingPlan::default(), &mut refs).unwrap_err();
+    assert!(e.contains("nothing to learn"), "{e}");
+    assert_eq!(s.samples(), 0, "nothing appended");
+    // a molecule's pass starts
+    Trainable::start_pass(&mut s, &h2(1.45), &SamplingPlan::default(), &mut refs).unwrap();
+}
+
+/// User test (M8a): the teacher's answer for a one-atom scene is used for its step and never kept
+/// (`LoneNotKept`); a two-atom scene's is kept.
+#[test]
+fn a_lone_atom_answer_is_used_and_never_kept() {
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut one = h2(1.45);
+    one.nuclei.truncate(1);
+    let r = s.evaluate(&one, &mut never()).unwrap();
+    assert_eq!(r.energy, MorseDimer::h2().e_atom, "the teacher's answer drives the step");
+    assert_eq!(s.samples(), 0, "store unchanged");
+    assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::LoneNotKept));
+    let prov = s.provenance_for(&one);
+    let mut notes = Vec::new();
+    assert!(!s.keep_sample(&[[0.0; 3]], &[1], -0.5, &[[0.0; 3]], Some(0.0), Some(2), &prov, SampleTag::Targeted, &mut notes));
+    assert!(notes.iter().any(|n| n.contains("lone atoms")), "{notes:?}");
+    assert_eq!(s.samples(), 0, "store unchanged");
+    s.evaluate(&h2(1.45), &mut never()).unwrap();
+    assert_eq!(s.samples(), 1, "a two-atom scene's answer is kept");
+}
+
+/// The Model tab's lone-atom note (coordinator request, M8a user test): all lone — the pass's
+/// refusal; some — they are not learned (the pass still runs); none — nothing.
+#[test]
+fn the_lone_atom_note_counts_the_atoms_without_a_neighbour() {
+    let h2o = [[0.0, 0.0, 0.0], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]];
+    assert_eq!(lone_atoms_note(&h2o, 6.0), None);
+    assert_eq!(lone_atoms_note(&[], 6.0), None);
+    assert_eq!(lone_atoms_note(&[[0.0; 3]], 6.0), Some(lone_pass_refusal(6.0)));
+    let one_far = [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 7.0, 0.0]];
+    assert_eq!(
+        lone_atoms_note(&one_far, 6.0).as_deref(),
+        Some("1 of 3 atoms has no neighbour within 6 Bohr — it won't be learned; move it within 6 Bohr (≈ 3.2 Å) of another atom")
+    );
+    let two_far = [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 7.0, 0.0], [0.0, -7.0, 0.0]];
+    assert_eq!(
+        lone_atoms_note(&two_far, 6.0).as_deref(),
+        Some("2 of 4 atoms have no neighbour within 6 Bohr — they won't be learned; move them within 6 Bohr (≈ 3.2 Å) of another atom")
+    );
+    // the pass is not blocked in the partial case
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    // H₂ and an H 7 Bohr away (a 20 Bohr cell: room inside its margin)
+    let mut sc = h2(1.4);
+    sc.nuclei.push(Nucleus::new(1, [0.0, 0.0, 7.0]));
+    sc.cell = Cell { n: 81, h: 0.25 };
+    Trainable::start_pass(&mut s, &sc, &SamplingPlan::default(), &mut sim::AtomReferences::default()).unwrap();
+    assert!(Trainable::status(&s, &sc, &[[0.0; 3]; 3]).lone_note.is_some_and(|n| n.starts_with("1 of 3 atoms")));
 }

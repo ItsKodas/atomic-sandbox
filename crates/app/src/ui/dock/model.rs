@@ -79,6 +79,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
         offer(ui, o, acts);
+        lone_note(ui, input, "lone-note-offer");
     }
     super::group(ui, st, "d-audits", |ui, st| {
         theme::section(ui, "Audits");
@@ -400,6 +401,14 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
     }
 }
 
+/// The amber note on atoms with no neighbour within the model's cutoff (`ModelStatus::lone_note`):
+/// they are not learned — every one of them, and the pass is refused. Decides nothing.
+fn lone_note(ui: &mut Ui, input: &PanelInput<'_>, probe: &str) {
+    if let Some(n) = input.model().and_then(|m| m.lone_note.as_deref()) {
+        super::super::probed(probe, ui.label(RichText::new(n).color(AMBER)));
+    }
+}
+
 /// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
@@ -421,6 +430,7 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         } else if let Some(c) = cost {
             ui.weak(c);
         }
+        lone_note(ui, input, "lone-note");
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
             .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")

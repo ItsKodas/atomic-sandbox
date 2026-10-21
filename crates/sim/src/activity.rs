@@ -485,6 +485,10 @@ pub enum TeachOutcome {
     /// fitted or judged (the model's cutoff cannot represent it; an audit landing there is not a
     /// judgement of the model, which strict mode refuses there).
     ShellNotKept,
+    /// A teacher answer in which no atom has a neighbour within the model's cutoff: used for its
+    /// step, never trained on — every descriptor is empty, so it teaches nothing and carries only the
+    /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
+    LoneNotKept,
     FenceDisagrees,
     WaitingForPass,
     /// Used for its step, not kept for this model: its settings differ.

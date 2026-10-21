@@ -1185,6 +1185,10 @@ pub struct TrainableStatus {
     pub retry_fit: bool,
     /// Where the model comes from (M8a Task 4a): a shared collection, a file, or neither.
     pub model_source: ModelSource,
+    /// Atoms of the scene with no neighbour within the model's cutoff, in words for the Model tab
+    /// (`providers::surrogate::lone_atoms_note`): all of them — a pass is refused; some — they are
+    /// not learned. `None` when every atom has a neighbour. Informational.
+    pub lone_note: Option<String>,
 }
 
 /// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the

@@ -204,6 +204,7 @@ pub(crate) fn model() -> ModelStatus {
         no_model: None,
         retry_fit: false,
         source: sim::ModelSource::None,
+        lone_note: None,
         collections: false,
         last_import: None,
         use_collection: false,
@@ -4755,4 +4756,31 @@ fn rewind_and_reverse_velocities_have_their_homes() {
     let rev = search::ENTRIES.iter().find(|e| e.name == "Reverse velocities").expect("searchable");
     assert_eq!(rev.place, search::Place::Menu(menus::MenuId::Physics));
     assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
+}
+
+/// The Model tab's amber lone-atom note (`ModelStatus::lone_note`) is drawn by Start sampling and
+/// sends nothing; without a note none is drawn.
+#[test]
+fn the_model_tab_warns_of_atoms_without_a_neighbour() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let note = "1 of 3 atoms has no neighbour within 6 Bohr — it won't be learned; move it within 6 Bohr (≈ 3.2 Å) of another atom";
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    let without = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&without), &cam);
+    PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    assert!(PROBES.with(|p| p.borrow().get("lone-note").is_none()), "no note without lone atoms");
+    let with = snapshot(&scene, Backend::Estimated, Some(ModelStatus { lone_note: Some(note.into()), ..model() }));
+    let inp = input(&scene, Some(&with), &cam);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    assert!(probed_rect("lone-note").width() > 0.0, "the note is drawn by Start sampling");
 }

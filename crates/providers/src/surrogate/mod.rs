@@ -2302,6 +2302,55 @@ impl SurrogateKs {
     }
 }
 
+/// No atom of `pos` has a neighbour within `r_cut` (Bohr; strictly inside, as rule 5a's f_c > 0):
+/// every descriptor is empty. Such a geometry teaches the model nothing — its energy is the sum
+/// of the references, which the per-box reference solves cover — and its teacher energies carry
+/// only an isolated atom's grid/box artefacts (user test, M8a: 202 lone-H samples spread by
+/// 1.3 mHa failed rule 4's self-check and the whole collection went untrusted). Never kept.
+pub(crate) fn no_neighbours(pos: &[[f64; 3]], r_cut: f64) -> bool {
+    let r2 = r_cut * r_cut;
+    pos.iter().enumerate().all(|(i, a)| {
+        pos[i + 1..].iter().all(|b| {
+            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2
+        })
+    })
+}
+
+/// Why a pass on a scene where no atom has a neighbour within `r_cut` is refused.
+pub(crate) fn lone_pass_refusal(r_cut: f64) -> String {
+    format!("a lone atom has nothing to learn — the model learns from neighbours within {r_cut} Bohr; train a molecule (e.g. H₂)")
+}
+
+/// The Model tab's note on atoms without a neighbour within `r_cut` (Bohr): every atom — the pass's
+/// refusal ([`lone_pass_refusal`]); some — they are not learned (the pass still runs); none, or
+/// no atoms — `None`. Informational: decides nothing.
+pub fn lone_atoms_note(pos: &[[f64; 3]], r_cut: f64) -> Option<String> {
+    let r2 = r_cut * r_cut;
+    let near = |a: &[f64; 3], b: &[f64; 3]| (0..3).map(|k| (a[k] - b[k]) * (a[k] - b[k])).sum::<f64>() < r2;
+    let lone = pos.iter().enumerate().filter(|&(i, a)| !pos.iter().enumerate().any(|(j, b)| j != i && near(a, b))).count();
+    let n = pos.len();
+    match lone {
+        0 => None,
+        _ if lone == n => Some(lone_pass_refusal(r_cut)),
+        1 => Some(format!(
+            "1 of {n} atoms has no neighbour within {r_cut} Bohr — it won't be learned; move it within {r_cut} Bohr (≈ {:.1} Å) of another atom",
+            units::bohr_to_angstrom(r_cut)
+        )),
+        _ => Some(format!(
+            "{lone} of {n} atoms have no neighbour within {r_cut} Bohr — they won't be learned; move them within {r_cut} Bohr (≈ {:.1} Å) of another atom",
+            units::bohr_to_angstrom(r_cut)
+        )),
+    }
+}
+
+impl SurrogateKs {
+    /// The model's cutoff (Bohr): its basis's, else the default basis's.
+    pub(crate) fn cutoff(&self) -> f64 {
+        self.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut)
+    }
+}
+
 impl Trainable for SurrogateKs {
     fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String> {
         if self.pass.is_some() {
@@ -2310,7 +2359,11 @@ impl Trainable for SurrogateKs {
         if let Some(why) = self.collection_refuses(&self.provenance_for(scene)) {
             return Err(format!("sampling: {why}"));
         }
-        let r_cut = self.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
+        let r_cut = self.cutoff();
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        if !pos.is_empty() && no_neighbours(&pos, r_cut) {
+            return Err(lone_pass_refusal(r_cut));
+        }
         let sampler = Sampler::with_cutoff(scene, plan, r_cut)?;
         // the caller's references seed the cache (an entry the cache already holds stays)
         for (key, r) in refs.iter() {
@@ -2636,6 +2689,7 @@ impl Trainable for SurrogateKs {
             no_model: self.no_model().map(|n| n.words),
             retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
             model_source: self.model_source(),
+            lone_note: lone_atoms_note(&scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), self.cutoff()),
         }
     }
 

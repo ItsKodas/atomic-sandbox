@@ -548,6 +548,10 @@ impl SurrogateKs {
     /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, multiplicity: Option<u32>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
+        if no_neighbours(pos, self.cutoff()) {
+            notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
+            return false;
+        }
         self.since_kept = 0;
         let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN), multiplicity) {
@@ -604,6 +608,12 @@ impl SurrogateKs {
         if let Some(why) = unfit {
             notes.push(format!("surrogate: sample not kept ({why} — spec §5.6)"));
             return TeachOutcome::UnfitNotKept;
+        }
+        // no atom with a neighbour within r_cut: nothing to learn, only an isolated atom's grid/box
+        // artefacts (`no_neighbours`) — used for its step, never kept, before `admit` touches anything
+        if no_neighbours(pos, self.cutoff()) {
+            notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
+            return TeachOutcome::LoneNotKept;
         }
         let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
         // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
