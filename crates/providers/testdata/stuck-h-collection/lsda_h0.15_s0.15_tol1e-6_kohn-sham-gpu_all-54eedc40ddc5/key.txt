@@ -1,0 +1,7 @@
+# Atomic Sandbox collection: the solver surface every sample here was solved on
+functional lsda
+h 0.15
+sigma 0.15
+tol 1e-6
+teacher Kohn-Sham (GPU)
+ionic all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8

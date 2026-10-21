@@ -8885,3 +8885,95 @@ fn a_reference_arriving_mid_run_keeps_e_conserved_continuous() {
     assert!(shift > 1e-3, "the premise");
     assert!(step <= 2.0 * verlet_step + 1e-12 && spread <= 2.0 * verlet_spread + 1e-12, "E_conserved continuous across the arrival: step {step:.2e}, spread {spread:.2e}");
 }
+
+/// A stub teacher of the GPU Kohn-Sham's name (a collection opens for its own teacher's name);
+/// never asked to solve.
+struct StubKsGpu;
+
+impl ForceProvider for StubKsGpu {
+    fn evaluate(&mut self, _scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        Err(ProviderError::Invalid("a stub teacher: never asked".into()))
+    }
+    fn name(&self) -> &'static str {
+        "Kohn-Sham (GPU)"
+    }
+    fn reset(&mut self) {}
+}
+
+/// The M8a user-test regression (`references.md` "M8a stuck collection"): the user's H-only
+/// collection (`testdata/stuck-h-collection`, 578 GPU teacher answers: H, H₂ at 81³ and 101³,
+/// H₃) as the live session held it — the collection's 8 held samples and the `degree_cap` 6 an
+/// earlier recovery had set. Under the cap one sample (H₂ at 5.585 Bohr in the 101³ box, its
+/// restricted-spin label 40 mHa above two atoms) drives the energy noise to 2e-2 Ha/atom and the
+/// misfit spreads over every H₂ sample (−25 mHa/atom each, the sample itself −6 mHa/atom): the
+/// worst offenders are 380 samples, past the quarantine's 10 % cap, so the old recovery did
+/// nothing — untrusted at every refit, and (every fallback a copy of a stored sample) no refit
+/// changed it. The recovery now re-judges the cap against the default basis (steps 1b/3): the
+/// refit ends trusted, every held sample is written to the collection as a status record, and a
+/// reopened collection holds the same codes.
+#[test]
+fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() {
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+    let dir = collection_root("stuck");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/stuck-h-collection").join(SLUG);
+    std::fs::create_dir_all(dir.join(SLUG)).unwrap();
+    for f in ["key.txt", "references.txt", "samples.bin", "history.bin"] {
+        std::fs::copy(src.join(f), dir.join(SLUG).join(f)).unwrap();
+    }
+    let key = surrogate::SurfaceKey {
+        functional: "lsda".into(),
+        h: 0.15,
+        sigma: 0.15,
+        tol: 1e-6,
+        teacher: "Kohn-Sham (GPU)".into(),
+        ionic: "all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8".into(),
+    };
+    assert_eq!(key.slug(), SLUG);
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert!(!c.read_only);
+    let live_codes = c.quarantine.clone();
+    assert_eq!((c.samples.len(), live_codes.iter().filter(|&&q| q == Q_HELD).count()), (578, 8), "the user's collection");
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.attach(c).unwrap();
+    // the live session's state: the collection's codes, the cap an earlier recovery set
+    s.quarantine = live_codes.clone();
+    s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+    s.species_dirty = true;
+    s.fit_store().unwrap();
+    let r = s.report().unwrap();
+    println!(
+        "the live state: Q′ {}, n {}, rmse E/atom {:.1e}, F {:.1e}; {:?}",
+        r.q_prime,
+        r.n_samples,
+        r.rmse_energy_per_atom,
+        r.rmse_force,
+        s.untrusted_reason()
+    );
+    assert!(!s.trusted() && s.untrusted_reason().is_some_and(|w| w.contains("training energy residual")), "the premise: {:?}", s.untrusted_reason());
+    assert!(s.worst_offenders().len() as f64 > QUARANTINE_MAX_FRACTION * 578.0, "the premise: the capped fit names no offender within the cap");
+    // the next refit recovers
+    let rep = s.refit().unwrap();
+    let t = s.training_residuals().unwrap();
+    println!(
+        "after the refit: cap {:?}, Q′ {}, n {}, worst E/atom {:.1e} (allowed {:.1e}), trusted {} {:?}; {:?}",
+        s.degree_cap,
+        rep.q_prime,
+        rep.n_samples,
+        t.energy_per_atom,
+        s.policy.energy_std_per_atom,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(t.energy_per_atom <= s.policy.energy_std_per_atom);
+    assert!(s.quarantined() as f64 <= QUARANTINE_MAX_FRACTION * 578.0);
+    assert!(s.is_quarantined(575), "the stretched H₂ label is held");
+    // the codes are the collection's: written as status records, read back on reopening
+    let held: Vec<usize> = (0..578).filter(|&i| s.is_quarantined(i)).collect();
+    println!("held: {held:?}");
+    assert!(held.iter().all(|&i| s.collection().unwrap().quarantine[i] == Q_HELD));
+    drop(s);
+    let (again, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert_eq!((0..578).filter(|&i| again.quarantine[i] == Q_HELD).collect::<Vec<_>>(), held);
+}

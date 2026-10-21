@@ -623,7 +623,15 @@
 //! 2. otherwise **quarantines** the worst offenders — the samples whose per-atom energy or worst
 //!    force residual, relative to its threshold, is within a factor 2 of the worst — and refits
 //!    without them, up to [`QUARANTINE_ROUNDS`] rounds, never more than
-//!    [`QUARANTINE_MAX_FRACTION`] of the store. A quarantined sample stays in the store (and in
+//!    [`QUARANTINE_MAX_FRACTION`] of the store;
+//! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
+//!    capped fit fails, the default basis is tried first exactly as step 1 tries the cap (kept if
+//!    it alone passes, counts included), and when the quarantine on the capped basis cannot
+//!    recover either, the same quarantine rounds run again from the default basis (from the state
+//!    the refit entered with) — that result stands only if it is trusted, else step 2's does. The
+//!    case (`references.md` "M8a stuck collection"): one stretched-H₂ label under cap 6 drove the
+//!    energy noise to 2e-2 Ha/atom and spread its misfit over all 380 H₂ samples, so step 2 named
+//!    no offender within its cap and the cap could never be undone — untrusted at every refit. A quarantined sample stays in the store (and in
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
 //!    spreads of one falls back ("near a quarantined geometry") — whichever rule fired first — and that
