@@ -405,6 +405,15 @@ impl SurrogateKs {
     /// (a repeated request while one is queued or running is the same request). False without an
     /// auditor.
     pub fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+        // the driver wants this one too: its answer is handed on (`shared`, "References per box")
+        let n = scene.cell.n;
+        self.own_ref_requests.retain(|&o| o != (z, n));
+        self.request_atom_reference_job(z, mass, scene)
+    }
+
+    /// [`request_atom_reference`](Self::request_atom_reference)'s job, for the driver or for the
+    /// provider itself (`shared::request_box_references`).
+    pub(super) fn request_atom_reference_job(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
         self.poll_side_jobs();
         if self.auditor.is_none() {
             return false;
@@ -671,6 +680,21 @@ impl SurrogateKs {
         // a reference is answered whatever the generation (its requester waits for it); one
         // abandoned by a Forget or an installed model comes back `Cancelled`
         if let (JobKind::Reference(z), Some(r)) = (ans.job.kind, ans.reference.take()) {
+            // in collection mode every solved reference is offered for its box (`shared` module
+            // doc, "References per box"); one the provider asked for itself is not handed on
+            let n = ans.job.scene.cell.n;
+            if let Ok(a) = &r {
+                if self.shared.is_some() {
+                    self.set_reference_solved(z, a.energy, n, a.face_density);
+                }
+            }
+            if let Some(k) = self.own_ref_requests.iter().position(|&o| o == (z, n)) {
+                self.own_ref_requests.remove(k);
+                if let Err(e) = &r {
+                    self.user_notes.push(format!("shared collection: the {} reference of the {n}³ box did not solve ({e}) — its answers keep waiting (a sampling pass solves it too)", symbol(z)));
+                }
+                return;
+            }
             return self.atom_references.push((z, r));
         }
         let Some(a) = self.auditor.as_ref() else { return };
@@ -726,6 +750,8 @@ impl SurrogateKs {
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        // the canonical surface in collection mode (`shared` module doc; the identity per scene)
+        let energy = self.to_canonical(&z, prov.grid_n, energy);
         // the model current now is the one to judge (a refit since the dispatch is what counts);
         // with the variance: the history's point needs the model's stds here (M8a Task 1 — one
         // variance evaluation per audit, within what the cadence budgets)

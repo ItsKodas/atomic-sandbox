@@ -335,6 +335,26 @@ impl SurrogateKs {
                 untrusted: false,
             });
         }
+        // collection mode: the scene's box must have the isolated-atom reference of every species —
+        // its answers are fitted against them (`shared` module doc, "References per box"); kept,
+        // waiting for them (the provider asks the auditor: `request_box_references`)
+        if let Some(&zm) = self.box_refs_missing(z, prov.grid_n).first() {
+            return Err(Gate {
+                reason: Refusal::new(
+                    format!(
+                        "surrogate: the shared collection has no isolated-atom reference of {} in this {}³ box yet — the teacher answers, and its answers wait for that reference before they enter the fit",
+                        units::isotopes::symbol(zm),
+                        prov.grid_n
+                    ),
+                    TeachRule::NewSpecies(zm),
+                    None,
+                ),
+                keep_sample: true,
+                thin: false,
+                dedup: false,
+                untrusted: false,
+            });
+        }
         if let Some((key, why)) = self.untrusted_check() {
             return Err(Gate {
                 reason: Refusal::new(format!("surrogate untrusted: {why}"), TeachRule::Untrusted(key), None),

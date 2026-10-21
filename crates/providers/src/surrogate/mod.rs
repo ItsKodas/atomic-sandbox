@@ -877,8 +877,9 @@
 //! **A shared collection** (M8a Task 4a, `shared` module doc) changes three things here: the
 //! store's provenance is the collection's (any box, neutral, automatic multiplicity) and a sample's
 //! check is the collection's surface-key check; a reference is offered with its box
-//! ([`set_reference_solved`](SurrogateKs::set_reference_solved): the box rule, odd n, the largest
-//! passing box stands) and the fit uses the collection's; and species growth rebuilds the
+//! ([`set_reference_solved`](SurrogateKs::set_reference_solved): the box rule, odd n) and kept per
+//! (species, box) — each sample is fitted against its own box's references, a sample whose box has
+//! none yet waits (`shared`, "References per box") —; and species growth rebuilds the
 //! accumulator from the whole collection-backed store, exactly as above.
 
 use crate::sampling::{atom_key, Sampler};
@@ -1212,9 +1213,12 @@ pub struct SurrogateKs {
     shared: Option<shared::SharedCollection>,
     /// Why the collection refused the sample just stored (taken by `keep_sample` for the step's
     /// note; `shared::SurrogateKs::take_collection_note`).
-    collection_note: Option<String>,
+    collection_note: Vec<String>,
     /// The model file the model was loaded from (`TrainableStatus::model_source`).
     source_file: Option<std::path::PathBuf>,
+    /// Isolated-atom references the provider asked the auditor for itself — (Z, box n) — whose
+    /// answers are not handed on to the driver (`shared` module doc, "References per box").
+    own_ref_requests: Vec<(u8, usize)>,
 }
 
 impl SurrogateKs {
@@ -1319,8 +1323,9 @@ impl SurrogateKs {
             pass_start: None,
             pass_coverage: None,
             shared: None,
-            collection_note: None,
+            collection_note: Vec::new(),
             source_file: None,
+            own_ref_requests: Vec::new(),
         }
     }
 
@@ -1413,6 +1418,10 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
+        // in collection mode every comparison and report is on the collection's canonical surface
+        // (`shared` module doc, "References per box"; the identity per scene)
+        let mut r = r;
+        r.energy = self.to_canonical(&h.z, h.prov.grid_n, r.energy);
         // the event's record of the solve (read before `r` and `h` are consumed below)
         let (teacher_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
         let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
@@ -1708,6 +1717,9 @@ impl ForceProvider for SurrogateKs {
             self.teacher.discontinuity();
             pass.teacher_used_elsewhere();
         }
+        // a box without its isolated-atom references in collection mode: ask the auditor for them
+        // (`shared` module doc, "References per box")
+        self.request_box_references(scene);
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
         // a failed audit of a composition this scene does not hold turns into a local fence, and back

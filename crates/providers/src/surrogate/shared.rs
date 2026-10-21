@@ -38,12 +38,27 @@
 //! * **Species growth** is today's `species_dirty` path: a sample with a new element marks the
 //!   basis dirty and the next refit rebuilds the accumulator from the whole store — every earlier
 //!   sample included — with the enlarged species set (it needs the new species' reference).
-//! * **References** (the Task 3 review's physics (c), controller ruling): a solved reference
-//!   ([`SurrogateKs::set_reference_solved`], what the sampling pass calls) is offered with its box
-//!   and face density (`Collection::offer_reference`: the box rule, odd n — the atom on a grid
-//!   node —, the largest passing box stands). The fit uses the collection's reference; one the
-//!   collection refuses is used for this session only when the collection has none, with a note.
-//!   A reference set without its box (`set_reference_energy`) is session-only.
+//! * **References per box** (M8a Task 4a fix round 2, controller ruling; the measurement:
+//!   `validate/references.md`, "M8a collection references", series (3) — within the box rule a lone
+//!   atom's energy still depends on the box length by up to ≈ 1e-2 Ha). The collection keeps a
+//!   reference per (species, box n) (`Collection::offer_reference`: the box rule, odd n), and **each
+//!   sample's fit target is E − Σ ref of its own box**. The provider keeps every collection-mode
+//!   sample's teacher energy and box (`SharedCollection::raw`, `box_n`) and fits
+//!   E_raw − Σ_i (ref(Z_i, its box) − ref_canonical(Z_i)) — with the model's references the
+//!   **canonical** ones (each species' largest box: [`SurrogateKs::display_reference`], the
+//!   reference for absolute energies), this is exactly E_raw − Σ ref(own box) as the fit's target,
+//!   and every model-vs-sample comparison downstream (residuals, leave-one-out, quarantine, fences,
+//!   audits) stays on one surface. A teacher answer entering a comparison is put on that surface the
+//!   same way ([`SurrogateKs::to_canonical`]; per scene the identity), and so is the step's reported
+//!   energy in collection mode (the teacher's own breakdown stays in `EvalStats::energy`): within a
+//!   scene the shift is a constant. The collection stores the raw answer. A sample whose box has no
+//!   reference for one of its species **waits** out of the fit (`Q_REF_WAIT`, provider-only) until
+//!   the reference arrives — from a sampling pass's reference jobs, or from the auditor, which the
+//!   provider asks itself when a scene's box lacks one (`request_box_references`; without an
+//!   auditor — the CPU teacher — a pass solves it), or with an import; rule 3's gate hands such a
+//!   box's steps to the teacher (the model cannot be judged there). When a reference arrives every
+//!   energy is rebased and the fit rebuilt (`rebase_collection`). A reference the collection refuses
+//!   (even n, box-affected) is used for its box in this session only.
 //! * **The audit history** is the collection's (`history.bin`): installed at attach, written back
 //!   (with `README.txt`) after every refit, at detach and when the provider is dropped. The class
 //!   verdict's hysteresis memory is not persisted in a collection (a reattached collection starts
@@ -104,6 +119,12 @@ pub(super) struct SharedCollection {
     waiting: usize,
     /// The audit history's [`history_stamp`] when it was last written.
     history_written: Option<(u64, u64)>,
+    /// Per stored sample: the teacher's own energy (Hartree) and the box it was solved in (grid
+    /// points per side) — module doc, "References per box".
+    pub(super) raw: Vec<f64>,
+    pub(super) box_n: Vec<usize>,
+    /// The references in use per (Z, box n): the collection's and this session's.
+    pub(super) box_refs: BTreeMap<(u8, usize), f64>,
     /// A write failed (or the collection is read-only): said once.
     write_noted: bool,
 }
@@ -188,9 +209,6 @@ impl SurrogateKs {
         self.face = vec![f64::NAN; n];
         self.quarantine = c.quarantine.clone();
         self.store = (n > 0).then_some(store);
-        for (&z, r) in &c.references {
-            self.refs.insert(z, r.energy);
-        }
         self.refs_dirty = true;
         self.pending_refit = n > 0;
         // the collection's audit history (module doc); its generations are the writers', so this
@@ -204,19 +222,29 @@ impl SurrogateKs {
         let stamp = history_stamp(&c.history);
         self.shared = Some(SharedCollection {
             link: (0..n).map(Link::In).collect(),
-            coll: c,
             prov,
             appended: 0,
             refused: BTreeMap::new(),
             waiting: 0,
             history_written: Some(stamp),
+            raw: c.samples.iter().map(|x| x.sample.energy).collect(),
+            box_n: c.samples.iter().map(|x| x.grid_n).collect(),
+            box_refs: c.references.iter().map(|(&k, r)| (k, r.energy)).collect(),
             write_noted: false,
+            coll: c,
         });
+        // the fit's energies: each sample against its own box's references (module doc)
+        self.rebase_collection();
         self.source_file = None;
         let mut note = format!(
-            "shared collection {slug} {}: {n} samples ({held_out} held out of the fit), {} references",
+            "shared collection {slug} {}: {n} samples ({held_out} held out of the fit{}), references of {} species in {} (species, box) pairs",
             if restoring { "attached again after the failed load" } else { "attached" },
-            self.refs.len()
+            match self.waiting_for_reference() {
+                0 => String::new(),
+                k => format!("; {k} wait for their box's references"),
+            },
+            self.refs.len(),
+            self.shared.as_ref().map_or(0, |s| s.box_refs.len())
         );
         if held > 0 && !restoring {
             note.push_str(&format!(" — the {held} samples held before are not in it (import a saved model file to add them)"));
@@ -318,7 +346,7 @@ impl SurrogateKs {
     /// store (created with the collection's provenance), then the offer to the collection.
     pub(super) fn push_shared(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>) -> Result<(), StoreError> {
         // the note describes this sample only (a pass sample's refusal must not reach a later step)
-        self.collection_note = None;
+        self.collection_note.clear();
         let sh = self.shared.as_ref().expect("collection mode");
         if sh.coll.admit_provenance(prov).is_err() {
             return Err(StoreError::ProvenanceMismatch);
@@ -333,16 +361,40 @@ impl SurrogateKs {
             self.quarantine.resize(n, Q_NONE);
         }
         let shared_prov = sh.prov.clone();
+        // the fit's energy: against its own box's references, or it waits (module doc)
+        let raw = s.energy;
+        let offset = self.box_offset(&s.z, prov.grid_n);
+        let mut s = s;
+        if let Some(o) = offset {
+            s.energy = raw - o;
+        }
+        let z_of = s.z.clone();
         let store = self.store.get_or_insert_with(|| SampleStore::new(shared_prov));
         store.push(s)?;
         store.provenance.record_masses(&prov.masses);
         self.face.resize(n, f64::NAN);
         self.face.push(face);
+        if offset.is_none() {
+            self.quarantine.resize(n + 1, Q_NONE);
+            self.quarantine[n] = Q_REF_WAIT;
+        }
         let sh = self.shared.as_mut().expect("collection mode");
         sh.link.resize(n, Link::Out);
         sh.link.push(Link::Out);
+        sh.raw.resize(n, f64::NAN);
+        sh.raw.push(raw);
+        sh.box_n.resize(n, 0);
+        sh.box_n.push(prov.grid_n);
         let link = self.offer(n, prov, multiplicity);
         self.shared.as_mut().expect("collection mode").link[n] = link;
+        if offset.is_none() {
+            let missing: Vec<&str> = self.box_refs_missing(&z_of, prov.grid_n).into_iter().map(symbol).collect();
+            self.collection_note.push(format!(
+                "surrogate: kept, waiting out of the fit for the isolated-atom reference of {} in its {}³ box (its fit target is E − Σ ref of its own box)",
+                missing.join(", "),
+                prov.grid_n
+            ));
+        }
         Ok(())
     }
 
@@ -351,7 +403,11 @@ impl SurrogateKs {
     /// audit, else the provider's own; an answer without a face density is refused as box status
     /// unknown (module doc).
     fn offer(&mut self, i: usize, prov: &Provenance, multiplicity: Option<u32>) -> Link {
-        let s = self.store.as_ref().expect("stored").samples[i].clone();
+        let mut s = self.store.as_ref().expect("stored").samples[i].clone();
+        // the collection keeps the teacher's own answer (module doc, "References per box")
+        if let Some(&raw) = self.shared.as_ref().and_then(|sh| sh.raw.get(i)) {
+            s.energy = raw;
+        }
         let face = self.face.get(i).copied().unwrap_or(f64::NAN);
         let draft = s.tag == SampleTag::DraftAudit || self.quarantine.get(i) == Some(&Q_DRAFT);
         let code = if face > box_affected_face_density(prov.h) {
@@ -359,7 +415,7 @@ impl SurrogateKs {
         } else if draft {
             Q_DRAFT
         } else {
-            self.quarantine.get(i).copied().unwrap_or(Q_NONE)
+            self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE)
         };
         let sh = self.shared.as_mut().expect("collection mode");
         let verdict = match sh.coll.admit(&s, prov, code) {
@@ -379,7 +435,7 @@ impl SurrogateKs {
             Err(_) if code == Q_DRAFT => {
                 sh.waiting += 1;
                 let slug = sh.coll.key.slug();
-                self.collection_note = Some(format!(
+                self.collection_note.push(format!(
                     "surrogate: held out of the strict fit, so not in the shared collection {slug} yet — it is added if a refit promotes it into the fit"
                 ));
                 Link::Waiting { grid_n: prov.grid_n, multiplicity }
@@ -387,16 +443,10 @@ impl SurrogateKs {
             Err(why) => {
                 *sh.refused.entry(why.clone()).or_default() += 1;
                 let slug = sh.coll.key.slug();
-                self.collection_note = Some(format!("surrogate: kept for this session only — the shared collection {slug} did not take it ({why})"));
+                self.collection_note.push(format!("surrogate: kept for this session only — the shared collection {slug} did not take it ({why})"));
                 Link::Out
             }
         }
-    }
-
-    /// The live step's words for a sample the collection refused or set to wait (taken once:
-    /// `keep_sample`).
-    pub(super) fn take_collection_note(&mut self) -> Option<String> {
-        self.collection_note.take()
     }
 
     /// Writes a status record for every collection sample whose quarantine code changed, and
@@ -406,7 +456,7 @@ impl SurrogateKs {
         let mut failed: Option<String> = None;
         let mut promoted: Vec<(usize, usize, Option<u32>)> = Vec::new();
         for (i, link) in sh.link.iter().enumerate() {
-            let code = self.quarantine.get(i).copied().unwrap_or(Q_NONE);
+            let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
             match *link {
                 Link::In(k) => {
                     if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
@@ -426,7 +476,7 @@ impl SurrogateKs {
             let mut prov = self.shared.as_ref().expect("collection mode").prov.clone();
             prov.grid_n = grid_n;
             let link = self.offer(i, &prov, multiplicity);
-            self.collection_note = None;
+            self.collection_note.clear();
             self.shared.as_mut().expect("collection mode").link[i] = link;
         }
     }
@@ -466,9 +516,10 @@ impl SurrogateKs {
     /// solved because their geometry was held already): `None` without a collection or when nothing
     /// was offered or skipped since the last summary.
     pub(super) fn take_collection_summary(&mut self, held: usize) -> Option<String> {
+        let wait_ref = self.waiting_for_reference();
         let sh = self.shared.as_mut()?;
         let refused: usize = sh.refused.values().sum();
-        if sh.appended == 0 && refused == 0 && sh.waiting == 0 && held == 0 {
+        if sh.appended == 0 && refused == 0 && sh.waiting == 0 && held == 0 && wait_ref == 0 {
             return None;
         }
         let why: Vec<String> = std::mem::take(&mut sh.refused).into_iter().map(|(w, n)| format!("{n} {w}")).collect();
@@ -483,6 +534,10 @@ impl SurrogateKs {
         }
         if waiting > 0 {
             text.push_str(&format!("; {waiting} draft-mode guesses held out of the strict fit wait outside it"));
+        }
+        let wait_ref = self.waiting_for_reference();
+        if wait_ref > 0 {
+            text.push_str(&format!("; {wait_ref} samples wait out of the fit for their box's isolated-atom references"));
         }
         Some(text)
     }
@@ -501,9 +556,11 @@ impl SurrogateKs {
     }
 
     /// A solved isolated-atom reference of species `z` (Hartree) with its box (`grid_n`, the solve's
-    /// face density): the sampling pass's setter. Without a collection it is
-    /// [`set_reference_energy`](Self::set_reference_energy); in collection mode it is offered to the
-    /// collection first and the fit uses the collection's reference (module doc, "References").
+    /// face density): the sampling pass's setter (and the auditor's answers in collection mode).
+    /// Without a collection it is [`set_reference_energy`](Self::set_reference_energy); in collection
+    /// mode it is offered to the collection for its (species, box) and used for that box — the
+    /// collection's stored one when it has one, else this one (for this session only when the
+    /// collection refuses it) — and every energy is rebased (module doc, "References per box").
     pub fn set_reference_solved(&mut self, z: u8, e: f64, grid_n: usize, face: Option<f64>) {
         let Some(sh) = self.shared.as_mut() else { return self.set_reference_energy(z, e) };
         let limit = box_affected_face_density(sh.coll.key.h);
@@ -511,36 +568,149 @@ impl SurrogateKs {
         let name = symbol(z);
         let offered = CollectionReference { energy: e, grid_n: Some(grid_n), face_density: face };
         let (value, note) = match sh.coll.offer_reference(z, offered, limit) {
-            Ok(ReferenceOutcome::Stored) => (e, format!("shared collection {slug}: the {name} reference {e:.6} Ha ({grid_n}³) is stored")),
-            Ok(ReferenceOutcome::Replaced { previous }) => (
-                e,
-                format!(
-                    "shared collection {slug}: the {name} reference {e:.6} Ha ({grid_n}³) replaces the one from {} ({:.6} Ha, Δ {:+.1e} Ha) — the larger box stands; the fit is rebuilt on it",
-                    previous.grid_n.map_or("an unrecorded box".to_string(), |n| format!("{n}³")),
-                    previous.energy,
-                    e - previous.energy
-                ),
-            ),
+            Ok(ReferenceOutcome::Stored) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box, {e:.6} Ha, is stored"))),
             Ok(ReferenceOutcome::Kept { stored }) => (
                 stored.energy,
-                format!(
-                    "shared collection {slug}: the {name} reference from {} ({:.6} Ha) stands — this {grid_n}³ solve ({e:.6} Ha) is no larger a box (Δ {:+.1e} Ha)",
-                    stored.grid_n.map_or("an unrecorded box".to_string(), |n| format!("{n}³")),
-                    stored.energy,
-                    e - stored.energy
-                ),
+                (stored.energy.to_bits() != e.to_bits()).then(|| format!("shared collection {slug}: the {name} reference of the {grid_n}³ box is the stored {:.6} Ha (this solve: Δ {:+.1e} Ha)", stored.energy, e - stored.energy)),
             ),
-            Ok(ReferenceOutcome::Refused(why)) => match sh.coll.references.get(&z) {
-                Some(r) => (r.energy, format!("shared collection {slug}: the {name} reference of this {grid_n}³ solve is not taken ({why}); the collection's ({:.6} Ha) stands", r.energy)),
-                None => (e, format!("shared collection {slug}: the {name} reference of this {grid_n}³ solve is not taken ({why}) — used for this session only; the collection needs one solved in a box that passes the box rule, with odd n")),
-            },
-            Err(w) => (
-                sh.coll.references.get(&z).map_or(e, |r| r.energy),
-                format!("shared collection {slug}: the {name} reference could not be written ({w}) — used for this session only"),
-            ),
+            Ok(ReferenceOutcome::Refused(why)) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box is not stored ({why}) — used for this box in this session only"))),
+            Err(w) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box could not be written ({w}) — used for this session only"))),
         };
-        self.user_notes.push(note);
-        self.set_reference_energy(z, value);
+        let changed = sh.box_refs.insert((z, grid_n), value).is_none_or(|old| old.to_bits() != value.to_bits());
+        self.user_notes.extend(note);
+        self.failed_refs.remove(&z);
+        self.legacy_refs.remove(&z);
+        if changed {
+            self.rebase_collection();
+        }
+    }
+
+    /// The canonical reference of each species: its largest box's (module doc, "References per box").
+    fn canonical_refs(box_refs: &BTreeMap<(u8, usize), f64>) -> BTreeMap<u8, f64> {
+        let mut out = BTreeMap::new();
+        for (&(z, _), &e) in box_refs {
+            out.insert(z, e); // ascending n: the largest box's comes last
+        }
+        out
+    }
+
+    /// The reference for absolute (display) energies of species `z`: in collection mode its largest
+    /// box's (module doc, "References per box"), else the model's reference.
+    pub fn display_reference(&self, z: u8) -> Option<f64> {
+        self.refs.get(&z).copied()
+    }
+
+    /// Σ_i (ref(Z_i, box n) − ref_canonical(Z_i)) over a geometry's atoms: what separates its own
+    /// box's fit target from the canonical surface. `Some(0)` without a collection; `None` when the
+    /// box lacks a reference of one of the species.
+    pub(super) fn box_offset(&self, z: &[u8], n: usize) -> Option<f64> {
+        let Some(sh) = self.shared.as_ref() else { return Some(0.0) };
+        let mut off = 0.0;
+        for &zi in z {
+            let own = sh.box_refs.get(&(zi, n))?;
+            let canon = sh.box_refs.range((zi, 0)..=(zi, usize::MAX)).next_back().map(|(_, &e)| e)?;
+            off += own - canon;
+        }
+        Some(off)
+    }
+
+    /// A teacher energy of a geometry solved in box `n` on the canonical surface (module doc,
+    /// "References per box"); unchanged without a collection or when the box lacks a reference.
+    pub(super) fn to_canonical(&self, z: &[u8], n: usize, e: f64) -> f64 {
+        self.box_offset(z, n).map_or(e, |o| e - o)
+    }
+
+    /// The inverse of [`to_canonical`](Self::to_canonical): the teacher's own energy back.
+    pub(super) fn to_raw(&self, z: &[u8], n: usize, e: f64) -> f64 {
+        self.box_offset(z, n).map_or(e, |o| e + o)
+    }
+
+    /// The species of `z` whose isolated-atom reference box `n` lacks (collection mode; empty
+    /// otherwise, and for the collection's own any-box provenance, n = 0).
+    pub(super) fn box_refs_missing(&self, z: &[u8], n: usize) -> Vec<u8> {
+        let Some(sh) = self.shared.as_ref().filter(|_| n != 0) else { return Vec::new() };
+        let mut out: Vec<u8> = z.iter().copied().filter(|&zi| !sh.box_refs.contains_key(&(zi, n))).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Samples waiting out of the fit for their box's references (`Q_REF_WAIT`).
+    pub fn waiting_for_reference(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_REF_WAIT).count()
+    }
+
+    /// Recomputes every collection-mode sample's fit energy from its teacher energy and its box's
+    /// references (module doc, "References per box"): the model's references become the canonical
+    /// ones, a sample whose box now has its references leaves the wait, one whose box lacks them
+    /// waits; anything changed rebuilds the fit at the next refit.
+    pub(super) fn rebase_collection(&mut self) {
+        let Some(sh) = self.shared.as_ref() else { return };
+        let canon = Self::canonical_refs(&sh.box_refs);
+        if canon != self.refs {
+            self.refs = canon;
+            self.refs_dirty = true;
+        }
+        let n = self.store.as_ref().map_or(0, |st| st.len());
+        let offsets: Vec<Option<f64>> = (0..n)
+            .map(|i| {
+                let sh = self.shared.as_ref().expect("collection mode");
+                let z = &self.store.as_ref().expect("stored").samples[i].z;
+                self.box_offset(z, sh.box_n[i])
+            })
+            .collect();
+        let raw = self.shared.as_ref().expect("collection mode").raw.clone();
+        let mut changed = false;
+        if !self.quarantine.is_empty() || offsets.iter().any(Option::is_none) {
+            self.quarantine.resize(n, Q_NONE);
+        }
+        for (i, off) in offsets.into_iter().enumerate() {
+            match off {
+                Some(o) => {
+                    let e = raw[i] - o;
+                    let st = self.store.as_mut().expect("stored");
+                    if st.samples[i].energy.to_bits() != e.to_bits() {
+                        st.samples[i].energy = e;
+                        changed = true;
+                    }
+                    if self.quarantine.get(i) == Some(&Q_REF_WAIT) {
+                        self.quarantine[i] = Q_NONE;
+                        changed = true;
+                    }
+                }
+                None => {
+                    if self.quarantine.get(i).is_none_or(|&q| q == Q_NONE) {
+                        self.quarantine.resize(n, Q_NONE);
+                        self.quarantine[i] = Q_REF_WAIT;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.species_dirty = true;
+            self.pending_refit = n > 0;
+        }
+    }
+
+    /// In collection mode with an auditor: asks it for every isolated-atom reference `scene`'s box
+    /// lacks (module doc, "References per box"); the answers are the provider's own (not handed on
+    /// to the driver unless it asks too).
+    pub(super) fn request_box_references(&mut self, scene: &Scene) {
+        if self.shared.is_none() || self.auditor.is_none() {
+            return;
+        }
+        let n = scene.cell.n;
+        let z: Vec<u8> = scene.nuclei.iter().map(|x| x.z).collect();
+        for zm in self.box_refs_missing(&z, n) {
+            if self.own_ref_requests.contains(&(zm, n)) {
+                continue;
+            }
+            let mass = scene.nuclei.iter().find(|x| x.z == zm).map_or(0.0, |x| x.mass);
+            if self.request_atom_reference_job(zm, mass, scene) {
+                self.own_ref_requests.push((zm, n));
+            }
+        }
     }
 
     /// Imports a `.model` file into the attached collection (module doc, "Who may open a
@@ -555,9 +725,10 @@ impl SurrogateKs {
         let limit = box_affected_face_density(sh.coll.key.h);
         let before = sh.coll.samples.len();
         let report = sh.coll.import_sidecar(path, limit)?;
-        let new: Vec<Sample> = sh.coll.samples[before..].iter().map(|c| c.sample.clone()).collect();
+        let new: Vec<(Sample, usize)> = sh.coll.samples[before..].iter().map(|c| (c.sample.clone(), c.grid_n)).collect();
         let prov = sh.prov.clone();
-        for (k, s) in (before..).zip(new) {
+        for (k, (s, grid_n)) in (before..).zip(new) {
+            let raw = s.energy;
             let z = s.z.clone();
             let n = self.store.as_ref().map_or(0, |st| st.len());
             if !self.quarantine.is_empty() {
@@ -570,6 +741,10 @@ impl SurrogateKs {
             let sh = self.shared.as_mut().expect("collection mode");
             sh.link.resize(n, Link::Out);
             sh.link.push(Link::In(k));
+            sh.raw.resize(n, f64::NAN);
+            sh.raw.push(raw);
+            sh.box_n.resize(n, 0);
+            sh.box_n.push(grid_n);
             if let Some(acc) = &self.accumulator {
                 if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
                     self.species_dirty = true;
@@ -578,6 +753,8 @@ impl SurrogateKs {
         }
         if report.imported > 0 {
             self.pending_refit = true;
+            // each against its own box's references; a box without them waits (module doc)
+            self.rebase_collection();
         }
         let slug = self.shared.as_ref().map_or_else(String::new, |s| s.coll.key.slug());
         self.user_notes.push(format!("shared collection {slug}: {} imported from {}, {} refused", report.imported, path.display(), report.refused.len()));

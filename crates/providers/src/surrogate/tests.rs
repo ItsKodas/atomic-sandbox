@@ -8193,6 +8193,8 @@ fn teach_h2_then_h2_he(s: &mut SurrogateKs) -> (usize, usize) {
     }
     s.refit().expect("the H₂ fit");
     assert_eq!(s.basis().unwrap().species, vec![1]);
+    // references are per box (fix round 2): the H reference of the 41³ box too
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
     for i in 0..30 {
         let sc = h2_he_at(1.2 + 0.6 * (i % 6) as f64 / 5.0, 2.4 + 0.15 * (i / 6) as f64, &mut rng);
         let r = s.evaluate(&sc, &mut never()).unwrap();
@@ -8228,8 +8230,8 @@ fn collection_mode_learns_across_scenes() {
     assert!((0..all).all(|i| s.collection_index(i) == Some(i)));
     assert!(c.samples[..h2_steps].iter().all(|x| x.grid_n == 33 && x.multiplicity == Some(1) && x.scene == "H2" && !x.multiplicity_forced));
     assert!(c.samples[h2_steps..].iter().all(|x| x.grid_n == 41 && x.multiplicity == Some(1) && x.scene == "H2He" && x.sample.z == vec![1, 1, 2]));
-    assert_eq!(c.references.get(&1).map(|r| (r.grid_n, r.face_density)), Some((Some(33), Some(0.0))));
-    assert_eq!(c.references.get(&2).map(|r| r.grid_n), Some(Some(41)));
+    assert_eq!(c.references.get(&(1, 33)).map(|r| (r.grid_n, r.face_density)), Some((Some(33), Some(0.0))));
+    assert_eq!(c.references.keys().copied().collect::<Vec<_>>(), vec![(1, 33), (1, 41), (2, 41)], "per (species, box)");
     let rep = s.refit().expect("the refit with the new species succeeds");
     assert_eq!(s.basis().unwrap().species, vec![1, 2], "the basis grew");
     assert_eq!(rep.n_samples, all, "the H₂ samples are still used");
@@ -8273,6 +8275,10 @@ fn a_reopened_collection_reproduces_the_same_fit() {
     s.attach_collection(&dir, &in_cell(h2(1.4), 41)).unwrap();
     assert_eq!(s.samples(), 70);
     assert!(s.model().is_none() && s.no_model().is_some_and(|n| n.missing.is_empty()), "every reference came with the collection");
+    // the per-box references round-trip (fix round 2)
+    let refs: Vec<((u8, usize), f64)> = s.collection().unwrap().references.iter().map(|(&k, r)| (k, r.energy)).collect();
+    assert_eq!(refs, vec![((1, 33), SpeciesMorse::atom(1)), ((1, 41), SpeciesMorse::atom(1)), ((2, 41), SpeciesMorse::atom(2))]);
+    assert_eq!(s.waiting_for_reference(), 0);
     let rep = s.refit().unwrap();
     assert_eq!(teacher.lock().unwrap().calls, 0, "no teacher solve: everything came from the collection");
     assert_eq!((rep.n_samples, rep.q_prime), (report.n_samples, report.q_prime));
@@ -8479,30 +8485,116 @@ fn a_rerun_pass_skips_the_geometries_the_collection_holds() {
     assert!(s.collection().unwrap().samples.len() > held);
 }
 
-/// References with their box (the Task 3 review's physics (c)): an even-n or box-affected solve is
-/// used for the session only when the collection has none; the largest passing odd box stands, and
-/// the fit uses the collection's value.
+/// References per box (fix round 2, controller ruling): stored per (species, box) by the box rule
+/// and odd n; an even-n or box-affected one is used for its box in this session only; a sample whose
+/// box lacks a reference waits out of the fit until it arrives; the display reference is the largest
+/// box's.
 #[test]
-fn the_collection_keeps_the_reference_of_the_largest_passing_box() {
+fn references_are_kept_per_box_and_samples_wait_for_theirs() {
     let dir = collection_root("refs");
     let (mut s, _) = pair_student();
     s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let mut rng = StdRng::seed_from_u64(21);
+    // an answer before any reference: kept, waiting
+    let r = s.evaluate(&h2_at(1.4, &mut rng), &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("waiting out of the fit") && n.contains("33³")), "{:?}", r.stats.notes);
+    assert_eq!((s.samples(), s.waiting_for_reference()), (1, 1));
     s.set_reference_solved(1, -0.47, 48, Some(0.0));
-    assert_eq!(s.reference_energy(1), Some(-0.47), "used for the session");
-    assert!(s.collection().unwrap().references.is_empty(), "an even box is not stored");
-    s.set_reference_solved(1, -0.4781, 33, Some(9.0));
-    assert!(s.collection().unwrap().references.is_empty(), "nor a box-affected one");
-    s.set_reference_solved(1, -0.4782, 41, Some(1e-9));
-    assert_eq!(s.reference_energy(1), Some(-0.4782));
+    assert_eq!(s.collection().unwrap().references.len(), 0, "an even box is not stored");
+    s.set_reference_solved(1, -0.4781, 41, Some(9.0));
+    assert_eq!(s.collection().unwrap().references.len(), 0, "nor a box-affected one");
+    assert_eq!(s.waiting_for_reference(), 1, "no reference of the 33³ box yet");
+    s.set_reference_solved(1, -0.4782, 33, Some(1e-9));
+    assert_eq!(s.waiting_for_reference(), 0, "its box's reference arrived");
     s.set_reference_solved(1, -0.4783, 33, Some(1e-9));
-    assert_eq!(s.reference_energy(1), Some(-0.4782), "a smaller box does not replace the 41³ one");
+    assert_eq!(s.collection().unwrap().references.get(&(1, 33)).map(|r| r.energy), Some(-0.4782), "the same box keeps its reference");
     s.set_reference_solved(1, -0.4784, 57, Some(1e-12));
-    assert_eq!(s.reference_energy(1), Some(-0.4784), "a larger one does");
-    s.set_reference_solved(1, -0.4785, 47, Some(1e5));
-    assert_eq!(s.reference_energy(1), Some(-0.4784), "a refused solve leaves the collection's");
+    assert_eq!(s.display_reference(1), Some(-0.4784), "the display reference is the largest box's");
+    assert_eq!(s.collection().unwrap().references.len(), 2);
     let notes = Trainable::take_notes(&mut s);
-    assert!(notes.iter().any(|n| n.contains("replaces the one from 41³")), "{notes:?}");
-    assert!(notes.iter().any(|n| n.contains("even grid n = 48")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("even grid n = 48") && n.contains("this session only")), "{notes:?}");
+}
+
+/// A teacher whose isolated atom depends on the box (the measured confinement of series (3) of
+/// `references.md`, "M8a collection references"): every atom's energy is raised by
+/// `BOX_SHIFT`·exp(−L/2), L = (n − 1)h the box length; the pairwise surface is [`SpeciesMorse`]'s.
+#[derive(Clone, Debug)]
+struct BoxMorse;
+
+const BOX_SHIFT: f64 = 0.1;
+
+impl BoxMorse {
+    fn atom_shift(cell: &Cell) -> f64 {
+        BOX_SHIFT * (-0.5 * (cell.n - 1) as f64 * cell.h).exp()
+    }
+}
+
+impl ForceProvider for BoxMorse {
+    fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let (e, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let energy = e + z.len() as f64 * BoxMorse::atom_shift(&scene.cell);
+        let mut stats = EvalStats::default();
+        stats.energy.total = energy;
+        stats.face_density = Some(0.0);
+        stats.multiplicity = Some(1 + (z.iter().map(|&x| x as u32).sum::<u32>() % 2));
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
+    }
+
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Fix round 2 (controller ruling): the same H₂ geometries taught in a 33³ (8 Bohr) and a 49³
+/// (12 Bohr) box, whose isolated atoms differ by the box shift. With each sample fitted against its
+/// own box's references the binding energies of the twin geometries agree and the fit is exact;
+/// with one reference shared by both boxes (the RED case: the large box's reference used for the
+/// small box's samples too) the twins disagree by 2·Δ and the fit carries that as noise.
+#[test]
+fn per_box_references_make_the_binding_energies_agree_across_boxes() {
+    let r: Vec<f64> = (0..36).map(|i| 1.1 + 1.2 * i as f64 / 35.0).collect();
+    let boxes = [33usize, 49];
+    let shift = |n: usize| BoxMorse::atom_shift(&Cell { n, h: 0.25 });
+    let delta = shift(33) - shift(49);
+    let run = |shared_reference: bool| {
+        let dir = collection_root(if shared_reference { "box-shared" } else { "box-own" });
+        let mut s = SurrogateKs::new(Box::new(BoxMorse), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.attach_collection(&dir, &h2(1.4)).unwrap();
+        for &n in &boxes {
+            // the box's own isolated atom — or, shared, the 12 Bohr box's for both
+            let e_ref = SpeciesMorse::atom(1) + if shared_reference { shift(49) } else { shift(n) };
+            s.set_reference_solved(1, e_ref, n, Some(0.0));
+        }
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut twins = Vec::new();
+        for &ri in &r {
+            let dir_v = unit_vector(&mut rng);
+            for &n in &boxes {
+                let sc = in_cell(dimer(ri, dir_v, [0.0; 3], 1, 1), n);
+                s.evaluate(&sc, &mut never()).unwrap();
+                s.discontinuity();
+            }
+            let st = s.store().unwrap();
+            twins.push((st.samples[st.len() - 2].energy, st.samples[st.len() - 1].energy));
+        }
+        let rep = s.refit().unwrap();
+        let worst = twins.iter().map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        (worst, rep.rmse_energy_per_atom, rep.n_samples)
+    };
+    let (own_worst, own_rmse, n_own) = run(false);
+    let (shared_worst, shared_rmse, n_shared) = run(true);
+    println!(
+        "per-box references: twin energies differ by at most {own_worst:.1e} Ha, fit rmse {own_rmse:.1e} Ha/atom ({n_own} samples); one shared reference: {shared_worst:.2e} Ha (2Δ = {:.2e}), rmse {shared_rmse:.1e} Ha/atom ({n_shared} samples)",
+        2.0 * delta
+    );
+    assert!(delta > 1e-3, "the premise: the boxes' atoms differ by {delta:.1e} Ha");
+    assert!(own_worst <= 1e-12, "own box: the twins' fit energies agree ({own_worst:.1e})");
+    assert!((shared_worst - 2.0 * delta).abs() <= 1e-12, "shared reference: the twins differ by the two atoms' box shift ({shared_worst:.2e})");
+    assert!(own_rmse < 0.1 * shared_rmse, "the shared reference's disagreement is fitted as noise: {own_rmse:.1e} vs {shared_rmse:.1e}");
 }
 
 /// A model file switches the provider to it (a specialised, per-scene model): the collection is let

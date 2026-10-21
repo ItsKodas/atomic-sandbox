@@ -49,6 +49,14 @@ impl SurrogateKs {
     /// In collection mode this is a session-only value (no box is recorded with it):
     /// [`set_reference_solved`](Self::set_reference_solved) is the collection's setter.
     pub fn set_reference_energy(&mut self, z: u8, e: f64) {
+        if self.shared.is_some() {
+            // collection mode: a reference is per box (`shared` module doc, "References per box")
+            self.user_notes.push(format!(
+                "shared collection: a {} reference without its box ({e:.6} Ha) is not used — references are per box; a sampling pass solves them",
+                symbol(z)
+            ));
+            return;
+        }
         self.legacy_refs.remove(&z);
         self.failed_refs.remove(&z);
         if self.refs.insert(z, e) != Some(e) {
@@ -87,7 +95,7 @@ impl SurrogateKs {
         // every scene of its surface (`shared` module doc)
         self.detach_collection();
         self.source_file = None;
-        self.collection_note = None;
+        self.collection_note.clear();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         if self.trusted() || was_model {
             self.epoch += 1;
@@ -537,7 +545,7 @@ impl SurrogateKs {
         let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN), multiplicity) {
             Ok(()) => {
-                notes.extend(self.take_collection_note());
+                notes.extend(std::mem::take(&mut self.collection_note));
                 if tag == SampleTag::DraftAudit {
                     // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
                     let n = self.samples();
@@ -590,7 +598,10 @@ impl SurrogateKs {
             return TeachOutcome::UnfitNotKept;
         }
         let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
-        let refused = a.kept && !self.keep_sample(pos, z, energy, forces, face, multiplicity, prov, tag, notes);
+        // the collection stores the teacher's own answer (`shared`, "References per box": the
+        // energy here is on the canonical surface)
+        let raw = self.to_raw(z, prov.grid_n, energy);
+        let refused = a.kept && !self.keep_sample(pos, z, raw, forces, face, multiplicity, prov, tag, notes);
         // admit may have released or superseded fenced samples: their statuses go to the collection
         self.sync_collection_status();
         if refused {

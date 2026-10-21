@@ -45,6 +45,13 @@ pub(super) const Q_HELD: u8 = surrogate::quarantine::Q_HELD;
 
 pub(super) const Q_SUPERSEDED: u8 = surrogate::quarantine::Q_SUPERSEDED;
 
+/// A collection sample whose box has no isolated-atom reference yet (M8a Task 4a fix round 2,
+/// `shared` module doc, "References per box"): its fit target E − Σ ref of its own box cannot be
+/// formed, so it waits out of the fit like a pending sample until that reference arrives. A
+/// provider-only code: never written to a file or a collection (a collection's status is its
+/// quarantine, and this is not one).
+pub(super) const Q_REF_WAIT: u8 = 5;
+
 /// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
 pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 

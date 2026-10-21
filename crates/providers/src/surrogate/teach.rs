@@ -770,6 +770,8 @@ impl SurrogateKs {
             // the settings of the scene the check was solved on (its box included: a shared
             // collection records it; per scene this equals the store's provenance)
             let prov = &self.scene_provenance(&h.scene);
+            // judged on the canonical surface (collection mode; the identity per scene)
+            let e_c = self.to_canonical(&z, prov.grid_n, h.energy);
             let mut sink = Vec::new();
             // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
             // mode reaches it (`judge_held_out`)
@@ -787,7 +789,7 @@ impl SurrogateKs {
                 match model.predict(&pos, &z, false) {
                     Ok(p) => {
                         let n = pos.len().max(1) as f64;
-                        let e = (h.energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
+                        let e = (e_c - p.energy).abs() / n / self.policy.energy_std_per_atom;
                         let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
                         Some(e.max(f))
                     }
@@ -806,7 +808,7 @@ impl SurrogateKs {
                 if r <= 1.0 {
                     passed += 1;
                 } else {
-                    failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
+                    failed.push(FailedAudit { pos, z, energy: e_c, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
                 }
             }
         }
@@ -977,7 +979,9 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = c.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = c.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else {
+            // judged on the canonical surface (collection mode; the identity per scene)
+            let c_energy = self.to_canonical(&z, c.scene.cell.n, c.energy);
+            let Some((e, f)) = self.check_ratios(&pos, &z, c_energy, &c.forces) else {
                 self.leave_shell_checks_unjudged(std::slice::from_ref(&c), "the model cannot predict this geometry");
                 continue;
             };
@@ -987,7 +991,7 @@ impl SurrogateKs {
                     c.r
                 ));
             } else {
-                let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c.energy - p.energy);
+                let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c_energy - p.energy);
                 self.user_notes.push(format!(
                     "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — a structural limitation: geometries with {name} in the cutoff shell ({:.2}–{:.2} Bohr) fall back to DFT (a shell fence); everywhere else the model answers as before{tail}",
                     c.r,
@@ -996,7 +1000,7 @@ impl SurrogateKs {
                     c.r_cut
                 ));
                 let pair = (c.pair.0.min(c.pair.1), c.pair.0.max(c.pair.1));
-                self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
+                self.audit_fences.push(FailedAudit { pos, z, energy: c_energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
             }
         }
     }

@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `key.txt` | the key, human-readable ([`SurfaceKey::to_text`]); checked on every open, so a slug collision is refused, never mixed |
 //! | `samples.bin` | the samples: magic [`MAGIC`], then append-only records (below) |
-//! | `references.txt` | isolated-atom energies, one `Z E n ρ` line each (Hartree, the solve's grid points per side, its face density in e/Bohr³; shortest round-trip decimals, `-` = unknown; "References" below) |
+//! | `references.txt` | isolated-atom energies **per box**, one `Z E n ρ` line per (species, box) (Hartree, the solve's grid points per side — the box length (n − 1)·h at the key's h —, its face density in e/Bohr³ or `-`; shortest round-trip decimals; "References" below) |
 //! | `history.bin` | the audit history ([`AuditHistory::encode`]) |
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
 //! | `.lock` | the owning process id while a writer has it open |
@@ -92,17 +92,19 @@
 //! box-dependent parts of an isolated atom's energy are controlled here
 //! ([`Collection::offer_reference`]):
 //!
-//! * **finite box**: a reference is taken only from a solve whose own face density passes the box
-//!   rule (`face_limit`, `providers::box_affected_face_density(h)` — the caller's), and among
-//!   passing ones the **largest box's** stands (a larger box replaces a stored reference, a smaller
-//!   or equal one never does; the accumulated normal equations cache E − Σref, so the provider
-//!   rebuilds its fit when a reference changes). Unknown box status is refused, like an imported
-//!   sample's. The rule bounds the face density, not the energy: within it a lone atom's energy
-//!   still falls with the box length by up to ≈ 1e-2 Ha (`validate/references.md`, "M8a collection
-//!   references", series (3)) — an open item of the box rule's calibration, recorded there.
+//! * **finite box** (M8a Task 4a fix round 2, controller ruling): within the box rule an isolated
+//!   atom's energy still depends on the box length by up to ≈ 1e-2 Ha (`validate/references.md`,
+//!   "M8a collection references", series (3)), so references are kept **per (species, box)** —
+//!   keyed by Z and n (the box length is (n − 1)·h at the key's h) — and each sample's fit target
+//!   is E − Σ ref of **its own box** (the provider's `shared` module doc). A reference is taken only
+//!   from a solve whose own face density passes the box rule (`face_limit`,
+//!   `providers::box_affected_face_density(h)`); unknown box status is refused, like an imported
+//!   sample's; a second solve of the same (species, box) keeps the stored one
+//!   ([`Collection::offer_reference`]). The largest box's reference of a species is its
+//!   **display** reference ([`Collection::largest_box_reference`]: absolute energies for display).
 //! * **egg-box phase**: the reference atom sits at the cell centre, which is a grid **node** for
 //!   odd n and a **cube centre** for even n. Only odd-n solves are taken, so every reference is at
-//!   the same lattice phase and the "largest box" comparison compares like with like. (The app's
+//!   the same lattice phase, so references of different boxes differ by their box alone. (The app's
 //!   grids are odd by construction, `app::quality`; an even-n reference is used by the provider for
 //!   its session only.) What remains is a documented approximation (CLAUDE.md rule 7): the samples
 //!   see every lattice phase, the reference one — the node's, the lowest of the high-symmetry sites
@@ -145,8 +147,8 @@ pub const REFUSE_DUPLICATE: &str = "an identical teacher answer is already in th
 pub const REFUSE_REFERENCE_SAMPLE: &str = "an isolated-atom reference solve: a collection keeps its references in references.txt, with their box";
 
 /// One isolated-atom reference of a collection (module doc, "References"): the energy (Hartree),
-/// the box it was solved in (grid points per side) and the face density of that solve (e/Bohr³).
-/// `None` = not recorded (a `references.txt` line of the two-field form).
+/// the box it was solved in (grid points per side; always `Some` for a stored reference — it is
+/// half of the key) and the face density of that solve (e/Bohr³; `None` = not recorded).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CollectionReference {
     pub energy: f64,
@@ -157,11 +159,9 @@ pub struct CollectionReference {
 /// What [`Collection::offer_reference`] did with a reference.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceOutcome {
-    /// The first reference of its species: stored.
+    /// The first reference of its (species, box): stored.
     Stored,
-    /// It replaced `previous` (a smaller box, or one of unknown box).
-    Replaced { previous: CollectionReference },
-    /// `stored` stands (a box at least as large); nothing written.
+    /// The (species, box) has one already: `stored` stands; nothing written.
     Kept { stored: CollectionReference },
     /// Not taken: why.
     Refused(String),
@@ -224,8 +224,8 @@ pub struct Collection {
     pub samples: Vec<CollectionSample>,
     /// Per sample, its current quarantine code ([`crate::quarantine`]; the latest status record).
     pub quarantine: Vec<u8>,
-    /// Isolated-atom references by Z (module doc, "References").
-    pub references: BTreeMap<u8, CollectionReference>,
+    /// Isolated-atom references by (Z, n) (module doc, "References").
+    pub references: BTreeMap<(u8, usize), CollectionReference>,
     /// The audit history ([`save_history`](Self::save_history) writes it).
     pub history: AuditHistory,
     /// Another live handle holds the lock: everything reads, nothing writes.
@@ -703,28 +703,21 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-/// One `references.txt` line: `Z E n ρ` (`-` for an unknown n or ρ), or the two-field `Z E` of a
-/// reference whose box was not recorded. `None` for anything else.
-fn parse_reference_line(line: &str) -> Option<(u8, CollectionReference)> {
+/// One `references.txt` line: `Z E n ρ` (n a number — the box is the key —, ρ a number or `-`).
+/// `None` for anything else.
+fn parse_reference_line(line: &str) -> Option<((u8, usize), CollectionReference)> {
     let f: Vec<&str> = line.split_whitespace().collect();
-    let z = f.first()?.parse::<u8>().ok().filter(|&z| z > 0)?;
-    let energy = f.get(1)?.parse::<f64>().ok().filter(|e| e.is_finite())?;
-    let (grid_n, face_density) = match f.len() {
-        2 => (None, None),
-        4 => {
-            let n = match f[2] {
-                "-" => None,
-                t => Some(t.parse::<usize>().ok()?),
-            };
-            let rho = match f[3] {
-                "-" => None,
-                t => Some(t.parse::<f64>().ok().filter(|x| x.is_finite())?),
-            };
-            (n, rho)
-        }
-        _ => return None,
+    if f.len() != 4 {
+        return None;
+    }
+    let z = f[0].parse::<u8>().ok().filter(|&z| z > 0)?;
+    let energy = f[1].parse::<f64>().ok().filter(|e| e.is_finite())?;
+    let n = f[2].parse::<usize>().ok()?;
+    let rho = match f[3] {
+        "-" => None,
+        t => Some(t.parse::<f64>().ok().filter(|x| x.is_finite())?),
     };
-    Some((z, CollectionReference { energy, grid_n, face_density }))
+    Some(((z, n), CollectionReference { energy, grid_n: Some(n), face_density: rho }))
 }
 
 fn element(z: u8) -> String {
@@ -831,8 +824,8 @@ impl Collection {
                         continue;
                     }
                     match parse_reference_line(line) {
-                        Some((z, r)) => {
-                            references.insert(z, r);
+                        Some((key, r)) => {
+                            references.insert(key, r);
                         }
                         None => report.notes.push(format!("references.txt line {}: '{line}' is not 'Z energy grid_n face_density' — ignored (that reference will be solved again)", k + 1)),
                     }
@@ -1022,20 +1015,20 @@ impl Collection {
         Ok(())
     }
 
-    /// Sets the reference of `z` as given (no rule applied: [`offer_reference`](Self::offer_reference)
-    /// is the admission) and rewrites `references.txt`.
+    /// Sets the reference of `z` in its box (`r.grid_n`, required) as given (no rule applied:
+    /// [`offer_reference`](Self::offer_reference) is the admission) and rewrites `references.txt`.
     pub fn set_reference(&mut self, z: u8, r: CollectionReference) -> Result<(), String> {
         self.writable()?;
+        let Some(n) = r.grid_n else { return Err(format!("reference Z {z}: its box is not recorded")) };
         if z == 0 || !r.energy.is_finite() || r.face_density.is_some_and(|x| !x.is_finite()) {
             return Err(format!("reference Z {z}, E {} is not a reference", r.energy));
         }
         let mut next = self.references.clone();
-        next.insert(z, r);
+        next.insert((z, n), r);
         let mut text = String::from(
             "# Atomic Sandbox collection: isolated-atom references, one 'Z E n rho' per line —\n# E the energy (Hartree), n the grid points per side of its solve, rho that solve's face density (e/Bohr^3); '-' = not recorded\n",
         );
-        for (z, r) in &next {
-            let n = r.grid_n.map_or("-".to_string(), |n| n.to_string());
+        for ((z, n), r) in &next {
             let rho = r.face_density.map_or("-".to_string(), |x| format!("{x:?}"));
             text.push_str(&format!("{z} {:?} {n} {rho}\n", r.energy));
         }
@@ -1047,9 +1040,9 @@ impl Collection {
 
     /// Offers a solved isolated-atom reference of `z` (module doc, "References"): refused for an
     /// unknown or box-affected face density (`face_limit` = the box rule at this surface's h), an
-    /// unknown box or an even n (the atom off the grid's nodes); otherwise stored when the species
-    /// has none, replacing the stored one when this box is larger (or the stored box unknown), and
-    /// kept out when it is not. `Err` only when a write it needs fails (a read-only collection).
+    /// unknown box or an even n (the atom off the grid's nodes); otherwise stored when its (species,
+    /// box) has none, and kept out when it has one. `Err` only when a write it needs fails (a
+    /// read-only collection).
     pub fn offer_reference(&mut self, z: u8, r: CollectionReference, face_limit: f64) -> Result<ReferenceOutcome, String> {
         use ReferenceOutcome::*;
         if z == 0 || !r.energy.is_finite() {
@@ -1071,17 +1064,19 @@ impl Collection {
                 "even grid n = {n}: the atom at the cell centre sits at a cube centre, not on a grid node — a collection's references are node-centred (odd n), so every box puts the atom at the same lattice phase"
             )));
         }
-        match self.references.get(&z).copied() {
+        match self.references.get(&(z, n)).copied() {
             None => {
                 self.set_reference(z, r)?;
                 Ok(Stored)
             }
-            Some(s) if s.grid_n.is_none_or(|m| m < n) => {
-                self.set_reference(z, r)?;
-                Ok(Replaced { previous: s })
-            }
             Some(s) => Ok(Kept { stored: s }),
         }
+    }
+
+    /// The reference of `z` from its largest box (n, the reference): the species' **display**
+    /// reference (module doc, "References"). `None` when the species has none.
+    pub fn largest_box_reference(&self, z: u8) -> Option<(usize, CollectionReference)> {
+        self.references.range((z, 0)..=(z, usize::MAX)).next_back().map(|(&(_, n), &r)| (n, r))
     }
 
     /// Writes [`history`](Self::history) to `history.bin`.
@@ -1148,10 +1143,10 @@ impl Collection {
         }
         for (z, e) in references {
             let name = element(z);
-            match self.references.get(&z) {
+            match self.largest_box_reference(z).map(|(_, r)| r) {
                 Some(have) if have.energy.to_bits() == e.to_bits() => {}
                 Some(have) => report.notes.push(format!(
-                    "the file's {name} reference {e:?} Ha differs from the collection's {:?} Ha by {:.1e}; the collection's is kept",
+                    "the file's {name} reference {e:?} Ha differs from the collection's (largest box) {:?} Ha by {:.1e}; the collection's are kept",
                     have.energy,
                     e - have.energy
                 )),
@@ -1226,10 +1221,8 @@ impl Collection {
         }
         t.push_str("species:\n");
         for (z, (atoms, samples)) in &species {
-            let r = self.references.get(z).map_or("no reference yet".to_string(), |r| {
-                let n = r.grid_n.map_or("box not recorded".to_string(), |n| format!("{n}³"));
-                format!("reference {:.6} Ha ({n})", r.energy)
-            });
+            let boxes: Vec<String> = self.references.range((*z, 0)..=(*z, usize::MAX)).map(|(&(_, n), r)| format!("{n}³ {:.6}", r.energy)).collect();
+            let r = if boxes.is_empty() { "no reference yet".to_string() } else { format!("references (Ha) {}", boxes.join(", ")) };
             t.push_str(&format!("  {} (Z {z}): {atoms} atoms in {samples} samples, {r}\n", element(*z)));
         }
         t.push_str(&format!("\npairs within {r_cut} Bohr (the default basis's cutoff):\n"));
@@ -1430,8 +1423,8 @@ mod tests {
             assert_eq!(a.sample.forces[0][1].to_bits(), (-0.0f64).to_bits());
         }
         assert_eq!(c.quarantine, vec![Q_NONE, Q_SUPERSEDED, Q_NONE, Q_NONE, Q_NONE]);
-        assert_eq!(c.references.get(&1).map(|r| r.energy.to_bits()), Some((-0.478_123_456_789_012_3f64).to_bits()));
-        assert_eq!(c.references.get(&1).map(|r| (r.grid_n, r.face_density)), Some((Some(49), Some(1.25e-9))));
+        assert_eq!(c.references.get(&(1, 49)).map(|r| r.energy.to_bits()), Some((-0.478_123_456_789_012_3f64).to_bits()));
+        assert_eq!(c.references.get(&(1, 49)).map(|r| (r.grid_n, r.face_density)), Some((Some(49), Some(1.25e-9))));
         assert_eq!(c.history.len(), 1);
         let folder = dir.join(key.slug());
         assert_eq!(SurfaceKey::from_text(&std::fs::read_to_string(folder.join("key.txt")).unwrap()).unwrap(), key);
@@ -1695,11 +1688,12 @@ mod tests {
         CollectionReference { energy, grid_n: Some(n), face_density: Some(face) }
     }
 
-    /// Task 4a ruling (Task 3 review, physics (c)): a reference enters only from a solve whose box
-    /// passes the box rule, with the atom on a grid node (odd n); among those the largest box's
-    /// stands; each is stored with its box and face density and survives a reopen.
+    /// Task 4a rulings (Task 3 review physics (c); fix round 2): a reference enters only from a solve
+    /// whose box passes the box rule, with the atom on a grid node (odd n); references are kept per
+    /// (species, box) — a second solve of the same box keeps the stored one — and round-trip with
+    /// their box and face density; the largest box's is the display reference.
     #[test]
-    fn a_reference_is_kept_from_the_largest_passing_odd_box() {
+    fn references_are_kept_per_box() {
         let dir = root("refs");
         let key = prov().surface_key();
         let limit = 2e-5;
@@ -1713,23 +1707,26 @@ mod tests {
             assert!(matches!(c.offer_reference(1, no_box, limit).unwrap(), ReferenceOutcome::Refused(_)));
             assert!(c.references.is_empty(), "nothing refused is stored");
             assert_eq!(c.offer_reference(1, solved(-0.4781, 49, 1e-9), limit).unwrap(), ReferenceOutcome::Stored);
-            assert_eq!(c.offer_reference(1, solved(-0.4779, 41, 1e-10), limit).unwrap(), ReferenceOutcome::Kept { stored: solved(-0.4781, 49, 1e-9) }, "a smaller box does not replace");
-            assert_eq!(c.offer_reference(1, solved(-0.4782, 49, 1e-9), limit).unwrap(), ReferenceOutcome::Kept { stored: solved(-0.4781, 49, 1e-9) }, "an equal box does not replace");
-            assert_eq!(c.offer_reference(1, solved(-0.4783, 81, 1e-12), limit).unwrap(), ReferenceOutcome::Replaced { previous: solved(-0.4781, 49, 1e-9) });
+            assert_eq!(c.offer_reference(1, solved(-0.4779, 41, 1e-10), limit).unwrap(), ReferenceOutcome::Stored, "another box is another reference");
+            assert_eq!(c.offer_reference(1, solved(-0.4782, 49, 1e-9), limit).unwrap(), ReferenceOutcome::Kept { stored: solved(-0.4781, 49, 1e-9) }, "the same box keeps its reference");
+            assert_eq!(c.offer_reference(1, solved(-0.4783, 81, 1e-12), limit).unwrap(), ReferenceOutcome::Stored);
             assert_eq!(c.offer_reference(8, solved(-15.8, 57, 1e-7), limit).unwrap(), ReferenceOutcome::Stored);
+            assert_eq!(c.largest_box_reference(1), Some((81, solved(-0.4783, 81, 1e-12))));
         }
-        let (c, _) = Collection::open(&dir, &key).unwrap();
-        assert_eq!(c.references.get(&1), Some(&solved(-0.4783, 81, 1e-12)));
-        assert_eq!(c.references.get(&8), Some(&solved(-15.8, 57, 1e-7)));
-        // a line of the old two-field form reads as a reference of unknown box, which any passing
-        // reference replaces
+        let (c, r) = Collection::open(&dir, &key).unwrap();
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        assert_eq!(c.references.len(), 4, "{:?}", c.references);
+        assert_eq!(c.references.get(&(1, 41)), Some(&solved(-0.4779, 41, 1e-10)));
+        assert_eq!(c.references.get(&(1, 49)), Some(&solved(-0.4781, 49, 1e-9)));
+        assert_eq!(c.references.get(&(1, 81)), Some(&solved(-0.4783, 81, 1e-12)));
+        assert_eq!(c.largest_box_reference(8), Some((57, solved(-15.8, 57, 1e-7))));
+        assert_eq!(c.largest_box_reference(2), None);
+        // a line not of the four-field form is ignored with a note
         let refs = dir.join(key.slug()).join("references.txt");
         std::fs::write(&refs, "1 -0.5\n").unwrap();
         drop(c);
-        let (mut c, r) = Collection::open(&dir, &key).unwrap();
-        assert!(r.notes.is_empty(), "{:?}", r.notes);
-        assert_eq!(c.references.get(&1), Some(&CollectionReference { energy: -0.5, grid_n: None, face_density: None }));
-        assert!(matches!(c.offer_reference(1, solved(-0.4783, 33, 1e-9), limit).unwrap(), ReferenceOutcome::Replaced { .. }));
+        let (c, r) = Collection::open(&dir, &key).unwrap();
+        assert!(c.references.is_empty() && r.notes.iter().any(|n| n.contains("ignored")), "{:?}", r.notes);
     }
 
     /// Fix round 1 (review I1): a stored answer and a stored geometry are found again, bit for bit,
