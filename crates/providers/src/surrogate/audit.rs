@@ -405,25 +405,29 @@ impl SurrogateKs {
     /// (a repeated request while one is queued or running is the same request). False without an
     /// auditor.
     pub fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
-        // the driver wants this one too: its answer is handed on (`shared`, "References per box")
-        let n = scene.cell.n;
-        self.own_ref_requests.retain(|&o| o != (z, n));
-        self.request_atom_reference_job(z, mass, scene)
+        self.request_atom_reference_job(z, mass, scene, true)
     }
 
-    /// [`request_atom_reference`](Self::request_atom_reference)'s job, for the driver or for the
-    /// provider itself (`shared::request_box_references`).
-    pub(super) fn request_atom_reference_job(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+    /// [`request_atom_reference`](Self::request_atom_reference)'s job, for the driver (`driver`:
+    /// its answer is handed on, always) or for the provider itself (`shared::request_box_references`).
+    /// One job per (Z, box n): a repeat — by either — joins the one queued or running (fix round 3:
+    /// a job of the same Z in another box is another job).
+    pub(super) fn request_atom_reference_job(&mut self, z: u8, mass: f64, scene: &Scene, driver: bool) -> bool {
         self.poll_side_jobs();
         if self.auditor.is_none() {
             return false;
         }
-        let pending = self.side_queue.iter().any(|j| j.2 == JobKind::Reference(z)) || self.auditor.as_ref().is_some_and(|a| a.busy == Some(JobKind::Reference(z)));
-        if pending {
+        let n = scene.cell.n;
+        if let Some(j) = self.ref_jobs.iter_mut().find(|j| j.z == z && j.n == n) {
+            j.driver |= driver;
             return true;
         }
+        // the collection the requesting scene shares, if any: only then may its answer become one
+        // of the collection's references (fix round 3, review 1)
+        let collection = self.shared.as_ref().filter(|sh| sh.coll.admit_provenance(&self.scene_provenance(scene)).is_ok()).map(|sh| sh.coll.key.slug());
         let atom = isolated_atom(z, Some(mass), scene);
         let prov = self.scene_provenance(&atom);
+        self.ref_jobs.push(super::shared::RefJob { z, n, driver, collection });
         self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
         self.pump_side_queue();
         true
@@ -443,14 +447,13 @@ impl SurrogateKs {
 
     /// Answers every reference request still queued — and `busy`'s, when it is one — with `why`
     /// (the auditor's thread is gone): each accepted request is answered exactly once.
-    pub(super) fn fail_references(&mut self, busy: Option<JobKind>, why: &str) {
-        let mut zs: Vec<u8> = self.side_queue.iter().filter_map(|j| if let JobKind::Reference(z) = j.2 { Some(z) } else { None }).collect();
-        if let Some(JobKind::Reference(z)) = busy {
-            zs.insert(0, z);
-        }
+    pub(super) fn fail_references(&mut self, _busy: Option<JobKind>, why: &str) {
+        // every job queued or running is in `ref_jobs`; the driver's are answered (fix round 3)
         self.side_queue.retain(|j| !matches!(j.2, JobKind::Reference(_)));
-        for z in zs {
-            self.atom_references.push((z, Err(ProviderError::Invalid(why.to_string()))));
+        for j in std::mem::take(&mut self.ref_jobs) {
+            if j.driver {
+                self.atom_references.push((j.z, Err(ProviderError::Invalid(why.to_string()))));
+            }
         }
     }
 
@@ -462,10 +465,8 @@ impl SurrogateKs {
         }
         if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
             if !self.send_job(scene, prov, kind, id) {
-                // the thread is gone: the references asked for are answered, the rest dropped
-                if let JobKind::Reference(z) = kind {
-                    self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher is gone".into()))));
-                }
+                // the thread is gone: the references asked for are answered (the popped one is still
+                // in `ref_jobs`), the rest dropped
                 self.fail_references(None, "the background teacher is gone");
                 self.side_queue.clear();
             }
@@ -680,22 +681,25 @@ impl SurrogateKs {
         // a reference is answered whatever the generation (its requester waits for it); one
         // abandoned by a Forget or an installed model comes back `Cancelled`
         if let (JobKind::Reference(z), Some(r)) = (ans.job.kind, ans.reference.take()) {
-            // in collection mode every solved reference is offered for its box (`shared` module
-            // doc, "References per box"); one the provider asked for itself is not handed on
+            // the job's record: who asked and which collection its scene shared (fix round 3); an
+            // answer without one (it cannot happen) is handed on and offered nowhere
             let n = ans.job.scene.cell.n;
-            if let Ok(a) = &r {
-                if self.shared.is_some() {
-                    self.set_reference_solved(z, a.energy, n, a.face_density);
-                }
+            let job = self.ref_jobs.iter().position(|j| j.z == z && j.n == n).map(|k| self.ref_jobs.remove(k));
+            let (driver, collection) = job.map_or((true, None), |j| (j.driver, j.collection));
+            // offered to the collection only when the requesting scene shared it — and it is still
+            // the one attached (`shared` module doc, "References per box"; review 1: never another
+            // surface's atom)
+            let ours = collection.is_some() && self.shared.as_ref().map(|s| s.coll.key.slug()) == collection;
+            if let (Ok(a), true) = (&r, ours) {
+                self.set_reference_solved(z, a.energy, n, a.face_density);
             }
-            if let Some(k) = self.own_ref_requests.iter().position(|&o| o == (z, n)) {
-                self.own_ref_requests.remove(k);
-                if let Err(e) = &r {
-                    self.user_notes.push(format!("shared collection: the {} reference of the {n}³ box did not solve ({e}) — its answers keep waiting (a sampling pass solves it too)", symbol(z)));
-                }
-                return;
+            if driver {
+                return self.atom_references.push((z, r));
             }
-            return self.atom_references.push((z, r));
+            if let Err(e) = &r {
+                self.user_notes.push(format!("shared collection: the {} reference of the {n}³ box did not solve ({e}) — its answers keep waiting (a sampling pass solves it too)", symbol(z)));
+            }
+            return;
         }
         let Some(a) = self.auditor.as_ref() else { return };
         if ans.job.generation != a.generation() {
@@ -751,6 +755,7 @@ impl SurrogateKs {
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // the canonical surface in collection mode (`shared` module doc; the identity per scene)
+        let raw_energy = energy;
         let energy = self.to_canonical(&z, prov.grid_n, energy);
         // the model current now is the one to judge (a refit since the dispatch is what counts);
         // with the variance: the history's point needs the model's stds here (M8a Task 1 — one
@@ -795,7 +800,7 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
+        let outcome = self.admit_and_keep(&pos, &z, energy, raw_energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound

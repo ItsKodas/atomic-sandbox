@@ -1216,9 +1216,14 @@ pub struct SurrogateKs {
     collection_note: Vec<String>,
     /// The model file the model was loaded from (`TrainableStatus::model_source`).
     source_file: Option<std::path::PathBuf>,
-    /// Isolated-atom references the provider asked the auditor for itself — (Z, box n) — whose
-    /// answers are not handed on to the driver (`shared` module doc, "References per box").
-    own_ref_requests: Vec<(u8, usize)>,
+    /// The isolated-atom reference jobs queued on or running in the auditor, one per (Z, box n),
+    /// with who asked (the driver, whose answers are always handed on, or the provider itself) and
+    /// the collection the requesting scene shared (`shared` module doc, "References per box").
+    ref_jobs: Vec<shared::RefJob>,
+    /// The change of the reported energy at the last evaluated positions that a box reference's
+    /// arrival made (the canonical surface moved under a teacher-surface report): booked into the
+    /// next evaluation's `refit_jump` (fix round 3; `shared::book_reference_arrival`).
+    offset_jump: f64,
 }
 
 impl SurrogateKs {
@@ -1325,7 +1330,8 @@ impl SurrogateKs {
             shared: None,
             collection_note: Vec::new(),
             source_file: None,
-            own_ref_requests: Vec::new(),
+            ref_jobs: Vec::new(),
+            offset_jump: 0.0,
         }
     }
 
@@ -1421,6 +1427,7 @@ impl SurrogateKs {
         // in collection mode every comparison and report is on the collection's canonical surface
         // (`shared` module doc, "References per box"; the identity per scene)
         let mut r = r;
+        let raw_energy = r.energy;
         r.energy = self.to_canonical(&h.z, h.prov.grid_n, r.energy);
         // the event's record of the solve (read before `r` and `h` are consumed below)
         let (teacher_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
@@ -1443,7 +1450,7 @@ impl SurrogateKs {
             ));
             TeachOutcome::ShellNotKept
         } else {
-            self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
+            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
         };
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
@@ -1604,6 +1611,7 @@ impl SurrogateKs {
             }
         };
         stats.solve_ms = t0.elapsed().as_millis() as u64;
+        self.take_offset_jump(&mut stats);
         stats.notes.extend(notes);
         // every note of this solve — the teacher's own and the step's, the admission's numbers
         // included (plan review S12) — but not the pending notes of other events (a background
@@ -1956,6 +1964,7 @@ impl ForceProvider for SurrogateKs {
         stats.atom_uncertainty = atom_uncertainty;
         stats.extrapolation = extrapolation;
         stats.refit_jump = self.jump_back(pred.energy, &pred.forces, &pos);
+        self.take_offset_jump(&mut stats);
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.append(&mut self.pending_notes);
@@ -1975,6 +1984,7 @@ impl ForceProvider for SurrogateKs {
         self.teacher.reset();
         self.last_fallback = false;
         self.last = None;
+        self.offset_jump = 0.0;
         self.last_variance = None; // the next consultation checks the variance afresh
     }
 
@@ -1982,6 +1992,7 @@ impl ForceProvider for SurrogateKs {
         self.teacher.discontinuity();
         self.last_fallback = false;
         self.last = None;
+        self.offset_jump = 0.0;
         self.last_variance = None;
     }
 

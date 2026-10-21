@@ -8771,3 +8771,117 @@ fn reference_lattice_phase_measurement() {
         }
     }
 }
+
+// ---- fix round 3 (re-review 2): references only from their own surface, the driver's delivered,
+// a reference's arrival booked ----
+
+/// Waits (≤ 5 s) for the auditor's reference answers handed on to the driver.
+fn await_references(s: &mut SurrogateKs, want: usize) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
+    let t0 = Instant::now();
+    let mut got = Vec::new();
+    while got.len() < want {
+        got.extend(s.take_atom_references());
+        assert!(t0.elapsed().as_secs_f64() < 5.0, "no reference answer within 5 s ({} of {want})", got.len());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    got
+}
+
+/// Re-review 2, item 1: a reference solved for a scene of another surface (another h) is handed to
+/// the driver that asked, and never becomes one of the collection's; the same request from a scene
+/// of the collection's surface is stored for its box; a box reference the provider asks for itself
+/// is stored and not handed on.
+#[test]
+fn a_reference_from_another_surface_never_enters_the_collection() {
+    let dir = collection_root("other-surface");
+    let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6).with_auditor(Box::new(SpeciesMorse::new()));
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let mass = Nucleus::new(1, [0.0; 3]).mass;
+    // another surface: h 0.2 (the collection's is 0.25)
+    let mut other = h2(1.4);
+    other.cell = Cell { n: 41, h: 0.2 };
+    let r = s.evaluate(&other, &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("does not take this scene")), "{:?}", r.stats.notes);
+    assert!(s.request_atom_reference(1, mass, &other));
+    let got = await_references(&mut s, 1);
+    assert!(matches!(got[0], (1, Ok(_))), "the driver gets its answer");
+    assert!(s.collection().unwrap().references.is_empty(), "another surface's atom never becomes a collection reference");
+    assert!(s.box_refs_missing(&[1], 41).contains(&1), "nor a reference of the 41³ box in use");
+    // the collection's own surface: the driver's request is stored too
+    assert!(s.request_atom_reference(1, mass, &in_cell(h2(1.4), 41)));
+    await_references(&mut s, 1);
+    assert_eq!(s.collection().unwrap().references.keys().copied().collect::<Vec<_>>(), vec![(1, 41)]);
+    // a box the provider asks for itself (its own scene lacks it): stored, not handed on
+    s.evaluate(&in_cell(h2(1.4), 49), &mut never()).unwrap();
+    let t0 = Instant::now();
+    while !s.collection().unwrap().references.contains_key(&(1, 49)) {
+        s.poll_side_jobs();
+        assert!(t0.elapsed().as_secs_f64() < 5.0, "the provider's own request was not answered");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(s.take_atom_references().is_empty(), "the provider's own answer is not handed to the driver");
+}
+
+/// Re-review 2, item 2: in collection mode the driver's bond reference — asked after the provider
+/// queued the same (Z, box) for itself — is delivered and the driver's reference job completes
+/// (before the fix it was swallowed and the driver waited for ever).
+#[test]
+fn the_drivers_reference_is_answered_in_collection_mode() {
+    let dir = collection_root("driver-ref");
+    let bonded = || sim::Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+    let mut s = SurrogateKs::new(Box::new(bonded()), FallbackPolicy::default()).with_auditor(Box::new(bonded()));
+    s.attach_collection(&dir, &h2(1.6)).unwrap();
+    let (p, _sh) = driven(s);
+    let mut d = Dynamics::new(h2(1.6), p, 0.25, 1);
+    assert_eq!(d.snapshot().bonds_pending, vec![1], "the constructor's density queues H");
+    let t0 = Instant::now();
+    let t = loop {
+        d.apply(DynCommand::Step(1));
+        let t = d.tick(f64::INFINITY, &mut never());
+        if t.bonds_pending.is_empty() && t.bonds.is_some() {
+            break t;
+        }
+        assert!(t0.elapsed().as_secs_f64() < 5.0, "the driver's reference never arrived: pending {:?}, notes {:?}", t.bonds_pending, t.notes);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(t.bonds.as_ref().map(|g| g.bonds.len()), Some(1));
+    // one job per (Z, box): a request for the same Z in another box is its own job, answered too
+    let s2 = _sh;
+    let mut g = surrogate_of(&s2);
+    let mass = Nucleus::new(1, [0.0; 3]).mass;
+    assert!(g.request_atom_reference(1, mass, &in_cell(h2(1.6), 41)));
+    assert!(g.request_atom_reference(1, mass, &in_cell(h2(1.6), 49)));
+    let got = await_references(&mut g, 2);
+    assert_eq!(got.len(), 2);
+}
+
+/// Re-review 2, item 3: a box reference arriving mid-run moves the canonical surface under the
+/// teacher-surface reports; the change is booked, so `E_conserved` stays continuous (the analytic
+/// box-dependent teacher: the reported energy shifts by 2·Δ ≈ 3.2e-3 Ha at the arrival).
+#[test]
+fn a_reference_arriving_mid_run_keeps_e_conserved_continuous() {
+    let dir = collection_root("arrival");
+    let scene = in_cell(h2(1.6), 33);
+    let mut s = SurrogateKs::new(Box::new(BoxMorse), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.attach_collection(&dir, &scene).unwrap();
+    // the canonical H reference: a larger box's
+    s.set_reference_solved(1, SpeciesMorse::atom(1) + BoxMorse::atom_shift(&Cell { n: 49, h: 0.25 }), 49, Some(0.0));
+    let (p, h) = driven(s);
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
+    let mut e = vec![d.snapshot().energy_conserved];
+    for k in 0..40 {
+        if k == 20 {
+            // the 33³ box's reference arrives (a pass's, or the auditor's)
+            surrogate_of(&h).set_reference_solved(1, SpeciesMorse::atom(1) + BoxMorse::atom_shift(&scene.cell), 33, Some(0.0));
+        }
+        d.apply(DynCommand::Step(1));
+        e.push(d.tick(f64::INFINITY, &mut never()).energy_conserved);
+    }
+    let shift = 2.0 * (BoxMorse::atom_shift(&scene.cell) - BoxMorse::atom_shift(&Cell { n: 49, h: 0.25 }));
+    let (verlet_spread, verlet_step) = verlet_reference(&scene, BoxMorse, 40);
+    let step = e.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f64, f64::max);
+    let spread = e.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - e.iter().cloned().fold(f64::INFINITY, f64::min);
+    println!("reference arrival: the reported surface moved by {shift:.2e} Ha; E_conserved max step {step:.2e}, spread {spread:.2e} (plain Verlet: step {verlet_step:.2e}, spread {verlet_spread:.2e})");
+    assert!(shift > 1e-3, "the premise");
+    assert!(step <= 2.0 * verlet_step + 1e-12 && spread <= 2.0 * verlet_spread + 1e-12, "E_conserved continuous across the arrival: step {step:.2e}, spread {spread:.2e}");
+}

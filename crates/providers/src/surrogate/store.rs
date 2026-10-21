@@ -96,6 +96,7 @@ impl SurrogateKs {
         self.detach_collection();
         self.source_file = None;
         self.collection_note.clear();
+        self.offset_jump = 0.0;
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         if self.trusted() || was_model {
             self.epoch += 1;
@@ -577,6 +578,7 @@ impl SurrogateKs {
         pos: &[[f64; 3]],
         z: &[u8],
         energy: f64,
+        raw_energy: f64,
         forces: &[[f64; 3]],
         face: Option<f64>,
         multiplicity: Option<u32>,
@@ -598,10 +600,10 @@ impl SurrogateKs {
             return TeachOutcome::UnfitNotKept;
         }
         let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
-        // the collection stores the teacher's own answer (`shared`, "References per box": the
-        // energy here is on the canonical surface)
-        let raw = self.to_raw(z, prov.grid_n, energy);
-        let refused = a.kept && !self.keep_sample(pos, z, raw, forces, face, multiplicity, prov, tag, notes);
+        // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
+        // the canonical surface for the comparisons; `raw_energy` exactly as solved — fix round 3,
+        // no round trip, so the duplicate check sees the teacher's bits)
+        let refused = a.kept && !self.keep_sample(pos, z, raw_energy, forces, face, multiplicity, prov, tag, notes);
         // admit may have released or superseded fenced samples: their statuses go to the collection
         self.sync_collection_status();
         if refused {

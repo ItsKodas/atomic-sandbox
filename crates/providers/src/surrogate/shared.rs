@@ -57,7 +57,11 @@
 //!   provider asks itself when a scene's box lacks one (`request_box_references`; without an
 //!   auditor — the CPU teacher — a pass solves it), or with an import; rule 3's gate hands such a
 //!   box's steps to the teacher (the model cannot be judged there). When a reference arrives every
-//!   energy is rebased and the fit rebuilt (`rebase_collection`). A reference the collection refuses
+//!   energy is rebased and the fit rebuilt (`rebase_collection`), and the change of the last
+//!   teacher-surface report is booked into the next evaluation's `refit_jump` so `E_conserved`
+//!   stays continuous (`book_reference_arrival`, fix round 3). Only a reference requested by a
+//!   scene of the collection's own surface is offered to it (`RefJob::collection`); the driver's
+//!   requests are always answered, one job per (Z, box). A reference the collection refuses
 //!   (even n, box-affected) is used for its box in this session only.
 //! * **The audit history** is the collection's (`history.bin`): installed at attach, written back
 //!   (with `README.txt`) after every refit, at detach and when the provider is dropped. The class
@@ -102,6 +106,17 @@ pub(super) enum Link {
     Out,
     /// A held-out draft guess (`Q_DRAFT`): offered again once a refit promotes it into the fit.
     Waiting { grid_n: usize, multiplicity: Option<u32> },
+}
+
+/// One isolated-atom reference job on the auditor (fix round 3): its species and box, whether the
+/// driver asked for it (then its answer is handed on, whoever else asked), and the slug of the
+/// collection the requesting scene shared (`None`: its answer is never one of a collection's
+/// references — another surface's scene, or no collection).
+pub(super) struct RefJob {
+    pub(super) z: u8,
+    pub(super) n: usize,
+    pub(super) driver: bool,
+    pub(super) collection: Option<String>,
 }
 
 /// The attached collection and the provider's bookkeeping of it (module doc).
@@ -591,7 +606,10 @@ impl SurrogateKs {
     /// collection's stored one when it has one, else this one (for this session only when the
     /// collection refuses it) — and every energy is rebased (module doc, "References per box").
     pub fn set_reference_solved(&mut self, z: u8, e: f64, grid_n: usize, face: Option<f64>) {
-        let Some(sh) = self.shared.as_mut() else { return self.set_reference_energy(z, e) };
+        if self.shared.is_none() {
+            return self.set_reference_energy(z, e);
+        }
+        let sh = self.shared.as_mut().expect("collection mode");
         let limit = box_affected_face_density(sh.coll.key.h);
         let slug = sh.coll.key.slug();
         let name = symbol(z);
@@ -605,12 +623,59 @@ impl SurrogateKs {
             Ok(ReferenceOutcome::Refused(why)) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box is not stored ({why}) — used for this box in this session only"))),
             Err(w) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box could not be written ({w}) — used for this session only"))),
         };
+        let before = self.last_report_offset();
+        let sh = self.shared.as_mut().expect("collection mode");
         let changed = sh.box_refs.insert((z, grid_n), value).is_none_or(|old| old.to_bits() != value.to_bits());
         self.user_notes.extend(note);
         self.failed_refs.remove(&z);
         self.legacy_refs.remove(&z);
         if changed {
             self.rebase_collection();
+            self.book_reference_arrival(before);
+        }
+    }
+
+    /// The canonical shift Σ(ref_own − ref_canonical) of the last report, when it was on the
+    /// teacher's surface (0 for a box without its references: the report was the raw answer);
+    /// `None` without a report or after a model-surface one (the model's answers do not move until
+    /// the refit, whose jump books them).
+    fn last_report_offset(&self) -> Option<f64> {
+        let l = self.last.as_ref().filter(|l| !l.on_model)?;
+        Some(self.box_offset(&l.z, l.provenance.grid_n).unwrap_or(0.0))
+    }
+
+    /// A reference changed the canonical surface under the last teacher-surface report (fix round
+    /// 3, review 3): the same answer would now be reported Δ = offset_before − offset_after higher.
+    /// The last report is re-expressed on the new surface (so a transition booked from it is right)
+    /// and Δ is booked into the next evaluation's `refit_jump` — position-independent (the offset
+    /// is a function of the composition and the box), so `E_conserved` stays continuous.
+    fn book_reference_arrival(&mut self, before: Option<f64>) {
+        let (Some(b), Some(a)) = (before, self.last_report_offset()) else { return };
+        let delta = b - a;
+        if delta != 0.0 {
+            if let Some(l) = self.last.as_mut() {
+                l.energy += delta;
+            }
+            self.offset_jump += delta;
+        }
+    }
+
+    /// Adds a booked reference arrival to this evaluation's `refit_jump` (once).
+    pub(super) fn take_offset_jump(&mut self, stats: &mut EvalStats) {
+        let j = std::mem::take(&mut self.offset_jump);
+        if j != 0.0 {
+            stats.refit_jump = Some(stats.refit_jump.unwrap_or(0.0) + j);
+        }
+    }
+
+    /// The code a released quarantined sample takes: back in the fit, or — in collection mode,
+    /// when its box has no reference yet — waiting for it (fix round 3, review minor 4).
+    pub(super) fn released_code(&self, i: usize) -> u8 {
+        let Some(sh) = self.shared.as_ref() else { return Q_NONE };
+        let z = self.store.as_ref().map(|st| st.samples[i].z.clone()).unwrap_or_default();
+        match sh.box_n.get(i) {
+            Some(&n) if self.box_offset(&z, n).is_none() => Q_REF_WAIT,
+            _ => Q_NONE,
         }
     }
 
@@ -647,11 +712,6 @@ impl SurrogateKs {
     /// "References per box"); unchanged without a collection or when the box lacks a reference.
     pub(super) fn to_canonical(&self, z: &[u8], n: usize, e: f64) -> f64 {
         self.box_offset(z, n).map_or(e, |o| e - o)
-    }
-
-    /// The inverse of [`to_canonical`](Self::to_canonical): the teacher's own energy back.
-    pub(super) fn to_raw(&self, z: &[u8], n: usize, e: f64) -> f64 {
-        self.box_offset(z, n).map_or(e, |o| e + o)
     }
 
     /// The species of `z` whose isolated-atom reference box `n` lacks (collection mode; empty
@@ -729,16 +789,18 @@ impl SurrogateKs {
         if self.shared.is_none() || self.auditor.is_none() {
             return;
         }
+        // only a scene of the collection's own surface (fix round 3, review 1)
+        if self.collection_refuses(&self.scene_provenance(scene)).is_some() {
+            return;
+        }
         let n = scene.cell.n;
         let z: Vec<u8> = scene.nuclei.iter().map(|x| x.z).collect();
         for zm in self.box_refs_missing(&z, n) {
-            if self.own_ref_requests.contains(&(zm, n)) {
+            if self.ref_jobs.iter().any(|j| j.z == zm && j.n == n) {
                 continue;
             }
             let mass = scene.nuclei.iter().find(|x| x.z == zm).map_or(0.0, |x| x.mass);
-            if self.request_atom_reference_job(zm, mass, scene) {
-                self.own_ref_requests.push((zm, n));
-            }
+            self.request_atom_reference_job(zm, mass, scene, false);
         }
     }
 

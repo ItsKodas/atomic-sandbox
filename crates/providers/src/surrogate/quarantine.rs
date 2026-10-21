@@ -308,7 +308,7 @@ impl SurrogateKs {
             .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces(&s.pos, &s.z, s.energy, &s.forces)))
             .collect();
         for &i in &back {
-            self.quarantine[i] = Q_NONE;
+            self.quarantine[i] = self.released_code(i);
         }
         back.len()
     }
@@ -565,7 +565,7 @@ impl SurrogateKs {
             for &i in near {
                 let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
                 if self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
-                    self.quarantine[i] = Q_NONE;
+                    self.quarantine[i] = self.released_code(i);
                     released += 1;
                 } else {
                     self.quarantine[i] = Q_SUPERSEDED;
