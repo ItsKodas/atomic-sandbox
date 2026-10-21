@@ -27,7 +27,11 @@
 //!    (`Provenance::ionic`, `crate::pseudo::provenance_tag`) follows the physics, not the menu:
 //!    `"none"` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the all-electron surface),
 //!    else `"<policy>/<recipe hash>/shared<τ>/<τ_c>/stop2x<floor>"`; the surfaces differ by tens of Ha per pseudised
-//!    atom and in bond angles, so a model taught on one is never consulted on another.
+//!    atom and in bond angles, so a model taught on one is never consulted on another. **With a
+//!    shared collection attached** (M8a Task 4a, `shared` module doc) the comparison is the
+//!    collection's surface-key check instead: any box, neutral, automatic multiplicity, the same
+//!    h, σ, tolerance, teacher and ionic tag; a charged or spin-forced scene is refused here, its
+//!    answers not kept (it keeps a per-scene model).
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
@@ -869,6 +873,13 @@
 //! sampling pass, the fallbacks and the background auditor — the sample tolerance 1e-6 (spec §4:
 //! the labels are permanent, and at the interactive 1e-5 the evidence's noise floor would be set
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
+//!
+//! **A shared collection** (M8a Task 4a, `shared` module doc) changes three things here: the
+//! store's provenance is the collection's (any box, neutral, automatic multiplicity) and a sample's
+//! check is the collection's surface-key check; a reference is offered with its box
+//! ([`set_reference_solved`](SurrogateKs::set_reference_solved): the box rule, odd n, the largest
+//! passing box stands) and the fit uses the collection's; and species growth rebuilds the
+//! accumulator from the whole collection-backed store, exactly as above.
 
 use crate::sampling::{atom_key, Sampler};
 use sim::activity::{SolveCounts, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
@@ -895,6 +906,7 @@ mod inspect;
 mod ledger;
 mod policy;
 mod quarantine;
+mod shared;
 mod store;
 mod teach;
 mod trust;
@@ -1195,6 +1207,14 @@ pub struct SurrogateKs {
     probe: Option<Arc<sim::ActivityProbe>>,
     /// One event per teaching solve and the lifetime counts (`ledger`, activity spec A2–A3).
     ledger: Ledger,
+    /// The shared collection this provider learns into (M8a Task 4a; `shared` module doc), if
+    /// attached: the process's one writable handle of it.
+    shared: Option<shared::SharedCollection>,
+    /// Why the collection refused the sample just stored (taken by `keep_sample` for the step's
+    /// note; `shared::SurrogateKs::take_collection_note`).
+    collection_note: Option<String>,
+    /// The model file the model was loaded from (`TrainableStatus::model_source`).
+    source_file: Option<std::path::PathBuf>,
 }
 
 impl SurrogateKs {
@@ -1298,6 +1318,9 @@ impl SurrogateKs {
             audit_origin: AuditOrigin::Audit,
             pass_start: None,
             pass_coverage: None,
+            shared: None,
+            collection_note: None,
+            source_file: None,
         }
     }
 
@@ -1396,6 +1419,7 @@ impl SurrogateKs {
         let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();
         let face = r.stats.face_density;
+        let multiplicity = r.stats.multiplicity;
         let model_answer = h.model.as_ref().map(|m| (m.energy, &m.forces[..]));
         let essential = h.model.is_none() && h.keep_sample && !h.thin;
         let rule = box_affected_face_density(h.prov.h);
@@ -1410,7 +1434,7 @@ impl SurrogateKs {
             ));
             TeachOutcome::ShellNotKept
         } else {
-            self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
+            self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
         };
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
@@ -1560,7 +1584,7 @@ impl SurrogateKs {
                 let at_model = self
                     .model
                     .as_ref()
-                    .filter(|m| flip && m.provenance == h.prov && m.basis.species_indices(&h.z).is_ok())
+                    .filter(|m| flip && self.same_surface(&m.provenance, &h.prov) && m.basis.species_indices(&h.z).is_ok())
                     .and_then(|m| m.predict(&h.pos, &h.z, false).ok());
                 match at_model {
                     Some(p) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - p.energy),
@@ -2103,6 +2127,9 @@ impl SurrogateKs {
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
+        if let Some(summary) = self.take_collection_summary() {
+            self.user_notes.push(summary);
+        }
         match unjudged {
             None => self.judge_shell_checks_with(shells, caveat),
             Some(why) => self.leave_shell_checks_unjudged(&shells, &why),
@@ -2168,6 +2195,9 @@ impl SurrogateKs {
     /// The model's provenance against `scene`'s, for the readouts (`TrainableStatus`).
     fn provenance_mismatch(&self, scene: &Scene) -> Option<String> {
         let want = self.provenance_for(scene);
+        if self.shared.is_some() {
+            return self.collection_refuses(&want);
+        }
         self.model.as_ref().filter(|m| m.provenance != want).map(|m| {
             let p = &m.provenance;
             format!(
@@ -2191,6 +2221,9 @@ impl Trainable for SurrogateKs {
     fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String> {
         if self.pass.is_some() {
             return Err("a pass is already running (cancel it first)".into());
+        }
+        if let Some(why) = self.collection_refuses(&self.provenance_for(scene)) {
+            return Err(format!("sampling: {why}"));
         }
         let r_cut = self.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
         let sampler = Sampler::with_cutoff(scene, plan, r_cut)?;
@@ -2348,9 +2381,13 @@ impl Trainable for SurrogateKs {
             self.ref_cache = sampler.take_references();
         }
         let n = self.samples();
+        let shared = self.shared.as_ref().map(|s| (s.coll.key.slug(), s.coll.samples.len()));
         SurrogateKs::forget(self);
         self.last_pass = None;
-        self.user_notes.push(format!("model forgotten ({n} samples dropped): the teacher answers every step"));
+        self.user_notes.push(match shared {
+            Some((slug, k)) => format!("model forgotten: the shared collection {slug} is let go — it stays on disk with its {k} samples (attach it again to use it); the teacher answers every step"),
+            None => format!("model forgotten ({n} samples dropped): the teacher answers every step"),
+        });
     }
 
     fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -2380,8 +2417,18 @@ impl Trainable for SurrogateKs {
         let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
         let n = sc.samples.len();
         let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
-        match self.install_sidecar(sc) {
+        // a model file switches the provider to it (a specialised, per-scene model); the shared
+        // collection comes back if the install fails (`shared` module doc)
+        let shared = self.detach_collection();
+        let installed = self.install_sidecar(sc);
+        if installed.is_err() {
+            if let Some(c) = shared {
+                let _ = self.attach(c);
+            }
+        }
+        match installed {
             Ok(()) => {
+                self.set_source_file(Some(path.to_path_buf()));
                 let trusted = self.trusted();
                 if s9 {
                     for (z, e) in refs {
@@ -2410,6 +2457,16 @@ impl Trainable for SurrogateKs {
         SurrogateKs::teacher_mut(self)
     }
 
+    fn attach_collection(&mut self, root: &std::path::Path, scene: &Scene) -> Result<(), String> {
+        self.attach_collection_at(root, scene)
+    }
+
+    fn import_model(&mut self, path: &std::path::Path) -> Result<sim::ImportSummary, String> {
+        let r = self.import_into_collection(path)?;
+        let refused = r.refused.into_iter().map(|(i, why)| ((i != surrogate::collection::WHOLE_FILE).then_some(i), why)).collect();
+        Ok(sim::ImportSummary { imported: r.imported, refused, notes: r.notes })
+    }
+
     fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
         SurrogateKs::retry_fit(self, scene, refs)
     }
@@ -2428,7 +2485,10 @@ impl Trainable for SurrogateKs {
             residuals: self.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
             force_bound: self.policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
             provenance_mismatch: self.provenance_mismatch(scene),
-            provenance: self.model.as_ref().map(|m| m.provenance.describe_recorded()),
+            provenance: match &self.shared {
+                Some(sh) => self.model.as_ref().map(|_| format!("shared collection {}: {} — any box, neutral, automatic multiplicity", sh.coll.key.slug(), sh.coll.key.describe())),
+                None => self.model.as_ref().map(|m| m.provenance.describe_recorded()),
+            },
             audit_every: self.policy.audit_every,
             draft: self.policy.never_fallback,
             quarantined: self.quarantined(),
@@ -2454,6 +2514,7 @@ impl Trainable for SurrogateKs {
             teach_offer: self.teach_offer(),
             no_model: self.no_model().map(|n| n.words),
             retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
+            model_source: self.model_source(),
         }
     }
 
@@ -2556,7 +2617,14 @@ impl SurrogateKs {
         let refs = set.references.clone();
         let s9 = set.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
         let n = set.samples.len();
-        self.install_samples(set).map_err(|e| format!("load model {}: {e}", path.display()))?;
+        let shared = self.detach_collection();
+        if let Err(e) = self.install_samples(set) {
+            if let Some(c) = shared {
+                let _ = self.attach(c);
+            }
+            return Err(format!("load model {}: {e}", path.display()));
+        }
+        self.set_source_file(Some(path.to_path_buf()));
         if s9 {
             for (z, e) in refs {
                 self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
@@ -2665,7 +2733,7 @@ impl SurrogateKs {
         if !nm.missing.is_empty() {
             let want = self.provenance_for(scene);
             if let Some(store) = &self.store {
-                if store.provenance != want {
+                if !self.same_surface(&store.provenance, &want) {
                     return Err(format!(
                         "the samples were taught at {} but the scene is solved at {} — the reference must be on the samples' surface (switch the scene back, or forget the samples)",
                         store.provenance.describe(),

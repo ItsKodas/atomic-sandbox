@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `key.txt` | the key, human-readable ([`SurfaceKey::to_text`]); checked on every open, so a slug collision is refused, never mixed |
 //! | `samples.bin` | the samples: magic [`MAGIC`], then append-only records (below) |
-//! | `references.txt` | isolated-atom energies, one `Z E` line each (Hartree, shortest round-trip decimal) |
+//! | `references.txt` | isolated-atom energies, one `Z E n ρ` line each (Hartree, the solve's grid points per side, its face density in e/Bohr³; shortest round-trip decimals, `-` = unknown; "References" below) |
 //! | `history.bin` | the audit history ([`AuditHistory::encode`]) |
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
 //! | `.lock` | the owning process id while a writer has it open |
@@ -79,6 +79,36 @@
 //! the `sample_face_density` array, such as a model written before the box rule) is refused as
 //! "box status unknown": the shared store takes nothing the box rule could not judge.
 //!
+//! A sample tagged `Reference` (an isolated-atom solve stored as a sample by an old file) is refused
+//! on import: the collection's references live in `references.txt` with their box, below.
+//!
+//! # References (M8a Task 4a; the Task 3 review's physics (c), controller ruling)
+//!
+//! The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`
+//! (`crate::fit`, "Isolated-atom limit"), so a reference wrong by δ_Z shifts every target by
+//! −N_Z·δ_Z — part of it is absorbed into the binding shape (biasing forces slightly), the rest
+//! inflates the energy residual, and the dissociation limit is off by δ_Z per atom. The key holds no
+//! box, so a collection's samples come from many boxes while each species has one reference. Two
+//! box-dependent parts of an isolated atom's energy are controlled here
+//! ([`Collection::offer_reference`]):
+//!
+//! * **finite box**: a reference is taken only from a solve whose own face density passes the box
+//!   rule (`face_limit`, `providers::box_affected_face_density(h)` — the caller's), and among
+//!   passing ones the **largest box's** stands (a larger box replaces a stored reference, a smaller
+//!   or equal one never does; the accumulated normal equations cache E − Σref, so the provider
+//!   rebuilds its fit when a reference changes). Unknown box status is refused, like an imported
+//!   sample's.
+//! * **egg-box phase**: the reference atom sits at the cell centre, which is a grid **node** for
+//!   odd n and a **cube centre** for even n. Only odd-n solves are taken, so every reference is at
+//!   the same lattice phase and the "largest box" comparison compares like with like. (The app's
+//!   grids are odd by construction, `app::quality`; an even-n reference is used by the provider for
+//!   its session only.) What remains is a documented approximation (CLAUDE.md rule 7): the samples
+//!   see every lattice phase, the reference one — the node's. The size of that offset is the atom's
+//!   lattice corrugation at h (`validate/references.md`, "M8a collection references").
+//!
+//! References carry no box record in a `.model` file, so [`Collection::import_sidecar`] takes none
+//! (a note per species says so); the next sampling pass solves them.
+//!
 //! # The lock
 //!
 //! `.lock` holds the process id of the writer. An open finds it absent (creates it, atomically),
@@ -108,6 +138,31 @@ pub const REFUSE_BOX: &str = "box-affected sample";
 pub const REFUSE_BOX_UNKNOWN: &str = "box status unknown (the file records no face density for this sample)";
 /// The refusal of a sample identical to a stored one (module doc, "Admission").
 pub const REFUSE_DUPLICATE: &str = "an identical teacher answer is already in the collection";
+/// The refusal of an imported `SampleTag::Reference` sample (module doc, "References").
+pub const REFUSE_REFERENCE_SAMPLE: &str = "an isolated-atom reference solve: a collection keeps its references in references.txt, with their box";
+
+/// One isolated-atom reference of a collection (module doc, "References"): the energy (Hartree),
+/// the box it was solved in (grid points per side) and the face density of that solve (e/Bohr³).
+/// `None` = not recorded (a `references.txt` line of the two-field form).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollectionReference {
+    pub energy: f64,
+    pub grid_n: Option<usize>,
+    pub face_density: Option<f64>,
+}
+
+/// What [`Collection::offer_reference`] did with a reference.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReferenceOutcome {
+    /// The first reference of its species: stored.
+    Stored,
+    /// It replaced `previous` (a smaller box, or one of unknown box).
+    Replaced { previous: CollectionReference },
+    /// `stored` stands (a box at least as large); nothing written.
+    Kept { stored: CollectionReference },
+    /// Not taken: why.
+    Refused(String),
+}
 
 fn refuse_charge(q: i32) -> String {
     format!("charge {q}: collections are neutral until M9")
@@ -166,8 +221,8 @@ pub struct Collection {
     pub samples: Vec<CollectionSample>,
     /// Per sample, its current quarantine code ([`crate::quarantine`]; the latest status record).
     pub quarantine: Vec<u8>,
-    /// Isolated-atom energies by Z, Hartree.
-    pub references: BTreeMap<u8, f64>,
+    /// Isolated-atom references by Z (module doc, "References").
+    pub references: BTreeMap<u8, CollectionReference>,
     /// The audit history ([`save_history`](Self::save_history) writes it).
     pub history: AuditHistory,
     /// Another live handle holds the lock: everything reads, nothing writes.
@@ -632,6 +687,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// One `references.txt` line: `Z E n ρ` (`-` for an unknown n or ρ), or the two-field `Z E` of a
+/// reference whose box was not recorded. `None` for anything else.
+fn parse_reference_line(line: &str) -> Option<(u8, CollectionReference)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    let z = f.first()?.parse::<u8>().ok().filter(|&z| z > 0)?;
+    let energy = f.get(1)?.parse::<f64>().ok().filter(|e| e.is_finite())?;
+    let (grid_n, face_density) = match f.len() {
+        2 => (None, None),
+        4 => {
+            let n = match f[2] {
+                "-" => None,
+                t => Some(t.parse::<usize>().ok()?),
+            };
+            let rho = match f[3] {
+                "-" => None,
+                t => Some(t.parse::<f64>().ok().filter(|x| x.is_finite())?),
+            };
+            (n, rho)
+        }
+        _ => return None,
+    };
+    Some((z, CollectionReference { energy, grid_n, face_density }))
+}
+
 fn element(z: u8) -> String {
     let s = units::elements::symbol(z);
     if s.is_empty() || s == "?" {
@@ -735,12 +814,11 @@ impl Collection {
                     if line.is_empty() || line.starts_with('#') {
                         continue;
                     }
-                    let parsed = line.split_once(' ').and_then(|(z, e)| Some((z.trim().parse::<u8>().ok()?, e.trim().parse::<f64>().ok()?)));
-                    match parsed {
-                        Some((z, e)) if z > 0 && e.is_finite() => {
-                            references.insert(z, e);
+                    match parse_reference_line(line) {
+                        Some((z, r)) => {
+                            references.insert(z, r);
                         }
-                        _ => report.notes.push(format!("references.txt line {}: '{line}' is not 'Z energy' — ignored (that reference will be solved again)", k + 1)),
+                        None => report.notes.push(format!("references.txt line {}: '{line}' is not 'Z energy grid_n face_density' — ignored (that reference will be solved again)", k + 1)),
                     }
                 }
             }
@@ -796,6 +874,13 @@ impl Collection {
     pub fn admit(&self, s: &Sample, prov: &Provenance, quarantine: u8) -> Result<(), String> {
         self.admit_settings(prov, quarantine)?;
         check_shape(s)
+    }
+
+    /// Whether samples solved at `prov` may share this collection at all — [`admit`](Self::admit)'s
+    /// rules about the settings (charge, a forced multiplicity, the surface) without a sample: what
+    /// the provider asks of a scene before it consults or teaches the shared fit there.
+    pub fn admit_provenance(&self, prov: &Provenance) -> Result<(), String> {
+        self.admit_settings(prov, Q_NONE)
     }
 
     /// [`admit`](Self::admit)'s rules about the settings and the code, in its order — the one
@@ -904,22 +989,66 @@ impl Collection {
         Ok(())
     }
 
-    /// Sets the isolated-atom energy of `z` (Hartree) and rewrites `references.txt`.
-    pub fn set_reference(&mut self, z: u8, energy: f64) -> Result<(), String> {
+    /// Sets the reference of `z` as given (no rule applied: [`offer_reference`](Self::offer_reference)
+    /// is the admission) and rewrites `references.txt`.
+    pub fn set_reference(&mut self, z: u8, r: CollectionReference) -> Result<(), String> {
         self.writable()?;
-        if z == 0 || !energy.is_finite() {
-            return Err(format!("reference Z {z}, E {energy} is not a reference"));
+        if z == 0 || !r.energy.is_finite() || r.face_density.is_some_and(|x| !x.is_finite()) {
+            return Err(format!("reference Z {z}, E {} is not a reference", r.energy));
         }
         let mut next = self.references.clone();
-        next.insert(z, energy);
-        let mut text = String::from("# Atomic Sandbox collection: isolated-atom reference energies, one 'Z E' per line (Hartree)\n");
-        for (z, e) in &next {
-            text.push_str(&format!("{z} {e:?}\n"));
+        next.insert(z, r);
+        let mut text = String::from(
+            "# Atomic Sandbox collection: isolated-atom references, one 'Z E n rho' per line —\n# E the energy (Hartree), n the grid points per side of its solve, rho that solve's face density (e/Bohr^3); '-' = not recorded\n",
+        );
+        for (z, r) in &next {
+            let n = r.grid_n.map_or("-".to_string(), |n| n.to_string());
+            let rho = r.face_density.map_or("-".to_string(), |x| format!("{x:?}"));
+            text.push_str(&format!("{z} {:?} {n} {rho}\n", r.energy));
         }
         let path = self.folder.join("references.txt");
         write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         self.references = next;
         Ok(())
+    }
+
+    /// Offers a solved isolated-atom reference of `z` (module doc, "References"): refused for an
+    /// unknown or box-affected face density (`face_limit` = the box rule at this surface's h), an
+    /// unknown box or an even n (the atom off the grid's nodes); otherwise stored when the species
+    /// has none, replacing the stored one when this box is larger (or the stored box unknown), and
+    /// kept out when it is not. `Err` only when a write it needs fails (a read-only collection).
+    pub fn offer_reference(&mut self, z: u8, r: CollectionReference, face_limit: f64) -> Result<ReferenceOutcome, String> {
+        use ReferenceOutcome::*;
+        if z == 0 || !r.energy.is_finite() {
+            return Ok(Refused(format!("Z {z}, E {}: not a reference", r.energy)));
+        }
+        let Some(rho) = r.face_density.filter(|x| x.is_finite()) else {
+            return Ok(Refused("box status unknown (the solve reports no face density)".into()));
+        };
+        if rho > face_limit {
+            return Ok(Refused(format!(
+                "box-affected: the atom's face density {rho:.2e} e/Bohr³ is above the box rule's {face_limit:.2e} — a larger cell's reference is needed"
+            )));
+        }
+        let Some(n) = r.grid_n else {
+            return Ok(Refused("box size unknown".into()));
+        };
+        if n % 2 == 0 {
+            return Ok(Refused(format!(
+                "even grid n = {n}: the atom at the cell centre sits at a cube centre, not on a grid node — a collection's references are node-centred (odd n), so every box puts the atom at the same lattice phase"
+            )));
+        }
+        match self.references.get(&z).copied() {
+            None => {
+                self.set_reference(z, r)?;
+                Ok(Stored)
+            }
+            Some(s) if s.grid_n.is_none_or(|m| m < n) => {
+                self.set_reference(z, r)?;
+                Ok(Replaced { previous: s })
+            }
+            Some(s) => Ok(Kept { stored: s }),
+        }
     }
 
     /// Writes [`history`](Self::history) to `history.bin`.
@@ -934,21 +1063,21 @@ impl Collection {
     /// samples) and per-sample ones (quarantined, box-affected — its code, or its recorded face
     /// density above `face_limit`, the box rule at this surface's h, `providers::box_affected_face_density`
     /// —, box status unknown — no face density recorded —, a draft audit, a duplicate) are all in
-    /// the report. A reference the collection lacks is
-    /// taken from the file when the file says it was made under the reference rule
-    /// ([`sidecar::REFERENCE_RULE`]); one it has is kept (a note when the file's differs). The
+    /// the report, and so is a `Reference`-tagged sample. The file's references are **not** taken:
+    /// a `.model` file records no box for them (module doc, "References"), so a note per species
+    /// says the next sampling pass solves it (or that the collection's own stands). The
     /// file's audit history is not imported (it judged that file's model, not this collection's).
     /// `Err` only for an unreadable file or a read-only collection.
     pub fn import_sidecar(&mut self, path: &Path, face_limit: f64) -> Result<ImportReport, String> {
         self.writable()?;
         let contents = sidecar::read_any(path).map_err(|e| e.to_string())?;
-        let (prov, samples, quarantine, face, references, rule) = match contents {
+        let (prov, samples, quarantine, face, references) = match contents {
             sidecar::Contents::Fitted(s) => {
                 let s = *s;
                 let refs: Vec<(u8, f64)> = s.model.basis.species.iter().copied().zip(s.model.ref_energy.iter().copied()).collect();
-                (s.model.provenance, s.samples, s.quarantine, s.face_density, refs, s.reference_rule)
+                (s.model.provenance, s.samples, s.quarantine, s.face_density, refs)
             }
-            sidecar::Contents::Samples(s) => (s.provenance, s.samples, s.quarantine, s.face_density, s.references, s.reference_rule),
+            sidecar::Contents::Samples(s) => (s.provenance, s.samples, s.quarantine, s.face_density, s.references),
         };
         let mut report = ImportReport::default();
         // the file-level rules first, in admit's order, so a whole file is refused once
@@ -963,6 +1092,10 @@ impl Collection {
         }
         let scene = path.file_stem().map_or_else(|| "imported".to_string(), |s| s.to_string_lossy().into_owned());
         for (i, s) in samples.into_iter().enumerate() {
+            if s.tag == SampleTag::Reference {
+                report.refused.push((i, REFUSE_REFERENCE_SAMPLE.to_string()));
+                continue;
+            }
             let code = if s.tag == SampleTag::DraftAudit { Q_DRAFT } else { quarantine.get(i).copied().unwrap_or(Q_NONE) };
             let rho = face.get(i).copied().unwrap_or(f64::NAN);
             let verdict = match self.admit(&s, &prov, code) {
@@ -983,13 +1116,15 @@ impl Collection {
         for (z, e) in references {
             let name = element(z);
             match self.references.get(&z) {
-                Some(&have) if have.to_bits() == e.to_bits() => {}
-                Some(&have) => report.notes.push(format!("the file's {name} reference {e:?} Ha differs from the collection's {have:?} Ha by {:.1e}; the collection's is kept", e - have)),
-                None if rule.as_deref() == Some(sidecar::REFERENCE_RULE) => {
-                    self.set_reference(z, e)?;
-                    report.notes.push(format!("{name} reference {e:?} Ha taken from the file"));
-                }
-                None => report.notes.push(format!("the file's {name} reference was not made under the reference rule ('{}'); not taken", sidecar::REFERENCE_RULE)),
+                Some(have) if have.energy.to_bits() == e.to_bits() => {}
+                Some(have) => report.notes.push(format!(
+                    "the file's {name} reference {e:?} Ha differs from the collection's {:?} Ha by {:.1e}; the collection's is kept",
+                    have.energy,
+                    e - have.energy
+                )),
+                None => report.notes.push(format!(
+                    "the file's {name} reference {e:?} Ha was not taken: the file records no box for it, and a collection takes a reference only from a solve whose box passes the box rule with the atom on a grid node (odd n) — the next sampling pass solves it"
+                )),
             }
         }
         Ok(report)
@@ -1058,7 +1193,10 @@ impl Collection {
         }
         t.push_str("species:\n");
         for (z, (atoms, samples)) in &species {
-            let r = self.references.get(z).map_or("no reference yet".to_string(), |e| format!("reference {e:.6} Ha"));
+            let r = self.references.get(z).map_or("no reference yet".to_string(), |r| {
+                let n = r.grid_n.map_or("box not recorded".to_string(), |n| format!("{n}³"));
+                format!("reference {:.6} Ha ({n})", r.energy)
+            });
             t.push_str(&format!("  {} (Z {z}): {atoms} atoms in {samples} samples, {r}\n", element(*z)));
         }
         t.push_str(&format!("\npairs within {r_cut} Bohr (the default basis's cutoff):\n"));
@@ -1240,7 +1378,7 @@ mod tests {
             c.set_status(1, Q_SUPERSEDED).unwrap();
             c.set_status(3, Q_NONE).unwrap();
             assert!(c.set_status(5, Q_HELD).is_err(), "no sample 5");
-            c.set_reference(1, -0.478_123_456_789_012_3).unwrap();
+            c.set_reference(1, CollectionReference { energy: -0.478_123_456_789_012_3, grid_n: Some(49), face_density: Some(1.25e-9) }).unwrap();
             c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7 });
             c.save_history().unwrap();
             assert_eq!(c.append(cs(2)), Err(REFUSE_DUPLICATE.to_string()), "an identical sample is refused");
@@ -1259,7 +1397,8 @@ mod tests {
             assert_eq!(a.sample.forces[0][1].to_bits(), (-0.0f64).to_bits());
         }
         assert_eq!(c.quarantine, vec![Q_NONE, Q_SUPERSEDED, Q_NONE, Q_NONE, Q_NONE]);
-        assert_eq!(c.references.get(&1).map(|e| e.to_bits()), Some((-0.478_123_456_789_012_3f64).to_bits()));
+        assert_eq!(c.references.get(&1).map(|r| r.energy.to_bits()), Some((-0.478_123_456_789_012_3f64).to_bits()));
+        assert_eq!(c.references.get(&1).map(|r| (r.grid_n, r.face_density)), Some((Some(49), Some(1.25e-9))));
         assert_eq!(c.history.len(), 1);
         let folder = dir.join(key.slug());
         assert_eq!(SurfaceKey::from_text(&std::fs::read_to_string(folder.join("key.txt")).unwrap()).unwrap(), key);
@@ -1383,7 +1522,7 @@ mod tests {
         assert_eq!(b.samples, a.samples, "a read-only open still reads");
         let e = b.append(cs(1)).unwrap_err();
         assert!(e.contains("read-only"), "{e}");
-        assert!(b.set_reference(1, -0.5).is_err());
+        assert!(b.set_reference(1, solved(-0.5, 49, 0.0)).is_err());
         assert!(b.write_readme().is_err());
         drop(b);
         assert!(lock.exists(), "a read-only handle never removes the owner's lock");
@@ -1462,12 +1601,13 @@ mod tests {
         draft.tag = SampleTag::DraftAudit;
         let mut big_box = prov();
         big_box.grid_n = 81;
-        let samples = vec![h2(0), h2(1), h2(2), h2(3), draft, h2(5), h2(0)];
-        let f = samples_file(&dir, "h2.model", &set(big_box, samples, vec![0, 1, 3, 0, 0, 0, 0], vec![1e-9, 1e-9, 1e-9, 1e-3, 1e-9, f64::NAN, 1e-9]));
+        let atom = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::Reference, weight: 1.0 };
+        let samples = vec![h2(0), h2(1), h2(2), h2(3), draft, h2(5), h2(0), atom];
+        let f = samples_file(&dir, "h2.model", &set(big_box, samples, vec![0, 1, 3, 0, 0, 0, 0, 0], vec![1e-9, 1e-9, 1e-9, 1e-3, 1e-9, f64::NAN, 1e-9, 1e-9]));
         let r = c.import_sidecar(&f, 1e-4).unwrap();
         assert_eq!(r.imported, 1, "{r:?}");
         let why: Vec<(usize, &str)> = r.refused.iter().map(|(i, s)| (*i, s.as_str())).collect();
-        assert_eq!(why.len(), 6, "{why:?}");
+        assert_eq!(why.len(), 7, "{why:?}");
         assert_eq!(why[0], (1, "quarantined sample (code 1)"));
         assert_eq!(why[1], (2, "box-affected sample"));
         assert_eq!(why[2].0, 3);
@@ -1475,9 +1615,13 @@ mod tests {
         assert_eq!(why[3], (4, "quarantined sample (code 4)"));
         assert_eq!(why[4], (5, REFUSE_BOX_UNKNOWN), "a NaN face density is not a pass");
         assert_eq!(why[5], (6, REFUSE_DUPLICATE));
+        assert_eq!(why[6], (7, REFUSE_REFERENCE_SAMPLE), "a reference solve is never a sample of the shared store");
         let got: Vec<_> = c.samples.iter().map(|s| (s.sample.clone(), s.grid_n, s.scene.clone(), s.multiplicity_forced, s.multiplicity)).collect();
         assert_eq!(got, vec![(h2(0), 81, "h2".to_string(), false, None)]);
-        assert_eq!(c.references.get(&1), Some(&-0.478), "a missing reference is taken from the file");
+        // Task 4a ruling: a file's reference carries no box record, so it is not taken (the next
+        // pass solves one in a box that passes the box rule) — and the note says so
+        assert!(c.references.is_empty(), "{:?}", c.references);
+        assert!(r.notes.iter().any(|n| n.contains("H reference") && n.contains("not taken")), "{:?}", r.notes);
         // importing the same file again adds nothing
         let r = c.import_sidecar(&f, 1e-4).unwrap();
         assert_eq!(r.imported, 0);
@@ -1505,13 +1649,54 @@ mod tests {
         let water = Sample { pos: vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]], z: vec![8, 1, 1], energy: -17.0, forces: vec![[0.0; 3]; 3], tag: SampleTag::Perturbation, weight: 1.0 };
         c.append(CollectionSample { sample: water, grid_n: 57, multiplicity_forced: false, multiplicity: None, scene: "h2o".into() }).unwrap();
         c.set_status(2, Q_HELD).unwrap();
-        c.set_reference(1, -0.478).unwrap();
+        c.set_reference(1, solved(-0.478, 49, 1e-9)).unwrap();
         c.write_readme().unwrap();
         let text = std::fs::read_to_string(dir.join(key.slug()).join("README.txt")).unwrap();
         println!("{text}");
         for want in ["lsda", "h 0.25", "4 samples", "H (Z 1)", "O (Z 8)", "H–H", "H–O", "h2o", "1 held"] {
             assert!(text.contains(want), "README lacks '{want}':\n{text}");
         }
+    }
+
+    fn solved(energy: f64, n: usize, face: f64) -> CollectionReference {
+        CollectionReference { energy, grid_n: Some(n), face_density: Some(face) }
+    }
+
+    /// Task 4a ruling (Task 3 review, physics (c)): a reference enters only from a solve whose box
+    /// passes the box rule, with the atom on a grid node (odd n); among those the largest box's
+    /// stands; each is stored with its box and face density and survives a reopen.
+    #[test]
+    fn a_reference_is_kept_from_the_largest_passing_odd_box() {
+        let dir = root("refs");
+        let key = prov().surface_key();
+        let limit = 2e-5;
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            let unknown = CollectionReference { energy: -0.47, grid_n: Some(49), face_density: None };
+            assert!(matches!(c.offer_reference(1, unknown, limit).unwrap(), ReferenceOutcome::Refused(ref w) if w.contains("box status unknown")));
+            assert!(matches!(c.offer_reference(1, solved(-0.47, 33, 3e-5), limit).unwrap(), ReferenceOutcome::Refused(ref w) if w.contains("box-affected")));
+            assert!(matches!(c.offer_reference(1, solved(-0.47, 48, 1e-9), limit).unwrap(), ReferenceOutcome::Refused(ref w) if w.contains("even")));
+            let no_box = CollectionReference { energy: -0.47, grid_n: None, face_density: Some(1e-9) };
+            assert!(matches!(c.offer_reference(1, no_box, limit).unwrap(), ReferenceOutcome::Refused(_)));
+            assert!(c.references.is_empty(), "nothing refused is stored");
+            assert_eq!(c.offer_reference(1, solved(-0.4781, 49, 1e-9), limit).unwrap(), ReferenceOutcome::Stored);
+            assert_eq!(c.offer_reference(1, solved(-0.4779, 41, 1e-10), limit).unwrap(), ReferenceOutcome::Kept { stored: solved(-0.4781, 49, 1e-9) }, "a smaller box does not replace");
+            assert_eq!(c.offer_reference(1, solved(-0.4782, 49, 1e-9), limit).unwrap(), ReferenceOutcome::Kept { stored: solved(-0.4781, 49, 1e-9) }, "an equal box does not replace");
+            assert_eq!(c.offer_reference(1, solved(-0.4783, 81, 1e-12), limit).unwrap(), ReferenceOutcome::Replaced { previous: solved(-0.4781, 49, 1e-9) });
+            assert_eq!(c.offer_reference(8, solved(-15.8, 57, 1e-7), limit).unwrap(), ReferenceOutcome::Stored);
+        }
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.references.get(&1), Some(&solved(-0.4783, 81, 1e-12)));
+        assert_eq!(c.references.get(&8), Some(&solved(-15.8, 57, 1e-7)));
+        // a line of the old two-field form reads as a reference of unknown box, which any passing
+        // reference replaces
+        let refs = dir.join(key.slug()).join("references.txt");
+        std::fs::write(&refs, "1 -0.5\n").unwrap();
+        drop(c);
+        let (mut c, r) = Collection::open(&dir, &key).unwrap();
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        assert_eq!(c.references.get(&1), Some(&CollectionReference { energy: -0.5, grid_n: None, face_density: None }));
+        assert!(matches!(c.offer_reference(1, solved(-0.4783, 33, 1e-9), limit).unwrap(), ReferenceOutcome::Replaced { .. }));
     }
 
     #[test]

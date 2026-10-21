@@ -3844,3 +3844,42 @@ Flips (ruling B): met — cadence 50: pair 11 (6 + 5; every loss the LOO floor a
 **Documented gap (rule 7): the many-body class answers rare steps beyond 1× its force bound.** Rule 6 bounds the *predicted* std, not the error: for a calibrated Gaussian posterior at std = bound an atom's error exceeds 1× its bound with P(χ²₃/3 > 1) ≈ 39 %, so a class allowed to answer near its bound will be audited beyond 1× now and then however well its std is calibrated. Measured with the inflation (audits per point while the class was trusted): **cadence 50 — 1 of 11** many-body audits beyond 1× (‖ΔF‖ 6.6e-3 Ha/Bohr ≈ 1.9× its bound, energy inside the tier; the test's own checker: 35 of 243 judged hot answers between 1× and 2.87×, none beyond 3× or the tier); **cadence 10 — 1 of 3** (‖ΔF‖ 2.1e-2 Ha/Bohr at z 43 against the model's own std — ≈ 3.5 inflated sigmas: λ calibrates the rms, not a heavy tail — and |ΔE|/N 1.5e-3 Ha/atom, past the tier), caught by that rule-8 audit, which untrusted the model until re-earned (the following model-surface steps fell back). The gated repro (audits off) judged all 65 checked hot answers within 1× (worst 0.97×). **Why the b35166e baseline's 0 is not comparable**: its max rule refused the many-body class almost throughout the repro (26–32 hot answers, 1–4 many-body audits), so it had almost no audited many-body answers to count; a verdict that lets the class answer is measured on 11 and 3 audits and hundreds of checked answers.
 
 **Open item for the physics re-review (fix round 3, concern 3): the inflated rule 6 starves the verdict's evidence window.** Steps the inflated rule 6 refuses are rule-6 points (codes 14/15) — the posterior's evidence (λ), not the class verdict's (audits and rule-4b only). Once a class is trusted, the refusals that would have been its rule-4b evidence become rule-6 points, and its verdict window keeps its older comparisons: at cadence 50 the many-body class stayed trusted from step 4275 on 3 points (W 0.28) while rule 6 (24 hot fallbacks) and the audits (161 rule-8 fallbacks) did the refusing, and it answered 442 hot steps (fix round 2: 105). Whether rule-6 refusals of a trusted class should feed its verdict (they are geometries the class would decide but for the std) is for the re-review to rule on.
+
+## M8a collection references and the class-LOO cost (Task 4a, 2026-10-21; `surrogate::collection` "References", `providers::surrogate::shared`)
+
+**The problem** (Task 3 review, physics (c)). The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`, so a reference wrong by δ_Z shifts every target by −N_Z·δ_Z (partly absorbed into the binding shape — a small force bias —, the rest into the energy residual) and moves the dissociation limit by δ_Z per atom. A collection's key holds no box, so its samples come from many boxes while each species has one reference. Two box-dependent parts of an isolated atom's energy:
+
+- **Finite box** — controlled: a reference enters a collection only from a solve whose own face density passes the box rule `box_affected_face_density(h)`; among passing ones the **largest box's** stands (a larger box replaces, a smaller or equal one never does; the replacement rebuilds the fit, since the accumulated normal equations cache E − Σref). Unknown box status is refused. A `.model` file's references carry no box record and are not imported (a note says so; the next pass solves them). `Reference`-tagged samples are refused on import.
+- **Lattice phase** — **decision: odd n only.** The reference atom sits at the cell centre: a grid node for odd n, a cube centre for even n. Only odd-n solves enter a collection, so every reference has the same lattice phase and "the largest box" compares like with like. Cost: none in the app — `app::quality` makes every grid odd by construction; an even-n reference (a scene file with even n) is used for its session only, with a note. The alternative (measure the node/cube-centre gap and accept either) was not taken: the gap is species- and h-dependent (measured below), and fixing the phase removes it from the comparison instead of bounding it.
+
+**Measured node vs cube centre** (`reference_lattice_phase_measurement`, `#[ignore]`d; GPU RX 7900 XTX, tol 1e-7, isolated atom at the cell centre, same box ± h; E_cube − E_node):
+
+| atom (multiplicity) | h (Bohr) | node, odd n | cube centre, even n | E_cube − E_node (Ha) |
+|---|---|---|---|---|
+| H all-electron (2) | 0.25 | −0.42422421 (49³) | −0.42410802 (48³) | **+1.16e-4** |
+| H all-electron (2) | 0.20 | −0.43831683 (61³) | −0.43823232 (60³) | **+8.45e-5** |
+| H all-electron (2) | 0.15 | −0.45208075 (81³) | −0.45202265 (80³) | **+5.81e-5** |
+| O all-electron (3) | 0.25 | SCF not converged (200 iterations, Δρ 1.0e-3 / 1.6e-3) | | — |
+| O all-electron (3) | 0.20 | −40.20158957 (61³) | −40.20045101 (60³) | **+1.14e-3** |
+| O all-electron (3) | 0.15 | −45.16014534 (81³) | −45.15945677 (80³) | **+6.89e-4** |
+| O pseudised, `CoresOnly` (3) | 0.25 | refused: h_req 0.20 | | — |
+| O pseudised, `CoresOnly` (3) | 0.20 | −16.10591461 (61³) | −16.10585938 (60³) | **+5.52e-5** |
+| O pseudised, `CoresOnly` (3) | 0.15 | −16.10469707 (81³) | −16.10465739 (80³) | **+3.97e-5** |
+
+The node is the lower site in every case. The two boxes of a row differ by h in length; the face densities (2–10e-7 e/Bohr³, both passing the box rule) put the confinement part of the difference at ≈ 1–11 % of the gap by the box rule's own scale (≈ 50 Ha per e/Bohr³ at h = 0.25, × (0.25/h)²; "Box-affected answers" — measured on H₂, so for O an estimate), so the gap is the lattice phase. It is 4–110 × the fits' per-atom energy noise (s_E ≈ 1e-5 Ha/atom on the H₂ passes): a reference of the other phase would shift a collection's targets by that much per atom, which is why the phase is fixed rather than bounded.
+
+**What stays approximate (rule 7).** The samples see every lattice phase; the reference is the node's. The model's isolated-atom limit is therefore the node-site energy, not the phase average the samples' egg-box scatter is centred on: an offset of at most |E_cube − E_node| (the two cubic sites bracket the corrugation along the lattice's high-symmetry path; the off-axis sites of the pseudo-O record above, "Site dependence", lie up to 4.1 mHa lower under the superseded round-1 rule). Per-scene models carry the same offset today (their reference is also solved at the cell centre). Not corrected here: the phase average would need several off-centre solves per species and per box.
+
+**Class-LOO cost at collection sizes** (`class_loo_cost_at_collection_sizes`, `#[ignore]`d; CPU, Ryzen 7 9800X3D, release; a pairwise-Morse teacher over H/He, 2–4 atoms per sample; reported for Task 5, which owns the interactive refit):
+
+| species (Q′) | samples | refit, with its LOO pass and any trust recovery (s) | class LOO pass alone (s) | per sample (ms) |
+|---|---|---|---|---|
+| H, He (176) | 500 | 2.10 | 0.08 | 0.16 |
+| H, He (176) | 1000 | 2.40 | 0.17 | 0.17 |
+| H, He (344: the recovery's degree cap 6) | 2000 | 21.0 | 1.14 | 0.57 |
+| H, He (344) | 4000 | 27.1 | 2.27 | 0.57 |
+| H, He, Li, Be (1232; `LOO_S4=1`) | 1500 | **639** | 10.7 | **7.1** |
+
+At 10 000 samples the LOO pass alone is ≈ 6 s at Q′ 344 and ≈ 71 s at Q′ 1232 (linear in the samples, measured slope) — against the spec's target of a refit under 1 s at 10 000 samples (§4.2), and the refit itself is the larger part (S = 4: 639 s at 1500 samples, M5's 260 s first refit measured on a smaller store). Task 5's interactive refit has to replace both, not only the LOO pass.
+
+The leave-one-out pass is linear in the samples and quadratic in Q′ (3N + 1 rows per sample, triangular solves of size Q′: 0.16 → 0.57 → 7.1 ms/sample for Q′ 176 → 344 → 1232, ratios 3.6 and 12.5 against (Q′ ratio)² 3.8 and 12.8). The refit around it is the larger cost (the hyperparameter search and the trust recovery's extra fits: the degree-cap retry raised Q′ to 344 at 2000 samples and multiplied the refit time by ≈ 9). Not optimised here (the brief: Task 5 owns the interactive refit).

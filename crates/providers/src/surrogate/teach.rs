@@ -752,7 +752,7 @@ impl SurrogateKs {
         };
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
-        let prov = self.store.as_ref().map(|s| s.provenance.clone());
+        let has_store = self.store.is_some();
         let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
         // R3-2: the checks judged near each blocker
@@ -764,12 +764,17 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = h.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = h.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some(prov) = prov.as_ref() else { continue };
+            if !has_store {
+                continue;
+            }
+            // the settings of the scene the check was solved on (its box included: a shared
+            // collection records it; per scene this equals the store's provenance)
+            let prov = &self.scene_provenance(&h.scene);
             let mut sink = Vec::new();
             // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
             // mode reaches it (`judge_held_out`)
             if self.geometry_refusal(&pos, &z).is_some() {
-                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::DraftAudit, &mut sink) {
+                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, None, prov, SampleTag::DraftAudit, &mut sink) {
                     deferred += 1;
                     *deferred_near.entry(h.blocker).or_insert(0) += 1;
                 }
@@ -790,7 +795,7 @@ impl SurrogateKs {
                 }
             };
             // judged, then kept (SHOULD-T4): validate, then train on all
-            if !self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::Targeted, &mut sink) {
+            if !self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, None, prov, SampleTag::Targeted, &mut sink) {
                 continue;
             }
             let index = self.samples() - 1;

@@ -210,6 +210,8 @@ pub(super) struct Solved {
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
     pub(super) face: Option<f64>,
+    /// The multiplicity the teacher solved at (`EvalStats::multiplicity`).
+    pub(super) multiplicity: Option<u32>,
     pub(super) display: Option<Display>,
     pub(super) orbitals: Option<OrbitalDisplay>,
     /// Why this answer must not be trained on (`EvalStats::untrainable`), if it must not.
@@ -298,7 +300,7 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     scf_steps = Some(r.stats.scf_steps);
-                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
+                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, multiplicity: r.stats.multiplicity, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
@@ -704,11 +706,11 @@ impl SurrogateKs {
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals, unfit })) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, unfit, ans.ms, ans.scf_steps);
+                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps);
             }
         }
     }
@@ -717,7 +719,8 @@ impl SurrogateKs {
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
     /// outcome) or discarded (plan review S11).
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, draft_guess, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
@@ -729,7 +732,7 @@ impl SurrogateKs {
         let pred = self
             .model
             .as_ref()
-            .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
+            .filter(|m| self.same_surface(&m.provenance, &prov) && m.basis.species_indices(&z).is_ok())
             .and_then(|m| m.predict(&pos, &z, true).ok());
         let Some(pred) = pred else {
             let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
@@ -766,7 +769,7 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
+        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound

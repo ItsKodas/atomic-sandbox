@@ -298,14 +298,16 @@ impl SurrogateKs {
         let Some(model) = &self.model else {
             return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, dedup: false, untrusted: false });
         };
-        if model.provenance != *prov {
+        if !self.same_surface(&model.provenance, prov) {
+            // in collection mode the collection's own reason (a charged scene keeps a per-scene
+            // model; `shared` module doc), else the two provenances
+            let text = match self.collection_refuses(prov) {
+                Some(why) => format!("surrogate: {why} — sample not kept"),
+                None => format!("surrogate: scene ({}) differs from the model's ({}) — sample not kept", prov.describe(), model.provenance.describe()),
+            };
             return Err(Gate {
                 reason: Refusal::new(
-                    format!(
-                        "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
-                        prov.describe(),
-                        model.provenance.describe()
-                    ),
+                    text,
                     TeachRule::OtherSettings,
                     None,
                 ),

@@ -36,7 +36,7 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
-pub use collection::{Collection, CollectionSample, ImportReport, OpenReport};
+pub use collection::{Collection, CollectionReference, CollectionSample, ImportReport, OpenReport, ReferenceOutcome};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, HISTORY_CAP};
 pub use novelty::NullSpace;

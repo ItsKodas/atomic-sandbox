@@ -212,8 +212,11 @@ impl ReferenceKey {
 
 /// One isolated-atom reference: the energy (Hartree) with the multiplicity that won the scan
 /// (`None` for an energy carried by a loaded model), the tolerance and the solver it was solved
-/// at (the key's, kept with the entry — spec §3.2), and the radial density (empty until solved
-/// with a density, module doc).
+/// at (the key's, kept with the entry — spec §3.2), the radial density (empty until solved
+/// with a density, module doc) and the winning solve's face density (e/Bohr³,
+/// `EvalStats::face_density`: how much the cell confines the atom — a shared collection takes a
+/// reference only when it passes the box rule, M8a Task 4a; `None` for a seeded energy or a
+/// provider without a grid).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtomReference {
     pub energy: f64,
@@ -221,6 +224,7 @@ pub struct AtomReference {
     pub tol: f64,
     pub provider: String,
     pub radial: RadialDensity,
+    pub face_density: Option<f64>,
 }
 
 /// The references solved so far (module doc, "Ownership").
@@ -250,7 +254,7 @@ impl AtomReferences {
         if self.get(&key).is_some_and(|r| !r.radial.is_empty()) {
             return;
         }
-        self.insert(key, AtomReference { energy: e, multiplicity, tol, provider: provider.to_string(), radial: RadialDensity::default() });
+        self.insert(key, AtomReference { energy: e, multiplicity, tol, provider: provider.to_string(), radial: RadialDensity::default(), face_density: None });
     }
 
     /// The species of `species` (in order, each once) with no entry under `key_for(z)` or an entry
@@ -320,8 +324,8 @@ pub struct AtomScan {
     sigma: Option<f64>,
     ionic: IonicPolicy,
     remaining: Vec<u32>,
-    /// (multiplicity, energy, its radial density), in the order solved.
-    tried: Vec<(u32, f64, RadialDensity)>,
+    /// (multiplicity, energy, its radial density, the solve's face density), in the order solved.
+    tried: Vec<(u32, f64, RadialDensity, Option<f64>)>,
     failed: Vec<(u32, String)>,
     /// The multiplicities whose first-round solve the device lost (retried once after the first
     /// round: module doc, "The retry round").
@@ -414,7 +418,7 @@ impl AtomScan {
             if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
                 return Err(ProviderError::Invalid(format!("provider '{}' returned a non-finite energy or force", provider.name())));
             }
-            Ok(r.energy)
+            Ok((r.energy, r.stats.face_density))
         });
         let r = match outcome {
             Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
@@ -429,10 +433,10 @@ impl AtomScan {
                 }
                 Err(e)
             }
-            Ok(e) => {
+            Ok((e, face)) => {
                 self.remaining.remove(0);
                 let radial = read_radial(provider, &self.cell);
-                self.tried.push((m, e, radial));
+                self.tried.push((m, e, radial, face));
                 Ok(Some((m, e)))
             }
         };
@@ -448,7 +452,7 @@ impl AtomScan {
     /// `None` when nothing was solved. `tol` and `provider` are recorded with it.
     pub fn finish(self, tol: f64, provider: &str) -> Option<AtomReference> {
         let best = self.tried.into_iter().min_by(|a, b| a.1.total_cmp(&b.1))?;
-        Some(AtomReference { energy: best.1, multiplicity: Some(best.0), tol, provider: provider.to_string(), radial: best.2 })
+        Some(AtomReference { energy: best.1, multiplicity: Some(best.0), tol, provider: provider.to_string(), radial: best.2, face_density: best.3 })
     }
 }
 
@@ -712,7 +716,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&key(1)).map(|r| (r.energy, r.multiplicity)), Some((-0.478, None)));
         assert_eq!(refs.missing(key, &[1, 8]), vec![1, 8], "a seeded energy has no table");
-        let full = AtomReference { energy: -0.47, multiplicity: Some(2), tol: 1e-6, provider: "t".into(), radial: RadialDensity::from_fn(|r| (-2.0 * r).exp(), 5.0, 0.125) };
+        let full = AtomReference { energy: -0.47, multiplicity: Some(2), tol: 1e-6, provider: "t".into(), radial: RadialDensity::from_fn(|r| (-2.0 * r).exp(), 5.0, 0.125), face_density: None };
         refs.insert(key(1), full.clone());
         assert_eq!(refs.missing(key, &[1, 8]), vec![8]);
         // a seed never overwrites a solved table

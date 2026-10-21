@@ -22,7 +22,7 @@
 //!    `gpu_oxygen_reference_multiplicity`) Hund's rule emerges: the triplet −16.106125 Ha below the
 //!    singlet −16.050056 (56.07 mHa; radial KB 56.06) and the quintet −15.756806. A multiplicity whose solve fails is
 //!    noted and left out; only if none succeeds does the pass end. The energy is set with
-//!    `SurrogateKs::set_reference_energy` — never a table — and cached with its multiplicity
+//!    `SurrogateKs::set_reference_solved` (with its box: a shared collection keeps it by the box rule, odd n) — never a table — and cached with its multiplicity
 //!    in a [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a
 //!    later pass at the same settings skips the scan. The sidecar records the rule
 //!    ([`surrogate::sidecar::REFERENCE_RULE`]); references from a file without it are not
@@ -125,7 +125,7 @@
 //! numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
-//! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
+//! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_answer`, with the solved multiplicity), so
 //! the box rule (`crate::surrogate::box_affected_face_density`) applies to the pass as it does to
 //! live answers: on a small box a scan to 1.8 r₀ or a 2000 K burst reaches geometries whose
 //! labels carry the box's confinement; they are kept (the model is still being built), never
@@ -1109,7 +1109,8 @@ impl Sampler {
                         // surface's energy
                         if let Some(r) = self.refs.get(&key) {
                             let (e, m) = (r.energy, r.multiplicity);
-                            surrogate.set_reference_energy(z, e);
+                            // with its box: a shared collection takes it only by the box rule (`surrogate::shared`)
+                            surrogate.set_reference_solved(z, e, self.scene.cell.n, r.face_density);
                             self.progress.done += scan.remaining().len();
                             let m = m.map_or("from a loaded model".to_string(), |m| format!("multiplicity {m}"));
                             self.notes.push(format!("sampling: reference {} (Z = {z}) from the cache: E = {e:.6} Ha, {m}", symbol(z)));
@@ -1200,9 +1201,9 @@ impl Sampler {
                         self.finish();
                         return Err(failure.expect("no success means the last solve failed"));
                     };
-                    let (m_best, e_best) = (r.multiplicity.expect("a solved scan has its multiplicity"), r.energy);
+                    let (m_best, e_best, face) = (r.multiplicity.expect("a solved scan has its multiplicity"), r.energy, r.face_density);
                     self.refs.insert(key, r);
-                    surrogate.set_reference_energy(z, e_best);
+                    surrogate.set_reference_solved(z, e_best, self.scene.cell.n, face);
                     let others: Vec<String> = tried.iter().filter(|t| t.0 != m_best).map(|(m, e)| format!("{m} ({e:.6})")).collect();
                     let c = &self.scene.cell;
                     self.notes.push(format!(
@@ -1478,7 +1479,7 @@ impl Sampler {
     /// density (module doc, "Box-affected samples"), and leaves its activity event (`burst_t`: a
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
-        let face = r.stats.face_density;
+        let (face, multiplicity) = (r.stats.face_density, r.stats.multiplicity);
         // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
         if let Some(why) = r.stats.untrainable() {
             let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
@@ -1508,7 +1509,7 @@ impl Sampler {
             weight: 1.0,
         };
         let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
-        let outcome = match surrogate.add_sample_with_face(sample, scene, face) {
+        let outcome = match surrogate.add_sample_answer(sample, scene, face, multiplicity) {
             Ok(()) => {
                 self.added += 1;
                 if boxed {

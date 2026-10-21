@@ -473,6 +473,11 @@ pub struct EnergyBreakdown {
 ///   warning, which stays): how much the box confines this answer — the confinement energy per
 ///   unit of it scales as 1/h² (`providers::surrogate::box_affected_face_density`). `None` from a
 ///   provider without a grid (analytic, surrogate-answered steps).
+/// - `multiplicity`: the spin multiplicity 2S + 1 = n↑ − n↓ + 1 the solve ran at — the scene's
+///   forced one, or for an automatic scene the solver's own choice (`qm::System`: paired, one
+///   unpaired electron for an odd count). `None` from a provider without electrons (analytic,
+///   surrogate-answered steps). A record: the shared collection keeps it with each sample (M8a
+///   Task 4a; spec §4.2 "a sample keeps its own multiplicity as solved").
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `scf_tol_used`: the Δρ tolerance this solve actually stopped at (M7): the provider's `scf_tol`, except
@@ -498,6 +503,7 @@ pub struct EvalStats {
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
     pub face_density: Option<f64>,
+    pub multiplicity: Option<u32>,
     pub eig_tol_used: Option<f64>,
     pub scf_tol_used: Option<f64>,
     pub energy: EnergyBreakdown,
@@ -592,6 +598,7 @@ impl Default for EvalStats {
             warnings: Vec::new(),
             notes: Vec::new(),
             face_density: None,
+            multiplicity: None,
             eig_tol_used: None,
             scf_tol_used: None,
             energy: EnergyBreakdown::default(),
@@ -935,6 +942,26 @@ pub trait Trainable {
     fn retry_fit(&mut self, _scene: &Scene, _refs: &mut AtomReferences) -> Result<bool, String> {
         self.refit().map(|_| false)
     }
+    /// Learns into the **shared collection** of `scene`'s solver surface (M8a Task 4a; spec §4.2;
+    /// `providers::surrogate`, "The shared collection"): opens `root/<the surface's slug>` and
+    /// replaces what the provider held with the collection's samples, references and audit
+    /// history (a no-op when that collection is already attached). From then on every kept teacher
+    /// answer the collection admits is appended to it. `Err` with the reason, nothing changed, for a
+    /// scene that cannot share one (charged — collections are neutral until M9 —, a forced
+    /// multiplicity: such a scene keeps a per-scene model), an unusable folder or a running pass.
+    /// The provider holds the process's one writable handle (a second open is read-only). The
+    /// collection is a `surrogate` type, which `sim` cannot name (CLAUDE.md rule 5): the provider
+    /// opens it from the folder. The default refuses.
+    fn attach_collection(&mut self, _root: &std::path::Path, _scene: &Scene) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
+    /// Imports a `.model` file's samples into the attached collection (`surrogate::Collection::
+    /// import_sidecar` with the box rule of the collection's h), never silently: what was taken and
+    /// what was refused, with the reasons. `Err` without an attached, writable collection. The
+    /// default refuses.
+    fn import_model(&mut self, _path: &std::path::Path) -> Result<ImportSummary, String> {
+        Err("this provider does not learn".into())
+    }
     /// The teacher, for work the model must not see (the pass's solves, the reference atoms).
     fn teacher_mut(&mut self) -> &mut dyn ForceProvider;
     /// The readouts at `scene` (whose settings the model's provenance is compared with) and the
@@ -1118,6 +1145,30 @@ pub struct TrainableStatus {
     /// [`Trainable::retry_fit`] can help now (a missing reference to re-solve, or enough samples
     /// for a fit that failed or is pending); false while a pass runs or when only more samples can.
     pub retry_fit: bool,
+    /// Where the model comes from (M8a Task 4a): a shared collection, a file, or neither.
+    pub model_source: ModelSource,
+}
+
+/// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the
+/// shared collection of the scene's solver surface (its folder name, the samples it holds, and
+/// whether another process holds its lock), a model file it was loaded from, or neither (learned
+/// in this session only, or nothing yet).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ModelSource {
+    Collection { slug: String, samples: usize, read_only: bool },
+    File(std::path::PathBuf),
+    #[default]
+    None,
+}
+
+/// What [`Trainable::import_model`] did (plain data of `surrogate::ImportReport`): the samples
+/// taken, every refusal with its index in the file (`None` = the whole file) and reason, and the
+/// notes (references, duplicates and the like).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImportSummary {
+    pub imported: usize,
+    pub refused: Vec<(Option<usize>, String)>,
+    pub notes: Vec<String>,
 }
 
 /// A teach-around offer (`TrainableStatus::teach_offer`).

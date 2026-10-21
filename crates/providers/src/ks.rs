@@ -451,7 +451,9 @@ impl OccupationWatch {
 /// The `EvalStats` fields that come straight from `ScfStats`, plus the M7 ones: the pseudised species' summaries
 /// (from `setup`), the core overlaps, the shared shells and whether their pattern changed since the previous
 /// evaluation (`watch`).
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, setup: Option<&qm::IonicSetup>, watch: &mut OccupationWatch) -> EvalStats {
+#[allow(clippy::too_many_arguments)]
+fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, system: &System, watch: &mut OccupationWatch) -> EvalStats {
+    let setup = system.ionic.as_deref();
     let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, mut warnings, core_overlaps, fractional, .. } = stats;
     let occupation_changed = watch.changed(&fractional);
     if occupation_changed {
@@ -473,6 +475,8 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         warnings,
         notes,
         face_density: Some(boundary_density),
+        // n↑ ≥ n↓ by construction (`qm::scf::spin_split`): 2S + 1 of the state solved
+        multiplicity: Some((system.n_up - system.n_dn + 1) as u32),
         eig_tol_used: Some(eig_tol_used),
         scf_tol_used: Some(scf_tol_used),
         energy: EnergyBreakdown { kinetic: energy.kinetic, external: energy.external, hartree: energy.hartree, xc: energy.xc, nuclear: energy.nuclear, total: energy.total },
@@ -663,7 +667,7 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, &system, &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 
@@ -1162,7 +1166,7 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, &system, &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 }

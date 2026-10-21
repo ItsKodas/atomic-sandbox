@@ -3378,7 +3378,12 @@ fn fnv1a(text: &str) -> u64 {
 /// note ("(the model's std × 23.62, its measured calibration for this environment class)"). No
 /// source, sample, refit or verdict moved: the session's answered geometries have inflated stds
 /// (2.4e-6 Ha/Bohr at step 40) three decades below their bounds.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x5dbf_9e0f_50a2_02b1;
+/// **Re-pinned for M8a Task 4a** (0x5dbf_9e0f_50a2_02b1 → below): `EvalStats` gained `multiplicity`
+/// (the analytic teacher reports none: 341 occurrences of ", multiplicity: None" in the 907-line
+/// trace, the same in the views trace). Removing exactly those strings from the new traces
+/// reproduces the old digest 0x5dbf_9e0f_50a2_02b1 — no decision, answer, note, sample or draw moved
+/// (the session attaches no collection).
+const SCRIPTED_SESSION_DIGEST: u64 = 0x229d_8fa5_2535_8822;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -3897,7 +3902,7 @@ fn fallback_events_carry_the_step_of_their_evaluation() {
 /// A teacher's (energy, forces, face density, display) as the auditor's answer carries it (no
 /// orbital payload: these audits run with the view off).
 fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> Result<Solved, String> {
-    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None, unfit: None })
+    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, multiplicity: None, display, orbitals: None, unfit: None })
 }
 
 /// A background audit job for `s` at `scene` under `prov` (the auditor's own bookkeeping
@@ -7096,7 +7101,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
     let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
-    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, 1.0, Some(10));
+    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
     assert!(note.starts_with("surrogate audit not judged: H–H at 5.50 Bohr is in the cutoff shell") && note.ends_with("the answer is not fitted"), "{note}");
@@ -7122,7 +7127,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
     let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
-    s.judge_audit(job(), t.energy, t.forces.clone(), None, None, 1.0, Some(10));
+    s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
     assert_eq!((p.kind, p.n_atoms, p.classes.clone(), p.model_gen), (surrogate::history::PointKind::Audit, 2, vec![1, 1], s.model_gen));
@@ -7135,10 +7140,10 @@ fn judged_audits_are_recorded_in_the_history() {
         assert_eq!(*e, d, "‖F_teacher − F_model‖ of atom {j}");
     }
     // a box-affected answer (face density above the rule): judged "not judged", no point, counted
-    s.judge_audit(job(), t.energy, t.forces.clone(), Some(1.0), None, 1.0, Some(10));
+    s.judge_audit(job(), t.energy, t.forces.clone(), Some(1.0), None, None, 1.0, Some(10));
     assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.box_affected), (1, 1));
     // a draft-mode guess at a geometry strict mode refuses: no point, counted
-    s.judge_audit(AuditJob { draft_guess: true, ..job() }, t.energy, t.forces.clone(), None, None, 1.0, Some(10));
+    s.judge_audit(AuditJob { draft_guess: true, ..job() }, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.draft), (1, 1));
     // the in-step audit (no auditor attached, audit every 2 answered steps): the second answered
     // step is audited inside `evaluate`; the cadence had reused the first verdict, so the point's
@@ -8035,4 +8040,516 @@ fn rule_6_refuses_where_the_class_calibration_inflates_the_std() {
     s.refresh_class_loo();
     assert_eq!(s.class_loo()[0].inflation, 1.0);
     assert_eq!(s.evaluate(&h2(1.62), &mut never()).unwrap().stats.source, Source::Surrogate);
+}
+
+// ---- the shared collection (M8a Task 4a; `shared` module doc) ----
+
+/// A pairwise Morse teacher over any species, smoothly cut off at the model's r_cut (so the
+/// surface is a function the descriptors can represent), reporting a face density (`face`;
+/// `None` = a teacher that reports none) and the multiplicity of the lowest-spin state of its
+/// electrons (Σ Z − charge: paired, one unpaired electron for an odd count — `qm::System`'s
+/// automatic choice), as a Kohn-Sham teacher does.
+#[derive(Clone, Debug)]
+struct SpeciesMorse {
+    face: Option<f64>,
+    calls: usize,
+}
+
+impl SpeciesMorse {
+    fn new() -> SpeciesMorse {
+        SpeciesMorse { face: Some(0.0), calls: 0 }
+    }
+
+    /// The isolated-atom energy of `z` (Hartree).
+    fn atom(z: u8) -> f64 {
+        match z {
+            1 => -0.478,
+            2 => -2.83,
+            _ => -1.0 * z as f64,
+        }
+    }
+
+    /// (D, a, r_e) of the pair (H–H the H₂-like well; H–He and He–He shallow, longer).
+    fn pair(a: u8, b: u8) -> (f64, f64, f64) {
+        match (a.min(b), a.max(b)) {
+            (1, 1) => (0.17, 1.0, 1.4),
+            (1, 2) => (0.012, 1.2, 2.6),
+            _ => (0.006, 1.3, 3.0),
+        }
+    }
+
+    fn energy_and_forces(pos: &[[f64; 3]], z: &[u8]) -> (f64, Vec<[f64; 3]>) {
+        let r_cut = Basis::new(&[1]).r_cut;
+        let mut e: f64 = z.iter().map(|&zi| SpeciesMorse::atom(zi)).sum();
+        let mut f = vec![[0.0; 3]; pos.len()];
+        for i in 0..pos.len() {
+            for j in i + 1..pos.len() {
+                let d: [f64; 3] = std::array::from_fn(|k| pos[j][k] - pos[i][k]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if r >= r_cut {
+                    continue;
+                }
+                let (dd, a, re) = SpeciesMorse::pair(z[i], z[j]);
+                let x = (-a * (r - re)).exp();
+                let v = dd * ((1.0 - x) * (1.0 - x) - 1.0);
+                let dv = 2.0 * dd * a * (1.0 - x) * x;
+                let c = 0.5 * (1.0 + (std::f64::consts::PI * r / r_cut).cos());
+                let dc = -0.5 * std::f64::consts::PI / r_cut * (std::f64::consts::PI * r / r_cut).sin();
+                e += v * c;
+                let de = dv * c + v * dc;
+                for k in 0..3 {
+                    f[i][k] += de * d[k] / r;
+                    f[j][k] -= de * d[k] / r;
+                }
+            }
+        }
+        (e, f)
+    }
+}
+
+impl ForceProvider for SpeciesMorse {
+    fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.calls += 1;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let (energy, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let electrons = z.iter().map(|&x| x as i64).sum::<i64>() - scene.charge as i64;
+        let mut stats = EvalStats::default();
+        stats.energy.total = energy;
+        stats.face_density = self.face;
+        stats.multiplicity = Some(scene.multiplicity.unwrap_or((electrons.rem_euclid(2) + 1) as u32));
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
+    }
+
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// A fresh, empty folder of a test's own, removed when it goes out of scope (declare it first:
+/// the providers holding collections in it drop — and release their locks — before it).
+struct CollectionRoot(std::path::PathBuf);
+
+impl std::ops::Deref for CollectionRoot {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for CollectionRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn collection_root(name: &str) -> CollectionRoot {
+    let dir = std::env::temp_dir().join(format!("as-shared-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    CollectionRoot(dir)
+}
+
+/// A surrogate over a shared [`SpeciesMorse`] teacher (default policy, tol 1e-6).
+fn pair_student() -> (SurrogateKs, Arc<Mutex<SpeciesMorse>>) {
+    let teacher = Shared::new(SpeciesMorse::new());
+    let handle = teacher.handle();
+    (SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6), handle)
+}
+
+/// `scene` in an n³ cell at h = 0.25.
+fn in_cell(mut scene: Scene, n: usize) -> Scene {
+    scene.cell = Cell { n, h: 0.25 };
+    scene
+}
+
+/// H₂ at r along a random direction, near the centre of a 33³ cell.
+fn h2_at(r: f64, rng: &mut StdRng) -> Scene {
+    let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+    dimer(r, unit_vector(rng), origin, 1, 1)
+}
+
+/// H₂ (r) with a He atom `d` from its centre, perpendicular, in a 41³ cell (another box than the
+/// H₂ scene's 33³: the same surface).
+fn h2_he_at(r: f64, d: f64, rng: &mut StdRng) -> Scene {
+    let mut sc = in_cell(dimer(r, [1.0, 0.0, 0.0], [0.0; 3], 1, 1), 41);
+    let tilt = rng.gen_range(-0.2..0.2);
+    sc.nuclei.push(Nucleus::new(2, [tilt, d, 0.0]));
+    sc
+}
+
+/// Teaches `s` (attached to a collection) H₂ at 40 teacher steps, refits; then 30 steps of H₂ + He
+/// in a larger box, the He reference solved there, and refits again: (the H₂ steps, all steps).
+fn teach_h2_then_h2_he(s: &mut SurrogateKs) -> (usize, usize) {
+    let mut rng = StdRng::seed_from_u64(31);
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    for i in 0..40 {
+        let sc = h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng);
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "no model yet: the teacher answers");
+        assert!(!r.stats.notes.iter().any(|n| n.contains("session only")), "{:?}", r.stats.notes);
+    }
+    s.refit().expect("the H₂ fit");
+    assert_eq!(s.basis().unwrap().species, vec![1]);
+    for i in 0..30 {
+        let sc = h2_he_at(1.2 + 0.6 * (i % 6) as f64 / 5.0, 2.4 + 0.15 * (i / 6) as f64, &mut rng);
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(r.stats.notes.iter().any(|n| n.contains("species He is not in the model")), "{:?}", r.stats.notes);
+    }
+    s.set_reference_solved(2, SpeciesMorse::atom(2), 41, Some(0.0));
+    (40, 70)
+}
+
+/// Plan Task 4 Step 1 (providers): with a collection attached, a second scene's answers append to
+/// the same collection — another box, a new species — the basis grows to {H, He}, the refit
+/// succeeds, and the earlier H₂ samples are still in the fit; each sample is filed with its box,
+/// its solved multiplicity and its formula.
+#[test]
+fn collection_mode_learns_across_scenes() {
+    let dir = collection_root("learn");
+    let (mut s, teacher) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let slug = s.provenance_for(&h2(1.4)).surface_key().slug();
+    assert_eq!(s.collection().unwrap().folder(), dir.join(&slug));
+    let (h2_steps, all) = teach_h2_then_h2_he(&mut s);
+    assert_eq!(teacher.lock().unwrap().calls, all);
+    let c = s.collection().unwrap();
+    assert_eq!(c.samples.len(), all, "every kept teacher answer was appended");
+    assert_eq!(s.samples(), all);
+    assert!((0..all).all(|i| s.collection_index(i) == Some(i)));
+    assert!(c.samples[..h2_steps].iter().all(|x| x.grid_n == 33 && x.multiplicity == Some(1) && x.scene == "H2" && !x.multiplicity_forced));
+    assert!(c.samples[h2_steps..].iter().all(|x| x.grid_n == 41 && x.multiplicity == Some(1) && x.scene == "H2He" && x.sample.z == vec![1, 1, 2]));
+    assert_eq!(c.references.get(&1).map(|r| (r.grid_n, r.face_density)), Some((Some(33), Some(0.0))));
+    assert_eq!(c.references.get(&2).map(|r| r.grid_n), Some(Some(41)));
+    let rep = s.refit().expect("the refit with the new species succeeds");
+    assert_eq!(s.basis().unwrap().species, vec![1, 2], "the basis grew");
+    assert_eq!(rep.n_samples, all, "the H₂ samples are still used");
+    println!("collection fit: {} samples, q′ {}, rmse E/atom {:.1e}, F {:.1e}; trusted {} ({:?})", rep.n_samples, rep.q_prime, rep.rmse_energy_per_atom, rep.rmse_force, s.trusted(), s.untrusted_reason());
+    let st = Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]);
+    assert_eq!(st.model_source, sim::ModelSource::Collection { slug: slug.clone(), samples: all, read_only: false });
+    assert_eq!(st.provenance_mismatch, None, "a 33³ scene shares the collection");
+    assert!(st.provenance.as_deref().is_some_and(|p| p.contains("any box")), "{:?}", st.provenance);
+    // the README says what it knows
+    drop(s);
+    let readme = std::fs::read_to_string(dir.join(&slug).join("README.txt")).unwrap();
+    for want in ["70 samples", "He (Z 2)", "H–He", "H2He: 30 samples, grid 41³", "H2: 40 samples, grid 33³"] {
+        assert!(readme.contains(want), "README lacks '{want}':\n{readme}");
+    }
+}
+
+/// A collection reopened by a new provider rebuilds the same fit from what it stored: samples,
+/// statuses and references — bit for bit the same predictions.
+#[test]
+fn a_reopened_collection_reproduces_the_same_fit() {
+    let dir = collection_root("reopen");
+    let probes = [h2(1.45), in_cell(h2(1.9), 41)];
+    let mut rng = StdRng::seed_from_u64(5);
+    let probes_he = [h2_he_at(1.4, 2.6, &mut rng), h2_he_at(1.6, 2.9, &mut rng)];
+    let (first, report) = {
+        let (mut s, _) = pair_student();
+        s.attach_collection(&dir, &h2(1.4)).unwrap();
+        teach_h2_then_h2_he(&mut s);
+        let rep = s.refit().unwrap();
+        let m = s.model().unwrap();
+        let p: Vec<_> = probes.iter().chain(&probes_he).map(|sc| {
+            let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+            let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+            m.predict(&pos, &z, true).unwrap()
+        }).collect();
+        (p, rep)
+    };
+    // a new provider (the first one dropped: the lock is free) attaches; with 70 samples below
+    // Q′ = 176 it does not fit at once (as a samples-only file's install), the refit does
+    let (mut s, teacher) = pair_student();
+    s.attach_collection(&dir, &in_cell(h2(1.4), 41)).unwrap();
+    assert_eq!(s.samples(), 70);
+    assert!(s.model().is_none() && s.no_model().is_some_and(|n| n.missing.is_empty()), "every reference came with the collection");
+    let rep = s.refit().unwrap();
+    assert_eq!(teacher.lock().unwrap().calls, 0, "no teacher solve: everything came from the collection");
+    assert_eq!((rep.n_samples, rep.q_prime), (report.n_samples, report.q_prime));
+    assert_eq!(rep.lambda.to_bits(), report.lambda.to_bits(), "{} vs {}", rep.lambda, report.lambda);
+    assert_eq!(s.reference_energy(2), Some(SpeciesMorse::atom(2)));
+    let m = s.model().unwrap();
+    for (sc, a) in probes.iter().chain(&probes_he).zip(&first) {
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+        let b = m.predict(&pos, &z, true).unwrap();
+        assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+        assert_eq!(a.forces, b.forces);
+        assert_eq!(a.energy_std.map(f64::to_bits), b.energy_std.map(f64::to_bits));
+    }
+}
+
+/// Plan Task 4 Step 1 (providers): a charged scene keeps a per-scene store — attaching a
+/// collection to it is refused with the reason and the provider learns it per scene; and a
+/// provider learning into a collection hands a charged scene's step to the teacher without
+/// keeping it, nothing appended, the note naming the reason.
+#[test]
+fn a_charged_scene_keeps_a_per_scene_store() {
+    let dir = collection_root("charged");
+    let mut rng = StdRng::seed_from_u64(7);
+    let charged = |r: f64, rng: &mut StdRng| {
+        let mut sc = h2_at(r, rng);
+        sc.charge = 1;
+        sc
+    };
+    // (a) the charged scene's own provider: no collection, a per-scene store
+    let (mut p, _) = pair_student();
+    let e = p.attach_collection(&dir, &charged(1.4, &mut rng)).unwrap_err();
+    assert!(e.contains("charge 1: collections are neutral until M9"), "{e}");
+    assert!(p.collection().is_none());
+    for i in 0..5 {
+        let r = p.evaluate(&charged(1.2 + 0.1 * i as f64, &mut rng), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+    }
+    assert_eq!(p.samples(), 5, "kept in the per-scene store");
+    assert_eq!(p.store().unwrap().provenance.charge, 1);
+    assert_eq!(Trainable::status(&p, &charged(1.4, &mut rng), &[[0.0; 3]; 2]).model_source, sim::ModelSource::None);
+    assert!(std::fs::read_dir(&*dir).unwrap().next().is_none(), "no collection was created");
+    // (b) a provider learning into the collection meets a charged scene
+    let (mut q, _) = pair_student();
+    q.attach_collection(&dir, &h2(1.4)).unwrap();
+    for i in 0..3 {
+        q.evaluate(&h2_at(1.3 + 0.1 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    assert_eq!(q.collection().unwrap().samples.len(), 3);
+    let r = q.evaluate(&charged(1.4, &mut rng), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "the teacher answers the step");
+    assert!(r.stats.notes.iter().any(|n| n.contains("charge 1: collections are neutral until M9") && n.contains("not kept")), "{:?}", r.stats.notes);
+    assert_eq!(q.collection().unwrap().samples.len(), 3, "nothing appended");
+    assert_eq!(q.samples(), 3, "and nothing kept in the shared store");
+    // once a model stands, rule 3 refuses the charged scene the same way
+    q.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    for i in 0..30 {
+        q.evaluate(&h2_at(1.1 + 0.04 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    q.refit().unwrap();
+    let n = q.collection().unwrap().samples.len();
+    let r = q.evaluate(&charged(1.4, &mut rng), &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("does not take this scene (charge 1: collections are neutral until M9)")), "{:?}", r.stats.notes);
+    assert_eq!(q.collection().unwrap().samples.len(), n);
+    let st = Trainable::status(&q, &charged(1.4, &mut rng), &[[0.0; 3]; 2]);
+    assert!(st.provenance_mismatch.as_deref().is_some_and(|m| m.contains("charge 1")), "{:?}", st.provenance_mismatch);
+    let plan = SamplingPlan::default();
+    let e = Trainable::start_pass(&mut q, &charged(1.4, &mut rng), &plan, &mut sim::references::AtomReferences::default()).unwrap_err();
+    assert!(e.contains("charge 1"), "{e}");
+}
+
+/// An answer the collection refuses — box-affected (its face density above the box rule even
+/// while the provider keeps it at code 0), or of unknown box status — stays in the provider's
+/// store for the session and is never written; a draft guess's audit waits outside and is
+/// appended when a refit promotes it; status changes are appended as records.
+#[test]
+fn refused_answers_stay_per_scene_and_statuses_are_appended() {
+    let dir = collection_root("refused");
+    let (mut s, teacher) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let mut rng = StdRng::seed_from_u64(11);
+    s.evaluate(&h2_at(1.4, &mut rng), &mut never()).unwrap();
+    teacher.lock().unwrap().face = Some(1.0);
+    let r = s.evaluate(&h2_at(1.5, &mut rng), &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("kept for this session only") && n.contains("box-affected sample")), "{:?}", r.stats.notes);
+    teacher.lock().unwrap().face = None;
+    let r = s.evaluate(&h2_at(1.6, &mut rng), &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("kept for this session only") && n.contains("box status unknown")), "{:?}", r.stats.notes);
+    assert_eq!(s.samples(), 3, "both kept in the session's store");
+    assert_eq!((s.collection_index(0), s.collection_index(1), s.collection_index(2)), (Some(0), None, None));
+    assert_eq!(s.collection().unwrap().samples.len(), 1);
+    // a pass sample's refusal is summed for the pass, never said by a later live step
+    let sc = h2_at(1.65, &mut rng);
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+    s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 }, &sc, Some(1.0), Some(1)).unwrap();
+    teacher.lock().unwrap().face = Some(0.0);
+    let r = s.evaluate(&h2_at(1.55, &mut rng), &mut never()).unwrap();
+    assert!(!r.stats.notes.iter().any(|n| n.contains("session only")), "{:?}", r.stats.notes);
+    assert_eq!((s.samples(), s.collection().unwrap().samples.len()), (5, 2));
+    let summary = s.take_collection_summary().unwrap();
+    assert!(summary.contains("3 kept for this session only") && summary.contains("2 box-affected sample"), "{summary}");
+    // a held-out draft guess's audit waits, and joins once promoted (Q_DRAFT → Q_NONE)
+    let prov = s.provenance_for(&h2(1.4));
+    let sc = h2_at(1.7, &mut rng);
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+    let mut sink = Vec::new();
+    assert!(s.keep_sample(&pos, &[1, 1], e, &f, Some(0.0), Some(1), &prov, SampleTag::DraftAudit, &mut sink));
+    assert_eq!(s.collection_index(5), None, "a draft guess is held out of the shared store too");
+    assert_eq!(s.collection().unwrap().samples.len(), 2);
+    s.quarantine[5] = Q_NONE;
+    s.store.as_mut().unwrap().samples[5].tag = SampleTag::Audit;
+    s.sync_collection_status();
+    assert_eq!(s.collection_index(5), Some(2), "promoted: appended");
+    assert_eq!(s.collection().unwrap().samples[2].multiplicity, Some(1));
+    // a quarantine code change of a collection sample is appended as a status record
+    s.quarantine.resize(6, Q_NONE);
+    s.quarantine[0] = Q_HELD;
+    s.sync_collection_status();
+    drop(s);
+    let key = prov.surface_key();
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert_eq!(c.samples.len(), 3);
+    assert_eq!(c.quarantine, vec![Q_HELD, Q_NONE, Q_NONE], "the hold survived the reopen");
+}
+
+/// References with their box (the Task 3 review's physics (c)): an even-n or box-affected solve is
+/// used for the session only when the collection has none; the largest passing odd box stands, and
+/// the fit uses the collection's value.
+#[test]
+fn the_collection_keeps_the_reference_of_the_largest_passing_box() {
+    let dir = collection_root("refs");
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    s.set_reference_solved(1, -0.47, 48, Some(0.0));
+    assert_eq!(s.reference_energy(1), Some(-0.47), "used for the session");
+    assert!(s.collection().unwrap().references.is_empty(), "an even box is not stored");
+    s.set_reference_solved(1, -0.4781, 33, Some(9.0));
+    assert!(s.collection().unwrap().references.is_empty(), "nor a box-affected one");
+    s.set_reference_solved(1, -0.4782, 41, Some(1e-9));
+    assert_eq!(s.reference_energy(1), Some(-0.4782));
+    s.set_reference_solved(1, -0.4783, 33, Some(1e-9));
+    assert_eq!(s.reference_energy(1), Some(-0.4782), "a smaller box does not replace the 41³ one");
+    s.set_reference_solved(1, -0.4784, 57, Some(1e-12));
+    assert_eq!(s.reference_energy(1), Some(-0.4784), "a larger one does");
+    s.set_reference_solved(1, -0.4785, 47, Some(1e5));
+    assert_eq!(s.reference_energy(1), Some(-0.4784), "a refused solve leaves the collection's");
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.contains("replaces the one from 41³")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("even grid n = 48")), "{notes:?}");
+}
+
+/// A model file switches the provider to it (a specialised, per-scene model): the collection is let
+/// go (its lock with it) and the source says File; saving is refused while a collection is attached;
+/// an import goes through the provider's own handle and joins the store.
+#[test]
+fn a_model_file_switches_off_the_collection_and_imports_join_it() {
+    let dir = collection_root("switch");
+    let mut rng = StdRng::seed_from_u64(13);
+    // a per-scene model of H₂ (no collection), saved
+    let file = dir.join("h2.model");
+    {
+        let (mut p, _) = pair_student();
+        p.set_reference_energy(1, SpeciesMorse::atom(1));
+        for i in 0..40 {
+            p.evaluate(&h2_at(1.1 + 0.03 * i as f64, &mut rng), &mut never()).unwrap();
+        }
+        p.refit().unwrap();
+        p.save_sidecar(&file).unwrap();
+    }
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    for i in 0..3 {
+        s.evaluate(&h2_at(1.2 + 0.1 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    let e = s.save_sidecar(&dir.join("x.model")).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+    // the import: through the provider's handle, into its store
+    let summary = Trainable::import_model(&mut s, &file).unwrap();
+    println!("import: {summary:?}");
+    assert_eq!(summary.imported, 40, "{summary:?}");
+    assert_eq!(s.samples(), 43);
+    assert_eq!(s.collection().unwrap().samples.len(), 43);
+    assert!(summary.notes.iter().any(|n| n.contains("not taken")), "the file's reference has no box: {summary:?}");
+    // the load switches to the file
+    Trainable::load(&mut s, &file, &h2(1.4)).unwrap();
+    assert!(s.collection().is_none());
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).model_source, sim::ModelSource::File(file.clone()));
+    assert_eq!(s.samples(), 40);
+    let key = s.provenance_for(&h2(1.4)).surface_key();
+    let (c, r) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert!(!r.locked_by_other && !c.read_only, "the lock was released");
+    assert_eq!(c.samples.len(), 43);
+}
+
+/// Measurement (M8a Task 4a, the controller's ask; reported, not asserted): the cost of the class
+/// rule's leave-one-out pass (`compute_class_loo_full`, run by every refit) and of the refit itself
+/// at collection sizes, two species (H, He: Q′ 176) on the [`SpeciesMorse`] teacher; `LOO_S4=1` adds
+/// four species (Q′ 1232) at one size. `cargo test -p providers --release class_loo_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement: cargo test -p providers --release class_loo_cost -- --ignored --nocapture"]
+fn class_loo_cost_at_collection_sizes() {
+    let run = |species: &[u8], n: usize| {
+        let (mut s, _) = pair_student();
+        for &z in species {
+            s.set_reference_energy(z, SpeciesMorse::atom(z));
+        }
+        let mut rng = StdRng::seed_from_u64(17);
+        let t0 = Instant::now();
+        for i in 0..n {
+            // 2–4 atoms of the species within a 3 Bohr ball, no pair closer than 1.0 Bohr
+            let k = 2 + i % 3;
+            let mut pos: Vec<[f64; 3]> = Vec::new();
+            while pos.len() < k {
+                let p: [f64; 3] = std::array::from_fn(|_| rng.gen_range(-1.5..1.5));
+                if pos.iter().all(|q| (0..3).map(|a| (p[a] - q[a]).powi(2)).sum::<f64>() > 1.0) {
+                    pos.push(p);
+                }
+            }
+            let z: Vec<u8> = (0..k).map(|j| species[(i + j) % species.len()]).collect();
+            let (energy, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
+            let sc = Scene { nuclei: pos.iter().zip(&z).map(|(&p, &zi)| Nucleus::new(zi, p)).collect(), ..h2(1.4) };
+            s.add_sample_with_face(Sample { pos, z, energy, forces, tag: SampleTag::Perturbation, weight: 1.0 }, &sc, Some(0.0)).unwrap();
+        }
+        let t_add = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let rep = s.refit().expect("refit");
+        let t_refit = t1.elapsed().as_secs_f64();
+        let t2 = Instant::now();
+        let (loo, _, _) = s.compute_class_loo_full();
+        let t_loo = t2.elapsed().as_secs_f64();
+        println!(
+            "S = {} (Q′ {}), {n} samples: store {t_add:.2} s, refit {t_refit:.2} s (its LOO pass included), class LOO alone {t_loo:.2} s = {:.2} ms/sample; classes {:?}",
+            species.len(),
+            rep.q_prime,
+            1e3 * t_loo / n as f64,
+            loo.iter().map(|c| (c.class, c.samples)).collect::<Vec<_>>()
+        );
+    };
+    for n in [500, 1000, 2000, 4000] {
+        run(&[1, 2], n);
+    }
+    if std::env::var("LOO_S4").is_ok() {
+        run(&[1, 2, 3, 4], 1500);
+    }
+}
+
+/// Measurement (M8a Task 4a, the Task 3 review's physics (c) (iv); reported, not asserted): an
+/// isolated atom's energy at the cell centre on a grid node (odd n) and at a cube centre (even n,
+/// the same box ± h) — the lattice-phase part of a reference, which the collection's odd-n rule
+/// fixes. GPU, tol 1e-6 (the sample tolerance the references are solved at), a 12 Bohr box.
+/// `cargo test -p providers --release reference_lattice_phase -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement (GPU): cargo test -p providers --release reference_lattice_phase -- --ignored --nocapture"]
+fn reference_lattice_phase_measurement() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("no GPU adapter — skipped");
+        return;
+    };
+    let cases = [(1u8, 2u32, sim::IonicPolicy::None), (8, 3, sim::IonicPolicy::None), (8, 3, sim::IonicPolicy::CoresOnly)];
+    for (h, n_odd) in [(0.25, 49usize), (0.20, 61), (0.15, 81)] {
+        for &(z, m, ionic) in &cases {
+            let mut out = Vec::new();
+            for n in [n_odd, n_odd - 1] {
+                let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+                t.set_display(false);
+                let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+                let t0 = Instant::now();
+                match t.evaluate(&sc, &mut never()) {
+                    Ok(r) => out.push(Some((r.energy, r.stats.face_density.unwrap_or(f64::NAN), r.stats.scf_steps, t0.elapsed().as_secs_f64()))),
+                    Err(e) => {
+                        println!("Z {z} M {m} {ionic:?} h {h} n {n}: failed ({e})");
+                        out.push(None);
+                    }
+                }
+            }
+            if let [Some(a), Some(b)] = &out[..] {
+                println!(
+                    "Z {z} M {m} {ionic:?} h {h}: node (n {n_odd}) {:.8} Ha, face {:.1e}, {} SCF, {:.1} s | cube centre (n {}) {:.8} Ha, face {:.1e}, {} SCF, {:.1} s | E_cube − E_node {:+.2e} Ha",
+                    a.0, a.1, a.2, a.3, n_odd - 1, b.0, b.1, b.2, b.3, b.0 - a.0
+                );
+            }
+        }
+    }
 }

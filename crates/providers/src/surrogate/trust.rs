@@ -539,7 +539,12 @@ impl SurrogateKs {
             p.begin_refit(self.samples());
             RefitPhase(p)
         });
-        self.refit_inner()
+        let r = self.refit_inner();
+        // the quarantine codes a refit moved, and the history it judged by, go to the shared
+        // collection (`shared` module doc)
+        self.sync_collection_status();
+        self.flush_collection();
+        r
     }
 
     /// [`refit`](Self::refit)'s body.
@@ -1045,7 +1050,7 @@ impl SurrogateKs {
         let next_is_model = (self.trusted() || self.policy.never_fallback)
             && match &self.last {
                 None => true,
-                Some(l) => l.provenance == model.provenance && model.basis.species_indices(&l.z).is_ok(),
+                Some(l) => self.same_surface(&model.provenance, &l.provenance) && model.basis.species_indices(&l.z).is_ok(),
             };
         self.pending_jump = match (&self.last, next_is_model) {
             (Some(l), true) => {
