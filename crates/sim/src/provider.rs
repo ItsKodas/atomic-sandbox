@@ -1212,6 +1212,11 @@ pub struct ClassLoo {
     /// The model generation (`TrainableStatus::model_gen`) since which the class has been trusted
     /// without interruption — the hysteresis memory; `None` while untrusted.
     pub trusted_since: Option<u64>,
+    /// The variance inflation rules 6 and 7 apply to the class's atoms (M8a Task 2 fix round 3,
+    /// `providers::surrogate::calibrate`, λ_c): the model's epistemic stds there are multiplied by
+    /// it before they are compared with their bounds. ≥ 1; 1 until the class has three
+    /// comparisons where the posterior decides.
+    pub inflation: f64,
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order

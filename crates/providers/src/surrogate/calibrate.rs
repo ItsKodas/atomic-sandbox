@@ -120,6 +120,53 @@
 //! worst evidence, never dropped (the activity Task 3b ruling). R_c stays as the floor — the model
 //! is never trusted beyond its own leave-one-out; robust, being an RMS over hundreds of atoms.
 //!
+//! # The variance inflation (fix round 3; the controller's ruling on C1)
+//!
+//! The class verdict judges a class's **rms** error; rules 6/7 judge each step by the posterior's
+//! epistemic std. Where the posterior is overconfident (κ 2–12 for the hot many-body class) a
+//! trusted class's heavy tail passes rule 6 — answers to 5.4× the bound in fix rounds 1–2. So the
+//! posterior's std is recalibrated per class by the error the teacher measured where that std
+//! decides (the standard post-hoc variance recalibration: one scale factor on the predictive
+//! variance, fitted on held-out comparisons — Levi, Gispan, Giladi & Fetaya, Sensors 22, 5540
+//! (2022), "Evaluating and calibrating uncertainty prediction in regression tasks" (not verified);
+//! Busk et al., Mach. Learn.: Sci. Technol. 3, 015012 (2022), for molecular models (not verified) —
+//! both cited from memory without access to the papers; the method stands on the measurement here,
+//! not on them):
+//!
+//! ```text
+//! λ_c = max(1, √( Σ_p w̄_p² / Σ_p s̄_p² )) · (1 + 1/√(2 n_c)),   s̄_p² = mean over the point's class atoms of (σ_epi,j/√3 / b_j)²
+//! rule 6:  λ_c(j) · σ_epi,j/√3 ≤ b_j             for every atom j (its own class's λ; 1 for an isolated atom)
+//! rule 7:  max_j λ_c(j) · σ_E,epi/N ≤ tier        (one scale of the posterior covariance Σ: both stds are linear in √Σ)
+//! ```
+//!
+//! over the class's points in the **posterior's jurisdiction** — the verdict's (audits, rule-4b
+//! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15) or with the class (21): the
+//! geometries where the std decides. Points of rules 5/5a–5e and the fences are not: those refuse
+//! whatever the std says. The same window of generations as the verdict (≥ [`WINDOW_POINTS`]),
+//! one draw per point, no weight cap (every comparison is equally a draw of the posterior; the cap
+//! protected the verdict's audits from heating floods). The guards the ruling asked for:
+//!
+//! - **The ratio of sums, not a mean of z²** (the physics review's I2: z = ‖ΔF‖/σ has no floor
+//!   on its denominator, and one confident comparison at z = 62 among 266 set κ ≥ 5.4 for the
+//!   ring's lifetime). Both sums are in the bound's units, so a point with a tiny std *and* a small
+//!   error adds little to either: the same 266 + 1 points give λ_raw = 1.0000 where the mean of z²
+//!   gives 3.9 (`the_variance_inflation_is_a_ratio_of_sums_over_the_posteriors_jurisdiction`).
+//!   The sums are dominated by the comparisons whose error or std is a sizeable fraction of the
+//!   bound — the ones rule 6 decides.
+//! - **Only with ≥ [`MIN_EVIDENCE`] points**; below, λ = 1 exactly (the uninflated rule of before:
+//!   nothing loosened, nothing tightened without evidence).
+//! - **Floored at 1**: never deflated — a posterior measured underconfident keeps its own std
+//!   (rule 6 is not loosened by calibration).
+//! - **× (1 + 1/√(2n))**: the conservative side of the estimate's one-sigma scatter, as for W.
+//! - **No cap**, and why that is safe from a lockout: a large λ only sends steps to the teacher,
+//!   and those steps are rule-6/7 points — the factor's own evidence — so λ is re-measured from the
+//!   refused geometries themselves as the window moves; a class whose model improves comes back.
+//!   A comparison that is not a number makes λ = ∞ (every atom of the class refused) until it ages.
+//!
+//! λ moves at refits, installs and policy changes, with the verdict (`refresh_class_loo`, which
+//! also drops a cached variance verdict). Rule 6's reported uncertainty is the inflated std; the
+//! history records the model's own (uninflated) stds, which λ is measured from.
+//!
 //! # The verdict, with hysteresis
 //!
 //! A class with fewer than Q′ samples is untrusted (`ClassKey::Samples`, as before). Otherwise:
@@ -224,6 +271,15 @@ pub struct ClassCalibration {
     /// (the [`WORST_ATOM`] guard's input; 0 without evidence, ∞ for a comparison that is not a
     /// number).
     pub worst_atom: f64,
+    /// λ_c, the variance inflation rules 6 and 7 apply to the class's atoms (fix round 3; module
+    /// doc, "The variance inflation"): ≥ 1, exactly 1 with fewer than [`MIN_EVIDENCE`] points in
+    /// its window, ∞ when a comparison there was not a number.
+    pub inflation: f64,
+    /// The points behind `inflation` (its own window over the posterior's jurisdiction).
+    pub inflation_points: usize,
+    /// √(Σ w̄² / Σ s̄²) before the floor at 1 and the scatter factor (NaN with fewer than
+    /// [`MIN_EVIDENCE`] points): the measured error over the epistemic std, both in bound units.
+    pub inflation_raw: f64,
 }
 
 impl ClassCalibration {
@@ -276,7 +332,8 @@ fn sq(x: f64) -> f64 {
     if x.is_finite() { x * x } else { f64::INFINITY }
 }
 
-/// Per point and class: (w̄², z̄², the energy term, the worst atom ratio), its generation and kind.
+/// Per point and class: (w̄², z̄², the energy term, the worst atom ratio, s̄² the epistemic force
+/// std in bound units), its generation and kind.
 struct PointEvidence {
     gen: u64,
     audit: bool,
@@ -284,6 +341,25 @@ struct PointEvidence {
     z2: f64,
     e2: f64,
     worst: f64,
+    s2: f64,
+}
+
+/// A history point in the **posterior's** jurisdiction (fix round 3, the variance inflation): the
+/// geometries where the model's predictive std decided or would have decided — the class
+/// verdict's jurisdiction (audits, rule-4b fallbacks) plus the fallbacks rules 6/7 refused alone
+/// (codes 14, 15) and those the class and rules 6/7 refused together (code 21). Not rules
+/// 5/5a–5e or the fences: those refuse whatever the std says (the extrapolating posterior's z rms
+/// 12–54 there argues for those rules, not for the std inside their reach).
+fn in_posterior_jurisdiction(kind: PointKind) -> bool {
+    match kind {
+        PointKind::Audit => true,
+        PointKind::Fallback { rule } => {
+            in_jurisdiction(kind)
+                || rule == super::history_rule_code(TeachRule::ForceUncertainty)
+                || rule == super::history_rule_code(TeachRule::EnergyUncertainty)
+                || rule == super::HISTORY_RULE_CLASS_AND_VARIANCE
+        }
+    }
 }
 
 /// The oldest generation of the window (module doc, "The evidence window"): from the newest
@@ -306,14 +382,16 @@ fn window_from(points: &[PointEvidence]) -> Option<u64> {
 /// The calibration per class from the history and the policy's bounds (module doc).
 pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration {
     let mut classes: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
+    let mut posterior: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
     let tier = policy.energy_std_per_atom;
     for p in history.iter() {
-        if !in_jurisdiction(p.kind) {
+        if !in_posterior_jurisdiction(p.kind) {
             continue;
         }
-        for (c, list) in classes.iter_mut().enumerate() {
+        let verdict = in_jurisdiction(p.kind);
+        for c in 0..2 {
             let code = c as u8 + 1;
-            let (mut w2, mut z2, mut worst, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+            let (mut w2, mut z2, mut worst, mut s2, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
             for j in 0..p.n_atoms {
                 if p.classes[j] != code {
                     continue;
@@ -322,16 +400,30 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
                 let w = p.err_force[j] / SQRT_3 / bound;
                 w2 += sq(w);
                 z2 += sq(p.err_force[j] / p.pred_force_std[j]);
+                s2 += sq(p.pred_force_std_epistemic[j] / SQRT_3 / bound);
                 worst = if w.is_finite() { worst.max(w) } else { f64::INFINITY };
                 n += 1;
             }
             if n == 0 {
                 continue;
             }
-            list.push(PointEvidence { gen: p.model_gen, audit: p.kind.is_audit(), w2: w2 / n as f64, z2: z2 / n as f64, e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier), worst });
+            let ev = || PointEvidence {
+                gen: p.model_gen,
+                audit: p.kind.is_audit(),
+                w2: w2 / n as f64,
+                z2: z2 / n as f64,
+                e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier),
+                worst,
+                s2: s2 / n as f64,
+            };
+            if verdict {
+                classes[c].push(ev());
+            }
+            posterior[c].push(ev());
         }
     }
     let per_class = std::array::from_fn(|c| {
+        let (inflation_var, inflation_points, inflation_raw) = variance_inflation(&posterior[c]);
         let all = &classes[c];
         let from = window_from(all);
         let inside = |e: &&PointEvidence| from.is_none_or(|g| e.gen >= g);
@@ -341,7 +433,7 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
         let points = n_a + n_f;
         let aged = all.len() - points;
         if points == 0 {
-            return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0 };
+            return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw };
         }
         // the fallbacks of the class together weigh at most the audits (never fewer than three);
         // the count in integers (review I1), the per-point weight only for the sums
@@ -355,9 +447,36 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
         let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
         let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
         let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-        ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom }
+        ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw }
     });
     Calibration { per_class }
+}
+
+/// λ_c (module doc, "The variance inflation"): over the class's points in the posterior's
+/// jurisdiction, in their own window of the newest generations ([`WINDOW_POINTS`]), one draw per
+/// point, λ = max(1, √(Σ w̄² / Σ s̄²)) · (1 + 1/√(2n)) — the measured force error over the
+/// epistemic std, both in the policy's bound units, as a ratio of sums (not a mean of ratios: a
+/// confident point with a small error adds little to either sum, so no point's tiny std can set
+/// the class's factor — the physics review's I2). 1 with fewer than [`MIN_EVIDENCE`] points; 1
+/// when every std is exactly 0 (rule 6 then compares 0 whatever the factor); ∞ when a
+/// comparison was not a number. Returns (λ, n, the raw ratio).
+fn variance_inflation(points: &[PointEvidence]) -> (f64, usize, f64) {
+    let from = window_from(points);
+    let inside: Vec<&PointEvidence> = points.iter().filter(|e| from.is_none_or(|g| e.gen >= g)).collect();
+    let n = inside.len();
+    if n < MIN_EVIDENCE {
+        return (1.0, n, f64::NAN);
+    }
+    let sw: f64 = inside.iter().map(|e| e.w2).sum();
+    let ss: f64 = inside.iter().map(|e| e.s2).sum();
+    if !(sw.is_finite() && ss.is_finite()) {
+        return (f64::INFINITY, n, f64::INFINITY);
+    }
+    if ss == 0.0 {
+        return (1.0, n, f64::NAN);
+    }
+    let raw = (sw / ss).sqrt();
+    (raw.max(1.0) * (1.0 + 1.0 / (2.0 * n as f64).sqrt()), n, raw)
 }
 
 /// What the refusal's words read (a `ClassLoo` holds all of it; `class_verdict` passes its own).

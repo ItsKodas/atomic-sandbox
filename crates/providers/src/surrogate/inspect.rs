@@ -143,7 +143,7 @@ impl SurrogateKs {
             return Some(r);
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, &pred, e, f);
+            let v = self.variance_check(model, &pred, e, f, pos);
             if !v.accept {
                 return v.reason;
             }
@@ -300,7 +300,7 @@ impl SurrogateKs {
             refusals.push(format!("{:?}{}: {}", r.rule, if short { " (short of samples)" } else { "" }, r.text));
         }
         if let (Some(e), Some(f)) = (pred.energy_std, pred.force_std_epistemic.as_ref()) {
-            let v = self.variance_check(model, &pred, e, f);
+            let v = self.variance_check(model, &pred, e, f, &pos);
             let _ = writeln!(o, "    variance: per-atom epistemic force std / bound [{}]", v.atoms.iter().map(|a| format!("{a:.2e}")).collect::<Vec<_>>().join(", "));
             if let Some(r) = v.reason.filter(|_| !v.accept) {
                 refusals.push(format!("{:?}: {}", r.rule, r.text));

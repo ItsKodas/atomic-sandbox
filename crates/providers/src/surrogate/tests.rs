@@ -2885,7 +2885,7 @@ fn an_h2_only_model_falls_back_on_h2_plus_h_as_a_new_environment() {
         let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         let model = s.model().unwrap().clone();
         let pred = model.predict(&pos, &[1, 1, 1], true).unwrap();
-        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap());
+        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos);
         let (nu, _) = ns.novelty(&pos, &[1, 1, 1]).unwrap();
         s.discontinuity();
         let r = s.evaluate(&sc, &mut never()).unwrap();
@@ -3370,7 +3370,15 @@ fn fnv1a(text: &str) -> u64 {
 /// review's I4 ruling). No decision, answer, sample or draw moved — the session's audits never
 /// gave the pair class a calibrated verdict different from the max rule's, and its auditor runs
 /// with audits off, so the re-audit a box-affected answer now asks for is never dispatched there.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x8da9_fc7a_ba0d_fcc4;
+/// **Re-pinned for M8a Task 2 fix round 3** (0x8da9_fc7a_ba0d_fcc4 → below; the traces of d19dc83
+/// and this tree compared by script with the std readouts masked: 0 lines differ in a decision):
+/// rules 6/7 now multiply the epistemic stds by the class's variance inflation λ, so the reported
+/// `uncertainty` / `atom_uncertainty` are the inflated numbers (the session's pair class measured
+/// λ = 23.6 from its rule-6 fallbacks), and the 10 steps rule 6 already refused say so in their
+/// note ("(the model's std × 23.62, its measured calibration for this environment class)"). No
+/// source, sample, refit or verdict moved: the session's answered geometries have inflated stds
+/// (2.4e-6 Ha/Bohr at step 40) three decades below their bounds.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x5dbf_9e0f_50a2_02b1;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -4006,11 +4014,11 @@ fn the_variance_verdict_carries_rule_6_or_7() {
     let model = s.model().unwrap().clone();
     let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
     let pred = model.predict(&pos, &[1, 1], true).unwrap();
-    let v = s.variance_check(&model, &pred, 1.0, &[0.0, 0.0]);
+    let v = s.variance_check(&model, &pred, 1.0, &[0.0, 0.0], &pos);
     let r = v.reason.expect("an energy std of 1 Ha refuses");
     assert_eq!((r.rule, r.atom), (R::EnergyUncertainty, None));
     assert_refusal(&r);
-    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 1.0]);
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 1.0], &pos);
     let r = v.reason.expect("a force std of 1 Ha/Bohr on atom 1 refuses");
     assert_eq!((r.rule, r.atom), (R::ForceUncertainty, Some(1)));
     assert_refusal(&r);
@@ -4137,7 +4145,7 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
     let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
@@ -4353,7 +4361,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -4585,10 +4593,10 @@ fn the_variance_rules_refuse_a_nan_std() {
     let model = s.model().unwrap().clone();
     let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
     let pred = model.predict(&pos, &[1, 1], true).unwrap();
-    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0]);
+    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0], &pos);
     assert!(!v.accept);
     assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::EnergyUncertainty));
-    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN]);
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN], &pos);
     assert!(!v.accept);
     assert_eq!(v.reason.as_ref().map(|r| (r.rule, r.atom)), Some((R::ForceUncertainty, Some(1))));
     assert!(v.uncertainty.is_nan(), "the readout shows the NaN, not the other atom's std");
@@ -4812,7 +4820,7 @@ fn training_views_read_the_store_and_the_posterior_only() {
     let floor = 2.0 * m.sigma_e; // energy_per_atom models: N s_E
     let epi = (pred.energy_std.unwrap().powi(2) - floor * floor).max(0.0).sqrt();
     assert!((c.sigma[k] - epi).abs() < 1e-15);
-    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap()).atoms.iter().copied().fold(0.0, f64::max);
+    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos).atoms.iter().copied().fold(0.0, f64::max);
     assert!((c.force_ratio[k] - ratio).abs() < 1e-15, "rule 6's ratio");
     assert!((c.energy[k] - (pred.energy - 2.0 * e_ref)).abs() < 1e-12);
     assert_eq!(c.refused[k], None, "inside the window the model answers");
@@ -6546,9 +6554,9 @@ fn a_short_class_is_never_an_acceptance() {
     use teach::tests_api::{teach_verdict, TeachVerdict};
     let class = |samples: usize, q: usize, f: f64, e: f64| {
         let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
-        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None }
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 }
     };
-    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
     assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
     assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
     assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
@@ -7911,3 +7919,120 @@ fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     assert!(answered >= 100, "{answered} answered");
 }
 
+
+// ---- M8a Task 2 fix round 3: the variance inflation of rules 6/7 ----
+
+/// A history point whose per-atom epistemic force std is `epi` and error `err` (Ha/Bohr), at a
+/// teacher force of 0 (every bound the absolute 2e-3).
+fn posterior_point(kind: surrogate::history::PointKind, err: f64, epi: f64) -> surrogate::AuditPoint {
+    surrogate::AuditPoint { pred_force_std_epistemic: vec![epi; 2], pred_force_std: vec![epi.max(1e-12); 2], ..history_point_full(kind, 2, 1, err, 0.0) }
+}
+
+/// The variance inflation λ (`calibrate`, "The variance inflation"): the measured error over the
+/// epistemic std, both in bound units, as a **ratio of sums** over the posterior's jurisdiction —
+/// 20 points at error 3× their std give λ = 3 × (1 + 1/√40); a calibrated class is floored at 1
+/// (nothing loosened) and carries only the scatter factor; fewer than three points give exactly
+/// 1; one confident point (std 1e-6) with a modest error (z = 62, the physics review's I2 case)
+/// among 266 calibrated points barely moves it (a mean of z² would give 4.0); fallbacks refused
+/// by rules 6/7 (codes 14, 15) and by the class with them (21) are its evidence, rule 5's are not;
+/// a comparison that is not a number makes it infinite.
+#[test]
+fn the_variance_inflation_is_a_ratio_of_sums_over_the_posteriors_jurisdiction() {
+    use calibrate::{calibrate, MIN_EVIDENCE};
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let infl = |n: usize| 1.0 + 1.0 / (2.0 * n as f64).sqrt();
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..20 {
+        h.push(posterior_point(PointKind::Audit, 1.5e-3, 5e-4));
+    }
+    let c = calibrate(&h, &pol).per_class[0];
+    assert!((c.inflation_raw - 3.0).abs() < 1e-12 && (c.inflation - 3.0 * infl(20)).abs() < 1e-12 && c.inflation_points == 20, "{c:?}");
+    // calibrated: floored at 1, the scatter factor only
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..20 {
+        h.push(posterior_point(PointKind::Audit, 2.5e-4, 5e-4));
+    }
+    let c = calibrate(&h, &pol).per_class[0];
+    assert!((c.inflation_raw - 0.5).abs() < 1e-12 && (c.inflation - infl(20)).abs() < 1e-12, "{c:?}");
+    // thin: exactly 1
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..MIN_EVIDENCE - 1 {
+        h.push(posterior_point(PointKind::Audit, 5e-2, 5e-4));
+    }
+    assert_eq!(calibrate(&h, &pol).per_class[0].inflation, 1.0);
+    // I2: one confident point with a modest error does not set the factor
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..266 {
+        h.push(posterior_point(PointKind::Audit, 5e-4, 5e-4));
+    }
+    h.push(posterior_point(PointKind::Audit, 6.2e-5, 1e-6));
+    let c = calibrate(&h, &pol).per_class[0];
+    let mean_of_ratios = ((266.0 + 62.0f64.powi(2)) / 267.0).sqrt();
+    println!("I2 case: λ raw {:.4} (a mean of z² would give {mean_of_ratios:.2}); {c:?}", c.inflation_raw);
+    assert!(c.inflation_raw < 1.001 && mean_of_ratios > 3.9, "{c:?}");
+    // the posterior's jurisdiction: rules 6/7 alone and with the class count, rule 5 does not
+    for (rule, counted) in [
+        (history_rule_code(TeachRule::ForceUncertainty), true),
+        (history_rule_code(TeachRule::EnergyUncertainty), true),
+        (HISTORY_RULE_CLASS_AND_VARIANCE, true),
+        (history_rule_code(TeachRule::Spread), false),
+        (history_rule_code(TeachRule::Grade), false),
+    ] {
+        let mut h = surrogate::AuditHistory::default();
+        for _ in 0..5 {
+            h.push(posterior_point(PointKind::Fallback { rule }, 1.5e-3, 5e-4));
+        }
+        let c = calibrate(&h, &pol).per_class[0];
+        assert_eq!(c.inflation_points, if counted { 5 } else { 0 }, "rule {rule}: {c:?}");
+        // the class verdict's own evidence is unchanged by them (not its jurisdiction)
+        assert_eq!(c.points, 0, "rule {rule}");
+    }
+    // not a number: infinite
+    let mut h = surrogate::AuditHistory::default();
+    for _ in 0..3 {
+        h.push(posterior_point(PointKind::Audit, 1e-3, 5e-4));
+    }
+    h.push(posterior_point(PointKind::Audit, f64::NAN, 5e-4));
+    assert_eq!(calibrate(&h, &pol).per_class[0].inflation, f64::INFINITY);
+}
+
+/// Rule 6 applies the class's inflation (fix round 3): a trained pair model answers an in-window
+/// H₂; the same model, once three rule-6 comparisons of the pair class have measured its error at
+/// R × its epistemic std (so λ = R(1 + 1/√6) puts the inflated std at 4× the bound there),
+/// refuses the same geometry by rule 6 — the note naming the calibration — and the step is a
+/// rule-6 point of the history (the factor's own evidence). The class verdict is untouched
+/// (rule-6 points are not its jurisdiction): the class stays trusted.
+#[test]
+fn rule_6_refuses_where_the_class_calibration_inflates_the_std() {
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    let sc = h2(1.6);
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let pred = s.model().unwrap().predict(&pos, &[1, 1], true).unwrap();
+    let epi = pred.force_std_epistemic.as_ref().unwrap().iter().copied().fold(0.0, f64::max);
+    let fmag = pred.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(f64::INFINITY, f64::min);
+    let bound = s.policy().force_bound(fmag);
+    // λ·epi/√3 = 4 bound with λ = R (1 + 1/√6) and R = err / 5e-4 (the points' epistemic std)
+    let lambda = 4.0 * bound * 3f64.sqrt() / epi;
+    let err = lambda / (1.0 + 1.0 / 6f64.sqrt()) * 5e-4;
+    let code_6 = history_rule_code(TeachRule::ForceUncertainty);
+    for _ in 0..3 {
+        s.audit_history.push(posterior_point(PointKind::Fallback { rule: code_6 }, err, 5e-4));
+    }
+    s.refresh_class_loo();
+    let l = s.class_loo()[0].clone();
+    println!("epistemic std {epi:.3e} at a bound {bound:.1e}: λ {:.4e}; {l:?}", l.inflation);
+    assert!((l.inflation - lambda).abs() < 1e-9 * lambda && l.trusted, "{l:?}");
+    let r = s.evaluate(&h2(1.61), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert!(r.stats.notes[0].contains("epistemic force std") && r.stats.notes[0].contains("its measured calibration for this environment class"), "{:?}", r.stats.notes);
+    assert_eq!(s.audit_history().iter().last().unwrap().kind, PointKind::Fallback { rule: code_6 });
+    // without the evidence (a forget of the history), the factor is 1 and the model answers again
+    s.audit_history = surrogate::AuditHistory::default();
+    s.refresh_class_loo();
+    assert_eq!(s.class_loo()[0].inflation, 1.0);
+    assert_eq!(s.evaluate(&h2(1.62), &mut never()).unwrap().stats.source, Source::Surrogate);
+}

@@ -465,18 +465,31 @@ impl SurrogateKs {
         Some(desc.iter().zip(&s).map(|(d, &si)| act.grade(si, d)).fold(0.0f64, f64::max))
     }
 
+    /// The variance inflation per atom of a geometry (M8a Task 2 fix round 3; `calibrate`, "The
+    /// variance inflation"): λ of the atom's environment class (`ClassLoo::inflation`), 1 for an
+    /// isolated atom or before the class has numbers.
+    pub(super) fn atom_inflation(&self, model: &Model, pos: &[[f64; 3]]) -> Vec<f64> {
+        let rc2 = model.basis.r_cut * model.basis.r_cut;
+        neighbour_counts(pos, rc2).into_iter().map(|k| atom_class(k).and_then(|c| self.class_loo.get(c)).map_or(1.0, |l| l.inflation)).collect()
+    }
+
     /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force
     /// std (`Prediction::force_std_epistemic`: force_std² = 3σ_f² + epistemic², exact) — rule 6
-    /// leaves the label noise out as rule 7 does for the energy (module doc).
-    pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64]) -> VarianceVerdict {
+    /// leaves the label noise out as rule 7 does for the energy (module doc). Since M8a Task 2 fix
+    /// round 3 each atom's epistemic force std is multiplied by its class's variance inflation λ
+    /// (`atom_inflation`; 1 for a calibrated or unmeasured class) and the epistemic energy std by
+    /// the largest λ among the geometry's atoms — one scale of the posterior covariance per class,
+    /// measured where the posterior decides (`calibrate`, "The variance inflation").
+    pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
-        // 6. forces, epistemic only
+        let infl = self.atom_inflation(model, pos);
+        // 6. forces, epistemic only, inflated by the class's calibration
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
         let mut atoms = Vec::with_capacity(n);
         for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
-            let fs = sd / SQRT_3;
+            let fs = sd / SQRT_3 * infl.get(j).copied().unwrap_or(1.0);
             uncertainty = max_nan(uncertainty, fs);
             let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
             atoms.push(fs / bound);
@@ -486,12 +499,14 @@ impl SurrogateKs {
                 worst = Some((j, fs, bound));
             }
         }
+        // the refusal says when the class's calibration decided (byte-identical without it)
+        let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
         if let Some((j, fs, bound)) = worst {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
                 reason: Some(Refusal::new(
-                    format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}"),
+                    format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}{}", scaled(infl.get(j).copied().unwrap_or(1.0))),
                     TeachRule::ForceUncertainty,
                     Some(j),
                 )),
@@ -502,13 +517,14 @@ impl SurrogateKs {
         // 7. energy, per atom, epistemic only
         let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
         // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
-        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64;
+        let e_infl = infl.iter().copied().fold(1.0f64, max_nan);
+        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64 * e_infl;
         if !(epistemic_per_atom <= p.energy_std_per_atom) {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
                 reason: Some(Refusal::new(
-                    format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom", p.energy_std_per_atom),
+                    format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),
                     TeachRule::EnergyUncertainty,
                     None,
                 )),

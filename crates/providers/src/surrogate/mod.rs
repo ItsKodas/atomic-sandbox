@@ -148,6 +148,14 @@
 //!    (Per atom the floor contributes s_E ≈ 1e-5 in quadrature, far below 1e-3: including it
 //!    would be inert in practice, not wrong; it is excluded for the reason, not the size.)
 //!    Otherwise → teacher; sample kept.
+//!
+//!    **Rules 6 and 7 are calibrated per environment class** (M8a Task 2 fix round 3, [`calibrate`],
+//!    "The variance inflation"): each atom's epistemic force std is multiplied by its class's λ
+//!    (`ClassLoo::inflation`; the energy's by the largest λ among the atoms) — the teacher's
+//!    measured error over the posterior's epistemic std, a ratio of sums in bound units over the
+//!    geometries where the std decides (audits, rule-4b and rule-6/7 fallbacks), ≥ 1, used from
+//!    three comparisons on. A refusal it decides says "(the model's std × λ, its measured
+//!    calibration for this environment class)".
 //! 8. **Audit** (ruling S7): every `audit_every`-th step the model answers (2000 by default;
 //!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
 //!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` — or, since
@@ -1762,7 +1770,7 @@ impl ForceProvider for SurrogateKs {
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
-                let mut v = self.variance_check(model, &pred, e, f);
+                let mut v = self.variance_check(model, &pred, e, f, &pos);
                 // rule 5d with the variance (the same cadence; a rejection is never reused)
                 if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
                     v.accept = false;

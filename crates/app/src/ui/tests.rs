@@ -190,7 +190,7 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1) }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0 }],
         last_audit_this_fit: true,
         audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
@@ -3803,7 +3803,7 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0 };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");

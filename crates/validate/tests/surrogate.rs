@@ -1366,6 +1366,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     // the grade against the outcome (the round-5 data: which γ the bad answers had)
     graded.sort_by(|a, b| a.0.total_cmp(&b.0));
     let beyond: Vec<String> = graded.iter().filter(|g| g.1 > REPRO_FORCE_RATIO || g.2 > tier).map(|g| format!("γ {:.2}: F×{:.1} ΔE/N {:.1e}", g.0, g.1, g.2)).collect();
+    let _ = writeln!(out, "    judged answers beyond 1× the force bound or the energy tier (the restated C1's scale): {} of {}", graded.iter().filter(|g| g.1 > 1.0 || g.2 > tier).count(), graded.len());
     let _ = writeln!(out, "    judged answers by grade: γ ∈ [{:.2}, {:.2}], median {:.2}; beyond the tier or 3× the force bound: {} — {}", graded.first().map_or(f64::NAN, |g| g.0), graded.last().map_or(f64::NAN, |g| g.0), graded.get(graded.len() / 2).map_or(f64::NAN, |g| g.0), beyond.len(), beyond.join("; "));
     for cut in [1.0, 1.1, 1.25, 1.5, 2.0] {
         let kept: Vec<&(f64, f64, f64)> = graded.iter().filter(|g| g.0 <= cut).collect();
@@ -1423,6 +1424,11 @@ struct ClassBaseline {
     /// controller's C1 acceptance, "beyond-p99-while-trusted counts per point").
     points_trusted: usize,
     points_beyond_trusted: usize,
+    /// The restated C1 (fix round 3, the controller's ruling): points while the class verdict was
+    /// trusted with an atom of the class judged beyond 1× its force bound (‖ΔF‖/√3 >
+    /// force_bound(|F_teacher|)) or |ΔE|/N beyond the energy tier — a missed large error when the
+    /// point is an audit (an answer the teacher judged).
+    points_beyond_bound_trusted: usize,
     /// The in-domain LOO p99 force error of the fit that judged the newest point (finite LOO errors
     /// only — physics review M6), the range over the fits seen, the fitted atoms of the class
     /// behind the last one and how many of them had an undefined (∞) leave-one-out.
@@ -1473,9 +1479,11 @@ struct TrustBaseline {
     /// calibration factor κ, its evidence in points, the LOO force / energy rms ratios, the
     /// measured force / energy errors (W, W_E; fix round 1) and the worst measured atom of the
     /// evidence window (fix round 2) — NaN where there is no evidence.
-    calibration: [(f64, usize, f64, f64, f64, f64, f64); 2],
+    calibration: [(f64, usize, f64, f64, f64, f64, f64, f64); 2],
     /// The largest worst-atom value the class's evidence window showed over the run (fix round 2).
     worst_atom_max: [f64; 2],
+    /// The largest rule-6/7 variance inflation λ of the class over the run (fix round 3).
+    inflation_max: [f64; 2],
     /// Fallback points' z (max over the point's atoms of the class) by refusing rule code, per
     /// class: the flagged tail the calibrated verdict is validated on (physics review I3).
     z_by_rule: [std::collections::BTreeMap<u8, Vec<f64>>; 2],
@@ -1541,8 +1549,9 @@ impl TrustBaseline {
             class_flips: [0; 2],
             class_entries: [0; 2],
             model_flips: 0,
-            calibration: [(f64::NAN, 0, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN); 2],
+            calibration: [(f64::NAN, 0, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, 1.0); 2],
             worst_atom_max: [0.0; 2],
+            inflation_max: [1.0; 2],
             z_by_rule: Default::default(),
             flip_log: Vec::new(),
             z_energy_audit: Vec::new(),
@@ -1595,8 +1604,8 @@ impl TrustBaseline {
                         self.class_entries[c] += (!a && b) as usize;
                         let l = &loo[c];
                         self.flip_log.push(format!(
-                            "step {} {}: {} → {} — {:?}; measured F {:.4}× E {:.4}× worst atom {:.2}× from {} evidence (κ {:.3}), LOO F rms {:.4}× max {:.2}×, E rms {:.4}× max {:.2}×, {} samples, model gen {}",
-                            self.steps, l.class, if a { "trusted" } else { "untrusted" }, if b { "trusted" } else { "untrusted" }, l.refusal, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN), l.evidence, l.calibration, l.force_rms, l.force_max, l.energy_rms, l.energy_max, l.samples, s.model_generation()
+                            "step {} {}: {} → {} — {:?}; measured F {:.4}× E {:.4}× worst atom {:.2}× from {} evidence (κ {:.3}, rule-6/7 inflation λ {:.3}), LOO F rms {:.4}× max {:.2}×, E rms {:.4}× max {:.2}×, {} samples, model gen {}",
+                            self.steps, l.class, if a { "trusted" } else { "untrusted" }, if b { "trusted" } else { "untrusted" }, l.refusal, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN), l.evidence, l.calibration, l.inflation, l.force_rms, l.force_max, l.energy_rms, l.energy_max, l.samples, s.model_generation()
                         ));
                     }
                 }
@@ -1604,7 +1613,10 @@ impl TrustBaseline {
         }
         self.prev_class = Some(verdict);
         for (c, l) in loo.iter().enumerate().take(2) {
-            self.calibration[c] = (l.calibration, l.evidence, l.force_rms, l.energy_rms, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN));
+            self.calibration[c] = (l.calibration, l.evidence, l.force_rms, l.energy_rms, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN), l.inflation);
+            if l.inflation > self.inflation_max[c] || l.inflation.is_nan() {
+                self.inflation_max[c] = l.inflation;
+            }
             if let Some(w) = l.worst_atom {
                 self.worst_atom_max[c] = if w.is_nan() || self.worst_atom_max[c].is_nan() { f64::NAN } else { self.worst_atom_max[c].max(w) };
             }
@@ -1644,6 +1656,9 @@ impl TrustBaseline {
             let mut point_max: [(f64, f64); 2] = [(f64::NEG_INFINITY, f64::NEG_INFINITY); 2];
             let mut point_err: [f64; 2] = [f64::NEG_INFINITY; 2];
             let mut point_beyond = [false; 2];
+            let pol = FallbackPolicy::default();
+            let energy_beyond = p.err_energy.abs() / p.n_atoms.max(1) as f64 > pol.energy_std_per_atom || !p.err_energy.is_finite();
+            let mut point_beyond_bound = [energy_beyond; 2];
             for j in 0..p.n_atoms {
                 let code = p.classes[j] as usize;
                 if code == 0 {
@@ -1661,6 +1676,7 @@ impl TrustBaseline {
                     b.atoms_model_untrusted += 1;
                 }
                 let z = p.err_force[j] / p.pred_force_std[j];
+                point_beyond_bound[c] |= !(p.err_force[j] / 3f64.sqrt() <= pol.force_bound(p.teacher_force[j]));
                 b.z_atom.push(z);
                 b.err_atom.push(p.err_force[j]);
                 point_max[c].1 = point_max[c].1.max(z);
@@ -1696,6 +1712,7 @@ impl TrustBaseline {
                         if verdict[c] == Some(true) {
                             b.points_trusted += 1;
                             b.points_beyond_trusted += point_beyond[c] as usize;
+                            b.points_beyond_bound_trusted += point_beyond_bound[c] as usize;
                         }
                     }
                 }
@@ -1727,7 +1744,8 @@ impl TrustBaseline {
             let b = &self.audit[c];
             let _ = writeln!(o, "  {name}: in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms, {} with an undefined LOO excluded; over the fits seen {:.2e}–{:.2e}); class verdict flips {} over {} consecutive-step pairs ({} of them entries untrusted → trusted, {} losses)",
                              b.p99, b.p99_atoms, b.loo_undefined, b.p99_min, b.p99_max, self.class_flips[c], self.steps.saturating_sub(1), self.class_entries[c], self.class_flips[c] - self.class_entries[c]);
-            let (kappa, evidence, f_rms, e_rms, w_f, w_e, worst) = self.calibration[c];
+            let (kappa, evidence, f_rms, e_rms, w_f, w_e, worst, lambda) = self.calibration[c];
+            let _ = writeln!(o, "    rule-6/7 variance inflation λ (fix round 3): {lambda:.3} at the last observation, max over the run {:.3}", self.inflation_max[c]);
             let _ = writeln!(o, "    calibrated verdict at the last observation (M8a Task 2, fix round 2): measured F {w_f:.4}× the bound, E {w_e:.4}× the tier, worst atom {worst:.3}× from {evidence} evidence points of the window (κ {kappa:.3}); LOO F rms {f_rms:.4}× E rms {e_rms:.4}× → the verdict's force value max(LOO, measured) = {:.4}× (enter ≤ {:.3}, stay ≤ {:.1}; entry also needs worst atom ≤ {:.0}); the window's worst atom over the run: max {:.3}×",
                              f_rms.max(w_f), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::WORST_ATOM, self.worst_atom_max[c]);
             for (rule, zs) in &self.z_by_rule[c] {
@@ -1741,7 +1759,7 @@ impl TrustBaseline {
                 let _ = writeln!(o, "    {what}: {} points touching the class ({} atoms; {} atoms while the class verdict was trusted, {} while the model was untrusted before the step)", b.points, b.atoms, b.atoms_trusted, b.atoms_model_untrusted);
                 let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (the brief's \"missed large error\"), {} while it was not",
                                  b.points_beyond, b.points_with_p99, share(b.points_beyond, b.points_with_p99), b.points - b.points_with_p99, b.atoms_beyond_trusted, b.atoms_trusted, share(b.atoms_beyond_trusted, b.atoms_trusted), b.atoms_beyond_untrusted);
-                let _ = writeln!(o, "      per point while the class verdict was trusted (fix round 2, the C1 acceptance): {} beyond the p99 of {} points", b.points_beyond_trusted, b.points_trusted);
+                let _ = writeln!(o, "      per point while the class verdict was trusted: {} beyond the p99 (the generalisation-gap statistic), {} beyond 1× the force bound or the energy tier (the restated C1, fix round 3), of {} points", b.points_beyond_trusted, b.points_beyond_bound_trusted, b.points_trusted);
                 let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
                 let _ = writeln!(o, "      ‖ΔF‖ per point (max over its atoms), Ha/Bohr: {}; per atom: {} — the audit's force tolerance is max({:.0e}, 10 % |F|) ≤ {:.0e} Ha/Bohr", sci(&b.err_point), sci(&b.err_atom), pol.force_std_abs, providers::surrogate::FORCE_STD_BOUND_MAX);
                 let _ = writeln!(o, "      z = ‖ΔF‖/pred_force_std per point (max over its atoms): {}; per atom: {}", quantiles(&b.z_point), quantiles(&b.z_atom));
@@ -1787,7 +1805,7 @@ fn trust_baseline_report() {
     let mut al = TrustBaseline::new(&format!("active_learning_run ({AL_STEPS} steps, audit every {every})"));
     active_learning_run(Some(&mut al), every);
     let mut out = String::new();
-    let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 2 — the measured error with the LOO floor over an evidence window of model generations, the worst-atom guard on entry; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0}, WINDOW_POINTS {})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM, providers::surrogate::WINDOW_POINTS);
+    let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 3 — the measured error with the LOO floor over an evidence window of model generations, the worst-atom guard on entry, rules 6/7 inflated by the class's λ; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0}, WINDOW_POINTS {})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM, providers::surrogate::WINDOW_POINTS);
     let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
     out += &repro.report();
     out += &al.report();

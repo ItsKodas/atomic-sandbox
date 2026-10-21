@@ -308,6 +308,9 @@ impl SurrogateKs {
     pub(super) fn refresh_class_loo(&mut self) {
         let (loo, worst, blockers) = self.compute_class_loo_full();
         self.class_loo = loo;
+        // the class verdicts carry rule 6/7's variance inflation (M8a Task 2 fix round 3): a cached
+        // variance verdict judged with the old factors is not reused
+        self.last_variance = None;
         self.class_worst = worst;
         self.class_blockers = blockers;
         // a class that is trusted again restarts its teach-around round count (SHOULD-T6)
@@ -430,6 +433,7 @@ impl SurrogateKs {
                     worst_atom: some(k.worst_atom),
                     evidence: k.evidence,
                     trusted_since,
+                    inflation: k.inflation,
                 }
             })
             .collect();
