@@ -457,10 +457,17 @@ impl SurrogateKs {
     /// calibration its class's species-less points give; 1 before the first fit.
     pub(super) fn key_inflation(&self, k: &surrogate::EnvKey) -> f64 {
         let c = (k.class as usize).wrapping_sub(1);
-        if let Some(s) = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)) {
-            return s.inflation;
+        let shown = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)).map(|s| s.inflation);
+        let Some(j) = self.class_judge.as_ref() else { return shown.unwrap_or(1.0) };
+        let own = j.refit_cal.key(k);
+        let lambda = shown.unwrap_or(own.inflation);
+        // a key with too little evidence of its own (fewer than MIN_EVIDENCE points: its λ is the
+        // floor 1) runs rule 6 at its class's measured λ, never looser (user-fix-2 physics review,
+        // Important: a sparse key must not drop to λ = 1 where its class measured 17.6)
+        if own.inflation_points < super::calibrate::MIN_EVIDENCE {
+            return j.refit_cal.per_class.get(c).map_or(lambda, |cl| lambda.max(cl.inflation));
         }
-        self.class_judge.as_ref().map_or(1.0, |j| j.refit_cal.key(k).inflation)
+        lambda
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
