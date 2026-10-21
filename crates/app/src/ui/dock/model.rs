@@ -580,6 +580,11 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
 pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at three or more geometries of a class, one badly predicted sample is enough to keep the whole class on DFT; from then on the class is judged by the error those DFT checks measured (on average, with a margin to start answering), with the left-out average as a floor.";
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
+/// One environment species' row under its class ("  many-body around O, with H: learned").
+pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
+    format!("  {class} {}: {}", s.words(), if s.trusted { "learned" } else { "not learned yet (DFT)" })
+}
+
 pub fn class_line(c: &sim::ClassLoo) -> String {
     format!(
         "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
@@ -595,8 +600,11 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
+        let s = |z, nb: Vec<u8>, trusted| sim::SpeciesVerdict { z, neighbours: nb, trusted, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
+        assert_eq!(super::species_line("many-body", &s(8, vec![1], true)), "  many-body around O, with H: learned");
+        assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], false)), "  many-body around H, with H and O: not learned yet (DFT)");
     }
 }
 
@@ -673,6 +681,10 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
             ui.vertical(|ui| {
                 for c in &m.class_loo {
                     ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
+                    // per environment species (M8a user-test fix 2): an atom answers by its own
+                    for s in c.species.iter().filter(|_| c.species.len() > 1) {
+                        ui.colored_label(if s.trusted { GREEN } else { AMBER }, RichText::new(species_line(c.class, s)).monospace());
+                    }
                 }
             })
             .response

@@ -502,6 +502,15 @@
 //!   `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
 //!   H₃⁺): a many-body class the max rule refuses for one compressed trimer (LOO max 1.57×)
 //!   enters on its own rule-4b comparisons and holds (`a_compressed_trimer_does_not_flip_the_many_body_verdict`).
+//! - **Per environment species** (M8a user-test fix 2, the controller's rulings; `calibrate` "Per
+//!   environment species"): the evidence window, W, λ, the worst-atom guard, the hysteresis
+//!   memory and the leave-one-out force/energy numbers are kept per key (class, Z, the sorted
+//!   neighbour species within r_cut — Z a key only), the Q′ sample count per class; an atom answers
+//!   by its own key's verdict and a refusal names it ("many-body around H, with H"). The class's
+//!   `ClassLoo` is all its keys trusted. A history point recorded before species were kept counts
+//!   for every key of its class. New verdict evidence (an audit or a rule-4b point) re-judges the
+//!   verdicts at once (`rejudge_classes`), not at the next refit. The user's case: one hot-H₃ point
+//!   at 5.66× its bound kept water's many-body environments out of a 1724-sample H/O collection.
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
 //! - **4b fallbacks**: kept unthinned while the class is short of Q′ samples, thinned like rule 5
@@ -928,6 +937,7 @@ mod views;
 
 use audit::*;
 use inspect::StrictVerdict;
+use trust::ClassJudge;
 use ledger::*;
 use policy::*;
 use quarantine::*;
@@ -1034,8 +1044,13 @@ pub struct SurrogateKs {
     /// verdict that **stood** when the current refit, install or policy change began — (trusted,
     /// `trusted_since`) — committed by `commit_class_memory` once that operation is done, so a
     /// recovery's intermediate fits inside one `refit` neither enter nor leave on their own.
-    /// Cleared by a forget or an install.
-    class_memory: Vec<(bool, Option<u64>)>,
+    /// Cleared by a forget or an install. Per environment key (class, Z, neighbour species: M8a
+    /// user-test fix 2, `calibrate` "Per environment species").
+    class_memory: BTreeMap<surrogate::EnvKey, (bool, Option<u64>)>,
+    /// What the class verdicts were last judged from — the fit's per-class statistics, its keys
+    /// and the calibration — so new evidence re-judges them without a refit (`rejudge_classes`,
+    /// the controller's ruling 3 of user-test fix 2); `None` before the first fit.
+    class_judge: Option<ClassJudge>,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -1270,7 +1285,8 @@ impl SurrogateKs {
             active_set: None,
             training_residuals: None,
             class_loo: Vec::new(),
-            class_memory: Vec::new(),
+            class_memory: BTreeMap::new(),
+            class_judge: None,
             audit_failed: None,
             audit_force: None,
             failed_audits: Vec::new(),
@@ -1495,7 +1511,7 @@ impl SurrogateKs {
         // there, an audit included) and not for a non-finite prediction (no finite stds exist)
         if let Some(m) = h.model.as_ref().filter(|_| !h.audit && !h.shell_fence && h.reason.rule != TeachRule::NonFiniteAnswer) {
             let kind = surrogate::history::PointKind::Fallback { rule: h.history_rule };
-            self.record_history_point(kind, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
+            self.record_history_point(kind, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
         }
         if h.model.is_some() && !h.audit {
             self.streak += 1;
@@ -1570,7 +1586,7 @@ impl SurrogateKs {
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
                     // the history's point (M8a Task 1): an in-step audit is never a draft guess
-                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
                     // a box-affected audit judged nothing: it does not satisfy the cadence — the
                     // next answered step is audited again — and it is counted for the checklist
                     // (M8a Task 2, the Task 1 physics review's I4); the step keeps the model's
@@ -1837,7 +1853,7 @@ impl ForceProvider for SurrogateKs {
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
-                let mut v = self.variance_check(model, &pred, e, f, &pos);
+                let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
                 // rule 5d with the variance (the same cadence; a rejection is never reused)
                 if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
                     v.accept = false;
@@ -1859,7 +1875,10 @@ impl ForceProvider for SurrogateKs {
         // must be trusted by the fit's leave-one-out errors. When rule 5 fires as well its note
         // (which atom, which feature) is the more specific one and is shown; the variance's
         // (6–7) yields to the class's
-        let class = self.class_untrusted(&counts);
+        let class = {
+            let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
+            self.class_untrusted(&env_keys(&pos, &z, rc2))
+        };
         let class_short = class.as_ref().is_some_and(|c| c.1);
         let by_class = class.is_some();
         let novel = (variance.novel && !variance.accept).then(|| variance.reason.clone()).flatten();

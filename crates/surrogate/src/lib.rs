@@ -38,6 +38,6 @@ pub use fit::{
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
 pub use collection::{Collection, CollectionReference, CollectionSample, ImportReport, OpenReport, ReferenceOutcome};
 pub use grade::ActiveSet;
-pub use history::{AuditHistory, AuditPoint, HISTORY_CAP};
+pub use history::{AuditHistory, AuditPoint, EnvKey, HISTORY_CAP};
 pub use novelty::NullSpace;
 pub use sidecar::{SampleSet, Sidecar};

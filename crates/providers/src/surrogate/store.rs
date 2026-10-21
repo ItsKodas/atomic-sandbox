@@ -120,7 +120,8 @@ impl SurrogateKs {
         self.audit_force = None;
         self.training_residuals = None;
         self.class_loo = Vec::new();
-        self.class_memory = Vec::new();
+        self.class_memory = BTreeMap::new();
+        self.class_judge = None;
         self.class_worst = Vec::new();
         self.class_blockers = Vec::new();
         self.teach_rounds.clear();
@@ -221,7 +222,7 @@ impl SurrogateKs {
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
         // and the audit history (version 7, M8a Task 1) with the class verdict's hysteresis memory
         // (M8a Task 2 fix round 2: a reload keeps a verdict inside the band)
-        surrogate::sidecar::write_full_with_memory(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory)
+        surrogate::sidecar::write_full_with_memory(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory.iter().map(|(k, &(t, g))| (k.clone(), t, g)).collect::<Vec<_>>())
     }
 
     /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
@@ -381,7 +382,7 @@ impl SurrogateKs {
         // and the saved verdicts' `trusted_since` are the writer's, so this provider's generation
         // moves past all of them — the calibrated verdict's evidence window compares generations
         // as numbers (`calibrate`, "The evidence window"; M8a Task 2 fix round 2)
-        let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.1)).max().unwrap_or(0);
+        let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.2)).max().unwrap_or(0);
         self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);
@@ -396,7 +397,8 @@ impl SurrogateKs {
         // resumed training keep a verdict that sat inside the band (ENTER, LEAVE]; a file without
         // one (or of another shape) starts without a memory and a band verdict re-enters
         self.class_loo = Vec::new();
-        self.class_memory = if class_memory.len() == ENV_CLASSES.len() { class_memory } else { Vec::new() };
+        self.class_memory = class_memory.into_iter().map(|(k, t, g)| (k, (t, g))).collect();
+        self.class_judge = None;
         self.refresh_class_loo();
         self.commit_class_memory();
         self.rebuild_active_set();

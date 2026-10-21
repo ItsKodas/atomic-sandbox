@@ -1446,7 +1446,7 @@ mod tests {
             c.set_status(3, Q_NONE).unwrap();
             assert!(c.set_status(5, Q_HELD).is_err(), "no sample 5");
             c.set_reference(1, CollectionReference { energy: -0.478_123_456_789_012_3, grid_n: Some(49), face_density: Some(1.25e-9) }).unwrap();
-            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7 });
+            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
             c.save_history().unwrap();
             assert_eq!(c.append(cs(2)), Err(REFUSE_DUPLICATE.to_string()), "an identical sample is refused");
             let mut retagged = cs(2);

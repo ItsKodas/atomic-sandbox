@@ -187,11 +187,11 @@ impl SurrogateKs {
             }
         }
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
+        if let Some((r, _)) = self.class_untrusted(&env_keys(pos, z, rc2)) {
             return Err(code(r));
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, pred, e, f, pos);
+            let v = self.variance_check(model, pred, e, f, pos, z);
             if !v.accept {
                 return Err(code(v.reason.expect("a refusing variance verdict names its rule")));
             }
@@ -277,7 +277,7 @@ impl SurrogateKs {
                         // `max_nan`: a NaN variance stays NaN (Task 3b), never a zero band
                         c.sigma.push(max_nan(e * e - floor2 * floor2, 0.0).sqrt());
                         // rule 6's ratio: max over the atoms of σ_F,epi/(√3 · bound) (plan review M5)
-                        c.force_ratio.push(self.variance_check(model, &p, e, f, &pos).atoms.iter().copied().fold(0.0, max_nan));
+                        c.force_ratio.push(self.variance_check(model, &p, e, f, &pos, &zs).atoms.iter().copied().fold(0.0, max_nan));
                     }
                     c.middle.push(self.verdict_middle(model, &pos, &zs, &p).err().map(|e| e.0));
                     c.r.push(x);

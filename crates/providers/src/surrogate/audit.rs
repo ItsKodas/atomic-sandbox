@@ -553,7 +553,7 @@ impl SurrogateKs {
     /// If the shapes disagree with the geometry (a programming error at the call site: every
     /// judged comparison leaves a point or a count, so nothing is dropped silently).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
         if box_affected {
             self.audit_history.unrecorded.box_affected += 1;
             return;
@@ -574,6 +574,8 @@ impl SurrogateKs {
         assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
         let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
         let classes = neighbour_counts(pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1)).collect();
+        // per atom (Z, its neighbours' species): the class verdict's key (user-test fix 2)
+        let species = if z.len() == n { neighbour_species(pos, z, rc2) } else { Vec::new() };
         let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
         // |F_teacher| per atom: the per-atom bound's input (M8a Task 2 fix round 1, review A.1)
         let teacher_force = forces.iter().map(|t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()).collect();
@@ -589,7 +591,14 @@ impl SurrogateKs {
             err_energy: energy - model_energy,
             n_atoms: n,
             model_gen: self.model_gen,
+            species,
         });
+        // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
+        // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never
+        // refits, and its evidence would otherwise never be read)
+        if super::calibrate::in_jurisdiction(kind) {
+            self.rejudge_classes();
+        }
     }
 
     /// The last audit judged the current fit: `false` when no audit ran since the last refit
@@ -861,7 +870,7 @@ impl SurrogateKs {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_history_point(PointKind::Audit, &pos, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
+        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

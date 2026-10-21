@@ -22,7 +22,7 @@ pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDen
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, ClassKey, ClassLoo, ImportSummary, ModelSource, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
+    AuditRecord, AuditVerdict, ClassKey, ClassLoo, SpeciesVerdict, ImportSummary, ModelSource, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
     ColourLook, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
     SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };

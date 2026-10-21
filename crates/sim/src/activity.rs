@@ -487,7 +487,12 @@ pub enum TeachOutcome {
     ShellNotKept,
     FenceDisagrees,
     WaitingForPass,
+    /// Used for its step, not kept for this model: its settings differ.
     NotOffered,
+    /// A DFT solve held out on purpose to test the teaching — a teach-around pass's held-out check
+    /// or a sampling pass's shell check: solved, never trained on, judged after the refit (M8a
+    /// user-test fix 2; these were worded "other settings" before).
+    HeldOut,
     /// A background audit's answer arrived after the model changed settings or species: not
     /// judged, not kept (plan review S11).
     Discarded,

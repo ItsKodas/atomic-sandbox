@@ -64,6 +64,17 @@
 //! like `atom_class`: **0 pair, 1 many-body**; an isolated atom (code 0 here) has no entry there.
 //! So code c ≥ 1 of a point is row c − 1 of a per-class table.
 //!
+//! # Species (M8a user-test fix 2: class trust per environment species)
+//!
+//! `AuditPoint::species[j]` = (Z_j, the sorted distinct species of the atom's neighbours within
+//! r_cut): with the class code it is the atom's [`EnvKey`], the key the calibrated class verdict
+//! keeps its evidence under (`providers::surrogate::calibrate`). Z is a key only (rule 1). Empty
+//! for a point recorded before species were kept: such a point counts for **every** key of its
+//! atoms' classes (the conservative reading; the controller's ruling). Serialised as the optional
+//! array `audit_species` after the ten ([`HistoryArrays::species`]): per point m = 0 (unknown) or
+//! m = n_atoms followed, per atom, by Z, k and the k neighbour species ascending. A file without the
+//! array reads with every point unknown.
+//!
 //! # What is not recorded
 //!
 //! A judged audit, and a fallback with the model's prediction, always leaves a point when the
@@ -84,6 +95,7 @@
 //! no_variance, box_affected, draft, unfit   u64 LE each, the Unrecorded counters
 //! array₁ … array₁₀                each u64 LE length n, then n f64 LE values — the ten
 //!                                 arrays of [`HistoryArrays::NAMES`] in that order
+//! array₁₁ (optional)              `audit_species` ("Species" above; absent in older files)
 //! (end — trailing bytes are an error)
 //! ```
 //!
@@ -173,6 +185,27 @@ pub struct AuditPoint {
     pub n_atoms: usize,
     /// The provider's model generation that was judged (`SurrogateKs::model_gen`).
     pub model_gen: u64,
+    /// Per atom: (Z, its neighbours' distinct species within r_cut, ascending) — module doc,
+    /// "Species"; empty when unknown (a point recorded before species were kept).
+    pub species: Vec<(u8, Vec<u8>)>,
+}
+
+/// The key the calibrated class verdict keeps its evidence under (module doc, "Species"): an
+/// atom's class code (1 pair, 2 many-body), its Z and its neighbours' distinct species within
+/// r_cut, ascending. Z is a key only — nothing per element is read from it (rule 1).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnvKey {
+    pub class: u8,
+    pub z: u8,
+    pub neighbours: Vec<u8>,
+}
+
+impl AuditPoint {
+    /// Atom j's [`EnvKey`], `None` for an isolated atom (class 0) or unknown species.
+    pub fn key(&self, j: usize) -> Option<EnvKey> {
+        let (z, nb) = self.species.get(j)?;
+        (self.classes[j] != 0).then(|| EnvKey { class: self.classes[j], z: *z, neighbours: nb.clone() })
+    }
 }
 
 impl AuditPoint {
@@ -189,6 +222,12 @@ impl AuditPoint {
         }
         if let Some(c) = self.classes.iter().find(|&&c| c > 2) {
             return Err(format!("audit point: class code {c} (0 isolated, 1 pair, 2 many-body)"));
+        }
+        if !(self.species.is_empty() || self.species.len() == n) {
+            return Err(format!("audit point: species has {} entries for {n} atoms", self.species.len()));
+        }
+        if self.species.iter().any(|(z, nb)| *z == 0 || nb.contains(&0) || nb.windows(2).any(|w| w[0] >= w[1])) {
+            return Err("audit point: a species entry is 0 or its neighbours are not ascending and distinct".into());
         }
         Ok(())
     }
@@ -229,9 +268,14 @@ pub struct HistoryArrays {
     pub force_std_epistemic: Vec<f64>,
     pub err_force: Vec<f64>,
     pub teacher_force: Vec<f64>,
+    /// The optional `audit_species` array (module doc, "Species"); empty = every point unknown.
+    pub species: Vec<f64>,
 }
 
 impl HistoryArrays {
+    /// The optional eleventh array's name (module doc, "Species").
+    pub const SPECIES: &'static str = "audit_species";
+
     /// The arrays' names in serialised order (the first [`PER_POINT`](Self::PER_POINT) are per
     /// point, the rest per atom).
     pub const NAMES: [&'static str; 10] = ["audit_atoms", "audit_model_gen", "audit_kind", "audit_energy_std", "audit_err_energy", "audit_classes", "audit_force_std", "audit_force_std_epistemic", "audit_err_force", "audit_teacher_force"];
@@ -257,7 +301,7 @@ impl HistoryArrays {
     /// The arrays from ten vectors in [`NAMES`](Self::NAMES) order.
     pub fn from_vecs(v: [Vec<f64>; 10]) -> HistoryArrays {
         let [atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force, teacher_force] = v;
-        HistoryArrays { atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force, teacher_force }
+        HistoryArrays { atoms, model_gen, kind, energy_std, err_energy, classes, force_std, force_std_epistemic, err_force, teacher_force, species: Vec::new() }
     }
 }
 
@@ -310,6 +354,12 @@ impl AuditHistory {
             a.force_std_epistemic.extend_from_slice(&p.pred_force_std_epistemic);
             a.err_force.extend_from_slice(&p.err_force);
             a.teacher_force.extend_from_slice(&p.teacher_force);
+            a.species.push(p.species.len() as f64);
+            for (z, nb) in &p.species {
+                a.species.push(*z as f64);
+                a.species.push(nb.len() as f64);
+                a.species.extend(nb.iter().map(|&x| x as f64));
+            }
         }
         a
     }
@@ -352,9 +402,10 @@ impl AuditHistory {
         if let Some((i, &c)) = a.classes.iter().enumerate().find(|(_, &c)| !(c == 0.0 || c == 1.0 || c == 2.0)) {
             return Err(format!("audit_classes[{i}] = {c} is not 0, 1 or 2"));
         }
+        let species = decode_species(&a.species, &a.atoms)?;
         let mut h = AuditHistory { ring: VecDeque::with_capacity(m.min(HISTORY_CAP)), recorded: 0, unrecorded };
         let mut at = 0usize;
-        for i in 0..m {
+        for (i, species) in species.into_iter().enumerate() {
             let n = a.atoms[i] as usize;
             let r = at..at + n;
             h.push(AuditPoint {
@@ -368,6 +419,7 @@ impl AuditHistory {
                 err_energy: a.err_energy[i],
                 n_atoms: n,
                 model_gen: a.model_gen[i] as u64,
+                species,
             });
             at += n;
         }
@@ -388,7 +440,8 @@ impl AuditHistory {
         for c in [self.recorded, self.unrecorded.no_variance, self.unrecorded.box_affected, self.unrecorded.draft, self.unrecorded.unfit] {
             out.extend_from_slice(&c.to_le_bytes());
         }
-        for (_, v) in slices {
+        // the ten, then the species array (module doc, "Species")
+        for v in slices.iter().map(|(_, v)| *v).chain([&a.species[..]]) {
             out.extend_from_slice(&(v.len() as u64).to_le_bytes());
             for x in v {
                 out.extend_from_slice(&x.to_le_bytes());
@@ -412,8 +465,12 @@ impl AuditHistory {
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
         let (recorded, no_variance, box_affected, draft, unfit) = (u64_at(8), u64_at(16), u64_at(24), u64_at(32), u64_at(40));
         let mut at = 48usize;
-        let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(HistoryArrays::NAMES.len());
-        for name in HistoryArrays::NAMES {
+        let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(HistoryArrays::NAMES.len() + 1);
+        // the ten, then the optional species array (module doc, "Species": absent in older files)
+        for (i, name) in HistoryArrays::NAMES.iter().chain([&HistoryArrays::SPECIES]).enumerate() {
+            if i == HistoryArrays::NAMES.len() && at == bytes.len() {
+                break;
+            }
             let prefix = bytes.get(at..at + 8).ok_or_else(|| format!("file ends before array {name}"))?;
             let n = u64::from_le_bytes(prefix.try_into().expect("8 bytes"));
             at += 8;
@@ -424,9 +481,51 @@ impl AuditHistory {
         if at != bytes.len() {
             return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
         }
-        let a = HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays"));
+        let species = if arrays.len() > HistoryArrays::NAMES.len() { arrays.pop().expect("eleven") } else { Vec::new() };
+        let a = HistoryArrays { species, ..HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays")) };
         Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit })
     }
+}
+
+/// The `audit_species` array (module doc, "Species") into per-point species lists; empty → every
+/// point unknown. Strict: integral codes, m ∈ {0, n_atoms}, Z in 1..=255, neighbours ascending and
+/// distinct, every entry consumed.
+fn decode_species(v: &[f64], atoms: &[f64]) -> Result<Vec<Vec<(u8, Vec<u8>)>>, String> {
+    if v.is_empty() {
+        return Ok(vec![Vec::new(); atoms.len()]);
+    }
+    let mut at = 0usize;
+    let mut next = |what: &str, max: f64| -> Result<usize, String> {
+        let x = *v.get(at).ok_or_else(|| format!("audit_species ends inside {what}"))?;
+        if !(x.fract() == 0.0 && (0.0..=max).contains(&x)) {
+            return Err(format!("audit_species[{at}] = {x} is not a valid {what}"));
+        }
+        at += 1;
+        Ok(x as usize)
+    };
+    let mut out = Vec::with_capacity(atoms.len());
+    for &n in atoms {
+        let n = n as usize;
+        let m = next("atom count", MAX_ATOMS)?;
+        if m != 0 && m != n {
+            return Err(format!("audit_species: {m} atoms for a point of {n}"));
+        }
+        let mut p = Vec::with_capacity(m);
+        for _ in 0..m {
+            let z = next("species", 255.0)? as u8;
+            let k = next("neighbour count", 255.0)?;
+            let nb = (0..k).map(|_| next("species", 255.0).map(|x| x as u8)).collect::<Result<Vec<u8>, String>>()?;
+            if z == 0 || nb.contains(&0) || nb.windows(2).any(|w| w[0] >= w[1]) {
+                return Err("audit_species: a species is 0 or the neighbours are not ascending and distinct".into());
+            }
+            p.push((z, nb));
+        }
+        out.push(p);
+    }
+    if at != v.len() {
+        return Err(format!("audit_species: {} trailing entries", v.len() - at));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -445,7 +544,34 @@ mod tests {
             err_energy: -2e-6,
             n_atoms: n,
             model_gen: gen,
+            species: if gen % 3 == 0 { Vec::new() } else { (0..n).map(|j| (1 + (j % 2) as u8, if j == 0 { vec![1, 8] } else { vec![8] })).collect() },
         }
+    }
+
+    /// M8a user-test fix 2: the species ride along as the optional eleventh array; a file written
+    /// without it (the ten arrays only) reads with every point's species unknown, the rest intact;
+    /// a malformed species array is refused.
+    #[test]
+    fn species_round_trip_and_old_files_read_unknown() {
+        let mut h = AuditHistory::default();
+        for g in 0..7 {
+            h.push(point(3, g));
+        }
+        assert!(h.iter().any(|p| !p.species.is_empty()) && h.iter().any(|p| p.species.is_empty()));
+        assert_eq!(AuditHistory::decode(&h.encode()).unwrap(), h);
+        assert_eq!(h.iter().nth(1).unwrap().key(1), Some(EnvKey { class: 1, z: 2, neighbours: vec![8] }));
+        assert_eq!(h.iter().nth(1).unwrap().key(0), None, "an isolated atom has no key");
+        // the ten arrays only: drop the species array (its length prefix and values, last)
+        let bytes = h.encode();
+        let n = h.to_arrays().species.len();
+        let old = &bytes[..bytes.len() - 8 - 8 * n];
+        let back = AuditHistory::decode(old).unwrap();
+        assert!(back.iter().all(|p| p.species.is_empty()));
+        assert!(back.iter().zip(h.iter()).all(|(a, b)| AuditPoint { species: Vec::new(), ..b.clone() } == *a));
+        // malformed: a species count that is not the point's atom count
+        let mut a = h.to_arrays();
+        a.species[0] = 2.0;
+        assert!(AuditHistory::from_arrays(&a, h.recorded(), h.unrecorded).is_err());
     }
 
     /// The arrays form and back is the identity, counters included; non-finite values survive

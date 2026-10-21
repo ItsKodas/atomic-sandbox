@@ -1306,6 +1306,44 @@ pub struct ClassLoo {
     /// it before they are compared with their bounds. ≥ 1; 1 until the class has three
     /// comparisons where the posterior decides.
     pub inflation: f64,
+    /// The verdict per environment species of the class (M8a user-test fix 2,
+    /// `providers::surrogate::calibrate` "Per environment species"): an atom answers by its own
+    /// (central Z, neighbour species) key's verdict. The class's own `trusted` is all of them
+    /// trusted; its `refusal` and evidence numbers are the first refused key's. Empty before the
+    /// class has samples.
+    pub species: Vec<SpeciesVerdict>,
+}
+
+/// One environment key's verdict ([`ClassLoo::species`]): the atom's species and its neighbours'
+/// distinct species within r_cut (ascending), with the numbers of its own evidence window — the
+/// fields mean what [`ClassLoo`]'s do, for this key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeciesVerdict {
+    pub z: u8,
+    pub neighbours: Vec<u8>,
+    pub trusted: bool,
+    pub refusal: Option<(ClassKey, f64, f64)>,
+    pub calibration: f64,
+    pub measured: Option<f64>,
+    pub measured_energy: Option<f64>,
+    pub worst_atom: Option<f64>,
+    pub evidence: usize,
+    pub trusted_since: Option<u64>,
+    pub inflation: f64,
+}
+
+impl SpeciesVerdict {
+    /// "around O, with H" / "around H, with H and O" — the key in words (symbols only: Z is a key).
+    pub fn words(&self) -> String {
+        let sym = |z: u8| units::elements::symbol(z).to_string();
+        let nb: Vec<String> = self.neighbours.iter().map(|&z| sym(z)).collect();
+        let with = match nb.len() {
+            0 => String::new(),
+            1 => format!(", with {}", nb[0]),
+            n => format!(", with {} and {}", nb[..n - 1].join(", "), nb[n - 1]),
+        };
+        format!("around {}{with}", sym(self.z))
+    }
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
@@ -1336,6 +1374,11 @@ pub enum ClassKey {
     /// The calibrated verdict, decided by the DFT-measured energy error (`ClassLoo::measured_energy`,
     /// in tier units) against its limit.
     MeasuredEnergy,
+    /// Between refits (M8a user-test fix 2: the verdict re-judged as evidence arrives) an untrusted
+    /// environment enters only on a full evidence window: (its comparisons, `WINDOW_POINTS` = 300)
+    /// — the count at which a window free of 3× atoms makes a 1 % tail unlikely. Until then entry
+    /// waits for the next refit's verdict.
+    Window,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

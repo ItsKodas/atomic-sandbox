@@ -168,8 +168,11 @@
 //! version 7 exists in a file). With a blank history nothing is added:
 //! the file is version 5's bytes under the version-7 magic. A fitted provider also writes the key
 //! `class_memory` (M8a Task 2 fix round 2, while version 7 was unreleased): the calibrated class
-//! verdict's hysteresis memory, one object per environment class (pair, many-body) {trusted (JSON
-//! bool), since (the model generation it was entered at, a JSON integer, or null)} — so a reload
+//! verdict's hysteresis memory, one object per environment key (M8a user-test fix 2: {class (1
+//! pair, 2 many-body), z, neighbours (the sorted neighbour species), trusted (JSON bool), since (the
+//! model generation it was entered at, a JSON integer, or null)}; the per-class form written before
+//! the keys reads as empty, a band verdict then re-entering under ENTER), and after the ten history
+//! arrays the optional `audit_species` array (`crate::history` "Species") — so a reload
 //! keeps a verdict that sat inside the hysteresis band (`providers::surrogate::calibrate`); absent,
 //! the loader starts without a memory (a band verdict re-enters). Optional and strict like
 //! `audit_history` when present. The keys and the arrays are read for
@@ -201,7 +204,12 @@
 
 use crate::descriptor::Basis;
 use crate::fit::{Accumulator, FitReport, Sample, SampleTag};
-use crate::history::{AuditHistory, HistoryArrays, Unrecorded};
+use crate::history::{AuditHistory, EnvKey, HistoryArrays, Unrecorded};
+
+/// The calibrated class verdict's hysteresis memory (header key `class_memory`): per environment
+/// key (class, Z, neighbour species — `crate::history::EnvKey`, M8a user-test fix 2) the standing
+/// verdict and the generation it was entered at.
+pub type ClassMemory = Vec<(EnvKey, bool, Option<u64>)>;
 use crate::model::{Model, Provenance};
 use std::io;
 use std::path::Path;
@@ -266,7 +274,7 @@ pub struct Sidecar {
     /// The calibrated class verdict's hysteresis memory per environment class (pair, many-body):
     /// (trusted, the model generation it was entered at) — header key `class_memory` (version 7;
     /// module doc). Empty when absent.
-    pub class_memory: Vec<(bool, Option<u64>)>,
+    pub class_memory: ClassMemory,
 }
 
 /// What a version-6 file holds: training samples taught before any fit formed (module doc,
@@ -405,7 +413,7 @@ pub fn write_full_with_history(path: &Path, model: &Model, acc: &Accumulator, re
 /// [`write_full_with_history`] with the calibrated class verdict's hysteresis memory (header key
 /// `class_memory`, written only when `memory` is not empty — module doc, "Version 7").
 #[allow(clippy::too_many_arguments)]
-pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(bool, Option<u64>)]) -> io::Result<()> {
+pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
@@ -546,7 +554,7 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(bool, Option<u64>)]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
     let magic: &[u8; 8] = if basis.body4 { MAGIC_V8 } else { MAGIC_V7 };
@@ -628,6 +636,8 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     let hist_arrays = with_history.then(|| history.to_arrays());
     if let Some(a) = &hist_arrays {
         arrays.extend(a.as_slices());
+        // the species array (`crate::history` "Species", M8a user-test fix 2), after the ten
+        arrays.push((HistoryArrays::SPECIES, &a.species));
     }
 
     let provenance = provenance_json(&model.provenance);
@@ -718,7 +728,13 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ));
     }
     if !memory.is_empty() {
-        let list: Vec<String> = memory.iter().map(|&(t, since)| obj(&[("trusted", t.to_string()), ("since", since.map_or("null".to_string(), |g| g.to_string()))])).collect();
+        let list: Vec<String> = memory
+            .iter()
+            .map(|(k, t, since)| {
+                let nb = format!("[{}]", k.neighbours.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
+                obj(&[("class", k.class.to_string()), ("z", k.z.to_string()), ("neighbours", nb), ("trusted", t.to_string()), ("since", since.map_or("null".to_string(), |g| g.to_string()))])
+            })
+            .collect();
         pairs.push(("class_memory", format!("[{}]", list.join(","))));
     }
     // optional (module doc): absent, the header is byte-identical to the older writer's
@@ -1154,6 +1170,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             fixed.push((*name, (i < HistoryArrays::PER_POINT).then_some(*points)));
         }
     }
+    // the optional species array after the ten (absent in files written before it)
+    let has_species = history_counts.is_some() && declared.get(fixed.len()).is_some_and(|(n, _)| n == HistoryArrays::SPECIES);
+    if has_species {
+        fixed.push((HistoryArrays::SPECIES, None));
+    }
     let arrays = read_arrays(bytes, &declared, &fixed, version)?;
     let mut it = arrays.into_iter();
     let mut next = || it.next().expect("every declared array read");
@@ -1239,22 +1260,30 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         None => AuditHistory::default(),
         Some((_, recorded, unrecorded)) => {
             let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next(), next()]);
+            let a = HistoryArrays { species: if has_species { next() } else { Vec::new() }, ..a };
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
     Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory })
 }
 
-/// The version-7 header key `class_memory` (module doc): per class (trusted, since), empty when
-/// absent or null; strict when present (at most the two environment classes, every field typed).
-fn decode_class_memory(h: &Json) -> Result<Vec<(bool, Option<u64>)>, String> {
+/// The version-7 header key `class_memory` (module doc): per environment key (class, z,
+/// neighbours, trusted, since), empty when absent or null; strict when present (every field
+/// typed). The per-class form written before the keys (M8a user-test fix 2: entries without `z`)
+/// reads as empty — the memory is dropped and a band verdict re-enters under the stricter ENTER,
+/// the conservative side.
+fn decode_class_memory(h: &Json) -> Result<ClassMemory, String> {
     let list = match h.get("class_memory") {
         Err(_) | Ok(Json::Null) => return Ok(Vec::new()),
         Ok(k) => k.arr().map_err(|e| format!("class_memory: {e}"))?,
     };
-    if list.len() > 2 {
-        return Err(format!("class_memory has {} entries (two environment classes)", list.len()));
+    if list.iter().any(|e| e.get("z").is_err()) {
+        return Ok(Vec::new());
     }
+    let byte = |e: &Json, name: &str| -> Result<u8, String> {
+        let v = e.get(name)?.usize().map_err(|x| format!("class_memory.{name}: {x}"))?;
+        u8::try_from(v).map_err(|_| format!("class_memory.{name} {v} is beyond 255"))
+    };
     list.iter()
         .map(|e| {
             let trusted = e.get("trusted")?.bool().map_err(|x| format!("class_memory.trusted: {x}"))?;
@@ -1262,7 +1291,8 @@ fn decode_class_memory(h: &Json) -> Result<Vec<(bool, Option<u64>)>, String> {
                 Json::Null => None,
                 g => Some(g.usize().map_err(|x| format!("class_memory.since: {x}"))? as u64),
             };
-            Ok((trusted, since))
+            let neighbours = e.get("neighbours")?.arr().map_err(|x| format!("class_memory.neighbours: {x}"))?.iter().map(|n| n.usize().map_err(|x| format!("class_memory.neighbours: {x}")).and_then(|v| u8::try_from(v).map_err(|_| format!("class_memory.neighbours: {v} is beyond 255")))).collect::<Result<Vec<u8>, String>>()?;
+            Ok((EnvKey { class: byte(e, "class")?, z: byte(e, "z")?, neighbours }, trusted, since))
         })
         .collect()
 }
@@ -2106,6 +2136,7 @@ pub(crate) mod tests {
             err_energy: if i % 3 == 0 { -1.3e-5 * (1.0 + k) } else { 2.1e-6 * k },
             n_atoms: n,
             model_gen: 3 + i / 7,
+            species: if i % 2 == 0 { Vec::new() } else { (0..n).map(|j| (1 + (j % 2) as u8 * 7, vec![1])).collect() },
         }
     }
 
@@ -2141,12 +2172,13 @@ pub(crate) mod tests {
         use crate::history::AuditHistory;
         let orig = random_sidecar(48, false);
         let path = tmp("memory-v7.model");
-        let memory = vec![(true, Some(41u64)), (false, None)];
+        let k = |class, z, nb: &[u8]| EnvKey { class, z, neighbours: nb.to_vec() };
+        let memory = vec![(k(2, 8, &[1]), true, Some(41u64)), (k(2, 1, &[1, 8]), false, None)];
         write_full_with_memory(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &memory).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string();
-        assert!(header.contains("\"class_memory\":[{\"trusted\":true,\"since\":41},{\"trusted\":false,\"since\":null}]"), "{header}");
+        assert!(header.contains("\"class_memory\":[{\"class\":2,\"z\":8,\"neighbours\":[1],\"trusted\":true,\"since\":41},{\"class\":2,\"z\":1,\"neighbours\":[1,8],\"trusted\":false,\"since\":null}]"), "{header}");
         assert_eq!(read(&path).unwrap().class_memory, memory);
         // absent: empty
         let plain = tmp("memory-none.model");
@@ -2229,10 +2261,12 @@ pub(crate) mod tests {
         assert!(header7.contains("\"audit_history\":{\"points\":57,\"recorded\":57,\"no_variance\":3,\"box_affected\":2,\"draft\":1,\"unfit\":4}"), "{header7}");
         let n_pts = 57usize;
         let a_sum = hist.to_arrays().classes.len();
-        // the body walk: the history arrays are the last ten (five of `points`, five of Σ atoms)
+        // the body walk: the history arrays are the ten (five of `points`, five of Σ atoms) before
+        // the species array, which is last (M8a user-test fix 2)
         let per_point = crate::history::HistoryArrays::PER_POINT;
         let hist_bytes = 10 * 8 + 8 * (per_point * n_pts + 5 * a_sum);
-        let hist_at = bytes.len() - hist_bytes;
+        let species_bytes = 8 + 8 * hist.to_arrays().species.len();
+        let hist_at = bytes.len() - species_bytes - hist_bytes;
         let classes_at = hist_at + per_point * (8 + 8 * n_pts) + 8;
         let mut bad_class = bytes.clone();
         bad_class[classes_at..classes_at + 8].copy_from_slice(&3.0f64.to_le_bytes());

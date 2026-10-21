@@ -190,7 +190,7 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0 }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, species: Vec::new() }],
         last_audit_this_fit: true,
         audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
@@ -3498,6 +3498,8 @@ mod activity_words {
         assert!(outcome_sentence(K::KeptByVote).starts_with(&format!("kept: {FENCE_VOTES} fresh answers agree with each other")));
         assert_eq!(outcome_label(K::NotOffered), "not kept: other settings");
         assert_eq!(outcome_sentence(K::NotOffered), "used for this step, not kept for this model: its settings differ");
+        assert_eq!(outcome_label(K::HeldOut), "not kept: held-out check");
+        assert_eq!(outcome_sentence(K::HeldOut), "a DFT solve held out on purpose to test the teaching — never trained on");
         assert_eq!(outcome_label(K::Discarded), "discarded");
     }
 
@@ -3866,7 +3868,7 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0 };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, species: Vec::new() };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
@@ -3880,7 +3882,7 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
         // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
-        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom] {
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window] {
             for cal in [1.0, f64::INFINITY] {
                 let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
                 assert!(!t.contains("less") && !t.contains("inf"), "{t}");

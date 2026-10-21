@@ -418,13 +418,19 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     println!("H–He after the rebuild: {:?} {:?}", r.stats.source, r.stats.notes);
     // class-wise trust (round 6): the one H–He sample is in the pair class with the 180 dimers,
     // and the fit without it cannot predict it (no other row carries an H–He feature) — so the
-    // pair class is untrusted, H₂ included, until H–He is learned
+    // pair class is not learned until H–He is. Since M8a user-test fix 2 an atom is judged by its
+    // own environment key: H with an H neighbour keeps its verdict (H₂ is answered), H with an He
+    // neighbour and He with an H one are refused
     let pair = s.class_loo()[0].clone();
     println!("pair class with one H–He sample: {pair:?}");
     assert!(!pair.trusted && pair.samples == 181 && pair.energy_max > 1.0, "{pair:?}");
+    s.discontinuity();
     let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "H₂ keeps its own verdict: {:?}", r.stats.notes);
+    s.discontinuity();
+    let r = s.evaluate(&h_he, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with He: LOO")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // H–He dimers over the window: the class earns its trust back and both are answered
     let mut rng = StdRng::seed_from_u64(9);
@@ -2673,7 +2679,7 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert!(!pair.trusted && pair.samples == 61 && pair.force_max > 1.0, "{pair:?}");
     let r = s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO force error")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with H: LOO force error")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
     // the isolated class is exempt from the class rule)
@@ -3047,7 +3053,7 @@ fn an_h2_only_model_falls_back_on_h2_plus_h_as_a_new_environment() {
         let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         let model = s.model().unwrap().clone();
         let pred = model.predict(&pos, &[1, 1, 1], true).unwrap();
-        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos);
+        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &[1, 1, 1]);
         let (nu, _) = ns.novelty(&pos, &[1, 1, 1]).unwrap();
         s.discontinuity();
         let r = s.evaluate(&sc, &mut never()).unwrap();
@@ -3316,7 +3322,7 @@ fn the_many_body_class_earns_trust_as_samples_arrive() {
             let pos: Vec<[f64; 3]> = qs.nuclei.iter().map(|n| n.pos).collect();
             let counts = neighbour_counts(&pos, rc2);
             assert_eq!(env_class(&counts), Some(1));
-            let class = s.class_untrusted(&counts);
+            let class = s.class_untrusted(&h_keys(&counts));
             assert_eq!(class.is_none(), many.trusted);
             if let Some((reason, short)) = &class {
                 assert_eq!(*short, k < q, "{reason}");
@@ -3550,7 +3556,13 @@ fn fnv1a(text: &str) -> u64 {
 /// and the notes quoting λ read smaller; with ā = 0 the old digest is reproduced exactly, and the
 /// two traces compared by script with the std readouts masked differ in 0 of 907 lines — no
 /// decision, answer, sample or draw moved.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x2380_b42c_3c51_40e7;
+/// **Re-pinned for M8a user-test fix 2** (0x2380_b42c_3c51_40e7 → below): the class refusal names
+/// its environment species ("many-body around H, with H: …", 3 notes), and the verdict is re-judged
+/// as evidence arrives (ruling 3): after a background audit (teacher − model +3.98e-9 Ha) the pair
+/// class's measured energy error over its 3 comparisons reads 4.07× the tier against LEAVE 1, so
+/// the scripted "audit 5" step falls back instead of waiting for the next refit (one more teacher
+/// call). Diffed against HEAD 78da699 with the species words masked: those 2 lines, nothing else.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xa314_5688_9292_d627;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -4186,11 +4198,11 @@ fn the_variance_verdict_carries_rule_6_or_7() {
     let model = s.model().unwrap().clone();
     let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
     let pred = model.predict(&pos, &[1, 1], true).unwrap();
-    let v = s.variance_check(&model, &pred, 1.0, &[0.0, 0.0], &pos);
+    let v = s.variance_check(&model, &pred, 1.0, &[0.0, 0.0], &pos, &[1, 1]);
     let r = v.reason.expect("an energy std of 1 Ha refuses");
     assert_eq!((r.rule, r.atom), (R::EnergyUncertainty, None));
     assert_refusal(&r);
-    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 1.0], &pos);
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 1.0], &pos, &[1, 1]);
     let r = v.reason.expect("a force std of 1 Ha/Bohr on atom 1 refuses");
     assert_eq!((r.rule, r.atom), (R::ForceUncertainty, Some(1)));
     assert_refusal(&r);
@@ -4317,8 +4329,8 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
-    let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+    let (r, short) = s.class_untrusted(&h_keys(&[1, 1])).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
 }
@@ -4533,7 +4545,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -4545,11 +4557,11 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                     assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
-                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom => unreachable!("the uncalibrated rule never names the calibrated verdict"),
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
-        let new = s.class_untrusted(&[1, 1]).map(|(r, short)| (short, r.text));
+        let new = s.class_untrusted(&h_keys(&[1, 1])).map(|(r, short)| (short, r.text));
         assert_eq!(new.is_some(), old.is_some(), "round {i}: {l:?}");
         if let (Some(new), Some(old)) = (&new, &old) {
             assert_eq!(new.0, old.0, "round {i}: the short-of-samples flag (thinning) is a decision: {l:?}");
@@ -4660,7 +4672,7 @@ fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
     assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
     s.training_residuals = Some(t);
     assert!(!s.trusted());
-    let classes = s.compute_class_loo_full().0;
+    let classes = s.compute_class_loo_full().0.unwrap().0;
     let pair = &classes[0];
     assert!(!pair.trusted, "{pair:?}");
     assert!(matches!(pair.refusal, Some((ClassKey::Force | ClassKey::Energy, ..))), "the LOO errors refuse it, not the count: {pair:?}");
@@ -4765,10 +4777,10 @@ fn the_variance_rules_refuse_a_nan_std() {
     let model = s.model().unwrap().clone();
     let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
     let pred = model.predict(&pos, &[1, 1], true).unwrap();
-    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0], &pos);
+    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0], &pos, &[1, 1]);
     assert!(!v.accept);
     assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::EnergyUncertainty));
-    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN], &pos);
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN], &pos, &[1, 1]);
     assert!(!v.accept);
     assert_eq!(v.reason.as_ref().map(|r| (r.rule, r.atom)), Some((R::ForceUncertainty, Some(1))));
     assert!(v.uncertainty.is_nan(), "the readout shows the NaN, not the other atom's std");
@@ -4992,7 +5004,7 @@ fn training_views_read_the_store_and_the_posterior_only() {
     let floor = 2.0 * m.sigma_e; // energy_per_atom models: N s_E
     let epi = (pred.energy_std.unwrap().powi(2) - floor * floor).max(0.0).sqrt();
     assert!((c.sigma[k] - epi).abs() < 1e-15);
-    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos).atoms.iter().copied().fold(0.0, f64::max);
+    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &[1, 1]).atoms.iter().copied().fold(0.0, f64::max);
     assert!((c.force_ratio[k] - ratio).abs() < 1e-15, "rule 6's ratio");
     assert!((c.energy[k] - (pred.energy - 2.0 * e_ref)).abs() < 1e-12);
     assert_eq!(c.refused[k], None, "inside the window the model answers");
@@ -5130,7 +5142,7 @@ fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     s.model = Some(model);
     s.report = Some(report);
     s.training_residuals = s.compute_training_residuals();
-    s.class_loo = s.compute_class_loo_full().0;
+    s.class_loo = s.compute_class_loo_full().0.map(|l| l.0).unwrap_or_default();
     s.rebuild_active_set();
     eprintln!(
         "four-species fit (fixed hyperparameters): solve {t_solve:.1} s, null space {t_null:.1} s, all {:.1} s; Q′ {}, {} samples, trusted {} ({:?})",
@@ -5414,12 +5426,14 @@ fn would_answer_agrees_with_evaluate_on_the_novelty_and_the_class() {
     }
     eprintln!("H₂ + H, spread envelope off: {seen:?}");
     assert!(seen.contains("NewEnvironment"), "5d reached: {seen:?}");
-    // 4b: one H–He sample untrusts the pair class (`new_species_falls_back_and_is_learned_…`)
+    // 4b: one H–He sample untrusts the H–He environments of the pair class
+    // (`new_species_falls_back_and_is_learned_…`; H₂ keeps its own key's verdict since M8a
+    // user-test fix 2)
     let (mut s, _) = trained(1.2, 2.2, 180, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
     s.evaluate(&dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2), &mut never()).unwrap();
     s.set_reference_energy(2, -2.83);
     s.refit().unwrap();
-    let sc = h2(1.6);
+    let sc = dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2);
     let (pos, z) = pos_z(&sc);
     let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
     assert_eq!(v, Err((R::Class(EnvClass::Pair), None)));
@@ -6726,9 +6740,9 @@ fn a_short_class_is_never_an_acceptance() {
     use teach::tests_api::{teach_verdict, TeachVerdict};
     let class = |samples: usize, q: usize, f: f64, e: f64| {
         let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
-        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 }
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() }
     };
-    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0 };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
     assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
     assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
     assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
@@ -6965,6 +6979,10 @@ fn consecutive_class_fallbacks_far_from_the_blocker_prompt_the_teach_offer() {
     let (mut s, _h) = gap_blocked(2.0, 3.6);
     assert!(!s.class_loo()[0].trusted, "premise");
     assert!(s.teach_offer().unwrap().prompt.is_none());
+    // the streak's own comparisons are good: since M8a user-test fix 2 (ruling 3) three of them
+    // re-judge the class in at once — the prompt's mechanics are tested here, so the verdict is
+    // held at the refit's (no judgement cache: nothing to re-judge from)
+    s.class_judge = None;
     let here = in_big_cell(h2(1.5));
     for k in 1..=teach::TEACH_PROMPT_STREAK {
         s.discontinuity();
@@ -6978,6 +6996,7 @@ fn consecutive_class_fallbacks_far_from_the_blocker_prompt_the_teach_offer() {
     assert!(p.contains("two-atom environments are untrusted everywhere — the worst is #60"), "{p}");
     // near the blocker: the same streak prompts nothing (fallbacks there teach its region)
     let (mut t, _h) = gap_blocked(2.0, 3.6);
+    t.class_judge = None;
     let near = in_big_cell(h2(3.6));
     for _ in 0..teach::TEACH_PROMPT_STREAK {
         t.discontinuity();
@@ -7489,6 +7508,16 @@ fn history_point(kind: surrogate::history::PointKind, n: usize, code: u8, z: f64
 }
 
 /// [`history_point`] with the per-atom force error and the signed energy error given directly.
+/// The environment keys of an all-H geometry from its neighbour counts (pair H{H}, many-body H{H}).
+fn h_keys(counts: &[usize]) -> Vec<Option<surrogate::EnvKey>> {
+    counts.iter().map(|&k| atom_class(k).map(|c| surrogate::EnvKey { class: c as u8 + 1, z: 1, neighbours: vec![1] })).collect()
+}
+
+/// The pair key of an H atom bonded to H.
+fn hk_pair() -> surrogate::EnvKey {
+    surrogate::EnvKey { class: 1, z: 1, neighbours: vec![1] }
+}
+
 fn history_point_full(kind: surrogate::history::PointKind, n: usize, code: u8, err_force: f64, err_energy: f64) -> surrogate::AuditPoint {
     surrogate::AuditPoint {
         kind,
@@ -7501,6 +7530,7 @@ fn history_point_full(kind: surrogate::history::PointKind, n: usize, code: u8, e
         err_energy,
         n_atoms: n,
         model_gen: 1,
+        species: Vec::new(),
     }
 }
 
@@ -7760,27 +7790,27 @@ fn the_hysteresis_memory_is_the_verdict_that_stood_when_the_refit_began() {
     };
     // in the band: the memory decides
     evidence(&mut s, 0.85);
-    s.class_memory = vec![(true, Some(7)), (false, None)];
+    s.class_memory = [(hk_pair(), (true, Some(7)))].into();
     s.refresh_class_loo();
     let l = &s.class_loo()[0];
     assert!(l.trusted && l.trusted_since == Some(7) && (l.measured.unwrap() - 0.85).abs() < 1e-9, "stays: {l:?}");
-    s.class_memory = vec![(false, None), (false, None)];
+    s.class_memory = [(hk_pair(), (false, None))].into();
     s.refresh_class_loo();
     let l = s.class_loo()[0].clone();
     assert!(!l.trusted && l.trusted_since.is_none(), "does not enter: {l:?}");
     assert!(matches!(l.refusal, Some((sim::ClassKey::Calibrated, v, lim)) if (v - 0.85).abs() < 1e-9 && lim == ENTER), "{l:?}");
-    let (r2, _) = s.class_untrusted(&[1, 1]).expect("refused");
+    let (r2, _) = s.class_untrusted(&h_keys(&[1, 1])).expect("refused");
     assert!(r2.text.contains("DFT-measured force error 0.85× the bound over 3 DFT comparisons, limit 0.71"), "{}", r2.text);
     // through refit(): the memory is read at the start and committed at the end
     s.refit().unwrap();
     assert!(!s.class_loo()[0].trusted, "untrusted memory, band value: still untrusted after the refit");
-    assert_eq!(s.class_memory[0], (false, None), "committed");
+    assert_eq!(s.class_memory.get(&hk_pair()).copied().unwrap_or((false, None)), (false, None), "committed");
     evidence(&mut s, 0.6);
     s.refit().unwrap();
     let gen = s.model_generation();
     let l = s.class_loo()[0].clone();
     assert!(l.trusted && l.trusted_since == Some(gen), "enters below ENTER at the refit's generation: {l:?}");
-    assert_eq!(s.class_memory[0], (true, Some(gen)));
+    assert_eq!(s.class_memory.get(&hk_pair()).copied().unwrap_or((false, None)), (true, Some(gen)));
     evidence(&mut s, 0.85);
     s.refit().unwrap();
     assert!(s.class_loo()[0].trusted && s.class_loo()[0].trusted_since == Some(gen), "stays trusted in the band, since the same generation: {:?}", s.class_loo()[0]);
@@ -7802,9 +7832,16 @@ fn the_hysteresis_memory_is_the_verdict_that_stood_when_the_refit_began() {
 fn a_class_refusal_the_variance_would_also_refuse_is_not_the_verdicts_evidence() {
     use surrogate::history::PointKind;
     let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    // the verdict is set by hand below: no re-judging it from the history (user-test fix 2's
+    // re-judge on new evidence would restore the fit's own)
+    s.class_judge = None;
     let untrust_pair = |s: &mut SurrogateKs| {
         s.class_loo[0].trusted = false;
         s.class_loo[0].refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+        for k in &mut s.class_loo[0].species {
+            k.trusted = false;
+            k.refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+        }
     };
     // the variance accepts: a rule-4b point, evidence
     untrust_pair(&mut s);
@@ -7972,12 +8009,14 @@ fn a_class_refused_on_its_evidence_reenters_after_a_teaching_refit() {
     // a verdict while the new model has fewer than WINDOW_POINTS comparisons: the old generation still counts
     s.refresh_class_loo();
     assert!(!s.class_loo()[0].trusted, "blocked until the refitted model's evidence fills a window: {:?}", s.class_loo()[0]);
-    for k in WINDOW_POINTS - 1..WINDOW_POINTS + 20 {
-        step(&mut s, k);
-    }
+    // the 300th comparison of the refitted model fills its window: since M8a user-test fix 2 (ruling
+    // 3) the verdict is re-judged as the evidence arrives — the class enters without a refit
+    step(&mut s, WINDOW_POINTS - 1);
+    let l = s.class_loo()[0].clone();
+    assert!(l.trusted && l.measured.is_some_and(|m| m < ENTER), "re-entered on its own evidence, no refit: {l:?}");
     s.refit().unwrap();
     let l = s.class_loo()[0].clone();
-    println!("the next refit, on the refitted model's {} comparisons: {l:?}", WINDOW_POINTS + 20);
+    println!("the next refit, on the refitted model's {} comparisons: {l:?}", WINDOW_POINTS);
     assert!(l.trusted && l.measured.is_some_and(|m| m < ENTER) && l.evidence >= calibrate::MIN_EVIDENCE, "re-entered: {l:?}");
     assert!(l.worst_atom.is_some_and(|w| w < 1.0), "{l:?}");
 }
@@ -7997,7 +8036,7 @@ fn a_band_verdict_survives_a_save_and_reload() {
         s.audit_history.push(history_point(PointKind::Audit, 2, 1, z));
     }
     let since = s.model_generation() - 1;
-    s.class_memory = vec![(true, Some(since)), (false, None)];
+    s.class_memory = [(hk_pair(), (true, Some(since)))].into();
     s.refresh_class_loo();
     s.commit_class_memory();
     let l = s.class_loo()[0].clone();
@@ -8011,7 +8050,7 @@ fn a_band_verdict_survives_a_save_and_reload() {
     assert_eq!(back.class_memory, s.class_memory);
     assert!(back.model_generation() > since && back.model_generation() > back.audit_history().iter().map(|p| p.model_gen).max().unwrap(), "generations stay monotone across the install");
     // a file without the memory (as written before fix round 2): the band verdict re-enters
-    s.class_memory = Vec::new();
+    s.class_memory = Default::default();
     s.save_sidecar(&path).unwrap();
     let (fresh, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
@@ -8116,14 +8155,14 @@ fn the_variance_inflation_measures_overconfidence_not_the_misfit_floor() {
             h.push(posterior_point(PointKind::Audit, err, epi));
         }
         let old = calibrate(&h, &pol).per_class[0];
-        let new = calibrate_with(&h, &pol, [a, 0.0]).per_class[0];
+        let new = calibrate_with(&h, &pol, [a, 0.0], &Default::default()).per_class[0];
         println!("k {k}: λ raw without the floor {:.2}, with it {:.4}", old.inflation_raw, new.inflation_raw);
         assert!(old.inflation_raw > 50.0, "the premise: the misfit floor alone inflated λ ({old:?})");
         assert!((new.inflation_raw - want).abs() < 1e-9, "{new:?}");
         // a point below the floor is clamped at 0, never negative evidence
         let mut h2 = h.clone();
         h2.push(posterior_point(PointKind::Audit, 0.0, epi));
-        let c2 = calibrate_with(&h2, &pol, [a, 0.0]).per_class[0];
+        let c2 = calibrate_with(&h2, &pol, [a, 0.0], &Default::default()).per_class[0];
         assert!((c2.inflation_raw - want * (20.0f64 / 21.0).sqrt()).abs() < 1e-9, "{c2:?}");
     }
 }
@@ -8965,7 +9004,7 @@ fn class_loo_cost_at_collection_sizes() {
             species.len(),
             rep.q_prime,
             1e3 * t_loo / n as f64,
-            loo.iter().map(|c| (c.class, c.samples)).collect::<Vec<_>>()
+            loo.iter().flat_map(|l| &l.0).map(|c| (c.class, c.samples)).collect::<Vec<_>>()
         );
     };
     for n in [500, 1000, 2000, 4000] {
@@ -9283,4 +9322,130 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
     // measured (references.md "M8a body-4"): trusted at the cap with 9 held where body-3 needed
     // the default basis and 38
     assert!(s.trusted() && s.quarantined() < 38, "{:?}, {} held", s.untrusted_reason(), s.quarantined());
+}
+
+/// The z of `history_point` whose atoms are measured at `ratio` × their bound (w_of⁻¹).
+fn z_at(ratio: f64) -> f64 {
+    ratio / w_of(1.0)
+}
+
+/// A history point of three many-body atoms with species attributed (`None` → recorded before
+/// species were kept), every atom measured at `ratio` × its bound, rule-4b many-body fallback.
+fn three_body_point(gen: u64, ratio: f64, species: Option<Vec<(u8, Vec<u8>)>>) -> surrogate::AuditPoint {
+    let code = history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody));
+    surrogate::AuditPoint { model_gen: gen, species: species.unwrap_or_default(), ..history_point(surrogate::history::PointKind::Fallback { rule: code }, 3, 2, z_at(ratio)) }
+}
+
+/// M8a user-test fix 2 (the user's case, `calibrate` "Per environment species"; numbers measured
+/// on the user's collection: one hot-H₃ fallback at 5.66× the bound in generation 416, then 81
+/// water fallbacks all ≤ 0.03×): with one window per class the H₃ point kept water out; per
+/// (class, Z, neighbour species) key water's O{H} and H{H, O} enter, H₃'s H{H} stays out until
+/// 300 newer H{H} comparisons age its bad point; a point recorded before species were kept counts
+/// for every key of its class.
+#[test]
+fn class_trust_is_per_environment_species_the_users_water_after_h3() {
+    use calibrate::{calibrate_with, ClassVerdict};
+    use sim::ClassKey;
+    let pol = FallbackPolicy::default();
+    let h3 = || Some(vec![(1u8, vec![1u8]); 3]);
+    let water = || Some(vec![(8u8, vec![1u8]), (1, vec![1, 8]), (1, vec![1, 8])]);
+    let key = |z: u8, nb: &[u8]| surrogate::EnvKey { class: 2, z, neighbours: nb.to_vec() };
+    let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49 };
+    let mut h = surrogate::AuditHistory::default();
+    h.push(three_body_point(416, 5.66, h3()));
+    for g in 0..81u64 {
+        h.push(three_body_point(436 + g / 4, 0.02, water()));
+    }
+    let cal = calibrate_with(&h, &pol, [0.0; 2], &Default::default());
+    // the class-wide reading (what decided before): the H₃ atom keeps every many-body environment out
+    assert!(matches!(cal.class_verdict(1, &st, 452, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }));
+    // per key: water enters, H₃ does not
+    for k in [key(8, &[1]), key(1, &[1, 8])] {
+        assert_eq!(cal.key_verdict(&k, &st, 452, false), ClassVerdict::Trusted, "{k:?}: {:?}", cal.key(&k));
+        assert!(cal.key(&k).worst_atom < 0.05);
+    }
+    let v = cal.key_verdict(&key(1, &[1]), &st, 452, false);
+    assert!(matches!(v, ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, .. } if (value - 5.66).abs() < 1e-9), "{v:?}");
+    // H₃'s key leaves the guard once 300 newer comparisons of its own fill its window
+    let mut aged = h.clone();
+    for i in 0..300u64 {
+        aged.push(three_body_point(470 + i / 100, 0.02, h3()));
+    }
+    let cal = calibrate_with(&aged, &pol, [0.0; 2], &Default::default());
+    assert_eq!(cal.key_verdict(&key(1, &[1]), &st, 452, false), ClassVerdict::Trusted, "{:?}", cal.key(&key(1, &[1])));
+    assert_eq!(cal.key(&key(1, &[1])).aged, 1);
+    // a point recorded before species were kept counts for every key of its class (ruling 2)
+    let mut old = surrogate::AuditHistory::default();
+    old.push(three_body_point(416, 5.66, None));
+    for g in 0..81u64 {
+        old.push(three_body_point(436 + g / 4, 0.02, water()));
+    }
+    let cal = calibrate_with(&old, &pol, [0.0; 2], &[key(1, &[1])].into());
+    for k in [key(8, &[1]), key(1, &[1, 8]), key(1, &[1])] {
+        assert!(matches!(cal.key_verdict(&k, &st, 452, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }), "{k:?}");
+    }
+    // … and a key no point and no fitted atom holds reads the class's species-less evidence
+    assert!(matches!(cal.key_verdict(&key(8, &[1, 8]), &st, 452, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }));
+}
+
+/// M8a user-test fix 2 (ruling 3): new evidence re-judges the class verdicts when it is recorded,
+/// without a refit — a parked scene whose fallbacks are all "skipped: similar" never refits. A
+/// pair class refused for one 5× comparison (an old-format point) answers again once 300
+/// attributed comparisons of a newer model, recorded through `record_history_point`, age it out;
+/// the refusal names the species; nothing was refitted in between.
+#[test]
+fn new_evidence_rejudges_the_class_verdict_without_a_refit() {
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert!(s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let fits = s.fits;
+    let code = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
+    s.audit_history.push(surrogate::AuditPoint { model_gen: s.model_gen, ..history_point(PointKind::Fallback { rule: code }, 2, 1, z_at(5.0)) });
+    s.class_memory = Default::default();
+    s.refresh_class_loo();
+    s.commit_class_memory();
+    let (r, _) = s.class_untrusted(&h_keys(&[1, 1])).expect("refused on the 5× comparison");
+    assert!(r.text.contains("(pair around H, with H: a DFT check found an atom's force 5.0× its bound"), "{}", r.text);
+    // a newer model's comparisons, recorded as `evaluate` records them
+    s.model_gen += 1;
+    let model = s.model().unwrap().clone();
+    let pos = [[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]];
+    let pred = model.predict(&pos, &[1, 1], true).unwrap();
+    let (e, f, fe) = (pred.energy_std.unwrap(), pred.force_std.clone().unwrap(), pred.force_std_epistemic.clone().unwrap());
+    let teacher: Vec<[f64; 3]> = pred.forces.iter().map(|f| [f[0] + 2e-5, f[1], f[2]]).collect();
+    for i in 0..300 {
+        s.record_history_point(PointKind::Fallback { rule: code }, &pos, &[1, 1], Some((e, &f, &fe)), pred.energy, &pred.forces, pred.energy, &teacher, false, false, false);
+        if i == 0 {
+            assert!(s.audit_history.iter().last().unwrap().species == vec![(1, vec![1]), (1, vec![1])], "species recorded");
+        }
+    }
+    assert_eq!(s.fits, fits, "no refit");
+    let l = &s.class_loo()[0];
+    assert!(l.trusted && l.species.len() == 1 && l.species[0].trusted, "re-judged: {l:?}");
+    assert!(s.class_untrusted(&h_keys(&[1, 1])).is_none());
+    assert_eq!(s.class_memory.get(&hk_pair()).map(|m| m.0), Some(true), "committed");
+}
+
+/// M8a user-test fix 2: between refits an untrusted environment enters only on a full window
+/// (`ClassKey::Window`) — the GPU gated repro's hot run, re-judged at once, let its many-body
+/// class in on three benign fallbacks and it answered collisions at 3.9× and 6.1× the bound. Three
+/// good comparisons re-judged between refits keep it out, with the words; the refit's own
+/// judgement (the rule of before) lets it in.
+#[test]
+fn between_refits_an_untrusted_class_enters_only_on_a_full_window() {
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    s.class_memory = [(hk_pair(), (false, None))].into();
+    for _ in 0..3 {
+        s.audit_history.push(surrogate::AuditPoint { model_gen: s.model_gen, species: vec![(1, vec![1]); 2], ..history_point(PointKind::Audit, 2, 1, z_at(0.1)) });
+    }
+    s.rejudge_classes();
+    let l = s.class_loo()[0].clone();
+    assert!(!l.trusted && l.species[0].refusal == Some((ClassKey::Window, 3.0, 300.0)), "{l:?}");
+    let (r, _) = s.class_untrusted(&h_keys(&[1, 1])).unwrap();
+    assert!(r.text.contains("(pair around H, with H: within its bound over 3 DFT comparisons, but entering before the next refit needs 300;"), "{}", r.text);
+    s.class_memory = [(hk_pair(), (false, None))].into();
+    s.refresh_class_loo();
+    assert!(s.class_loo()[0].trusted, "the refit's judgement: {:?}", s.class_loo()[0]);
 }

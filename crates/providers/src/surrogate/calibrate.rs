@@ -27,6 +27,38 @@
 //!    ‖ΔF_j‖ / pred_force_std_j, E[z²] = 1 for a calibrated posterior — the spec's "predicted
 //!    uncertainty vs measured error", reported as the calibration factor κ_c.
 //!
+//! # Per environment species (M8a user-test fix 2, the controller's rulings 1–3)
+//!
+//! The evidence, its window, W, λ, the worst-atom guard and the hysteresis memory are kept per
+//! **environment key** (`surrogate::EnvKey`): the atom's class, its Z and the sorted set of its
+//! neighbours' species within r_cut — Z as a key only (rule 1), nothing read from it. An atom's
+//! verdict is its own key's ([`Calibration::key_verdict`]); the class's leave-one-out statistics
+//! and its Q′ sample count stay per class (the fit's residuals are per class). The user's case: a
+//! hot-H₃ fallback measured an H atom at 5.66× its bound (generation 416); with one evidence
+//! window per class it kept every many-body environment out, water's included, although water's 81
+//! comparisons were all within 0.03× the bound — and with fewer than [`WINDOW_POINTS`] many-body
+//! points in the ring nothing aged. A key of the central species alone would not have separated
+//! them: water's H atoms have an O and an H within r_cut (two neighbours, many-body), the same
+//! "many-body H" as H₃'s. With the neighbour species, water is O{H} and H{H, O}, H₃ is H{H}.
+//!
+//! A history point recorded before species were kept (`AuditPoint::species` empty) counts for
+//! **every** key of its atoms' classes — the conservative reading (ruling 2): an old collection's
+//! evidence keeps blocking until the window of newer, attributed points ages it out.
+//! [`Calibration::per_class`] is still the class-wide calibration (every point of the class): a
+//! readout. **Re-judged on new evidence** (ruling 3): a new audit or rule-4b point re-runs this
+//! calibration and the per-key verdicts against the class statistics of the fit that stands
+//! (`SurrogateKs::rejudge_classes`; cost one pass over the ≤ 4096-point ring), so a parked scene
+//! whose fallbacks are all "skipped: similar" — no refit — can enter or leave. **Entering between
+//! refits needs a full window** (`ClassKey::Window`): an untrusted key whose re-judged verdict
+//! would trust it on fewer than [`WINDOW_POINTS`] comparisons keeps waiting for the next refit —
+//! the gated repro's hot run measured why: re-judged at once, its many-body class entered on its
+//! first three benign rule-4b fallbacks (rms inside ENTER) and answered two compact collisions at
+//! 3.9× and 6.1× the force bound, the heavy tail a short window cannot see ("Why 300"). Leaving is
+//! immediate. **λ does not move between refits**: the variance inflation is the posterior's and is
+//! re-measured with it (refits, installs, policy changes); re-measured on every new verdict point it
+//! let rule 6 admit the same run's tail (one answer at 3.19× with the window rule alone; both
+//! guards: 85 answers, worst 0.97×, the record of before — `references.md`).
+//!
 //! # The evidence window (fix round 2: evidence ages by model generation)
 //!
 //! A history point is a measurement of the model that judged it (`AuditPoint::model_gen`). Once a
@@ -227,8 +259,9 @@
 
 use sim::activity::{EnvClass, TeachRule};
 use sim::ClassKey;
-use std::collections::BTreeMap;
-use surrogate::history::{AuditHistory, PointKind};
+use std::collections::{BTreeMap, BTreeSet};
+use surrogate::history::{AuditHistory, AuditPoint, PointKind};
+use surrogate::EnvKey;
 
 use super::FallbackPolicy;
 
@@ -304,11 +337,23 @@ impl ClassCalibration {
     }
 }
 
-/// The calibration of both classes (indexed like `atom_class` / `ENV_CLASSES`: 0 pair,
-/// 1 many-body).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The calibration: class-wide (indexed like `atom_class` / `ENV_CLASSES`: 0 pair, 1 many-body; a
+/// readout) and per environment key (module doc, "Per environment species": what decides).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Calibration {
     pub per_class: [ClassCalibration; 2],
+    /// Per key: its attributed points with the class's species-less points.
+    pub per_key: BTreeMap<EnvKey, ClassCalibration>,
+    /// Per class: the species-less points alone — what a key without attributed points reads.
+    pub legacy: [ClassCalibration; 2],
+}
+
+impl Calibration {
+    /// The calibration a key's verdict reads: its own, or its class's species-less points for a
+    /// key with no attributed point.
+    pub fn key(&self, k: &EnvKey) -> ClassCalibration {
+        self.per_key.get(k).copied().unwrap_or(self.legacy[(k.class.clamp(1, 2) - 1) as usize])
+    }
 }
 
 /// The per-class leave-one-out statistics the verdict reads (what
@@ -333,7 +378,7 @@ pub enum ClassVerdict {
 }
 
 /// A history point in the verdict's jurisdiction: an audit, or a fallback refused by rule 4b.
-fn in_jurisdiction(kind: PointKind) -> bool {
+pub(super) fn in_jurisdiction(kind: PointKind) -> bool {
     match kind {
         PointKind::Audit => true,
         PointKind::Fallback { rule } => {
@@ -349,6 +394,7 @@ fn sq(x: f64) -> f64 {
 
 /// Per point and class: (w̄², z̄², the energy term, the worst atom ratio, s̄² the epistemic force
 /// std in bound units), its generation and kind.
+#[derive(Clone, Copy)]
 struct PointEvidence {
     gen: u64,
     audit: bool,
@@ -381,7 +427,7 @@ fn in_posterior_jurisdiction(kind: PointKind) -> bool {
 
 /// The oldest generation of the window (module doc, "The evidence window"): from the newest
 /// generation back, whole generations until they hold [`WINDOW_POINTS`]; `None` = every point.
-fn window_from(points: &[PointEvidence]) -> Option<u64> {
+fn window_from(points: &[&PointEvidence]) -> Option<u64> {
     let mut per_gen: BTreeMap<u64, usize> = BTreeMap::new();
     for p in points {
         *per_gen.entry(p.gen).or_default() += 1;
@@ -397,18 +443,64 @@ fn window_from(points: &[PointEvidence]) -> Option<u64> {
 }
 
 /// The calibration per class from the history and the policy's bounds (module doc), with no
-/// aleatoric level removed from the inflation's numerator ([`calibrate_with`] with ā = 0).
+/// aleatoric level removed from the inflation's numerator ([`calibrate_with`] with ā = 0) and no
+/// keys beyond the history's own.
 pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration {
-    calibrate_with(history, policy, [0.0; 2])
+    calibrate_with(history, policy, [0.0; 2], &BTreeSet::new())
+}
+
+/// One point's evidence over the atoms `atoms` (all of one class, aleatoric level `aleatoric`).
+fn point_evidence(p: &AuditPoint, atoms: &[usize], aleatoric: f64, policy: &FallbackPolicy) -> Option<PointEvidence> {
+    if atoms.is_empty() {
+        return None;
+    }
+    let (mut w2, mut z2, mut worst, mut s2, mut a2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for &j in atoms {
+        let bound = policy.force_bound(p.teacher_force[j]);
+        let w = p.err_force[j] / SQRT_3 / bound;
+        w2 += sq(w);
+        z2 += sq(p.err_force[j] / p.pred_force_std[j]);
+        s2 += sq(p.pred_force_std_epistemic[j] / SQRT_3 / bound);
+        a2 += sq(aleatoric / bound);
+        worst = if w.is_finite() { worst.max(w) } else { f64::INFINITY };
+    }
+    let n = atoms.len() as f64;
+    Some(PointEvidence {
+        gen: p.model_gen,
+        audit: p.kind.is_audit(),
+        w2: w2 / n,
+        z2: z2 / n,
+        e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / policy.energy_std_per_atom),
+        worst,
+        s2: s2 / n,
+        a2: a2 / n,
+    })
+}
+
+/// The verdict's and the posterior's evidence lists of one class or key.
+#[derive(Default)]
+struct Lists {
+    verdict: Vec<PointEvidence>,
+    posterior: Vec<PointEvidence>,
+}
+
+impl Lists {
+    fn push(&mut self, e: PointEvidence, verdict: bool) {
+        if verdict {
+            self.verdict.push(e);
+        }
+        self.posterior.push(e);
+    }
 }
 
 /// [`calibrate`] with each class's aleatoric force level ā_c (Ha/Bohr per component; module doc,
 /// "The variance inflation": min(σ_F, the class's training force-residual rms)) removed from the
-/// inflation's measured errors.
-pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric: [f64; 2]) -> Calibration {
-    let mut classes: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
-    let mut posterior: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
-    let tier = policy.energy_std_per_atom;
+/// inflation's measured errors, and a calibration for every key in `keys` (the fit's own atoms'
+/// keys) besides the history's attributed ones (module doc, "Per environment species").
+pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric: [f64; 2], keys: &BTreeSet<EnvKey>) -> Calibration {
+    let mut class: [Lists; 2] = Default::default();
+    let mut legacy: [Lists; 2] = Default::default();
+    let mut by_key: BTreeMap<EnvKey, Lists> = BTreeMap::new();
     for p in history.iter() {
         if !in_posterior_jurisdiction(p.kind) {
             continue;
@@ -416,67 +508,72 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
         let verdict = in_jurisdiction(p.kind);
         for c in 0..2 {
             let code = c as u8 + 1;
-            let (mut w2, mut z2, mut worst, mut s2, mut a2, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
-            for j in 0..p.n_atoms {
-                if p.classes[j] != code {
-                    continue;
-                }
-                let bound = policy.force_bound(p.teacher_force[j]);
-                let w = p.err_force[j] / SQRT_3 / bound;
-                w2 += sq(w);
-                z2 += sq(p.err_force[j] / p.pred_force_std[j]);
-                s2 += sq(p.pred_force_std_epistemic[j] / SQRT_3 / bound);
-                a2 += sq(aleatoric[c] / bound);
-                worst = if w.is_finite() { worst.max(w) } else { f64::INFINITY };
-                n += 1;
+            let atoms: Vec<usize> = (0..p.n_atoms).filter(|&j| p.classes[j] == code).collect();
+            let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) else { continue };
+            class[c].push(e, verdict);
+            if p.species.is_empty() {
+                legacy[c].push(e, verdict);
             }
-            if n == 0 {
-                continue;
+        }
+        let mut atoms_of: BTreeMap<EnvKey, Vec<usize>> = BTreeMap::new();
+        for j in 0..p.n_atoms {
+            if let Some(k) = p.key(j) {
+                atoms_of.entry(k).or_default().push(j);
             }
-            let ev = || PointEvidence {
-                gen: p.model_gen,
-                audit: p.kind.is_audit(),
-                w2: w2 / n as f64,
-                z2: z2 / n as f64,
-                e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier),
-                worst,
-                s2: s2 / n as f64,
-                a2: a2 / n as f64,
-            };
-            if verdict {
-                classes[c].push(ev());
+        }
+        for (k, atoms) in atoms_of {
+            let c = (k.class - 1) as usize;
+            if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
+                by_key.entry(k).or_default().push(e, verdict);
             }
-            posterior[c].push(ev());
         }
     }
-    let per_class = std::array::from_fn(|c| {
-        let (inflation_var, inflation_points, inflation_raw) = variance_inflation(&posterior[c]);
-        let all = &classes[c];
-        let from = window_from(all);
-        let inside = |e: &&PointEvidence| from.is_none_or(|g| e.gen >= g);
-        let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).collect();
-        let fallbacks: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| !e.audit).collect();
-        let (n_a, n_f) = (audits.len(), fallbacks.len());
-        let points = n_a + n_f;
-        let aged = all.len() - points;
-        if points == 0 {
-            return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw };
-        }
-        // the fallbacks of the class together weigh at most the audits (never fewer than three);
-        // the count in integers (review I1), the per-point weight only for the sums
-        let cap = n_a.max(MIN_EVIDENCE);
-        let evidence = n_a + n_f.min(cap);
-        let w_f = if n_f == 0 { 0.0 } else { n_f.min(cap) as f64 / n_f as f64 };
-        let den = evidence as f64;
-        let sum = |f: &dyn Fn(&PointEvidence) -> f64| audits.iter().map(|e| f(e)).sum::<f64>() + w_f * fallbacks.iter().map(|e| f(e)).sum::<f64>();
-        let inflation = 1.0 + 1.0 / (2.0 * points as f64).sqrt();
-        let z_rms = (sum(&|e| e.z2) / den).sqrt();
-        let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
-        let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
-        let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-        ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw }
-    });
-    Calibration { per_class }
+    fn refs(l: &[PointEvidence]) -> Vec<&PointEvidence> {
+        l.iter().collect()
+    }
+    let per_class = std::array::from_fn(|c| summarise(&refs(&class[c].verdict), &refs(&class[c].posterior)));
+    let legacy_cal: [ClassCalibration; 2] = std::array::from_fn(|c| summarise(&refs(&legacy[c].verdict), &refs(&legacy[c].posterior)));
+    let all: BTreeSet<EnvKey> = keys.iter().filter(|k| (1..=2).contains(&k.class)).cloned().chain(by_key.keys().cloned()).collect();
+    let empty = Lists::default();
+    let per_key = all
+        .into_iter()
+        .map(|k| {
+            let own = by_key.get(&k).unwrap_or(&empty);
+            let old = &legacy[(k.class - 1) as usize];
+            let v: Vec<&PointEvidence> = own.verdict.iter().chain(&old.verdict).collect();
+            let q: Vec<&PointEvidence> = own.posterior.iter().chain(&old.posterior).collect();
+            (k, summarise(&v, &q))
+        })
+        .collect();
+    Calibration { per_class, per_key, legacy: legacy_cal }
+}
+
+/// One class's or key's calibration from its verdict and posterior evidence (module doc).
+fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalibration {
+    let (inflation_var, inflation_points, inflation_raw) = variance_inflation(posterior);
+    let from = window_from(all);
+    let inside = |e: &&&PointEvidence| from.is_none_or(|g| e.gen >= g);
+    let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).copied().collect();
+    let fallbacks: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| !e.audit).copied().collect();
+    let (n_a, n_f) = (audits.len(), fallbacks.len());
+    let points = n_a + n_f;
+    let aged = all.len() - points;
+    if points == 0 {
+        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw };
+    }
+    // the fallbacks of the class together weigh at most the audits (never fewer than three);
+    // the count in integers (review I1), the per-point weight only for the sums
+    let cap = n_a.max(MIN_EVIDENCE);
+    let evidence = n_a + n_f.min(cap);
+    let w_f = if n_f == 0 { 0.0 } else { n_f.min(cap) as f64 / n_f as f64 };
+    let den = evidence as f64;
+    let sum = |f: &dyn Fn(&PointEvidence) -> f64| audits.iter().map(|e| f(e)).sum::<f64>() + w_f * fallbacks.iter().map(|e| f(e)).sum::<f64>();
+    let inflation = 1.0 + 1.0 / (2.0 * points as f64).sqrt();
+    let z_rms = (sum(&|e| e.z2) / den).sqrt();
+    let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
+    let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
+    let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
+    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw }
 }
 
 /// λ_c (module doc, "The variance inflation"): over the class's points in the posterior's
@@ -487,9 +584,9 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
 /// the class's factor — the physics review's I2). 1 with fewer than [`MIN_EVIDENCE`] points; 1
 /// when every std is exactly 0 (rule 6 then compares 0 whatever the factor); ∞ when a
 /// comparison was not a number. Returns (λ, n, the raw ratio).
-fn variance_inflation(points: &[PointEvidence]) -> (f64, usize, f64) {
+fn variance_inflation(points: &[&PointEvidence]) -> (f64, usize, f64) {
     let from = window_from(points);
-    let inside: Vec<&PointEvidence> = points.iter().filter(|e| from.is_none_or(|g| e.gen >= g)).collect();
+    let inside: Vec<&PointEvidence> = points.iter().filter(|e| from.is_none_or(|g| e.gen >= g)).copied().collect();
     let n = inside.len();
     if n < MIN_EVIDENCE {
         return (1.0, n, f64::NAN);
@@ -549,6 +646,7 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
             w.measured.map_or("—".to_string(), |m| format!("{m:.2}×"))
         ),
         ClassKey::MeasuredEnergy => format!("DFT-measured energy error {value:.2}× the tier over {over}, limit {limit:.2}; {n} samples"),
+        ClassKey::Window => format!("within its bound over {value:.0} DFT comparisons, but entering before the next refit needs {limit:.0}; {n} samples"),
     }
 }
 
@@ -557,7 +655,20 @@ impl Calibration {
     /// Q′ and the standing verdict `was_trusted` (the hysteresis; module doc, "The verdict").
     #[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
     pub fn class_verdict(&self, class: usize, st: &ClassStats, q_prime: usize, was_trusted: bool) -> ClassVerdict {
-        let cal = self.per_class[class];
+        verdict(self.per_class[class], st, q_prime, was_trusted)
+    }
+
+    /// The verdict for one environment key (module doc, "Per environment species"): its own
+    /// calibration ([`Calibration::key`]) with its class's leave-one-out statistics `st`.
+    pub fn key_verdict(&self, key: &EnvKey, st: &ClassStats, q_prime: usize, was_trusted: bool) -> ClassVerdict {
+        verdict(self.key(key), st, q_prime, was_trusted)
+    }
+}
+
+/// The verdict from one calibration (module doc, "The verdict, with hysteresis").
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
+pub fn verdict(cal: ClassCalibration, st: &ClassStats, q_prime: usize, was_trusted: bool) -> ClassVerdict {
+    {
         let finite = |x: f64| (!x.is_nan()).then_some(x);
         let words = WordsInput {
             samples: st.samples,

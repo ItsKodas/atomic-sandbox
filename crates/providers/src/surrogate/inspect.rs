@@ -139,11 +139,11 @@ impl SurrogateKs {
             }
         }
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
+        if let Some((r, _)) = self.class_untrusted(&env_keys(pos, z, rc2)) {
             return Some(r);
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, &pred, e, f, pos);
+            let v = self.variance_check(model, &pred, e, f, pos, z);
             if !v.accept {
                 return v.reason;
             }
@@ -296,11 +296,11 @@ impl SurrogateKs {
         let counts = neighbour_counts(&pos, rc2);
         let classes: Vec<&str> = counts.iter().map(|&k| atom_class(k).map_or("isolated", |c| ENV_CLASSES[c])).collect();
         let _ = writeln!(o, "    neighbour counts within r_cut {:?} → atom classes {:?}", counts, classes);
-        if let Some((r, short)) = self.class_untrusted(&counts) {
+        if let Some((r, short)) = self.class_untrusted(&env_keys(&pos, &z, rc2)) {
             refusals.push(format!("{:?}{}: {}", r.rule, if short { " (short of samples)" } else { "" }, r.text));
         }
         if let (Some(e), Some(f)) = (pred.energy_std, pred.force_std_epistemic.as_ref()) {
-            let v = self.variance_check(model, &pred, e, f, &pos);
+            let v = self.variance_check(model, &pred, e, f, &pos, &z);
             let _ = writeln!(o, "    variance: per-atom epistemic force std / bound [{}]", v.atoms.iter().map(|a| format!("{a:.2e}")).collect::<Vec<_>>().join(", "));
             if let Some(r) = v.reason.filter(|_| !v.accept) {
                 refusals.push(format!("{:?}: {}", r.rule, r.text));

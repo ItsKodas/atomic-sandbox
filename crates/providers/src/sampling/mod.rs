@@ -1275,7 +1275,7 @@ impl Sampler {
                         }
                         Ok(r) if job.holdout => {
                             self.progress.done += 1;
-                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::NotOffered);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::HeldOut);
                             ev.detail = format!("teaching: a held-out check near #{} — solved, never fitted (it tests the result after the refit)", job.blocker);
                             ev.face_density = r.stats.face_density;
                             ev.n_atoms = job.scene.nuclei.len();
@@ -1324,7 +1324,7 @@ impl Sampler {
                         Ok(res) => {
                             self.progress.done += 1;
                             self.last_scan = Some((pair, k));
-                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotOffered);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::HeldOut);
                             ev.detail = format!("sampling: the shell check of scan {i}–{j} at r = {r:.2} Bohr (beyond 5/6 {SCAN_LIMIT_MARK}) — solved, never fitted; judged after the refit");
                             ev.face_density = res.stats.face_density;
                             ev.n_atoms = sc.nuclei.len();

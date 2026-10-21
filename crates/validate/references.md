@@ -3848,6 +3848,45 @@ Flips (ruling B): met — cadence 50: pair 11 (6 + 5; every loss the LOO floor a
 
 **Open item for the physics re-review (fix round 3, concern 3): the inflated rule 6 starves the verdict's evidence window.** Steps the inflated rule 6 refuses are rule-6 points (codes 14/15) — the posterior's evidence (λ), not the class verdict's (audits and rule-4b only). Once a class is trusted, the refusals that would have been its rule-4b evidence become rule-6 points, and its verdict window keeps its older comparisons: at cadence 50 the many-body class stayed trusted from step 4275 on 3 points (W 0.28) while rule 6 (24 hot fallbacks) and the audits (161 rule-8 fallbacks) did the refusing, and it answered 442 hot steps (fix round 2: 105). Whether rule-6 refusals of a trusted class should feed its verdict (they are geometries the class would decide but for the std) is for the re-review to rule on.
 
+### User-test fix 2 (2026-10-22): class trust per environment species; new evidence re-judges at once
+
+**The user's case** (water taught on the shared H/O collection, ionic `All`, h = σ = 0.15; 1724 samples, Q′ 452): every step fell back with "many-body … a DFT check found an atom's force 5.7× its bound". Measured on a copy (attach + refit: n 1713, Q′ 284, gen 466): the many-body class held **109** jurisdiction points, fewer than `WINDOW_POINTS` 300, so the window was the whole ring. One point decided it: a hot-H₃ rule-4b fallback at **5.66×** (generation 416, not a stored sample). The 81 water comparisons (gens 436–457, 80 rule-4b and 1 code 21) were all ≤ 0.03× the bound. Under λ 17.6 rule 6 would have refused only 1 of them (λ·σ_epi/√3/b median 0.07), so code 21 was not the mechanism; the controller dropped that item. The verdict was recomputed only at refits, and a parked scene's "skipped: similar" fallbacks never refit.
+
+**The change** (`calibrate` "Per environment species", the controller's rulings 1–3):
+- **Keys.** The window, W, λ, the `WORST_ATOM` guard, the hysteresis memory and the leave-one-out force/energy numbers are kept per **(class, Z, the sorted neighbour species within r_cut)**. Z is a key only. The Q′ sample count stays per class.
+- **Why not the central species alone.** Water's H atoms have O and H within 6 Bohr, so they are "many-body H" like H₃'s. With neighbour species, water is O{H} and H{H, O}, and H₃ is H{H}.
+- **History.** History points carry per-atom species (the optional `audit_species` array, `surrogate::history` "Species"). Points written before it count for **every** key of their class (ruling 2).
+- **Memory.** The hysteresis memory is saved per key. The old per-class form reads empty, so a band verdict re-enters under ENTER.
+- **Re-judging.** A new audit or rule-4b point re-judges the verdicts at once (`rejudge_classes`, one pass over the ring), not at the next refit (ruling 3). Leaving takes effect at once. Two guards keep the re-judge from loosening anything between refits, both measured on the GPU gated repro (`the_stuck_escape_repro_is_answered_honestly`, hot run):
+
+| version | hot run: model answers | judged | worst force / bound |
+|---|---|---|---|
+| HEAD (fix round 3 record) | 81 | 65 | 0.97 |
+| re-judge with neither guard | 336 | 154 | **6.07** (two answers beyond 3×: 3.95× and 6.07×, \|ΔE\|/N 0.9 and 1.4 mHa) |
+| + the window entry rule only | 400 | 163 | **3.19** |
+| + λ frozen between refits (as committed) | 85 | 61 | **0.97**, \|ΔE\|/N ≤ 5.8e-4 Ha — passes |
+
+- **Entering between refits needs a full window** of `WINDOW_POINTS` 300 comparisons (`ClassKey::Window`, "Why 300").
+- **λ is the posterior's, re-measured only at refits, installs and policy changes** (`ClassJudge::refit_cal`). Re-measuring it on every new verdict point between refits was decisive: it let rule 6 admit the hot run's tail.
+
+**The copy, after this change:**
+
+| | as stored (old points count for every key) | + 300 attributed water comparisons at the measured 0.02×, re-judged without a refit |
+|---|---|---|
+| many-body around O, with H | refused, worst atom 5.66× | **trusted** (W 0.0095, worst 0.009, energy 0.012; λ stays 17.6 until the next refit — rule 6 at that λ would have refused 1 of the 81 recorded water steps, median 0.07× the bound) |
+| many-body around H, with H and O | refused, worst atom 5.66× | **trusted** (W 0.014, worst 0.013) |
+| many-body around H, with H (H₃) | refused, worst atom 5.66× | refused, 5.66× (its window still holds the point) |
+| pair around H, with H | trusted (W 0.28) | trusted |
+
+The existing collection therefore unlocks only after the window ages. Water's keys need 300 points newer than generation 416. The ring already holds 81 water points from gens 436–457, so about 220 more water fallback steps are needed, and nothing has to be refitted.
+
+**Costs of the change:**
+- A key that no fitted atom and no attributed point holds is judged by its class's species-less evidence and the class's leave-one-out numbers.
+- The per-step verdict now moves with the evidence. One step of the scripted Morse session falls back on a 3-comparison energy reading of 4.07× (the digest was re-pinned; with the species words masked it is the only changed line besides the teacher-call count).
+- `new_species_falls_back_and_is_learned_at_the_next_refit`: H₂ now keeps its own verdict while the first H–He sample refuses only the H–He keys. The class-wide cost documented in M6 Task 11 is gone.
+
+Tests: `class_trust_is_per_environment_species_the_users_water_after_h3`, `new_evidence_rejudges_the_class_verdict_without_a_refit`, `species_round_trip_and_old_files_read_unknown`, `sidecar_round_trips_the_class_memory`.
+
 ## M8a collection references and the class-LOO cost (Task 4a, 2026-10-21; `surrogate::collection` "References", `providers::surrogate::shared`)
 
 **The problem** (Task 3 review, physics (c)). The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`, so a reference wrong by δ_Z shifts every target by −N_Z·δ_Z (partly absorbed into the binding shape — a small force bias —, the rest into the energy residual) and moves the dissociation limit by δ_Z per atom. A collection's key holds no box, so its samples come from many boxes while each species has one reference. Two box-dependent parts of an isolated atom's energy:

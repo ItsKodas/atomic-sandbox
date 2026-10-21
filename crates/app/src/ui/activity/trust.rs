@@ -97,6 +97,22 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
                 }
             ),
         });
+        // per environment species when the class holds more than one (an atom answers by its own)
+        for s in l.species.iter().filter(|_| l.species.len() > 1) {
+            v.push(Line {
+                met: s.trusted,
+                why: false,
+                text: format!("    {}", words::species_line(l.class, s)),
+                hover: format!(
+                    "the verdict for atoms {} in this class: its own DFT checks{}; {CLASS_HELP}",
+                    s.words(),
+                    match (s.measured, s.worst_atom) {
+                        (Some(f), Some(a)) => format!(" measured force {f:.2}× the bound, worst atom {a:.1}×, over {} comparisons", s.evidence),
+                        _ => " — none yet".to_string(),
+                    }
+                ),
+            });
+        }
     }
     v
 }

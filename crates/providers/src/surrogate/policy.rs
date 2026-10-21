@@ -93,6 +93,29 @@ pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
     c
 }
 
+/// Per atom (Z, the distinct species of its neighbours within r_cut, ascending) — with the atom's
+/// class, its [`surrogate::EnvKey`] (the calibrated class verdict's key, M8a user-test fix 2). Z is
+/// a key only (rule 1).
+pub(super) fn neighbour_species(pos: &[[f64; 3]], z: &[u8], rc2: f64) -> Vec<(u8, Vec<u8>)> {
+    (0..pos.len())
+        .map(|i| {
+            let mut nb: Vec<u8> = (0..pos.len()).filter(|&j| j != i && (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() < rc2).map(|j| z[j]).collect();
+            nb.sort_unstable();
+            nb.dedup();
+            (z[i], nb)
+        })
+        .collect()
+}
+
+/// Per atom its [`surrogate::EnvKey`] (class, Z, neighbour species), `None` for an isolated atom.
+pub(super) fn env_keys(pos: &[[f64; 3]], z: &[u8], rc2: f64) -> Vec<Option<surrogate::EnvKey>> {
+    neighbour_counts(pos, rc2)
+        .into_iter()
+        .zip(neighbour_species(pos, z, rc2))
+        .map(|(k, (z, neighbours))| atom_class(k).map(|c| surrogate::EnvKey { class: c as u8 + 1, z, neighbours }))
+        .collect()
+}
+
 /// The force-label noise prior of a pseudopotential scene, Ha/Bohr per component (M7 Task 9; Task 8b review
 /// ruling (b), Task 8a review): the teacher's own path scatter on the GPU at the sampling tolerance — measured
 /// 4.7–4.8e-5 on lone pseudo-O and on OH, up to ≈ 7e-5 on warm teacher chains — which no model can represent.
@@ -488,11 +511,15 @@ impl SurrogateKs {
     }
 
     /// The variance inflation per atom of a geometry (M8a Task 2 fix round 3; `calibrate`, "The
-    /// variance inflation"): λ of the atom's environment class (`ClassLoo::inflation`), 1 for an
-    /// isolated atom or before the class has numbers.
-    pub(super) fn atom_inflation(&self, model: &Model, pos: &[[f64; 3]]) -> Vec<f64> {
+    /// variance inflation"): λ of the atom's environment key (class, Z, neighbour species — M8a
+    /// user-test fix 2; `SpeciesVerdict::inflation`), 1 for an isolated atom or before the class
+    /// has numbers.
+    pub(super) fn atom_inflation(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Vec<f64> {
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        neighbour_counts(pos, rc2).into_iter().map(|k| atom_class(k).and_then(|c| self.class_loo.get(c)).map_or(1.0, |l| l.inflation)).collect()
+        if z.len() != pos.len() {
+            return vec![1.0; pos.len()];
+        }
+        env_keys(pos, z, rc2).into_iter().map(|k| k.map_or(1.0, |k| self.key_inflation(&k))).collect()
     }
 
     /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force
@@ -502,10 +529,10 @@ impl SurrogateKs {
     /// (`atom_inflation`; 1 for a calibrated or unmeasured class) and the epistemic energy std by
     /// the largest λ among the geometry's atoms — one scale of the posterior covariance per class,
     /// measured where the posterior decides (`calibrate`, "The variance inflation").
-    pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]]) -> VarianceVerdict {
+    pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]], z: &[u8]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
-        let infl = self.atom_inflation(model, pos);
+        let infl = self.atom_inflation(model, pos, z);
         // 6. forces, epistemic only, inflated by the class's calibration
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;

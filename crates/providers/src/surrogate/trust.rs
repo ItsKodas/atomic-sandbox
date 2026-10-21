@@ -145,6 +145,39 @@ pub fn env_class(counts: &[usize]) -> Option<usize> {
     }
 }
 
+/// What the class verdicts are judged from (`SurrogateKs::class_judge`; M8a user-test fix 2): the
+/// fit's per-class leave-one-out statistics, the aleatoric levels, Q′, the keys of the fitted
+/// atoms, and the calibration of the last judgement.
+#[derive(Clone, Debug)]
+pub(super) struct ClassJudge {
+    pub(super) stats: [super::calibrate::ClassStats; 2],
+    /// Per environment key its own leave-one-out numbers (the class's sample count).
+    pub(super) key_stats: BTreeMap<surrogate::EnvKey, super::calibrate::ClassStats>,
+    pub(super) aleatoric: [f64; 2],
+    pub(super) q_prime: usize,
+    pub(super) keys: std::collections::BTreeSet<surrogate::EnvKey>,
+    pub(super) cal: super::calibrate::Calibration,
+    /// The calibration of the last refit, install or policy change: λ's source. The variance
+    /// inflation is a property of the posterior and moves with it — at refits — never with the
+    /// re-judge between them (the GPU gated repro: λ re-measured on every new verdict point let
+    /// rule 6 admit the hot run's tail).
+    pub(super) refit_cal: super::calibrate::Calibration,
+    /// Judged between refits (`rejudge_classes`): an untrusted key enters only on a full window
+    /// (`ClassKey::Window`, `calibrate` "Per environment species").
+    pub(super) between_refits: bool,
+}
+
+/// The entry rule between refits (`ClassKey::Window`; `calibrate` "Per environment species"): a
+/// key that did not stand trusted and would now be trusted on fewer than `WINDOW_POINTS`
+/// comparisons is refused until the next refit's verdict or a full window.
+fn entry_between_refits(refusal: Option<(ClassKey, f64, f64)>, was_trusted: bool, kc: &super::calibrate::ClassCalibration, between_refits: bool) -> Option<(ClassKey, f64, f64)> {
+    let w = super::calibrate::WINDOW_POINTS;
+    if refusal.is_none() && between_refits && !was_trusted && kc.points < w {
+        return Some((ClassKey::Window, kc.points as f64, w as f64));
+    }
+    refusal
+}
+
 /// The fitted state a recovery attempt may have to restore.
 pub(super) struct FitState {
     pub(super) accumulator: Option<Accumulator>,
@@ -156,7 +189,8 @@ pub(super) struct FitState {
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
-    pub(super) class_memory: Vec<(bool, Option<u64>)>,
+    pub(super) class_memory: BTreeMap<surrogate::EnvKey, (bool, Option<u64>)>,
+    pub(super) class_judge: Option<ClassJudge>,
     pub(super) class_worst: Vec<Option<(usize, f64)>>,
     pub(super) class_blockers: Vec<Vec<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
@@ -307,7 +341,8 @@ impl SurrogateKs {
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
         let (loo, worst, blockers) = self.compute_class_loo_full();
-        self.class_loo = loo;
+        self.class_judge = loo.as_ref().map(|l| l.1.clone());
+        self.class_loo = loo.map(|l| l.0).unwrap_or_default();
         // the class verdicts carry rule 6/7's variance inflation (M8a Task 2 fix round 3): a cached
         // variance verdict judged with the old factors is not reused
         self.last_variance = None;
@@ -318,6 +353,114 @@ impl SurrogateKs {
         for c in trusted {
             self.teach_rounds.remove(&c);
         }
+    }
+
+    /// Re-judges the class verdicts from the history as it stands, against the class statistics of
+    /// the fit that stands (M8a user-test fix 2, the controller's ruling 3: new evidence is read
+    /// when it arrives, not at the next refit — a parked scene whose fallbacks are all "skipped:
+    /// similar" never refits). The standing verdicts are the hysteresis memory and the new ones
+    /// are committed. Nothing without a fit. Cost: one calibration pass over the ring.
+    pub(super) fn rejudge_classes(&mut self) {
+        let Some(mut j) = self.class_judge.take() else { return };
+        j.cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, j.aleatoric, &j.keys);
+        j.between_refits = true;
+        let loo = self.judge_classes(&j);
+        // a cached variance verdict was judged with the old factors: dropped when one moved (the
+        // variance cadence is otherwise untouched by new evidence)
+        let factors = |l: &[ClassLoo]| l.iter().flat_map(|c| c.species.iter().map(|s| s.inflation.to_bits()).chain([c.inflation.to_bits()])).collect::<Vec<u64>>();
+        if factors(&loo) != factors(&self.class_loo) {
+            self.last_variance = None;
+        }
+        self.class_loo = loo;
+        self.class_judge = Some(j);
+        let trusted: Vec<usize> = self.class_loo.iter().enumerate().filter(|(_, c)| c.trusted).map(|(k, _)| k).collect();
+        for c in trusted {
+            self.teach_rounds.remove(&c);
+        }
+        self.commit_class_memory();
+    }
+
+    /// The verdicts per class and per environment key (module doc, "Class-wise trust";
+    /// `calibrate` "Per environment species") from a judgement's inputs: every key of a class is
+    /// judged by its own calibration with the class's leave-one-out statistics and its own
+    /// hysteresis memory; the class is trusted when all its keys are, and reports the first refused
+    /// key's refusal and numbers (the class-wide calibration when all are trusted).
+    pub(super) fn judge_classes(&self, j: &ClassJudge) -> Vec<ClassLoo> {
+        use super::calibrate::{verdict, ClassVerdict};
+        let refusal_of = |v: ClassVerdict| match v {
+            ClassVerdict::Trusted => None,
+            ClassVerdict::Untrusted { key, value, limit, .. } => Some((key, value, limit)),
+        };
+        (0..2)
+            .map(|c| {
+                let st = j.stats[c];
+                let species: Vec<sim::SpeciesVerdict> = j
+                    .cal
+                    .per_key
+                    .iter()
+                    .filter(|(k, _)| k.class as usize == c + 1)
+                    .map(|(k, kc)| {
+                        let (was, since) = self.class_memory.get(k).copied().unwrap_or((false, None));
+                        let refusal = entry_between_refits(refusal_of(verdict(*kc, j.key_stats.get(k).unwrap_or(&st), j.q_prime, was)), was, kc, j.between_refits);
+                        let trusted = refusal.is_none();
+                        let some = |x: f64| (kc.points > 0).then_some(x);
+                        sim::SpeciesVerdict {
+                            z: k.z,
+                            neighbours: k.neighbours.clone(),
+                            trusted,
+                            refusal,
+                            calibration: kc.factor,
+                            measured: some(kc.measured),
+                            measured_energy: some(kc.measured_energy),
+                            worst_atom: some(kc.worst_atom),
+                            evidence: kc.evidence,
+                            trusted_since: if trusted { since.or(Some(self.model_gen)) } else { None },
+                            inflation: j.refit_cal.key(k).inflation,
+                        }
+                    })
+                    .collect();
+                let first_refused = j.cal.per_key.iter().filter(|(k, _)| k.class as usize == c + 1).zip(&species).find(|(_, s)| !s.trusted);
+                let (cal, refusal) = match first_refused {
+                    Some(((_, kc), s)) => (*kc, s.refusal),
+                    None if species.is_empty() => {
+                        let cc = j.cal.per_class[c];
+                        (cc, refusal_of(verdict(cc, &st, j.q_prime, false)))
+                    }
+                    None => (j.cal.per_class[c], None),
+                };
+                let trusted = refusal.is_none();
+                let some = |x: f64| (cal.points > 0).then_some(x);
+                ClassLoo {
+                    class: ENV_CLASSES[c],
+                    samples: st.samples,
+                    force_rms: st.force_rms,
+                    force_max: st.force_max,
+                    energy_rms: st.energy_rms,
+                    energy_max: st.energy_max,
+                    trusted,
+                    refusal,
+                    calibration: cal.factor,
+                    measured: some(cal.measured),
+                    measured_energy: some(cal.measured_energy),
+                    worst_atom: some(cal.worst_atom),
+                    evidence: cal.evidence,
+                    trusted_since: if trusted { species.iter().filter_map(|s| s.trusted_since).max().or(Some(self.model_gen)) } else { None },
+                    inflation: species.iter().map(|s| s.inflation).fold(j.refit_cal.per_class[c].inflation, f64::max),
+                    species,
+                }
+            })
+            .collect()
+    }
+
+    /// λ of an environment key (`calibrate`, "The variance inflation"; per key since M8a user-test
+    /// fix 2): its verdict's, or — for a key no fitted atom and no attributed point holds — the
+    /// calibration its class's species-less points give; 1 before the first fit.
+    pub(super) fn key_inflation(&self, k: &surrogate::EnvKey) -> f64 {
+        let c = (k.class as usize).wrapping_sub(1);
+        if let Some(s) = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)) {
+            return s.inflation;
+        }
+        self.class_judge.as_ref().map_or(1.0, |j| j.refit_cal.key(k).inflation)
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
@@ -340,10 +483,14 @@ impl SurrogateKs {
     /// (`Q_DRAFT`) are excluded like every other excluded sample (`surrogate` module doc, "Draft
     /// mode"). Empty without a model.
     #[allow(clippy::type_complexity)]
-    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
+    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (None, Vec::new(), Vec::new());
         };
+        // the environment keys of the fitted atoms (`calibrate`, "Per environment species") and
+        // their leave-one-out sums (as `acc`, per key)
+        let mut keys = std::collections::BTreeSet::new();
+        let mut key_acc: BTreeMap<surrogate::EnvKey, (usize, f64, usize, f64, f64, f64)> = BTreeMap::new();
         let rc2 = model.basis.r_cut * model.basis.r_cut;
         // per class: samples, Σ force ratio², atoms, max force ratio, max energy ratio, Σ energy ratio²
         let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64); 2];
@@ -358,6 +505,8 @@ impl SurrogateKs {
                 continue;
             }
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().map(atom_class).collect();
+            let atom_keys = if s.z.len() == s.pos.len() { env_keys(&s.pos, &s.z, rc2) } else { Vec::new() };
+            keys.extend(atom_keys.iter().flatten().cloned());
             if let Ok((_, f_model)) = surrogate::energy_and_forces(model, &s.pos, &s.z) {
                 for ((fm, f), cj) in f_model.iter().zip(&s.forces).zip(&classes) {
                     if let Some(c) = *cj {
@@ -369,6 +518,31 @@ impl SurrogateKs {
             let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
             let e_ratio = l.as_ref().map_or(f64::INFINITY, |l| (if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n }) / self.policy.energy_std_per_atom);
+            // per environment key the same leave-one-out sums over its own atoms (user-test fix 2:
+            // an atom is judged by its own key, so another species' outlier does not decide it;
+            // the energy counts for every key the sample holds, as for the class)
+            let present: std::collections::BTreeSet<&surrogate::EnvKey> = atom_keys.iter().flatten().collect();
+            for k in present {
+                let a = key_acc.entry(k.clone()).or_insert((0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64));
+                a.0 += 1;
+                a.4 = max_nan(a.4, e_ratio);
+                a.5 += e_ratio * e_ratio;
+                match l.as_ref() {
+                    None => a.3 = f64::INFINITY,
+                    Some(l) => {
+                        for ((r, f), kj) in l.forces.iter().zip(&s.forces).zip(&atom_keys) {
+                            if kj.as_ref() != Some(k) {
+                                continue;
+                            }
+                            let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+                            let ratio = d / b;
+                            a.1 += ratio * ratio;
+                            a.2 += 1;
+                            a.3 = max_nan(a.3, ratio);
+                        }
+                    }
+                }
+            }
             for (c, a) in acc.iter_mut().enumerate() {
                 if !classes.contains(&Some(c)) {
                     continue;
@@ -412,52 +586,29 @@ impl SurrogateKs {
             let rms = if n > 0 { (ss / n as f64).sqrt() } else { report.sigma_f };
             report.sigma_f.min(rms)
         });
-        let cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, aleatoric);
-        let loo = acc
-            .iter()
-            .zip(ENV_CLASSES)
-            .enumerate()
-            .map(|(c, (&(samples, ss, atoms, force_max, energy_max, se), class))| {
-                let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
-                // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
-                let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
-                let energy_rms = if samples > 0 { (se / samples as f64).sqrt() } else { 0.0 };
-                let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
-                // the hysteresis memory is the verdict that stood when this refit, install or
-                // policy change began (`class_memory`; reset by a forget or an install)
-                let (was_trusted, since) = self.class_memory.get(c).copied().unwrap_or((false, None));
-                let st = super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max };
-                let refusal = match cal.class_verdict(c, &st, report.q_prime, was_trusted) {
-                    super::calibrate::ClassVerdict::Trusted => None,
-                    super::calibrate::ClassVerdict::Untrusted { key, value, limit, .. } => Some((key, value, limit)),
-                };
-                let trusted = refusal.is_none();
-                let trusted_since = if trusted { since.or(Some(self.model_gen)) } else { None };
-                let k = cal.per_class[c];
-                let some = |x: f64| (k.points > 0).then_some(x);
-                ClassLoo {
-                    class,
-                    samples,
-                    force_rms,
-                    force_max,
-                    energy_rms,
-                    energy_max,
-                    trusted,
-                    refusal,
-                    calibration: k.factor,
-                    measured: some(k.measured),
-                    measured_energy: some(k.measured_energy),
-                    worst_atom: some(k.worst_atom),
-                    evidence: k.evidence,
-                    trusted_since,
-                    inflation: k.inflation,
-                }
-            })
-            .collect();
+        let cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, aleatoric, &keys);
+        let stats_of = |(samples, ss, atoms, force_max, energy_max, se): (usize, f64, usize, f64, f64, f64)| {
+            let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
+            // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
+            let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
+            let energy_rms = if samples > 0 { (se / samples as f64).sqrt() } else { 0.0 };
+            let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
+            super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
+        };
+        let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
+        // per key: its own leave-one-out numbers, the class's sample count (the Q′ rule is the class's)
+        let key_stats = key_acc.into_iter().map(|(k, a)| {
+            let c = (k.class - 1) as usize;
+            (k, super::calibrate::ClassStats { samples: stats[c].samples, ..stats_of(a) })
+        }).collect();
+        let judge = ClassJudge { stats, key_stats, aleatoric, q_prime: report.q_prime, keys, refit_cal: cal.clone(), cal, between_refits: false };
+        // the hysteresis memory is the verdict that stood when this refit, install or policy
+        // change began (`class_memory`; reset by a forget or an install)
+        let loo = self.judge_classes(&judge);
         for b in &mut blockers {
             b.sort_by(|x, y| y.1.total_cmp(&x.1));
         }
-        (loo, worst, blockers)
+        (Some((loo, judge)), worst, blockers)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
@@ -469,7 +620,12 @@ impl SurrogateKs {
     /// (`class_memory`; M8a Task 2): called once a refit, an install or a policy change is done,
     /// never by the intermediate fits inside one of them.
     pub(super) fn commit_class_memory(&mut self) {
-        self.class_memory = self.class_loo.iter().map(|l| (l.trusted, l.trusted_since)).collect();
+        self.class_memory = self
+            .class_loo
+            .iter()
+            .enumerate()
+            .flat_map(|(c, l)| l.species.iter().map(move |s| (surrogate::EnvKey { class: c as u8 + 1, z: s.z, neighbours: s.neighbours.clone() }, (s.trusted, s.trusted_since))))
+            .collect();
     }
 
     /// Per atom of every fitted sample (the accumulated prefix, excluded samples skipped — the same
@@ -497,42 +653,69 @@ impl SurrogateKs {
         out
     }
 
-    /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
-    /// neighbour counts `counts`: `None` when every class among its atoms ([`atom_class`]) is
-    /// trusted (isolated atoms are exempt), else the first untrusted class's refusal (pair before
-    /// many-body) and whether that class is short of samples.
-    pub(super) fn class_untrusted(&self, counts: &[usize]) -> Option<(Refusal, bool)> {
-        let present: Vec<usize> = (0..ENV_CLASSES.len()).filter(|&c| counts.iter().any(|&k| atom_class(k) == Some(c))).collect();
-        present.into_iter().find_map(|c| self.one_class_untrusted(c))
+    /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query whose atoms have the
+    /// environment keys `keys` (`env_keys`; per key since M8a user-test fix 2): `None` when every
+    /// key among its atoms is trusted (isolated atoms are exempt), else the first untrusted key's
+    /// refusal (pair before many-body) and whether its class is short of samples.
+    pub(super) fn class_untrusted(&self, keys: &[Option<surrogate::EnvKey>]) -> Option<(Refusal, bool)> {
+        let present: std::collections::BTreeSet<&surrogate::EnvKey> = keys.iter().flatten().collect();
+        present.into_iter().find_map(|k| self.one_key_untrusted(k))
     }
 
-    /// The class rule's refusal for class `c` (index into [`ENV_CLASSES`]), `None` when trusted.
-    fn one_class_untrusted(&self, c: usize) -> Option<(Refusal, bool)> {
+    /// The class rule's refusal for environment key `k`, `None` when trusted: its own verdict
+    /// (`SpeciesVerdict`), or — for a key no fitted atom and no attributed point holds — the verdict
+    /// its class's species-less evidence gives, without a standing verdict.
+    fn one_key_untrusted(&self, k: &surrogate::EnvKey) -> Option<(Refusal, bool)> {
         let q = self.report.as_ref()?.q_prime;
+        let c = (k.class as usize).wrapping_sub(1);
         let refusal = |text: String| Refusal::new(text, TeachRule::Class(env_class_code(c)), None);
+        let name = ENV_CLASSES.get(c).copied().unwrap_or("?");
         let Some(l) = self.class_loo.get(c) else {
-            return Some((refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({}: no leave-one-out numbers)", ENV_CLASSES[c])), true));
+            return Some((refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({name}: no leave-one-out numbers)")), true));
         };
-        if l.trusted {
+        // a class without per-species verdicts (no fitted atom of it) answers by its own verdict
+        let class_wide = l.species.is_empty();
+        let own = if class_wide {
+            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation })
+        } else {
+            l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours).cloned()
+        };
+        let s = match own {
+            Some(s) => s,
+            None => {
+                let j = self.class_judge.as_ref()?;
+                let kc = j.cal.key(k);
+                let refusal = match super::calibrate::verdict(kc, &j.stats[c], j.q_prime, false) {
+                    super::calibrate::ClassVerdict::Trusted => None,
+                    super::calibrate::ClassVerdict::Untrusted { key, value, limit, .. } => Some((key, value, limit)),
+                };
+                let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
+                let some = |x: f64| (kc.points > 0).then_some(x);
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation }
+            }
+        };
+        if s.trusted {
             return None;
         }
-        // the class rule's own verdict (`calibrate::class_verdict`, plan review M3), never a re-test
-        // of the numbers, in the verdict's own words (`calibrate::refusal_words`: one wording for
-        // the verdict and this note, the M8a Task 2 review's M2); `None` cannot occur here
+        // the class rule's own verdict (`calibrate::verdict`, plan review M3), never a re-test of
+        // the numbers, in the verdict's own words (`calibrate::refusal_words`: one wording for the
+        // verdict and this note, the M8a Task 2 review's M2); `None` cannot occur here
         // (`trusted == refusal.is_none()`) and is worded as the uncalibrated force rule
-        let (key, value, limit) = l.refusal.unwrap_or((ClassKey::Force, l.force_max.max(l.force_rms), 1.0));
+        let (key, value, limit) = s.refusal.unwrap_or((ClassKey::Force, l.force_max.max(l.force_rms), 1.0));
+        let st = self.class_judge.as_ref().filter(|_| !class_wide).and_then(|j| j.key_stats.get(k).copied()).unwrap_or(super::calibrate::ClassStats { samples: l.samples, force_rms: l.force_rms, force_max: l.force_max, energy_rms: l.energy_rms, energy_max: l.energy_max });
         let words = super::calibrate::WordsInput {
-            samples: l.samples,
-            force_rms: l.force_rms,
-            force_max: l.force_max,
-            energy_max: l.energy_max,
-            measured: l.measured,
-            measured_energy: l.measured_energy,
-            evidence: l.evidence,
-            calibration: l.calibration,
+            samples: st.samples,
+            force_rms: st.force_rms,
+            force_max: st.force_max,
+            energy_max: st.energy_max,
+            measured: s.measured,
+            measured_energy: s.measured_energy,
+            evidence: s.evidence,
+            calibration: s.calibration,
         };
         let limit = if key == ClassKey::Samples { q as f64 } else { limit };
-        let text = format!("surrogate: this kind of environment isn't learned well enough yet ({}: {})", l.class, super::calibrate::refusal_words(key, value, limit, &words));
+        let what = if class_wide { l.class.to_string() } else { format!("{} {}", l.class, s.words()) };
+        let text = format!("surrogate: this kind of environment isn't learned well enough yet ({what}: {})", super::calibrate::refusal_words(key, value, limit, &words));
         Some((refusal(text), key == ClassKey::Samples))
     }
 
@@ -945,6 +1128,7 @@ impl SurrogateKs {
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
             class_memory: self.class_memory.clone(),
+            class_judge: self.class_judge.clone(),
             class_worst: self.class_worst.clone(),
             class_blockers: self.class_blockers.clone(),
             degree_cap: self.degree_cap,
@@ -963,6 +1147,7 @@ impl SurrogateKs {
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
         self.class_memory = s.class_memory;
+        self.class_judge = s.class_judge;
         self.class_worst = s.class_worst;
         self.class_blockers = s.class_blockers;
         self.degree_cap = s.degree_cap;
