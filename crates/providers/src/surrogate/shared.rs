@@ -1001,13 +1001,13 @@ impl SurrogateKs {
 
     /// Loads a **specialised model** (M8a Task 7, ruling P8; `surrogate::sidecar` "Version 6"):
     /// accepted for any neutral scene whose surface key matches the file's (its box is not
-    /// compared — the samples come from many boxes). Each sample is put on one reference frame:
-    /// E − Σ_i (ref(Z_i, its box) − ref_frame(Z_i)), with the frame the scene's own box when the
-    /// file holds its references for every species (then exact: the fit target is E − Σ ref of
-    /// the sample's own box, as in the collection, and the scene's teacher answers share the
-    /// frame), else each species' largest box (a note names the box offset that remains — up to
-    /// ≈ 1e-2 Ha per atom, `validate/references.md` "M8a collection references"; CLAUDE.md rule 7).
-    /// The result is installed as a per-scene samples file of the scene's provenance and fitted
+    /// compared — the samples come from many boxes). Each sample is put on the **scene box's**
+    /// reference frame: E − Σ_i (ref(Z_i, its box) − ref(Z_i, scene box)), so the fit target is
+    /// E − Σ ref of the sample's own box, as in the collection, and the scene's teacher answers
+    /// share the frame. A file without the scene box's reference of every species it holds is
+    /// **refused**, the box named (Task 7 fix round 1, controller ruling: never fit across two
+    /// frames — the largest box's frame would differ from this box's teacher answers by up to
+    /// ≈ 1e-2 Ha per atom, `validate/references.md` "M8a collection references"). The result is installed as a per-scene samples file of the scene's provenance and fitted
     /// on load as today; the collection is let go like any model-file load.
     pub(super) fn load_specialised(&mut self, path: &Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
         let want = self.provenance_for(scene);
@@ -1032,11 +1032,16 @@ impl SurrogateKs {
         let mut file_species: Vec<u8> = set.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         file_species.sort_unstable();
         file_species.dedup();
-        let own_box = file_species.iter().all(|&z| br.contains_key(&(z, n_box)));
-        let frame: BTreeMap<u8, f64> = file_species
-            .iter()
-            .filter_map(|&z| if own_box { br.get(&(z, n_box)).copied() } else { br.range((z, 0)..=(z, usize::MAX)).next_back().map(|(_, &e)| e) }.map(|e| (z, e)))
-            .collect();
+        let missing: Vec<&str> = file_species.iter().filter(|&&z| !br.contains_key(&(z, n_box))).map(|&z| symbol(z)).collect();
+        if !missing.is_empty() {
+            let msg = refused(format!(
+                "this file has no references for a {n_box}³ box ({}) — train once in this box in the shared collection, or save the file again afterwards",
+                missing.join(", ")
+            ));
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
+        let frame: BTreeMap<u8, f64> = file_species.iter().filter_map(|&z| br.get(&(z, n_box)).map(|&e| (z, e))).collect();
         let mut boxes: Vec<usize> = set.sample_box.clone();
         boxes.sort_unstable();
         boxes.dedup();
@@ -1082,7 +1087,7 @@ impl SurrogateKs {
         }
         self.set_source_file(Some(path.to_path_buf()));
         self.specialised = set.specialised;
-        if s9 && own_box {
+        if s9 {
             // the scene's own box: the cache's key (grid n included) is exactly right
             for (&z, &e) in &frame {
                 self.ref_cache.seed_energy(atom_key(&want, z), e, None, want.tol, &want.teacher);
@@ -1097,11 +1102,6 @@ impl SurrogateKs {
         let names: Vec<&str> = self.specialised.iter().map(|&z| symbol(z)).collect();
         let grids: Vec<String> = boxes.iter().map(|b| format!("{b}³")).collect();
         self.user_notes.push(format!("specialised model ({}) loaded from {}: {n} samples from boxes {}: {state}", names.join(", "), path.display(), grids.join(", ")));
-        if !own_box {
-            self.user_notes.push(format!(
-                "specialised model: the file holds no isolated-atom references of this scene's box ({n_box}³), so its energies are placed on each species' largest box's reference; this box's teacher answers differ from that frame by the box's reference offset (up to ≈ 1e-2 Ha per atom, validate/references.md \"M8a collection references\") — a specialised model saved after the collection learned in this box has none"
-            ));
-        }
         if dropped > 0 {
             self.user_notes.push(format!("specialised model: {dropped} samples left out — the file holds no reference of their box for one of their species"));
         }

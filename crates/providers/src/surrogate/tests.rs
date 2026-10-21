@@ -8894,11 +8894,30 @@ fn a_specialised_model_loads_in_another_box_and_fits() {
     assert_eq!(st.model_source, sim::ModelSource::File(file.clone()));
     assert_eq!(st.provenance_mismatch, None, "the store is the scene's own (41³)");
     assert!(p.user_notes.iter().any(|n| n.contains("specialised model (H)") && n.contains("33³")), "{:?}", p.user_notes);
-    assert!(!p.user_notes.iter().any(|n| n.contains("no isolated-atom references")), "41³ has them");
-    // a box the file has no references of (49³): loads on the largest box's, the offset named
+    // a box the file has no references of (49³): refused, the box named — never two frames (fix round 1)
     let (mut b, _) = pair_student();
-    Trainable::load(&mut b, &file, &in_cell(h2(1.4), 49)).unwrap();
-    assert!(b.user_notes.iter().any(|n| n.contains("no isolated-atom references of this scene's box (49³)")), "{:?}", b.user_notes);
+    let e = Trainable::load(&mut b, &file, &in_cell(h2(1.4), 49)).unwrap_err();
+    assert!(e.contains("no references for a 49³ box (H)") && e.contains("train once in this box"), "{e}");
+    assert_eq!(b.samples(), 0, "nothing installed");
+    // I2: the shift E − Σ(ref(Z, own box) − ref(Z, scene box)), pinned with box references that differ
+    let shifted = dir.join("h-shifted.model");
+    let (d33, d41) = (-0.4712, -0.4650);
+    let pinned = surrogate::SampleSet { box_references: vec![(1, 33, d33), (1, 41, d41)], ..set.clone() };
+    surrogate::sidecar::write_samples(&shifted, &pinned).unwrap();
+    let (mut r, _) = pair_student();
+    Trainable::load(&mut r, &shifted, &scene).unwrap();
+    let got = &r.store.as_ref().unwrap().samples;
+    assert_eq!(got.len(), set.samples.len());
+    for (g, raw) in got.iter().zip(&set.samples) {
+        let want = raw.energy - 2.0 * (d33 - d41);
+        assert!((g.energy - want).abs() < 1e-12, "{} vs {want}", g.energy);
+    }
+    assert_eq!(r.refs.get(&1).copied(), Some(d41), "the model's reference is the scene box's");
+    // in its own box (33³) nothing shifts
+    let (mut o, _) = pair_student();
+    Trainable::load(&mut o, &shifted, &h2(1.4)).unwrap();
+    assert!(o.store.as_ref().unwrap().samples.iter().zip(&set.samples).all(|(g, raw)| g.energy == raw.energy));
+    assert_eq!(o.refs.get(&1).copied(), Some(d33));
     // a later load of another file clears the mark
     Trainable::forget(&mut p);
     assert!(Trainable::specialised(&p).is_empty());
