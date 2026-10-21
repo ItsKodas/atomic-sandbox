@@ -1,5 +1,7 @@
 # Atomic Sandbox
 
+*Powered by **LIRA**, the live interactive real-space ab initio engine: Kohn-Sham DFT solved on the GPU.*
+
 An interactive 3D sandbox that simulates matter from the atomic level up with real physics, written from scratch in Rust + wgpu. Nuclei are classical point particles; electrons are solved with real-space Kohn-Sham density-functional theory on a GPU grid. Nothing chemical is hardcoded — every element is described by its atomic number and isotope mass only, and bonds, shapes and energies have to *emerge* from the equations.
 
 How it was built, what failed on the way and how long each part took: [DEVLOG.md](DEVLOG.md).
