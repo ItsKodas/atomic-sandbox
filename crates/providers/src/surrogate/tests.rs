@@ -6592,7 +6592,7 @@ fn a_round_that_leaves_its_class_short_is_not_accepted() {
     let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
     let held = s.store().unwrap().samples.last().unwrap().clone();
     let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
-    let holdout = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    let holdout = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, multiplicity: None, unfit: false };
     s.finish_teach(&[60], vec![holdout], &progress);
     let outcome = s.user_notes.last().unwrap().clone();
     println!("{outcome}");
@@ -7302,7 +7302,7 @@ fn every_blocker_needs_a_judged_check() {
     let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
     let held = s.store().unwrap().samples[30].clone();
     let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
-    let near_60 = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    let near_60 = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, multiplicity: None, unfit: false };
     s.finish_teach(&[59, 60], vec![near_60], &progress);
     let outcome = s.user_notes.last().unwrap().clone();
     println!("{outcome}");
@@ -8214,6 +8214,12 @@ fn collection_mode_learns_across_scenes() {
     s.attach_collection(&dir, &h2(1.4)).unwrap();
     let slug = s.provenance_for(&h2(1.4)).surface_key().slug();
     assert_eq!(s.collection().unwrap().folder(), dir.join(&slug));
+    // a second handle of the same collection (read-only: this process holds the lock) never
+    // replaces the writable one (fix round 1, review M6)
+    let (second, r) = surrogate::Collection::open(&dir, &s.provenance_for(&h2(1.4)).surface_key()).unwrap();
+    assert!(r.locked_by_other && second.read_only);
+    s.attach(second).unwrap();
+    assert!(!s.collection().unwrap().read_only, "the writable handle stays");
     let (h2_steps, all) = teach_h2_then_h2_he(&mut s);
     assert_eq!(teacher.lock().unwrap().calls, all);
     let c = s.collection().unwrap();
@@ -8340,8 +8346,9 @@ fn a_charged_scene_keeps_a_per_scene_store() {
 
 /// An answer the collection refuses — box-affected (its face density above the box rule even
 /// while the provider keeps it at code 0), or of unknown box status — stays in the provider's
-/// store for the session and is never written; a draft guess's audit waits outside and is
-/// appended when a refit promotes it; status changes are appended as records.
+/// store for the session and is never written; a draft guess's audit waits outside (worded as
+/// waiting, not refused) and is appended when a refit's `judge_held_out` promotes it; status
+/// changes are appended as records.
 #[test]
 fn refused_answers_stay_per_scene_and_statuses_are_appended() {
     let dir = collection_root("refused");
@@ -8367,31 +8374,109 @@ fn refused_answers_stay_per_scene_and_statuses_are_appended() {
     let r = s.evaluate(&h2_at(1.55, &mut rng), &mut never()).unwrap();
     assert!(!r.stats.notes.iter().any(|n| n.contains("session only")), "{:?}", r.stats.notes);
     assert_eq!((s.samples(), s.collection().unwrap().samples.len()), (5, 2));
-    let summary = s.take_collection_summary().unwrap();
+    let summary = s.take_collection_summary(0).unwrap();
     assert!(summary.contains("3 kept for this session only") && summary.contains("2 box-affected sample"), "{summary}");
-    // a held-out draft guess's audit waits, and joins once promoted (Q_DRAFT → Q_NONE)
+    // a model over the window (40 pass-like samples, the reference with its box)
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    for i in 0..40 {
+        let sc = h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+        s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 }, &sc, Some(0.0), Some(1)).unwrap();
+    }
+    s.refit().unwrap();
+    assert_eq!(s.collection().unwrap().samples.len(), 42);
+    // a draft guess's audit inside the window: it waits, worded as waiting (review M2) ...
     let prov = s.provenance_for(&h2(1.4));
-    let sc = h2_at(1.7, &mut rng);
+    let sc = h2_at(1.62, &mut rng);
     let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
     let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
-    let mut sink = Vec::new();
-    assert!(s.keep_sample(&pos, &[1, 1], e, &f, Some(0.0), Some(1), &prov, SampleTag::DraftAudit, &mut sink));
-    assert_eq!(s.collection_index(5), None, "a draft guess is held out of the shared store too");
-    assert_eq!(s.collection().unwrap().samples.len(), 2);
-    s.quarantine[5] = Q_NONE;
-    s.store.as_mut().unwrap().samples[5].tag = SampleTag::Audit;
-    s.sync_collection_status();
-    assert_eq!(s.collection_index(5), Some(2), "promoted: appended");
-    assert_eq!(s.collection().unwrap().samples[2].multiplicity, Some(1));
+    let mut notes = Vec::new();
+    assert!(s.keep_sample(&pos, &[1, 1], e, &f, Some(0.0), Some(1), &prov, SampleTag::DraftAudit, &mut notes));
+    let draft = s.samples() - 1;
+    assert_eq!(s.collection_index(draft), None, "a draft guess is held out of the shared store too");
+    assert!(notes.iter().any(|n| n.contains("held out of the strict fit") && n.contains("added if a refit promotes it")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("session only")), "{notes:?}");
+    let summary = s.take_collection_summary(0).unwrap();
+    assert!(summary.contains("1 draft-mode guesses") && !summary.contains("kept for this session only"), "{summary}");
+    // ... and the next refit promotes it (strict mode's domain reaches it: `judge_held_out`), which
+    // appends it (review M4: through the refit, not by hand)
+    s.refit().unwrap();
+    assert_eq!(s.quarantine.get(draft).copied().unwrap_or(Q_NONE), Q_NONE, "promoted by the refit");
+    assert_eq!(s.collection_index(draft), Some(42), "promoted: appended");
+    assert_eq!(s.collection().unwrap().samples[42].multiplicity, Some(1));
+    assert_eq!(s.collection().unwrap().samples[42].sample.tag, SampleTag::Audit);
     // a quarantine code change of a collection sample is appended as a status record
-    s.quarantine.resize(6, Q_NONE);
+    s.quarantine.resize(s.samples(), Q_NONE);
     s.quarantine[0] = Q_HELD;
     s.sync_collection_status();
     drop(s);
     let key = prov.surface_key();
     let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
-    assert_eq!(c.samples.len(), 3);
-    assert_eq!(c.quarantine, vec![Q_HELD, Q_NONE, Q_NONE], "the hold survived the reopen");
+    assert_eq!(c.samples.len(), 43);
+    assert_eq!(c.quarantine[0], Q_HELD, "the hold survived the reopen");
+    assert!(c.quarantine[1..].iter().all(|&q| q == Q_NONE));
+}
+
+/// Fix round 1 (review I1): an answer bit-identical to one the collection holds is not kept again —
+/// in the shared store a twin doubles the geometry's weight and gives it a leave-one-out twin.
+#[test]
+fn a_duplicate_answer_is_not_kept_twice() {
+    let dir = collection_root("duplicate");
+    let (mut s, teacher) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let sc = h2(1.45);
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!((s.samples(), s.collection().unwrap().samples.len()), (1, 1));
+    // the analytic teacher answers the same geometry bit for bit
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(teacher.lock().unwrap().calls, 2, "the step itself is the teacher's");
+    assert!(r.stats.notes.iter().any(|n| n.contains("sample not kept") && n.contains("identical teacher answer")), "{:?}", r.stats.notes);
+    assert_eq!((s.samples(), s.collection().unwrap().samples.len()), (1, 1), "neither the session nor the collection holds a twin");
+    // the pass's path refuses it too
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+    let again = Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 };
+    assert_eq!(s.add_sample_answer(again, &sc, Some(0.0), Some(1)), Err(StoreError::Duplicate));
+    assert_eq!(s.samples(), 1);
+}
+
+/// Fix round 1 (review I1): a pass re-run on the same scene replays its seeded perturbations and its
+/// scan points bit for bit; a geometry the collection holds is not solved again, and the pass's
+/// summary counts the skips.
+#[test]
+fn a_rerun_pass_skips_the_geometries_the_collection_holds() {
+    let dir = collection_root("rerun");
+    let (mut s, teacher) = pair_student();
+    let scene = h2(1.4);
+    s.attach_collection(&dir, &scene).unwrap();
+    let plan = SamplingPlan { perturbations: 6, hot_burst_steps: 0, scan_points_per_pair: 4, seed: 0, ..SamplingPlan::default() };
+    let run = |s: &mut SurrogateKs| {
+        Trainable::start_pass(s, &scene, &plan, &mut sim::references::AtomReferences::default()).unwrap();
+        loop {
+            match Trainable::pass_step(s, &mut never()) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => panic!("pass: {e}"),
+            }
+        }
+        Trainable::take_notes(s)
+    };
+    run(&mut s);
+    let (calls, held) = (teacher.lock().unwrap().calls, s.collection().unwrap().samples.len());
+    assert_eq!(held, 10, "6 perturbations and 4 scan points");
+    let notes = run(&mut s);
+    println!("{notes:#?}");
+    assert_eq!(teacher.lock().unwrap().calls, calls, "the second pass solved nothing: references cached, every geometry held");
+    assert_eq!(s.collection().unwrap().samples.len(), held, "nothing appended twice");
+    assert_eq!(s.samples(), held, "nor kept twice in the session");
+    assert!(notes.iter().any(|n| n.contains("10 geometries already in it, not solved again")), "{notes:?}");
+    // a third pass on a moved scene solves again (other positions, other geometries)
+    let moved = h2(1.5);
+    Trainable::start_pass(&mut s, &moved, &plan, &mut sim::references::AtomReferences::default()).unwrap();
+    while let Ok(Some(_)) = Trainable::pass_step(&mut s, &mut never()) {}
+    assert!(s.collection().unwrap().samples.len() > held);
 }
 
 /// References with their box (the Task 3 review's physics (c)): an even-n or box-affected solve is
@@ -8515,10 +8600,11 @@ fn class_loo_cost_at_collection_sizes() {
     }
 }
 
-/// Measurement (M8a Task 4a, the Task 3 review's physics (c) (iv); reported, not asserted): an
-/// isolated atom's energy at the cell centre on a grid node (odd n) and at a cube centre (even n,
-/// the same box ± h) — the lattice-phase part of a reference, which the collection's odd-n rule
-/// fixes. GPU, tol 1e-6 (the sample tolerance the references are solved at), a 12 Bohr box.
+/// Measurement (M8a Task 4a, the Task 3 review's physics (c) (iv), and fix round 1's I2; reported,
+/// not asserted; `validate/references.md` "M8a collection references", series (1)–(3)): an isolated
+/// atom's energy (1) at the cell centre on a grid node (odd n) and at a cube centre (even n, the same
+/// box ± h); (2) at the four high-symmetry sites of one odd box — the lattice phase alone; (3) on the
+/// node in boxes of growing length — the box alone. GPU, tol 1e-6 (the sample tolerance the references are solved at), a 12 Bohr box.
 /// `cargo test -p providers --release reference_lattice_phase -- --ignored --nocapture`.
 #[test]
 #[ignore = "measurement (GPU): cargo test -p providers --release reference_lattice_phase -- --ignored --nocapture"]
@@ -8550,6 +8636,46 @@ fn reference_lattice_phase_measurement() {
                     a.0, a.1, a.2, a.3, n_odd - 1, b.0, b.1, b.2, b.3, b.0 - a.0
                 );
             }
+            // fix round 1 (review I2): every high-symmetry site in the same odd box — node, edge
+            // centre (h/2, 0, 0), face centre (h/2, h/2, 0), cube centre (h/2, h/2, h/2)
+            let half = 0.5 * h;
+            let mut sites = Vec::new();
+            for (name, p) in [("node", [0.0; 3]), ("edge", [half, 0.0, 0.0]), ("face", [half, half, 0.0]), ("cube", [half, half, half])] {
+                let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+                t.set_display(false);
+                let sc = Scene { nuclei: vec![Nucleus::new(z, p)], cell: Cell { n: n_odd, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+                match t.evaluate(&sc, &mut never()) {
+                    Ok(r) => sites.push((name, r.energy)),
+                    Err(e) => {
+                        println!("Z {z} M {m} {ionic:?} h {h} n {n_odd} {name}: failed ({e})");
+                        break;
+                    }
+                }
+            }
+            if sites.len() == 4 {
+                let e0 = sites[0].1;
+                let words: Vec<String> = sites.iter().map(|(n, e)| format!("{n} {:+.2e}", e - e0)).collect();
+                let spread = sites.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max) - sites.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+                println!("Z {z} M {m} {ionic:?} h {h} n {n_odd}: sites vs the node (Ha): {}; spread {spread:.2e}", words.join(", "));
+            }
+        }
+    }
+    // fix round 1: the box length at a fixed site (the node) and h — the part of an isolated atom's
+    // energy that depends on the cell beyond the box rule's face density
+    for (z, m, ionic, h, ns) in [(1u8, 2u32, sim::IonicPolicy::None, 0.25, vec![33usize, 41, 49, 57, 65, 81]), (8, 3, sim::IonicPolicy::CoresOnly, 0.20, vec![41, 51, 61, 71, 81])] {
+        let mut rows = Vec::new();
+        for n in ns {
+            let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+            t.set_display(false);
+            let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+            match t.evaluate(&sc, &mut never()) {
+                Ok(r) => rows.push((n, (n - 1) as f64 * h, r.energy, r.stats.face_density.unwrap_or(f64::NAN))),
+                Err(e) => println!("Z {z} {ionic:?} h {h} n {n}: failed ({e})"),
+            }
+        }
+        let last = rows.last().map_or(f64::NAN, |r| r.2);
+        for (n, l, e, rho) in rows {
+            println!("box series Z {z} {ionic:?} h {h}: n {n} (L {l:.2} Bohr) E {e:.8} Ha, E − E(largest) {:+.2e} Ha, face {rho:.1e}", e - last);
         }
     }
 }

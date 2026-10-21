@@ -356,6 +356,8 @@ pub struct Holdout {
     pub energy: f64,
     pub forces: Vec<[f64; 3]>,
     pub face: Option<f64>,
+    /// The multiplicity the teacher solved at (`EvalStats::multiplicity`).
+    pub multiplicity: Option<u32>,
     /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
     pub unfit: bool,
 }
@@ -414,6 +416,9 @@ pub struct Sampler {
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
     tail_skipped: usize,
+    /// Jobs whose geometry the attached shared collection already held, bit for bit: not solved
+    /// again (M8a Task 4a fix round 1; [`Sampler::collection_skipped`]).
+    collection_skipped: usize,
     /// Scan points not solved for [`SCAN_CUTOFF_FRACTION`].
     limit_skipped: usize,
     /// How the last failed sample solve's SCF ended (`SolverError::scf_end`), for the scan's tail.
@@ -615,6 +620,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            collection_skipped: 0,
             limit_skipped: 0,
             last_failure: None,
             last_n: None,
@@ -665,6 +671,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            collection_skipped: 0,
             limit_skipped: 0,
             last_failure: None,
             last_n: None,
@@ -1218,6 +1225,9 @@ impl Sampler {
                 }
                 Job::Target(job) => {
                     self.progress.target = Some(job.blocker);
+                    if !job.holdout && self.held_by_collection(surrogate, &job.scene, PassJob::Teach { blocker: job.blocker, holdout: false }) {
+                        return Ok(Some(self.progress()));
+                    }
                     let started = Instant::now();
                     match self.solve(&mut teacher, surrogate, &job.scene, true, true, should_abort) {
                         Err(ProviderError::Cancelled) => {
@@ -1246,12 +1256,13 @@ impl Sampler {
                             ev.scf_steps = Some(r.stats.scf_steps);
                             ev.scf_end = converged(r.stats.scf_steps);
                             surrogate.push_event(ev);
-                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, energy: r.energy, forces: r.forces, scene: job.scene });
+                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, multiplicity: r.stats.multiplicity, energy: r.energy, forces: r.forces, scene: job.scene });
                         }
                         Ok(r) => self.record(surrogate, &job.scene, r, SampleTag::Targeted, None),
                     }
                     return Ok(Some(self.progress()));
                 }
+                Job::Perturbation(sc) if self.held_by_collection(surrogate, &sc, PassJob::Perturbation) => return Ok(Some(self.progress())),
                 Job::Perturbation(sc) => match self.sample(&mut teacher, surrogate, &sc, SampleTag::Perturbation, true, should_abort) {
                     Err(e) => {
                         self.queue.push_front(Job::Perturbation(sc));
@@ -1299,6 +1310,11 @@ impl Sampler {
                     }
                     return Ok(Some(self.progress()));
                 }
+                Job::Scan(sc, _, _) if self.held_by_collection(surrogate, &sc, PassJob::Scan) => {
+                    // the next point is solved cold-adjacent: its predecessor was not solved here
+                    self.last_scan = None;
+                    return Ok(Some(self.progress()));
+                }
                 Job::Scan(sc, pair, k) => {
                     let fresh = k == 0 || self.last_scan != Some((pair, k - 1));
                     match self.sample(&mut teacher, surrogate, &sc, SampleTag::Scan, fresh, should_abort) {
@@ -1320,6 +1336,34 @@ impl Sampler {
                 }
             }
         }
+    }
+
+    /// A job whose geometry the attached shared collection already holds — the same atoms at the
+    /// same positions, bit for bit (a pass on the same scene replays its seeded perturbations and
+    /// its scan points exactly) — is not solved again: a second answer there would be a twin of
+    /// the stored one, doubling its weight and its leave-one-out (M8a Task 4a fix round 1, review
+    /// I1). Counted, an event left, the ghost marked skipped; `true` when skipped. The hot burst is
+    /// a trajectory and is never skipped (an exact repeat of its answers is refused as a duplicate
+    /// by the store instead), nor are a shell check or a held-out check (measurements, not fitted).
+    fn held_by_collection(&mut self, surrogate: &mut SurrogateKs, sc: &Scene, job: PassJob) -> bool {
+        if !surrogate.collection_holds_geometry(sc) {
+            return false;
+        }
+        self.progress.done += 1;
+        self.progress.skipped += 1;
+        self.collection_skipped += 1;
+        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(job), TeachOutcome::NotSolved);
+        ev.detail = "sampling: this geometry is already in the shared collection (the same atoms at the same positions, bit for bit) — not solved again".to_string();
+        ev.n_atoms = sc.nuclei.len();
+        surrogate.push_event(ev);
+        self.mark(GhostOutcome::Skipped, ghost_atoms(sc));
+        true
+    }
+
+    /// Jobs not solved because the attached shared collection already held their geometry
+    /// ([`held_by_collection`](Self::held_by_collection)).
+    pub fn collection_skipped(&self) -> usize {
+        self.collection_skipped
     }
 
     /// The pass's per-sample time limit now (s; module doc, "The time limit"): `None` before

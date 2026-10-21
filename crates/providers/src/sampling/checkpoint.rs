@@ -391,6 +391,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         boxed: c[2],
         cell_skipped: c[3],
         tail_skipped: c[4],
+        collection_skipped: 0,
         limit_skipped: c[5],
         last_failure: None,
         last_n: None,

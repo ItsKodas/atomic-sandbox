@@ -2127,7 +2127,7 @@ impl SurrogateKs {
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
-        if let Some(summary) = self.take_collection_summary() {
+        if let Some(summary) = self.take_collection_summary(sampler.collection_skipped()) {
             self.user_notes.push(summary);
         }
         match unjudged {
@@ -2423,7 +2423,7 @@ impl Trainable for SurrogateKs {
         let installed = self.install_sidecar(sc);
         if installed.is_err() {
             if let Some(c) = shared {
-                let _ = self.attach(c);
+                self.reattach_after_failed_load(c);
             }
         }
         match installed {
@@ -2620,7 +2620,7 @@ impl SurrogateKs {
         let shared = self.detach_collection();
         if let Err(e) = self.install_samples(set) {
             if let Some(c) = shared {
-                let _ = self.attach(c);
+                self.reattach_after_failed_load(c);
             }
             return Err(format!("load model {}: {e}", path.display()));
         }
@@ -2732,6 +2732,9 @@ impl SurrogateKs {
         }
         if !nm.missing.is_empty() {
             let want = self.provenance_for(scene);
+            if let Some(why) = self.collection_refuses(&want) {
+                return Err(format!("the reference must be on the samples' surface: {why}"));
+            }
             if let Some(store) = &self.store {
                 if !self.same_surface(&store.provenance, &want) {
                     return Err(format!(

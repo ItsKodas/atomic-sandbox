@@ -266,6 +266,10 @@ pub enum StoreError {
         n_forces: usize,
     },
     NonPositiveWeight(f64),
+    /// The same teacher answer (atoms, positions, energy and forces, bit for bit) is already held:
+    /// a second copy would double the geometry's weight and give it a leave-one-out twin
+    /// (M8a Task 4a fix round 1; the shared collection's duplicate rule, `crate::collection`).
+    Duplicate,
 }
 
 impl fmt::Display for StoreError {
@@ -277,6 +281,7 @@ impl fmt::Display for StoreError {
                 "sample has {n_pos} positions, {n_z} charges and {n_forces} forces"
             ),
             StoreError::NonPositiveWeight(w) => write!(f, "sample weight {w} is not positive"),
+            StoreError::Duplicate => write!(f, "an identical teacher answer is already held"),
         }
     }
 }

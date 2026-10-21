@@ -147,9 +147,11 @@ impl Provenance {
     /// The recorded mass set is NOT part of it — a refusal must not name a field that was not
     /// compared (P2); [`describe_recorded`](Self::describe_recorded) adds it for info lines.
     pub fn describe(&self) -> String {
+        // grid_n 0 = any box: a shared collection's provenance (`providers::surrogate`, "shared")
+        let grid = if self.grid_n == 0 { "any box,".to_string() } else { format!("{}³", self.grid_n) };
         format!(
-            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}, ionic {}",
-            self.grid_n,
+            "{} h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}, ionic {}",
+            grid,
             self.h,
             self.sigma,
             self.charge,

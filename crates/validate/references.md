@@ -3849,26 +3849,57 @@ Flips (ruling B): met — cadence 50: pair 11 (6 + 5; every loss the LOO floor a
 
 **The problem** (Task 3 review, physics (c)). The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`, so a reference wrong by δ_Z shifts every target by −N_Z·δ_Z (partly absorbed into the binding shape — a small force bias —, the rest into the energy residual) and moves the dissociation limit by δ_Z per atom. A collection's key holds no box, so its samples come from many boxes while each species has one reference. Two box-dependent parts of an isolated atom's energy:
 
-- **Finite box** — controlled: a reference enters a collection only from a solve whose own face density passes the box rule `box_affected_face_density(h)`; among passing ones the **largest box's** stands (a larger box replaces, a smaller or equal one never does; the replacement rebuilds the fit, since the accumulated normal equations cache E − Σref). Unknown box status is refused. A `.model` file's references carry no box record and are not imported (a note says so; the next pass solves them). `Reference`-tagged samples are refused on import.
+- **Finite box** — controlled: a reference enters a collection only from a solve whose own face density passes the box rule `box_affected_face_density(h)`; among passing ones the **largest box's** stands (a larger box replaces, a smaller or equal one never does; the replacement rebuilds the fit, since the accumulated normal equations cache E − Σref). Unknown box status is refused. (Within the rule a lone atom's energy still depends on the box: series (3) below.) A `.model` file's references carry no box record and are not imported (a note says so; the next pass solves them). `Reference`-tagged samples are refused on import.
 - **Lattice phase** — **decision: odd n only.** The reference atom sits at the cell centre: a grid node for odd n, a cube centre for even n. Only odd-n solves enter a collection, so every reference has the same lattice phase and "the largest box" compares like with like. Cost: none in the app — `app::quality` makes every grid odd by construction; an even-n reference (a scene file with even n) is used for its session only, with a note. The alternative (measure the node/cube-centre gap and accept either) was not taken: the gap is species- and h-dependent (measured below), and fixing the phase removes it from the comparison instead of bounding it.
 
-**Measured node vs cube centre** (`reference_lattice_phase_measurement`, `#[ignore]`d; GPU RX 7900 XTX, tol 1e-7, isolated atom at the cell centre, same box ± h; E_cube − E_node):
+**Measured** (`reference_lattice_phase_measurement`, `#[ignore]`d; GPU RX 7900 XTX, **tol 1e-6** — the sample tolerance the references are solved at; one neutral atom at the stated multiplicity). Three series; fix round 1 (review I2) added the second and third, which changed the reading of the first.
 
-| atom (multiplicity) | h (Bohr) | node, odd n | cube centre, even n | E_cube − E_node (Ha) |
+*(1) Odd vs even n* — the atom at the cell centre, a node (odd n) against a cube centre (even n); the two boxes differ by h in length:
+
+| atom (multiplicity) | h (Bohr) | node, odd n | cube centre, even n | E_even − E_odd (Ha) |
 |---|---|---|---|---|
-| H all-electron (2) | 0.25 | −0.42422421 (49³) | −0.42410802 (48³) | **+1.16e-4** |
-| H all-electron (2) | 0.20 | −0.43831683 (61³) | −0.43823232 (60³) | **+8.45e-5** |
-| H all-electron (2) | 0.15 | −0.45208075 (81³) | −0.45202265 (80³) | **+5.81e-5** |
+| H all-electron (2) | 0.25 | −0.42422421 (49³) | −0.42410802 (48³) | +1.16e-4 |
+| H all-electron (2) | 0.20 | −0.43831683 (61³) | −0.43823232 (60³) | +8.45e-5 |
+| H all-electron (2) | 0.15 | −0.45208075 (81³) | −0.45202265 (80³) | +5.81e-5 |
 | O all-electron (3) | 0.25 | SCF not converged (200 iterations, Δρ 1.0e-3 / 1.6e-3) | | — |
-| O all-electron (3) | 0.20 | −40.20158957 (61³) | −40.20045101 (60³) | **+1.14e-3** |
-| O all-electron (3) | 0.15 | −45.16014534 (81³) | −45.15945677 (80³) | **+6.89e-4** |
+| O all-electron (3) | 0.20 | −40.20158957 (61³) | −40.20045101 (60³) | +1.14e-3 |
+| O all-electron (3) | 0.15 | −45.16014534 (81³) | −45.15945677 (80³) | +6.89e-4 |
 | O pseudised, `CoresOnly` (3) | 0.25 | refused: h_req 0.20 | | — |
-| O pseudised, `CoresOnly` (3) | 0.20 | −16.10591461 (61³) | −16.10585938 (60³) | **+5.52e-5** |
-| O pseudised, `CoresOnly` (3) | 0.15 | −16.10469707 (81³) | −16.10465739 (80³) | **+3.97e-5** |
+| O pseudised, `CoresOnly` (3) | 0.20 | −16.10591461 (61³) | −16.10585938 (60³) | +5.52e-5 |
+| O pseudised, `CoresOnly` (3) | 0.15 | −16.10469707 (81³) | −16.10465739 (80³) | +3.97e-5 |
 
-The node is the lower site in every case. The two boxes of a row differ by h in length; the face densities (2–10e-7 e/Bohr³, both passing the box rule) put the confinement part of the difference at ≈ 1–11 % of the gap by the box rule's own scale (≈ 50 Ha per e/Bohr³ at h = 0.25, × (0.25/h)²; "Box-affected answers" — measured on H₂, so for O an estimate), so the gap is the lattice phase. It is 4–110 × the fits' per-atom energy noise (s_E ≈ 1e-5 Ha/atom on the H₂ passes): a reference of the other phase would shift a collection's targets by that much per atom, which is why the phase is fixed rather than bounded.
+*(2) The lattice phase alone* — the four high-symmetry sites in the **same** odd box (node (0,0,0), edge centre (h/2,0,0), face centre (h/2,h/2,0), cube centre (h/2,h/2,h/2)), energies relative to the node (Ha):
 
-**What stays approximate (rule 7).** The samples see every lattice phase; the reference is the node's. The model's isolated-atom limit is therefore the node-site energy, not the phase average the samples' egg-box scatter is centred on: an offset of at most |E_cube − E_node| (the two cubic sites bracket the corrugation along the lattice's high-symmetry path; the off-axis sites of the pseudo-O record above, "Site dependence", lie up to 4.1 mHa lower under the superseded round-1 rule). Per-scene models carry the same offset today (their reference is also solved at the cell centre). Not corrected here: the phase average would need several off-centre solves per species and per box.
+| atom | h | box | edge | face | cube | spread |
+|---|---|---|---|---|---|---|
+| H all-electron | 0.25 | 49³ | +3.35e-6 | +6.64e-6 | +1.00e-5 | **1.0e-5** |
+| H all-electron | 0.20 | 61³ | +2.01e-6 | +4.00e-6 | +6.03e-6 | **6.0e-6** |
+| H all-electron | 0.15 | 81³ | +1.11e-6 | +2.14e-6 | +3.23e-6 | **3.2e-6** |
+| O all-electron | 0.20 | 61³ | +3.09e-4 | +6.21e-4 | +1.00e-3 | **1.0e-3** |
+| O all-electron | 0.15 | 81³ | +2.02e-4 | +4.01e-4 | +6.26e-4 | **6.3e-4** |
+| O pseudised | 0.20 | 61³ | +2.21e-6 | +6.62e-6 | +1.08e-5 | **1.1e-5** |
+| O pseudised | 0.15 | 81³ | +2.31e-7 | +2.06e-6 | +2.97e-6 | **3.0e-6** |
+
+The node is the lowest site and the cube centre the highest in every case measured, the edge and face centres between. For all-electron O the phase is the whole of series (1)'s gap; for H and pseudised O it is a small part (1.0e-5 of 1.16e-4 for H at h = 0.25): **series (1) is mostly the box length**, which round 0 of this task misread as the phase (its estimate of the confinement share from the face densities was wrong — series (3)).
+
+*(3) The box length alone* — the atom on the node, h fixed, odd n:
+
+| atom | h | L = (n − 1)h (Bohr): E − E(largest box) (Ha), face density (e/Bohr³) |
+|---|---|---|
+| H all-electron | 0.25 | 8: **+1.05e-2**, 2.2e-5 · 10: +2.48e-3, 3.8e-6 · 12: **+5.78e-4**, 7.0e-7 · 14: +1.32e-4, 1.3e-7 · 16: +2.91e-5, 2.6e-8 · 20: 0, 1.0e-9 |
+| O pseudised | 0.20 | 8: **+9.93e-3**, 2.1e-5 · 10: +1.53e-3, 2.2e-6 · 12: +2.46e-4, 2.7e-7 · 14: +3.61e-5, 3.8e-8 · 16: 0, 5.6e-9 |
+
+The shift falls off exponentially with L, as confinement of the density tail does, and it is far larger per unit of face density than the box rule assumes: ΔE/ρ_face ≈ 480–1100 Ha per e/Bohr³ for the lone H at h = 0.25 (≈ 470–950 for pseudo-O at h = 0.20), against the ≈ 40–55 measured on H₂ that `BOX_AFFECTED_FACE_DENSITY` was calibrated with ("Box-affected answers", Task 9). At the box rule's threshold (2e-5 · (h/0.25)²; the 8 Bohr rows sit at it) a lone atom is still ≈ 1e-2 Ha above its large-box energy, and at the presets' 12 Bohr (30× under the threshold) ≈ 2.5–6e-4 Ha.
+
+**The decision stands — odd n only — for the lattice phase:** it removes up to 1e-3 Ha (all-electron O) from the comparison of references, at no cost in the app (`app::quality` makes every grid odd). **The box length is the larger term for H and pseudised O**, and the rule "the largest passing box stands" picks the least-confined reference — the right direction, but not a correction of the samples, which carry their own box's confinement.
+
+**What stays approximate (rule 7).**
+- *Lattice phase:* the samples see every phase; the reference is the node's, the lowest of the four sites. The model's isolated-atom limit therefore sits below the samples' phase average by **of the order of the in-box site spread of series (2)** (≈ 3e-6–1e-5 Ha for H and pseudised O, 6e-4–1e-3 Ha for all-electron O; node lower than the other sites in every case measured; general off-symmetry positions not measured, so not a bound). Per-scene models carry the same offset (their reference is also solved at the cell centre).
+- *Box length (open item, raised to the controller; not changed here — rule 6):* within the box rule an isolated atom's energy still depends on the cell by up to ≈ 1e-2 Ha (series (3)). A collection mixes samples from different boxes and fits them against one reference from the largest passing box, so a sample from a smaller box carries, per atom, an offset of the order of its box's confinement relative to the reference's (≈ 6e-4 Ha per H atom for a 12 Bohr sample box against a 20 Bohr reference at h = 0.25), absorbed into the energy residual and partly into the binding shape. The box rule's threshold — calibrated on H₂, an order of magnitude more lenient than series (3) supports for lone atoms — governs what enters; recalibrating it (or a per-sample box correction) is a physics decision for the M8a review, not made silently here.
+
+**The audit history judges the session's fit** (review M5): in collection mode an audit or fallback point compares the teacher with the model of the session, which can include session-only samples (box-affected answers the provider still fits below its trust floor, `shared` module doc), and is written to the collection's `history.bin` like any other point. Recorded, not corrected: a point measures the model that judged it, and the calibrated verdict's evidence window ages by model generation.
+
+**Known gap: O₂ under the automatic multiplicity (pre-existing, recorded in M8a Task 4a's review).** The automatic multiplicity is the lowest spin the electron count allows (`qm::scf::spin_split`: n mod 2 unpaired — not a search for the lowest-energy state), so an auto-multiplicity O₂ is solved as a **singlet**, while the O reference is the lowest-energy multiplicity of the atom's scan (ruling S9: the **triplet**). The O₂ surface's dissociation limit is then not 2·E_ref(O) and a fit's isolated-atom limit for O₂ fragments is the triplet atoms'. Per-scene models have it too; in a collection it means auto-multiplicity O₂ samples sit on the singlet surface beside the triplet references. A scene that forces M = 3 (the O₂ ground state) is refused by collections (forced multiplicities are per-scene).
 
 **Class-LOO cost at collection sizes** (`class_loo_cost_at_collection_sizes`, `#[ignore]`d; CPU, Ryzen 7 9800X3D, release; a pairwise-Morse teacher over H/He, 2–4 atoms per sample; reported for Task 5, which owns the interactive refit):
 

@@ -97,14 +97,17 @@
 //!   passing ones the **largest box's** stands (a larger box replaces a stored reference, a smaller
 //!   or equal one never does; the accumulated normal equations cache E − Σref, so the provider
 //!   rebuilds its fit when a reference changes). Unknown box status is refused, like an imported
-//!   sample's.
+//!   sample's. The rule bounds the face density, not the energy: within it a lone atom's energy
+//!   still falls with the box length by up to ≈ 1e-2 Ha (`validate/references.md`, "M8a collection
+//!   references", series (3)) — an open item of the box rule's calibration, recorded there.
 //! * **egg-box phase**: the reference atom sits at the cell centre, which is a grid **node** for
 //!   odd n and a **cube centre** for even n. Only odd-n solves are taken, so every reference is at
 //!   the same lattice phase and the "largest box" comparison compares like with like. (The app's
 //!   grids are odd by construction, `app::quality`; an even-n reference is used by the provider for
 //!   its session only.) What remains is a documented approximation (CLAUDE.md rule 7): the samples
-//!   see every lattice phase, the reference one — the node's. The size of that offset is the atom's
-//!   lattice corrugation at h (`validate/references.md`, "M8a collection references").
+//!   see every lattice phase, the reference one — the node's, the lowest of the high-symmetry sites
+//!   measured. The offset is of the order of the atom's in-box site spread at h, not a bound
+//!   (`validate/references.md`, "M8a collection references", series (2)).
 //!
 //! References carry no box record in a `.model` file, so [`Collection::import_sidecar`] takes none
 //! (a note per species says so); the next sampling pass solves them.
@@ -232,6 +235,8 @@ pub struct Collection {
     _lock: Option<Lock>,
     locked_by: Option<u32>,
     seen: HashSet<u64>,
+    /// Geometry fingerprints (Z and position bits) of the stored samples ([`Collection::holds_geometry`]).
+    geometries: HashSet<u64>,
     /// Bytes of whole records in `samples.bin` (the next record is written here).
     good_len: u64,
     /// Test hook: the next record write stops after this many bytes with an error.
@@ -647,6 +652,17 @@ fn fingerprint(s: &Sample) -> u64 {
     fnv1a64(&b)
 }
 
+/// The identity of a geometry: Z and the exact bits of the positions (a pass replays its
+/// geometries bitwise; M8a Task 4a fix round 1).
+fn geometry_print(z: &[u8], pos: &[[f64; 3]]) -> u64 {
+    let mut b = Vec::with_capacity(z.len() * 25);
+    b.extend_from_slice(z);
+    for &c in pos.iter().flatten() {
+        b.extend_from_slice(&c.to_bits().to_le_bytes());
+    }
+    fnv1a64(&b)
+}
+
 /// The same teacher answer: atoms, positions, energy and forces bit for bit (tag and weight are
 /// bookkeeping, not the answer — module doc, "Admission"). Matches [`fingerprint`].
 fn same_answer(a: &Sample, b: &Sample) -> bool {
@@ -838,6 +854,7 @@ impl Collection {
 
         report.samples = parsed.samples.len();
         let seen = parsed.samples.iter().map(|s| fingerprint(&s.sample)).collect();
+        let geometries = parsed.samples.iter().map(|s| geometry_print(&s.sample.z, &s.sample.pos)).collect();
         let good_len = if read_only {
             parsed.good_len as u64
         } else {
@@ -855,6 +872,7 @@ impl Collection {
             _lock: lock,
             locked_by,
             seen,
+            geometries,
             good_len,
             #[cfg(test)]
             fail_next_write: None,
@@ -973,9 +991,24 @@ impl Collection {
         }
         self.write_record(&rec)?;
         self.seen.insert(fp);
+        self.geometries.insert(geometry_print(&s.sample.z, &s.sample.pos));
         self.samples.push(s);
         self.quarantine.push(Q_NONE);
         Ok(())
+    }
+
+    /// Whether this exact teacher answer (atoms, positions, energy and forces, bit for bit) is
+    /// stored — what [`append`](Self::append) refuses as a duplicate.
+    pub fn holds_answer(&self, s: &Sample) -> bool {
+        self.seen.contains(&fingerprint(s)) && self.samples.iter().any(|t| same_answer(&t.sample, s))
+    }
+
+    /// Whether a sample of this geometry (the same atoms at the same positions, bit for bit) is
+    /// stored, whatever its answer: a pass that replays a stored geometry need not solve it again
+    /// (M8a Task 4a fix round 1).
+    pub fn holds_geometry(&self, z: &[u8], pos: &[[f64; 3]]) -> bool {
+        let bits = |v: &[[f64; 3]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        self.geometries.contains(&geometry_print(z, pos)) && self.samples.iter().any(|t| t.sample.z == z && bits(&t.sample.pos) == bits(pos))
     }
 
     /// Records a later quarantine change of sample `index` (a status record; module doc).
@@ -1697,6 +1730,29 @@ mod tests {
         assert!(r.notes.is_empty(), "{:?}", r.notes);
         assert_eq!(c.references.get(&1), Some(&CollectionReference { energy: -0.5, grid_n: None, face_density: None }));
         assert!(matches!(c.offer_reference(1, solved(-0.4783, 33, 1e-9), limit).unwrap(), ReferenceOutcome::Replaced { .. }));
+    }
+
+    /// Fix round 1 (review I1): a stored answer and a stored geometry are found again, bit for bit,
+    /// also after a reopen; another position bit is another geometry.
+    #[test]
+    fn a_stored_answer_and_geometry_are_found_again() {
+        let dir = root("holds");
+        let key = prov().surface_key();
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            c.append(cs(3)).unwrap();
+            assert!(c.holds_answer(&h2(3)) && c.holds_geometry(&h2(3).z, &h2(3).pos));
+        }
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        let s = h2(3);
+        assert!(c.holds_answer(&s) && c.holds_geometry(&s.z, &s.pos));
+        let mut other_answer = s.clone();
+        other_answer.energy += 1e-12;
+        assert!(!c.holds_answer(&other_answer) && c.holds_geometry(&other_answer.z, &other_answer.pos), "a re-solve with another answer is the same geometry");
+        let mut moved = s.pos.clone();
+        moved[1][0] = f64::from_bits(moved[1][0].to_bits() + 1);
+        assert!(!c.holds_geometry(&s.z, &moved));
+        assert!(!c.holds_geometry(&[1, 2], &s.pos));
     }
 
     #[test]

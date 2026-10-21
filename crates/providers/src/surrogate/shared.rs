@@ -47,7 +47,13 @@
 //! * **The audit history** is the collection's (`history.bin`): installed at attach, written back
 //!   (with `README.txt`) after every refit, at detach and when the provider is dropped. The class
 //!   verdict's hysteresis memory is not persisted in a collection (a reattached collection starts
-//!   without one, like a sidecar of version < 7).
+//!   without one, like a sidecar of version < 7). **The history judges the session's fit** (review
+//!   M5): an audit or fallback point compares the teacher with the model standing in this session,
+//!   which includes any session-only samples (box-affected ones the provider still fits below its
+//!   trust floor). Such a point is written to the collection's `history.bin` like any other; the
+//!   difference from the collection-only fit is those few samples' influence (a box-affected sample
+//!   leaves the fit once the trust floor is met without it). Recorded, not corrected: a point
+//!   measures the model that judged it, and the evidence window ages by model generation.
 //!
 //! **Not in collection mode:** a scene that cannot share the collection (charged, a forced
 //! multiplicity, another surface) is refused by rule 3 — the teacher answers, the sample is not
@@ -94,6 +100,8 @@ pub(super) struct SharedCollection {
     appended: usize,
     /// Samples refused since the counter was last read, by reason.
     refused: BTreeMap<String, usize>,
+    /// Draft-mode guesses set to wait since the counter was last read (not refusals: module doc).
+    waiting: usize,
     /// The audit history's [`history_stamp`] when it was last written.
     history_written: Option<(u64, u64)>,
     /// A write failed (or the collection is read-only): said once.
@@ -145,7 +153,20 @@ impl SurrogateKs {
     /// load — by the collection's samples, references and audit history, and a fit is made when one
     /// can form. `Err`, nothing changed, while a pass runs or for a collection of another teacher or
     /// tolerance than this provider's (its h, σ and ionic tag are the scenes' to match).
+    ///
+    /// A handle of the collection already attached is dropped and nothing changes (a second open in
+    /// this process is read-only: replacing the writable handle with it would lose the lock — review
+    /// M6).
     pub fn attach(&mut self, c: Collection) -> Result<(), String> {
+        self.attach_inner(c, false)
+    }
+
+    /// [`attach`](Self::attach); `restoring`: a collection taken back after a failed load (its
+    /// note says so, and says nothing of the samples held before — they are the failed load's).
+    pub(super) fn attach_inner(&mut self, c: Collection, restoring: bool) -> Result<(), String> {
+        if self.shared.as_ref().is_some_and(|s| s.coll.key == c.key) {
+            return Ok(());
+        }
         if self.pass.is_some() {
             return Err("shared collection: cancel the running sampling pass first".into());
         }
@@ -187,12 +208,17 @@ impl SurrogateKs {
             prov,
             appended: 0,
             refused: BTreeMap::new(),
+            waiting: 0,
             history_written: Some(stamp),
             write_noted: false,
         });
         self.source_file = None;
-        let mut note = format!("shared collection {slug} attached: {n} samples ({held_out} held out of the fit), {} references", self.refs.len());
-        if held > 0 {
+        let mut note = format!(
+            "shared collection {slug} {}: {n} samples ({held_out} held out of the fit), {} references",
+            if restoring { "attached again after the failed load" } else { "attached" },
+            self.refs.len()
+        );
+        if held > 0 && !restoring {
             note.push_str(&format!(" — the {held} samples held before are not in it (import a saved model file to add them)"));
         }
         if read_only {
@@ -231,6 +257,14 @@ impl SurrogateKs {
         let (c, report) = Collection::open(root, &key)?;
         self.user_notes.extend(report.notes.into_iter().map(|n| format!("shared collection {}: {n}", key.slug())));
         self.attach(c)
+    }
+
+    /// Takes a collection back after a load that failed (review M3): a failure to do so is said.
+    pub(super) fn reattach_after_failed_load(&mut self, c: Collection) {
+        let slug = c.key.slug();
+        if let Err(e) = self.attach_inner(c, true) {
+            self.user_notes.push(format!("shared collection {slug}: could not be attached again after the failed load ({e}) — the provider is per-scene now; attach it again to use it"));
+        }
     }
 
     /// Writes the audit history and the README of the attached collection, then lets it go
@@ -289,6 +323,11 @@ impl SurrogateKs {
         if sh.coll.admit_provenance(prov).is_err() {
             return Err(StoreError::ProvenanceMismatch);
         }
+        // the same answer is held already (its twin is in the store, mirrored from the collection):
+        // a second copy would double its weight and give it a leave-one-out twin (review I1)
+        if sh.coll.holds_answer(&s) {
+            return Err(StoreError::Duplicate);
+        }
         let n = self.store.as_ref().map_or(0, |st| st.len());
         if !self.quarantine.is_empty() {
             self.quarantine.resize(n, Q_NONE);
@@ -337,23 +376,27 @@ impl SurrogateKs {
                 sh.appended += 1;
                 Link::In(k)
             }
+            Err(_) if code == Q_DRAFT => {
+                sh.waiting += 1;
+                let slug = sh.coll.key.slug();
+                self.collection_note = Some(format!(
+                    "surrogate: held out of the strict fit, so not in the shared collection {slug} yet — it is added if a refit promotes it into the fit"
+                ));
+                Link::Waiting { grid_n: prov.grid_n, multiplicity }
+            }
             Err(why) => {
                 *sh.refused.entry(why.clone()).or_default() += 1;
-                self.collection_note = Some(why);
-                if code == Q_DRAFT {
-                    Link::Waiting { grid_n: prov.grid_n, multiplicity }
-                } else {
-                    Link::Out
-                }
+                let slug = sh.coll.key.slug();
+                self.collection_note = Some(format!("surrogate: kept for this session only — the shared collection {slug} did not take it ({why})"));
+                Link::Out
             }
         }
     }
 
-    /// The live step's words for a sample the collection refused (taken once: `keep_sample`).
+    /// The live step's words for a sample the collection refused or set to wait (taken once:
+    /// `keep_sample`).
     pub(super) fn take_collection_note(&mut self) -> Option<String> {
-        let why = self.collection_note.take()?;
-        let slug = self.shared.as_ref().map_or_else(String::new, |s| s.coll.key.slug());
-        Some(format!("surrogate: kept for this session only — the shared collection {slug} did not take it ({why})"))
+        self.collection_note.take()
     }
 
     /// Writes a status record for every collection sample whose quarantine code changed, and
@@ -419,21 +462,42 @@ impl SurrogateKs {
         }
     }
 
-    /// The pass's summary of what the collection took (`finish_pass`): `None` without a collection
-    /// or when nothing was offered since the last summary.
-    pub(super) fn take_collection_summary(&mut self) -> Option<String> {
+    /// The pass's summary of what the collection took (`finish_pass`; `held`: the pass's jobs not
+    /// solved because their geometry was held already): `None` without a collection or when nothing
+    /// was offered or skipped since the last summary.
+    pub(super) fn take_collection_summary(&mut self, held: usize) -> Option<String> {
         let sh = self.shared.as_mut()?;
         let refused: usize = sh.refused.values().sum();
-        if sh.appended == 0 && refused == 0 {
+        if sh.appended == 0 && refused == 0 && sh.waiting == 0 && held == 0 {
             return None;
         }
         let why: Vec<String> = std::mem::take(&mut sh.refused).into_iter().map(|(w, n)| format!("{n} {w}")).collect();
         let appended = std::mem::take(&mut sh.appended);
+        let waiting = std::mem::take(&mut sh.waiting);
         let mut text = format!("shared collection {}: {appended} samples added ({} in all)", sh.coll.key.slug(), sh.coll.samples.len());
+        if held > 0 {
+            text.push_str(&format!("; {held} geometries already in it, not solved again"));
+        }
         if refused > 0 {
             text.push_str(&format!("; {refused} kept for this session only — {}", why.join("; ")));
         }
+        if waiting > 0 {
+            text.push_str(&format!("; {waiting} draft-mode guesses held out of the strict fit wait outside it"));
+        }
         Some(text)
+    }
+
+    /// Whether the attached collection holds `scene`'s geometry bit for bit (the pass's
+    /// skip-before-solving; `crate::sampling`, `held_by_collection`). `false` without a collection
+    /// or for a scene that cannot share it.
+    pub(crate) fn collection_holds_geometry(&self, scene: &Scene) -> bool {
+        let Some(sh) = self.shared.as_ref() else { return false };
+        if sh.coll.admit_provenance(&self.scene_provenance(scene)).is_err() {
+            return false;
+        }
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        sh.coll.holds_geometry(&z, &pos)
     }
 
     /// A solved isolated-atom reference of species `z` (Hartree) with its box (`grid_n`, the solve's
