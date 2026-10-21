@@ -33,7 +33,9 @@
 //!   key's [`SurfaceKey::to_text`].
 //! * kind 1, **sample**: `flags: u16 LE` (0 today: room for Task 10's per-atom force mask and
 //!   use-energy flag — a set bit adds its fields after the ones below, under the same magic), `tag:
-//!   u8` (the sidecar's tag code), `multiplicity_forced: u8`, `grid_n: u32`, `weight: f64`,
+//!   u8` (the sidecar's tag code), `multiplicity_forced: u8`, `multiplicity: u32` (the spin
+//!   multiplicity 2S + 1 the teacher solved the sample at; 0 = not recorded — spec §4.2 "a sample
+//!   keeps its own multiplicity as solved", filled from Task 4), `grid_n: u32`, `weight: f64`,
 //!   `energy: f64`, `n: u32`, `z: n × u8`, `pos: 3n × f64`, `forces: 3n × f64`, `scene: u16 length ·
 //!   UTF-8` (all little-endian; f64 bit patterns kept exactly).
 //! * kind 2, **status**: `sample index: u64, code: u8` — a later quarantine change of the sample
@@ -49,6 +51,15 @@
 //! back to its last whole record so the next append follows it. A collection is never refused for
 //! a damaged tail.
 //!
+//! Damage in the **middle** of the file (a bad checksum with whole records after it — a disk
+//! error, not a crash) drops those later records too, by design: status records name samples by
+//! their index in file order, so skipping one sample record would move every later status onto the
+//! wrong sample. The dropped bytes are set aside like a torn tail's, so nothing is lost for good.
+//!
+//! An append that fails part-way without a crash (disk full, an I/O error) cuts the file back to
+//! the last whole record before it returns the error, so a partial record never sits in front of
+//! later appends; if even that cut fails, the handle turns read-only.
+//!
 //! # Admission (spec §4.2, controller rulings P3/P5 of Task 3)
 //!
 //! [`Collection::admit`], in this order: a charged scene's sample is refused (collections are
@@ -58,7 +69,15 @@
 //! code's only encoding of "forced") is refused — an automatic multiplicity is the lowest-energy
 //! state the teacher found and may share; a sample of another surface is refused naming the
 //! differing field. Box size (`grid_n`) is not a reason: it is recorded per sample.
-//! [`Collection::append`] re-checks the shape and the forced flag and refuses an exact duplicate.
+//! [`Collection::append`] re-checks the shape and the forced flag and refuses a duplicate: the same
+//! teacher answer (atoms, positions, energy and forces, bit for bit) whatever its tag or weight —
+//! a duplicate would double a geometry's weight and let its twin predict it in leave-one-out.
+//!
+//! [`Collection::import_sidecar`] applies the same rules per sample, the box rule by the sample's
+//! recorded face density too (the provider keeps box-affected answers at code 0 while its own trust
+//! floor needs them). A sample whose face density the file does not record (NaN, or a file without
+//! the `sample_face_density` array, such as a model written before the box rule) is refused as
+//! "box status unknown": the shared store takes nothing the box rule could not judge.
 //!
 //! # The lock
 //!
@@ -82,6 +101,29 @@ use std::path::{Path, PathBuf};
 
 /// The magic of `samples.bin` (module doc).
 pub const MAGIC: &[u8; 8] = b"ASCOLL1\0";
+
+/// The refusal of a box-affected sample (by its code, or by its face density on import).
+pub const REFUSE_BOX: &str = "box-affected sample";
+/// The refusal of an imported sample whose face density the file does not record (module doc).
+pub const REFUSE_BOX_UNKNOWN: &str = "box status unknown (the file records no face density for this sample)";
+/// The refusal of a sample identical to a stored one (module doc, "Admission").
+pub const REFUSE_DUPLICATE: &str = "an identical teacher answer is already in the collection";
+
+fn refuse_charge(q: i32) -> String {
+    format!("charge {q}: collections are neutral until M9")
+}
+
+fn refuse_quarantined(code: u8) -> String {
+    format!("quarantined sample (code {code})")
+}
+
+fn refuse_forced(m: u32) -> String {
+    format!("the scene forced multiplicity {m}")
+}
+
+fn refuse_surface(difference: &str) -> String {
+    format!("another solver surface: {difference}")
+}
 
 /// The index of an [`ImportReport::refused`] entry that refuses the whole file (its charge, a
 /// forced multiplicity, another surface, or no samples at all) rather than one sample.
@@ -108,6 +150,10 @@ pub struct CollectionSample {
     /// true in a collection today — admission refuses such samples — but kept per record so a
     /// later physics ruling can admit them without a new format.
     pub multiplicity_forced: bool,
+    /// The spin multiplicity 2S + 1 the teacher solved this sample at, when recorded (`None` =
+    /// unknown: imported samples, and live ones until Task 4 records it). Spec §4.2: a sample keeps
+    /// its own multiplicity as solved.
+    pub multiplicity: Option<u32>,
     /// The scene's name, for the knowledge map and the README.
     pub scene: String,
 }
@@ -131,6 +177,11 @@ pub struct Collection {
     _lock: Option<Lock>,
     locked_by: Option<u32>,
     seen: HashSet<u64>,
+    /// Bytes of whole records in `samples.bin` (the next record is written here).
+    good_len: u64,
+    /// Test hook: the next record write stops after this many bytes with an error.
+    #[cfg(test)]
+    fail_next_write: Option<usize>,
 }
 
 /// What [`Collection::open`] found.
@@ -227,6 +278,13 @@ fn acquire(path: &Path) -> io::Result<LockState> {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     text = std::fs::read_to_string(path).unwrap_or_default();
                 }
+                // Known race (Task 3 review, Minor 4; accepted, documented): two processes that both
+                // find the same dead pid can both remove the file, and the second removal can delete
+                // the lock the first has just created — both then believe they own the collection.
+                // It needs two instances starting within milliseconds after a crash; the remedy (take
+                // over by rename, then re-read and confirm our pid) is left for the user-data
+                // milestone, which owns multi-instance behaviour. Likewise a writer stalled for more
+                // than 50 ms between `create_new` and its write loses its lock to a second opener.
                 match text.trim().parse::<u32>() {
                     Ok(pid) if pid_alive(pid) => return Ok(LockState::HeldBy(pid)),
                     parsed => {
@@ -322,11 +380,12 @@ fn header_record(key: &SurfaceKey) -> Vec<u8> {
 fn sample_record(s: &CollectionSample) -> Vec<u8> {
     let x = &s.sample;
     let n = x.z.len();
-    let mut p = Vec::with_capacity(40 + n * 49 + s.scene.len());
+    let mut p = Vec::with_capacity(44 + n * 49 + s.scene.len());
     p.extend_from_slice(&[REC_SAMPLE, RECORD_VERSION]);
     p.extend_from_slice(&0u16.to_le_bytes());
     p.push(sidecar::tag_index(x.tag));
     p.push(s.multiplicity_forced as u8);
+    p.extend_from_slice(&s.multiplicity.unwrap_or(0).to_le_bytes());
     p.extend_from_slice(&(s.grid_n as u32).to_le_bytes());
     put_f64(&mut p, x.weight);
     put_f64(&mut p, x.energy);
@@ -401,6 +460,7 @@ fn decode_sample(c: &mut Cursor) -> Result<CollectionSample, String> {
         1 => true,
         k => return Err(format!("multiplicity flag {k} is neither 0 nor 1")),
     };
+    let multiplicity = Some(c.u32("multiplicity")?).filter(|&m| m != 0);
     let grid_n = c.u32("grid_n")? as usize;
     let weight = c.f64("weight")?;
     let energy = c.f64("energy")?;
@@ -414,7 +474,7 @@ fn decode_sample(c: &mut Cursor) -> Result<CollectionSample, String> {
     let len = c.u16("scene name length")? as usize;
     let scene = String::from_utf8(c.take(len, "scene name")?.to_vec()).map_err(|_| "the scene name is not UTF-8".to_string())?;
     c.done()?;
-    Ok(CollectionSample { sample: Sample { pos, z, energy, forces, tag, weight }, grid_n, multiplicity_forced: forced, scene })
+    Ok(CollectionSample { sample: Sample { pos, z, energy, forces, tag, weight }, grid_n, multiplicity_forced: forced, multiplicity, scene })
 }
 
 /// What `samples.bin` held.
@@ -530,6 +590,13 @@ fn fingerprint(s: &Sample) -> u64 {
     }
     b.extend_from_slice(&s.energy.to_bits().to_le_bytes());
     fnv1a64(&b)
+}
+
+/// The same teacher answer: atoms, positions, energy and forces bit for bit (tag and weight are
+/// bookkeeping, not the answer — module doc, "Admission"). Matches [`fingerprint`].
+fn same_answer(a: &Sample, b: &Sample) -> bool {
+    let bits = |v: &[[f64; 3]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+    a.z == b.z && a.energy.to_bits() == b.energy.to_bits() && bits(&a.pos) == bits(&b.pos) && bits(&a.forces) == bits(&b.forces)
 }
 
 /// The shape, finiteness and weight of a sample (what a fit needs of it).
@@ -655,7 +722,7 @@ impl Collection {
                 f.sync_data().map_err(at)?;
             }
             drop(f);
-            file = Some(OpenOptions::new().append(true).open(&path).map_err(at)?);
+            file = Some(OpenOptions::new().write(true).open(&path).map_err(at)?);
         }
 
         // references.txt
@@ -693,7 +760,27 @@ impl Collection {
 
         report.samples = parsed.samples.len();
         let seen = parsed.samples.iter().map(|s| fingerprint(&s.sample)).collect();
-        let c = Collection { key: key.clone(), samples: parsed.samples, quarantine: parsed.quarantine, references, history, read_only, folder, file, _lock: lock, locked_by, seen };
+        let good_len = if read_only {
+            parsed.good_len as u64
+        } else {
+            std::fs::metadata(&path).map_err(at)?.len()
+        };
+        let c = Collection {
+            key: key.clone(),
+            samples: parsed.samples,
+            quarantine: parsed.quarantine,
+            references,
+            history,
+            read_only,
+            folder,
+            file,
+            _lock: lock,
+            locked_by,
+            seen,
+            good_len,
+            #[cfg(test)]
+            fail_next_write: None,
+        };
         Ok((c, report))
     }
 
@@ -707,34 +794,76 @@ impl Collection {
     /// whose face density is above the box rule even when the provider kept it in its own fit
     /// (the per-scene store may need it; the shared one never does). `Ok(())` or the reason.
     pub fn admit(&self, s: &Sample, prov: &Provenance, quarantine: u8) -> Result<(), String> {
-        if prov.charge != 0 {
-            return Err(format!("charge {}: collections are neutral until M9", prov.charge));
-        }
-        if quarantine == Q_BOX {
-            return Err("box-affected sample".into());
-        }
-        if quarantine != Q_NONE {
-            return Err(format!("quarantined sample (code {quarantine})"));
-        }
-        if let Some(m) = prov.multiplicity {
-            return Err(format!("the scene forced multiplicity {m}"));
-        }
-        if let Some(d) = self.key.difference(&prov.surface_key()) {
-            return Err(format!("another solver surface: {d}"));
-        }
+        self.admit_settings(prov, quarantine)?;
         check_shape(s)
     }
 
-    fn writable(&self) -> Result<(), String> {
-        if self.read_only {
-            return Err(format!("the collection is read-only: process {} holds its lock", self.locked_by.map_or("?".into(), |p| p.to_string())));
+    /// [`admit`](Self::admit)'s rules about the settings and the code, in its order — the one
+    /// place their refusal words are written (`import_sidecar`'s whole-file check uses it too).
+    fn admit_settings(&self, prov: &Provenance, quarantine: u8) -> Result<(), String> {
+        if prov.charge != 0 {
+            return Err(refuse_charge(prov.charge));
+        }
+        if quarantine == Q_BOX {
+            return Err(REFUSE_BOX.into());
+        }
+        if quarantine != Q_NONE {
+            return Err(refuse_quarantined(quarantine));
+        }
+        if let Some(m) = prov.multiplicity {
+            return Err(refuse_forced(m));
+        }
+        if let Some(d) = self.key.difference(&prov.surface_key()) {
+            return Err(refuse_surface(&d));
         }
         Ok(())
     }
 
+    fn writable(&self) -> Result<(), String> {
+        if self.read_only {
+            return Err(match self.locked_by {
+                Some(p) => format!("the collection is read-only: process {p} holds its lock"),
+                None => "the collection is read-only: a write failed and could not be undone; reopen it".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes one record at the end of the whole records, flushed and synced; on any error the file
+    /// is cut back to that end (module doc), and if the cut fails too the handle turns read-only.
     fn write_record(&mut self, rec: &[u8]) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom};
+        let path = self.folder.join("samples.bin");
+        let start = self.good_len;
+        #[cfg(test)]
+        let fail = self.fail_next_write.take();
         let f = self.file.as_mut().ok_or("the collection has no open sample file")?;
-        f.write_all(rec).and_then(|_| f.flush()).and_then(|_| f.sync_data()).map_err(|e| format!("{}: {e}", self.folder.join("samples.bin").display()))
+        let written = (|| -> io::Result<()> {
+            f.seek(SeekFrom::Start(start))?;
+            #[cfg(test)]
+            if let Some(k) = fail {
+                f.write_all(&rec[..k.min(rec.len())])?;
+                return Err(io::Error::other("injected write failure"));
+            }
+            f.write_all(rec)?;
+            f.flush()?;
+            f.sync_data()
+        })();
+        match written {
+            Ok(()) => {
+                self.good_len = start + rec.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                let cut = f.set_len(start).and_then(|_| f.sync_data());
+                if let Err(c) = cut {
+                    self.read_only = true;
+                    self.file = None;
+                    return Err(format!("{}: {e}; cutting the partial record back also failed ({c}): the collection is read-only until reopened", path.display()));
+                }
+                Err(format!("{}: {e} (the partial record was cut back)", path.display()))
+            }
+        }
     }
 
     /// Appends a sample (flushed and synced before it returns; module doc). The caller has
@@ -750,8 +879,8 @@ impl Collection {
             return Err("sample too large for a record".into());
         }
         let fp = fingerprint(&s.sample);
-        if self.seen.contains(&fp) && self.samples.iter().any(|t| t.sample == s.sample) {
-            return Err("an identical sample is already in the collection".into());
+        if self.seen.contains(&fp) && self.samples.iter().any(|t| same_answer(&t.sample, &s.sample)) {
+            return Err(REFUSE_DUPLICATE.into());
         }
         let rec = sample_record(&s);
         if rec.len() - 8 > MAX_RECORD {
@@ -804,7 +933,8 @@ impl Collection {
     /// silently: whole-file refusals (a charged scene, a forced multiplicity, another surface, no
     /// samples) and per-sample ones (quarantined, box-affected — its code, or its recorded face
     /// density above `face_limit`, the box rule at this surface's h, `providers::box_affected_face_density`
-    /// — a draft audit, a duplicate) are all in the report. A reference the collection lacks is
+    /// —, box status unknown — no face density recorded —, a draft audit, a duplicate) are all in
+    /// the report. A reference the collection lacks is
     /// taken from the file when the file says it was made under the reference rule
     /// ([`sidecar::REFERENCE_RULE`]); one it has is kept (a note when the file's differs). The
     /// file's audit history is not imported (it judged that file's model, not this collection's).
@@ -822,16 +952,10 @@ impl Collection {
         };
         let mut report = ImportReport::default();
         // the file-level rules first, in admit's order, so a whole file is refused once
-        let whole = if prov.charge != 0 {
-            Some(format!("charge {}: collections are neutral until M9", prov.charge))
-        } else if let Some(m) = prov.multiplicity {
-            Some(format!("the scene forced multiplicity {m}"))
-        } else if let Some(d) = self.key.difference(&prov.surface_key()) {
-            Some(format!("another solver surface: {d}"))
-        } else if samples.is_empty() {
-            Some("the file holds no training samples (a model-only file)".into())
-        } else {
-            None
+        let whole = match self.admit_settings(&prov, Q_NONE) {
+            Err(why) => Some(why),
+            Ok(()) if samples.is_empty() => Some("the file holds no training samples (a model-only file)".into()),
+            Ok(()) => None,
         };
         if let Some(why) = whole {
             report.refused.push((WHOLE_FILE, why));
@@ -841,16 +965,17 @@ impl Collection {
         for (i, s) in samples.into_iter().enumerate() {
             let code = if s.tag == SampleTag::DraftAudit { Q_DRAFT } else { quarantine.get(i).copied().unwrap_or(Q_NONE) };
             let rho = face.get(i).copied().unwrap_or(f64::NAN);
-            let verdict = if code == Q_NONE && rho.is_finite() && rho > face_limit {
-                Err(format!("box-affected sample (face density {rho:.2e} e/Bohr³ above the box rule's {face_limit:.2e})"))
-            } else {
-                self.admit(&s, &prov, code)
+            let verdict = match self.admit(&s, &prov, code) {
+                Err(why) => Err(why),
+                Ok(()) if !rho.is_finite() => Err(REFUSE_BOX_UNKNOWN.to_string()),
+                Ok(()) if rho > face_limit => Err(format!("{REFUSE_BOX} (face density {rho:.2e} e/Bohr³ above the box rule's {face_limit:.2e})")),
+                Ok(()) => Ok(()),
             };
             if let Err(why) = verdict {
                 report.refused.push((i, why));
                 continue;
             }
-            match self.append(CollectionSample { sample: s, grid_n: prov.grid_n, multiplicity_forced: false, scene: scene.clone() }) {
+            match self.append(CollectionSample { sample: s, grid_n: prov.grid_n, multiplicity_forced: false, multiplicity: None, scene: scene.clone() }) {
                 Ok(()) => report.imported += 1,
                 Err(why) => report.refused.push((i, why)),
             }
@@ -966,12 +1091,28 @@ mod tests {
     use crate::sidecar::{self, SampleSet, REFERENCE_RULE};
     use std::path::PathBuf;
 
-    /// A fresh, empty directory of its own for test `name`.
-    fn root(name: &str) -> PathBuf {
+    /// A fresh, empty directory of a test's own, removed when it goes out of scope (declare it
+    /// first, so the collections opened in it are dropped — and their files closed — before it).
+    struct TempRoot(PathBuf);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn root(name: &str) -> TempRoot {
         let dir = std::env::temp_dir().join(format!("ascoll-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempRoot(dir)
     }
 
     fn prov() -> Provenance {
@@ -992,7 +1133,7 @@ mod tests {
     }
 
     fn cs(i: usize) -> CollectionSample {
-        CollectionSample { sample: h2(i), grid_n: 49 + 8 * (i % 2), multiplicity_forced: false, scene: format!("h2-{}", i % 2) }
+        CollectionSample { sample: h2(i), grid_n: 49 + 8 * (i % 2), multiplicity_forced: false, multiplicity: i.is_multiple_of(2).then_some(1), scene: format!("h2-{}", i % 2) }
     }
 
     fn samples_path(dir: &Path, key: &SurfaceKey) -> PathBuf {
@@ -1102,12 +1243,17 @@ mod tests {
             c.set_reference(1, -0.478_123_456_789_012_3).unwrap();
             c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7 });
             c.save_history().unwrap();
-            let e = c.append(cs(2)).unwrap_err();
-            assert!(e.contains("already"), "an identical sample is refused: {e}");
+            assert_eq!(c.append(cs(2)), Err(REFUSE_DUPLICATE.to_string()), "an identical sample is refused");
+            let mut retagged = cs(2);
+            retagged.sample.tag = SampleTag::Fallback;
+            retagged.sample.weight = 7.0;
+            retagged.scene = "elsewhere".into();
+            assert_eq!(c.append(retagged), Err(REFUSE_DUPLICATE.to_string()), "the same answer under another tag and weight is a duplicate");
         }
         let (c, r) = Collection::open(&dir, &key).unwrap();
         assert_eq!((r.samples, r.dropped_tail), (5, 0));
         assert_eq!(c.samples, (0..5).map(cs).collect::<Vec<_>>());
+        assert_eq!(c.samples.iter().map(|s| s.multiplicity).collect::<Vec<_>>(), vec![Some(1), None, Some(1), None, Some(1)], "the solved multiplicity round-trips, unknown included");
         for (a, b) in c.samples.iter().zip((0..5).map(cs)) {
             assert_eq!(a.sample.energy.to_bits(), b.sample.energy.to_bits());
             assert_eq!(a.sample.forces[0][1].to_bits(), (-0.0f64).to_bits());
@@ -1157,6 +1303,35 @@ mod tests {
         let (c, r) = Collection::open(&dir, &key).unwrap();
         assert_eq!((r.samples, r.dropped_tail), (9, 1), "{r:?}");
         drop(c);
+    }
+
+    /// An append that fails part-way (disk full, an I/O error — injected here) cuts the partial
+    /// record back, so later appends follow the last whole record and a reopen loses nothing.
+    #[test]
+    fn a_failed_append_is_cut_back() {
+        let dir = root("failed-append");
+        let key = prov().surface_key();
+        let path = samples_path(&dir, &key);
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            for i in 0..3 {
+                c.append(cs(i)).unwrap();
+            }
+            let before = std::fs::metadata(&path).unwrap().len();
+            c.fail_next_write = Some(30);
+            let e = c.append(cs(3)).unwrap_err();
+            assert!(e.contains("cut back"), "{e}");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), before, "the partial record is gone");
+            assert_eq!(c.samples.len(), 3);
+            c.fail_next_write = Some(5);
+            assert!(c.set_status(0, Q_HELD).is_err());
+            assert_eq!(c.quarantine[0], Q_NONE, "a failed status write changes nothing");
+            c.append(cs(3)).unwrap();
+            c.append(cs(4)).unwrap();
+        }
+        let (c, r) = Collection::open(&dir, &key).unwrap();
+        assert_eq!((r.samples, r.dropped_tail), (5, 0), "{r:?}");
+        assert_eq!(c.samples, (0..5).map(cs).collect::<Vec<_>>());
     }
 
     /// A record written by a newer build (an unknown kind with a valid checksum) refuses the open —
@@ -1290,23 +1465,33 @@ mod tests {
         let samples = vec![h2(0), h2(1), h2(2), h2(3), draft, h2(5), h2(0)];
         let f = samples_file(&dir, "h2.model", &set(big_box, samples, vec![0, 1, 3, 0, 0, 0, 0], vec![1e-9, 1e-9, 1e-9, 1e-3, 1e-9, f64::NAN, 1e-9]));
         let r = c.import_sidecar(&f, 1e-4).unwrap();
-        assert_eq!(r.imported, 2, "{r:?}");
+        assert_eq!(r.imported, 1, "{r:?}");
         let why: Vec<(usize, &str)> = r.refused.iter().map(|(i, s)| (*i, s.as_str())).collect();
-        assert_eq!(why.len(), 5, "{why:?}");
+        assert_eq!(why.len(), 6, "{why:?}");
         assert_eq!(why[0], (1, "quarantined sample (code 1)"));
         assert_eq!(why[1], (2, "box-affected sample"));
         assert_eq!(why[2].0, 3);
         assert!(why[2].1.starts_with("box-affected sample (face density"), "{why:?}");
         assert_eq!(why[3], (4, "quarantined sample (code 4)"));
-        assert_eq!(why[4].0, 6);
-        assert!(why[4].1.contains("already"), "{why:?}");
-        let got: Vec<_> = c.samples.iter().map(|s| (s.sample.clone(), s.grid_n, s.scene.clone(), s.multiplicity_forced)).collect();
-        assert_eq!(got, vec![(h2(0), 81, "h2".to_string(), false), (h2(5), 81, "h2".to_string(), false)]);
+        assert_eq!(why[4], (5, REFUSE_BOX_UNKNOWN), "a NaN face density is not a pass");
+        assert_eq!(why[5], (6, REFUSE_DUPLICATE));
+        let got: Vec<_> = c.samples.iter().map(|s| (s.sample.clone(), s.grid_n, s.scene.clone(), s.multiplicity_forced, s.multiplicity)).collect();
+        assert_eq!(got, vec![(h2(0), 81, "h2".to_string(), false, None)]);
         assert_eq!(c.references.get(&1), Some(&-0.478), "a missing reference is taken from the file");
         // importing the same file again adds nothing
         let r = c.import_sidecar(&f, 1e-4).unwrap();
         assert_eq!(r.imported, 0);
-        assert_eq!(c.samples.len(), 2);
+        assert_eq!(c.samples.len(), 1);
+
+        // a file with no face-density array at all (written before the box rule, like
+        // models/SiH4.model): every sample's box status is unknown, each refused by name
+        let mut big_box = prov();
+        big_box.grid_n = 81;
+        let f = samples_file(&dir, "old.model", &set(big_box, vec![h2(7), h2(8)], vec![], vec![]));
+        let r = c.import_sidecar(&f, 1e-4).unwrap();
+        assert_eq!(r.imported, 0, "{r:?}");
+        assert_eq!(r.refused, vec![(0, REFUSE_BOX_UNKNOWN.to_string()), (1, REFUSE_BOX_UNKNOWN.to_string())]);
+        assert_eq!(c.samples.len(), 1);
     }
 
     #[test]
@@ -1318,7 +1503,7 @@ mod tests {
             c.append(cs(i)).unwrap();
         }
         let water = Sample { pos: vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]], z: vec![8, 1, 1], energy: -17.0, forces: vec![[0.0; 3]; 3], tag: SampleTag::Perturbation, weight: 1.0 };
-        c.append(CollectionSample { sample: water, grid_n: 57, multiplicity_forced: false, scene: "h2o".into() }).unwrap();
+        c.append(CollectionSample { sample: water, grid_n: 57, multiplicity_forced: false, multiplicity: None, scene: "h2o".into() }).unwrap();
         c.set_status(2, Q_HELD).unwrap();
         c.set_reference(1, -0.478).unwrap();
         c.write_readme().unwrap();
