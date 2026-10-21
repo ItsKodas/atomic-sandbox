@@ -336,6 +336,19 @@ pub fn teach_label(m: &ModelStatus) -> Option<String> {
 /// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
 pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
     let Some(o) = &m.teach_offer else { return };
+    // nothing to say and nothing to teach (every blocker already refused, e.g. after two rounds):
+    // no box — an empty pulsing outline read as a missing button (user report 2026-10-22); the
+    // refusals below still say why
+    let label = teach_label(m);
+    if o.prompt.is_none() && label.is_none() {
+        for (i, c, ins, why) in &o.refused {
+            ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
+        }
+        if o.refused_total > o.refused.len() {
+            ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
+        }
+        return;
+    }
     // the warning and its fix in one amber box whose outline pulses (user request 2026-10-19:
     // the button was easy to miss); still while a pass runs
     let pulse = if sampling {
@@ -354,7 +367,7 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
             if let Some(p) = &o.prompt {
                 ui.colored_label(AMBER, p);
             }
-            if let Some(label) = teach_label(m) {
+            if let Some(label) = &label {
                 let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
                 ui.add_space(4.0);
                 let button = egui::Button::new(RichText::new(format!("Fix it: {label}")).strong().size(14.0).color(egui::Color32::from_rgb(0x1c, 0x14, 0x05)))
