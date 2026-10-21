@@ -196,16 +196,18 @@
 //! by MacKay's β update at fixed ρ, t = ρRSS_E + RSS_F over n_E + n_F − γ (stationarity in t:
 //! d ln p/dt = [−(n_E + n_F) + γ]/(2t) + (ρRSS_E + RSS_F)/(2t²)), alternated to 1e-6; then one
 //! exact factorisation and inverse at (λ, s_E², s_F²) (the vectorised kernels, ≈ Q′³) gives
-//! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the direction of
-//! the next ρ: a step in ln ρ, halved until the profile E(ρ) = max_{λ,t} ln p does not decrease
-//! (the bare fixed point cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection
-//! fixture; at a maximum of E the per-kind conditions hold, so the stopping point is the same).
+//! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ, as a
+//! step in ln ρ whose multiplier halves each time the step reverses direction (the bare fixed point
+//! cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection fixture; an evidence
+//! comparison cannot steer it: ln p carries ~5e-6 relative of rounding between two spectra, the
+//! near-null eigenvalues' ε‖H‖ against the ridge floor). A multiplier below 2⁻¹² without the
+//! stopping test met is reported as a stall (`RefitKind::Spectral::stalled`, `converged` false).
 //! The stopping test, the floors, the pins and `sigma_f_min` are the reference search's; the
 //! returned posterior is factored at the final levels. A numerical failure of the spectral search
 //! falls back to the reference search. Measured on a Q′ 250 body-4 fixture
-//! (`large_basis_search_finds_the_reference_search_optimum`): λ, σ_E, σ_F within 0.2 % of the
-//! reference search, ln p equal to 7 digits, 128 ms against 3 681 ms; at Q′ 2 688 and 10 000
-//! samples a search takes 96 s (7 rounds, ≈ 3 spectra per round; `references.md` "M8a body-4").
+//! (`large_basis_search_finds_the_reference_search_optimum`): λ equal to 5 digits, σ_E within
+//! 0.05 %, ln p equal to 7 digits, 49 ms against 4 007 ms; at Q′ 2 688 and 10 000 samples a search
+//! takes 27.8 s (6 rounds; `references.md` "M8a body-4").
 //!
 //! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
 //! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1
@@ -229,7 +231,11 @@
 //! where the evidence is "warm", and a reopened collection's first fit equals the session's last
 //! search bit for bit. The report of a warm refit carries the search's
 //! `condition_estimate` and `converged` and 0 `hyper_iterations`. At Q′ 2 688 and 10 000 samples a
-//! sample's add + warm refit takes 0.17 s (`surrogate_perf`, `refit_is_interactive_at_ten_thousand_samples`).
+//! sample's add + warm refit takes 0.17 s. The warm refit also declines (searches) once the ridge
+//! floor 4Q′ε·max diag A of the grown data passes the standing λ_eff: the frozen ridge would no
+//! longer be a fresh solve's (`a_long_warm_chain_stays_the_exact_posterior`: after 800 + 10 × 19
+//! samples, std within 4.5e-6 and γ within 2e-6 of a fresh solve where λ is above the floor; where
+//! the floor binds the chain searches again after 8 warm refits) (`surrogate_perf`, `refit_is_interactive_at_ten_thousand_samples`).
 //!
 //! **The accumulation** of a body-4 basis sums a sample's 3N force rows into one block first and
 //! adds that compensated (one Neumaier step per entry per sample, not per row; threaded over the
@@ -455,9 +461,11 @@ pub struct FitReport {
     pub n_samples: usize,
     /// Independent columns Q′ (trust rule: n_samples ≳ Q′).
     pub q_prime: usize,
-    /// κ₂ estimate of the posterior precision A.
+    /// κ₂ estimate of the posterior precision A. **After a warm refit** (`Accumulator::refit` on a
+    /// body-4 basis, module doc "The large-basis path"): the last search's, not re-estimated.
     pub condition_estimate: f64,
-    /// Outer alternation rounds of the hyperparameter search, and whether it met 1e-3.
+    /// Outer alternation rounds of the hyperparameter search, and whether it met 1e-3. **After a
+    /// warm refit**: 0 rounds, and `converged` is the last search's (no search ran).
     pub hyper_iterations: usize,
     pub converged: bool,
 }
@@ -912,8 +920,10 @@ pub enum RefitKind {
     /// A basis without body-4 (every per-scene model): [`Accumulator::solve`], bit for bit.
     Full,
     /// A body-4 basis: the hyperparameters searched spectrally, `rounds` outer rounds (one
-    /// tridiagonalisation and one factorisation each).
-    Spectral { rounds: usize },
+    /// factorisation and ≥ 1 tridiagonalisations each); `stalled` when the ρ step found no ascent
+    /// before the 1e-3 test was met (the search stopped at the profile's maximum to the evidence's
+    /// resolution; the report says `converged: false` then).
+    Spectral { rounds: usize, stalled: bool },
     /// A body-4 basis: the samples added since the last refit folded into the posterior at the
     /// standing hyperparameters and standardisation by rank-one updates of its factor.
     Warm { samples: usize },
@@ -1029,7 +1039,7 @@ impl Accumulator {
             converged: hyper.converged,
             condition,
         }));
-        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations };
+        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations, stalled: extra.stalled };
         Ok(out)
     }
 
@@ -1042,6 +1052,13 @@ impl Accumulator {
         let (_, _, problem) = self.prepare(ref_energy, Some((&w.scale, &w.d)))?;
         let q = self.q_prime;
         let (ie, i_f) = (1.0 / w.s_e2, 1.0 / w.s_f2);
+        // the ridge floor 4Q′ε·max diag A grows with the data; once it passes the standing λ_eff
+        // the warm posterior (whose ridge is frozen) is no longer the one a fresh solve gives —
+        // search instead (fix round 1, the review's M2: a long chain measured the gap)
+        let max_diag = (0..q).map(|i| problem.g_e[i * q + i] * ie + problem.g_f[i * q + i] * i_f).fold(0.0f64, f64::max);
+        if 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag > w.lambda_eff {
+            return Err(FitError::Singular);
+        }
         // the standardised energy rows of the pending samples: G̃_E before sample j is the
         // accumulator's minus the rows of samples j.. (they are already in its sums)
         let e_rows: Vec<Vec<f64>> = pending.iter().map(|ps| (0..q).map(|i| w.d[i] * ps.e[i]).collect()).collect();
@@ -1573,6 +1590,8 @@ struct LargeExtra {
     lambda_eff: f64,
     tr_sigma: f64,
     tr_sigma_ge: f64,
+    /// The spectral search stopped on a ρ stall (`RefitKind::Spectral::stalled`).
+    stalled: bool,
 }
 
 /// The spectrum of H_ρ = G̃_F + ρ G̃_E for one noise ratio ρ = s_F²/s_E² (module doc, "The
@@ -1666,7 +1685,7 @@ impl TwoNoise {
         let tr_sigma = (0..q).map(|i| inv[i * q + i]).sum();
         let logdet = cholesky_logdet(&chol, q);
         let m_norm2 = m.iter().map(|v| v * v).sum();
-        Ok((Solved { a, chol, m, rss_e, rss_f, gamma_e, gamma_f, logdet, m_norm2 }, LargeExtra { lambda_eff, tr_sigma, tr_sigma_ge }))
+        Ok((Solved { a, chol, m, rss_e, rss_f, gamma_e, gamma_f, logdet, m_norm2 }, LargeExtra { lambda_eff, tr_sigma, tr_sigma_ge, stalled: false }))
     }
 
     /// [`TwoNoise::estimate`] on the large-basis path: the same stationarity conditions and
@@ -1685,10 +1704,11 @@ impl TwoNoise {
     /// from one spectrum of H_ρ (λ by the grid-and-golden search, t by MacKay's β update
     /// t = (ρ RSS_E + RSS_F)/(n − γ), alternated to 1e-6; with a pinned level t follows the pin).
     /// At the profile's point one exact solve gives RSS_κ and γ_κ per kind, and the per-kind fixed
-    /// points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ — taken as a step in ln ρ, halved until the profile
-    /// does not decrease (the bare fixed point can cycle: ρ 460 → 2.1e4 → 1.4e3 → 460 on a
-    /// near-noise-free collection fixture). Converged when λ, s_E² and s_F² all move by less than
-    /// 1e-3 (the original alternation's test); the returned solve is at the final levels.
+    /// points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ — taken as a step in ln ρ whose multiplier halves
+    /// each time the step reverses direction (the bare fixed point can cycle: ρ 460 → 2.1e4 → 1.4e3
+    /// → 460 on a near-noise-free collection fixture). Converged when λ, s_E² and s_F² all move by
+    /// less than 1e-3 (the original alternation's test); a multiplier below 2⁻¹² without that is a
+    /// stall (`LargeExtra::stalled`, `converged` false). The returned solve is at the final levels.
     fn estimate_spectral_free(&self, opts: &FitOptions, start: Option<(f64, f64, f64)>) -> Result<(Hyper, Solved, LargeExtra), FitError> {
         let pin_e = opts.sigma_e.is_some();
         let pin_f = opts.sigma_f.is_some();
@@ -1756,7 +1776,7 @@ impl TwoNoise {
             Ok((lambda, t, ev))
         };
         let mut rho = s_f2_0 / s_e2_0;
-        let (mut lambda, mut t, mut ev) = profile(rho, s_f2_0)?;
+        let (mut lambda, mut t, _) = profile(rho, s_f2_0)?;
         let levels = |rho: f64, t: f64| -> (f64, f64) {
             match (pin_e, pin_f) {
                 (true, _) => (s_e2_0, t),
@@ -1766,6 +1786,8 @@ impl TwoNoise {
         let mut lambda_prev: Option<f64> = None;
         let mut iterations = 0;
         let mut converged = false;
+        let mut stalled = false;
+        let (mut alpha, mut prev_step) = (1.0f64, None);
         for round in 0..OUTER_ROUNDS {
             iterations = round + 1;
             let (s_e2, s_f2) = levels(rho, t);
@@ -1788,33 +1810,29 @@ impl TwoNoise {
                 converged = true;
                 break;
             }
-            // the step in ln ρ the per-kind fixed points ask for, halved until the profile holds
+            // the step in ln ρ the per-kind fixed points ask for, damped: the multiplier halves
+            // whenever the step reverses the previous one's direction (the bare fixed point can
+            // cycle). Not an evidence comparison: the profile's ln p carries ~5e-6 relative of
+            // rounding between two spectra (the near-null eigenvalues' ε‖H‖ against the ridge
+            // floor), more than a converging step changes it.
             let step = (next_f / next_e).ln() - rho.ln();
-            let mut alpha = 1.0;
-            let mut moved = false;
-            for _ in 0..12 {
-                let rho_try = rho * (alpha * step).exp();
-                let t_try = if pin_e || pin_f { t } else { next_f };
-                match profile(rho_try, t_try) {
-                    Ok((l2, t2, ev2)) if ev2 >= ev - 1e-12 * ev.abs().max(1.0) => {
-                        (rho, lambda, t, ev) = (rho_try, l2, t2, ev2);
-                        moved = true;
-                        break;
-                    }
-                    _ => alpha *= 0.5,
-                }
+            if prev_step.is_some_and(|p: f64| p * step < 0.0) {
+                alpha *= 0.5;
             }
-            if !moved {
-                // no ascent along the fixed points' direction within 2⁻¹² of the step: the profile
-                // is at its maximum to the resolution the evidence carries (λ re-checked next round)
-                if lambda_change <= OUTER_TOL {
-                    converged = true;
-                    break;
-                }
+            if alpha < 1.0 / 4096.0 {
+                // damped to nothing without meeting the test: stopped, reported as a stall and
+                // not as converged (review M5)
+                stalled = true;
+                break;
             }
+            prev_step = Some(step);
+            rho *= (alpha * step).exp();
+            let t_try = if pin_e || pin_f { t } else { next_f };
+            (lambda, t, _) = profile(rho, t_try)?;
         }
         let (s_e2, s_f2) = levels(rho, t);
-        let (sol, extra) = self.solve_large(lambda, s_e2, s_f2)?;
+        let (sol, mut extra) = self.solve_large(lambda, s_e2, s_f2)?;
+        extra.stalled = stalled;
         Ok((Hyper { lambda, s_e2, s_f2, iterations, converged }, sol, extra))
     }
 }
@@ -2577,14 +2595,18 @@ mod tests {
 
     /// `n` noisy morse-bend samples of 5-atom H/O clusters (1e-5 Ha, 1e-4 Ha/Bohr scatter).
     fn morse_bend_samples(rng: &mut StdRng, n: usize) -> Vec<Sample> {
+        morse_bend_noisy(rng, n, 1e-5, 1e-4)
+    }
+
+    fn morse_bend_noisy(rng: &mut StdRng, n: usize, se: f64, sf: f64) -> Vec<Sample> {
         (0..n)
             .map(|_| {
                 let (pos, z) = random_cluster(rng, 5, 3.2);
                 let (mut e, mut f) = morse_bend(&pos, &z);
-                e += 1e-5 * normal(rng);
+                e += se * normal(rng);
                 for fj in &mut f {
                     for a in 0..3 {
-                        fj[a] += 1e-4 * normal(rng);
+                        fj[a] += sf * normal(rng);
                     }
                 }
                 Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 }
@@ -2621,7 +2643,7 @@ mod tests {
         let (m_sp, r_sp) = acc.refit(&opts, &provenance(), &refs).unwrap();
         let t_sp = t.elapsed();
         let rounds = match acc.last_refit() {
-            RefitKind::Spectral { rounds } => rounds,
+            RefitKind::Spectral { rounds, .. } => rounds,
             k => panic!("expected a spectral search, got {k:?}"),
         };
         eprintln!(
@@ -2655,6 +2677,88 @@ mod tests {
     /// The warm refit (module doc) is the exact posterior at the standing hyperparameters and
     /// standardisation: after samples arrive, its mean, factor, γ_E and γ_F equal a fresh
     /// factorisation's to rounding; growth beyond `WARM_GROWTH` searches again.
+    #[test]
+    fn a_long_warm_chain_stays_the_exact_posterior() {
+        // fix round 1 (the review's M2): γ is carried by Woodbury subtraction across up to a
+        // quarter of the store; ten warm refits of 19 samples each after a search at 800 (190
+        // updates, ≈ 3 000 rank-one steps) against a fresh solve at the standing settings
+        let mut rng = StdRng::seed_from_u64(79);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        // labels at a DFT-like scatter (1e-4 Ha, 2e-3 Ha/Bohr): λ above the ridge floor; at the
+        // 1e-4 Ha/Bohr scatter the floor binds and grows with the data, and the warm refit
+        // correctly declines (asserted below)
+        for s in morse_bend_noisy(&mut rng, 800, 1e-4, 2e-3) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut last = None;
+        for _ in 0..10 {
+            for s in morse_bend_noisy(&mut rng, 19, 1e-4, 2e-3) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            last = Some(acc.refit(&opts, &provenance(), &refs).unwrap());
+            assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 19 });
+        }
+        let (m_w, r_w) = last.unwrap();
+        let w = acc.warm.as_ref().unwrap();
+        let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+        let (sol, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+        eprintln!("λ {:e}, λ_eff warm {:e}, fresh {:e}", w.lambda, w.lambda_eff, extra.lambda_eff);
+        let q = acc.q_prime;
+        let chol = m_w.sigma_inv_chol.as_ref().unwrap();
+        let amax = sol.a.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+        let mut worst_a: f64 = 0.0;
+        for i in 0..q {
+            for j in 0..=i {
+                worst_a = worst_a.max((dot(&chol[i * q..i * q + j + 1], &chol[j * q..j * q + j + 1]) - sol.a[i * q + j]).abs() / amax);
+            }
+        }
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+        let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+        let (mut worst_f, mut worst_std): (f64, f64) = (0.0, 0.0);
+        for s in morse_bend_samples(&mut StdRng::seed_from_u64(600), 10) {
+            let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                }
+            }
+            for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                worst_std = worst_std.max(rel_change(*x, y));
+            }
+        }
+        let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+        eprintln!(
+            "long warm chain (800 + 10×19, Q′ {q}): backward error {worst_a:.1e}, |ΔF|/σ_F {worst_f:.1e} (bound {bound:.1e}), std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}",
+            r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f
+        );
+        assert_eq!(extra.lambda_eff, w.lambda_eff, "λ above the floor");
+        assert!(worst_a < 1e-13 && worst_f < bound && worst_std < 1e-5);
+        assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+        // the floor-bound case: the warm refit declines once the floor passes the standing λ_eff
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 800) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut kinds = Vec::new();
+        for _ in 0..10 {
+            for s in morse_bend_samples(&mut rng, 19) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            acc.refit(&opts, &provenance(), &refs).unwrap();
+            kinds.push(acc.last_refit());
+            let w = acc.warm.as_ref().unwrap();
+            let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+            let (_, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+            assert_eq!(extra.lambda_eff, w.lambda_eff, "whatever the kind, the standing posterior's ridge is the fresh one's ({kinds:?})");
+        }
+        eprintln!("floor-bound chain: {kinds:?}");
+    }
+
     #[test]
     fn warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters() {
         let mut rng = StdRng::seed_from_u64(78);

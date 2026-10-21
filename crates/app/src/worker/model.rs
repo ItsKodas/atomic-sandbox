@@ -333,9 +333,15 @@ pub enum FirstPass {
 /// scene whose trust floor costs 79–126 s at the cold rate now starts without asking, and a
 /// water-like scene then runs ≈ 1.7× that plus its references (references.md, "M6 Task 9").
 pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
+    first_pass_for(scene, plan, per_solve_s, false)
+}
+
+/// [`first_pass`] for a pass that learns into a shared collection (`body4`: its trust floor counts
+/// the collection's body-4 basis, M8a Task 5 fix round 1) or not.
+pub fn first_pass_for(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>, body4: bool) -> FirstPass {
     let Some(per) = per_solve_s.filter(|c| *c > 0.0) else { return FirstPass::Start(plan) };
     // the fewest solves that can earn trust within the target (the plan itself when it fits)
-    let floor = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
+    let floor = plan.scaled_to_for(scene, (PASS_TARGET_S / per).floor() as usize, body4);
     let n = floor.solves(scene).unwrap_or(0);
     if n as f64 * per <= PASS_TARGET_S * 1.05 {
         return FirstPass::Start(plan);
@@ -362,10 +368,15 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 /// longer — `PlanSolves::scaled_to`, so never below the solves trust needs — and `None` when it
 /// fits (or nothing was timed). The running pass is shrunk to it by `Trainable::rescale_pass`.
 pub fn pass_resize(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64]) -> Option<(SamplingPlan, f64)> {
+    pass_resize_for(scene, plan, per_solve_s, false)
+}
+
+/// [`pass_resize`] with the collection's body-4 trust floor when `body4` ([`first_pass_for`]).
+pub fn pass_resize_for(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64], body4: bool) -> Option<(SamplingPlan, f64)> {
     let per = median(per_solve_s).filter(|m| m.is_finite() && *m > 0.0)?;
     let max = (PASS_TARGET_S / per).floor() as usize;
     let full = plan.solves(scene).ok()?;
-    (full > max).then(|| (plan.scaled_to(scene, max), per))
+    (full > max).then(|| (plan.scaled_to_for(scene, max, body4), per))
 }
 
 /// The automatic first pass being timed for its re-sizing ([`pass_resize`]).
@@ -515,7 +526,8 @@ impl Worker {
     /// `StartSampling`, never re-sized).
     pub(super) fn start_first_pass(&mut self, plan: SamplingPlan) {
         let scene = self.dy.snapshot().scene;
-        match first_pass(&scene, plan, self.solve_s) {
+        let body4 = self.use_collection && self.collections.is_some();
+        match first_pass_for(&scene, plan, self.solve_s, body4) {
             FirstPass::Start(plan) => {
                 self.dy.apply(DynCommand::StartSampling(plan.clone()));
                 if sampling_active(&self.dy.snapshot()) {
@@ -550,7 +562,8 @@ impl Worker {
         }
         let before = p.total;
         let Some(sizing) = self.sizing.take() else { return };
-        let Some((plan, per)) = pass_resize(&sizing.scene, &sizing.plan, &sizing.per_solve_s) else { return };
+        let body4 = self.use_collection && self.collections.is_some();
+        let Some((plan, per)) = pass_resize_for(&sizing.scene, &sizing.plan, &sizing.per_solve_s, body4) else { return };
         self.dy.rescale_sampling(&plan);
         let Some(now) = self.dy.snapshot().sampling.filter(|now| now.total != before) else { return };
         let full = sizing.plan.solves(&sizing.scene).unwrap_or(before);

@@ -1892,6 +1892,32 @@ fn a_vibrating_turning_molecule_in_a_fence_still_votes() {
     println!("outcomes {outcomes:?}");
     assert_eq!(voted, Some(2), "the third visit is the vote: {outcomes:?}");
     assert_eq!(outcomes[..3], [K::FenceDisagrees, K::FenceDisagrees, K::KeptByVote]);
+    // fix round 1 (the review's I1): votes taken against different models do not combine — a
+    // model change that does not pass through `fit_store` (`restore_state` moves the generation
+    // without clearing the votes) between the second and the third visit: no vote at the third
+    let mut s2 = SurrogateKs::new(Box::new(teacher()), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s2.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    let mut t = teacher();
+    for i in 0..60 {
+        let r = 1.0 + 0.6 * i as f64 / 59.0;
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        let res = t.evaluate(&sc, &mut never()).unwrap();
+        s2.add_sample(Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 }, &sc).unwrap();
+    }
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s2.add_sample(bad, &stray).unwrap();
+    s2.refit().unwrap();
+    let mut out2 = Vec::new();
+    for k in 0..3 {
+        if k == 2 {
+            s2.model_gen += 1;
+        }
+        s2.evaluate(&visit(k), &mut never()).unwrap();
+        out2.extend(drain(&mut s2).into_iter().map(|e| e.outcome));
+    }
+    assert_eq!(out2[..3], [K::FenceDisagrees, K::FenceDisagrees, K::FenceDisagrees], "votes across a model change: {out2:?}");
 }
 
 /// Diagnosis (M8a Task 5, the user's κ = 136.65): the calibration readout κ_c of a collection's
@@ -1951,6 +1977,31 @@ fn kappa_tail_of_a_collection_history() {
         for (k, x) in z2.iter().take(5).enumerate() {
             println!("    top {k}: z̄ {:.1} (worst atom ‖ΔF‖ {:.2e} Ha/Bohr over a std of {:.2e}); its error in bound units {:.2}", x.0.sqrt(), x.1, x.2, x.3);
         }
+    }
+}
+
+/// Fix round 1 (the review's I2): λ_c on a collection before (no aleatoric removal) and after
+/// (ā_c = min(σ_F, the class's training force-residual rms)). Fits the collection named by
+/// `COLLECTION_DIR` (a copy of a `models/collections/<slug>` folder — never the live one).
+#[test]
+#[ignore = "diagnosis: COLLECTION_DIR=<copy of a collection folder> cargo test -p providers --release lambda_before_after -- --ignored --nocapture"]
+fn lambda_before_after_on_a_collection() {
+    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
+    let (c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.attach(c).unwrap();
+    s.species_dirty = true;
+    let t = std::time::Instant::now();
+    s.fit_store().unwrap();
+    let r = s.report().unwrap();
+    println!("fit: {} samples, Q′ {}, σ_F {:.3e} Ha/Bohr, {} history points, {:.1} s", r.n_samples, r.q_prime, r.sigma_f, s.audit_history.len(), t.elapsed().as_secs_f64());
+    let old = super::calibrate::calibrate(&s.audit_history, &s.policy);
+    for (c, cl) in s.class_loo.iter().enumerate() {
+        println!(
+            "class {}: λ before {:.3} (raw {:.3}, {} points), after {:.3}; trusted {}, measured W {:?}",
+            ENV_CLASSES[c], old.per_class[c].inflation, old.per_class[c].inflation_raw, old.per_class[c].inflation_points, cl.inflation, cl.trusted, cl.measured
+        );
     }
 }
 
@@ -3494,7 +3545,12 @@ fn fnv1a(text: &str) -> u64 {
 /// trace, the same in the views trace). Removing exactly those strings from the new traces
 /// reproduces the old digest 0x5dbf_9e0f_50a2_02b1 — no decision, answer, note, sample or draw moved
 /// (the session attaches no collection).
-const SCRIPTED_SESSION_DIGEST: u64 = 0x229d_8fa5_2535_8822;
+/// **Re-pinned for M8a Task 5 fix round 1** (0x229d_8fa5_2535_8822 → below): λ_c's numerator now
+/// excludes the fit's aleatoric level (`calibrate` "The variance inflation"), so the inflated stds
+/// and the notes quoting λ read smaller; with ā = 0 the old digest is reproduced exactly, and the
+/// two traces compared by script with the std readouts masked differ in 0 of 907 lines — no
+/// decision, answer, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x2380_b42c_3c51_40e7;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -8044,6 +8100,34 @@ fn posterior_point(kind: surrogate::history::PointKind, err: f64, epi: f64) -> s
     surrogate::AuditPoint { pred_force_std_epistemic: vec![epi; 2], pred_force_std: vec![epi.max(1e-12); 2], ..history_point_full(kind, 2, 1, err, 0.0) }
 }
 
+/// The inflation's aleatoric subtraction (M8a Task 5 fix round 1).
+#[test]
+fn the_variance_inflation_measures_overconfidence_not_the_misfit_floor() {
+    // M8a Task 5 fix round 1 (the review's I2): at a fresh geometry E[(‖ΔF‖/√3)²] = σ_epi²/3 + ā²;
+    // a calibrated posterior with a tiny epistemic std under a misfit floor ā must get λ = 1
+    use calibrate::{calibrate, calibrate_with};
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let (epi, a) = (1e-5, 3e-4); // ‖·‖ of the epistemic std; ā per component
+    for (k, want) in [(1.0f64, 1.0f64), (3.0, 3.0)] {
+        let err = (k * k * epi * epi + 3.0 * a * a).sqrt(); // ‖ΔF‖ with (‖ΔF‖/√3)² = k²σ_epi²/3 + ā²
+        let mut h = surrogate::AuditHistory::default();
+        for _ in 0..20 {
+            h.push(posterior_point(PointKind::Audit, err, epi));
+        }
+        let old = calibrate(&h, &pol).per_class[0];
+        let new = calibrate_with(&h, &pol, [a, 0.0]).per_class[0];
+        println!("k {k}: λ raw without the floor {:.2}, with it {:.4}", old.inflation_raw, new.inflation_raw);
+        assert!(old.inflation_raw > 50.0, "the premise: the misfit floor alone inflated λ ({old:?})");
+        assert!((new.inflation_raw - want).abs() < 1e-9, "{new:?}");
+        // a point below the floor is clamped at 0, never negative evidence
+        let mut h2 = h.clone();
+        h2.push(posterior_point(PointKind::Audit, 0.0, epi));
+        let c2 = calibrate_with(&h2, &pol, [a, 0.0]).per_class[0];
+        assert!((c2.inflation_raw - want * (20.0f64 / 21.0).sqrt()).abs() < 1e-9, "{c2:?}");
+    }
+}
+
 /// The variance inflation λ (`calibrate`, "The variance inflation"): the measured error over the
 /// epistemic std, both in bound units, as a **ratio of sums** over the posterior's jurisdiction —
 /// 20 points at error 3× their std give λ = 3 × (1 + 1/√40); a calibrated class is floored at 1
@@ -8375,14 +8459,32 @@ fn a_reopened_collection_reproduces_the_same_fit() {
         // large-basis path"): a warm model depends on when the last search ran, a search only on
         // the statistics — so the session's fit compared here is a search over all of them (a
         // rebuild), as the reopened provider's first fit is (M8a Task 5)
+        let predict_all = |s: &SurrogateKs| -> Vec<surrogate::Prediction> {
+            let m = s.model().unwrap();
+            probes.iter().chain(&probes_he).map(|sc| {
+                let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+                let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+                m.predict(&pos, &z, true).unwrap()
+            }).collect()
+        };
+        s.refit().unwrap(); // the session's own refit (warm when its warm state stands)
+        let session = (s.trusted(), predict_all(&s), s.model().unwrap().lambda);
         s.species_dirty = true;
         let rep = s.refit().unwrap();
-        let m = s.model().unwrap();
-        let p: Vec<_> = probes.iter().chain(&probes_he).map(|sc| {
-            let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
-            let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
-            m.predict(&pos, &z, true).unwrap()
-        }).collect();
+        let p = predict_all(&s);
+        // fix round 1 (the review's M3): the session's own (possibly warm) model and the search the
+        // reopened collection gets agree on trust and within a tenth of the policy's tiers
+        let pol = FallbackPolicy::default();
+        assert_eq!(session.0, s.trusted(), "trust of the session's model and of a search");
+        for ((a, b), sc) in session.1.iter().zip(&p).zip(probes.iter().chain(&probes_he)) {
+            let n = sc.nuclei.len() as f64;
+            assert!((a.energy - b.energy).abs() / n <= 0.1 * pol.energy_std_per_atom, "{} vs {}", a.energy, b.energy);
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                let (d, bound) = pol.force_residual(fa, fb);
+                assert!(d <= 0.1 * bound, "{fa:?} vs {fb:?}");
+            }
+        }
+        println!("session model (λ {:.4e}) vs a search (λ {:.4e}): agree", session.2, rep.lambda);
         (p, rep)
     };
     // a new provider (the first one dropped: the lock is free) attaches; with 70 samples below

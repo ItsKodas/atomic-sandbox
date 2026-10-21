@@ -368,6 +368,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         pass_start,
     };
     let sampler = Sampler {
+        body4: false, // set by the resuming provider (`with_body4`)
         scene: scene.clone(),
         plan: plan.clone(),
         refs_total: c[0],

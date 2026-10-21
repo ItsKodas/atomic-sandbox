@@ -234,7 +234,26 @@ pub trait PlanSolves: Sized {
     /// shorter pass could not earn trust: then the plan that just reaches it). Unchanged when it
     /// already fits. Used to keep the viewer's automatic first pass near its time target (Task
     /// 9); σ, T, the scan range and the seed are kept.
-    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan;
+    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan {
+        self.scaled_to_for(scene, max_solves, false)
+    }
+
+    /// [`scaled_to`](Self::scaled_to) with the trust floor of a basis with (`body4`: a shared
+    /// collection's, M8a Task 5 fix round 1) or without the body-4 block
+    /// ([`min_samples_for_trust_basis`]).
+    fn scaled_to_for(&self, scene: &Scene, max_solves: usize, body4: bool) -> SamplingPlan;
+}
+
+/// [`PlanSolves::min_samples_for_trust`] for the basis a fit of `scene`'s species would use: with
+/// the body-4 block exactly when the pass learns into a shared collection (its Q′: 284 instead of
+/// 176 at two species; `surrogate::descriptor` "Body-4 features").
+pub fn min_samples_for_trust_basis(scene: &Scene, body4: bool) -> usize {
+    let mut species: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+    species.sort_unstable();
+    species.dedup();
+    let mut b = Basis::new(&species);
+    b.body4 = body4;
+    b.column_classes().len() + MIN_RESIDUAL_DOF as usize
 }
 
 impl PlanSolves for SamplingPlan {
@@ -243,13 +262,10 @@ impl PlanSolves for SamplingPlan {
     }
 
     fn min_samples_for_trust(scene: &Scene) -> usize {
-        let mut species: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        species.sort_unstable();
-        species.dedup();
-        Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize
+        min_samples_for_trust_basis(scene, false)
     }
 
-    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan {
+    fn scaled_to_for(&self, scene: &Scene, max_solves: usize, body4: bool) -> SamplingPlan {
         let Ok(full) = self.solves(scene) else { return self.clone() };
         if full <= max_solves {
             return self.clone();
@@ -261,7 +277,7 @@ impl PlanSolves for SamplingPlan {
             ..self.clone()
         };
         let refs = at(0.0).solves(scene).unwrap_or(0);
-        let floor = Self::min_samples_for_trust(scene);
+        let floor = min_samples_for_trust_basis(scene, body4);
         let ok = |p: &SamplingPlan| p.solves(scene).unwrap_or(usize::MAX);
         // the largest factor that fits, by bisection (the count is monotone in f)
         let (mut lo, mut hi) = (0.0f64, 1.0f64);
@@ -395,6 +411,8 @@ pub const GHOST_TRAIL: usize = 6;
 
 /// The resumable pass (module doc).
 pub struct Sampler {
+    /// The pass learns into a shared collection (its trust floor counts the body-4 basis).
+    body4: bool,
     scene: Scene,
     /// The plan's counts as they stand: the plan the pass was built with until a
     /// [`rescale`](Self::rescale) lowers them.
@@ -596,6 +614,7 @@ impl Sampler {
         }
         let stage = Self::stage_of(queue.front(), burst.left);
         Ok(Sampler {
+            body4: false,
             scene: base,
             plan: plan.clone(),
             refs_total,
@@ -657,6 +676,7 @@ impl Sampler {
         let queue: VecDeque<Job> = jobs.into_iter().map(|j| if inside_cell(&j.scene) { Job::Target(j) } else { Job::Skip("teaching", None, None) }).collect();
         let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
         Sampler {
+            body4: false,
             scene: base.clone(),
             plan,
             refs_total: 0,
@@ -770,6 +790,13 @@ impl Sampler {
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).
+    /// The pass learns into a shared collection: its trust floor counts the body-4 basis
+    /// (M8a Task 5 fix round 1; [`min_samples_for_trust_basis`]).
+    pub fn with_body4(mut self, body4: bool) -> Sampler {
+        self.body4 = body4;
+        self
+    }
+
     pub fn with_references(mut self, cache: ReferenceCache) -> Sampler {
         self.refs = cache;
         self
@@ -841,7 +868,7 @@ impl Sampler {
         let planned = self.scan_planned.clone();
         let nonref = |(p, m, b): (usize, usize, usize)| p + planned.iter().map(|&n| n.min(m)).sum::<usize>() + b;
         let mut want = (plan.perturbations.min(cur.0), plan.scan_points_per_pair.min(cur.1), plan.hot_burst_steps.min(cur.2));
-        let floor = <SamplingPlan as PlanSolves>::min_samples_for_trust(&self.scene).min(nonref(cur));
+        let floor = min_samples_for_trust_basis(&self.scene, self.body4).min(nonref(cur));
         // the exact count to end at: the plan's, or the floor (before the raise below rounds up)
         let target = nonref(want).max(floor);
         if nonref(want) < floor {

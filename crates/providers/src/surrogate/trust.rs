@@ -350,11 +350,22 @@ impl SurrogateKs {
         let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
         // per class: the samples beyond 1× (the blockers a teach-around pass may target)
         let mut blockers: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 2];
+        // per class: Σ over its fitted atoms of the training force residual ‖F_model − F‖²/3, atoms
+        // (the inflation's aleatoric level, `calibrate` "The variance inflation")
+        let mut train = [(0.0f64, 0usize); 2];
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
             }
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().map(atom_class).collect();
+            if let Ok((_, f_model)) = surrogate::energy_and_forces(model, &s.pos, &s.z) {
+                for ((fm, f), cj) in f_model.iter().zip(&s.forces).zip(&classes) {
+                    if let Some(c) = *cj {
+                        train[c].0 += ((fm[0] - f[0]).powi(2) + (fm[1] - f[1]).powi(2) + (fm[2] - f[2]).powi(2)) / 3.0;
+                        train[c].1 += 1;
+                    }
+                }
+            }
             let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
             let e_ratio = l.as_ref().map_or(f64::INFINITY, |l| (if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n }) / self.policy.energy_std_per_atom);
@@ -395,7 +406,13 @@ impl SurrogateKs {
             }
         }
         // the audit calibration per class (M8a Task 2) — the verdict's evidence
-        let cal = super::calibrate::calibrate(&self.audit_history, &self.policy);
+        // ā_c = min(σ_F, the class's training force-residual rms) (fix round 1, the review's I2)
+        let aleatoric: [f64; 2] = std::array::from_fn(|c| {
+            let (ss, n) = train[c];
+            let rms = if n > 0 { (ss / n as f64).sqrt() } else { report.sigma_f };
+            report.sigma_f.min(rms)
+        });
+        let cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, aleatoric);
         let loo = acc
             .iter()
             .zip(ENV_CLASSES)

@@ -2295,7 +2295,7 @@ impl Trainable for SurrogateKs {
                 self.ref_cache.insert(key.clone(), r.clone());
             }
         }
-        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
+        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4);
         self.pass_start = Some(self.samples());
         if let Some(sh) = self.shared.as_mut() {
             sh.pass_start = Some(sh.coll.samples.len());
@@ -2401,7 +2401,7 @@ impl Trainable for SurrogateKs {
                 self.ref_cache.insert(key.clone(), r.clone());
             }
         }
-        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
+        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4);
         self.pass_start = Some(info.pass_start.min(self.samples()));
         if let Some(sh) = self.shared.as_mut() {
             sh.pass_start = Some(info.pass_start);

@@ -134,10 +134,25 @@
 //! not on them):
 //!
 //! ```text
-//! λ_c = max(1, √( Σ_p w̄_p² / Σ_p s̄_p² )) · (1 + 1/√(2 n_c)),   s̄_p² = mean over the point's class atoms of (σ_epi,j/√3 / b_j)²
+//! λ_c = max(1, √( Σ_p max(0, w̄_p² − ā_p²) / Σ_p s̄_p² )) · (1 + 1/√(2 n_c)),   s̄_p² = mean over the point's class atoms of (σ_epi,j/√3 / b_j)²
+//!       ā_p² = mean over the point's class atoms of (ā_c / b_j)²,   ā_c = min(σ_F, the class's training force-residual rms per component)
 //! rule 6:  λ_c(j) · σ_epi,j/√3 ≤ b_j             for every atom j (its own class's λ; 1 for an isolated atom)
 //! rule 7:  max_j λ_c(j) · σ_E,epi/N ≤ tier        (one scale of the posterior covariance Σ: both stds are linear in √Σ)
 //! ```
+//!
+//! **The aleatoric part is removed from the numerator** (M8a Task 5 fix round 1, the review's I2).
+//! At a fresh geometry the error the teacher measures has the expectation E[(‖ΔF‖/√3)²] =
+//! σ_epi²/3 + σ_F² — the epistemic part *and* the fit's misfit floor σ_F, which no amount of data
+//! at that geometry removes and which rule 6 (the epistemic std only) is not about. Without the
+//! subtraction even a calibrated posterior got λ² ≈ 1 + σ_F²/s̄² — 24.9 / 18.9 (223 a day earlier)
+//! on the user's collection — and λ·s̄ was the total rms error: rule 6 then refused any atom whose
+//! epistemic std exceeded a few times the class's typical one, and every fallback it added shrank
+//! s̄ and grew λ. Per point the subtraction is clamped at 0 (a point whose error is below the floor
+//! is no evidence of overconfidence, not negative evidence). ā_c is min(σ_F, the class's own
+//! training residual rms): σ_F is the fit's estimate over all rows, a class that the fit
+//! represents better than average must not have more subtracted than its own misfit. Dividing by
+//! the total std instead was rejected: it under-inflates a truly overconfident posterior (σ_F
+//! dominates the denominator exactly where the epistemic std is too small).
 //!
 //! over the class's points in the **posterior's jurisdiction** — the verdict's (audits, rule-4b
 //! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15) or with the class (21): the
@@ -342,6 +357,8 @@ struct PointEvidence {
     e2: f64,
     worst: f64,
     s2: f64,
+    /// ā̄² = mean over the point's class atoms of (ā_c/b_j)²: the aleatoric part of w̄² (fix round 1)
+    a2: f64,
 }
 
 /// A history point in the **posterior's** jurisdiction (fix round 3, the variance inflation): the
@@ -379,8 +396,16 @@ fn window_from(points: &[PointEvidence]) -> Option<u64> {
     None
 }
 
-/// The calibration per class from the history and the policy's bounds (module doc).
+/// The calibration per class from the history and the policy's bounds (module doc), with no
+/// aleatoric level removed from the inflation's numerator ([`calibrate_with`] with ā = 0).
 pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration {
+    calibrate_with(history, policy, [0.0; 2])
+}
+
+/// [`calibrate`] with each class's aleatoric force level ā_c (Ha/Bohr per component; module doc,
+/// "The variance inflation": min(σ_F, the class's training force-residual rms)) removed from the
+/// inflation's measured errors.
+pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric: [f64; 2]) -> Calibration {
     let mut classes: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
     let mut posterior: [Vec<PointEvidence>; 2] = [Vec::new(), Vec::new()];
     let tier = policy.energy_std_per_atom;
@@ -391,7 +416,7 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
         let verdict = in_jurisdiction(p.kind);
         for c in 0..2 {
             let code = c as u8 + 1;
-            let (mut w2, mut z2, mut worst, mut s2, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
+            let (mut w2, mut z2, mut worst, mut s2, mut a2, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
             for j in 0..p.n_atoms {
                 if p.classes[j] != code {
                     continue;
@@ -401,6 +426,7 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
                 w2 += sq(w);
                 z2 += sq(p.err_force[j] / p.pred_force_std[j]);
                 s2 += sq(p.pred_force_std_epistemic[j] / SQRT_3 / bound);
+                a2 += sq(aleatoric[c] / bound);
                 worst = if w.is_finite() { worst.max(w) } else { f64::INFINITY };
                 n += 1;
             }
@@ -415,6 +441,7 @@ pub fn calibrate(history: &AuditHistory, policy: &FallbackPolicy) -> Calibration
                 e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / tier),
                 worst,
                 s2: s2 / n as f64,
+                a2: a2 / n as f64,
             };
             if verdict {
                 classes[c].push(ev());
@@ -467,7 +494,9 @@ fn variance_inflation(points: &[PointEvidence]) -> (f64, usize, f64) {
     if n < MIN_EVIDENCE {
         return (1.0, n, f64::NAN);
     }
-    let sw: f64 = inside.iter().map(|e| e.w2).sum();
+    // the measured error less its aleatoric part, per point and never below 0 (fix round 1, the
+    // review's I2): E[w̄²] = s̄² + ā̄² for a calibrated posterior at a fresh geometry
+    let sw: f64 = inside.iter().map(|e| (e.w2 - e.a2).max(0.0)).sum();
     let ss: f64 = inside.iter().map(|e| e.s2).sum();
     if !(sw.is_finite() && ss.is_finite()) {
         return (f64::INFINITY, n, f64::INFINITY);

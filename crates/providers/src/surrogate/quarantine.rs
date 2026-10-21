@@ -72,23 +72,30 @@ pub(super) struct FenceVote {
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
     pub(super) residual: Option<(f64, Vec<[f64; 3]>)>,
+    /// The model generation the residual was taken against: votes combine only within one
+    /// (fix round 1, the review's I1 — a refit in between changes what "the model's error" is).
+    pub(super) gen: u64,
 }
 
 /// Two fence votes agree (`surrogate` module doc, "Fence voting"): their residuals teacher − model
 /// do — the per-atom energy residuals within `energy_std_per_atom` and, per atom, the force
-/// residuals' magnitudes within the force bound of the second — when both carry one; else the
+/// residuals' magnitudes within the policy's force bound of that atom's teacher force in the second
+/// vote (`force_bound(|F_teacher|)`, as everywhere else) — when both carry one; else the
 /// raw answers ([`SurrogateKs::agree`]). Residuals, not answers (M8a Task 5, the user's
 /// compressed-H₂ log): votes are fresh answers at *different* geometries along a trajectory
 /// (a vibration enters the fence once per period), whose raw energies and forces differ by the
 /// surface's own slope — on a steep inner wall more than the tiers — while the model's error
 /// there varies slowly; magnitudes, because the molecule turns between votes and a force
-/// residual turns with it.
+/// residual turns with it. Magnitudes drop the direction: two residuals of equal size pointing
+/// differently relative to the molecule agree here (a direction-aware invariant — the residual
+/// projected on the interatomic unit vectors, or Kabsch-aligned frames — would not); the vote only
+/// keeps one sample for the next refit, whose `judge_votes` decides on the full vectors.
 pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) -> bool {
     match (&va.residual, &vb.residual) {
         (Some((ea, fa)), Some((eb, fb))) => {
             let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             (ea - eb).abs() / va.n.max(1) as f64 <= p.energy_std_per_atom
-                && fa.iter().zip(fb).all(|(a, b)| (norm(a) - norm(b)).abs() / 3f64.sqrt() <= p.force_bound(norm(b)))
+                && fa.iter().zip(fb).zip(&vb.forces).all(|((a, b), t)| (norm(a) - norm(b)).abs() / 3f64.sqrt() <= p.force_bound(norm(t)))
         }
         _ => SurrogateKs::agree(p, va.n, va.energy, &va.forces, vb.energy, &vb.forces),
     }
@@ -616,7 +623,7 @@ impl SurrogateKs {
                 // other but not with the model are evidence the model is wrong here
                 let n = pos.len();
                 let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
-                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual });
+                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.fence_votes.len() > FENCE_VOTES {
                     self.fence_votes.remove(0);
                 }
@@ -624,7 +631,7 @@ impl SurrogateKs {
                 // within the per-atom energy threshold and every atom's force bound)
                 let votes = &self.fence_votes;
                 let consistent = votes.len() == FENCE_VOTES
-                    && votes.iter().all(|v| v.n == n && v.near.iter().any(|i| near.contains(i)))
+                    && votes.iter().all(|v| v.n == n && v.gen == self.model_gen && v.near.iter().any(|i| near.contains(i)))
                     && votes.iter().enumerate().all(|(a, va)| {
                         votes[a + 1..].iter().all(|vb| votes_agree(&self.policy, va, vb))
                     });

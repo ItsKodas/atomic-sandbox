@@ -278,7 +278,7 @@ fn refit_is_interactive_at_ten_thousand_samples() {
     let (model, rep) = acc.refit(&opts, &prov, &refs).unwrap();
     let t_first = t.elapsed();
     let rounds = match acc.last_refit() {
-        RefitKind::Spectral { rounds } => rounds,
+        RefitKind::Spectral { rounds, .. } => rounds,
         k => panic!("the first refit is a search, got {k:?}"),
     };
     println!(
