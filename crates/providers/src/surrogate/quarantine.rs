@@ -64,12 +64,34 @@ pub const QUARANTINE_ROUNDS: usize = 5;
 /// Never quarantine more than this fraction of the store.
 pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
-/// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting).
+/// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
+/// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
 pub(super) struct FenceVote {
     pub(super) near: Vec<usize>,
     pub(super) n: usize,
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
+    pub(super) residual: Option<(f64, Vec<[f64; 3]>)>,
+}
+
+/// Two fence votes agree (`surrogate` module doc, "Fence voting"): their residuals teacher − model
+/// do — the per-atom energy residuals within `energy_std_per_atom` and, per atom, the force
+/// residuals' magnitudes within the force bound of the second — when both carry one; else the
+/// raw answers ([`SurrogateKs::agree`]). Residuals, not answers (M8a Task 5, the user's
+/// compressed-H₂ log): votes are fresh answers at *different* geometries along a trajectory
+/// (a vibration enters the fence once per period), whose raw energies and forces differ by the
+/// surface's own slope — on a steep inner wall more than the tiers — while the model's error
+/// there varies slowly; magnitudes, because the molecule turns between votes and a force
+/// residual turns with it.
+pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) -> bool {
+    match (&va.residual, &vb.residual) {
+        (Some((ea, fa)), Some((eb, fb))) => {
+            let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            (ea - eb).abs() / va.n.max(1) as f64 <= p.energy_std_per_atom
+                && fa.iter().zip(fb).all(|(a, b)| (norm(a) - norm(b)).abs() / 3f64.sqrt() <= p.force_bound(norm(b)))
+        }
+        _ => SurrogateKs::agree(p, va.n, va.energy, &va.forces, vb.energy, &vb.forces),
+    }
 }
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
@@ -593,7 +615,8 @@ impl SurrogateKs {
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
                 // other but not with the model are evidence the model is wrong here
                 let n = pos.len();
-                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec() });
+                let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
+                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual });
                 if self.fence_votes.len() > FENCE_VOTES {
                     self.fence_votes.remove(0);
                 }
@@ -603,7 +626,7 @@ impl SurrogateKs {
                 let consistent = votes.len() == FENCE_VOTES
                     && votes.iter().all(|v| v.n == n && v.near.iter().any(|i| near.contains(i)))
                     && votes.iter().enumerate().all(|(a, va)| {
-                        votes[a + 1..].iter().all(|vb| Self::agree(&self.policy, n, va.energy, &va.forces, vb.energy, &vb.forces))
+                        votes[a + 1..].iter().all(|vb| votes_agree(&self.policy, va, vb))
                     });
                 // one vote per region until a refit has judged it; at most FENCE_VOTE_LIMIT per
                 // fenced sample

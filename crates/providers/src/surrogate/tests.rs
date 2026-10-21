@@ -1843,6 +1843,117 @@ fn consistent_answers_inside_a_fence_teach_the_model_the_region() {
     assert!(after.abs() / 2.0 <= 1e-3, "the region is learned: {after:+.2e}");
 }
 
+/// Fence votes along a trajectory (M8a Task 5, the user's compressed-H₂ log: "fallback · fence ·
+/// not kept: fence" every vibration period, residuals 1.39–1.66 mHa, never a vote): a molecule
+/// that re-enters the fence at slightly different bond lengths and turned between visits gives
+/// raw answers that differ by more than the tiers — the vote compared those — while its
+/// residuals teacher − model agree. The vote compares residuals (rotation-invariantly), so the
+/// third such answer is kept.
+#[test]
+fn a_vibrating_turning_molecule_in_a_fence_still_votes() {
+    let teacher = || Bumped { inner: MorseDimer::h2(), amp: 2e-2, r0: 2.1, w: 0.3 };
+    let mut s = SurrogateKs::new(Box::new(teacher()), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    let mut t = teacher();
+    for i in 0..60 {
+        let r = 1.0 + 0.6 * i as f64 / 59.0;
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        let res = t.evaluate(&sc, &mut never()).unwrap();
+        let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 };
+        s.add_sample(smp, &sc).unwrap();
+    }
+    let stray = h2(1.9);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.refit().unwrap();
+    assert!(s.trusted() && s.is_quarantined(60), "{:?}", s.untrusted_reason());
+    // three visits: bond lengths 1.900, 1.906, 1.903 Bohr, the axis turned by 40° each time
+    let visit = |k: usize| {
+        let a = (40.0f64 * k as f64).to_radians();
+        dimer([1.900, 1.906, 1.903][k], [a.cos(), a.sin(), 0.0], [0.0; 3], 1, 1)
+    };
+    // the premise: the raw answers disagree pairwise (the old vote), the model misses them all
+    let raw: Vec<ForceResult> = (0..3).map(|k| teacher().evaluate(&visit(k), &mut never()).unwrap()).collect();
+    let raw_agree = SurrogateKs::agree(s.policy(), 2, raw[0].energy, &raw[0].forces, raw[1].energy, &raw[1].forces);
+    assert!(!raw_agree, "test premise: the raw answers of two visits differ by more than the tiers");
+    let mut outcomes = Vec::new();
+    let mut voted = None;
+    for k in 0..3 {
+        let res = s.evaluate(&visit(k), &mut never()).unwrap();
+        assert_ne!(res.stats.source, Source::Surrogate, "visit {k} falls back (fenced)");
+        outcomes.extend(drain(&mut s).into_iter().map(|e| e.outcome));
+        if voted.is_none() && res.stats.notes.iter().any(|n| n.contains("mutually consistent fresh teacher answers")) {
+            voted = Some(k);
+        }
+    }
+    use sim::activity::TeachOutcome as K;
+    println!("outcomes {outcomes:?}");
+    assert_eq!(voted, Some(2), "the third visit is the vote: {outcomes:?}");
+    assert_eq!(outcomes[..3], [K::FenceDisagrees, K::FenceDisagrees, K::KeptByVote]);
+}
+
+/// Diagnosis (M8a Task 5, the user's κ = 136.65): the calibration readout κ_c of a collection's
+/// audit history against the decision numbers — the measured error W_c and the variance
+/// inflation λ_c — and how much of κ_c's mean of z² its largest points carry. Reads the file
+/// named by `COLLECTION_HISTORY` (a collection's `history.bin`; a copy, never the live one).
+#[test]
+#[ignore = "diagnosis: COLLECTION_HISTORY=<copy of history.bin> cargo test -p providers --release kappa_tail -- --ignored --nocapture"]
+fn kappa_tail_of_a_collection_history() {
+    let path = std::env::var("COLLECTION_HISTORY").expect("COLLECTION_HISTORY names a history.bin");
+    let h = surrogate::AuditHistory::decode(&std::fs::read(path).unwrap()).unwrap();
+    let pol = FallbackPolicy::default();
+    let cal = super::calibrate::calibrate(&h, &pol);
+    use sim::activity::EnvClass;
+    let class_codes = [super::history_rule_code(TeachRule::Class(EnvClass::Pair)), super::history_rule_code(TeachRule::Class(EnvClass::ManyBody))];
+    for (c, cc) in cal.per_class.iter().enumerate() {
+        println!(
+            "class {}: κ {:.2} (ẑ {:.2}, {} points: {} audits, {} fallbacks, evidence {}), measured W {:.3}, energy {:.3}, worst atom {:.2}, inflation λ {:.3} (raw {:.3}, {} points)",
+            ENV_CLASSES[c], cc.factor, cc.z_rms, cc.points, cc.audits, cc.fallbacks, cc.evidence, cc.measured, cc.measured_energy, cc.worst_atom, cc.inflation, cc.inflation_raw, cc.inflation_points
+        );
+        // the verdict jurisdiction's points (all generations): z̄² per point, the share of the largest
+        let mut z2: Vec<(f64, f64, f64, f64)> = Vec::new(); // (z̄², ‖ΔF‖ max, std at that atom, w̄)
+        for p in h.iter() {
+            let in_j = match p.kind {
+                surrogate::history::PointKind::Audit => true,
+                surrogate::history::PointKind::Fallback { rule } => class_codes.contains(&rule),
+            };
+            if !in_j {
+                continue;
+            }
+            let (mut s, mut n, mut worst, mut wsum) = (0.0, 0usize, (0.0f64, 0.0f64, 0.0f64), 0.0);
+            for j in 0..p.n_atoms {
+                if p.classes[j] != c as u8 + 1 {
+                    continue;
+                }
+                let z = p.err_force[j] / p.pred_force_std[j];
+                s += z * z;
+                n += 1;
+                if z > worst.0 {
+                    worst = (z, p.err_force[j], p.pred_force_std[j]);
+                }
+                wsum += (p.err_force[j] / 3f64.sqrt() / pol.force_bound(p.teacher_force[j])).powi(2);
+            }
+            if n > 0 {
+                z2.push((s / n as f64, worst.1, worst.2, (wsum / n as f64).sqrt()));
+            }
+        }
+        z2.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let total: f64 = z2.iter().map(|x| x.0).sum();
+        let share = |k: usize| z2.iter().take(k).map(|x| x.0).sum::<f64>() / total;
+        let without = |k: usize| (z2.iter().skip(k).map(|x| x.0).sum::<f64>() / (z2.len() - k).max(1) as f64).sqrt();
+        println!(
+            "  all-generation jurisdiction: {} points, ẑ {:.2}; the largest 1 / 5 / 10 points carry {:.1} % / {:.1} % / {:.1} % of Σz̄²; ẑ without them {:.2} / {:.2} / {:.2}; median z̄ {:.2}",
+            z2.len(), (total / z2.len().max(1) as f64).sqrt(), 100.0 * share(1), 100.0 * share(5), 100.0 * share(10), without(1), without(5), without(10),
+            z2.get(z2.len() / 2).map_or(f64::NAN, |x| x.0.sqrt())
+        );
+        for (k, x) in z2.iter().take(5).enumerate() {
+            println!("    top {k}: z̄ {:.1} (worst atom ‖ΔF‖ {:.2e} Ha/Bohr over a std of {:.2e}); its error in bound units {:.2}", x.0.sqrt(), x.1, x.2, x.3);
+        }
+    }
+}
+
 /// The driver's safety net: a change of energy surface between consecutive evaluations that
 /// carries no `refit_jump` restarts the conserved-energy history with a note.
 #[test]

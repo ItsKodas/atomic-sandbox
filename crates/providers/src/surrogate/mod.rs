@@ -687,9 +687,12 @@
 //! used to leave no learning path: every fresh answer there disagrees with the model, none was
 //! kept, and the fence never released — DFT speed under a trusted badge. So when
 //! [`FENCE_VOTES`] (3) consecutive fresh teacher answers inside one fence disagree with the model
-//! but are **mutually consistent** (every pair within `energy_std_per_atom` per atom and every
-//! atom's force bound), the third is kept (tag Fallback) and the next refit decides: if the new
-//! model reproduces the kept answer it stays in the fit — the fenced glitch is then released if
+//! but are **mutually consistent** — their residuals teacher − model agree: every pair's per-atom
+//! energy residuals within `energy_std_per_atom` and every atom's force-residual magnitudes within
+//! its force bound (`quarantine::votes_agree`; M8a Task 5: before, the raw answers were compared,
+//! and the votes of a vibration entering a fence once per period — different geometries on a steep
+//! wall, the molecule turned in between — never agreed although the model's error did) — the
+//! third is kept (tag Fallback) and the next refit decides: if the new model reproduces the kept answer it stays in the fit — the fenced glitch is then released if
 //! the model reproduces it too, or superseded by the next fresh answer, which now agrees; if the
 //! model cannot reproduce the kept answer, it is quarantined itself and its region takes no
 //! further vote (an unrepresentable region — a dimer beyond the cutoff — costs one sample, not a
