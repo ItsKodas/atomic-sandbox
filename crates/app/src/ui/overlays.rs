@@ -471,6 +471,9 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                             ui.add_space(8.0);
                             ui.label("size");
                             ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
+                            ui.add_space(8.0);
+                            ui.label("blur");
+                            ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).show_value(false)).on_hover_text("how soft each dot's edge is: left crisp, right blurry (the middle is the default look)");
                         });
                     });
                 }

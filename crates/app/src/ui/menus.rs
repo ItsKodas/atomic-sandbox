@@ -718,6 +718,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
             ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount (× the default)"));
             ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size"));
+            ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).text("blur (0 crisp … 1 soft)"));
             if st.dots_glow {
                 ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness"));
             }

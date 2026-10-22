@@ -43,6 +43,10 @@ pub struct DotsUniform {
     /// Feather (user request 2026-10-19): dots where √(field / max) is below `cut` fade out (over
     /// 0.4 cut … cut); 0 = every dot shown.
     pub cut: f32,
+    /// The dots' blur (user request 2026-10-22): 0 = crisp … 1 = soft; 0.5 = the look before
+    /// the slider (a glowing dot's Gaussian exp(−4 d²), a plain dot's 1 − d⁴). Display only.
+    pub blur: f32,
+    pub _pad: [f32; 3],
 }
 
 /// Dot colour: the volume mode's ramp of the field at the dot (log over 3 decades of its max).
@@ -55,7 +59,7 @@ pub const COLOUR_BY_TINT: u32 = 2;
 /// `tint_neg` where it is negative.
 pub const COLOUR_BY_SIGN: u32 = 3;
 
-const _: () = assert!(std::mem::size_of::<DotsUniform>() == 112);
+const _: () = assert!(std::mem::size_of::<DotsUniform>() == 128);
 
 struct Bound { compute_bg: wgpu::BindGroup, draw_bg: wgpu::BindGroup, n_rows: u32, dims: [u32; 3], colour: bool }
 
@@ -268,7 +272,7 @@ mod tests {
         pass.set_params(ctx, &DotsUniform {
             box_min: [LO; 3], use_colour: 0, box_max: [HI; 3], count: DOTS, dims: [0; 3], seed,
             tint: [1.0; 4], tint_neg: [1.0; 4], size_px: 1.0, intensity: 1.0, colour_by: COLOUR_BY_DENSITY, signed,
-            walk: 0.0, refresh: 0.0, glow: 0, cut: 0.0,
+            walk: 0.0, refresh: 0.0, glow: 0, cut: 0.0, blur: 0.5, _pad: [0.0; 3],
         });
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         pass.generate(&mut enc);

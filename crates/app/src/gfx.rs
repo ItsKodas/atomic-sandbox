@@ -181,6 +181,7 @@ pub struct Painter {
     dots_size: f32,
     dots_brightness: f32,
     dots_feather: f32,
+    dots_blur: f32,
     /// Bloom (`render::bloom`): its strength (0 = off) and threshold, from View.
     bloom: render::bloom::Bloom,
     bloom_intensity: f32,
@@ -272,6 +273,7 @@ impl Painter {
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            dots_blur: 0.5,
             bloom: render::bloom::Bloom::new(ctx, format),
             bloom_intensity: 0.0,
             bloom_threshold: 0.7,
@@ -672,7 +674,7 @@ impl Painter {
         self.shimmer = ui.shimmer;
         // the dots' look (View ▸ Density ▸ dots)
         self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
-        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather);
+        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather, self.dots_blur) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather, ui.dots_blur);
         (self.bloom_intensity, self.bloom_threshold) = (ui.bloom, ui.bloom_threshold);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
@@ -759,6 +761,7 @@ impl Painter {
             colour_by: look.colour_by, signed: u32::from(look.signed),
             // the fresh re-draws (which keep the walk honest) slow with the drift, so slow dots do not pop
             walk: self.dots_float, refresh: 0.01 * (self.dots_float / 0.35).clamp(0.02, 1.0), glow: u32::from(glow), cut: self.dots_feather,
+            blur: self.dots_blur, _pad: [0.0; 3],
         });
     }
 

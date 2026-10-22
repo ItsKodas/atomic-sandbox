@@ -18,7 +18,7 @@ macro_rules! fields {
         $m!(show_partial_core, show_bonds, show_labels, show_badge, show_ghost, show_angles, show_bond_lengths, show_charges, follow_selected,
             shimmer, dots_by_orbital, orbital_phase, colour_additive, colour_physical, show_cell, show_floor, show_axes,
             show_place_grid, grid_in_angstrom, show_trails, hide_cloud, warp_fields, camera_view, dots_float, dots_glow, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
-            gamma, opacity, iso, phase_iso, spin_iso, trail_opacity, trail_fs, volume_mode, motion_blur, shutter, exposure_ev, camera_solidity, camera_size, camera_smooth, fov_deg, label_opacity, dots_drift, dots_amount, dots_size, dots_brightness, dots_feather, bloom, bloom_threshold)
+            gamma, opacity, iso, phase_iso, spin_iso, trail_opacity, trail_fs, volume_mode, motion_blur, shutter, exposure_ev, camera_solidity, camera_size, camera_smooth, fov_deg, label_opacity, dots_drift, dots_amount, dots_size, dots_brightness, dots_feather, dots_blur, bloom, bloom_threshold)
     };
 }
 

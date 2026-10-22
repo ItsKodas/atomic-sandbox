@@ -649,6 +649,8 @@ pub struct UiState {
     pub dots_brightness: f32,
     /// The dots' feather: the faint outskirts fade out (0 = every dot; up to 0.8 of √(field / max)).
     pub dots_feather: f32,
+    /// The dots' blur (user request 2026-10-22): 0 crisp … 1 soft; 0.5 = the look before the slider.
+    pub dots_blur: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -942,6 +944,7 @@ right {}
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            dots_blur: 0.5,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,

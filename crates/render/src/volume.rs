@@ -930,7 +930,7 @@ mod orbital_tests {
                     box_min: [LO; 3], use_colour: 0, box_max: [-LO; 3], count: 200_000, dims: [0; 3], seed: 7,
                     tint: [0.9, 0.3, 0.2, 1.0], tint_neg: [0.2, 0.45, 0.9, 1.0], size_px: 1.25, intensity: 0.35,
                     colour_by: if signed { crate::dots::COLOUR_BY_SIGN } else { crate::dots::COLOUR_BY_DENSITY }, signed: u32::from(signed),
-                    walk: 0.0, refresh: 1.0, glow: 0, cut: 0.0,
+                    walk: 0.0, refresh: 1.0, glow: 0, cut: 0.0, blur: 0.5, _pad: [0.0; 3],
                 });
             }
             let frame = || {
