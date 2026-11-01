@@ -80,7 +80,11 @@
 //! "box status unknown": the shared store takes nothing the box rule could not judge.
 //!
 //! A sample tagged `Reference` (an isolated-atom solve stored as a sample by an old file) is refused
-//! on import: the collection's references live in `references.txt` with their box, below.
+//! on import: the collection's references live in `references.txt` with their box, below. So is
+//! any sample of **lone atoms** (no atom with a neighbour within the model's cutoff, the caller's
+//! `r_cut`: [`crate::no_neighbours`]) — the provider never keeps such an answer (it teaches
+//! nothing: only the isolated atoms' grid/box artefacts), and a file written before that rule may
+//! hold some.
 //!
 //! # References (M8a Task 4a; the Task 3 review's physics (c), controller ruling)
 //!
@@ -143,6 +147,9 @@ pub const REFUSE_BOX: &str = "box-affected sample";
 pub const REFUSE_BOX_UNKNOWN: &str = "box status unknown (the file records no face density for this sample)";
 /// The refusal of a sample identical to a stored one (module doc, "Admission").
 pub const REFUSE_DUPLICATE: &str = "an identical teacher answer is already in the collection";
+/// The refusal of an imported sample of lone atoms — no atom with a neighbour within the cutoff
+/// (module doc, "Admission"; [`crate::no_neighbours`]).
+pub const REFUSE_LONE: &str = "lone atoms (no atom has a neighbour within the model's cutoff — nothing to learn)";
 /// The refusal of an imported `SampleTag::Reference` sample (module doc, "References").
 pub const REFUSE_REFERENCE_SAMPLE: &str = "an isolated-atom reference solve: a collection keeps its references in references.txt, with their box";
 
@@ -1131,13 +1138,14 @@ impl Collection {
     /// silently: whole-file refusals (a charged scene, a forced multiplicity, another surface, no
     /// samples) and per-sample ones (quarantined, box-affected — its code, or its recorded face
     /// density above `face_limit`, the box rule at this surface's h, `providers::box_affected_face_density`
-    /// —, box status unknown — no face density recorded —, a draft audit, a duplicate) are all in
-    /// the report, and so is a `Reference`-tagged sample. The file's references are **not** taken:
+    /// —, box status unknown — no face density recorded —, a draft audit, a duplicate, lone atoms —
+    /// no atom with a neighbour within `r_cut`, Bohr, the model's cutoff) are all in the report, and
+    /// so is a `Reference`-tagged sample. The file's references are **not** taken:
     /// a `.model` file records no box for them (module doc, "References"), so a note per species
     /// says the next sampling pass solves it (or that the collection's own stands). The
     /// file's audit history is not imported (it judged that file's model, not this collection's).
     /// `Err` only for an unreadable file or a read-only collection.
-    pub fn import_sidecar(&mut self, path: &Path, face_limit: f64) -> Result<ImportReport, String> {
+    pub fn import_sidecar(&mut self, path: &Path, face_limit: f64, r_cut: f64) -> Result<ImportReport, String> {
         self.writable()?;
         let contents = sidecar::read_any(path).map_err(|e| e.to_string())?;
         let (prov, samples, quarantine, face, references) = match contents {
@@ -1163,6 +1171,10 @@ impl Collection {
         for (i, s) in samples.into_iter().enumerate() {
             if s.tag == SampleTag::Reference {
                 report.refused.push((i, REFUSE_REFERENCE_SAMPLE.to_string()));
+                continue;
+            }
+            if crate::no_neighbours(&s.pos, r_cut) {
+                report.refused.push((i, REFUSE_LONE.to_string()));
                 continue;
             }
             let code = if s.tag == SampleTag::DraftAudit { Q_DRAFT } else { quarantine.get(i).copied().unwrap_or(Q_NONE) };
@@ -1645,7 +1657,7 @@ mod tests {
         let charged = dir.join("nh4+.model");
         std::fs::write(&charged, v5).unwrap();
         assert!(matches!(sidecar::read_any(&charged).unwrap(), sidecar::Contents::Fitted(_)));
-        let r = c.import_sidecar(&charged, 1e-4).unwrap();
+        let r = c.import_sidecar(&charged, 1e-4, 6.0).unwrap();
         assert_eq!(r.imported, 0);
         assert_eq!(r.refused, vec![(WHOLE_FILE, "charge 1: collections are neutral until M9".to_string())]);
         assert!(c.samples.is_empty());
@@ -1654,11 +1666,11 @@ mod tests {
         let mut forced = prov();
         forced.multiplicity = Some(3);
         let f = samples_file(&dir, "triplet.model", &set(forced, vec![h2(0)], vec![], vec![]));
-        assert_eq!(c.import_sidecar(&f, 1e-4).unwrap().refused, vec![(WHOLE_FILE, "the scene forced multiplicity 3".to_string())]);
+        assert_eq!(c.import_sidecar(&f, 1e-4, 6.0).unwrap().refused, vec![(WHOLE_FILE, "the scene forced multiplicity 3".to_string())]);
         let mut other = prov();
         other.h = 0.2;
         let f = samples_file(&dir, "coarse.model", &set(other, vec![h2(0)], vec![], vec![]));
-        let r = c.import_sidecar(&f, 1e-4).unwrap();
+        let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
         assert_eq!((r.imported, r.refused.len()), (0, 1));
         assert!(r.refused[0].1.contains("h 0.2 (the collection's 0.25)"), "{:?}", r.refused);
         assert!(c.samples.is_empty());
@@ -1671,7 +1683,7 @@ mod tests {
         let atom = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::Reference, weight: 1.0 };
         let samples = vec![h2(0), h2(1), h2(2), h2(3), draft, h2(5), h2(0), atom];
         let f = samples_file(&dir, "h2.model", &set(big_box, samples, vec![0, 1, 3, 0, 0, 0, 0, 0], vec![1e-9, 1e-9, 1e-9, 1e-3, 1e-9, f64::NAN, 1e-9, 1e-9]));
-        let r = c.import_sidecar(&f, 1e-4).unwrap();
+        let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
         assert_eq!(r.imported, 1, "{r:?}");
         let why: Vec<(usize, &str)> = r.refused.iter().map(|(i, s)| (*i, s.as_str())).collect();
         assert_eq!(why.len(), 7, "{why:?}");
@@ -1690,7 +1702,7 @@ mod tests {
         assert!(c.references.is_empty(), "{:?}", c.references);
         assert!(r.notes.iter().any(|n| n.contains("H reference") && n.contains("not taken")), "{:?}", r.notes);
         // importing the same file again adds nothing
-        let r = c.import_sidecar(&f, 1e-4).unwrap();
+        let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
         assert_eq!(r.imported, 0);
         assert_eq!(c.samples.len(), 1);
 
@@ -1699,10 +1711,29 @@ mod tests {
         let mut big_box = prov();
         big_box.grid_n = 81;
         let f = samples_file(&dir, "old.model", &set(big_box, vec![h2(7), h2(8)], vec![], vec![]));
-        let r = c.import_sidecar(&f, 1e-4).unwrap();
+        let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
         assert_eq!(r.imported, 0, "{r:?}");
         assert_eq!(r.refused, vec![(0, REFUSE_BOX_UNKNOWN.to_string()), (1, REFUSE_BOX_UNKNOWN.to_string())]);
         assert_eq!(c.samples.len(), 1);
+    }
+
+    /// User-fix-4: an imported sample of lone atoms — no atom with a neighbour within the cutoff,
+    /// one atom or two far apart, whatever its tag — is refused by name (a file written before the
+    /// keep rule may hold some); a dimer just inside the cutoff is taken.
+    #[test]
+    fn import_refuses_lone_atoms() {
+        let dir = root("import-lone");
+        let key = prov().surface_key();
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        let one = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::LiveStep, weight: 1.0 };
+        let apart = Sample { pos: vec![[0.0; 3], [6.0, 0.0, 0.0]], z: vec![1, 1], energy: -0.956, forces: vec![[0.0; 3]; 2], tag: SampleTag::Scan, weight: 1.0 };
+        let mut near = apart.clone();
+        near.pos[1][0] = 5.99;
+        let f = samples_file(&dir, "lone.model", &set(prov(), vec![h2(0), one, apart, near], vec![], vec![1e-9; 4]));
+        let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
+        assert_eq!(r.imported, 2, "{r:?}");
+        assert_eq!(r.refused, vec![(1, REFUSE_LONE.to_string()), (2, REFUSE_LONE.to_string())]);
+        assert_eq!(c.samples.len(), 2);
     }
 
     #[test]

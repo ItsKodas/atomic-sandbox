@@ -726,6 +726,9 @@ pub enum SampleState {
     BoxExcluded,
     /// A draft-mode audit's answer held out of the strict fit.
     HeldOut,
+    /// Lone atoms (no atom with a neighbour within the cutoff) loaded from before the keep rule
+    /// refused them: held out of the fit — they teach nothing.
+    Lone,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).

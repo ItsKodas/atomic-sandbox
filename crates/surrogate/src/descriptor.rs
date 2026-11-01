@@ -903,6 +903,21 @@ pub(crate) fn t4_channels(basis: &Basis, t: &Body4Term) -> [usize; 3] {
     [basis.body2_index(t.t[0], t.n[0]), basis.body2_index(t.t[1], t.n[1]), basis.body2_index(t.t[2], t.n[2])]
 }
 
+/// No atom of `pos` has a neighbour within `r_cut` (Bohr; strictly inside, where f_c > 0): every
+/// descriptor is empty, so the model's energy there is Σ ref exactly (`crate::fit`, "Isolated-atom
+/// limit") and a teacher answer at such a geometry teaches it nothing — its label E − Σ ref is
+/// only the isolated atoms' grid/box artefact. The provider never keeps one, holds stored ones out
+/// of the fit, and a collection refuses one on import (`crate::collection`, "Admission").
+pub fn no_neighbours(pos: &[[f64; 3]], r_cut: f64) -> bool {
+    let r2 = r_cut * r_cut;
+    pos.iter().enumerate().all(|(i, a)| {
+        pos[i + 1..].iter().all(|b| {
+            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2
+        })
+    })
+}
+
 /// The descriptor values B_i alone — what [`describe`] puts in `AtomDescriptor::b`, bit for bit
 /// (the same sums in the same order), without the gradient lists: the surrogate's per-step
 /// envelope and quarantine checks need only the values, and the gradients cost about twice the

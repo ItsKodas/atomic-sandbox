@@ -1127,6 +1127,10 @@ pub struct TrainableStatus {
     /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit
     /// (`providers::surrogate`, "Draft mode").
     pub held_out: usize,
+    /// Stored samples of lone atoms (no atom with a neighbour within the model's cutoff) loaded
+    /// from before the keep rule refused them, held out of the fit (`providers::surrogate`,
+    /// `Q_LONE`).
+    pub lone: usize,
     /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
     /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
     pub box_affected: usize,
@@ -1134,7 +1138,7 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `lone` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// What the last refit's trust recovery did.

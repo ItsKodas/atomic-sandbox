@@ -69,6 +69,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_SUPERSEDED) => "superseded",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
+        Some(Q_LONE) => "held out (lone atoms)",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }
@@ -510,7 +511,7 @@ impl SurrogateKs {
                 c.f_ratio
             );
         }
-        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.unfitted());
+        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.lone_held_out(), self.unfitted());
         // references and atomisation energies (an outlier flags a reference mix-up)
         let _ = writeln!(
             o,

@@ -167,6 +167,7 @@ fn state_word(s: SampleState) -> &'static str {
         SampleState::Superseded => "superseded",
         SampleState::BoxExcluded => "box-excluded",
         SampleState::HeldOut => "held out (draft guess)",
+        SampleState::Lone => "held out (lone atoms)",
     }
 }
 

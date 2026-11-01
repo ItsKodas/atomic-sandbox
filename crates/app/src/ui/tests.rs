@@ -178,7 +178,7 @@ pub(crate) fn model() -> ModelStatus {
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {

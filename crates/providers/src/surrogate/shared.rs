@@ -32,6 +32,10 @@
 //!   teacher that reports no face density —, quarantined, a duplicate, read-only).
 //! * **A draft-mode guess's audit** (`Q_DRAFT`, held out of the strict fit) waits outside the
 //!   collection and is offered again if a refit promotes it into the fit (`judge_held_out`).
+//! * **Lone atoms stored before the keep rule** (no atom with a neighbour within the cutoff:
+//!   `no_neighbours`; a collection appended to before the rule may hold them) are held out of the
+//!   fit at attach (`Q_LONE`, provider-only: no status record is ever written for them, the
+//!   collection's own code stands) and said once; an import refuses them.
 //! * **Status changes are appended**: whenever the provider's quarantine code of a collection
 //!   sample changes (held, superseded, released), a status record is written
 //!   (`sync_collection_status`, after every refit and every admitted teacher answer).
@@ -233,6 +237,10 @@ impl SurrogateKs {
         self.face = vec![f64::NAN; n];
         self.quarantine = c.quarantine.clone();
         self.store = (n > 0).then_some(store);
+        // samples of lone atoms kept before the keep rule refused them: held out, never written
+        // (`Q_LONE`) — before the reference wait below, which they never join
+        let r_cut = self.cutoff();
+        let lone = self.hold_out_lone(r_cut);
         self.refs_dirty = true;
         self.pending_refit = n > 0;
         // the collection's audit history (module doc); its generations are the writers', so this
@@ -279,6 +287,7 @@ impl SurrogateKs {
             note.push_str(" — read-only: another process holds its lock, so this session's answers are used and not added to it");
         }
         self.user_notes.push(note);
+        self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
             if let Err(e) = SurrogateKs::refit(self) {
                 self.last_fit_error = Some(e.to_string());
@@ -506,6 +515,10 @@ impl SurrogateKs {
         let mut failed: Option<String> = None;
         let mut promoted: Vec<(usize, usize, Option<u32>)> = Vec::new();
         for (i, link) in sh.link.iter().enumerate() {
+            // a lone sample's hold-out is the provider's (`Q_LONE`): the collection's code stands
+            if self.quarantine.get(i) == Some(&Q_LONE) {
+                continue;
+            }
             let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
             match *link {
                 Link::In(k) => {
@@ -821,7 +834,9 @@ impl SurrogateKs {
         let sh = self.shared.as_mut().ok_or("import: no shared collection is attached (the Model tab's shared model)")?;
         let limit = box_affected_face_density(sh.coll.key.h);
         let before = sh.coll.samples.len();
-        let report = sh.coll.import_sidecar(path, limit)?;
+        let r_cut = self.cutoff();
+        let sh = self.shared.as_mut().expect("checked");
+        let report = sh.coll.import_sidecar(path, limit, r_cut)?;
         let new: Vec<(Sample, usize)> = sh.coll.samples[before..].iter().map(|c| (c.sample.clone(), c.grid_n)).collect();
         let prov = sh.prov.clone();
         for (k, (s, grid_n)) in (before..).zip(new) {
@@ -888,8 +903,8 @@ impl SurrogateKs {
             references: Vec::new(),
             reference_rule: Some(surrogate::sidecar::REFERENCE_RULE.to_string()),
             // provider-only codes are not file codes: a draft guess's tag carries it, a waiting
-            // sample waits again at the reload
-            quarantine: keep.iter().map(|&i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT && q != Q_REF_WAIT).unwrap_or(Q_NONE)).collect(),
+            // sample waits again at the reload, a lone one writes the code it was loaded with
+            quarantine: keep.iter().map(|&i| self.persisted_code(i)).collect(),
             face_density: keep.iter().map(|&i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect(),
             sample_box: keep.iter().map(|&i| sh.box_n.get(i).copied().unwrap_or(0)).collect(),
             specialised: Vec::new(),
@@ -972,6 +987,9 @@ impl SurrogateKs {
         if taken > 0 {
             self.pending_refit = true;
             self.user_notes.push(format!("shared collection {slug}: {taken} session-only samples of this session are back (kept beside the collection, never added to it)"));
+            let r_cut = self.cutoff();
+            let lone = self.hold_out_lone(r_cut);
+            self.note_lone_held_out(&format!("shared collection {slug}: session-only samples {}", path.display()), lone, r_cut);
         }
         Ok(taken)
     }

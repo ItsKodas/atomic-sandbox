@@ -297,6 +297,8 @@ impl SurrogateKs {
                 Q_SUPERSEDED => SampleState::Superseded,
                 Q_BOX => SampleState::BoxExcluded,
                 Q_DRAFT => SampleState::HeldOut,
+                // lone atoms loaded from before the keep rule: held out for good
+                Q_LONE => SampleState::Lone,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,

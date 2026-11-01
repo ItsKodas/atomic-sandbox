@@ -1089,6 +1089,10 @@ pub struct SurrogateKs {
     /// Per stored sample: quarantined (module doc, "Trust recovery"); shorter than the store
     /// means "not quarantined" for the rest.
     quarantine: Vec<u8>,
+    /// Per stored sample held out as lone atoms (`Q_LONE`, set at load — `quarantine` module doc of
+    /// [`Q_LONE`]): the code it was loaded with, which a saved file writes back (the provider-only
+    /// code is never persisted).
+    lone_codes: BTreeMap<usize, u8>,
     /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
     degree_cap: Option<usize>,
     /// Thinned candidates since the last kept fallback sample (thinning; the no-model cap).
@@ -1308,6 +1312,7 @@ impl SurrogateKs {
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
+            lone_codes: BTreeMap::new(),
             degree_cap: None,
             since_kept: THIN_EVERY,
             desc_cache: Vec::new(),
@@ -2312,14 +2317,10 @@ impl SurrogateKs {
 /// of the references, which the per-box reference solves cover — and its teacher energies carry
 /// only an isolated atom's grid/box artefacts (user test, M8a: 202 lone-H samples spread by
 /// 1.3 mHa failed rule 4's self-check and the whole collection went untrusted). Never kept.
+/// The predicate is the `surrogate` crate's (`surrogate::no_neighbours`), which a collection's
+/// import uses too; samples of this kind stored before the rule are held out at load (`Q_LONE`).
 pub(crate) fn no_neighbours(pos: &[[f64; 3]], r_cut: f64) -> bool {
-    let r2 = r_cut * r_cut;
-    pos.iter().enumerate().all(|(i, a)| {
-        pos[i + 1..].iter().all(|b| {
-            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2
-        })
-    })
+    surrogate::no_neighbours(pos, r_cut)
 }
 
 /// Why a pass on a scene where no atom has a neighbour within `r_cut` is refused.
@@ -2674,6 +2675,7 @@ impl Trainable for SurrogateKs {
             superseded: self.superseded(),
             box_excluded: self.box_excluded(),
             held_out: self.held_out(),
+            lone: self.lone_held_out(),
             box_affected: self.box_affected(),
             trust_floor: self.trust_floor(),
             unfitted: self.unfitted(),

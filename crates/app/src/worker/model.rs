@@ -255,13 +255,21 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
 }
 
 /// The hover text of the "fit vs held" line.
-pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; new ones arrived after the last refit";
+pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; lone atoms (no neighbour within the cutoff, kept before such answers were refused) teach nothing; new ones arrived after the last refit";
 
 /// "fit N of S held: B box-excluded, Q quarantined, X superseded, P newer than the fit" — every
 /// sample the store holds beyond the fit, by reason (exact right after a refit, M6 Task 11:
 /// the user's unexplained "230 vs 250").
-pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, held_out: usize, unfitted: usize) -> String {
-    let parts: Vec<String> = [(box_excluded, "box-excluded"), (quarantined, "quarantined"), (superseded, "superseded"), (held_out, "draft guesses held out"), (unfitted, "newer than the fit")]
+#[allow(clippy::too_many_arguments)]
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+    let parts: Vec<String> = [
+        (box_excluded, "box-excluded"),
+        (quarantined, "quarantined"),
+        (superseded, "superseded"),
+        (held_out, "draft guesses held out"),
+        (lone, "lone atoms held out"),
+        (unfitted, "newer than the fit"),
+    ]
         .into_iter()
         .filter(|&(k, _)| k > 0)
         .map(|(k, what)| format!("{k} {what}"))
@@ -695,7 +703,7 @@ impl Worker {
             unfitted: st.unfitted,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
-            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.held_out, st.unfitted)),
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.held_out, st.lone, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
@@ -765,9 +773,10 @@ mod fit_vs_held_tests {
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
     fn the_fit_vs_held_line_names_what_the_fit_left_out() {
-        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0), "250 of 250 held");
-        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
-        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
-        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 3, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 3, 0, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 5, 0), "40 of 45 held: 5 lone atoms held out");
     }
 }

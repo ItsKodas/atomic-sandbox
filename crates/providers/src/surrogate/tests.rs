@@ -9648,3 +9648,175 @@ fn a_new_species_does_not_raise_the_sample_floor_of_the_keys_it_does_not_touch()
         assert_eq!(last.get(k), Some(v), "{k}");
     }
 }
+
+/// A sample of lone H atoms as a collection record of the 33³ box (user-fix-4): even `k` one atom,
+/// odd `k` two atoms 7.1 Bohr apart (beyond the 6 Bohr cutoff, inside the cell's margin) — what a
+/// collection appended to before the keep rule (e842928) may hold. Its energy is Σ ref plus an
+/// isolated atom's grid/box artefact, its forces zero.
+fn lone_record(k: usize) -> surrogate::CollectionSample {
+    let x = 0.05 * k as f64;
+    let (pos, z) = if k % 2 == 0 { (vec![[x, 0.0, 0.0]], vec![1]) } else { (vec![[-2.5 + x, -2.5, 0.0], [2.5, 2.5, 0.0]], vec![1, 1]) };
+    let n = z.len();
+    let sample = Sample { pos, z, energy: n as f64 * SpeciesMorse::atom(1) + 1e-4 * k as f64, forces: vec![[0.0; 3]; n], tag: SampleTag::Fallback, weight: 1.0 };
+    surrogate::CollectionSample { sample, grid_n: 33, multiplicity_forced: false, multiplicity: Some(2), scene: "H".into() }
+}
+
+/// User-fix-4: a collection holding lone-atom samples stored before the keep rule (appended here
+/// directly, bypassing it) attaches with them held out of the fit (`Q_LONE`) and says so once;
+/// the fit, the readouts and a later refit never see them; quarantine release never takes one
+/// back; and nothing is written to the collection for them (`samples.bin` unchanged after a
+/// flush, their codes the stored ones).
+#[test]
+fn lone_samples_stored_before_the_keep_rule_are_held_out_at_attach() {
+    let dir = collection_root("lone-attach");
+    let scene = h2(1.4);
+    // a session teaches H₂ (40 teacher answers, the H reference of the 33³ box)
+    let key = {
+        let (mut s, _) = pair_student();
+        s.attach_collection(&dir, &scene).unwrap();
+        let mut rng = StdRng::seed_from_u64(31);
+        s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+        for i in 0..40 {
+            s.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+        }
+        s.refit().unwrap();
+        assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+        s.collection().unwrap().key.clone()
+    };
+    // an older build appended five lone-atom samples, and once quarantined one of them
+    let lone: Vec<usize> = (40..45).collect();
+    {
+        let (mut c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.samples.len(), 40);
+        for k in 0..5 {
+            c.append(lone_record(k)).unwrap();
+        }
+        c.set_status(41, Q_HELD).unwrap();
+    }
+    let bin = dir.join(key.slug()).join("samples.bin");
+    let stored = std::fs::read(&bin).unwrap();
+    let mut want_codes = vec![Q_NONE; 45];
+    want_codes[41] = Q_HELD;
+
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &scene).unwrap();
+    assert_eq!(s.samples(), 45);
+    assert_eq!(s.lone_held_out(), 5);
+    assert!(lone.iter().all(|&i| s.quarantine[i] == Q_LONE && s.excluded(i)), "{:?}", &s.quarantine);
+    assert!((0..40).all(|i| !s.excluded(i)));
+    let note = format!("shared collection {}: 5 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit — they teach nothing (kept on disk, unchanged)", key.slug());
+    assert_eq!(s.user_notes.iter().filter(|n| **n == note).count(), 1, "said once: {:?}", s.user_notes);
+    // the fit formed at attach without them; the readouts count them
+    let rep = s.report().expect("fitted at attach").clone();
+    assert_eq!(rep.n_samples, 40, "the lone samples are not fitted");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let st = Trainable::status(&s, &scene, &[[0.0; 3]; 2]);
+    assert_eq!((st.lone, st.quarantined, st.held_out, st.box_excluded), (5, 0, 0, 0));
+    assert_eq!(st.fit.unwrap().0 + st.quarantined + st.superseded + st.box_excluded + st.held_out + st.lone + st.unfitted, st.samples, "fit vs held reconciles");
+    let views = s.training_views().expect("views");
+    let states: Vec<sim::activity::SampleState> = views.parity_energy.iter().filter(|p| lone.contains(&p.index)).map(|p| p.state).collect();
+    assert!(!states.is_empty() && states.iter().all(|&x| x == sim::activity::SampleState::Lone), "{states:?}");
+    // never released, never fencing; a refit (a rebuild) leaves them out
+    assert_eq!(s.release_reproduced(), 0);
+    assert_eq!(s.quarantined(), 0, "the stored Q_HELD of a lone sample is not a quarantine here");
+    assert!(s.near_quarantined(&lone_record(0).sample.pos, &[1]).is_empty());
+    s.species_dirty = true;
+    let rep = s.refit().unwrap();
+    assert_eq!(rep.n_samples, 40);
+    assert!(lone.iter().all(|&i| s.quarantine[i] == Q_LONE), "{:?}", &s.quarantine);
+    // nothing written for them: the collection's codes stand, its file is unchanged after a flush
+    assert_eq!(s.collection().unwrap().quarantine, want_codes);
+    s.flush_collection();
+    drop(s);
+    assert_eq!(std::fs::read(&bin).unwrap(), stored, "samples.bin unchanged: no status record for a lone sample");
+    let (again, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert_eq!(again.quarantine, want_codes);
+}
+
+/// User-fix-4: a collection holding nothing but lone atoms attaches as the no-model case does —
+/// no fit, the no-model words name 0 usable samples, no Retry.
+#[test]
+fn a_collection_of_only_lone_atoms_attaches_with_no_model() {
+    let dir = collection_root("lone-only");
+    let scene = h2(1.4);
+    let (s0, _) = pair_student();
+    let key = s0.provenance_for(&scene).surface_key();
+    drop(s0);
+    {
+        let (mut c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+        c.set_reference(1, surrogate::CollectionReference { energy: SpeciesMorse::atom(1), grid_n: Some(33), face_density: Some(0.0) }).unwrap();
+        for k in 0..6 {
+            c.append(lone_record(k)).unwrap();
+        }
+    }
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &scene).unwrap();
+    assert_eq!((s.samples(), s.lone_held_out()), (6, 6));
+    assert!(s.model().is_none());
+    let nm = s.no_model().expect("the no-model case");
+    assert!(nm.words.starts_with("no model yet: 0 usable samples, a fit needs Q′"), "{}", nm.words);
+    assert!(!nm.retry && nm.missing.is_empty());
+    assert!(s.user_notes.iter().any(|n| n.contains("6 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit")), "{:?}", s.user_notes);
+}
+
+/// User-fix-4, the per-scene file: a model file whose fit used lone-atom samples (written before
+/// the keep rule) installs with them held out and its fit rebuilt without them (no DFT); release
+/// never takes one back; a save writes the codes they were loaded with. A file with nothing but
+/// lone atoms to fit installs as the no-model case.
+#[test]
+fn lone_samples_in_a_model_file_are_held_out_at_load() {
+    let (mut s, _) = pair_student();
+    let mut rng = StdRng::seed_from_u64(31);
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    for i in 0..40 {
+        s.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    // the old keep path: three lone samples stored as any other, one box-excluded (a code a refit
+    // never releases)
+    let prov = s.provenance_for(&h2(1.4));
+    for k in 0..3 {
+        s.add_sample_with_provenance(lone_record(k).sample, &prov).unwrap();
+    }
+    s.quarantine.resize(43, Q_NONE);
+    s.quarantine[41] = Q_BOX;
+    s.species_dirty = true;
+    s.refit().unwrap();
+    assert_eq!(s.report().unwrap().n_samples, 42, "the premise: the old fit used two lone samples");
+    let dir = collection_root("lone-file");
+    let path = dir.join("old.model");
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    assert_eq!(file.quarantine[40..], [Q_NONE, Q_BOX, Q_NONE]);
+
+    let (mut back, _) = pair_student();
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    assert_eq!(back.lone_held_out(), 3);
+    assert!((40..43).all(|i| back.quarantine[i] == Q_LONE));
+    assert_eq!(back.report().unwrap().n_samples, 40, "rebuilt without them");
+    assert!(back.trusted(), "{:?}", back.untrusted_reason());
+    assert!(
+        back.user_notes.iter().any(|n| n == "model file: 3 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit — they teach nothing (kept on disk, unchanged)"),
+        "{:?}",
+        back.user_notes
+    );
+    assert!(back.user_notes.iter().any(|n| n.contains("its fit used 2 of them — rebuilt")), "{:?}", back.user_notes);
+    assert!(!back.user_notes.iter().any(|n| n.contains("fit membership")), "not a membership mismatch: {:?}", back.user_notes);
+    assert_eq!(back.release_reproduced(), 0);
+    assert_eq!((back.quarantined(), back.box_excluded()), (0, 0));
+    // the codes on disk are the ones they were loaded with
+    let again = dir.join("again.model");
+    back.save_sidecar(&again).unwrap();
+    assert_eq!(surrogate::sidecar::read(&again).unwrap().quarantine[40..], [Q_NONE, Q_BOX, Q_NONE]);
+
+    // nothing but lone atoms to fit: the samples install with no model
+    let mut only = surrogate::sidecar::read(&path).unwrap();
+    for q in &mut only.quarantine[..40] {
+        *q = Q_BOX;
+    }
+    let (mut none, _) = pair_student();
+    none.install_sidecar(only).unwrap();
+    assert!(none.model().is_none());
+    assert_eq!((none.samples(), none.lone_held_out()), (43, 3));
+    assert!(none.no_model().is_some_and(|nm| nm.words.starts_with("no model yet: 0 usable samples")), "{:?}", none.no_model().map(|n| n.words));
+    assert!(none.user_notes.iter().any(|n| n.starts_with("model file: 3 samples of lone atoms")), "{:?}", none.user_notes);
+}

@@ -140,6 +140,7 @@ impl SurrogateKs {
         self.last_variance = None;
         self.answered = 0;
         self.quarantine.clear();
+        self.lone_codes.clear();
         self.face.clear();
         self.fence_votes.clear();
         self.fence_kept.clear();
@@ -172,8 +173,9 @@ impl SurrogateKs {
         }
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it)
-        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT).unwrap_or(Q_NONE)).collect();
+        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it); a
+        // lone sample (`Q_LONE`, provider-only) writes the code it was loaded with
+        let flags: Vec<u8> = (0..samples.len()).map(|i| self.persisted_code(i)).collect();
         // the face densities whenever one is known (M8a Task 4a: a collection imports a sample only
         // when its box status can be judged — `surrogate::collection`, "Admission"; before, the
         // array was written only when a sample was box-affected, so a clean file read as unknown)
@@ -256,6 +258,10 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        // samples of lone atoms kept before the keep rule refused them: held out (`Q_LONE`)
+        let r_cut = self.cutoff();
+        let lone = self.hold_out_lone(r_cut);
+        self.note_lone_held_out("model file", lone, r_cut);
         // references of another rule are not fitted on (a new fit would bake them in — the model has
         // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
         let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
@@ -325,6 +331,35 @@ impl SurrogateKs {
         if model.ref_energy.len() != model.basis.n_species() {
             return Err("the file's reference energies do not match its species".into());
         }
+        // samples of lone atoms kept before the keep rule refused them are held out (`Q_LONE`,
+        // below). A fit that cannot form without them leaves the file's samples installed with no
+        // model — the no-model case of a samples file (`install_samples`), which this set is
+        let lone_cut = model.basis.r_cut;
+        let lone_fallback = samples.iter().any(|s| no_neighbours(&s.pos, lone_cut)).then(|| surrogate::SampleSet {
+            provenance: model.provenance.clone(),
+            samples: samples.clone(),
+            references: model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect(),
+            reference_rule: reference_rule.clone(),
+            quarantine: quarantine.clone(),
+            face_density: face_density.clone(),
+            sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves,
+            teacher_solves_note: teacher_solves_note.clone(),
+            created_by: surrogate::sidecar::CREATED_BY.to_string(),
+        });
+        if let Some(set) = lone_fallback.as_ref() {
+            let usable = (0..set.samples.len())
+                .filter(|&i| !no_neighbours(&set.samples[i].pos, lone_cut) && set.samples[i].tag != SampleTag::DraftAudit && set.quarantine.get(i).is_none_or(|&q| q == Q_NONE))
+                .count();
+            if usable == 0 {
+                let set = lone_fallback.expect("checked");
+                self.install_samples(set)?;
+                self.user_notes.push("model file: besides its lone atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
+                return Ok(());
+            }
+        }
         // a draft guess's audit is held out of the fit (`Q_DRAFT`): restored from its tag
         let mut quarantine = quarantine;
         if let Some(last) = samples.iter().rposition(|s| s.tag == SampleTag::DraftAudit) {
@@ -367,6 +402,10 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        self.lone_codes.clear();
+        // the lone samples the file's fit held (`Q_LONE`; the prefix above is the file's own)
+        let lone = self.hold_out_lone(lone_cut);
+        let lone_in_fit = self.lone_codes.iter().filter(|&(&i, &q)| i < self.accumulated && q == Q_NONE).count();
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
@@ -438,12 +477,28 @@ impl SurrogateKs {
             (s.yy_e, s.yy_f)
         });
         let (want_n, want_rows) = self.report.as_ref().map_or((members, rows), |r| (r.n_samples, r.n_rows));
-        if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
+        if lone_in_fit > 0 {
+            // the file's fit used them: rebuilt from its stored samples without them (no DFT); a
+            // fit that cannot form leaves the samples with no model (the no-model case; its own
+            // install notes the lone samples)
+            self.species_dirty = true;
+            if let Err(e) = self.fit_store() {
+                self.install_samples(lone_fallback.expect("lone samples were found"))?;
+                self.user_notes.push(format!("model file: its fit cannot be rebuilt without its {lone_in_fit} lone-atom samples ({e}) — its samples are installed with no model yet"));
+                return Ok(());
+            }
+            self.note_lone_held_out("model file", lone, lone_cut);
+            self.user_notes.push(format!("model file: its fit used {lone_in_fit} of them — rebuilt from its stored samples without them (no DFT)"));
+        } else if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
             self.species_dirty = true;
             self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
             self.user_notes.push(format!(
                 "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums — the fit was rebuilt from its stored samples (no DFT)"
             ));
+        }
+        if lone_in_fit == 0 {
+            // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
+            self.note_lone_held_out("model file", lone, lone_cut);
         }
         // round 1, SHOULD-2: the failed audits it still held, re-judged on this fit (not counted
         // as a refit's re-judgement)

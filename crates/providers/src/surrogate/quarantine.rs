@@ -52,6 +52,22 @@ pub(super) const Q_SUPERSEDED: u8 = surrogate::quarantine::Q_SUPERSEDED;
 /// quarantine, and this is not one).
 pub(super) const Q_REF_WAIT: u8 = 5;
 
+/// A stored sample of **lone atoms** — no atom has a neighbour within the model's cutoff
+/// ([`no_neighbours`]) — loaded from a collection or a file written before the keep rule refused
+/// such answers (`TeachOutcome::LoneNotKept`; user test M8a: 202 lone-H samples spread by 1.3 mHa
+/// failed rule 4's self-check and untrusted a whole collection). Every descriptor of such a
+/// sample is empty, so the model's answer there is Σ ref exactly (no intercept, `surrogate::fit`
+/// "Isolated-atom limit") and its label E − Σ ref(own box) is only the isolated atom's grid/box
+/// artefact: it teaches nothing. Set at load by [`SurrogateKs::hold_out_lone`] and **held out of
+/// the fit for good** — not fitted, not in the envelope, the grade, the leave-one-out or the
+/// thinning distance, never fencing, never released or superseded (only `Q_HELD` is), never
+/// promoted (only `Q_DRAFT` is), never moved by the box or reference rules (they touch only
+/// `Q_NONE` and `Q_REF_WAIT`). A provider-only code like [`Q_REF_WAIT`]: never written — a
+/// collection gets no status record for it (its own code stands), a saved file writes the code the
+/// sample was loaded with (`lone_codes`) — so nothing on disk changes and the samples stay for a
+/// model that may one day learn from them (long-range terms).
+pub(super) const Q_LONE: u8 = 6;
+
 /// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
 pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 
@@ -164,6 +180,58 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_DRAFT).count()
     }
 
+    /// Stored samples of lone atoms held out of the fit ([`Q_LONE`]).
+    pub fn lone_held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_LONE).count()
+    }
+
+    /// Holds every stored sample in which no atom has a neighbour within `r_cut` (Bohr) out of the
+    /// fit ([`Q_LONE`]), remembering the code it had (`lone_codes`: what a saved file writes back);
+    /// how many were newly held. Called where stored samples are installed (a collection's attach,
+    /// a model or samples file, a session-only file), never on a fresh teacher answer (the keep
+    /// rule refuses those).
+    pub(super) fn hold_out_lone(&mut self, r_cut: f64) -> usize {
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let lone: Vec<usize> = (0..store.len()).filter(|&i| self.quarantine.get(i) != Some(&Q_LONE) && no_neighbours(&store.samples[i].pos, r_cut)).collect();
+        if lone.is_empty() {
+            return 0;
+        }
+        let n = store.len();
+        self.quarantine.resize(n, Q_NONE);
+        for &i in &lone {
+            self.lone_codes.insert(i, self.quarantine[i]);
+            self.quarantine[i] = Q_LONE;
+        }
+        lone.len()
+    }
+
+    /// The code sample `i` is written to a file with: a lone sample's ([`Q_LONE`]) is the code it
+    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it) and `Q_REF_WAIT` (it
+    /// waits again at the reload) write as `Q_NONE`.
+    pub(super) fn persisted_code(&self, i: usize) -> u8 {
+        let q = match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
+            Q_LONE => self.lone_codes.get(&i).copied().unwrap_or(Q_NONE),
+            q => q,
+        };
+        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE {
+            Q_NONE
+        } else {
+            q
+        }
+    }
+
+    /// The user's note on [`hold_out_lone`](Self::hold_out_lone)'s count `k` of the samples from
+    /// `source` ("shared collection <slug>", "model file …").
+    pub(super) fn note_lone_held_out(&mut self, source: &str, k: usize, r_cut: f64) {
+        if k > 0 {
+            let r = format!("{r_cut}");
+            self.user_notes.push(format!(
+                "{source}: {k} sample{} of lone atoms (no neighbour within {r} Bohr) held out of the fit — they teach nothing (kept on disk, unchanged)",
+                if k == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     /// Stored samples kept since the last refit (not in the fit yet; M6 Task 11's reconciliation,
     /// `sim::TrainableStatus::unfitted`).
     pub fn unfitted(&self) -> usize {
@@ -215,8 +283,8 @@ impl SurrogateKs {
         true
     }
 
-    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded or a
-    /// held-out draft guess).
+    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded, a
+    /// held-out draft guess, waiting for its box's reference, or lone atoms).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -540,7 +608,8 @@ impl SurrogateKs {
     /// stored atom of its species) from the geometry to the nearest stored sample (thinning),
     /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
     /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
-    /// strict mode the region (round 1 re-review, R1-1). ∞ without a model, an envelope or a candidate.
+    /// strict mode the region (round 1 re-review, R1-1) — and so are lone atoms (`Q_LONE`: never
+    /// data). ∞ without a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -549,7 +618,7 @@ impl SurrogateKs {
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
             for (i, atoms) in self.desc_cache.iter().enumerate() {
-                if self.quarantine.get(i) == Some(&Q_DRAFT) {
+                if matches!(self.quarantine.get(i), Some(&Q_DRAFT) | Some(&Q_LONE)) {
                     continue;
                 }
                 for (s, b) in atoms {
