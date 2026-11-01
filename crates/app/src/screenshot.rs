@@ -88,6 +88,9 @@ pub struct ShotUi {
     pub ptable: Option<String>,
     pub wait_bonds: bool,
     pub wait_model: bool,
+    /// `load=<file>`: a saved `.model` loaded into the estimated solver after the first solve
+    /// (then the shot waits for it like `wait=model`).
+    pub load: Option<String>,
     /// `wait=relax`: relax the geometry (FIRE, Physics ▸ Relax geometry) after the first solve and shoot the relaxed
     /// scene; prints a "relax summary" line with the distances and the angles at each nucleus (the M7 Task 13 checklist
     /// shot of relaxed water).
@@ -110,6 +113,8 @@ pub struct ShotUi {
     pub aids_off: bool,
     pub dots_by_orbital: Option<bool>,
     pub nucleus_scale: Option<f32>,
+    /// `camera=on|off`: the Camera view (the atoms as they look) over the Volume or the Dots.
+    pub camera: Option<bool>,
     /// `trails=on|off`, `trail_fs=<fs>`, `trail_opacity=<0-100>`.
     pub trails: Option<bool>,
     pub trail_fs: Option<f64>,
@@ -254,6 +259,14 @@ impl ShotUi {
                     }
                     s.trail_opacity = Some(pct);
                 }
+                "camera" => {
+                    s.camera = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("--ui: camera=on|off, got {v}")),
+                    })
+                }
+                "load" => s.load = Some(v.to_string()),
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
                     s.render = Some(match v {
@@ -379,6 +392,9 @@ impl ShotUi {
             viewer.camera.distance = x;
         }
         viewer.ui.nucleus_scale = self.nucleus_scale;
+        if let Some(on) = self.camera {
+            viewer.ui.camera_view = on && viewer.ui.volume_mode != crate::ui::VOLUME_ISO;
+        }
         if let Some(on) = self.ghost {
             viewer.ui.show_ghost = on;
         }
@@ -559,7 +575,10 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     } else {
         wait_for_first_solve(&mut viewer, hl, painter)?;
     }
-    if o.ui.wait_model {
+    if let Some(file) = &o.ui.load {
+        viewer.send(crate::worker::Command::Dyn(::sim::DynCommand::LoadModel(file.into())));
+        wait_for_fitted(&mut viewer, hl, painter)?;
+    } else if o.ui.wait_model {
         wait_for_fitted(&mut viewer, hl, painter)?;
     } else if sample {
         wait_for_model(&mut viewer, hl, painter)?;
@@ -882,6 +901,19 @@ fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
         viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
             return Err("--sample needs the estimated solver (--estimated)".into());
+        }
+        // a pass the worker only offers (its first solve was slow — the pseudopotential's generation
+        // counts): `--sample` asked for it, so it is "Start anyway"
+        let offer = viewer
+            .snapshot
+            .as_ref()
+            .filter(|s| !crate::sim::sampling_active(&s.dynamics))
+            .and_then(|s| s.model.as_ref())
+            .and_then(|m| m.pass_offer.as_ref())
+            .map(|o| o.plan.clone());
+        if let Some(plan) = offer {
+            eprintln!("--sample: starting the offered pass");
+            viewer.apply(crate::ui::Action::StartOffered(plan));
         }
     }
 }

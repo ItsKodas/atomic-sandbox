@@ -29,6 +29,9 @@ pub struct ToolState {
     pub gizmo: Option<GizmoDrag>,
     /// The Edit tool's box selection: where the left button went down on empty space.
     pub boxing: Option<(f32, f32)>,
+    /// The Edit tool's clipboard (Ctrl C): each copied nucleus's Z, isotope and position relative
+    /// to the copied group's centroid (Bohr).
+    pub clipboard: Vec<(u8, Option<u16>, [f64; 3])>,
 }
 
 impl ToolState {
@@ -53,6 +56,9 @@ impl ToolState {
 pub enum Handle {
     Axis(usize),
     Plane(usize),
+    /// The ring around axis k: dragging it turns the selection about that axis through its centroid
+    /// (user request 2026-10-21).
+    Ring(usize),
 }
 
 /// A held Edit handle: the selection's positions when it was grabbed, the point on the handle's
@@ -66,6 +72,10 @@ pub struct GizmoDrag {
     pub resume: bool,
     /// The offset applied so far (Bohr).
     pub delta: [f64; 3],
+    /// A ring: the cursor's screen angle about the centroid when it was grabbed, and the turn
+    /// applied so far (radians, about the ring's axis).
+    pub start_angle: f32,
+    pub angle: f64,
 }
 
 /// The handles' arrow length on screen (window physical pixels).
@@ -124,11 +134,66 @@ pub fn gizmo_hit(cam: &OrbitCamera, vp: Viewport, c: Vec3, px: f32, py: f32) -> 
     if let Some((_, k)) = axis_hit {
         return Some(Handle::Axis(k));
     }
+    // the rings: within 7 px of the projected circle (the nearest)
+    let ring_hit = (0..3)
+        .filter_map(|k| {
+            let pts: Option<Vec<(f32, f32)>> = ring_points(c, l, k).iter().map(|p| project(cam, *p, vp)).collect();
+            let pts = pts?;
+            let d = pts.windows(2).map(|w| seg_dist((px, py), w[0], w[1])).fold(f32::INFINITY, f32::min);
+            (d < 7.0).then_some((d, k))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, k)) = ring_hit {
+        return Some(Handle::Ring(k));
+    }
     (0..3).find_map(|k| {
         let q = plane_quad(c, l, k);
         let q_px = [project(cam, q[0], vp)?, project(cam, q[1], vp)?, project(cam, q[2], vp)?, project(cam, q[3], vp)?];
         in_quad((px, py), &q_px).then_some(Handle::Plane(k))
     })
+}
+
+/// The rings' radius, a fraction of the arrow length.
+pub const RING_RADIUS: f32 = 0.78;
+
+/// The ring around axis `k` (a closed polyline of 65 points, the first repeated last).
+pub fn ring_points(c: Vec3, l: f32, k: usize) -> Vec<Vec3> {
+    let (a, b) = (axis((k + 1) % 3), axis((k + 2) % 3));
+    let r = RING_RADIUS * l;
+    (0..=64).map(|i| {
+        let t = std::f32::consts::TAU * i as f32 / 64.0;
+        c + (a * t.cos() + b * t.sin()) * r
+    }).collect()
+}
+
+/// The cursor's angle about the projected centroid on screen (radians, y down).
+pub fn screen_angle(c_px: (f32, f32), px: f32, py: f32) -> f32 {
+    (py - c_px.1).atan2(px - c_px.0)
+}
+
+/// The turn about axis `k` that follows a cursor moved by `d_screen` radians around the centroid on
+/// screen: the selection turns the way the cursor goes, seen from the camera (the axis pointing at
+/// the eye turns counter-clockwise on screen for a positive angle; screen y points down).
+pub fn ring_turn(cam: &OrbitCamera, c: Vec3, k: usize, d_screen: f32) -> f64 {
+    let toward_eye = axis(k).dot(cam.eye() - c).signum();
+    -(d_screen as f64) * toward_eye as f64
+}
+
+/// `p` turned by `angle` (radians, right-handed) about axis `k` through `c`.
+pub fn rotate_about(p: [f64; 3], c: [f64; 3], k: usize, angle: f64) -> [f64; 3] {
+    let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+    let (x, y) = (p[i] - c[i], p[j] - c[j]);
+    let (sn, cs) = angle.sin_cos();
+    let mut out = p;
+    out[i] = c[i] + cs * x - sn * y;
+    out[j] = c[j] + sn * x + cs * y;
+    out
+}
+
+/// The mean of `pos` (f64).
+pub fn mean(pos: &[[f64; 3]]) -> [f64; 3] {
+    let n = pos.len().max(1) as f64;
+    std::array::from_fn(|k| pos.iter().map(|p| p[k]).sum::<f64>() / n)
 }
 
 /// The point under the pixel on the handle's line (the closest point of the axis through `c` to
@@ -154,6 +219,8 @@ pub fn handle_point(cam: &OrbitCamera, vp: Viewport, px: f32, py: f32, h: Handle
             }
             ray_plane(o, d, c, n)
         }
+        // a ring is dragged by its screen angle (`screen_angle`), not by a point
+        Handle::Ring(_) => Some(c),
     }
 }
 
@@ -163,6 +230,7 @@ pub fn handle_delta(h: Handle, start: Vec3, now: Vec3) -> [f64; 3] {
     match h {
         Handle::Axis(k) => (0..3).filter(|&j| j != k).for_each(|j| d[j] = 0.0),
         Handle::Plane(k) => d[k] = 0.0,
+        Handle::Ring(_) => d = [0.0; 3],
     }
     d
 }
@@ -497,6 +565,25 @@ mod tests {
         assert_eq!(clamp_delta(&base, [3.0, -0.5, 0.0], &s), [1.125, -0.5, 0.0]);
         let one = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
         assert_eq!(box_select(&cam, vp, &one, (c_px.0 - 10.0, c_px.1 - 10.0), (c_px.0 + 10.0, c_px.1 + 10.0)), vec![0]);
+    }
+
+    /// The rotation helpers: a quarter turn about z maps x onto y; the ring is hit on its circle;
+    /// a cursor going counter-clockwise on screen around a z axis pointing at the eye turns +z.
+    #[test]
+    fn rings_turn_the_selection_the_way_the_cursor_goes() {
+        let q = rotate_about([1.0, 0.0, 0.5], [0.0; 3], 2, std::f64::consts::FRAC_PI_2);
+        assert!((q[0]).abs() < 1e-12 && (q[1] - 1.0).abs() < 1e-12 && q[2] == 0.5);
+        let cam = OrbitCamera::new(Vec3::new(0.3, 0.2, 0.1), 10.0);
+        let vp = Viewport::full(800.0, 600.0);
+        let c = Vec3::ZERO;
+        let l = gizmo_length(&cam, c, vp).unwrap();
+        // a point of the z ring that projects away from the arrows: the one farthest from the axes' tips
+        let pts = ring_points(c, l, 2);
+        let hit = pts.iter().filter_map(|p| project(&cam, *p, vp)).find(|p| matches!(gizmo_hit(&cam, vp, c, p.0, p.1), Some(Handle::Ring(2))));
+        assert!(hit.is_some(), "the z ring is hit somewhere on its circle");
+        // screen y down: a negative screen-angle change is counter-clockwise as seen
+        let sign = axis(2).dot(cam.eye() - c).signum() as f64;
+        assert_eq!(ring_turn(&cam, c, 2, -0.1).signum(), sign);
     }
 
     #[test]
