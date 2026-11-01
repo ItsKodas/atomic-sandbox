@@ -700,7 +700,8 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
                 for c in &m.class_loo {
                     ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
                     // per environment species (M8a user-test fix 2): an atom answers by its own
-                    for s in c.species.iter().filter(|_| c.species.len() > 1) {
+                    // … and always under a refused class, so the short key is named (M8a user-fix 3)
+                    for s in c.species.iter().filter(|_| c.species.len() > 1 || !c.trusted) {
                         ui.colored_label(if s.trusted { GREEN } else { AMBER }, RichText::new(species_line(c.class, s)).monospace());
                     }
                 }

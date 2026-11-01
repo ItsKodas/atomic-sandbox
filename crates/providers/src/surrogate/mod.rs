@@ -693,7 +693,8 @@
 //! fence-capable samples; the 33³ GPU round trip needs them kept). They are stored with their face
 //! density (sidecar `sample_face_density`) and are **never quarantine candidates** — a
 //! box-affected sample must not fence its descriptor neighbourhood (Task 9 fix round 1, S1) —
-//! and once the store holds the trust floor (Q′ + 30) without them, the next refit excludes
+//! and once the store holds the trust floor (the columns the usable atoms touch + 30; Q′ + 30
+//! before M8a user-fix 3's ruling on concern 2) without them, the next refit excludes
 //! them from the fit for good (`box_excluded()`, sidecar code 3). Until then the
 //! training-residual gate bounds any bias such a sample can leave in an early fit: either the
 //! model reproduces it within the tier (so the bias is under the tier) or the model stays
@@ -767,7 +768,8 @@
 //! - **Said plainly.** [`no_model`](SurrogateKs::no_model) gives the reason, in this order: a
 //!   species whose reference is missing ("the P atom reference did not solve (4 cold attempts:
 //!   SCF stalled …)" — the failed scan is remembered per species until an energy arrives), too
-//!   few usable samples for Q′, the last fit error, a fit not made yet; `TrainableStatus::no_model`
+//!   few usable samples for the columns their atoms touch (`fit_floor`; the same floor gates the
+//!   end-of-pass refit, M8a user-fix 3), the last fit error, a fit not made yet; `TrainableStatus::no_model`
 //!   carries the words to the Model and Activity tabs.
 //! - **Retried where that can help** (physics review of the fix). A cold solve is deterministic, so
 //!   the reference scan retries only a multiplicity lost to the device, once, cold, after its first
@@ -1085,6 +1087,10 @@ pub struct SurrogateKs {
     /// Consultations since the variance was last evaluated (the cadence, module doc).
     consults: usize,
     last_variance: Option<VarianceVerdict>,
+    /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
+    /// keyed by a fingerprint of those samples and that basis (`fit_floor`; the status asks for it
+    /// every snapshot, a descriptor pass over the store each time would cost ms).
+    fit_floor_cache: std::sync::Mutex<Option<(u64, usize)>>,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1312,6 +1318,7 @@ impl SurrogateKs {
             last: None,
             consults: 0,
             last_variance: None,
+            fit_floor_cache: std::sync::Mutex::new(None),
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
@@ -2151,7 +2158,7 @@ impl SurrogateKs {
             "sampling pass"
         };
         self.teacher.discontinuity();
-        let (fittable, q_prime) = self.fittable_and_q_prime();
+        let (fittable, floor, q_prime) = self.fittable_and_floor();
         // the shell checks are judged against this pass's own refit only (final review M2): with
         // no refit the model standing is none or an earlier fit, whose verdict on the shell is
         // not this pass's measurement
@@ -2162,12 +2169,16 @@ impl SurrogateKs {
         let msg = if self.samples() == 0 {
             unjudged = Some("the pass fitted no model".into());
             format!("{kind} {how}: no samples to fit")
-        } else if fittable < q_prime {
-            unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below Q′ = {q_prime}"));
-            // below Q′ the model cannot earn trust (the trust rule needs n ≥ Q′), and the fit
-            // with its trust recovery costs seconds on the worker thread (Task 3 fix round 2):
-            // keep the samples, skip the refit until there are enough
-            format!("{kind} {how}: {fittable} samples kept — not enough to fit (Q′ = {q_prime}); sample more to train")
+        } else if fittable < floor {
+            unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below the {floor} model columns their atoms touch"));
+            // below the floor the model cannot earn trust (the trust rule needs n ≥ |∪ S_k|,
+            // `sample_floor`), and the fit with its trust recovery costs seconds on the worker
+            // thread (Task 3 fix round 2): keep the samples, skip the refit until there are
+            // enough. The floor is the columns the samples' atoms touch, not the basis's Q′ (M8a
+            // user-fix 3, the controller's ruling on concern 2): a new species in a large
+            // collection raises Q′ by its own block, and N₂ trained into a 1200-sample water
+            // store would otherwise never refit
+            format!("{kind} {how}: {fittable} samples kept — not enough to fit ({floor} model columns their atoms touch; Q′ {q_prime}); sample more to train")
         } else {
             match SurrogateKs::refit(self) {
                 Ok(r) => {
@@ -2254,16 +2265,49 @@ impl SurrogateKs {
         (c.total > 0).then_some(c)
     }
 
-    /// The stored samples a fit would use (not quarantined, superseded or box-excluded) and the
-    /// Q′ of the basis it would build for them (`surrogate::fit`, the independent columns; the
-    /// trust rule needs n ≥ Q′). (0, 0) without samples.
-    fn fittable_and_q_prime(&self) -> (usize, usize) {
-        let Some(store) = self.store.as_ref() else { return (0, 0) };
+    /// The stored samples a fit would use (not quarantined, superseded, box-excluded or held
+    /// out), the floor they must reach — the independent columns their atoms touch in the basis
+    /// the fit would build, |∪ S_k| ([`fit_floor`](Self::fit_floor); the trust rule's
+    /// `sample_floor`) — and that basis's Q′ (a readout). (0, 0, 0) without samples.
+    ///
+    /// No count is needed by the fit itself: a column no fitted atom touches has an all-zero Gram
+    /// row and column, and the ridge prior holds its coefficient at 0 (`surrogate::fit`, "Ridge
+    /// floor"; the solve fails only for an all-zero Gram at λ = 0, `FitError::Singular`).
+    fn fittable_and_floor(&self) -> (usize, usize, usize) {
+        let Some(store) = self.store.as_ref() else { return (0, 0, 0) };
         let n = (0..store.samples.len()).filter(|&i| !self.excluded(i)).count();
         let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         species.sort_unstable();
         species.dedup();
-        (n, self.fit_basis(&species).column_classes().len())
+        let basis = self.fit_basis(&species);
+        (n, self.fit_floor(&basis), basis.column_classes().len())
+    }
+
+    /// The independent columns of `basis` the atoms of the samples a fit would use touch,
+    /// |∪ S_k| (`trust::key_column_counts`), or the basis's Q′ when they touch none (no usable
+    /// sample): the floor every gate on fitting counts against (M8a user-fix 3, the controller's
+    /// ruling on concern 2: the global Q′ gates fitting nowhere). Cached on a fingerprint of the
+    /// samples (count, energies, held-out codes) and the basis (species, shape).
+    pub(super) fn fit_floor(&self, basis: &Basis) -> usize {
+        use std::hash::{Hash, Hasher};
+        let Some(store) = self.store.as_ref() else { return basis.n_independent_columns() };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        store.samples.len().hash(&mut h);
+        for s in &store.samples {
+            s.energy.to_bits().hash(&mut h);
+        }
+        self.quarantine.hash(&mut h);
+        (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.r_cut.to_bits()).hash(&mut h);
+        let key = h.finish();
+        if let Some((k, f)) = *self.fit_floor_cache.lock().unwrap() {
+            if k == key {
+                return f;
+            }
+        }
+        let union = trust::key_column_counts(basis, store.samples.iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
+        let f = if union > 0 { union } else { basis.n_independent_columns() };
+        *self.fit_floor_cache.lock().unwrap() = Some((key, f));
+        f
     }
 
     /// The basis a fit of these species is built on: the default (`Basis::new`), the recovery
@@ -2838,7 +2882,7 @@ impl SurrogateKs {
         species.sort_unstable();
         species.dedup();
         let missing: Vec<u8> = species.iter().copied().filter(|z| !self.refs.get(z).is_some_and(|e| e.is_finite())).collect();
-        let (fittable, q_prime) = self.fittable_and_q_prime();
+        let (fittable, floor, q_prime) = self.fittable_and_floor();
         let n = self.samples();
         // a reference whose SCF itself fails: a cold solve is deterministic (`sim::references`,
         // "The retry round"), so neither Retry nor another pass on this surface can change it
@@ -2862,11 +2906,11 @@ impl SurrogateKs {
                     None => format!("the {} atom reference is not solved yet", symbol(z)),
                 })
                 .collect();
-            if fittable < q_prime {
+            if fittable < floor {
                 // a pass solves the references first: sampling more is the remedy for both
                 return Some(NoModel {
                     words: format!(
-                        "no model yet: {} usable samples, a fit needs Q′ = {q_prime}, and {} — sample more (a pass solves the references first; the {n} samples so far are kept)",
+                        "no model yet: {} usable samples, a fit needs {floor} (the model columns their atoms touch; Q′ {q_prime}), and {} — sample more (a pass solves the references first; the {n} samples so far are kept)",
                         fittable,
                         parts.join("; ")
                     ),
@@ -2883,9 +2927,9 @@ impl SurrogateKs {
                 missing,
             });
         }
-        if fittable < q_prime {
+        if fittable < floor {
             return Some(NoModel {
-                words: format!("no model yet: {fittable} usable samples, a fit needs Q′ = {q_prime} — sample more (the {n} samples so far are kept)"),
+                words: format!("no model yet: {fittable} usable samples, a fit needs {floor} (the model columns their atoms touch; Q′ {q_prime}) — sample more (the {n} samples so far are kept)"),
                 retry: false,
                 missing,
             });

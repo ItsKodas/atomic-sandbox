@@ -53,8 +53,16 @@
 //! store is below Q′ (1200 water samples and 5 N₂ against Q′ ≈ 1590). Measured
 //! (`the_whole_model_floor_is_the_columns_the_fitted_atoms_touch`): 440 H/O samples, floor 142 of
 //! Q′ 176; five N₂ join, floor 171 = 142 + N₂'s own 29 against Q′ 543, n 445 — trusted, water
-//! answered. The basis's Q′ stays only where no class judgement exists (no store) and as the
-//! sampling pass's and the no-model readout's "enough to fit" gate.
+//! answered. The gates on fitting count the same floor (the controller's ruling on concern 2):
+//! the end-of-pass refit and the no-model readout need the usable samples to reach the columns
+//! their atoms touch in the basis the fit would build (`SurrogateKs::fit_floor`), and the box
+//! exclusion waits for that floor + 30 (`trust_floor`) — so a pass bringing N₂ into a 1200-sample
+//! water store refits (`a_pass_bringing_a_new_species_into_a_large_store_refits`: 480 samples,
+//! floor 171, Q′ 543, the N₂ key 40 of 29 and learned). The fit itself needs no count: a column no
+//! fitted atom touches has an all-zero Gram row and column and the ridge prior holds its
+//! coefficient at 0. The basis's Q′ stays only where no class judgement exists (no store) and
+//! as the no-model keep cap ([`super::NO_MODEL_SAMPLE_FACTOR`] · Q′, which only bounds how many
+//! answers are kept before a first fit).
 //!
 //! # What the verdict asks
 //!

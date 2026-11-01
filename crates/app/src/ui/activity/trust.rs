@@ -97,8 +97,10 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
                 }
             ),
         });
-        // per environment species when the class holds more than one (an atom answers by its own)
-        for s in l.species.iter().filter(|_| l.species.len() > 1) {
+        // per environment species when the class holds more than one (an atom answers by its own),
+        // and always for a refused class: its key's row says which key is short and of what (M8a
+        // user-fix 3, the controller's ruling on concern 1 — the user learns what to train)
+        for s in l.species.iter().filter(|_| l.species.len() > 1 || !l.trusted) {
             v.push(Line {
                 met: s.trusted,
                 why: false,

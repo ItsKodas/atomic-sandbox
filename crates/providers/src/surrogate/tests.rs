@@ -7237,8 +7237,8 @@ fn shell_checks_are_judged_against_the_passs_own_refit_or_said_unmeasured() {
     while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
     let notes = Trainable::take_notes(&mut s);
     println!("{}", notes.join("\n"));
-    let (fittable, q_prime) = s.fittable_and_q_prime();
-    assert!(s.model().is_none() && fittable < q_prime, "premise: below Q′ ({fittable} < {q_prime}), no fit");
+    let (fittable, floor, _) = s.fittable_and_floor();
+    assert!(s.model().is_none() && fittable < floor, "premise: below the fit floor ({fittable} < {floor}), no fit");
     assert!(
         notes.iter().any(|n| n.starts_with("sampling: the shell check of H–H at r = ") && n.contains("could not be judged (the pass's refit did not run") && n.ends_with("stays unmeasured")),
         "{notes:?}"
@@ -9761,7 +9761,7 @@ fn a_collection_of_only_lone_atoms_attaches_with_no_model() {
     assert_eq!((s.samples(), s.lone_held_out()), (6, 6));
     assert!(s.model().is_none());
     let nm = s.no_model().expect("the no-model case");
-    assert!(nm.words.starts_with("no model yet: 0 usable samples, a fit needs Q′"), "{}", nm.words);
+    assert!(nm.words.starts_with("no model yet: 0 usable samples, a fit needs "), "{}", nm.words);
     assert!(!nm.retry && nm.missing.is_empty());
     assert!(s.user_notes.iter().any(|n| n.contains("6 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit")), "{:?}", s.user_notes);
 }
@@ -9922,6 +9922,71 @@ fn the_whole_model_floor_is_the_columns_the_fitted_atoms_touch() {
     assert_eq!(floor3, floor + nn.1, "the floor grows by N₂'s own columns, which water's atoms never touch");
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
     assert!(nn.0 == 5 && !nn.2, "{nn:?}");
+    let water = random_water(&mut StdRng::seed_from_u64(77));
+    s.discontinuity();
+    assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate, "water is still answered");
+}
+
+/// [`PairMorse`] for two or more nuclei, E_atom for one: a pass's teacher over any species (its
+/// isolated-atom references included).
+struct AnyMorse;
+
+impl ForceProvider for AnyMorse {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 1 {
+            return AtomMorse(MorseDimer::h2()).evaluate(scene, a);
+        }
+        PairMorse(MorseDimer::h2()).evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// M8a user-fix 3, the controller's ruling on concern 2: the end-of-pass refit gate counts the
+/// columns the fit's atoms touch, not the basis's Q′. A trusted water store of 440 samples; a
+/// sampling pass on N₂ adds its scan. The store stays below the three-species Q′ 543 — the old gate
+/// skipped the refit ("not enough to fit (Q′ = 543)"), so N₂ was never learned — but above the
+/// columns its atoms touch: the pass refits, the N key appears with the pass's samples, and water
+/// is still answered.
+#[test]
+fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
+    let mut s = SurrogateKs::new(Box::new(AnyMorse), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    for z in [1, 8] {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(0x5a11);
+    let add = |s: &mut SurrogateKs, sc: Scene| s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    for (z0, z1) in [(1, 1), (8, 1), (8, 8)] {
+        for i in 0..80 {
+            let sc = in_cell_65(dimer(1.2 + 2.6 * i as f64 / 79.0, unit_vector(&mut rng), [0.0; 3], z0, z1));
+            add(&mut s, sc);
+        }
+    }
+    for _ in 0..200 {
+        let sc = random_water(&mut rng);
+        add(&mut s, sc);
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let gen = s.model_gen;
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 40, ..SamplingPlan::default() };
+    let n2 = in_cell_65(dimer(2.1, [0.0, 0.0, 1.0], [0.0; 3], 7, 7));
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &n2, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    println!("{}", notes.join("\n"));
+    let rep = s.report().unwrap().clone();
+    let (fittable, floor, q) = s.fittable_and_floor();
+    println!("after the N₂ pass: n {} (fittable {fittable}), floor {floor}, Q′ {q}, keys {:?}", rep.n_samples, key_counts(&s));
+    assert_eq!(s.basis().unwrap().species, vec![1, 7, 8], "the pass refitted with N: {notes:?}");
+    assert!(s.model_gen > gen && fittable < q && floor <= fittable, "below the global Q′, above the floor: {fittable} {floor} {q}");
+    assert!(!notes.iter().any(|n| n.contains("not enough to fit")), "{notes:?}");
+    let nn = key_counts(&s)["pair around N, with N"];
+    assert!(nn.0 >= nn.1, "the N₂ key holds the pass's samples: {nn:?}");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
     let water = random_water(&mut StdRng::seed_from_u64(77));
     s.discontinuity();
     assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate, "water is still answered");

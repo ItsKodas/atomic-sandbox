@@ -4784,3 +4784,26 @@ fn the_model_tab_warns_of_atoms_without_a_neighbour() {
     }
     assert!(probed_rect("lone-note").width() > 0.0, "the note is drawn by Start sampling");
 }
+
+/// M8a user-fix 3, the controller's ruling on concern 1: a class refused for one short key names
+/// that key and its floor, in the Activity tab and the Model tab alike, even when the class holds
+/// only that key (rows per key used to appear only for classes of two or more keys).
+#[test]
+fn a_refused_class_names_its_short_key() {
+    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29 };
+    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![nn.clone()] };
+    let m = ModelStatus { class_loo: vec![pair.clone()], ..model() };
+    let scene = Scene::preset("h2").unwrap();
+    let st = UiState::new("h2", &scene);
+    let lines = activity::trust::lines(&m, &scene, &st);
+    assert!(
+        lines.iter().any(|l| l.text.contains("around N, with N") && l.text.contains("5 of 29 samples needed")),
+        "{:?}",
+        lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    assert_eq!(dock::model::species_line("pair", &nn), "  pair around N, with N: not learned yet (DFT) · 5 of 29 samples needed");
+    // a trusted single-key class keeps its one line
+    let ok = sim::SpeciesVerdict { trusted: true, refusal: None, samples: 40, ..nn };
+    let m = ModelStatus { class_loo: vec![sim::ClassLoo { trusted: true, refusal: None, samples: 40, species: vec![ok], ..pair }], ..model() };
+    assert!(!activity::trust::lines(&m, &scene, &st).iter().any(|l| l.text.contains("around N, with N")));
+}

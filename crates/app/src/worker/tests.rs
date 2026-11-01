@@ -988,7 +988,7 @@ fn cancel_below_q_prime_keeps_the_samples_without_a_refit() {
         cancel.as_secs_f64() * 1e3
     );
     assert!(cancel < Duration::from_millis(1500), "Cancel took {cancel:?}");
-    assert!(note.contains("samples kept — not enough to fit (Q′ = "), "{:?}", c.dynamics.notes);
+    assert!(note.contains("samples kept — not enough to fit ("), "{:?}", c.dynamics.notes);
     assert!(!model(&c).fitted, "no refit below Q′");
     assert!(model(&c).samples >= 3, "the samples are kept");
 }

@@ -3972,6 +3972,25 @@ The floor of 142 is below Q′ 176 because the O-centred (H, O) cross body-3 blo
 
 **Minor 4:** formatting of the descriptor test.
 
+#### The fit gates (2026-11-02; the controller's ruling on concern 2)
+
+Every gate on fitting now counts the floor |∪ S_k|: the columns the usable samples' atoms touch in the basis the fit would build (`SurrogateKs::fit_floor`, cached on a fingerprint of the samples and the basis). The gates are:
+- the end-of-pass refit;
+- the no-model readout;
+- the box exclusion's trust floor (that floor + 30).
+
+They no longer count the basis's Q′. The fit itself needs no count: a column no fitted atom touches has an all-zero Gram row and column, and the ridge prior holds its coefficient at 0.
+
+`a_pass_bringing_a_new_species_into_a_large_store_refits` (440 H/O samples, then a 40-point N₂ scan pass):
+- The pass refits on 480 samples: floor 171, Q′ 543. The old gate would have refused it ("not enough to fit (Q′ = 543)").
+- The N₂ key reads 40 for 29 columns and is learned. The water keys keep 200/80 samples each and stay trusted, and water is answered.
+
+The basis's Q′ remains only:
+- where there is no class judgement;
+- in the no-model keep cap (`NO_MODEL_SAMPLE_FACTOR` · Q′), which bounds how many answers are kept before a first fit.
+
+**Concern 1 (accepted: rare keys fall back until they have their own samples).** A refused class now always lists its keys in the Activity and Model tabs, even when it holds a single key. The short key reads, for example, "pair around N, with N … 5 of 29 samples needed" (`ui::tests::a_refused_class_names_its_short_key`).
+
 ## M8a collection references and the class-LOO cost (Task 4a, 2026-10-21; `surrogate::collection` "References", `providers::surrogate::shared`)
 
 **The problem** (Task 3 review, physics (c)). The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`, so a reference wrong by δ_Z shifts every target by −N_Z·δ_Z (partly absorbed into the binding shape — a small force bias —, the rest into the energy residual) and moves the dissociation limit by δ_Z per atom. A collection's key holds no box, so its samples come from many boxes while each species has one reference. Two box-dependent parts of an isolated atom's energy:

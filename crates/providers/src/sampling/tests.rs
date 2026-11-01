@@ -480,7 +480,7 @@ fn sampling_commands_flow_through_dynamics() {
     let p = snap.sampling.clone().unwrap();
     println!("cancelled: {p:?}; notes {:?}", snap.notes);
     assert!(p.cancelled && p.finished);
-    assert!(snap.notes.iter().any(|n| n.contains("samples kept — not enough to fit (Q′ = ")), "{:?}", snap.notes);
+    assert!(snap.notes.iter().any(|n| n.contains("samples kept — not enough to fit (")), "{:?}", snap.notes);
     assert_eq!(p.stage, "cancelled");
     assert!(h.lock().unwrap().discontinuities > disc0, "the live run must not extrapolate from the last sample geometry");
     {
