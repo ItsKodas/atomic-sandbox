@@ -7,6 +7,38 @@
 //! passes in (`SurrogateKs::class_memory`). Atomic units throughout (Hartree, Bohr); every number
 //! below is a ratio to the policy's own bounds.
 //!
+//! # The sample floor per key (M8a user-fix 3)
+//!
+//! The verdict's first condition is a count: enough samples for the parameters the key's
+//! predictions can move with. An atom's energy term is E_i = Σ_k c_{s_i,k} B_{i,k}; a feature of
+//! a neighbour channel it does not have is exactly 0, so its prediction depends only on the
+//! independent columns ([`surrogate::Basis::column_classes`]) with B_{i,k} ≠ 0 there
+//! ([`surrogate::touched_columns`]). Per key (`trust::key_column_counts`):
+//!
+//! - **q_k** = the independent columns non-zero on at least one fitted atom of the key — the key's
+//!   column support, data-driven, nothing per element (rule 1);
+//! - **n_k** = the fitted samples holding an atom **of the key's class** that touches at least one
+//!   of those columns — the class's samples (the count this rule always used) restricted to the
+//!   rows that constrain the key's parameters;
+//! - the key is short while n_k < q_k ("12 of 29 samples needed").
+//!
+//! Before, every key was held to its class's count against the **whole** basis's Q′. A species
+//! added to a collection brings columns no other key touches, so it raised every key's bar: the
+//! user's water (H/O, Q′ 452, its many-body class 649+ samples, trusted) read "967 samples < Q′
+//! 1590" on every key once N₂ was trained in, though none of its data or columns changed. Why the
+//! column support and not the rank of the key's design block: the support is what the parameters
+//! *are*; the rank is what the data *identify*, and a count of samples per parameter is a floor
+//! below which the leave-one-out and DFT checks that follow cannot be read — identifiability
+//! itself is theirs to judge (an undefined leave-one-out refuses as ∞). The rank would also cost an
+//! eigen-decomposition per key per refit. Why the class restriction on n_k: a dimer's atom has
+//! non-zero body-3 features (one neighbour: R_n R_n′ (2l+1)/4π) on every many-body column of its
+//! species, but cannot tell their angular directions apart, so dimers must not count towards a
+//! many-body key — the class count kept that out, and n_k keeps it. And without it another
+//! species' samples of the same class would count for the key (the H₂ dimers of an H/N
+//! collection for N₂). A key no fitted atom holds is held, as before, to its class's count against
+//! the whole Q′ (nothing is learned for it). The whole-model condition — n_samples ≥ Q′ over the
+//! fit, `TrustKey::Samples` — keeps the global Q′: it is about the whole parameter vector.
+//!
 //! # What the verdict asks
 //!
 //! Rule 4b asks, per environment class c (pair, many-body; [`super::trust::atom_class`]): may the
@@ -33,7 +65,8 @@
 //! **environment key** (`surrogate::EnvKey`): the atom's class, its Z and the sorted set of its
 //! neighbours' species within r_cut — Z as a key only (rule 1), nothing read from it. An atom's
 //! verdict is its own key's ([`Calibration::key_verdict`]); the class's leave-one-out statistics
-//! and its Q′ sample count stay per class (the fit's residuals are per class). The user's case: a
+//! stay per class (the fit's residuals are per class), and the sample floor is the key's own (M8a
+//! user-fix 3, "The sample floor per key" below). The user's case: a
 //! hot-H₃ fallback measured an H atom at 5.66× its bound (generation 416); with one evidence
 //! window per class it kept every many-body environment out, water's included, although water's 81
 //! comparisons were all within 0.03× the bound — and with fewer than [`WINDOW_POINTS`] many-body
@@ -216,7 +249,8 @@
 //!
 //! # The verdict, with hysteresis
 //!
-//! A class with fewer than Q′ samples is untrusted (`ClassKey::Samples`, as before). Otherwise:
+//! A key short of samples is untrusted (`ClassKey::Samples`; "The sample floor per key" below; a
+//! class-wide verdict: fewer than Q′ samples, as before). Otherwise:
 //!
 //! - **The worst-atom guard** ([`WORST_ATOM`] = 3; `ClassKey::WorstAtom`): an untrusted class does
 //!   not **enter** while any point in its window has an atom measured beyond 3× its bound — at
@@ -630,7 +664,8 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
     let posterior = if w.calibration.is_finite() && w.calibration > 1.05 { format!("; the model's own uncertainty was {:.1}× too small there", w.calibration) } else { String::new() };
     let over = format!("{} DFT comparison{}", w.evidence, if w.evidence == 1 { "" } else { "s" });
     match key {
-        ClassKey::Samples => format!("{n} samples < Q′ {limit:.0}"),
+        // M8a user-fix 3: a key's floor is the columns its atoms touch, not the whole basis's Q′
+        ClassKey::Samples => format!("{n} of {limit:.0} samples needed"),
         ClassKey::Force => {
             let energy = if w.energy_max > 1.0 { format!(", energy {:.1}× the tier", w.energy_max) } else { String::new() };
             format!("LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {n} samples", w.force_max, w.force_rms)

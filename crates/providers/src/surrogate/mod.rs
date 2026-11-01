@@ -44,7 +44,7 @@
 //!      or the measured energy error is beyond the verdict's limit (1/√2 to enter, 1 to stay), or,
 //!      entering, one atom of the window was measured beyond 3× its bound; with fewer comparisons,
 //!      the rule of before (a LOO ratio beyond 1) or one measured atom beyond 3× → teacher; sample
-//!      kept (never thinned while the class is short of Q′ samples — those earn its trust; thinned
+//!      kept (never thinned while the key is short of samples — those earn its trust; thinned
 //!      like rule 5 otherwise; never a copy, short or not: `is_label_copy`); reported on the
 //!      teacher's surface (the model's energy there is unvalidated); the comparison is a **rule-4b
 //!      point of the audit history**, the evidence that calibrates the class. "surrogate: this
@@ -451,8 +451,12 @@
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
 //! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
-//!   `validate/references.md`, "M8a calibrated verdict"): ≥ Q′ samples holding it (the trust
-//!   rule's minimum count), and the error the teacher **measured** where this verdict decides
+//!   `validate/references.md`, "M8a calibrated verdict"): enough samples — per environment key
+//!   (M8a user-fix 3, `calibrate` "The sample floor per key") its class's samples that load on the
+//!   basis columns its atoms touch, at least as many as those columns (not the class's count
+//!   against the whole basis's Q′: a species added to a collection must not raise the floor of
+//!   keys whose columns it does not touch; the user's water read "967 samples < Q′ 1590" once N₂
+//!   was trained in) — and the error the teacher **measured** where this verdict decides
 //!   within the verdict's limit. The evidence is the audit history's points in the verdict's
 //!   jurisdiction — audits, and the fallbacks rule 4b itself refused (never rule 5/5e's, which
 //!   refuse whatever the class verdict says, nor a class refusal rule 6/7 would have refused as
@@ -505,7 +509,8 @@
 //! - **Per environment species** (M8a user-test fix 2, the controller's rulings; `calibrate` "Per
 //!   environment species"): the evidence window, W, λ, the worst-atom guard, the hysteresis
 //!   memory and the leave-one-out force/energy numbers are kept per key (class, Z, the sorted
-//!   neighbour species within r_cut — Z a key only), the Q′ sample count per class; an atom answers
+//!   neighbour species within r_cut — Z a key only), and (since M8a user-fix 3) the sample floor:
+//!   the key's own columns, not the whole Q′; an atom answers
 //!   by its own key's verdict and a refusal names it ("many-body around H, with H"). The class's
 //!   `ClassLoo` is all its keys trusted. A history point recorded before species were kept counts
 //!   for every key of its class. New verdict evidence (an audit or a rule-4b point) re-judges the
@@ -513,7 +518,7 @@
 //!   at 5.66× its bound kept water's many-body environments out of a 1724-sample H/O collection.
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
-//! - **4b fallbacks**: kept unthinned while the class is short of Q′ samples, thinned like rule 5
+//! - **4b fallbacks**: kept unthinned while the key is short of samples, thinned like rule 5
 //!   otherwise, and never a copy of a stored sample (`is_label_copy`; round 1 of the
 //!   2026-10-18 review, MUST-2). An interim version never thinned them (the user's water + H₂ showed
 //!   every 4b fallback "skipped: similar"); the review showed that copies of a parked geometry add

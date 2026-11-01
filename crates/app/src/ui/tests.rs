@@ -3873,7 +3873,7 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
-        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
+        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 of 40 samples needed)");
         // M8a Task 2 (fix round 2, review I3): each number named by what measured it — the DFT
         // checks' measured error, the fit's leave-one-out floor, the measured energy
         assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");

@@ -491,6 +491,18 @@ impl Basis {
         classes
     }
 
+    /// The independent column (index into [`Basis::column_classes`]) of every full column
+    /// q = s·P + k: both orderings of a hetero body-2 pair map to their one class.
+    pub fn column_class_index(&self) -> Vec<usize> {
+        let mut of = vec![usize::MAX; self.n_species() * self.n_features()];
+        for (c, class) in self.column_classes().iter().enumerate() {
+            for &q in class {
+                of[q] = c;
+            }
+        }
+        of
+    }
+
     /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]):
     /// n_max·S(S+1)/2 body-2 classes plus S·(P₃ + P₄) body-3 and body-4 columns.
     pub fn n_independent_columns(&self) -> usize {
@@ -861,6 +873,30 @@ pub fn describe(
     Ok(out)
 }
 
+/// Per atom, the independent columns ([`Basis::column_classes`] indices, ascending) its energy
+/// term E_i = Σ_k c_{s_i,k} B_{i,k} depends on here: those whose descriptor value B_{i,k} is
+/// non-zero. A feature of a neighbour channel the atom does not have is a sum (or a product of
+/// sums) with no term, exactly 0.0, so this is the atom's environment's column support — the
+/// parameters its predictions can move with (M8a user-fix 3: a class key is held to the count
+/// of these, not to the whole basis's Q′). `class_of` is [`Basis::column_class_index`], computed
+/// once by a caller that walks many geometries. Same panics as [`describe_values`].
+pub fn touched_columns(basis: &Basis, class_of: &[usize], pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<Vec<usize>>, DescribeError> {
+    let s = basis.species_indices(z)?;
+    let p = basis.n_features();
+    let of = class_of;
+    let values = describe_values(basis, pos, z)?;
+    Ok(values
+        .iter()
+        .zip(&s)
+        .map(|(b, &si)| {
+            let mut c: Vec<usize> = b.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(k, _)| of[si * p + k]).collect();
+            c.sort_unstable();
+            c.dedup();
+            c
+        })
+        .collect())
+}
+
 /// The three channels t·n_max + n of a body-4 term's factors.
 #[inline]
 pub(crate) fn t4_channels(basis: &Basis, t: &Body4Term) -> [usize; 3] {
@@ -1011,6 +1047,39 @@ mod tests {
         let mut one = Basis::new(&[1]);
         one.body3 = false;
         assert_eq!(one.column_classes(), (0..8).map(|q| vec![q]).collect::<Vec<_>>());
+    }
+
+    /// M8a user-fix 3: an atom touches only the columns of its own centre species and of the
+    /// neighbour species it has; adding a third species to the basis adds columns no H/O atom
+    /// touches, so an H/O environment's support does not grow with it.
+    #[test]
+    fn an_atom_touches_only_its_own_species_and_neighbour_channels() {
+        // water-like: O at the origin, two H at ~1.8 Bohr
+        let pos = [[0.0, 0.0, 0.0], [1.8, 0.0, 0.0], [-0.45, 1.74, 0.0]];
+        let z = [8, 1, 1];
+        for body4 in [false, true] {
+            let mut ho = Basis::new(&[1, 8]);
+            ho.body4 = body4;
+            let mut hno = Basis::new(&[1, 7, 8]);
+            hno.body4 = body4;
+            assert!(ho.column_class_index().iter().all(|&c| c < ho.n_independent_columns()));
+            let a = touched_columns(&ho, &ho.column_class_index(), &pos, &z).unwrap();
+            let b = touched_columns(&hno, &hno.column_class_index(), &pos, &z).unwrap();
+            for (i, (ta, tb)) in a.iter().zip(&b).enumerate() {
+                assert!(!ta.is_empty());
+                assert_eq!(ta.len(), tb.len(), "body4 {body4}, atom {i}: the N channel adds no column an H/O atom touches");
+            }
+            assert!(hno.n_independent_columns() > ho.n_independent_columns());
+            // an N₂ atom touches no column an H/O atom does: disjoint
+            let n2 = touched_columns(&hno, &hno.column_class_index(), &[[0.0; 3], [2.07, 0.0, 0.0]], &[7, 7]).unwrap();
+            for t in &b {
+                assert!(n2[0].iter().all(|c| !t.contains(c)), "N₂'s columns are not water's");
+            }
+            println!("body4 {body4}: Q′ H/O {} → H/N/O {}; water O touches {}, H {}; N₂'s N {}", ho.n_independent_columns(), hno.n_independent_columns(), b[0].len(), b[1].len(), n2[0].len());
+        }
+        // a lone atom touches nothing
+        let one = Basis::new(&[1]);
+    assert!(touched_columns(&one, &one.column_class_index(), &[[0.0; 3]], &[1]).unwrap()[0].is_empty());
     }
 
     #[test]

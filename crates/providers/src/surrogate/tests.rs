@@ -420,7 +420,10 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     // and the fit without it cannot predict it (no other row carries an H–He feature) — so the
     // pair class is not learned until H–He is. Since M8a user-test fix 2 an atom is judged by its
     // own environment key: H with an H neighbour keeps its verdict (H₂ is answered), H with an He
-    // neighbour and He with an H one are refused
+    // neighbour and He with an H one are refused — since M8a user-fix 3 for want of samples on
+    // their own floor: one sample against the 29 columns an H atom with an He neighbour touches
+    // (8 H–He body-2, 21 He–He body-3 at D = 4), where the class's 181 against the whole Q′ 176
+    // passed the count and the leave-one-out refused
     let pair = s.class_loo()[0].clone();
     println!("pair class with one H–He sample: {pair:?}");
     assert!(!pair.trusted && pair.samples == 181 && pair.energy_max > 1.0, "{pair:?}");
@@ -430,7 +433,7 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     s.discontinuity();
     let r = s.evaluate(&h_he, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with He: LOO")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with He: 1 of 29 samples needed)")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // H–He dimers over the window: the class earns its trust back and both are answered
     let mut rng = StdRng::seed_from_u64(9);
@@ -3561,7 +3564,11 @@ fn fnv1a(text: &str) -> u64 {
 /// so every later sample count reads one fewer, the step-79 refit no longer quarantines it (its
 /// recovery note and the quarantine count go) and the step-84 one counts one quarantined sample
 /// fewer. Every answer, source, fit number and the background auditor's section are unchanged.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x5c56_a109_42ac_bc80;
+/// **Re-pinned for M8a user-fix 3** (0x5c56_a109_42ac_bc80 → below): the short-of-samples refusal
+/// reads "3 of 29 samples needed" instead of "3 samples < Q′ 29" (steps 92–94; one species, so the
+/// key's column floor is the whole Q′ and no decision moves). Diffed against HEAD 07e8315: those 3
+/// lines, nothing else; with the old wording substituted back the trace hashes to the old pin.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x49de_dced_28e4_5113;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -4505,7 +4512,9 @@ fn pre_task3_class_untrusted(l: &sim::ClassLoo, q: usize) -> Option<(bool, Strin
         return None;
     }
     Some(if l.samples < q {
-        (true, format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples))
+        // M8a user-fix 3 reworded the short-of-samples refusal ("N samples < Q′ q" → "N of q
+        // samples needed"): the floor is a key's own column count, the whole Q′ only class-wide
+        (true, format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} of {q} samples needed)", l.class, l.samples))
     } else if l.force_max > 1.0 || l.force_rms > 1.0 {
         let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
         (false, format!(
@@ -6765,9 +6774,16 @@ fn a_round_that_leaves_its_class_short_is_not_accepted() {
     while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
     assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise: the round is accepted at Q′ {}", s.report().unwrap().q_prime);
     // the same state judged at a higher floor: the class is short, its leave-one-out still passes
+    // (since M8a user-fix 3 a key's floor is its own column count, so the floor is raised there)
     let n = s.class_loo()[0].samples;
-    s.report.as_mut().unwrap().q_prime = n + 10;
     s.refresh_class_loo();
+    let mut j = s.class_judge.take().unwrap();
+    assert!(j.key_stats.values().all(|st| st.samples == n), "one species, dimers only: the key's count is the class's");
+    for q in j.key_q.values_mut() {
+        *q = n + 10;
+    }
+    s.class_loo = s.judge_classes(&j);
+    s.class_judge = Some(j);
     assert!(matches!(s.class_loo()[0].refusal, Some((sim::ClassKey::Samples, ..))), "{:?}", s.class_loo()[0]);
     let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
     let held = s.store().unwrap().samples.last().unwrap().clone();
@@ -9515,4 +9531,120 @@ fn the_lone_atom_note_counts_the_atoms_without_a_neighbour() {
     sc.cell = Cell { n: 81, h: 0.25 };
     Trainable::start_pass(&mut s, &sc, &SamplingPlan::default(), &mut sim::AtomReferences::default()).unwrap();
     assert!(Trainable::status(&s, &sc, &[[0.0; 3]; 3]).lone_note.is_some_and(|n| n.starts_with("1 of 3 atoms")));
+}
+
+/// A water-like O + 2 H (O–H 1.6–2.2 Bohr, H–O–H 95–125°), randomly turned, in the 65³ cell.
+fn random_water(rng: &mut StdRng) -> Scene {
+    let u = unit_vector(rng);
+    let mut w = unit_vector(rng);
+    let dot = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    for a in 0..3 {
+        w[a] -= dot * u[a];
+    }
+    let n = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let w: [f64; 3] = std::array::from_fn(|a| w[a] / n);
+    let (r1, r2) = (rng.gen_range(1.6..2.2), rng.gen_range(1.6..2.2));
+    let th: f64 = rng.gen_range(95.0f64..125.0).to_radians();
+    let mut sc = in_cell_65(dimer(r1, u, [0.0; 3], 8, 1));
+    // O at the origin
+    let o = sc.nuclei[0].pos;
+    for nu in &mut sc.nuclei {
+        nu.pos = std::array::from_fn(|a| nu.pos[a] - o[a]);
+    }
+    sc.nuclei.push(Nucleus::new(1, std::array::from_fn(|a| r2 * (u[a] * th.cos() + w[a] * th.sin()))));
+    sc
+}
+
+/// The (samples, columns) of every environment key's verdict, by its words.
+fn key_counts(s: &SurrogateKs) -> BTreeMap<String, (usize, usize, bool)> {
+    s.class_loo().iter().flat_map(|c| c.species.iter().map(move |v| (format!("{} {}", c.class, v.words()), (v.samples, v.columns, v.trusted)))).collect()
+}
+
+/// M8a user-fix 3 (the user's shared collection: water trusted at Q′ 452; N₂ trained into it
+/// raised Q′ to 1590 and every key read "967 samples < Q′ 1590"). A class key is held to the
+/// samples of its class that load on the basis columns its own atoms touch, against the count of
+/// those columns — not the class's count against the whole basis's Q′. A pair-additive Morse
+/// teacher (species-blind: rule 1 is the model's, not the fixture's) over H/O dimers and water
+/// trimers: every H/O key trusted. Five N₂ dimers and a refit: the basis has three species and
+/// the many-body class's count is below the new Q′ (the old rule would refuse water), but every
+/// H/O key's (samples, columns) is unchanged and it stays trusted; the N key is "not learned yet"
+/// on its own floor and learned once it holds that many N₂ samples.
+#[test]
+fn a_new_species_does_not_raise_the_sample_floor_of_the_keys_it_does_not_touch() {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    for z in [1, 7, 8] {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(0xf1c3);
+    let add = |s: &mut SurrogateKs, sc: Scene| s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    for (z0, z1) in [(1, 1), (8, 1), (8, 8)] {
+        for i in 0..120 {
+            let sc = in_cell_65(dimer(1.2 + 2.6 * i as f64 / 119.0, unit_vector(&mut rng), [0.0; 3], z0, z1));
+            add(&mut s, sc);
+        }
+    }
+    for _ in 0..220 {
+        let sc = random_water(&mut rng);
+        add(&mut s, sc);
+    }
+    let rep = s.refit().unwrap();
+    let before = key_counts(&s);
+    println!("H/O: Q′ {}, n {}; keys {before:?}", rep.q_prime, rep.n_samples);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert_eq!(before.len(), 6, "pair H{{H}}, H{{O}}, O{{H}}, O{{O}}; many-body H{{H, O}}, O{{H}}: {before:?}");
+    assert!(before.values().all(|&(n, q, t)| t && n >= q && q < rep.q_prime), "{before:?}");
+    let water = random_water(&mut StdRng::seed_from_u64(77));
+    s.discontinuity();
+    assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate);
+
+    // five N₂ dimers: the basis grows to three species
+    for i in 0..5 {
+        let sc = in_cell_65(dimer(1.6 + 0.4 * i as f64, unit_vector(&mut rng), [0.0; 3], 7, 7));
+        add(&mut s, sc);
+    }
+    let rep3 = s.refit().unwrap();
+    assert_eq!(s.basis().unwrap().species, vec![1, 7, 8]);
+    let after = key_counts(&s);
+    println!("H/N/O: Q′ {}, n {}; keys {after:?}", rep3.q_prime, rep3.n_samples);
+    // the count's cost per judgement (one descriptor pass over the fitted samples), and with body-4
+    for body4 in [false, true] {
+        let mut b = s.basis().unwrap().clone();
+        b.body4 = body4;
+        let t0 = std::time::Instant::now();
+        let c = super::trust::key_column_counts(&b, &s.store().unwrap().samples);
+        println!("key_column_counts, body4 {body4} (Q′ {}): {:.1} ms over {} samples; {c:?}", b.n_independent_columns(), t0.elapsed().as_secs_f64() * 1e3, s.samples());
+    }
+    let many = s.class_loo()[1].clone();
+    assert!(rep3.q_prime > rep.q_prime && many.samples < rep3.q_prime, "the old rule (class count {} vs Q′ {}) would refuse water", many.samples, rep3.q_prime);
+    for (k, v) in &before {
+        assert_eq!(after.get(k), Some(v), "{k}: an H/O key's samples, columns and verdict do not move with N");
+    }
+    let nn = after.get("pair around N, with N").copied().expect("the N₂ key");
+    assert!(!nn.2 && nn.0 == 5 && nn.1 > 5, "{nn:?}");
+    let refusal = s.class_loo()[0].species.iter().find(|v| v.z == 7).unwrap().refusal;
+    assert_eq!(refusal, Some((sim::ClassKey::Samples, 5.0, nn.1 as f64)));
+    s.discontinuity();
+    assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate, "water is still answered");
+    // the class rule's own refusal for an N₂ geometry (an earlier rule — the grade, γ = ∞ on five
+    // samples — answers `evaluate` first) is the short-of-samples one, on the key's own floor
+    let rc2 = s.basis().unwrap().r_cut.powi(2);
+    let n2: Vec<[f64; 3]> = in_cell_65(dimer(2.1, [0.0, 0.0, 1.0], [0.0; 3], 7, 7)).nuclei.iter().map(|n| n.pos).collect();
+    let (r, short) = s.class_untrusted(&env_keys(&n2, &[7, 7], rc2)).expect("N₂ is not learned yet");
+    let note = format!("surrogate: this kind of environment isn't learned well enough yet (pair around N, with N: 5 of {} samples needed)", nn.1);
+    assert!(short && r.text == note, "{note}: {}", r.text);
+
+    // N₂ samples up to its own floor: the N key is learned, the H/O keys untouched
+    let need = nn.1;
+    for i in 0..need + 10 {
+        let sc = in_cell_65(dimer(1.2 + 2.6 * i as f64 / (need + 9) as f64, unit_vector(&mut rng), [0.0; 3], 7, 7));
+        add(&mut s, sc);
+    }
+    s.refit().unwrap();
+    let last = key_counts(&s);
+    println!("with {} N₂: keys {last:?}", need + 15);
+    let nn = last["pair around N, with N"];
+    assert!(nn.0 >= nn.1 && nn.2, "{nn:?}");
+    for (k, v) in &before {
+        assert_eq!(last.get(k), Some(v), "{k}");
+    }
 }

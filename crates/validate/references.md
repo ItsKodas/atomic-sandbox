@@ -3887,6 +3887,55 @@ The existing collection therefore unlocks only after the window ages. Water's ke
 
 Tests: `class_trust_is_per_environment_species_the_users_water_after_h3`, `new_evidence_rejudges_the_class_verdict_without_a_refit`, `species_round_trip_and_old_files_read_unknown`, `sidecar_round_trips_the_class_memory`.
 
+### User-fix 3 (2026-11-02): a key's sample floor is the columns it touches, not the whole basis
+
+**The user's case.** Water was trusted in a shared H/O collection: Q′ 452, "many-body around H, with H and O" 649+ samples. The user then trained N₂ into the same collection. The basis grew to three species with body-4, and Q′ rose to 1590. Every key then read "not learned yet", for example "many-body around H, with H and O: 967 samples < Q′ 1590". None of water's data had changed.
+
+**Root cause.** The class verdict compared each key's count (its class's samples) with the whole basis's Q′. A key's predictions depend only on the columns that are non-zero on its atoms (E_i = Σ_k c_{s_i,k} B_{i,k}). A feature of a neighbour channel the atom does not have is exactly 0. So the N channels add columns that water's H and O atoms never touch, yet they raised water's bar.
+
+**The change** (`calibrate` "The sample floor per key"; `trust::key_column_counts`, `surrogate::touched_columns`). Per environment key:
+- **q_k** = the independent columns non-zero on at least one fitted atom of the key.
+- **n_k** = the fitted samples that hold an atom of the key's class touching one of those columns.
+- The key is short while n_k < q_k.
+
+The wording is "N of q_k samples needed": in refusals, in the Activity line, and on every Model-tab key row (`SpeciesVerdict::samples`/`columns`).
+
+**Kept as before:**
+- The whole-model condition n_samples ≥ Q′ (`TrustKey::Samples`).
+- The class-wide verdict.
+- A key no fitted atom holds, which keeps its class's count against the whole Q′.
+
+**Why the class restriction on n_k.** A dimer's atom is non-zero on every many-body column of its species, because a body-3 feature with one neighbour is R_n R_n′ (2l+1)/4π. But a dimer cannot separate the angular directions. The H₃ ladder test (`the_many_body_class_earns_trust_as_samples_arrive`) still reads short exactly while k < 29.
+
+**Why the support and not the rank.** The count is a floor per parameter. Identifiability is left to the leave-one-out and DFT checks: an undefined LOO refuses as ∞.
+
+**Synthetic H/O → H/N/O** (`a_new_species_does_not_raise_the_sample_floor_of_the_keys_it_does_not_touch`; pair-additive Morse teacher; 120 each of H₂, OH and O₂ dimers plus 220 water trimers; body-3, D = 4, n_max 8; release, CPU). Each cell is (n_k, q_k, verdict):
+
+| key | H/O (Q′ 176, n 580) | + 5 N₂ (Q′ 543, n 585) | + 39 more N₂ |
+|---|---|---|---|
+| many-body around H, with H and O | 220, 92, trusted | 220, 92, trusted | unchanged |
+| many-body around O, with H | 220, 29, trusted | 220, 29, trusted | unchanged |
+| pair around H, with H / H, with O / O, with H / O, with O | 120, 29, trusted (each) | unchanged | unchanged |
+| pair around N, with N | — | **5, 29, "5 of 29 samples needed"** | 44, 29, trusted |
+
+After the N₂ refit the many-body class holds 220 samples against Q′ 543. The old rule would have refused water there. With the old floor substituted (each key's class count against the whole Q′), the test fails at its first key assertion.
+
+**Column supports with body-4** (`an_atom_touches_only_its_own_species_and_neighbour_channels`):
+
+| basis | Q′ H/O → H/N/O | water's O | water's H | N₂'s N |
+|---|---|---|---|---|
+| body-3 | 176 → 543 | 29 | 92 | 29 |
+| body-4 | 284 → 1032 | 38 | 146 | 38 |
+
+In each basis, N₂'s columns are disjoint from water's.
+
+**What else moved:**
+- `new_species_falls_back_and_is_learned_at_the_next_refit`: the first H–He sample is now refused as "1 of 29 samples needed". Before, the count passed (181 against Q′ 176) and the LOO refused. With 41 H–He samples the key is learned, as before.
+- The scripted Morse session re-pinned: three notes reworded ("3 of 29 samples needed"). One species, so no decision moved. With the old wording substituted back, the trace hashes to the old pin.
+- The teach-around offer's richer-basis floor (`richer_basis_floor`) lists the keys that would be short, each on its own floor in the richer basis.
+
+**Not measured on the user's collection.** The H/N/O collection was not on disk. The live numbers for it are the next user test.
+
 ## M8a collection references and the class-LOO cost (Task 4a, 2026-10-21; `surrogate::collection` "References", `providers::surrogate::shared`)
 
 **The problem** (Task 3 review, physics (c)). The fit has no intercept: an atom with no neighbour inside r_cut has energy exactly `ref[Z]`, so a reference wrong by δ_Z shifts every target by −N_Z·δ_Z (partly absorbed into the binding shape — a small force bias —, the rest into the energy residual) and moves the dissociation limit by δ_Z per atom. A collection's key holds no box, so its samples come from many boxes while each species has one reference. Two box-dependent parts of an isolated atom's energy:

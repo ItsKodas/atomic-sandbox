@@ -442,8 +442,9 @@ impl SurrogateKs {
     }
 
     /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
-    /// may still take it, the sample floor the richer basis would set and the classes it would
-    /// leave short — the same `Basis` count the refit uses, no estimate.
+    /// may still take it, the sample floor the richer basis would set and the environment keys it
+    /// would leave short — each key's own floor in that basis (M8a user-fix 3,
+    /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
     fn richer_basis_floor(&self) -> Option<String> {
         let model = self.model.as_ref()?;
         let b = &model.basis;
@@ -456,11 +457,16 @@ impl SurrogateKs {
         let mut rich = Basis::new(&species);
         rich.degree_cap = RECOVERY_DEGREE_CAP;
         rich.body4 = b.body4;
-        let q = rich.column_classes().len();
-        let short: Vec<String> = self.class_loo.iter().enumerate().filter(|(_, c)| c.samples > 0 && c.samples < q).map(|(k, c)| format!("{} have {}", CLASS_WORDS[k], c.samples)).collect();
+        let store = self.store.as_ref()?;
+        let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
+            .into_iter()
+            .filter(|(_, (n, q))| n < q)
+            .map(|(k, (n, q))| format!("{} {} has {n} of {q}", ENV_CLASSES[(k.class - 1) as usize], sim::key_words(k.z, &k.neighbours)))
+            .collect();
         (!short.is_empty()).then(|| {
             format!(
-                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), every kind of environment needs ≥ {q} samples: {} — a sampling pass would then be needed as well",
+                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
                 b.degree_cap,
                 short.join(", ")
             )
@@ -847,7 +853,7 @@ impl SurrogateKs {
             _ => None,
         });
         if let Some((a, b, q0)) = grew {
-            lines.push(format!("– the taught region needed the richer basis (degree {a} → {b}): the sample floor of every kind of environment rose {q0} → {q_now}"));
+            lines.push(format!("– the taught region needed the richer basis (degree {a} → {b}): the model's columns rose {q0} → {q_now}, and with them the sample floor of every kind of environment whose columns grew"));
         }
         let samples_before = start.as_ref().map_or(usize::MAX, |st| st.samples_before);
         for (c, l) in self.class_loo.iter().enumerate() {

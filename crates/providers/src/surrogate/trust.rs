@@ -145,15 +145,69 @@ pub fn env_class(counts: &[usize]) -> Option<usize> {
     }
 }
 
+/// Per environment key of `samples`' atoms (M8a user-fix 3; `calibrate` "The sample floor per
+/// key"): (n_k, q_k). q_k is the number of independent basis columns the key's atoms touch
+/// ([`surrogate::touched_columns`]: non-zero on at least one atom of the key) — the parameters its
+/// predictions can move with. n_k is the number of samples holding an atom **of the key's class**
+/// whose environment touches at least one of those columns — the class's samples (the count the
+/// rule always used) restricted to those that constrain the key's parameters. A key is held to
+/// n_k ≥ q_k, not the class's count to the whole basis's Q′: a species added to the collection
+/// brings columns no other key touches and must not raise their bar, and another species' samples
+/// of the same class must not count for it. The class restriction keeps what the class count
+/// meant: a pair geometry loads on the many-body columns of its species (a body-3 feature of a
+/// one-neighbour atom is R_n R_n′ (2l+1)/4π, non-zero) but cannot tell their angular directions
+/// apart, so dimers never count towards a many-body key. Data-driven, nothing per element (rule
+/// 1). Samples the basis cannot describe (a species it lacks) are skipped.
+pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl IntoIterator<Item = &'a Sample>) -> BTreeMap<surrogate::EnvKey, (usize, usize)> {
+    let rc2 = basis.r_cut * basis.r_cut;
+    let words = basis.n_independent_columns().div_ceil(64);
+    let class_of = basis.column_class_index();
+    let set = |bits: &mut [u64], cols: &[usize]| {
+        for &c in cols {
+            bits[c / 64] |= 1u64 << (c % 64);
+        }
+    };
+    // per sample, per class (pair, many-body): the columns its atoms of that class touch
+    let mut per_sample: Vec<[Vec<u64>; 2]> = Vec::new();
+    let mut per_key: BTreeMap<surrogate::EnvKey, Vec<u64>> = BTreeMap::new();
+    for s in samples {
+        if s.z.len() != s.pos.len() {
+            continue;
+        }
+        let Ok(touched) = surrogate::touched_columns(basis, &class_of, &s.pos, &s.z) else { continue };
+        let mut by_class = [vec![0u64; words], vec![0u64; words]];
+        for (cols, k) in touched.iter().zip(env_keys(&s.pos, &s.z, rc2)) {
+            let Some(k) = k else { continue };
+            set(&mut by_class[(k.class - 1) as usize], cols);
+            set(per_key.entry(k).or_insert_with(|| vec![0u64; words]), cols);
+        }
+        per_sample.push(by_class);
+    }
+    per_key
+        .into_iter()
+        .map(|(k, bits)| {
+            let c = (k.class - 1) as usize;
+            let q = bits.iter().map(|w| w.count_ones() as usize).sum();
+            let n = per_sample.iter().filter(|s| s[c].iter().zip(&bits).any(|(a, b)| a & b != 0)).count();
+            (k, (n, q))
+        })
+        .collect()
+}
+
 /// What the class verdicts are judged from (`SurrogateKs::class_judge`; M8a user-test fix 2): the
 /// fit's per-class leave-one-out statistics, the aleatoric levels, Q′, the keys of the fitted
 /// atoms, and the calibration of the last judgement.
 #[derive(Clone, Debug)]
 pub(super) struct ClassJudge {
     pub(super) stats: [super::calibrate::ClassStats; 2],
-    /// Per environment key its own leave-one-out numbers (the class's sample count).
+    /// Per environment key its own leave-one-out numbers, with its class's samples that load on
+    /// its columns as its sample count (M8a user-fix 3, [`key_column_counts`]).
     pub(super) key_stats: BTreeMap<surrogate::EnvKey, super::calibrate::ClassStats>,
+    /// Per environment key of the fitted atoms the columns it touches: the sample count it is held
+    /// to (M8a user-fix 3). A key without fitted atoms is held to the whole basis's `q_prime`.
+    pub(super) key_q: BTreeMap<surrogate::EnvKey, usize>,
     pub(super) aleatoric: [f64; 2],
+    /// The whole basis's Q′: the class-wide verdict's floor and that of a key no fitted atom holds.
     pub(super) q_prime: usize,
     pub(super) keys: std::collections::BTreeSet<surrogate::EnvKey>,
     pub(super) cal: super::calibrate::Calibration,
@@ -401,7 +455,13 @@ impl SurrogateKs {
                     .filter(|(k, _)| k.class as usize == c + 1)
                     .map(|(k, kc)| {
                         let (was, since) = self.class_memory.get(k).copied().unwrap_or((false, None));
-                        let refusal = entry_between_refits(refusal_of(verdict(*kc, j.key_stats.get(k).unwrap_or(&st), j.q_prime, was)), was, kc, j.between_refits);
+                        // its own sample count and column count (M8a user-fix 3); a key no fitted
+                        // atom holds keeps the class's count against the whole basis's Q′
+                        let (kst, kq) = match (j.key_stats.get(k), j.key_q.get(k)) {
+                            (Some(kst), Some(&kq)) => (kst, kq),
+                            (kst, _) => (kst.unwrap_or(&st), j.q_prime),
+                        };
+                        let refusal = entry_between_refits(refusal_of(verdict(*kc, kst, kq, was)), was, kc, j.between_refits);
                         let trusted = refusal.is_none();
                         let some = |x: f64| (kc.points > 0).then_some(x);
                         sim::SpeciesVerdict {
@@ -416,6 +476,8 @@ impl SurrogateKs {
                             evidence: kc.evidence,
                             trusted_since: if trusted { since.or(Some(self.model_gen)) } else { None },
                             inflation: j.refit_cal.key(k).inflation,
+                            samples: kst.samples,
+                            columns: kq,
                         }
                     })
                     .collect();
@@ -603,12 +665,20 @@ impl SurrogateKs {
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
-        // per key: its own leave-one-out numbers, the class's sample count (the Q′ rule is the class's)
-        let key_stats = key_acc.into_iter().map(|(k, a)| {
-            let c = (k.class - 1) as usize;
-            (k, super::calibrate::ClassStats { samples: stats[c].samples, ..stats_of(a) })
-        }).collect();
-        let judge = ClassJudge { stats, key_stats, aleatoric, q_prime: report.q_prime, keys, refit_cal: cal.clone(), cal, between_refits: false };
+        // per key: its own leave-one-out numbers, and the samples that load on the columns it
+        // touches against the count of those columns (M8a user-fix 3: not the class's count
+        // against the whole basis's Q′, which a species added elsewhere raised for every key)
+        let counts = key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s));
+        let key_q: BTreeMap<surrogate::EnvKey, usize> = counts.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
+        let key_stats = key_acc
+            .into_iter()
+            .map(|(k, a)| {
+                let c = (k.class - 1) as usize;
+                let samples = counts.get(&k).map_or(stats[c].samples, |&(n, _)| n);
+                (k, super::calibrate::ClassStats { samples, ..stats_of(a) })
+            })
+            .collect();
+        let judge = ClassJudge { stats, key_stats, key_q, aleatoric, q_prime: report.q_prime, keys, refit_cal: cal.clone(), cal, between_refits: false };
         // the hysteresis memory is the verdict that stood when this refit, install or policy
         // change began (`class_memory`; reset by a forget or an install)
         let loo = self.judge_classes(&judge);
@@ -683,7 +753,7 @@ impl SurrogateKs {
         // a class without per-species verdicts (no fitted atom of it) answers by its own verdict
         let class_wide = l.species.is_empty();
         let own = if class_wide {
-            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation })
+            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q })
         } else {
             l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours).cloned()
         };
@@ -698,7 +768,7 @@ impl SurrogateKs {
                 };
                 let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
                 let some = |x: f64| (kc.points > 0).then_some(x);
-                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation }
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: j.stats[c].samples, columns: j.q_prime }
             }
         };
         if s.trusted {
@@ -720,7 +790,8 @@ impl SurrogateKs {
             evidence: s.evidence,
             calibration: s.calibration,
         };
-        let limit = if key == ClassKey::Samples { q as f64 } else { limit };
+        // the limit is the verdict's own: a key's sample floor is its own column count (M8a
+        // user-fix 3), the whole basis's Q′ only for a class-wide verdict or a key no fitted atom holds
         let what = if class_wide { l.class.to_string() } else { format!("{} {}", l.class, s.words()) };
         let text = format!("surrogate: this kind of environment isn't learned well enough yet ({what}: {})", super::calibrate::refusal_words(key, value, limit, &words));
         Some((refusal(text), key == ClassKey::Samples))

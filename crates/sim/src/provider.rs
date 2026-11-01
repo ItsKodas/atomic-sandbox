@@ -1334,20 +1334,32 @@ pub struct SpeciesVerdict {
     pub evidence: usize,
     pub trusted_since: Option<u64>,
     pub inflation: f64,
+    /// The samples that load on the basis columns this key's atoms touch, and the count of those
+    /// columns — the sample floor it is held to (M8a user-fix 3: its own parameters, not the whole
+    /// basis's Q′, so a species added elsewhere does not raise it). For a key no fitted atom holds:
+    /// its class's sample count and the whole basis's Q′.
+    pub samples: usize,
+    pub columns: usize,
 }
 
 impl SpeciesVerdict {
     /// "around O, with H" / "around H, with H and O" — the key in words (symbols only: Z is a key).
     pub fn words(&self) -> String {
-        let sym = |z: u8| units::elements::symbol(z).to_string();
-        let nb: Vec<String> = self.neighbours.iter().map(|&z| sym(z)).collect();
-        let with = match nb.len() {
-            0 => String::new(),
-            1 => format!(", with {}", nb[0]),
-            n => format!(", with {} and {}", nb[..n - 1].join(", "), nb[n - 1]),
-        };
-        format!("around {}{with}", sym(self.z))
+        key_words(self.z, &self.neighbours)
     }
+}
+
+/// An environment key (central Z, its neighbours' distinct species) in words: "around O, with H"
+/// / "around H, with H and O" (symbols only: Z is a key).
+pub fn key_words(z: u8, neighbours: &[u8]) -> String {
+    let sym = |z: u8| units::elements::symbol(z).to_string();
+    let nb: Vec<String> = neighbours.iter().map(|&z| sym(z)).collect();
+    let with = match nb.len() {
+        0 => String::new(),
+        1 => format!(", with {}", nb[0]),
+        n => format!(", with {} and {}", nb[..n - 1].join(", "), nb[n - 1]),
+    };
+    format!("around {}{with}", sym(z))
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
@@ -1355,7 +1367,10 @@ impl SpeciesVerdict {
 /// `providers::surrogate::calibrate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassKey {
-    /// Fewer samples of the class than Q′: (samples, Q′).
+    /// Fewer samples than the parameters the verdict's atoms can move with: (samples, needed). Per
+    /// environment key (M8a user-fix 3) the samples that load on the basis columns its atoms touch
+    /// against the count of those columns ([`SpeciesVerdict::columns`]); class-wide, the class's
+    /// samples against the whole basis's Q′.
     Samples,
     /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its
     /// bound: (that ratio, 3). It keeps an untrusted class from entering at every evidence count,
