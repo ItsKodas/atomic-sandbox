@@ -1338,8 +1338,8 @@ pub struct SpeciesVerdict {
     pub evidence: usize,
     pub trusted_since: Option<u64>,
     pub inflation: f64,
-    /// The samples that load on the basis columns this key's atoms touch, and the count of those
-    /// columns — the sample floor it is held to (M8a user-fix 3: its own parameters, not the whole
+    /// The fitted samples holding an atom of this key, and the count of the basis columns its atoms
+    /// touch — the sample floor it is held to (M8a user-fix 3 and its review: its own parameters, not the whole
     /// basis's Q′, so a species added elsewhere does not raise it). For a key no fitted atom holds:
     /// its class's sample count and the whole basis's Q′.
     pub samples: usize,
@@ -1372,8 +1372,9 @@ pub fn key_words(z: u8, neighbours: &[u8]) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassKey {
     /// Fewer samples than the parameters the verdict's atoms can move with: (samples, needed). Per
-    /// environment key (M8a user-fix 3) the samples that load on the basis columns its atoms touch
-    /// against the count of those columns ([`SpeciesVerdict::columns`]); class-wide, the class's
+    /// environment key (M8a user-fix 3 and its review) the fitted samples holding an atom of the key
+    /// against the count of the basis columns its atoms touch ([`SpeciesVerdict::columns`]);
+    /// class-wide, the class's
     /// samples against the whole basis's Q′.
     Samples,
     /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its

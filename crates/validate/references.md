@@ -3895,17 +3895,17 @@ Tests: `class_trust_is_per_environment_species_the_users_water_after_h3`, `new_e
 
 **The change** (`calibrate` "The sample floor per key"; `trust::key_column_counts`, `surrogate::touched_columns`). Per environment key:
 - **q_k** = the independent columns non-zero on at least one fitted atom of the key.
-- **n_k** = the fitted samples that hold an atom of the key's class touching one of those columns.
+- **n_k** = the fitted samples holding at least one atom whose key is k (since the review's ruling 1; first committed as "samples of the key's class with an atom touching one of those columns", see below).
 - The key is short while n_k < q_k.
 
 The wording is "N of q_k samples needed": in refusals, in the Activity line, and on every Model-tab key row (`SpeciesVerdict::samples`/`columns`).
 
 **Kept as before:**
-- The whole-model condition n_samples ≥ Q′ (`TrustKey::Samples`).
+- The whole-model condition n_samples ≥ Q′ (`TrustKey::Samples`) — until the review's ruling 2, below.
 - The class-wide verdict.
 - A key no fitted atom holds, which keeps its class's count against the whole Q′.
 
-**Why the class restriction on n_k.** A dimer's atom is non-zero on every many-body column of its species, because a body-3 feature with one neighbour is R_n R_n′ (2l+1)/4π. But a dimer cannot separate the angular directions. The H₃ ladder test (`the_many_body_class_earns_trust_as_samples_arrive`) still reads short exactly while k < 29.
+**Why the class restriction on n_k** (first version; superseded by the review's own-key count). A dimer's atom is non-zero on every many-body column of its species, because a body-3 feature with one neighbour is R_n R_n′ (2l+1)/4π. But a dimer cannot separate the angular directions. The H₃ ladder test (`the_many_body_class_earns_trust_as_samples_arrive`) still reads short exactly while k < 29.
 
 **Why the support and not the rank.** The count is a floor per parameter. Identifiability is left to the leave-one-out and DFT checks: an undefined LOO refuses as ∞.
 
@@ -3935,6 +3935,42 @@ In each basis, N₂'s columns are disjoint from water's.
 - The teach-around offer's richer-basis floor (`richer_basis_floor`) lists the keys that would be short, each on its own floor in the richer basis.
 
 **Not measured on the user's collection.** The H/N/O collection was not on disk. The live numbers for it are the next user test.
+
+#### Review fix round (2026-11-02; `user-fix-3-review.md`, APPROVE WITH FIXES)
+
+**Ruling 1: n_k counts only the samples holding an atom of key k.** The first version counted any sample of the key's class with an atom touching one of k's columns. Columns are shared between keys, so other keys' samples stood in for k's.
+
+`a_key_counts_only_the_samples_holding_an_atom_of_it` (H/N; 120 H₂, 120 H₃, 3 NH₃; Morse teacher). Each cell is (n_k, q_k, verdict):
+
+| key | first version | own-key count |
+|---|---|---|
+| many-body around H, with H and N (NH₃'s H) | 123, 92 — passes on H₃'s samples (by construction, not run: every H₃ atom touches its H–H columns) | **3, 92, short: "3 of 92 samples needed"** |
+| many-body around N, with H | — | 3, 29, short |
+| many-body around H, with H (H₃) | — | 120, 29, trusted |
+| pair around H, with H | — | 120, 29, trusted |
+
+The synthetic H/O → H/N/O numbers above are unchanged under this count: 220, 120, then 5 → 44 for N₂.
+
+**The cost of the own-key count.** A key seen in few samples is short on its own floor even where its columns are shared with a well-sampled key, for example a stretched water's pair H{O}. It falls back until it has its own samples.
+
+**Ruling 2: the whole-model floor is the columns the fitted atoms touch.** `TrustKey::Samples` now requires n_samples ≥ |∪_k S_k| (`SurrogateKs::sample_floor`). The refusal reads "n_samples N < M (the model columns its fitted atoms touch; Q′ Q)". The basis's Q′ remains only where there is no class judgement (no store).
+
+`the_whole_model_floor_is_the_columns_the_fitted_atoms_touch` (80 each of H₂, OH and O₂ dimers plus 200 water trimers, then 5 N₂):
+
+| | H/O | + 5 N₂ |
+|---|---|---|
+| n | 440 | 445 |
+| Q′ | 176 | 543 |
+| floor | 142 | 171 = 142 + N₂'s own 29 |
+| trusted | yes | yes; water answered by the surrogate |
+
+Under the global Q′ this store (445 < 543) would have untrusted the whole model, water included.
+
+The floor of 142 is below Q′ 176 because the O-centred (H, O) cross body-3 block (34 columns) is touched by no fitted atom: water's O has only H neighbours, and O₂'s O has only O.
+
+**Minor 3: Model-tab key rows.** A row reads "967 samples for 38 columns". The form "N of q samples needed" appears only when that count is what refuses the key.
+
+**Minor 4:** formatting of the descriptor test.
 
 ## M8a collection references and the class-LOO cost (Task 4a, 2026-10-21; `surrogate::collection` "References", `providers::surrogate::shared`)
 

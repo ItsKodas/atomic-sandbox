@@ -460,6 +460,7 @@ impl SurrogateKs {
         let store = self.store.as_ref()?;
         let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
         let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
+            .per_key
             .into_iter()
             .filter(|(_, (n, q))| n < q)
             .map(|(k, (n, q))| format!("{} {} has {n} of {q}", ENV_CLASSES[(k.class - 1) as usize], sim::key_words(k.z, &k.neighbours)))

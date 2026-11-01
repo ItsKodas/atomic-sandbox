@@ -10,7 +10,7 @@
 //!
 //! | key | fails when | value / limit |
 //! |---|---|---|
-//! | `Samples` | n_samples < Q′ | n_samples / Q′ |
+//! | `Samples` | n_samples < the columns the fitted atoms touch, \|∪ S_k\| (Q′ without a class judgement; M8a user-fix 3 review) | n_samples / that count |
 //! | `ResidualDofE` | not ν_E ≥ 30 (`MIN_RESIDUAL_DOF`) | ν_E / 30 |
 //! | `ResidualDofF` | not ν_F ≥ 30 | ν_F / 30 |
 //! | `EnergyResidual` | max over samples of \|E_model − E_s\|/N_s > `energy_std_per_atom` | that max / the tier (Ha/atom) |
@@ -44,8 +44,10 @@ pub const MIN_RESIDUAL_DOF: f64 = 30.0;
 #[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
 mod predicates {
     use super::*;
-    pub(super) fn samples_short(r: &FitReport) -> bool {
-        r.n_samples < r.q_prime
+    /// `floor`: [`SurrogateKs::sample_floor`] — the columns the fitted atoms touch (M8a user-fix 3
+    /// review, ruling 2), Q′ only without a class judgement.
+    pub(super) fn samples_short(r: &FitReport, floor: usize) -> bool {
+        r.n_samples < floor
     }
     pub(super) fn dof_short(dof: f64) -> bool {
         !(dof >= MIN_RESIDUAL_DOF)
@@ -145,20 +147,28 @@ pub fn env_class(counts: &[usize]) -> Option<usize> {
     }
 }
 
-/// Per environment key of `samples`' atoms (M8a user-fix 3; `calibrate` "The sample floor per
-/// key"): (n_k, q_k). q_k is the number of independent basis columns the key's atoms touch
-/// ([`surrogate::touched_columns`]: non-zero on at least one atom of the key) — the parameters its
-/// predictions can move with. n_k is the number of samples holding an atom **of the key's class**
-/// whose environment touches at least one of those columns — the class's samples (the count the
-/// rule always used) restricted to those that constrain the key's parameters. A key is held to
-/// n_k ≥ q_k, not the class's count to the whole basis's Q′: a species added to the collection
-/// brings columns no other key touches and must not raise their bar, and another species' samples
-/// of the same class must not count for it. The class restriction keeps what the class count
-/// meant: a pair geometry loads on the many-body columns of its species (a body-3 feature of a
-/// one-neighbour atom is R_n R_n′ (2l+1)/4π, non-zero) but cannot tell their angular directions
-/// apart, so dimers never count towards a many-body key. Data-driven, nothing per element (rule
-/// 1). Samples the basis cannot describe (a species it lacks) are skipped.
-pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl IntoIterator<Item = &'a Sample>) -> BTreeMap<surrogate::EnvKey, (usize, usize)> {
+/// The sample floors of a set of fitted samples (M8a user-fix 3 and its review; `calibrate` "The
+/// sample floor per key"): per environment key (n_k, q_k), and the whole model's floor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct ColumnCounts {
+    /// Per key: n_k the samples holding at least one atom **whose key is k**, q_k the independent
+    /// basis columns non-zero on at least one atom of k ([`surrogate::touched_columns`]) — the
+    /// parameters its predictions can move with.
+    pub(super) per_key: BTreeMap<surrogate::EnvKey, (usize, usize)>,
+    /// |∪_k S_k|: the independent columns any atom of the samples touches — the parameters the
+    /// fit's data can move at all, the whole-model sample floor (`TrustKey::Samples`).
+    pub(super) union: usize,
+}
+
+/// [`ColumnCounts`] of `samples` in `basis`. A key is held to n_k ≥ q_k, not its class's count to
+/// the whole basis's Q′: a species added to the collection brings columns no other key touches
+/// and must not raise their bar. n_k counts only samples holding an atom of k itself (the
+/// review's ruling 1): counting every sample that loads on k's columns let other keys' samples
+/// stand in for k's — H₃'s samples for the H{H, N} key of NH₃ (its N channels resting on three
+/// samples), water's H for H₃'s key, a dimer's atom (non-zero on every many-body column of its
+/// species: a one-neighbour body-3 feature is R_n R_n′ (2l+1)/4π) for a many-body key. Data-driven,
+/// nothing per element (rule 1). Samples the basis cannot describe (a species it lacks) are skipped.
+pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl IntoIterator<Item = &'a Sample>) -> ColumnCounts {
     let rc2 = basis.r_cut * basis.r_cut;
     let words = basis.n_independent_columns().div_ceil(64);
     let class_of = basis.column_class_index();
@@ -167,31 +177,29 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
             bits[c / 64] |= 1u64 << (c % 64);
         }
     };
-    // per sample, per class (pair, many-body): the columns its atoms of that class touch
-    let mut per_sample: Vec<[Vec<u64>; 2]> = Vec::new();
-    let mut per_key: BTreeMap<surrogate::EnvKey, Vec<u64>> = BTreeMap::new();
+    let mut union = vec![0u64; words];
+    // per key: its columns and its sample count
+    let mut per_key: BTreeMap<surrogate::EnvKey, (Vec<u64>, usize)> = BTreeMap::new();
     for s in samples {
         if s.z.len() != s.pos.len() {
             continue;
         }
         let Ok(touched) = surrogate::touched_columns(basis, &class_of, &s.pos, &s.z) else { continue };
-        let mut by_class = [vec![0u64; words], vec![0u64; words]];
+        let mut present = std::collections::BTreeSet::new();
         for (cols, k) in touched.iter().zip(env_keys(&s.pos, &s.z, rc2)) {
+            set(&mut union, cols);
             let Some(k) = k else { continue };
-            set(&mut by_class[(k.class - 1) as usize], cols);
-            set(per_key.entry(k).or_insert_with(|| vec![0u64; words]), cols);
+            set(&mut per_key.entry(k.clone()).or_insert_with(|| (vec![0u64; words], 0)).0, cols);
+            present.insert(k);
         }
-        per_sample.push(by_class);
+        for k in present {
+            if let Some(e) = per_key.get_mut(&k) {
+                e.1 += 1;
+            }
+        }
     }
-    per_key
-        .into_iter()
-        .map(|(k, bits)| {
-            let c = (k.class - 1) as usize;
-            let q = bits.iter().map(|w| w.count_ones() as usize).sum();
-            let n = per_sample.iter().filter(|s| s[c].iter().zip(&bits).any(|(a, b)| a & b != 0)).count();
-            (k, (n, q))
-        })
-        .collect()
+    let count = |bits: &[u64]| bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+    ColumnCounts { per_key: per_key.into_iter().map(|(k, (bits, n))| (k, (n, count(&bits)))).collect(), union: count(&union) }
 }
 
 /// What the class verdicts are judged from (`SurrogateKs::class_judge`; M8a user-test fix 2): the
@@ -200,8 +208,8 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
 #[derive(Clone, Debug)]
 pub(super) struct ClassJudge {
     pub(super) stats: [super::calibrate::ClassStats; 2],
-    /// Per environment key its own leave-one-out numbers, with its class's samples that load on
-    /// its columns as its sample count (M8a user-fix 3, [`key_column_counts`]).
+    /// Per environment key its own leave-one-out numbers, with the fitted samples holding an atom
+    /// of that key as its sample count (M8a user-fix 3 review, [`key_column_counts`]).
     pub(super) key_stats: BTreeMap<surrogate::EnvKey, super::calibrate::ClassStats>,
     /// Per environment key of the fitted atoms the columns it touches: the sample count it is held
     /// to (M8a user-fix 3). A key without fitted atoms is held to the whole basis's `q_prime`.
@@ -209,6 +217,9 @@ pub(super) struct ClassJudge {
     pub(super) aleatoric: [f64; 2],
     /// The whole basis's Q′: the class-wide verdict's floor and that of a key no fitted atom holds.
     pub(super) q_prime: usize,
+    /// The columns the fitted atoms touch, |∪_k S_k| ([`ColumnCounts::union`]): the whole-model
+    /// sample floor (`TrustKey::Samples`; M8a user-fix 3 review, ruling 2).
+    pub(super) fit_columns: usize,
     pub(super) keys: std::collections::BTreeSet<surrogate::EnvKey>,
     pub(super) cal: super::calibrate::Calibration,
     /// The calibration of the last refit, install or policy change: λ's source. The variance
@@ -290,6 +301,15 @@ impl SurrogateKs {
         self.checks().collect()
     }
 
+    /// The whole-model sample floor (`TrustKey::Samples`; M8a user-fix 3 review, ruling 2): the
+    /// independent columns the fitted atoms touch, |∪_k S_k| — a species the fit holds a few samples
+    /// of raises it only by the columns its own atoms touch (and its key is short on its own
+    /// floor). The whole basis's Q′ without a class judgement (no store) or when no fitted atom
+    /// touches a column.
+    pub(super) fn sample_floor(&self, r: &FitReport) -> usize {
+        self.class_judge.as_ref().map(|j| j.fit_columns).filter(|&u| u > 0).unwrap_or(r.q_prime)
+    }
+
     /// [`trust_checks`](Self::trust_checks) without the allocation: the one sequence that
     /// `trusted`, `untrusted_check` and the checklist read.
     fn checks(&self) -> impl Iterator<Item = TrustCheck> + use<> {
@@ -304,7 +324,7 @@ impl SurrogateKs {
             (None, _) => check(TrustKey::Audit, fails, 0.0, p.energy_std_per_atom),
         };
         [
-            r.map(|r| check(TrustKey::Samples, samples_short(r), r.n_samples as f64, r.q_prime as f64)),
+            r.map(|r| check(TrustKey::Samples, samples_short(r, self.sample_floor(r)), r.n_samples as f64, self.sample_floor(r) as f64)),
             r.map(|r| check(TrustKey::ResidualDofE, dof_short(r.residual_dof_e), r.residual_dof_e, MIN_RESIDUAL_DOF)),
             r.map(|r| check(TrustKey::ResidualDofF, dof_short(r.residual_dof_f), r.residual_dof_f, MIN_RESIDUAL_DOF)),
             t.map(|t| check(TrustKey::EnergyResidual, energy_residual_fails(t, p), t.energy_per_atom, p.energy_std_per_atom)),
@@ -327,7 +347,7 @@ impl SurrogateKs {
         // the count conditions: the app's `COUNT_REFUSALS` matches their wording ("n_samples ",
         // "residual_dof_") so the Model tab does not blame the box for them: keep the prefixes
         let text = match c.key {
-            TrustKey::Samples => format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime),
+            TrustKey::Samples => format!("n_samples {} < {} (the model columns its fitted atoms touch; Q′ {})", r.n_samples, self.sample_floor(r), r.q_prime),
             TrustKey::ResidualDofE => format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e),
             TrustKey::ResidualDofF => format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f),
             TrustKey::EnergyResidual => format!("max training energy residual {:.1e} > {:.1e} Ha/atom", c.value, c.limit),
@@ -665,20 +685,20 @@ impl SurrogateKs {
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
-        // per key: its own leave-one-out numbers, and the samples that load on the columns it
-        // touches against the count of those columns (M8a user-fix 3: not the class's count
+        // per key: its own leave-one-out numbers, and the fitted samples holding an atom of the key
+        // against the columns its atoms touch (M8a user-fix 3 and its review: not the class's count
         // against the whole basis's Q′, which a species added elsewhere raised for every key)
         let counts = key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s));
-        let key_q: BTreeMap<surrogate::EnvKey, usize> = counts.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
+        let key_q: BTreeMap<surrogate::EnvKey, usize> = counts.per_key.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
         let key_stats = key_acc
             .into_iter()
             .map(|(k, a)| {
                 let c = (k.class - 1) as usize;
-                let samples = counts.get(&k).map_or(stats[c].samples, |&(n, _)| n);
+                let samples = counts.per_key.get(&k).map_or(stats[c].samples, |&(n, _)| n);
                 (k, super::calibrate::ClassStats { samples, ..stats_of(a) })
             })
             .collect();
-        let judge = ClassJudge { stats, key_stats, key_q, aleatoric, q_prime: report.q_prime, keys, refit_cal: cal.clone(), cal, between_refits: false };
+        let judge = ClassJudge { stats, key_stats, key_q, aleatoric, q_prime: report.q_prime, fit_columns: counts.union, keys, refit_cal: cal.clone(), cal, between_refits: false };
         // the hysteresis memory is the verdict that stood when this refit, install or policy
         // change began (`class_memory`; reset by a forget or an install)
         let loo = self.judge_classes(&judge);
@@ -1350,7 +1370,7 @@ impl SurrogateKs {
     /// The trust rule fails for want of data (n_samples < Q′ or too few residual degrees of
     /// freedom): every teacher answer is then worth keeping (no thinning).
     pub(super) fn trust_needs_samples(&self) -> bool {
-        self.report.as_ref().is_none_or(|r| samples_short(r) || dof_short(r.residual_dof_e) || dof_short(r.residual_dof_f))
+        self.report.as_ref().is_none_or(|r| samples_short(r, self.sample_floor(r)) || dof_short(r.residual_dof_e) || dof_short(r.residual_dof_f))
     }
 
     /// Reference energies in `basis.species` order.

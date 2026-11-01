@@ -392,8 +392,11 @@
 //!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
-//! The model may answer only when the last `FitReport` has `n_samples ≥ q_prime` (distinct
-//! geometries, not rows: the 3N force rows of one sample probe one geometry) AND
+//! The model may answer only when the last `FitReport` has `n_samples ≥` the independent columns
+//! its fitted atoms touch, |∪_k S_k| (`sample_floor`; since M8a user-fix 3's review — before it
+//! was the whole basis's `q_prime`, which a species held in a few samples raised by columns no
+//! other atom touches; Q′ still without a class judgement; `calibrate` "The sample floor per key")
+//! (distinct geometries, not rows: the 3N force rows of one sample probe one geometry) AND
 //! `residual_dof_e ≥ 30` AND `residual_dof_f ≥ 30` (the two noise levels are then known to
 //! ≈ 25 %, so the variance means something). Below that the fit is a curve through too few
 //! points with a noise estimate collapsing towards its floor — overconfident inside its span.
@@ -452,9 +455,9 @@
 //! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
 //!   `validate/references.md`, "M8a calibrated verdict"): enough samples — per environment key
-//!   (M8a user-fix 3, `calibrate` "The sample floor per key") its class's samples that load on the
-//!   basis columns its atoms touch, at least as many as those columns (not the class's count
-//!   against the whole basis's Q′: a species added to a collection must not raise the floor of
+//!   (M8a user-fix 3 and its review, `calibrate` "The sample floor per key") the fitted samples
+//!   holding an atom of the key, at least as many as the basis columns its atoms touch (not the
+//!   class's count against the whole basis's Q′: a species added to a collection must not raise the floor of
 //!   keys whose columns it does not touch; the user's water read "967 samples < Q′ 1590" once N₂
 //!   was trained in) — and the error the teacher **measured** where this verdict decides
 //!   within the verdict's limit. The evidence is the audit history's points in the verdict's

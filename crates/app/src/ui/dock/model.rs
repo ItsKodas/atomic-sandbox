@@ -590,10 +590,16 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
 pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model directions its atoms can move along (per kind of atom and neighbours: the columns those environments touch, not the whole model's), is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at three or more geometries of a class, one badly predicted sample is enough to keep the whole class on DFT; from then on the class is judged by the error those DFT checks measured (on average, with a margin to start answering), with the left-out average as a floor.";
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
-/// One environment species' row under its class ("  many-body around O, with H: learned · 967 of
-/// 371 samples needed"): the samples against the columns its atoms touch (M8a user-fix 3).
+/// One environment species' row under its class ("  many-body around O, with H: learned · 967
+/// samples for 38 columns"): its samples against the columns its atoms touch (M8a user-fix 3), read
+/// "12 of 146 samples needed" only when that count is what refuses it (the review's Minor 3).
 pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
-    format!("  {class} {}: {} · {} of {} samples needed", s.words(), if s.trusted { "learned" } else { "not learned yet (DFT)" }, s.samples, s.columns)
+    let count = if matches!(s.refusal, Some((sim::ClassKey::Samples, ..))) {
+        format!("{} of {} samples needed", s.samples, s.columns)
+    } else {
+        format!("{} samples for {} columns", s.samples, s.columns)
+    };
+    format!("  {class} {}: {} · {count}", s.words(), if s.trusted { "learned" } else { "not learned yet (DFT)" })
 }
 
 pub fn class_line(c: &sim::ClassLoo) -> String {
@@ -613,9 +619,10 @@ mod tests {
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
         let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
-        let s = |z, nb: Vec<u8>, trusted, samples, columns| sim::SpeciesVerdict { z, neighbours: nb, trusted, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns };
-        assert_eq!(super::species_line("many-body", &s(8, vec![1], true, 967, 38)), "  many-body around O, with H: learned · 967 of 38 samples needed");
-        assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], false, 12, 146)), "  many-body around H, with H and O: not learned yet (DFT) · 12 of 146 samples needed");
+        let s = |z, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples, columns| sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns };
+        assert_eq!(super::species_line("many-body", &s(8, vec![1], None, 967, 38)), "  many-body around O, with H: learned · 967 samples for 38 columns");
+        assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], Some((sim::ClassKey::Samples, 12.0, 146.0)), 12, 146)), "  many-body around H, with H and O: not learned yet (DFT) · 12 of 146 samples needed");
+        assert_eq!(super::species_line("pair", &s(1, vec![7], Some((sim::ClassKey::Force, 2.5, 1.0)), 300, 29)), "  pair around H, with N: not learned yet (DFT) · 300 samples for 29 columns");
     }
 }
 

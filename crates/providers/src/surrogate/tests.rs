@@ -330,7 +330,9 @@ fn untrusted_model_falls_back_with_the_reason() {
     assert_eq!(r.stats.energy_surface(), Surface::Teacher);
     assert_eq!(calls(&h), 1);
     assert_eq!(s.samples(), 6);
-    let want = format!("surrogate untrusted: n_samples {} < q_prime {}", rep.n_samples, rep.q_prime);
+    // one species, dimers: the fitted atoms touch every column, the floor is Q′ (user-fix 3 review)
+    assert_eq!(s.sample_floor(&rep), rep.q_prime);
+    let want = format!("surrogate untrusted: n_samples {} < {} (the model columns its fitted atoms touch; Q′ {})", rep.n_samples, rep.q_prime, rep.q_prime);
     assert!(r.stats.notes.iter().any(|n| n.contains(&want)), "{:?}", r.stats.notes);
 
     // enough samples for n_samples ≥ q′ (29 with the body-3 default basis, S = 1) but not
@@ -4287,7 +4289,10 @@ fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
 fn the_refusal_strings_are_unchanged() {
     let (s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
     let r = s.report().unwrap().clone();
-    assert_eq!(s.untrusted_reason().unwrap(), format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
+    // reworded in M8a user-fix 3's review: the floor is the columns the fitted atoms touch (here
+    // every column: one species, dimers)
+    assert_eq!(s.sample_floor(&r), r.q_prime);
+    assert_eq!(s.untrusted_reason().unwrap(), format!("n_samples {} < {} (the model columns its fitted atoms touch; Q′ {})", r.n_samples, r.q_prime, r.q_prime));
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     s.audit_failed = Some(0.5);
     s.audit_atoms = 2;
@@ -4375,7 +4380,8 @@ fn pre_task3_untrusted_check(s: &SurrogateKs) -> Option<(sim::activity::TrustKey
     use sim::activity::TrustKey;
     let r = s.report.as_ref()?;
     if r.n_samples < r.q_prime {
-        return Some((TrustKey::Samples, format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime)));
+        // the wording of M8a user-fix 3's review (the floor equals Q′ in the sweep's one-species store)
+        return Some((TrustKey::Samples, format!("n_samples {} < {} (the model columns its fitted atoms touch; Q′ {})", r.n_samples, r.q_prime, r.q_prime)));
     }
     if !(r.residual_dof_e >= MIN_RESIDUAL_DOF) {
         return Some((TrustKey::ResidualDofE, format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e)));
@@ -4440,6 +4446,7 @@ fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     let (report, residuals) = (s.report.clone().unwrap(), s.training_residuals.unwrap());
     let q = report.q_prime;
+    assert_eq!(s.sample_floor(&report), q, "one species, dimers: the whole-model floor is Q′ (user-fix 3 review)");
     let mut rng = StdRng::seed_from_u64(0x7a5c3);
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for i in 0..40_000 {
@@ -9819,4 +9826,103 @@ fn lone_samples_in_a_model_file_are_held_out_at_load() {
     assert_eq!((none.samples(), none.lone_held_out()), (43, 3));
     assert!(none.no_model().is_some_and(|nm| nm.words.starts_with("no model yet: 0 usable samples")), "{:?}", none.no_model().map(|n| n.words));
     assert!(none.user_notes.iter().any(|n| n.starts_with("model file: 3 samples of lone atoms")), "{:?}", none.user_notes);
+}
+
+/// An NH₃-like N + 3 H (N–H 1.8–2.0 Bohr, the H's at random azimuths on a cone), randomly placed
+/// in the 65³ cell's middle.
+fn random_nh3(rng: &mut StdRng) -> Scene {
+    let mut sc = in_cell_65(dimer(1.9, [1.0, 0.0, 0.0], [0.0; 3], 7, 1));
+    sc.nuclei.truncate(0);
+    sc.nuclei.push(Nucleus::new(7, [0.0; 3]));
+    let phase: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+    for k in 0..3 {
+        let r = rng.gen_range(1.8..2.0);
+        let phi = phase + k as f64 * std::f64::consts::TAU / 3.0 + rng.gen_range(-0.2..0.2);
+        let (st, ct) = (0.94f64, -0.34f64);
+        sc.nuclei.push(Nucleus::new(1, [r * st * phi.cos(), r * st * phi.sin(), r * ct]));
+    }
+    sc
+}
+
+/// M8a user-fix 3 review, ruling 1: a key's sample count is the fitted samples holding an atom of
+/// that key, not every sample that loads on its columns. An H/N collection of H₂ dimers, H₃
+/// trimers and three NH₃: NH₃'s H{H, N} key shares its H–H columns with H₃'s H{H}, and counted by
+/// "loads on its columns" it held 123 samples against its ≈ 92 columns — its N channels resting on
+/// three samples. Counted by its own atoms it holds 3 and is short; H₃'s key holds its own 120.
+#[test]
+fn a_key_counts_only_the_samples_holding_an_atom_of_it() {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    for z in [1, 7] {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(0x4e3);
+    let add = |s: &mut SurrogateKs, sc: Scene| s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    for i in 0..120 {
+        let sc = in_cell_65(dimer(1.2 + 2.6 * i as f64 / 119.0, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        add(&mut s, sc);
+    }
+    for _ in 0..120 {
+        let sc = random_h3(&mut rng);
+        add(&mut s, sc);
+    }
+    for _ in 0..3 {
+        let sc = random_nh3(&mut rng);
+        add(&mut s, sc);
+    }
+    s.refit().unwrap();
+    let keys = key_counts(&s);
+    println!("H/N: keys {keys:?}");
+    let hhn = keys["many-body around H, with H and N"];
+    assert_eq!(hhn.0, 3, "NH₃'s H key holds its own three samples: {hhn:?}");
+    assert!(!hhn.2 && hhn.1 > 3, "{hhn:?}");
+    let v = s.class_loo()[1].species.iter().find(|v| v.z == 1 && v.neighbours == vec![1, 7]).unwrap().clone();
+    assert_eq!(v.refusal, Some((sim::ClassKey::Samples, 3.0, hhn.1 as f64)), "short on its own floor");
+    let nh = keys["many-body around N, with H"];
+    assert!(nh.0 == 3 && !nh.2, "{nh:?}");
+    let hh = keys["many-body around H, with H"];
+    assert_eq!(hh.0, 120, "H₃'s key: its own samples, NH₃'s H atoms are another key");
+}
+
+/// M8a user-fix 3 review, ruling 2: the whole-model floor (`TrustKey::Samples`) is the columns the
+/// fitted atoms touch, |∪ S_k|, not the whole basis's Q′. A water store well above its own columns
+/// but below the three-species Q′ once five N₂ dimers join: the model stays trusted and water is
+/// answered; the N₂ key is short on its own floor.
+#[test]
+fn the_whole_model_floor_is_the_columns_the_fitted_atoms_touch() {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    for z in [1, 7, 8] {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(0x5a11);
+    let add = |s: &mut SurrogateKs, sc: Scene| s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    for (z0, z1) in [(1, 1), (8, 1), (8, 8)] {
+        for i in 0..80 {
+            let sc = in_cell_65(dimer(1.2 + 2.6 * i as f64 / 79.0, unit_vector(&mut rng), [0.0; 3], z0, z1));
+            add(&mut s, sc);
+        }
+    }
+    for _ in 0..200 {
+        let sc = random_water(&mut rng);
+        add(&mut s, sc);
+    }
+    let rep = s.refit().unwrap();
+    let floor = s.sample_floor(&rep);
+    println!("H/O: n {}, Q′ {}, floor {floor}", rep.n_samples, rep.q_prime);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    for i in 0..5 {
+        let sc = in_cell_65(dimer(1.6 + 0.4 * i as f64, unit_vector(&mut rng), [0.0; 3], 7, 7));
+        add(&mut s, sc);
+    }
+    let rep3 = s.refit().unwrap();
+    let floor3 = s.sample_floor(&rep3);
+    println!("H/N/O: n {}, Q′ {}, floor {floor3}; checks {:?}", rep3.n_samples, rep3.q_prime, s.trust_checks());
+    assert!(rep3.n_samples < rep3.q_prime, "premise: below the global Q′ ({} < {})", rep3.n_samples, rep3.q_prime);
+    assert!(floor3 <= rep3.n_samples && floor3 < rep3.q_prime, "{floor3}");
+    let nn = key_counts(&s)["pair around N, with N"];
+    assert_eq!(floor3, floor + nn.1, "the floor grows by N₂'s own columns, which water's atoms never touch");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(nn.0 == 5 && !nn.2, "{nn:?}");
+    let water = random_water(&mut StdRng::seed_from_u64(77));
+    s.discontinuity();
+    assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate, "water is still answered");
 }

@@ -880,7 +880,12 @@ pub fn describe(
 /// parameters its predictions can move with (M8a user-fix 3: a class key is held to the count
 /// of these, not to the whole basis's Q′). `class_of` is [`Basis::column_class_index`], computed
 /// once by a caller that walks many geometries. Same panics as [`describe_values`].
-pub fn touched_columns(basis: &Basis, class_of: &[usize], pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<Vec<usize>>, DescribeError> {
+pub fn touched_columns(
+    basis: &Basis,
+    class_of: &[usize],
+    pos: &[[f64; 3]],
+    z: &[u8],
+) -> Result<Vec<Vec<usize>>, DescribeError> {
     let s = basis.species_indices(z)?;
     let p = basis.n_features();
     let of = class_of;
@@ -889,7 +894,12 @@ pub fn touched_columns(basis: &Basis, class_of: &[usize], pos: &[[f64; 3]], z: &
         .iter()
         .zip(&s)
         .map(|(b, &si)| {
-            let mut c: Vec<usize> = b.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(k, _)| of[si * p + k]).collect();
+            let mut c: Vec<usize> = b
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v != 0.0)
+                .map(|(k, _)| of[si * p + k])
+                .collect();
             c.sort_unstable();
             c.dedup();
             c
@@ -1077,24 +1087,50 @@ mod tests {
             ho.body4 = body4;
             let mut hno = Basis::new(&[1, 7, 8]);
             hno.body4 = body4;
-            assert!(ho.column_class_index().iter().all(|&c| c < ho.n_independent_columns()));
+            assert!(ho
+                .column_class_index()
+                .iter()
+                .all(|&c| c < ho.n_independent_columns()));
             let a = touched_columns(&ho, &ho.column_class_index(), &pos, &z).unwrap();
             let b = touched_columns(&hno, &hno.column_class_index(), &pos, &z).unwrap();
             for (i, (ta, tb)) in a.iter().zip(&b).enumerate() {
                 assert!(!ta.is_empty());
-                assert_eq!(ta.len(), tb.len(), "body4 {body4}, atom {i}: the N channel adds no column an H/O atom touches");
+                assert_eq!(
+                    ta.len(),
+                    tb.len(),
+                    "body4 {body4}, atom {i}: the N channel adds no column an H/O atom touches"
+                );
             }
             assert!(hno.n_independent_columns() > ho.n_independent_columns());
             // an N₂ atom touches no column an H/O atom does: disjoint
-            let n2 = touched_columns(&hno, &hno.column_class_index(), &[[0.0; 3], [2.07, 0.0, 0.0]], &[7, 7]).unwrap();
+            let n2 = touched_columns(
+                &hno,
+                &hno.column_class_index(),
+                &[[0.0; 3], [2.07, 0.0, 0.0]],
+                &[7, 7],
+            )
+            .unwrap();
             for t in &b {
-                assert!(n2[0].iter().all(|c| !t.contains(c)), "N₂'s columns are not water's");
+                assert!(
+                    n2[0].iter().all(|c| !t.contains(c)),
+                    "N₂'s columns are not water's"
+                );
             }
-            println!("body4 {body4}: Q′ H/O {} → H/N/O {}; water O touches {}, H {}; N₂'s N {}", ho.n_independent_columns(), hno.n_independent_columns(), b[0].len(), b[1].len(), n2[0].len());
+            println!(
+                "body4 {body4}: Q′ H/O {} → H/N/O {}; water O touches {}, H {}; N₂'s N {}",
+                ho.n_independent_columns(),
+                hno.n_independent_columns(),
+                b[0].len(),
+                b[1].len(),
+                n2[0].len()
+            );
         }
         // a lone atom touches nothing
         let one = Basis::new(&[1]);
-    assert!(touched_columns(&one, &one.column_class_index(), &[[0.0; 3]], &[1]).unwrap()[0].is_empty());
+        assert!(
+            touched_columns(&one, &one.column_class_index(), &[[0.0; 3]], &[1]).unwrap()[0]
+                .is_empty()
+        );
     }
 
     #[test]
