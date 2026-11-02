@@ -757,6 +757,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         probed("show-ghost", ui.checkbox(&mut st.show_ghost, "show what training is solving"))
             .on_hover_text("while a sampling pass runs, the view shows the geometry the teacher is solving right now as a wireframe ghost (a lone reference atom, a random nudge with arrows, the scanned pair, the hot burst with a trail) instead of your scene, flashing green / red / grey as each sample is kept / fails / is skipped; your scene returns when the pass ends or is cancelled. Display only"
             );
+        super::knowledge::overlay_toggle(ui, st);
         let mut smooth = st.smooth_motion;
         if ui
             .checkbox(&mut smooth, "smooth motion")

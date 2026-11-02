@@ -586,6 +586,7 @@ impl Viewer {
         self.ui.activity.views_sent = false;
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
+        self.ui.activity.knowledge = None; // the new worker ships its own model's map
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
@@ -1702,6 +1703,13 @@ impl Viewer {
         (0..n)
             .map(|i| unc.map_or(0.0, |u| u[i]).max(env.map_or(0.0, |e| e[i])) as f32)
             .collect()
+    }
+
+    /// The knowledge overlay's per-nucleus coverage (`sim::atom_coverage`, 0 never seen … 1 well
+    /// known; `gfx::World::knowledge`) of the nuclei drawn: empty (no tint) while View ▸ Display
+    /// aids ▸ knowledge overlay is off or no knowledge map has arrived. O(N²) per frame, display only.
+    pub fn atom_knowledge(&self, nuclei: &[crate::scene::SceneNucleus]) -> Vec<f32> {
+        crate::ui::knowledge::overlay_coverage(&self.ui, nuclei)
     }
 
     /// Draft mode's red banner (`providers::surrogate`, "Draft mode"): while the model answers

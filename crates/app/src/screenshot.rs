@@ -25,7 +25,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
 /// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
+/// knowledge|activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
 /// others on the right; the left dock starts open on Readouts, the right one collapsed), `dock=closed`
 /// collapses both, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
@@ -54,6 +54,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Atom trails (View ▸ Display aids ▸ Trails): `trails=on|off`, `trail_fs=<fs>` (the length in
 /// simulated femtoseconds, 5–10 000; 100 by default) and `trail_opacity=<0-100>` (percent; 70 by
 /// default). They are set before the play, so the history is collected while it runs.
+///
+/// The knowledge map (M8a Task 9): `tab=knowledge` opens its tab (right dock), `knowledge=on|off`
+/// switches View ▸ Display aids ▸ knowledge overlay (the atoms' tint and its legend; off by
+/// default). Both need the estimated solver's map to show more than their empty state.
 ///
 /// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
 /// the training plots and the timeline: the last three for the estimated solver).
@@ -117,6 +121,8 @@ pub struct ShotUi {
     pub camera: Option<bool>,
     /// `trails=on|off`, `trail_fs=<fs>`, `trail_opacity=<0-100>`.
     pub trails: Option<bool>,
+    /// `knowledge=on|off`: the knowledge overlay (M8a Task 9).
+    pub knowledge: Option<bool>,
     pub trail_fs: Option<f64>,
     pub trail_opacity: Option<f32>,
     pub show: Option<crate::ui::ShowMode>,
@@ -245,6 +251,13 @@ impl ShotUi {
                         other => return Err(format!("--ui: trails=on|off, got {other}")),
                     })
                 }
+                "knowledge" => {
+                    s.knowledge = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: knowledge=on|off, got {other}")),
+                    })
+                }
                 "trail_fs" => {
                     let fs: f64 = v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?;
                     if !(crate::trails::LENGTH_MIN_FS..=crate::trails::LENGTH_MAX_FS).contains(&fs) {
@@ -351,6 +364,7 @@ impl ShotUi {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
+                "knowledge" => DockTab::Knowledge,
                 "activity" => DockTab::Activity,
                 "orbitals" => DockTab::Orbitals,
                 "selection" => DockTab::Selection,
@@ -397,6 +411,9 @@ impl ShotUi {
         }
         if let Some(on) = self.ghost {
             viewer.ui.show_ghost = on;
+        }
+        if let Some(on) = self.knowledge {
+            viewer.ui.show_knowledge = on;
         }
         if self.aids_off {
             viewer.ui.show_cell = false;
@@ -511,6 +528,7 @@ impl Shot {
             let shown = viewer.shown_scene(Instant::now());
             let lines = viewer.overlay_lines(&shown);
             let risk = viewer.atom_risk();
+            let knowledge = viewer.atom_knowledge(viewer.drawn_nuclei(&shown));
             let selected = viewer.tool.set(shown.nuclei.len());
             let warp_from = viewer.warp_source();
             let world = World {
@@ -520,6 +538,7 @@ impl Shot {
                 lines: &lines,
                 viewport: viewer.viewport,
                 risk: &risk,
+                knowledge: &knowledge,
                 blur: &[],
                 glow: None,
                 warp_from: warp_from.as_deref(),

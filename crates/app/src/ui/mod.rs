@@ -27,6 +27,7 @@ mod dock;
 mod files;
 pub mod profile;
 mod icons;
+pub mod knowledge;
 pub mod logbook;
 mod menus;
 pub mod model_offer;
@@ -230,22 +231,24 @@ pub enum DockTab {
     Orbitals,
     Selection,
     Log,
+    /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
+    Knowledge,
 }
 
 impl DockTab {
     /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser).
-    pub const ALL: [DockTab; 7] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const ALL: [DockTab; 8] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
     /// The left dock's tabs, in strip order: stats and what is going on.
     pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
     /// The right dock's tabs, in strip order: configuring things.
-    pub const RIGHT: [DockTab; 4] = [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const RIGHT: [DockTab; 5] = [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
     /// The dock this tab starts in (the tests; the layout can move it: `UiState::side_of`).
     #[cfg(test)]
     pub fn side(self) -> DockSide {
         match self {
             DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
-            DockTab::Model | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
         }
     }
 
@@ -258,6 +261,7 @@ impl DockTab {
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
+            DockTab::Knowledge => "Knowledge · what the model knows",
         }
     }
 }
@@ -616,6 +620,13 @@ pub struct UiState {
     /// default; how long a point stays, in simulated fs ([`trails::LENGTH_MIN_FS`]…
     /// [`trails::LENGTH_MAX_FS`], logarithmic slider), and the alpha of the newest end (0–1).
     pub show_trails: bool,
+    /// View ▸ Display aids ▸ knowledge overlay (M8a Task 9, `knowledge`): each atom tinted by how
+    /// well the model knows its surroundings (`sim::atom_coverage`), with a legend. Off by
+    /// default; display only, not recorded; kept in the profile.
+    pub show_knowledge: bool,
+    /// The knowledge map's own view state (`knowledge::KnowledgeView`: the picked pair or element,
+    /// the pop-out window). Display only.
+    pub knowledge: knowledge::KnowledgeView,
     /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
     pub motion_blur: f32,
     /// View ▸ Density ▸ show ▸ None: no electron cloud, only the atoms (display only).
@@ -923,6 +934,8 @@ right {}
             show_place_grid: true,
             grid_in_angstrom: false,
             show_trails: false,
+            show_knowledge: false,
+            knowledge: Default::default(),
             motion_blur: 0.5,
             hide_cloud: false,
             camera_view: false,
@@ -1310,6 +1323,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         out.commands.push(Command::SetActivityViews(want));
     }
     overlays::show(root.ctx(), view, st, input, &mut acts);
+    knowledge::legend(root.ctx(), view, st, input);
+    knowledge::window(root.ctx(), st, input);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);

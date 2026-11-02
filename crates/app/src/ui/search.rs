@@ -99,6 +99,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Menu(M::View), "m-density"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
     e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Menu(M::View), "m-display"),
+    e("Knowledge overlay", "tint atoms coverage how well known model learned never seen thin trusted 3D colour", Menu(M::View), "m-display"),
     e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
@@ -164,6 +165,9 @@ pub const ENTRIES: &[Entry] = &[
     e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    // Knowledge (M8a Task 9)
+    e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
+    e("Open the knowledge map window", "pop out knowledge map larger window", Dock(D::Knowledge), "d-knowledge-popout"),
     // Activity
     e("Jobs (what is running)", "activity progress cancel pause stop sampling refit audit solve work", Dock(D::Activity), "d-jobs"),
     e("Counters (samples, teacher solves)", "activity samples in the model teacher solves this session ticks", Dock(D::Activity), "d-counters"),
@@ -366,9 +370,9 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                         Place::Toolbar => "toolbar".to_string(),
                         Place::SceneChip => "scene chip".to_string(),
                         Place::Menu(m) => format!("menu › {}", m.title()),
-                        // the Model tab shows its controls only with the estimated solver
-                        Place::Dock(DockTab::Model) if st.backend != crate::sim::Backend::Estimated => {
-                            format!("dock › {} (pick Estimated first)", DockTab::Model.title())
+                        // the Model and Knowledge tabs show their contents only with the estimated solver
+                        Place::Dock(t @ (DockTab::Model | DockTab::Knowledge)) if st.backend != crate::sim::Backend::Estimated => {
+                            format!("dock › {} (pick Estimated first)", t.title())
                         }
                         // the Activity tab shows its trust, training and timeline groups likewise
                         Place::Dock(DockTab::Activity) if st.backend != crate::sim::Backend::Estimated && matches!(entry.anchor, "d-trust" | "d-training" | "d-timeline") => {

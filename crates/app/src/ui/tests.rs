@@ -909,7 +909,9 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     let mut rich = snapshot(&scene, Backend::Estimated, Some(model()));
     rich.activity.events = activity_tab::every_kind_of_event();
     rich.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    rich.activity.knowledge = Some(std::sync::Arc::new(knowledge::fixture_map()));
     st.activity.absorb(&rich);
+    st.show_knowledge = true; // the overlay's legend over every layout
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -4563,14 +4565,14 @@ fn auto_audit_cadence_follows_the_play_speed() {
     assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
 }
 
-/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Orbitals,
-/// Selection and Log on the right; each side has its own open flag and selected tab, a strip button
+/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Knowledge
+/// (M8a Task 9), Orbitals, Selection and Log on the right; each side has its own open flag and selected tab, a strip button
 /// opens (or collapses) its own side only, and the search opens a control's own dock.
 #[test]
 fn the_two_docks_hold_their_own_tabs() {
     use super::DockSide;
     assert_eq!(DockTab::LEFT, [DockTab::Activity, DockTab::Readouts, DockTab::Graph], "the left dock's order");
-    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
+    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
     assert!(DockTab::LEFT.iter().all(|t| t.side() == DockSide::Left) && DockTab::RIGHT.iter().all(|t| t.side() == DockSide::Right));
     assert_eq!(DockTab::ALL.len(), DockTab::LEFT.len() + DockTab::RIGHT.len());
     assert!(DockTab::ALL.iter().all(|t| t.side().tabs().contains(t)));
@@ -4806,4 +4808,192 @@ fn a_refused_class_names_its_short_key() {
     let ok = sim::SpeciesVerdict { trusted: true, refusal: None, samples: 40, ..nn };
     let m = ModelStatus { class_loo: vec![sim::ClassLoo { trusted: true, refusal: None, samples: 40, species: vec![ok], ..pair }], ..model() };
     assert!(!activity::trust::lines(&m, &scene, &st).iter().any(|l| l.text.contains("around N, with N")));
+}
+
+/// M8a Task 9: the knowledge map — the tab draws a map, a click picks a pair or an element, the pair
+/// detail names the environment keys behind its verdict, and the overlay is display state kept in
+/// the profile.
+mod knowledge_map {
+    use super::*;
+    use knowledge::Pick;
+    use std::sync::Arc;
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                let o = show(root, st, inp);
+                assert!(o.commands.is_empty() && o.actions.is_empty(), "the map is display only");
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Three carbons in a chain with two hydrogens (C–C 2.89 Bohr, C–H 2.06 Bohr): a C–C the
+    /// fixture map has never seen.
+    fn chain() -> Scene {
+        let n = |z: u8, pos: [f64; 3]| crate::scene::SceneNucleus { z, a: None, pos, vel: [0.0; 3] };
+        Scene {
+            nuclei: vec![n(6, [-2.89, 0.0, 0.0]), n(6, [0.0, 0.0, 0.0]), n(6, [2.89, 0.0, 0.0]), n(1, [0.0, 2.06, 0.0]), n(1, [-2.89, -2.06, 0.0])],
+            ..Scene::preset("h2o").unwrap()
+        }
+    }
+
+    fn with_map(scene: &Scene, m: ModelStatus) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(m));
+        snap.activity.knowledge = Some(Arc::new(knowledge::fixture_map()));
+        snap
+    }
+
+    #[test]
+    fn the_knowledge_tab_draws_the_map_and_picks_by_click() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        assert!(st.activity.knowledge.is_some(), "the map is kept from the snapshot");
+        st.open_tab(DockTab::Knowledge);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a", "2140 samples · H C O", "3 trusted", "2 thin", "1 never seen", "C–C · never", "C–H · trusted", "H–H · thin", "2140 atoms", "THIS SCENE ASKS"] {
+            assert!(t.contains(want), "{want:?} in the tab:\n{t}");
+        }
+        // nothing picked: the weakest pair the scene asks (C–C, never seen) and its empty histogram
+        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("never taught"), "{t}");
+        // a click on a line's label picks the pair: its histogram with the scene's distances
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 6));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("the pair you picked · 610 samples") && t.contains("asked now (the open scene):") && t.contains("2 at 2.06 taught"), "{t}");
+        // a node picks its element: neighbour counts and bond angles, the scene's atoms marked
+        click_widget(&ctx, &mut st, &inp, "knowledge-element-6");
+        assert_eq!(st.knowledge.pick, Pick::Element(6));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("asked: #0") && t.contains("BOND ANGLES AT C"), "{t}");
+        // the pop-out window draws the same map
+        click_widget(&ctx, &mut st, &inp, "knowledge-popout");
+        assert!(st.knowledge.window);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Knowledge map") && t.matches("element · 610 atoms").count() == 2, "tab and window share the pick:\n{t}");
+        // another solver: the empty state
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        st.backend = Backend::Gpu;
+        let t = texts(&ctx, &mut st, &input(&scene, Some(&gpu), &cam));
+        assert!(t.contains("Pick Estimated to see it"), "{t}");
+    }
+
+    #[test]
+    fn the_pair_detail_lists_the_keys_behind_its_verdict() {
+        let scene = chain();
+        let cam = camera();
+        let key = |z: u8, neighbours: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize| sim::SpeciesVerdict {
+            z,
+            neighbours,
+            trusted: refusal.is_none(),
+            refusal,
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 0,
+            trusted_since: None,
+            inflation: 1.0,
+            samples,
+            columns,
+        };
+        let mut m = model();
+        let pair = m.class_loo[0].clone();
+        m.class_loo = vec![
+            sim::ClassLoo { species: vec![key(1, vec![1], None, 120, 12), key(6, vec![1], None, 600, 30)], ..pair.clone() },
+            sim::ClassLoo { class: "many-body", trusted: false, species: vec![key(1, vec![1, 7], Some((sim::ClassKey::Samples, 3.0, 92.0)), 3, 92), key(7, vec![1], None, 120, 20)], ..pair },
+        ];
+        let snap = with_map(&scene, m.clone());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        st.open_tab(DockTab::Knowledge);
+        st.knowledge.pick = Pick::Pair(1, 1);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("thin: taught, but not everywhere it was met"), "{t}");
+        assert!(t.contains("Three-or-more-atom arrangements around H, with H and N — not yet (3 of 92 samples needed)"), "the short key, in the Activity tab's words:\n{t}");
+        // only the keys where H sees H: not C's or N's (the Activity tab lists those elsewhere)
+        assert!(t.contains("learned: pair around H, with H\n"), "{t}");
+        assert!(!t.contains("the model as a whole is not trusted"), "{t}");
+        // an untrusted model: rule 4 is said first
+        let untrusted = ModelStatus { trusted: false, untrusted_reason: Some("max training energy residual 2.2e-3 > 1.0e-3 Ha/atom".into()), ..m };
+        let snap = with_map(&scene, untrusted);
+        let t = texts(&ctx, &mut st, &input(&scene, Some(&snap), &cam));
+        assert!(t.contains("the model as a whole is not trusted yet (max training energy residual"), "{t}");
+    }
+
+    #[test]
+    fn the_knowledge_overlay_is_display_only_and_kept_in_the_profile() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        assert!(!st.show_knowledge, "off by default");
+        assert!(knowledge::overlay_coverage(&st, &scene.nuclei).is_empty(), "off: no tint");
+        // View ▸ Display aids ▸ knowledge overlay: no command, no recorded action
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+        let outs = click_widget(&ctx, &mut st, &inp, "show-knowledge");
+        egui::Popup::close_all(&ctx);
+        assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
+        assert!(st.show_knowledge);
+        // the tint: the carbons see C–C, never seen
+        let cov = knowledge::overlay_coverage(&st, &scene.nuclei);
+        assert_eq!(cov.len(), 5);
+        assert_eq!(&cov[..3], &[0.0, 0.0, 0.0], "{cov:?}");
+        assert_eq!(knowledge::tint_srgb(0.0), [122, 118, 144]);
+        assert_eq!(knowledge::tint_srgb(0.5), [228, 192, 68]);
+        assert_eq!(knowledge::tint_srgb(1.0), [110, 210, 120]);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("knowledge overlay") && t.contains("1 well known") && t.contains("per atom: its least-known neighbour within 6.0 Bohr"), "the legend:\n{t}");
+        // Ctrl K finds it in the View menu, and the map in the dock
+        assert!(matches!(search::results("knowledge overlay", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
+        assert_eq!(search::results("knowledge map", 1)[0].place, search::Place::Dock(DockTab::Knowledge));
+        // the profile keeps it
+        let text = profile::capture(&st);
+        assert!(text.contains("show_knowledge = true"), "{text}");
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.show_knowledge);
+        // a profile saved before the Knowledge tab keeps its layout and gains the tab
+        let mut old = UiState::new("h2o", &scene);
+        profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\n");
+        assert_eq!(old.left_tabs, vec![DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Log], "the moved Log stays left");
+        assert_eq!(old.right_tabs, vec![DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection]);
+        assert_eq!(old.dock_tab, DockTab::Selection);
+        // a layout naming a tab twice is still ignored
+        let mut dup = UiState::new("h2o", &scene);
+        profile::apply(&mut dup, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Log\n");
+        assert_eq!(dup.right_tabs, DockTab::RIGHT.to_vec());
+    }
 }

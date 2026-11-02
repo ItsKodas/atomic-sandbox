@@ -17,7 +17,7 @@ macro_rules! fields {
     ($m:ident) => {
         $m!(show_partial_core, show_bonds, show_labels, show_badge, show_ghost, show_angles, show_bond_lengths, show_charges, follow_selected,
             shimmer, dots_by_orbital, orbital_phase, colour_additive, colour_physical, show_cell, show_floor, show_axes,
-            show_place_grid, grid_in_angstrom, show_trails, hide_cloud, warp_fields, camera_view, dots_float, dots_glow, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
+            show_place_grid, grid_in_angstrom, show_trails, show_knowledge, hide_cloud, warp_fields, camera_view, dots_float, dots_glow, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
             gamma, opacity, iso, phase_iso, spin_iso, trail_opacity, trail_fs, volume_mode, motion_blur, shutter, exposure_ev, camera_solidity, camera_size, camera_smooth, fov_deg, label_opacity, dots_drift, dots_amount, dots_size, dots_brightness, dots_feather, dots_blur, bloom, bloom_threshold)
     };
 }
@@ -61,7 +61,8 @@ pub fn capture(st: &UiState) -> String {
 }
 
 /// Applies a profile's text to `st`: unknown keys and unreadable values are skipped, a tab
-/// layout that does not name every tab exactly once is ignored.
+/// layout that names a tab twice is ignored, and a tab it does not name (one added since it was
+/// saved: Knowledge, M8a Task 9) joins its default dock at its default place.
 pub fn apply(st: &mut UiState, text: &str) {
     let kv: std::collections::HashMap<&str, &str> = text
         .lines()
@@ -94,11 +95,18 @@ pub fn apply(st: &mut UiState, text: &str) {
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
     }
-    if let (Some(l), Some(r)) = (kv.get("left_tabs").and_then(|v| tabs_of(v)), kv.get("right_tabs").and_then(|v| tabs_of(v))) {
+    if let (Some(mut l), Some(mut r)) = (kv.get("left_tabs").and_then(|v| tabs_of(v)), kv.get("right_tabs").and_then(|v| tabs_of(v))) {
         let mut all: Vec<u8> = l.iter().chain(&r).map(|t| *t as u8).collect();
         all.sort_unstable();
         all.dedup();
-        if all.len() == DockTab::ALL.len() && l.len() + r.len() == DockTab::ALL.len() {
+        if all.len() == l.len() + r.len() {
+            for (list, defaults) in [(&mut l, &DockTab::LEFT[..]), (&mut r, &DockTab::RIGHT[..])] {
+                for (k, &t) in defaults.iter().enumerate() {
+                    if !all.contains(&(t as u8)) {
+                        list.insert(k.min(list.len()), t);
+                    }
+                }
+            }
             (st.left_tabs, st.right_tabs) = (l, r);
         }
     }

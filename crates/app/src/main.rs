@@ -876,6 +876,7 @@ impl App {
         let shown = v.shown_scene(Instant::now());
         let lines = v.overlay_lines(&shown);
         let risk = v.atom_risk();
+        let knowledge = v.atom_knowledge(v.drawn_nuclei(&shown));
         let blur = if v.ui.camera_view { Vec::new() } else { v.blur_ghosts(&shown) };
         let frames = if v.ui.camera_view { v.camera_frames(&shown) } else { Vec::new() };
         let selected = v.tool.set(shown.nuclei.len());
@@ -887,6 +888,7 @@ impl App {
             lines: &lines,
             viewport: v.viewport,
             risk: &risk,
+            knowledge: &knowledge,
             blur: &blur,
             glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size, v.ui.camera_smooth)),
             warp_from: warp_from.as_deref(),
