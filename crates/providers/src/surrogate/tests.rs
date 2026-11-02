@@ -10136,6 +10136,7 @@ fn a_masked_sample_never_contributes_its_energy_or_its_masked_out_forces() {
     garbage.refit().unwrap();
     let (ac, ag) = (clean.accumulator().unwrap(), garbage.accumulator().unwrap());
     assert_eq!((ac.n_e, ac.n_f, ac.n_scale), (whole, 6 * whole + 6 * k, whole + k), "energy rows of the whole samples, 3 force rows per interior atom");
+    assert_eq!(ac.sums(), ag.sums(), "the same statistics, bit for bit");
     let (mc, mg) = (clean.model().unwrap(), garbage.model().unwrap());
     assert_eq!(mc.coeffs, mg.coeffs, "the masked-out labels never reach the fit");
     assert_eq!((mc.sigma_e, mc.sigma_f, mc.lambda), (mg.sigma_e, mg.sigma_f, mg.lambda));
