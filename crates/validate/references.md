@@ -4173,3 +4173,21 @@ Cost probe (`transfer_cost_probe`): one Accurate solve each, cold / warm after a
 Standard pass's job count — CH₄ 81³ 384 jobs, 69.9 s (incl. pseudopotential generation) / 2.1 s; C₂H₆
 95³ 600 jobs, 8.5 / 8.0 s; C₃H₈ 107³ 840 jobs, 37.6 / 30.6 s; H₂O 95³ 300 jobs, 18.7 / 2.8 s; (H₂O)₂
 start 101³ (a 4 Bohr margin then; the test now boxes training clusters at 5) 384 jobs, 22.6 / 10.2 s; (H₂O)₃ start 101³ 588 jobs, 65.0 / 48.9 s.
+
+## M8a capping gate (Task 10a, 2026-11-02; `tests/capping.rs` `capped_segments_train_like_the_whole_molecule`, `#[ignore]`d) — **not yet run**
+
+Spec §4.5's condition: a collection taught on capped segments of n-butane (the two end cuts, each a
+propane-like 10 + 1-cap segment whose interior is the methyl group, at `COLLECTION_R_CUT` = 6 Bohr)
+must reproduce held-out whole-molecule DFT forces on the interior-class atoms (both methyls, 8 of 14
+atoms) within **1.5×** of a collection taught on the whole molecule's own answers; a control (the
+whole answers restricted to the same rows) separates the capping error from the data volume. The
+test-local cut is checked on the CPU (`the_test_cut_keeps_the_selected_atoms_interior`, runs in the
+default suite). Cost probe (`capping_cost_probe`, RX 7900 XTX): butane 125³ — 159 s cold incl. the
+pseudopotential generation, 95 s warm, 90 s cold after a reset; an end segment in the same box 48 s
+cold, 37 s warm. Estimated GPU wall: `relax_butane` (ruling P7: the scene must be relaxed by this
+solver first) 2.6–5.3 h for 100–200 FIRE steps, then the gate 1.5 h (20 training geometries) to
+2.6 h (40) at the probe's times — up to 3.8–6.4 h at Task 6's measured 2.5× run-over-probe factor.
+Over the task's 3 h budget: not run; `scenes/butane.scene` not made. Run, alone: `relax_butane`, then
+`cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`
+(`CAPPING_TRAIN=n` sets the training geometries, `CAPPING_REUSE=1` continues a stopped run from
+its stored answers).
