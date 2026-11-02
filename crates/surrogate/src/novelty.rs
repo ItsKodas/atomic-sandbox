@@ -148,4 +148,19 @@ impl NullSpace {
         }
         Ok(worst)
     }
+
+    /// ν of the query's energy row and, per atom, the largest ν of its three force rows (the
+    /// split of [`novelty`](Self::novelty) a per-atom verdict reads; the same rows, the same ν):
+    /// `novelty` is (max of all of them, where). Zeros when nothing is unspanned.
+    pub fn novelty_per_atom(&self, pos: &[[f64; 3]], z: &[u8]) -> Result<(f64, Vec<f64>), DescribeError> {
+        if self.vectors.is_empty() || !(self.tau > 0.0) {
+            return Ok((0.0, vec![0.0; pos.len()]));
+        }
+        let (e_row, f_rows) = crate::loo::standardised_rows(&self.basis, &self.col_index, &self.d, self.energy_per_atom, pos, z)?;
+        let mut atoms = vec![0.0f64; pos.len()];
+        for (r, row) in f_rows.iter().enumerate() {
+            atoms[r / 3] = atoms[r / 3].max(self.nu(row));
+        }
+        Ok((self.nu(&e_row), atoms))
+    }
 }

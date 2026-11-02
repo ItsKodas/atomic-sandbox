@@ -108,6 +108,19 @@ pub const AUDIT_BURST: usize = 3;
 /// "not answering here" with the rule that fires ([`SurrogateKs::stuck`]; module doc, "Stuck").
 pub const STUCK_STEPS: usize = 50;
 
+/// The fit's own leave-one-out RMSE ([`SurrogateKs::loo_rms`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LooRms {
+    /// Hartree per atom, RMS over samples.
+    pub energy_per_atom: f64,
+    /// Hartree/Bohr, RMS over Cartesian force components.
+    pub force: f64,
+    /// Samples with a defined leave-one-out residual.
+    pub samples: usize,
+    /// Fitted samples whose leave-one-out residual is undefined (left out of both RMSEs).
+    pub undefined: usize,
+}
+
 /// Worst training residuals of the current model over the store (trust rule).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrainingResiduals {
@@ -750,6 +763,36 @@ impl SurrogateKs {
         out
     }
 
+    /// The fit's own leave-one-out RMSE over the members of [`loo_force_errors`](Self::loo_force_errors)
+    /// (the accumulated prefix, excluded samples skipped): the energy per atom over samples
+    /// (Hartree/atom; the LOO energy residual is per atom when the fit is, else divided by N) and
+    /// the force per Cartesian component over atoms (Hartree/Bohr) — the in-domain errors held-out
+    /// errors are compared with (M8a Task 6, the transfer test). Samples whose LOO is undefined
+    /// (a direction only they determine) are counted in `undefined` and left out. `None` without a
+    /// model or with no defined LOO. A readout; it decides nothing.
+    pub fn loo_rms(&self) -> Option<LooRms> {
+        let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
+        let (mut se, mut sf, mut nf, mut samples, mut undefined) = (0.0f64, 0.0f64, 0usize, 0usize, 0usize);
+        for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
+            if self.excluded(i) {
+                continue;
+            }
+            match surrogate::loo::leave_one_out(model, s) {
+                None => undefined += 1,
+                Some(l) => {
+                    let e = if model.energy_per_atom { l.energy } else { l.energy / s.pos.len().max(1) as f64 };
+                    se += e * e;
+                    samples += 1;
+                    for r in &l.forces {
+                        sf += r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+                        nf += 3;
+                    }
+                }
+            }
+        }
+        (samples > 0).then(|| LooRms { energy_per_atom: (se / samples as f64).sqrt(), force: (sf / nf.max(1) as f64).sqrt(), samples, undefined })
+    }
+
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query whose atoms have the
     /// environment keys `keys` (`env_keys`; per key since M8a user-test fix 2): `None` when every
     /// key among its atoms is trusted (isolated atoms are exempt), else the first untrusted key's
@@ -1267,11 +1310,12 @@ impl SurrogateKs {
         let opts = FitOptions { sigma_f_min: force_noise_prior(&provenance.ionic), ..FitOptions::default() };
         // (Re)build the accumulator: from scratch after a species or reference change, else
         // only the samples added since the last refit.
-        // (a collection attached or let go changes the basis: body-4 follows `shared`)
+        // (a collection attached or let go changes the basis: body-4 and the reach follow `shared`)
+        let default = self.default_basis(&[]);
         let rebuild = self.accumulator.is_none()
             || self.species_dirty
             || self.refs_dirty
-            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != self.default_basis(&[]).body4);
+            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != default.body4 || a.basis.r_cut != default.r_cut);
         let basis = if rebuild {
             let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
             species.sort_unstable();

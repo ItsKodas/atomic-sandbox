@@ -955,12 +955,12 @@ use quarantine::*;
 pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
 pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
-pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
+pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
-pub use trust::{atom_class, env_class, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use views::Verdict;
 pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
 
@@ -1262,6 +1262,9 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach
+    /// measurement set another ([`SurrogateKs::with_collection_r_cut`]).
+    collection_r_cut: f64,
     /// Why the collection refused the sample just stored (taken by `keep_sample` for the step's
     /// note; `shared::SurrogateKs::take_collection_note`).
     collection_note: Vec<String>,
@@ -1387,6 +1390,7 @@ impl SurrogateKs {
             shared: None,
             #[cfg(test)]
             body4_off: false,
+            collection_r_cut: surrogate::COLLECTION_R_CUT,
             collection_note: Vec::new(),
             source_file: None,
             specialised: Vec::new(),
@@ -1398,6 +1402,17 @@ impl SurrogateKs {
     /// Records the teacher's SCF tolerance in the samples' provenance (module doc).
     pub fn with_teacher_tol(mut self, tol: f64) -> SurrogateKs {
         self.teacher_tol = tol;
+        self
+    }
+
+    /// A shared collection's fit uses the cutoff `r_cut` (Bohr) instead of
+    /// [`surrogate::COLLECTION_R_CUT`]: the reach measurement of the transfer test (M8a Task 6,
+    /// `validate/tests/transfer.rs`), which re-fits one collection's samples at another reach. A
+    /// per-scene model keeps `Basis::new`'s cutoff whatever this says. Set before
+    /// [`attach`](Self::attach): the fit's basis follows it at the next rebuild.
+    pub fn with_collection_r_cut(mut self, r_cut: f64) -> SurrogateKs {
+        assert!(r_cut.is_finite() && r_cut > 0.0, "with_collection_r_cut: r_cut = {r_cut}");
+        self.collection_r_cut = r_cut;
         self
     }
 
@@ -2323,11 +2338,16 @@ impl SurrogateKs {
         b
     }
 
-    /// [`fit_basis`](Self::fit_basis) without the recovery degree cap: `Basis::new` with body-4
-    /// exactly when a shared collection is attached (the trust floor's and the no-model cap's count).
+    /// [`fit_basis`](Self::fit_basis) without the recovery degree cap: `Basis::new` with body-4 and
+    /// the collection's reach (`collection_r_cut`) exactly when a shared collection is attached (the
+    /// trust floor's and the no-model cap's count).
     pub(super) fn default_basis(&self, species: &[u8]) -> Basis {
         let mut b = Basis::new(species);
         b.body4 = self.shared.is_some();
+        // a collection's reach (M8a Task 6: `surrogate::COLLECTION_R_CUT`); per scene, `Basis::new`'s
+        if self.shared.is_some() {
+            b.r_cut = self.collection_r_cut;
+        }
         #[cfg(test)]
         {
             b.body4 &= !self.body4_off;
@@ -2399,9 +2419,10 @@ pub fn lone_atoms_note(pos: &[[f64; 3]], r_cut: f64) -> Option<String> {
 }
 
 impl SurrogateKs {
-    /// The model's cutoff (Bohr): its basis's, else the default basis's.
-    pub(crate) fn cutoff(&self) -> f64 {
-        self.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut)
+    /// The model's cutoff (Bohr): its basis's, else the basis a fit would use (a shared
+    /// collection's reach, `Basis::new`'s per scene).
+    pub fn cutoff(&self) -> f64 {
+        self.basis().map_or(self.default_basis(&[]).r_cut, |b| b.r_cut)
     }
 }
 

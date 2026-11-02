@@ -17,6 +17,9 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The surrogate helpers of the surrogate suite and the transfer test (M8a Task 6).
+pub mod surrogate;
+
 /// Serialises the GPU sections of concurrently running tests within one binary (poisoning is
 /// harmless here). Distinct test binaries never run at the same time under `cargo test`.
 pub static GPU: Mutex<()> = Mutex::new(());

@@ -457,6 +457,7 @@ impl SurrogateKs {
         let mut rich = Basis::new(&species);
         rich.degree_cap = RECOVERY_DEGREE_CAP;
         rich.body4 = b.body4;
+        rich.r_cut = b.r_cut;
         let store = self.store.as_ref()?;
         let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
         let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)

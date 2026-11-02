@@ -274,6 +274,34 @@ impl FallbackPolicy {
     }
 }
 
+/// The strict policy's verdict per atom ([`SurrogateKs::atom_verdicts`]; M8a Task 6): what M8b's
+/// per-atom freezing and the transfer test read where `would_answer` gives one verdict for the
+/// whole geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtomVerdicts {
+    /// A rule that refuses the whole geometry: the gate (rules 1–4: no model, an unknown species,
+    /// other settings, an untrusted fit), a non-finite answer, 5e without a grade, 5d on the energy
+    /// row, rule 7 (the energy std is the whole geometry's), the fences. `None`: none does.
+    pub geometry: Option<TeachRule>,
+    /// Per atom, the first per-atom rule that refuses it in `evaluate`'s order — 5a, 5b, 5c, 5e
+    /// (γ = ∞, then γ > γ_max), 5d on its force rows, 4b on its environment key, 6 on its force
+    /// std — or `None`: the atom is trusted. Every `None` when the gate refused.
+    pub atoms: Vec<Option<TeachRule>>,
+}
+
+impl AtomVerdicts {
+    /// The geometry is answered by the model: no geometry rule and every atom trusted (exactly
+    /// `would_answer(..).is_ok()`).
+    pub fn answers(&self) -> bool {
+        self.geometry.is_none() && self.atoms.iter().all(Option::is_none)
+    }
+
+    /// The atom is trusted and the geometry not refused as a whole.
+    pub fn trusted(&self, i: usize) -> bool {
+        self.geometry.is_none() && self.atoms[i].is_none()
+    }
+}
+
 /// The variance verdict (rules 6–7) of the last consultation that evaluated it.
 #[derive(Clone)]
 pub(super) struct VarianceVerdict {
@@ -501,6 +529,108 @@ impl SurrogateKs {
         (atoms, reason)
     }
 
+    /// The strict policy's verdict **per atom** at `scene`'s geometry ([`AtomVerdicts`]; M8a Task 6,
+    /// the transfer test's "atoms it calls trusted"). Read-only, the teacher is never called, and
+    /// every number is the one [`would_answer`](Self::would_answer) reads: `would_answer` is `Ok`
+    /// exactly when [`AtomVerdicts::answers`]. `None` for an empty scene. The fence reads the
+    /// descriptor cache as `would_answer` does (`ensure_desc_cache` first while samples are held).
+    pub fn atom_verdicts(&self, scene: &Scene) -> Option<AtomVerdicts> {
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let n = pos.len();
+        if n == 0 {
+            return None;
+        }
+        let whole = |rule: TeachRule| Some(AtomVerdicts { geometry: Some(rule), atoms: vec![None; n] });
+        if let Err(g) = self.gate(&z, &self.scene_provenance(scene)) {
+            return whole(g.reason.rule);
+        }
+        let model = self.model.as_ref().expect("the gate passed: a model exists");
+        // past the gate an unknown species is unreachable (rule 2), named as `would_answer` names it
+        let pred = match model.predict(&pos, &z, true) {
+            Ok(p) => p,
+            Err(surrogate::DescribeError::UnknownSpecies(zu)) => return whole(TeachRule::NewSpecies(zu)),
+        };
+        if let Some(r) = non_finite_answer(&pred) {
+            return whole(r.rule);
+        }
+        let mut atoms: Vec<Option<TeachRule>> = vec![None; n];
+        let mut geometry: Option<TeachRule> = None;
+        let refuse = |atoms: &mut Vec<Option<TeachRule>>, i: usize, rule: TeachRule| {
+            if atoms[i].is_none() {
+                atoms[i] = Some(rule);
+            }
+        };
+        // 5a–5c and 5e per atom (`envelope_outside`'s tests, atom by atom, in its order)
+        if let (Some(env), Ok(desc), Ok(sp)) = (self.envelope.as_ref(), describe_values(&model.basis, &pos, &z), model.basis.species_indices(&z)) {
+            if self.active_set.as_ref().is_some_and(|a| !a.converged()) {
+                geometry = geometry.or(Some(TeachRule::NoGrade));
+            }
+            for (i, d) in desc.iter().enumerate() {
+                let (dist, _) = env.distance(sp[i], d);
+                let lone = n >= 2 && lone_atom(&model.basis, d);
+                let (ratio, _) = if n >= 2 { env.coordination_ratio(&model.basis, sp[i], d) } else { (0.0, 0) };
+                let grade = self.active_set.as_ref().map_or(0.0, |a| a.grade(sp[i], d));
+                if lone {
+                    refuse(&mut atoms, i, TeachRule::IsolatedAtom);
+                } else if ratio > COORDINATION_RATIO {
+                    refuse(&mut atoms, i, TeachRule::Coordination);
+                } else if dist > self.policy.max_descriptor_distance {
+                    refuse(&mut atoms, i, TeachRule::Spread);
+                } else if grade == f64::INFINITY {
+                    refuse(&mut atoms, i, TeachRule::UnspannedAtom);
+                } else if grade > self.policy.max_grade {
+                    refuse(&mut atoms, i, TeachRule::Grade);
+                }
+            }
+        }
+        let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
+            (Some(e), Some(f)) => Some((e, f)),
+            _ => None,
+        };
+        // 5d: the energy row refuses the geometry, an atom's force rows the atom
+        if posterior.is_some() {
+            if let Some((nu_e, nu_atoms)) = self.null_space.as_ref().and_then(|ns| ns.novelty_per_atom(&pos, &z).ok()) {
+                if nu_e > 1.0 {
+                    geometry = geometry.or(Some(TeachRule::NewEnvironment));
+                }
+                for (i, nu) in nu_atoms.into_iter().enumerate() {
+                    if nu > 1.0 {
+                        refuse(&mut atoms, i, TeachRule::NewEnvironment);
+                    }
+                }
+            }
+        }
+        // 4b: each atom's own environment key
+        let rc2 = model.basis.r_cut * model.basis.r_cut;
+        for (i, key) in env_keys(&pos, &z, rc2).into_iter().enumerate() {
+            if let Some((r, _)) = key.and_then(|k| self.class_untrusted(&[Some(k)])) {
+                refuse(&mut atoms, i, r.rule);
+            }
+        }
+        // 6 per atom, 7 for the geometry
+        if let Some((e, f)) = posterior {
+            let v = self.variance_check(model, &pred, e, f, &pos, &z);
+            for (i, ratio) in v.atoms.iter().enumerate() {
+                if !(*ratio <= 1.0) {
+                    refuse(&mut atoms, i, TeachRule::ForceUncertainty);
+                }
+            }
+            if let Some(r) = self.energy_variance_refusal(model, n, e, &self.atom_inflation(model, &pos, &z)) {
+                geometry = geometry.or(Some(r.rule));
+            }
+        }
+        // the fences refuse the geometry
+        if geometry.is_none() {
+            if !self.near_quarantined_cached(&pos, &z).is_empty() {
+                geometry = Some(TeachRule::NearQuarantine);
+            } else if let Some(r) = self.audit_fence_refusal(&pos, &z) {
+                geometry = Some(r.rule);
+            }
+        }
+        Some(AtomVerdicts { geometry, atoms })
+    }
+
     /// The largest per-atom extrapolation grade γ of a geometry against the current active set
     /// (rule 5e; a readout — `None` without a fit or for an unknown species).
     pub fn extrapolation_grade(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<f64> {
@@ -564,23 +694,28 @@ impl SurrogateKs {
             };
         }
         // 7. energy, per atom, epistemic only
+        if let Some(r) = self.energy_variance_refusal(model, n, e_std, &infl) {
+            return VarianceVerdict { accept: false, uncertainty, reason: Some(r), atoms, novel: false };
+        }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
+    }
+
+    /// Rule 7 alone ([`variance_check`](Self::variance_check)'s energy half): the epistemic energy
+    /// std per atom of an `n`-atom prediction whose total std is `e_std`, inflated by the largest
+    /// of the atoms' class factors `infl`, against `energy_std_per_atom`.
+    pub(super) fn energy_variance_refusal(&self, model: &Model, n: usize, e_std: f64, infl: &[f64]) -> Option<Refusal> {
+        let p = &self.policy;
+        let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
         let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
         // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
         let e_infl = infl.iter().copied().fold(1.0f64, max_nan);
         let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64 * e_infl;
-        if !(epistemic_per_atom <= p.energy_std_per_atom) {
-            return VarianceVerdict {
-                accept: false,
-                uncertainty,
-                reason: Some(Refusal::new(
-                    format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),
-                    TeachRule::EnergyUncertainty,
-                    None,
-                )),
-                atoms,
-                novel: false,
-            };
-        }
-        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
+        (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
+            Refusal::new(
+                format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),
+                TeachRule::EnergyUncertainty,
+                None,
+            )
+        })
     }
 }

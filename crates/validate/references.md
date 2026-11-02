@@ -4111,3 +4111,65 @@ Honest (floored) it refuses everything; useful (unfloored) it claims 1.6–250×
 **κ = 136.65 (the user's readout).** κ_c is a readout (`ClassLoo::calibration`, decides nothing): the rms of z = ‖ΔF‖/σ_pred over the class's evidence, whose denominator has no floor. On the live collection (copy of 2026-10-22, `kappa_tail_of_a_collection_history`): pair κ 3.53 — one point at z̄ 12.3 carries 69 % of Σz̄² (ẑ without it 1.74, median z̄ 1.51); many-body κ 10.24 — one point at z̄ 59.3 (‖ΔF‖ 3.2e-2 Ha/Bohr over a std of 4.6e-4: 4.6× its bound) carries 98 % (ẑ without it 1.60). Tail-dominated, as the Task 2 review's I2 said: one confident miss sets it; 136.65 was such a point in the window then. The verdict decides on the measured error W_c (pair 0.28, many-body 0.83 of the bound; both trusted), not on κ. **What decides per step is the inflation λ_c** (rules 6/7), and it is large: pair 24.9 (223 on the copy of 2026-10-21), many-body 18.9 — the measured error (≈ 0.2–0.8 of the bound, mostly the fit's misfit at σ_F level) over the *epistemic* std alone (≈ 1e-6–1e-5 Ha/Bohr where the class is well sampled). The effect is conservative — rule 6 then refuses an atom whose epistemic std exceeds bound/λ, i.e. a few times the class's typical one — never a loosening; not changed here (a decision rule, physics review). Recorded as a question for it: comparing the measured error with the epistemic std after removing the fit's own aleatoric 3σ_F² (or against the total std) would make λ_c measure the posterior's miscalibration rather than the misfit floor.
 
 **Fix round 1 (the review's I2, as recommended).** λ_c² = Σ_p max(0, w̄_p² − ā_p²) / Σ_p s̄_p², ā_p² the mean over the point's class atoms of (ā_c/b_j)², ā_c = min(σ_F, the class's training force-residual rms per component); floor 1 and × (1 + 1/√2n) kept (`calibrate::calibrate_with`; test `the_variance_inflation_measures_overconfidence_not_the_misfit_floor`: a calibrated posterior under a misfit floor gets raw λ 1.0000 where the old estimator gave 52.0, a 3× overconfident one 3.0000). **On the live collection** (fresh copy 2026-10-22, 1 557 fitted samples, H + O since the water samples, Q′ 452, σ_F 2.10e-4 Ha/Bohr, 496 history points; `lambda_before_after_on_a_collection`): pair λ 24.85 → **21.19**, many-body 18.86 → **18.82**. The misfit floor was *not* what made λ large here: the audited errors (W 0.28 of the bound ≈ 5.6e-4 Ha/Bohr per component) are ≈ 2.7 σ_F, so the pair class's epistemic std is genuinely ≈ 20× too small at the geometries it answers — λ now measures that overconfidence, and rule 6 keeps refusing accordingly. The scripted session's digest moved only in its std readouts (0 of 907 lines differ with them masked). **Fence votes per model generation** (the review's I1): a vote carries the model generation it was taken against and votes combine only within one (`restore_state` moves the generation without clearing them; asserted in `a_vibrating_turning_molecule_in_a_fence_still_votes`); the vote's force check uses the policy's bound of the teacher force (M1).
+
+## M8a transfer and reach (Task 6, 2026-11-02; `tests/transfer.rs` `fragments_transfer_to_propane_and_the_water_trimer`, `#[ignore]`d; release, RX 7900 XTX, teacher GpuKs at the Accurate grid h = σ = 0.15, `ionic accepted`, tol 1e-6)
+
+Run: `cargo test -p validate --release --test transfer -- --ignored --nocapture --test-threads 1 fragments_transfer`
+(GPU, alone; hydrocarbons measured **5.0 h**: the CH₄ + C₂H₆ Standard passes ≈ 4.0 h for 984 jobs, the
+propane references + confinement solves + 20 held-out geometries 1.0 h at 179 s per held-out solve —
+`ollama.exe` was resident during the run, contention not excluded; `TRANSFER_REUSE=1` re-attaches the
+taught collection and skips the passes, `TRANSFER_CONTROL_ONLY=1` stops after the CPU-only in-domain
+control). Criterion (spec §4.3, never loosened): force RMSE on the atoms the collection trusts and RMS
+|ΔE|/N on the geometries it answers ≤ 2 × its own leave-one-out RMSE; asserted at `COLLECTION_R_CUT`.
+Trust is taken per atom (`SurrogateKs::atom_verdicts`, exactly `would_answer` when every atom is
+trusted). The 9 Bohr row re-fits the same 753 stored samples (taught by passes at 6 Bohr: scans stop
+at 5 Bohr) and reuses the held-out teacher answers.
+
+| system, reach | fit (samples, Q′) | LOO RMSE E / F | 2×LOO bound E / F | trusted atoms | answered geometries | held-out error, all atoms (F RMSE / RMS ΔE/N) | refusals (first per-atom rule) | eval / with variance / verdict |
+|---|---|---|---|---|---|---|---|---|
+| CH₄+C₂H₆ → C₃H₈, r_cut 6 | 753, 452 | 3.21e-5 Ha/atom / 5.30e-4 Ha/Bohr | 6.42e-5 / 1.06e-3 | **0/220 (100 % refused)** | 0/20 | 3.43 Ha/Bohr / 0.353 Ha | UnspannedAtom 103, Spread 77, NewEnvironment 38, Grade 2; geometry 5d 20 | 45 / 1705 / 3011 µs |
+| CH₄+C₂H₆ → C₃H₈, r_cut 9 | 726, 284 | 5.00e-5 / 1.04e-3 | 1.00e-4 / 2.09e-3 | **0/220 (100 % refused)** | 0/20 | 14.3 Ha/Bohr / 1.31 Ha | Spread 216, UnspannedAtom 4; geometry 5d 20 | 41 / 744 / 1326 µs |
+| H₂O+(H₂O)₂ → (H₂O)₃, both | not run (cost; below) | | | | | | | |
+
+**Finding: no transfer was measured; the criterion held vacuously.** The collection refused every
+propane atom at both reaches, and rightly — the errors it would have made there are 3–14 Ha/Bohr and
+0.35–1.3 Ha/atom (a linear model answering along directions its data never spanned: 5e γ = ∞ on 103
+atoms at 6 Bohr). Two causes, measured separately:
+1. **Propane's environments are new to CH₄ + C₂H₆ at either reach.** At 6 Bohr every propane atom sees
+   three carbons (C1–C3 = 4.8 Bohr), never more than two in the fragments: 5c/5d/5e fire on all of them.
+2. **The collection does not trust its own many-body H environment.** In-domain control (CPU, 20
+   perturbed geometries of each fragment, `atom_verdicts`): CH₄ 20/100 atoms trusted, 0/20 geometries
+   answered; C₂H₆ 38/160 at 6 Bohr (0/160 at 9 Bohr), 0/20 answered — every refusal 4b `Class(ManyBody)`.
+   The class's leave-one-out max is 3.1–5.8× the force bound (rms 0.17–0.28×) from its worst samples, and
+   with no audit evidence (κ 1.00, 0 evidence points) the verdict falls back to "a LOO ratio beyond 1"
+   (`providers::surrogate` rule 4b). A Standard pass alone does not earn trust for C–H many-body
+   environments; audits (the app's live use) are what calibrate it. The fit's Q′ is path-dependent
+   (284 ↔ 452 between the attach refit and a second refit: the provider's recovery degree cap), reported
+   as observed.
+
+**Confinement residual** (the references-per-box ruling, Task 4a): the fragment's own geometry solved
+in its training box and in propane's 107³ box, [E − Σ ref(own box)] − [E − Σ ref(107³)]:
+CH₄ 81³ → 107³ **−8.85e-4 Ha (−1.77e-4 Ha/atom)**, force rms 3.8e-4 Ha/Bohr (face density 8.3e-7, below
+the box rule's 7.2e-6); C₂H₆ 95³ → 107³ +3.34e-4 Ha (+4.2e-5 Ha/atom), force rms 1.6e-4. The per-box
+references remove each atom's own confinement but leave a molecule-vs-atom residual of 5.5× (CH₄'s
+12 Bohr box) and 1.3× (C₂H₆'s 14 Bohr box) the collection's LOO energy RMSE — on its own beyond the 2×
+energy bound for CH₄'s box, while the box rule (face density) does not flag it. The isolated atoms are
+more confined than the molecule (H: −0.477787 Ha at 81³, −0.478136 at 107³; C: −5.535794, −5.536906).
+A collection that mixes 12 Bohr samples with larger boxes carries ≈ 2e-4 Ha/atom of box inconsistency
+in its energy labels.
+
+**Reach decision: `COLLECTION_R_CUT` = 6 Bohr kept** (the plan's rule: both reaches "pass", vacuously;
+9 Bohr is 1.6–2× worse in-domain on the same samples, and its evaluation cost was not separable on an
+11-atom molecule where every atom is within 6 Bohr of most others — in a dense scene the neighbour count
+grows ≈ (9/6)³ ≈ 3.4×). Revisable once a transfer is measured (after audits have calibrated the class
+verdict, and with passes run at 9 Bohr).
+
+**The water case was not run** (task brief cost rule): its estimate from the probe and the measured
+hydrocarbon rate is ≈ 6–10 h of GPU — the FIRE relaxations of (H₂O)₂ and (H₂O)₃ (P7; the trimer's warm
+solve is 49 s at 101³), the H₂O and (H₂O)₂ passes and 20 trimer held-out solves. `scenes/h2o_dimer.scene`
+and `scenes/h2o_trimer.scene` are not yet made (`relax_the_water_clusters`).
+
+Cost probe (`transfer_cost_probe`): one Accurate solve each, cold / warm after a 0.05 Bohr move, and the
+Standard pass's job count — CH₄ 81³ 384 jobs, 69.9 s (incl. pseudopotential generation) / 2.1 s; C₂H₆
+95³ 600 jobs, 8.5 / 8.0 s; C₃H₈ 107³ 840 jobs, 37.6 / 30.6 s; H₂O 95³ 300 jobs, 18.7 / 2.8 s; (H₂O)₂
+start 101³ (a 4 Bohr margin then; the test now boxes training clusters at 5) 384 jobs, 22.6 / 10.2 s; (H₂O)₃ start 101³ 588 jobs, 65.0 / 48.9 s.

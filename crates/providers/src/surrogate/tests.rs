@@ -4880,6 +4880,76 @@ fn would_answer_agrees_with_evaluate() {
     assert!(answered > 20 && agree - answered > 20, "the sweep must cover both verdicts");
 }
 
+/// M8a Task 6: `loo_rms` is the RMS of the same leave-one-out residuals `loo_force_errors` lists
+/// (per component: ‖ΔF‖²/3 per atom), over the same members, with a finite energy RMSE.
+#[test]
+fn loo_rms_agrees_with_the_per_atom_loo_errors() {
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let per_atom = s.loo_force_errors();
+    let l = s.loo_rms().expect("a fit");
+    assert_eq!(l.undefined, 0, "{l:?}");
+    let want = (per_atom.iter().map(|(_, e)| e * e).sum::<f64>() / (3 * per_atom.len()) as f64).sqrt();
+    assert!((l.force - want).abs() <= 1e-12 * want, "{l:?} vs {want:e}");
+    assert!(l.energy_per_atom.is_finite() && l.energy_per_atom > 0.0, "{l:?}");
+    assert_eq!(l.samples * 2, per_atom.len(), "dimers: two atoms per sample");
+}
+
+/// M8a Task 6: `atom_verdicts` splits `would_answer`'s verdict per atom — the geometry is answered
+/// exactly where `would_answer` is `Ok`, and a refused geometry names a rule the split carries
+/// (its geometry rule or an atom's) — over dimers, trimers and the H₂-only model asked about
+/// H₂ + H (5d's case). A trimer's third atom far out (a dimer + a lone atom) is refused per atom
+/// (5a) while the dimer's atoms are not refused by 5a.
+#[test]
+fn atom_verdicts_split_would_answer_per_atom() {
+    let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    let mut rng = StdRng::seed_from_u64(0x5EED);
+    let mut scenes = Vec::new();
+    for _ in 0..100 {
+        scenes.push(h2(rng.gen_range(0.9..3.2)));
+    }
+    for _ in 0..40 {
+        let mut sc = h2(rng.gen_range(1.2..2.0));
+        sc.nuclei.push(Nucleus::new(1, [rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5)]));
+        scenes.push(sc);
+    }
+    let mut lone = h2(1.6);
+    lone.nuclei.push(Nucleus::new(1, [0.0, 7.0, 0.0]));
+    scenes.push(lone.clone());
+    s.ensure_desc_cache();
+    let check = |s: &SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        let v = s.would_answer(&pos, &z, &s.provenance_for(sc));
+        let a = s.atom_verdicts(sc).expect("atoms");
+        assert_eq!(a.atoms.len(), sc.nuclei.len());
+        assert_eq!(v.is_ok(), a.answers(), "{:?}: would_answer {v:?}, atom verdicts {a:?}", sc.nuclei);
+        if let Err((rule, atom)) = v {
+            let carried = a.geometry == Some(rule) || atom.is_some_and(|i| a.atoms[i] == Some(rule)) || a.atoms.iter().any(|r| *r == Some(rule));
+            assert!(carried, "{:?}: would_answer {rule:?} at {atom:?}, atom verdicts {a:?}", sc.nuclei);
+        }
+        (v.is_ok(), a)
+    };
+    let mut answered = 0;
+    for sc in &scenes {
+        answered += check(&s, sc).0 as usize;
+    }
+    assert!(answered > 20 && scenes.len() - answered > 20, "the sweep must cover both verdicts ({answered} of {})", scenes.len());
+    let (_, a) = check(&s, &lone);
+    assert_eq!(a.atoms[2], Some(sim::activity::TeachRule::IsolatedAtom), "{a:?}");
+    assert!(a.atoms[..2].iter().all(|r| *r != Some(sim::activity::TeachRule::IsolatedAtom)), "{a:?}");
+    // 5d on the H₂-only model
+    let mut d = dimer_model_three_atom_teacher();
+    d.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    d.active_set = None;
+    d.ensure_desc_cache();
+    for i in 0..15 {
+        let (ok, a) = check(&d, &h2_plus_h(2.0 + 0.25 * i as f64));
+        if !ok {
+            assert!(a.geometry.is_some() || a.atoms.iter().any(Option::is_some), "{a:?}");
+        }
+    }
+}
+
 /// Plan review S1: the fence, the trust rule and draft mode — and the variance rule with its
 /// atom, and the non-finite answer ahead of the envelope (Task 3b put it before every other
 /// rule in `evaluate`). `would_answer` names each as `evaluate` does, and ignores draft mode: it

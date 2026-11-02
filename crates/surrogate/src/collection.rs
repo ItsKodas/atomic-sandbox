@@ -1212,7 +1212,7 @@ impl Collection {
     }
 
     /// Writes `README.txt`: the key, the sample counts (by status, by origin), the species (atoms,
-    /// samples, references), the species pairs seen within the default basis's r_cut, and the scenes.
+    /// samples, references), the species pairs seen within the collection's reach (`COLLECTION_R_CUT`), and the scenes.
     pub fn write_readme(&self) -> Result<(), String> {
         self.writable()?;
         let path = self.folder.join("README.txt");
@@ -1220,7 +1220,7 @@ impl Collection {
     }
 
     fn readme(&self) -> String {
-        let r_cut = crate::descriptor::Basis::new(&[1]).r_cut;
+        let r_cut = crate::descriptor::COLLECTION_R_CUT;
         let mut t = String::new();
         t.push_str("Atomic Sandbox — shared model collection\n\n");
         t.push_str(&format!("surface: {}\nfolder:  {}\n\n", self.key.describe(), self.key.slug()));
@@ -1278,7 +1278,7 @@ impl Collection {
             let r = if boxes.is_empty() { "no reference yet".to_string() } else { format!("references (Ha) {}", boxes.join(", ")) };
             t.push_str(&format!("  {} (Z {z}): {atoms} atoms in {samples} samples, {r}\n", element(*z)));
         }
-        t.push_str(&format!("\npairs within {r_cut} Bohr (the default basis's cutoff):\n"));
+        t.push_str(&format!("\npairs within {r_cut} Bohr (the collection's reach):\n"));
         for ((a, b), (samples, atom_pairs, nearest)) in &pairs {
             t.push_str(&format!("  {}–{}: {samples} samples, {atom_pairs} atom pairs, nearest {nearest:.3} Bohr\n", element(*a), element(*b)));
         }

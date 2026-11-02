@@ -14,4 +14,4 @@ pub mod surrogate;
 
 pub use ks::{field_bytes, gpu_footprint_bytes, orbital_view_footprint_bytes, solve_footprint_bytes, CpuKs, GpuKs};
 pub use sampling::{atom_key, run_sampling, Holdout, PairScan, PlanSolves, Sampler, ShellCheck, TargetJob, SCAN_CUTOFF_FRACTION};
-pub use surrogate::{box_affected_face_density, Blocker, FallbackPolicy, SurrogateKs, TrainingResiduals, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_ROUNDS};
+pub use surrogate::{box_affected_face_density, AtomVerdicts, Blocker, FallbackPolicy, LooRms, SurrogateKs, TrainingResiduals, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_ROUNDS};

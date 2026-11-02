@@ -238,6 +238,17 @@ pub struct Basis {
 /// per matrix), and it is the first degree with a genuinely angular four-body term (l = 1, 1, 2).
 pub const BODY4_DEGREE_CAP: usize = 2;
 
+/// The cutoff (Bohr) of a shared collection's basis (M8a Task 6; spec §4.3 "Reach"): the one
+/// place a collection's reach is set (the provider's fit basis, its sampling passes' scan and
+/// shell limits, the collection README's pair list). Per-scene models keep [`Basis::new`]'s 6 Bohr
+/// bit for bit (their sidecars carry their basis). Chosen by the transfer test
+/// (`validate/tests/transfer.rs`, `references.md` "M8a transfer and reach", 2026-11-02): **6 Bohr
+/// kept** — on CH₄ + C₂H₆ → propane neither reach transferred (the collection refused every propane
+/// atom at both, rightly: its errors there were 3–14 Ha/Bohr), and the 9 Bohr re-fit of the same
+/// samples was 1.6–2× worse in-domain (leave-one-out RMSE) with ≈ (9/6)³ ≈ 3.4× the neighbours
+/// per atom in a dense scene; the water case is unmeasured. Revisable when a transfer is measured.
+pub const COLLECTION_R_CUT: f64 = 6.0;
+
 /// One body-4 feature: the Gaunt contraction Σ_{m₁m₂m₃} G^{l₁l₂l₃}_{m₁m₂m₃} A_{(t₁,n₁),l₁m₁}
 /// A_{(t₂,n₂),l₂m₂} A_{(t₃,n₃),l₃m₃} of three (channel, l) items in increasing order (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

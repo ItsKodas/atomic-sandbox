@@ -181,18 +181,19 @@
 use gpu::GpuContext;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use providers::{FallbackPolicy, Sampler, SurrogateKs, TrainingResiduals};
+use providers::{FallbackPolicy, Sampler, SurrogateKs};
 use sim::{ForceProvider, ForceResult, Integrator, Nucleus, SamplingPlan, Scene, Source};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use surrogate::{Basis, FitReport, Prediction};
+use surrogate::Prediction;
 
 mod common;
 use common::{
     au_per_ps, bond, chrono_free_date, fit_line, h2, h3_plus, locate_surface, ms, never, no_augment, period_from_upward_crossings, relax, scene, solve,
     timing_row, triangle, EvalLog, Locked, DISPLACEMENT, DT_FS, H, H3_SIDE0, HARTREE_IN_CM, N_H2, TOL_H2,
 };
+use common::surrogate::{class_summary, fit_summary, model_vs_dft, residuals, sample_and_fit, student};
 
 /// Timing rows for `last-run-surrogate.md`, rewritten whenever a test finishes.
 static TIMING: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -297,70 +298,8 @@ const AL_T_ROT: f64 = 300.0;
 
 fn gpu() -> Option<GpuContext> { common::gpu("surrogate") }
 
-fn policy(audit_every: usize) -> FallbackPolicy {
-    FallbackPolicy { audit_every, ..FallbackPolicy::default() }
-}
-
-/// A `SurrogateKs` over the suite's locked, logged GPU teacher at tol 1e-6.
-fn student(ctx: &GpuContext, audit_every: usize) -> (SurrogateKs, Arc<Mutex<EvalLog>>) {
-    let (p, log) = Locked::new(ctx.clone(), TOL_H2);
-    (SurrogateKs::new(Box::new(p), policy(audit_every)).with_teacher_tol(TOL_H2), log)
-}
-
 fn h2_plan() -> SamplingPlan {
     SamplingPlan { hot_burst_t: H2_BURST_T, seed: seed(), ..SamplingPlan::default() }
-}
-
-fn residuals(t: Option<TrainingResiduals>) -> String {
-    t.map_or("—".into(), |t| format!("E/atom {:.2e}, F {:.2e} (bound {:.2e})", t.energy_per_atom, t.force, t.force_bound))
-}
-
-/// The per-class leave-one-out numbers (round 6) and the calibrated verdict's inputs (M8a Task 2):
-/// "pair n 273, LOO F rms 0.05× max 0.40×, E rms 0.04× max 0.10×, κ 1.41 (3 evidence), trusted".
-fn class_summary(s: &SurrogateKs) -> String {
-    s.class_loo()
-        .iter()
-        .map(|c| {
-            format!(
-                "{} n {}, LOO F rms {:.3}× max {:.3}×, E rms {:.3}× max {:.3}×, κ {:.2} ({} evidence), {}",
-                c.class, c.samples, c.force_rms, c.force_max, c.energy_rms, c.energy_max, c.calibration, c.evidence,
-                if c.trusted { "trusted" } else { "untrusted" }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn fit_summary(rep: &FitReport, s: &SurrogateKs) -> String {
-    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}; classes: {}",
-            rep.n_samples, rep.q_prime, rep.n_rows, rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.lambda, rep.dof_eff, rep.gamma_e, rep.gamma_f,
-            rep.residual_dof_e, rep.residual_dof_f, rep.condition_estimate, rep.hyper_iterations, if rep.converged { "" } else { " (not converged)" },
-            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")), class_summary(s))
-}
-
-/// One sampling pass with the surrogate's own teacher (`Sampler::step_own_teacher`, what
-/// `Dynamics` drives), then one refit. Appends the pass summary and the sampler's notes.
-fn sample_and_fit(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, out: &mut String) -> (FitReport, Duration) {
-    let t = Instant::now();
-    let r_cut = s.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
-    let mut sampler = Sampler::with_cutoff(sc, plan, r_cut).unwrap_or_else(|e| panic!("sampling plan: {e}"));
-    while sampler.step_own_teacher(s, &mut never()).unwrap_or_else(|e| panic!("sampling: {e}")).is_some() {}
-    let p = sampler.progress();
-    let notes = sampler.take_notes();
-    s.discontinuity();
-    let pass = t.elapsed();
-    let t = Instant::now();
-    let rep = s.refit().unwrap_or_else(|e| panic!("refit: {e}"));
-    let fit_ms = ms(t.elapsed());
-    let _ = writeln!(out, "  sampling pass ({} perturbations σ {}, {} scan points/pair over {:?} × r₀, {}-step burst at {} K, seed {}): {} samples of {} jobs ({} skipped, {} failed) in {:.1} s; E_ref(H) = {:+.6} Ha",
-                     plan.perturbations, plan.perturbation_sigma, plan.scan_points_per_pair, plan.scan_range, plan.hot_burst_steps, plan.hot_burst_t, plan.seed,
-                     sampler.samples_added(), p.total, p.skipped, p.failed, pass.as_secs_f64(), s.reference_energy(1).unwrap_or(f64::NAN));
-    for n in &notes { let _ = writeln!(out, "    note: {n}"); }
-    let b = s.basis().expect("fitted");
-    let _ = writeln!(out, "  basis: n_max {}, l_max {}, r_cut {}, degree cap {}, body3 {}, species {:?}, P {} features, Q′ {}; refit {fit_ms:.0} ms: {}",
-                     b.n_max, b.l_max, b.r_cut, b.degree_cap, b.body3, b.species, b.n_features(), b.n_independent_columns(), fit_summary(&rep, s));
-    assert_eq!((p.failed, p.skipped), (0, 0), "sampling pass: {p:?}");
-    (rep, pass)
 }
 
 /// rms and max of |ΔE| and of the per-component |ΔF| over a set of geometries.
@@ -387,16 +326,6 @@ impl ErrStats {
     }
     fn rmse_e(&self) -> f64 { (self.se2 / self.n.max(1) as f64).sqrt() }
     fn rmse_f(&self) -> f64 { (self.sf2 / self.nf.max(1) as f64).sqrt() }
-}
-
-/// The model's prediction (with its stds) and the teacher's answer at one geometry, the teacher
-/// called directly (a held-out comparison: nothing is kept as a sample).
-fn model_vs_dft(s: &mut SurrogateKs, sc: &Scene, what: &str) -> (Prediction, ForceResult) {
-    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
-    let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
-    let pred = s.model().expect("a fitted model").predict(&pos, &z, true).unwrap_or_else(|e| panic!("{what}: predict: {e}"));
-    let dft = solve(s.teacher_mut(), sc, what);
-    (pred, dft)
 }
 
 fn force_diffs<'a>(a: &'a [[f64; 3]], b: &'a [[f64; 3]]) -> impl Iterator<Item = f64> + 'a {
