@@ -3440,3 +3440,31 @@ fn a_solver_switch_reattaches_the_collection_and_the_autosave_follows_the_mode()
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// M8a Task 9: the knowledge map ships with the fit that made it, the training views closed, and
+/// is not rebuilt while nothing it shows changed; a policy change (a new model generation) ships
+/// it again.
+#[test]
+fn the_knowledge_map_ships_when_the_fit_changes() {
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let mut map = None;
+    snapshots_until(
+        &w,
+        "a fitted model",
+        |s| {
+            if let Some(k) = &s.activity.knowledge {
+                map = Some(k.clone());
+            }
+        },
+        |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working,
+    );
+    let map = map.expect("built with the first fit, the views closed");
+    assert_eq!(map.elements.iter().map(|e| e.z).collect::<Vec<_>>(), vec![1]);
+    assert!(map.pairs.len() == 1 && map.pairs[0].samples > 0, "{:?}", map.pairs);
+    w.send(Command::Dyn(DynCommand::SetSpeed(3)));
+    assert!(idle(&w).activity.knowledge.is_none(), "nothing changed: no rebuild");
+    w.send(Command::SetAudit(7));
+    snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
+}

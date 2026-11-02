@@ -1039,6 +1039,11 @@ pub trait Trainable {
     fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
         None
     }
+    /// What the model's fitted samples cover (`crate::knowledge::KnowledgeMap`, M8a Task 9),
+    /// built from what the provider holds without a teacher solve; `None` without a fitted model.
+    fn knowledge_map(&self) -> Option<crate::knowledge::KnowledgeMap> {
+        None
+    }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.

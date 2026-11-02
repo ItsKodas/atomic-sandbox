@@ -9991,3 +9991,6 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
     s.discontinuity();
     assert_eq!(s.evaluate(&water, &mut never()).unwrap().stats.source, Source::Surrogate, "water is still answered");
 }
+
+/// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
+mod knowledge;

@@ -935,6 +935,7 @@ use surrogate::sidecar::TeacherSolves;
 mod audit;
 pub mod calibrate;
 mod inspect;
+mod knowledge;
 mod ledger;
 mod policy;
 mod quarantine;
@@ -2785,6 +2786,10 @@ impl Trainable for SurrogateKs {
 
     fn training_views(&mut self) -> Option<sim::TrainingViews> {
         SurrogateKs::training_views(self)
+    }
+
+    fn knowledge_map(&self) -> Option<sim::KnowledgeMap> {
+        SurrogateKs::knowledge_map(self)
     }
 
     fn request_display(&mut self, scene: &Scene) -> bool {
