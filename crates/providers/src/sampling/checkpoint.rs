@@ -272,7 +272,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
     if nuclei.is_empty() {
         return Err(need("nuclei"));
     }
-    let scene = Scene { nuclei, cell, charge, multiplicity, sigma, external_field: [0.0; 3], ionic };
+    let scene = Scene { nuclei, cell, charge, multiplicity, sigma, external_field: [0.0; 3], ionic, train_mask: None };
     let n = scene.nuclei.len();
     let plan = plan.ok_or_else(|| need("plan"))?;
     let c = counters.ok_or_else(|| need("counters"))?;

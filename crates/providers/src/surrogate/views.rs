@@ -335,9 +335,13 @@ impl SurrogateKs {
             }
             let n = smp.pos.len() as f64;
             let st = state(i);
-            parity_energy.push(ParityPoint { dft: (smp.energy - eref) / n, model: (pred.energy - eref) / n, kind: kind(smp.tag), state: st, index: i });
+            // a capped segment (M8a Task 10): no energy point (its energy is not fitted: it holds
+            // the caps), the interior atoms' forces only
+            if smp.use_energy {
+                parity_energy.push(ParityPoint { dft: (smp.energy - eref) / n, model: (pred.energy - eref) / n, kind: kind(smp.tag), state: st, index: i });
+            }
             if st == SampleState::Fitted {
-                for (ft, fm) in smp.forces.iter().zip(&pred.forces) {
+                for (_, (ft, fm)) in smp.forces.iter().zip(&pred.forces).enumerate().filter(|(j, _)| smp.trains_atom(*j)) {
                     force_atoms.push([0, 1, 2].map(|a| [ft[a] as f32, fm[a] as f32]));
                 }
             }

@@ -111,7 +111,7 @@ fn gpu() -> Option<GpuContext> {
 }
 
 fn accurate(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::Accepted }
+    Scene { nuclei, cell: Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::Accepted, train_mask: None }
 }
 
 /// The app's h2o preset geometry (O–H 1.81 Bohr, 104.5°) in its 14 Bohr box at the Accurate grid.

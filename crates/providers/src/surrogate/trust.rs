@@ -199,7 +199,12 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
         }
         let Ok(touched) = surrogate::touched_columns(basis, &class_of, &s.pos, &s.z) else { continue };
         let mut present = std::collections::BTreeSet::new();
-        for (cols, k) in touched.iter().zip(env_keys(&s.pos, &s.z, rc2)) {
+        // a masked sample's fitted (interior) atoms only: a cap or an edge atom is no key's
+        // sample and moves no column the key is held to (M8a Task 10)
+        for (j, (cols, k)) in touched.iter().zip(env_keys(&s.pos, &s.z, rc2)).enumerate() {
+            if !s.trains_atom(j) {
+                continue;
+            }
             set(&mut union, cols);
             let Some(k) = k else { continue };
             set(&mut per_key.entry(k.clone()).or_insert_with(|| (vec![0u64; words], 0)).0, cols);
@@ -213,6 +218,12 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
     }
     let count = |bits: &[u64]| bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
     ColumnCounts { per_key: per_key.into_iter().map(|(k, (bits, n))| (k, (n, count(&bits)))).collect(), union: count(&union) }
+}
+
+/// A sample's per-atom environment keys with the atoms its force mask leaves out set to `None`
+/// (M8a Task 10, `surrogate` module doc "Masked scenes"): only interior atoms describe knowledge.
+pub(super) fn trained_keys(s: &Sample, keys: Vec<Option<surrogate::EnvKey>>) -> Vec<Option<surrogate::EnvKey>> {
+    keys.into_iter().enumerate().map(|(j, k)| k.filter(|_| s.trains_atom(j))).collect()
 }
 
 /// What the class verdicts are judged from (`SurrogateKs::class_judge`; M8a user-test fix 2): the
@@ -409,8 +420,11 @@ impl SurrogateKs {
             }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
             let n = s.pos.len().max(1) as f64;
-            worst.energy_per_atom = max_nan(worst.energy_per_atom, (p.energy - s.energy).abs() / n);
-            for (fm, fs) in p.forces.iter().zip(&s.forces) {
+            // the fitted rows only (a masked sample: no energy, the interior atoms' forces)
+            if s.use_energy {
+                worst.energy_per_atom = max_nan(worst.energy_per_atom, (p.energy - s.energy).abs() / n);
+            }
+            for (_, (fm, fs)) in p.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
                 let (d, bound) = self.policy.force_residual(fm, fs);
                 // a NaN ratio is the worst and stays so (activity Task 3b)
                 let ratio = d / bound;
@@ -592,10 +606,12 @@ impl SurrogateKs {
         // the environment keys of the fitted atoms (`calibrate`, "Per environment species") and
         // their leave-one-out sums (as `acc`, per key)
         let mut keys = std::collections::BTreeSet::new();
-        let mut key_acc: BTreeMap<surrogate::EnvKey, (usize, f64, usize, f64, f64, f64)> = BTreeMap::new();
+        let mut key_acc: BTreeMap<surrogate::EnvKey, (usize, f64, usize, f64, f64, f64, usize)> = BTreeMap::new();
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        // per class: samples, Σ force ratio², atoms, max force ratio, max energy ratio, Σ energy ratio²
-        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64); 2];
+        // per class: samples, Σ force ratio², atoms, max force ratio, max energy ratio, Σ energy
+        // ratio², samples with a fitted energy (a capped segment's has none: `surrogate` module
+        // doc, "Masked samples")
+        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64, 0usize); 2];
         let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
         // per class: the samples beyond 1× (the blockers a teach-around pass may target)
         let mut blockers: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 2];
@@ -606,8 +622,9 @@ impl SurrogateKs {
             if self.excluded(i) {
                 continue;
             }
-            let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().map(atom_class).collect();
-            let atom_keys = if s.z.len() == s.pos.len() { env_keys(&s.pos, &s.z, rc2) } else { Vec::new() };
+            // only the fitted (interior) atoms of a masked sample describe a class or a key
+            let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().map(|(j, c)| atom_class(c).filter(|_| s.trains_atom(j))).collect();
+            let atom_keys = if s.z.len() == s.pos.len() { trained_keys(s, env_keys(&s.pos, &s.z, rc2)) } else { Vec::new() };
             keys.extend(atom_keys.iter().flatten().cloned());
             if let Ok((_, f_model)) = surrogate::energy_and_forces(model, &s.pos, &s.z) {
                 for ((fm, f), cj) in f_model.iter().zip(&s.forces).zip(&classes) {
@@ -619,23 +636,27 @@ impl SurrogateKs {
             }
             let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
-            let e_ratio = l.as_ref().map_or(f64::INFINITY, |l| (if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n }) / self.policy.energy_std_per_atom);
+            // no energy evidence from a sample whose energy was not fitted (`None`)
+            let e_ratio: Option<f64> = s.use_energy.then(|| l.as_ref().and_then(|l| l.energy).map_or(f64::INFINITY, |e| (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / self.policy.energy_std_per_atom));
             // per environment key the same leave-one-out sums over its own atoms (user-test fix 2:
             // an atom is judged by its own key, so another species' outlier does not decide it;
             // the energy counts for every key the sample holds, as for the class)
             let present: std::collections::BTreeSet<&surrogate::EnvKey> = atom_keys.iter().flatten().collect();
             for k in present {
-                let a = key_acc.entry(k.clone()).or_insert((0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64));
+                let a = key_acc.entry(k.clone()).or_insert((0usize, 0.0f64, 0usize, 0.0f64, 0.0f64, 0.0f64, 0usize));
                 a.0 += 1;
-                a.4 = max_nan(a.4, e_ratio);
-                a.5 += e_ratio * e_ratio;
+                if let Some(e_ratio) = e_ratio {
+                    a.4 = max_nan(a.4, e_ratio);
+                    a.5 += e_ratio * e_ratio;
+                    a.6 += 1;
+                }
                 match l.as_ref() {
                     None => a.3 = f64::INFINITY,
                     Some(l) => {
                         for ((r, f), kj) in l.forces.iter().zip(&s.forces).zip(&atom_keys) {
-                            if kj.as_ref() != Some(k) {
+                            let Some(r) = r.filter(|_| kj.as_ref() == Some(k)) else {
                                 continue;
-                            }
+                            };
                             let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                             let ratio = d / b;
                             a.1 += ratio * ratio;
@@ -650,8 +671,11 @@ impl SurrogateKs {
                     continue;
                 }
                 a.0 += 1;
-                a.4 = max_nan(a.4, e_ratio);
-                a.5 += e_ratio * e_ratio;
+                if let Some(e_ratio) = e_ratio {
+                    a.4 = max_nan(a.4, e_ratio);
+                    a.5 += e_ratio * e_ratio;
+                    a.6 += 1;
+                }
                 let mut f_worst = 0.0f64;
                 match l.as_ref() {
                     None => {
@@ -660,9 +684,9 @@ impl SurrogateKs {
                     }
                     Some(l) => {
                         for ((r, f), cj) in l.forces.iter().zip(&s.forces).zip(&classes) {
-                            if *cj != Some(c) {
+                            let Some(r) = r.filter(|_| *cj == Some(c)) else {
                                 continue;
-                            }
+                            };
                             let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                             let ratio = d / b;
                             a.1 += ratio * ratio;
@@ -672,11 +696,13 @@ impl SurrogateKs {
                         }
                     }
                 }
-                let r = max_nan(f_worst, e_ratio);
+                let r = max_nan(f_worst, e_ratio.unwrap_or(0.0));
                 if worst[c].is_none_or(|(_, w)| !(r <= w)) {
                     worst[c] = Some((i, r));
                 }
-                if !(r <= 1.0) {
+                // a capped segment is never a teach-around target: its geometry is a cut-out the
+                // segment scene's own pass teaches (`surrogate` module doc, "Masked scenes")
+                if !(r <= 1.0) && s.is_whole() {
                     blockers[c].push((i, r));
                 }
             }
@@ -689,12 +715,16 @@ impl SurrogateKs {
             report.sigma_f.min(rms)
         });
         let cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, aleatoric, &keys);
-        let stats_of = |(samples, ss, atoms, force_max, energy_max, se): (usize, f64, usize, f64, f64, f64)| {
+        let stats_of = |(samples, ss, atoms, force_max, energy_max, se, e_samples): (usize, f64, usize, f64, f64, f64, usize)| {
             let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
             // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
             let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
-            let energy_rms = if samples > 0 { (se / samples as f64).sqrt() } else { 0.0 };
+            let energy_rms = if e_samples > 0 { (se / e_samples as f64).sqrt() } else { 0.0 };
             let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
+            // samples but none with a fitted energy (a key taught only by capped segments): no
+            // energy evidence, which the energy rule reads as failed — the conservative side
+            // (`surrogate` module doc, "Masked samples"; an item for the physics review)
+            let (energy_rms, energy_max) = if samples > 0 && e_samples == 0 { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, energy_max) };
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
@@ -702,6 +732,7 @@ impl SurrogateKs {
         // against the columns its atoms touch (M8a user-fix 3 and its review: not the class's count
         // against the whole basis's Q′, which a species added elsewhere raised for every key)
         let counts = key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s));
+        // (`key_column_counts` counts the fitted atoms of masked samples only)
         let key_q: BTreeMap<surrogate::EnvKey, usize> = counts.per_key.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
         let key_stats = key_acc
             .into_iter()
@@ -754,10 +785,11 @@ impl SurrogateKs {
             if self.excluded(i) {
                 continue;
             }
-            let classes = neighbour_counts(&s.pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1));
+            // the fitted atoms only (a masked sample's caps and edge atoms are not training points)
+            let classes: Vec<(usize, u8)> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).map(|(j, c)| (j, atom_class(c).map_or(0, |k| k as u8 + 1))).collect();
             match surrogate::loo::leave_one_out(model, s) {
-                None => out.extend(classes.map(|c| (c, f64::INFINITY))),
-                Some(l) => out.extend(classes.zip(&l.forces).map(|(c, r)| (c, (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()))),
+                None => out.extend(classes.iter().map(|&(_, c)| (c, f64::INFINITY))),
+                Some(l) => out.extend(classes.iter().filter_map(|&(j, c)| l.forces[j].map(|r| (c, (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt())))),
             }
         }
         out
@@ -767,12 +799,13 @@ impl SurrogateKs {
     /// (the accumulated prefix, excluded samples skipped): the energy per atom over samples
     /// (Hartree/atom; the LOO energy residual is per atom when the fit is, else divided by N) and
     /// the force per Cartesian component over atoms (Hartree/Bohr) — the in-domain errors held-out
-    /// errors are compared with (M8a Task 6, the transfer test). Samples whose LOO is undefined
+    /// errors are compared with (M8a Task 6, the transfer test); of a masked sample (M8a Task 10) only
+    /// the fitted rows — no energy when it was not fitted, the interior atoms' forces. Samples whose LOO is undefined
     /// (a direction only they determine) are counted in `undefined` and left out. `None` without a
     /// model or with no defined LOO. A readout; it decides nothing.
     pub fn loo_rms(&self) -> Option<LooRms> {
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
-        let (mut se, mut sf, mut nf, mut samples, mut undefined) = (0.0f64, 0.0f64, 0usize, 0usize, 0usize);
+        let (mut se, mut ne, mut sf, mut nf, mut samples, mut undefined) = (0.0f64, 0usize, 0.0f64, 0usize, 0usize, 0usize);
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
@@ -780,17 +813,20 @@ impl SurrogateKs {
             match surrogate::loo::leave_one_out(model, s) {
                 None => undefined += 1,
                 Some(l) => {
-                    let e = if model.energy_per_atom { l.energy } else { l.energy / s.pos.len().max(1) as f64 };
-                    se += e * e;
+                    if let Some(e) = l.energy {
+                        let e = if model.energy_per_atom { e } else { e / s.pos.len().max(1) as f64 };
+                        se += e * e;
+                        ne += 1;
+                    }
                     samples += 1;
-                    for r in &l.forces {
+                    for r in l.forces.iter().flatten() {
                         sf += r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
                         nf += 3;
                     }
                 }
             }
         }
-        (samples > 0).then(|| LooRms { energy_per_atom: (se / samples as f64).sqrt(), force: (sf / nf.max(1) as f64).sqrt(), samples, undefined })
+        (samples > 0).then(|| LooRms { energy_per_atom: if ne > 0 { (se / ne as f64).sqrt() } else { 0.0 }, force: (sf / nf.max(1) as f64).sqrt(), samples, undefined })
     }
 
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query whose atoms have the
@@ -937,11 +973,13 @@ impl SurrogateKs {
         let n = case.pos.len().max(1) as f64;
         let in_fit = case.index.filter(|&i| i < self.accumulated && !self.excluded(i));
         let (e_pred, f_pred, how) = match in_fit.and_then(|i| self.store.as_ref().map(|st| &st.samples[i])) {
-            Some(smp) => match surrogate::loo::leave_one_out(model, smp) {
-                Some(l) => {
+            // (a masked sample — never audited: a masked scene is teacher-only — would take the
+            // plain prediction for what its fit left out: its energy, its masked-out atoms)
+            Some(smp) => match surrogate::loo::leave_one_out(model, smp).zip(model.predict(&case.pos, &case.z, false).ok()) {
+                Some((l, plain)) => {
                     let per = if model.energy_per_atom { n } else { 1.0 };
-                    let f: Vec<[f64; 3]> = smp.forces.iter().zip(&l.forces).map(|(f, r)| [f[0] - r[0], f[1] - r[1], f[2] - r[2]]).collect();
-                    (smp.energy - l.energy * per, f, "the refit's model without the audited sample (leave-one-out)")
+                    let f: Vec<[f64; 3]> = smp.forces.iter().zip(&l.forces).zip(&plain.forces).map(|((f, r), p)| r.map_or(*p, |r| [f[0] - r[0], f[1] - r[1], f[2] - r[2]])).collect();
+                    (l.energy.map_or(plain.energy, |e| smp.energy - e * per), f, "the refit's model without the audited sample (leave-one-out)")
                 }
                 None => (f64::NAN, vec![[f64::NAN; 3]; case.pos.len()], "the leave-one-out prediction is undefined (the sample alone spans a direction)"),
             },
@@ -1144,7 +1182,7 @@ impl SurrogateKs {
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
         let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
         self.audit_fences.iter().position(|c| {
-            let atoms = describe_sample(basis, &Sample { pos: c.pos.clone(), z: c.z.clone(), energy: c.energy, forces: c.forces.clone(), tag: SampleTag::Audit, weight: 1.0 });
+            let atoms = describe_sample(basis, &Sample { pos: c.pos.clone(), z: c.z.clone(), energy: c.energy, forces: c.forces.clone(), tag: SampleTag::Audit, weight: 1.0, force_mask: None, use_energy: true });
             let worst = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
                 let best = atoms.iter().filter(|(s, _)| s == qs).map(|(s, b)| spread_distance(env, *s, qd, b)).fold(f64::INFINITY, f64::min);
                 worst.max(best)

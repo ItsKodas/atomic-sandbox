@@ -464,6 +464,9 @@ pub enum TeachRule {
     Audit,
     RelaxVerification,
     Pass(PassJob),
+    /// The scene is a capped segment (`Scene::train_mask`, M8a Task 10): it teaches its interior
+    /// atoms; the model never answers there (its caps and edge atoms are not the source's).
+    Segment,
 }
 
 /// What happened to the teacher's answer (`providers::surrogate::admit` and the pass).

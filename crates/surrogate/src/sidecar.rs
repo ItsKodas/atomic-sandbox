@@ -80,6 +80,23 @@
 //!
 //! A file without it reads as "not known" for every sample.
 //!
+//! **Optional, every version** (M8a Task 10, masked samples — `crate::fit` module doc, "Masked
+//! samples"): when any stored sample is masked (a capped segment's: `Sample::force_mask` set or
+//! `use_energy` false), two more arrays follow the face densities (after `sample_face_density`
+//! when present, else after `sample_quarantine` when present, else after the sample arrays):
+//!
+//! | name | length | content |
+//! |---|---|---|
+//! | sample_mask_kind | M | per sample, bit 0: it has a force mask; bit 1: its energy is not fitted (0 to 3, exact integral f64) |
+//! | sample_force_mask | Σ atoms of the samples with bit 0 | per atom of those samples in order: 1 its forces are fitted, 0 not |
+//!
+//! A file without them reads as "every sample whole" (no mask, energy fitted), so every earlier
+//! file still reads, and a file with no masked sample is written exactly as before. A build that
+//! predates them refuses such a file (its declared arrays are not that build's list) — it never
+//! reads a capped segment's caps as training data. With a masked sample whose energy is unused the
+//! accumulator object carries one more key, `n_scale` (`Accumulator::n_scale`, the scale rows;
+//! written only when it differs from `n_e`, read as `n_e` when absent).
+//!
 //! **Optional, every version** (activity spec A2; plan review M4, S17): the header key
 //! `teacher_solves` {pass, fallback, audit, verification, kept (JSON integers), complete (bool)}
 //! — the model's lifetime teaching solves by origin and how many were kept; `complete: false`
@@ -630,7 +647,8 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         arrays.push(("body3_terms", &terms));
     }
     let q_flags = quarantine_values(quarantine)?;
-    push_sample_tail(&mut arrays, &q_flags, face_density);
+    let masks = mask_arrays(samples);
+    push_sample_tail(&mut arrays, &q_flags, face_density, masks.as_ref());
     // the audit history (version 7), last: nothing when blank, so such a file is version 5's bytes
     let with_history = *history != AuditHistory::default();
     let hist_arrays = with_history.then(|| history.to_arrays());
@@ -698,6 +716,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("energy_per_atom", acc.energy_per_atom.map_or("null".into(), |b| b.to_string())),
         ("envelope_count", format!("[{}]", env.count.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","))),
     ]);
+    // the scale rows (M8a Task 10, module doc): only when a sample without an energy row made
+    // them differ from the energy rows, so every other file is byte-identical
+    let acc_json = if acc.n_scale != acc.n_e { format!("{},\"n_scale\":{}}}", &acc_json[..acc_json.len() - 1], acc.n_scale) } else { acc_json };
     let arrays_json = arrays_json(&arrays);
     let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
@@ -828,14 +849,59 @@ fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
 }
 
 /// The optional sample tail (module doc): the quarantine flags when one is set, then the face
-/// densities when given.
-fn push_sample_tail<'a>(arrays: &mut Vec<(&'a str, &'a [f64])>, q_flags: &'a [f64], face_density: &'a [f64]) {
+/// densities when given, then the masks when a sample is masked.
+fn push_sample_tail<'a>(arrays: &mut Vec<(&'a str, &'a [f64])>, q_flags: &'a [f64], face_density: &'a [f64], masks: Option<&'a (Vec<f64>, Vec<f64>)>) {
     if q_flags.iter().any(|&q| q != 0.0) {
         arrays.push(("sample_quarantine", q_flags));
     }
     if !face_density.is_empty() {
         arrays.push(("sample_face_density", face_density));
     }
+    if let Some((kind, mask)) = masks {
+        arrays.push(("sample_mask_kind", kind));
+        arrays.push(("sample_force_mask", mask));
+    }
+}
+
+/// The two mask arrays (module doc, M8a Task 10) when any sample is masked, else `None`.
+fn mask_arrays(samples: &[Sample]) -> Option<(Vec<f64>, Vec<f64>)> {
+    if samples.iter().all(Sample::is_whole) {
+        return None;
+    }
+    let kind = samples.iter().map(|s| (u8::from(s.force_mask.is_some()) | (u8::from(!s.use_energy) << 1)) as f64).collect();
+    let mask = samples.iter().flat_map(|s| s.force_mask.iter().flatten().map(|&b| if b { 1.0 } else { 0.0 })).collect();
+    Some((kind, mask))
+}
+
+/// Applies the two mask arrays to `samples` (module doc, M8a Task 10): every kind 0 to 3, the
+/// mask entries 0 or 1 and exactly as many as the masked samples' atoms, and no sample that
+/// teaches nothing (no energy and no masked-in atom).
+fn decode_masks(samples: &mut [Sample], kind: &[f64], mask: &[f64]) -> Result<(), String> {
+    let mut at = 0usize;
+    for (i, (s, &k)) in samples.iter_mut().zip(kind).enumerate() {
+        if !(k == 0.0 || k == 1.0 || k == 2.0 || k == 3.0) {
+            return Err(format!("sample_mask_kind[{i}] = {k} is not 0, 1, 2 or 3"));
+        }
+        let k = k as u8;
+        s.use_energy = k & 2 == 0;
+        s.force_mask = None;
+        if k & 1 != 0 {
+            let n = s.pos.len();
+            let m = mask.get(at..at + n).ok_or_else(|| format!("sample_force_mask ends inside sample {i}"))?;
+            if let Some(j) = m.iter().position(|&x| x != 0.0 && x != 1.0) {
+                return Err(format!("sample_force_mask: sample {i} atom {j} is {} (0 or 1)", m[j]));
+            }
+            s.force_mask = Some(m.iter().map(|&x| x == 1.0).collect());
+            at += n;
+        }
+        if !s.use_energy && s.trained_atoms() == 0 {
+            return Err(format!("sample {i} teaches nothing (no energy and no masked-in atom)"));
+        }
+    }
+    if at != mask.len() {
+        return Err(format!("sample_force_mask has {} entries, the masked samples {at} atoms", mask.len()));
+    }
+    Ok(())
 }
 
 /// The header's `provenance` object.
@@ -903,7 +969,8 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
         ("sample_forces", &s_forces),
     ];
     let q_flags = quarantine_values(&set.quarantine)?;
-    push_sample_tail(&mut arrays, &q_flags, &set.face_density);
+    let masks = mask_arrays(&set.samples);
+    push_sample_tail(&mut arrays, &q_flags, &set.face_density, masks.as_ref());
     let references = format!("[{}]", set.references.iter().map(|&(z, e)| format!("[{z},{}]", num(e))).collect::<Vec<_>>().join(","));
     let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(MAGIC_V6).expect("ASCII"))),
@@ -1161,7 +1228,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
     // the optional quarantine flags and face densities, in that order (module doc)
-    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let (has_quarantine, has_face, has_masks) = sample_tail(&declared, &mut fixed, n_stored);
     // the audit history (version 7, module doc): the key announces the ten arrays, last
     let history_counts = if version >= 7 { decode_history_key(&h)? } else { None };
     let class_memory = if version >= 7 { decode_class_memory(&h)? } else { Vec::new() };
@@ -1228,6 +1295,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     acc.n_f = a.get("n_f")?.usize()?;
     acc.sum_log_w_f = a.get("sum_log_w_f")?.f64()?;
     acc.n_samples = a.get("n_samples")?.usize()?;
+    // the scale rows (M8a Task 10): absent = the energy rows
+    acc.n_scale = match a.get("n_scale") {
+        Err(_) | Ok(Json::Null) => acc.n_e,
+        Ok(v) => v.usize()?,
+    };
     acc.energy_per_atom = match a.get("energy_per_atom")? {
         Json::Null => None,
         v => Some(v.bool()?),
@@ -1245,7 +1317,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
 
     let (atoms, tags, weights, energies) = (next(), next(), next(), next());
     let (zs, pos, forces) = (next(), next(), next());
-    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    let mut samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
     if has_terms {
         let stored = next();
         let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
@@ -1256,6 +1328,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     }
     let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
     let face_density = if has_face { next() } else { Vec::new() };
+    if has_masks {
+        let (kind, mask) = (next(), next());
+        decode_masks(&mut samples, &kind, &mask)?;
+    }
     let audit_history = match history_counts {
         None => AuditHistory::default(),
         Some((_, recorded, unrecorded)) => {
@@ -1351,14 +1427,18 @@ fn decode_samples_file(bytes: &[u8]) -> Result<SampleSet, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
-    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let (has_quarantine, has_face, has_masks) = sample_tail(&declared, &mut fixed, n_stored);
     let mut it = read_arrays(bytes, &declared, &fixed, version)?.into_iter();
     let mut next = || it.next().expect("every declared array read");
     let (atoms, tags, weights, energies) = (next(), next(), next(), next());
     let (zs, pos, forces) = (next(), next(), next());
-    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    let mut samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
     let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
     let face_density = if has_face { next() } else { Vec::new() };
+    if has_masks {
+        let (kind, mask) = (next(), next());
+        decode_masks(&mut samples, &kind, &mask)?;
+    }
     let sample_box = match h.get("sample_box") {
         Err(_) | Ok(Json::Null) => Vec::new(),
         Ok(b) => b.arr()?.iter().map(Json::usize).collect::<Result<Vec<_>, _>>()?,
@@ -1441,19 +1521,25 @@ fn declared_arrays(h: &Json) -> Result<Vec<(String, usize)>, String> {
         .collect()
 }
 
-/// The optional quarantine flags and face densities after the `fixed` arrays, in that order
-/// (module doc): appended to `fixed` when declared; (quarantine present, face densities present).
-fn sample_tail(declared: &[(String, usize)], fixed: &mut Vec<(&str, Option<usize>)>, n_stored: usize) -> (bool, bool) {
+/// The optional quarantine flags, face densities and masks after the `fixed` arrays, in that
+/// order (module doc): appended to `fixed` when declared; (quarantine present, face densities
+/// present, masks present).
+fn sample_tail(declared: &[(String, usize)], fixed: &mut Vec<(&str, Option<usize>)>, n_stored: usize) -> (bool, bool, bool) {
     let extra: Vec<&str> = declared.iter().skip(fixed.len()).map(|(n, _)| n.as_str()).collect();
     let has_quarantine = extra.first() == Some(&"sample_quarantine");
     let has_face = extra.get(usize::from(has_quarantine)) == Some(&"sample_face_density");
+    let has_masks = extra.get(usize::from(has_quarantine) + usize::from(has_face)) == Some(&"sample_mask_kind");
     if has_quarantine {
         fixed.push(("sample_quarantine", Some(n_stored)));
     }
     if has_face {
         fixed.push(("sample_face_density", Some(n_stored)));
     }
-    (has_quarantine, has_face)
+    if has_masks {
+        fixed.push(("sample_mask_kind", Some(n_stored)));
+        fixed.push(("sample_force_mask", None));
+    }
+    (has_quarantine, has_face, has_masks)
 }
 
 /// The arrays after the header: the declared list must be `fixed` (names in order, lengths where
@@ -1551,7 +1637,7 @@ fn decode_sample_list(atoms: &[f64], tags: &[f64], weights: &[f64], energies: &[
             z.push(zz as u8);
         }
         let triples = |v: &[f64]| -> Vec<[f64; 3]> { v[3 * k..3 * (k + n)].chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() };
-        samples.push(Sample { pos: triples(pos), z, energy: energies[i], forces: triples(forces), tag: TAGS[tag as usize], weight: w });
+        samples.push(Sample { pos: triples(pos), z, energy: energies[i], forces: triples(forces), tag: TAGS[tag as usize], weight: w, force_mask: None, use_energy: true });
         k += n;
     }
     Ok(samples)
@@ -1975,6 +2061,7 @@ pub(crate) mod tests {
         acc.rhs_e = random_vec(&mut rng, q);
         acc.yy_e = 0.123_456_789_012_345_6;
         acc.n_e = 41;
+        acc.n_scale = 41;
         acc.sum_log_w_e = -0.0;
         acc.gram_f = random_vec(&mut rng, q * q);
         acc.rhs_f = random_vec(&mut rng, q);
@@ -2051,6 +2138,7 @@ pub(crate) mod tests {
                     forces: (0..n).map(|_| [rng.gen_range(-0.1..0.1), -0.0, rng.gen_range(-0.1..0.1)]).collect(),
                     tag: tags[i % tags.len()],
                     weight: if i % 5 == 0 { 2.5 } else { 1.0 },
+                    force_mask: None, use_energy: true,
                 }
             })
             .collect();
@@ -2306,6 +2394,7 @@ pub(crate) mod tests {
             assert_eq!(x.to_bits(), y.to_bits(), "{name}");
         }
         assert_eq!((a.n_e, a.n_f, a.n_samples, a.energy_per_atom), (b.n_e, b.n_f, b.n_samples, b.energy_per_atom));
+        assert_eq!(a.n_scale, b.n_scale);
         assert_eq!(a.envelope.count, b.envelope.count);
         assert_eq!(a.envelope.species, b.envelope.species);
         assert_eq!(a.envelope.n_features, b.envelope.n_features);
@@ -2314,6 +2403,91 @@ pub(crate) mod tests {
     #[test]
     fn sidecar_round_trips_bit_exact() {
         round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V7);
+    }
+
+    /// Masks the fixture's samples as capped segments would be (M8a Task 10): every third sample
+    /// with a force mask (its first atom out when it has more than one), every fourth without its
+    /// energy (then its first atom always in).
+    fn masked_samples(samples: &[Sample]) -> Vec<Sample> {
+        samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n = s.pos.len();
+                let force_mask = (i % 3 == 0).then(|| (0..n).map(|j| j > 0 || n == 1 || i % 4 == 0).collect());
+                Sample { force_mask, use_energy: i % 4 != 0, ..s.clone() }
+            })
+            .collect()
+    }
+
+    /// M8a Task 10 (module doc, "masked samples"): the force masks and the unused-energy flags
+    /// round-trip through a fitted file (version 7) and a samples-only file (version 6), with the
+    /// accumulator's scale-row count; a file with no masked sample is byte-identical to the
+    /// earlier writer's (no mask arrays, no `n_scale` key) and reads as "every sample whole"; a
+    /// malformed mask is refused.
+    #[test]
+    fn masked_samples_round_trip_and_old_files_read_whole() {
+        let orig = random_sidecar(12, false);
+        // an old file: the writer before Task 10 wrote exactly these bytes (no new key, no array)
+        let old = tmp("masks-old.model");
+        write(&old, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&old).unwrap()).to_string();
+        assert!(!text.contains("sample_mask_kind") && !text.contains("n_scale"));
+        let back = read(&old).unwrap();
+        assert!(back.samples.iter().all(Sample::is_whole), "an old file's samples read whole");
+        assert_eq!(back.accumulator.n_scale, back.accumulator.n_e);
+        // masked samples, and an accumulator whose scale rows exceed its energy rows
+        let samples = masked_samples(&orig.samples);
+        assert!(samples.iter().any(|s| s.force_mask.is_some() && s.use_energy) && samples.iter().any(|s| s.force_mask.is_some() && !s.use_energy) && samples.iter().any(|s| s.force_mask.is_none() && !s.use_energy));
+        let mut acc = orig.accumulator.clone();
+        acc.n_scale = 52;
+        let p = tmp("masks.model");
+        write(&p, &orig.model, &acc, orig.report.as_ref(), &samples, orig.reference_rule.as_deref()).unwrap();
+        let back = read(&p).unwrap();
+        assert_eq!(back.samples, samples);
+        assert_eq!(back.accumulator.n_scale, 52);
+        assert_accumulators_bit_equal(&back.accumulator, &acc);
+        // with the history after the tail (version 7's last arrays) and quarantine + densities before it
+        let n = samples.len();
+        let q: Vec<u8> = (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect();
+        let face: Vec<f64> = (0..n).map(|i| 1e-6 * i as f64).collect();
+        let mut history = AuditHistory::default();
+        history.push(history_point(1, 3));
+        write_full_with_history(&p, &orig.model, &acc, orig.report.as_ref(), &samples, None, &q, &face, None, &[], &history).unwrap();
+        let back = read(&p).unwrap();
+        assert_eq!((back.samples.clone(), back.quarantine.clone(), bits(&back.face_density)), (samples.clone(), q.clone(), bits(&face)));
+        assert_eq!(back.audit_history, history);
+        // a samples-only file (version 6)
+        let set = SampleSet {
+            provenance: orig.model.provenance.clone(),
+            samples: samples.clone(),
+            references: vec![(1, -0.45)],
+            reference_rule: None,
+            quarantine: Vec::new(),
+            face_density: face.clone(),
+            sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: CREATED_BY.into(),
+        };
+        let p6 = tmp("masks-v6.model");
+        write_samples(&p6, &set).unwrap();
+        let Contents::Samples(back) = read_any(&p6).unwrap() else { panic!("a samples-only file") };
+        assert_eq!(back.samples, samples);
+        // malformed masks are refused, never misread: a sample that teaches nothing, a kind beyond
+        // 3, a mask entry not 0/1, a mask array of the wrong length
+        let mut s_bad = samples.clone();
+        s_bad[0].force_mask = Some(vec![false; s_bad[0].pos.len()]);
+        s_bad[0].use_energy = false;
+        assert!(decode_masks(&mut s_bad.clone(), &[3.0], &vec![0.0; s_bad[0].pos.len()]).unwrap_err().contains("teaches nothing"));
+        assert!(decode_masks(&mut s_bad.clone(), &[4.0], &[]).unwrap_err().contains("not 0, 1, 2 or 3"));
+        assert!(decode_masks(&mut s_bad.clone(), &[1.0], &vec![0.5; s_bad[0].pos.len()]).unwrap_err().contains("(0 or 1)"));
+        assert!(decode_masks(&mut s_bad[..1].to_vec(), &[1.0], &vec![1.0; s_bad[0].pos.len() + 1]).unwrap_err().contains("entries"));
+        for f in [old, p, p6] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the

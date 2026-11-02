@@ -31,13 +31,17 @@
 //!
 //! * kind 0, **header** (first record, once): `u16 LE length · the key's text` — must equal this
 //!   key's [`SurfaceKey::to_text`].
-//! * kind 1, **sample**: `flags: u16 LE` (0 today: room for Task 10's per-atom force mask and
-//!   use-energy flag — a set bit adds its fields after the ones below, under the same magic), `tag:
-//!   u8` (the sidecar's tag code), `multiplicity_forced: u8`, `multiplicity: u32` (the spin
-//!   multiplicity 2S + 1 the teacher solved the sample at; 0 = not recorded — spec §4.2 "a sample
-//!   keeps its own multiplicity as solved", filled from Task 4), `grid_n: u32`, `weight: f64`,
-//!   `energy: f64`, `n: u32`, `z: n × u8`, `pos: 3n × f64`, `forces: 3n × f64`, `scene: u16 length ·
-//!   UTF-8` (all little-endian; f64 bit patterns kept exactly).
+//! * kind 1, **sample**: `flags: u16 LE`, `tag: u8` (the sidecar's tag code),
+//!   `multiplicity_forced: u8`, `multiplicity: u32` (the spin multiplicity 2S + 1 the teacher solved
+//!   the sample at; 0 = not recorded — spec §4.2 "a sample keeps its own multiplicity as solved",
+//!   filled from Task 4), `grid_n: u32`, `weight: f64`, `energy: f64`, `n: u32`, `z: n × u8`,
+//!   `pos: 3n × f64`, `forces: 3n × f64`, `scene: u16 length · UTF-8` (all little-endian; f64 bit
+//!   patterns kept exactly), then the fields of the set flags (M8a Task 10, a capped segment's
+//!   masked sample — `crate::fit` module doc, "Masked samples"): bit 0 **force mask**, `n × u8`
+//!   (1 the atom's forces are fitted, 0 not); bit 1 **energy not fitted** (no field). A sample
+//!   without a mask and with its energy fitted is written with flags 0, byte for byte as before, so
+//!   every older file reads unchanged (as whole samples); a build before Task 10 refuses a record
+//!   with a flag set (below) — it never reads a cap's force as training data.
 //! * kind 2, **status**: `sample index: u64, code: u8` — a later quarantine change of the sample
 //!   with that index ([`crate::quarantine`] codes); the latest record per sample wins on load.
 //!   A sample enters with [`Q_NONE`] (the admission rules refuse every other code).
@@ -70,8 +74,9 @@
 //! state the teacher found and may share; a sample of another surface is refused naming the
 //! differing field. Box size (`grid_n`) is not a reason: it is recorded per sample.
 //! [`Collection::append`] re-checks the shape and the forced flag and refuses a duplicate: the same
-//! teacher answer (atoms, positions, energy and forces, bit for bit) whatever its tag or weight —
-//! a duplicate would double a geometry's weight and let its twin predict it in leave-one-out.
+//! teacher answer (atoms, positions, energy and forces, bit for bit) whatever its tag, weight or
+//! mask — a duplicate would double a geometry's weight and let its twin predict it in
+//! leave-one-out (a second copy under another mask would refit rows the first already holds).
 //!
 //! [`Collection::import_sidecar`] applies the same rules per sample, the box rule by the sample's
 //! recorded face density too (the provider keeps box-affected answers at code 0 while its own trust
@@ -199,8 +204,12 @@ const REC_SAMPLE: u8 = 1;
 const REC_STATUS: u8 = 2;
 /// The version every record kind is written at (module doc).
 const RECORD_VERSION: u8 = 1;
-/// The sample flags this build reads (none yet; module doc).
-const SAMPLE_FLAGS_KNOWN: u16 = 0;
+/// Sample flag bit 0: a force mask follows (module doc, M8a Task 10).
+const FLAG_FORCE_MASK: u16 = 1;
+/// Sample flag bit 1: the energy is not fitted.
+const FLAG_NO_ENERGY: u16 = 2;
+/// The sample flags this build reads (module doc).
+const SAMPLE_FLAGS_KNOWN: u16 = FLAG_FORCE_MASK | FLAG_NO_ENERGY;
 /// The largest record accepted (a hostile or damaged length prefix is not followed past this):
 /// 64 MiB ≈ a 1.3-million-atom sample.
 const MAX_RECORD: usize = 1 << 26;
@@ -447,9 +456,10 @@ fn header_record(key: &SurfaceKey) -> Vec<u8> {
 fn sample_record(s: &CollectionSample) -> Vec<u8> {
     let x = &s.sample;
     let n = x.z.len();
-    let mut p = Vec::with_capacity(44 + n * 49 + s.scene.len());
+    let mut p = Vec::with_capacity(44 + n * 50 + s.scene.len());
     p.extend_from_slice(&[REC_SAMPLE, RECORD_VERSION]);
-    p.extend_from_slice(&0u16.to_le_bytes());
+    let flags = if x.force_mask.is_some() { FLAG_FORCE_MASK } else { 0 } | if x.use_energy { 0 } else { FLAG_NO_ENERGY };
+    p.extend_from_slice(&flags.to_le_bytes());
     p.push(sidecar::tag_index(x.tag));
     p.push(s.multiplicity_forced as u8);
     p.extend_from_slice(&s.multiplicity.unwrap_or(0).to_le_bytes());
@@ -465,6 +475,9 @@ fn sample_record(s: &CollectionSample) -> Vec<u8> {
     }
     p.extend_from_slice(&(s.scene.len() as u16).to_le_bytes());
     p.extend_from_slice(s.scene.as_bytes());
+    if let Some(m) = &x.force_mask {
+        p.extend(m.iter().map(|&b| u8::from(b)));
+    }
     frame(&p)
 }
 
@@ -540,8 +553,21 @@ fn decode_sample(c: &mut Cursor) -> Result<CollectionSample, String> {
     let forces = c.triples(n, "forces")?;
     let len = c.u16("scene name length")? as usize;
     let scene = String::from_utf8(c.take(len, "scene name")?.to_vec()).map_err(|_| "the scene name is not UTF-8".to_string())?;
+    let force_mask = if flags & FLAG_FORCE_MASK != 0 {
+        let m = c.take(n, "force mask")?;
+        if let Some(j) = m.iter().position(|&b| b > 1) {
+            return Err(format!("force mask entry {j} is {} (0 or 1)", m[j]));
+        }
+        Some(m.iter().map(|&b| b == 1).collect::<Vec<bool>>())
+    } else {
+        None
+    };
     c.done()?;
-    Ok(CollectionSample { sample: Sample { pos, z, energy, forces, tag, weight }, grid_n, multiplicity_forced: forced, multiplicity, scene })
+    let sample = Sample { pos, z, energy, forces, tag, weight, force_mask, use_energy: flags & FLAG_NO_ENERGY == 0 };
+    if !sample.use_energy && sample.trained_atoms() == 0 {
+        return Err("the sample teaches nothing (no energy and no masked-in atom)".into());
+    }
+    Ok(CollectionSample { sample, grid_n, multiplicity_forced: forced, multiplicity, scene })
 }
 
 /// What `samples.bin` held.
@@ -682,6 +708,12 @@ fn check_shape(s: &Sample) -> Result<(), String> {
     let n = s.z.len();
     if n == 0 || s.pos.len() != n || s.forces.len() != n {
         return Err(format!("sample has {} positions, {n} charges and {} forces", s.pos.len(), s.forces.len()));
+    }
+    if s.force_mask.as_ref().is_some_and(|m| m.len() != n) {
+        return Err(format!("sample has {n} atoms and a force mask of {}", s.force_mask.as_ref().map_or(0, Vec::len)));
+    }
+    if !s.use_energy && s.trained_atoms() == 0 {
+        return Err("sample teaches nothing (no energy and no masked-in atom)".into());
     }
     if s.z.contains(&0) {
         return Err("sample has an atom of Z 0".into());
@@ -1238,16 +1270,24 @@ impl Collection {
         for s in &self.samples {
             *tags.entry(format!("{:?}", s.sample.tag)).or_default() += 1;
         }
-        t.push_str(&format!("by origin: {}\n\n", tags.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")));
+        t.push_str(&format!("by origin: {}\n", tags.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")));
+        // capped segments (M8a Task 10): only their interior atoms are knowledge, below too
+        let segments = self.samples.iter().filter(|s| !s.sample.is_whole()).count();
+        if segments > 0 {
+            t.push_str(&format!("{segments} of them capped segments (only their interior atoms' forces are taught and counted below)\n"));
+        }
+        t.push('\n');
         let mut species: BTreeMap<u8, (usize, usize)> = BTreeMap::new();
         let mut pairs: BTreeMap<(u8, u8), (usize, usize, f64)> = BTreeMap::new();
         for s in &self.samples {
             let x = &s.sample;
-            let mut zs: Vec<u8> = x.z.clone();
+            let mut zs: Vec<u8> = x.z.iter().enumerate().filter(|(j, _)| x.trains_atom(*j)).map(|(_, &z)| z).collect();
             zs.sort_unstable();
             zs.dedup();
-            for &z in &x.z {
-                species.entry(z).or_default().0 += 1;
+            for (j, &z) in x.z.iter().enumerate() {
+                if x.trains_atom(j) {
+                    species.entry(z).or_default().0 += 1;
+                }
             }
             for z in zs {
                 species.entry(z).or_default().1 += 1;
@@ -1257,7 +1297,8 @@ impl Collection {
             for i in 0..x.z.len() {
                 for j in i + 1..x.z.len() {
                     let d = (0..3).map(|a| (x.pos[i][a] - x.pos[j][a]).powi(2)).sum::<f64>().sqrt();
-                    if d < r_cut {
+                    // a pair is known through an atom that is (its neighbourhood is the source's)
+                    if d < r_cut && (x.trains_atom(i) || x.trains_atom(j)) {
                         let p = (x.z[i].min(x.z[j]), x.z[i].max(x.z[j]));
                         *here.entry(p).or_default() += 1;
                         let m = nearest.entry(p).or_insert(f64::INFINITY);
@@ -1346,6 +1387,7 @@ mod tests {
             forces: vec![[0.01 * i as f64, -0.0, 1e-300], [-0.01 * i as f64, 0.0, -1e-300]],
             tag: [SampleTag::LiveStep, SampleTag::Scan, SampleTag::Audit][i % 3],
             weight: if i.is_multiple_of(4) { 2.5 } else { 1.0 },
+            force_mask: None, use_energy: true,
         }
     }
 
@@ -1552,6 +1594,50 @@ mod tests {
         assert_eq!(c.samples, (0..5).map(cs).collect::<Vec<_>>());
     }
 
+    /// M8a Task 10 (module doc): a capped segment's masked samples round-trip with their flags;
+    /// a whole sample is written with flags 0, byte for byte as a pre-Task-10 build wrote it; a
+    /// misshapen mask is refused at append, a damaged mask byte at open.
+    #[test]
+    fn masked_samples_round_trip_and_old_records_read_whole() {
+        let dir = root("masks");
+        let key = prov().surface_key();
+        let masked = |i: usize, mask: Option<Vec<bool>>, use_energy: bool| {
+            let mut c = cs(i);
+            c.sample.force_mask = mask;
+            c.sample.use_energy = use_energy;
+            c
+        };
+        let want = vec![cs(0), masked(1, Some(vec![true, false]), false), masked(2, Some(vec![false, true]), true), masked(3, None, false)];
+        // the pre-Task-10 record of a whole sample: flags 0 and nothing after the scene name
+        let whole = sample_record(&cs(0));
+        assert_eq!(u16::from_le_bytes([whole[10], whole[11]]), 0, "flags 0");
+        assert!(whole.ends_with(cs(0).scene.as_bytes()), "no field after the scene name");
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            for s in &want {
+                c.append(s.clone()).unwrap();
+            }
+            assert!(c.append(masked(4, Some(vec![true]), true)).unwrap_err().contains("force mask of 1"));
+            assert!(c.append(masked(5, Some(vec![false, false]), false)).unwrap_err().contains("teaches nothing"));
+            assert_eq!(c.append(masked(1, None, true)), Err(REFUSE_DUPLICATE.to_string()), "the same answer under another mask is a duplicate");
+        }
+        let (c, r) = Collection::open(&dir, &key).unwrap();
+        assert_eq!((r.samples, r.dropped_tail), (4, 0));
+        assert_eq!(c.samples, want);
+        // a damaged mask byte (checksum fixed up, so it is not damage) is refused by name
+        let path = samples_path(&dir, &key);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let rec = sample_record(&want[1]);
+        let at = bytes.windows(rec.len()).position(|w| w == &rec[..]).expect("the record is in the file");
+        let len = rec.len();
+        bytes[at + len - 1] = 7;
+        let crc = crc32(&bytes[at + 8..at + len]);
+        bytes[at + 4..at + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let e = Collection::open(&dir, &key).unwrap_err();
+        assert!(e.contains("force mask entry 1 is 7"), "{e}");
+    }
+
     /// A record written by a newer build (an unknown kind with a valid checksum) refuses the open —
     /// it is never truncated as if torn.
     #[test]
@@ -1680,7 +1766,7 @@ mod tests {
         draft.tag = SampleTag::DraftAudit;
         let mut big_box = prov();
         big_box.grid_n = 81;
-        let atom = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::Reference, weight: 1.0 };
+        let atom = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::Reference, weight: 1.0, force_mask: None, use_energy: true };
         let samples = vec![h2(0), h2(1), h2(2), h2(3), draft, h2(5), h2(0), atom];
         let f = samples_file(&dir, "h2.model", &set(big_box, samples, vec![0, 1, 3, 0, 0, 0, 0, 0], vec![1e-9, 1e-9, 1e-9, 1e-3, 1e-9, f64::NAN, 1e-9, 1e-9]));
         let r = c.import_sidecar(&f, 1e-4, 6.0).unwrap();
@@ -1725,8 +1811,8 @@ mod tests {
         let dir = root("import-lone");
         let key = prov().surface_key();
         let (mut c, _) = Collection::open(&dir, &key).unwrap();
-        let one = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::LiveStep, weight: 1.0 };
-        let apart = Sample { pos: vec![[0.0; 3], [6.0, 0.0, 0.0]], z: vec![1, 1], energy: -0.956, forces: vec![[0.0; 3]; 2], tag: SampleTag::Scan, weight: 1.0 };
+        let one = Sample { pos: vec![[0.0; 3]], z: vec![1], energy: -0.478, forces: vec![[0.0; 3]], tag: SampleTag::LiveStep, weight: 1.0, force_mask: None, use_energy: true };
+        let apart = Sample { pos: vec![[0.0; 3], [6.0, 0.0, 0.0]], z: vec![1, 1], energy: -0.956, forces: vec![[0.0; 3]; 2], tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
         let mut near = apart.clone();
         near.pos[1][0] = 5.99;
         let f = samples_file(&dir, "lone.model", &set(prov(), vec![h2(0), one, apart, near], vec![], vec![1e-9; 4]));
@@ -1744,7 +1830,7 @@ mod tests {
         for i in 0..3 {
             c.append(cs(i)).unwrap();
         }
-        let water = Sample { pos: vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]], z: vec![8, 1, 1], energy: -17.0, forces: vec![[0.0; 3]; 3], tag: SampleTag::Perturbation, weight: 1.0 };
+        let water = Sample { pos: vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]], z: vec![8, 1, 1], energy: -17.0, forces: vec![[0.0; 3]; 3], tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true };
         c.append(CollectionSample { sample: water, grid_n: 57, multiplicity_forced: false, multiplicity: None, scene: "h2o".into() }).unwrap();
         c.set_status(2, Q_HELD).unwrap();
         c.set_reference(1, solved(-0.478, 49, 1e-9)).unwrap();
@@ -1835,7 +1921,7 @@ mod tests {
         let mol = |i: usize, z: Vec<u8>, n: usize| {
             let pos: Vec<[f64; 3]> = (0..z.len()).map(|k| [1.3 * k as f64, 0.1 * i as f64, 0.0]).collect();
             let forces = vec![[0.0, 0.01 * i as f64, 0.0]; z.len()];
-            CollectionSample { sample: Sample { pos, z, energy: -1.0 - 1e-3 * i as f64, forces, tag: SampleTag::Scan, weight: 1.0 }, grid_n: n, multiplicity_forced: false, multiplicity: None, scene: "mixed".into() }
+            CollectionSample { sample: Sample { pos, z, energy: -1.0 - 1e-3 * i as f64, forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, grid_n: n, multiplicity_forced: false, multiplicity: None, scene: "mixed".into() }
         };
         c.append(mol(0, vec![1, 1], 49)).unwrap(); // H₂: kept
         c.append(mol(1, vec![6, 1, 1], 57)).unwrap(); // CH₂: kept (another box)

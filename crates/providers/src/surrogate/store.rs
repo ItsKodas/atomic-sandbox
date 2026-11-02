@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// `s` as the scene teaches it (M8a Task 10, ruling P10): a capped segment's scene
+/// (`Scene::train_mask`, one entry per nucleus — the sample's atoms) masks the sample's forces to
+/// its interior atoms and leaves its energy unfitted; any other scene leaves the sample as it is.
+pub(super) fn masked_by(mut s: Sample, scene: &Scene) -> Sample {
+    if let Some(m) = scene.train_mask().filter(|m| m.len() == s.pos.len()) {
+        s.force_mask = Some(m.to_vec());
+        s.use_energy = false;
+    }
+    s
+}
+
 impl SurrogateKs {
     /// Samples held (fallback steps and `add_sample`).
     pub fn samples(&self) -> usize {
@@ -15,7 +26,7 @@ impl SurrogateKs {
     /// settings the sample was produced at (its provenance); the first sample pins the store's.
     pub fn add_sample(&mut self, s: Sample, scene: &Scene) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
-        self.add_sample_with_provenance(s, &prov)
+        self.add_sample_with_provenance(masked_by(s, scene), &prov)
     }
 
     /// The primitive behind [`add_sample`](Self::add_sample): a sample with the provenance it
@@ -39,7 +50,7 @@ impl SurrogateKs {
     /// recorded with the sample (`shared` module doc).
     pub fn add_sample_answer(&mut self, s: Sample, scene: &Scene, face: Option<f64>, multiplicity: Option<u32>) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
-        self.push_sample(s, &prov, face.unwrap_or(f64::NAN), multiplicity)
+        self.push_sample(masked_by(s, scene), &prov, face.unwrap_or(f64::NAN), multiplicity)
     }
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
@@ -603,12 +614,20 @@ impl SurrogateKs {
     /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, multiplicity: Option<u32>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
+        self.keep_sample_masked(pos, z, energy, forces, face, multiplicity, prov, tag, None, notes)
+    }
+
+    /// [`keep_sample`](Self::keep_sample) for a capped segment's answer (M8a Task 10, ruling P10;
+    /// module doc "Masked scenes"): with `mask` the sample's force mask is the scene's training
+    /// mask and its energy is not fitted (it holds the caps).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn keep_sample_masked(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, multiplicity: Option<u32>, prov: &Provenance, tag: SampleTag, mask: Option<&[bool]>, notes: &mut Vec<String>) -> bool {
         if no_neighbours(pos, self.cutoff()) {
             notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
             return false;
         }
         self.since_kept = 0;
-        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
+        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0, force_mask: mask.map(<[bool]>::to_vec), use_energy: mask.is_none() };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN), multiplicity) {
             Ok(()) => {
                 notes.extend(std::mem::take(&mut self.collection_note));
@@ -656,6 +675,7 @@ impl SurrogateKs {
         prov: &Provenance,
         unfit: Option<&str>,
         tag: SampleTag,
+        mask: Option<&[bool]>,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
         // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
@@ -674,7 +694,7 @@ impl SurrogateKs {
         // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
         // the canonical surface for the comparisons; `raw_energy` exactly as solved — fix round 3,
         // no round trip, so the duplicate check sees the teacher's bits)
-        let refused = a.kept && !self.keep_sample(pos, z, raw_energy, forces, face, multiplicity, prov, tag, notes);
+        let refused = a.kept && !self.keep_sample_masked(pos, z, raw_energy, forces, face, multiplicity, prov, tag, mask, notes);
         // admit may have released or superseded fenced samples: their statuses go to the collection
         self.sync_collection_status();
         if refused {

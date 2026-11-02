@@ -131,7 +131,7 @@ pub fn parse_scene(text: &str) -> Result<Scene, String> {
         }
     }
     let cell = cell.ok_or("no grid line")?;
-    Ok(Scene { nuclei, cell, charge, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic })
+    Ok(Scene { nuclei, cell, charge, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic, train_mask: None })
 }
 
 /// A scene file's text for `sc` (the shipped format; positions to 4 decimals, as the shipped

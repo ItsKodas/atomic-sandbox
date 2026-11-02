@@ -250,6 +250,48 @@
 //! it (median ratio 0.004 at K = 50, 0.63 at K = 200):
 //! `spectral_truncation_of_the_covariance_is_measured_and_floored`.
 //!
+//! # Masked samples (M8a Task 10, "Train this segment"; spec §4.5, controller ruling P10)
+//!
+//! A capped cut-out of a larger scene (the segment: selected atoms, their neighbours within
+//! r_cut, a hydrogen on every cut bond) is a real closed-shell molecule, and its teacher answer
+//! is exact for it — but only its **interior** atoms (every source atom within r_cut of them is
+//! in the segment and no cap is within r_cut: ruling P15) have the environment they have in the
+//! source scene. The sample therefore carries `force_mask` (true = interior) and
+//! `use_energy = false` (E includes the caps and the edge atoms, whose per-atom energies are not
+//! the source's and cannot be separated from the total). [`Accumulator::add`] then adds:
+//!
+//! * **no energy row** (n_E unchanged);
+//! * the **3 force rows of each interior atom j** only: F_{j,a} = −Σ_i ∂E_i/∂r_{j,a}, the sum over
+//!   every centre i within r_cut of j — edge atoms and caps included, since they are real atoms of
+//!   the segment whose E_i depend on r_j. Those rows are the segment's own exact equations; what
+//!   differs from the source is the physics beyond the model (the DFT force on j in the capped
+//!   molecule against the whole one's, and the many-body terms of a centre i whose own
+//!   neighbourhood holds a cap — a force's model reach is 2 r_cut). That difference is the
+//!   capping error the validate gate `capping.rs` measures; it is not hidden here.
+//! * a **scale row** (`sumsq`, `n_scale`): the standardisation D is a property of the features,
+//!   not of the targets, so a sample without an energy row still contributes the per-atom mean of
+//!   its interior atoms' descriptors (Σ_{i interior} B_i / n_interior) — the same quantity an
+//!   energy row holds for a whole sample (÷ N). For every unmasked sample the scale row IS its
+//!   energy row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
+//! * the **envelope** (`Envelope::add_atom`) of the interior atoms only: a cap or an edge atom
+//!   describes no knowledge of the source (the conservative ruling — the provider's active set
+//!   and key counts follow it).
+//!
+//! **A fit without energy rows** (a collection taught only by segments): G_E = b_E = yᵀWy_E = 0,
+//! so s_E enters neither A, m, γ nor the evidence (every energy term is 0 · something finite). It
+//! cannot be estimated (no residual) and is pinned at [`SIGMA_E_WITHOUT_ENERGY_ROWS`] = 1 Ha per
+//! atom, which leaves the force fit exactly what the force rows alone give and makes every
+//! predicted energy std ≥ N Ha — and `residual_dof_e` is 0 — so the provider's trust rule answers
+//! no energy from such a fit. Forces determine the energy model's coefficients too (every
+//! feature has a non-zero gradient somewhere; the constant per species is the fixed reference),
+//! so the predicted energies are meaningful; they are just not vouched for by energy data.
+//!
+//! The warm refit folds a masked sample's rows like any other (k = 3·n_interior, plus 1 when the
+//! energy is fitted): the Woodbury update of tr Σ is unchanged, tr(Σ G̃_E) gains no own-row term
+//! for a sample without an energy row, and G̃_E before sample j subtracts only the pending energy
+//! rows that exist. [`fit`]'s exact residual RMSEs and `loo::leave_one_out` use the fitted rows
+//! only.
+//!
 //! # Accuracy notes
 //!
 //! * RSS from the statistics cancels to ~ε·yᵀWy, so `Accumulator::solve` cannot report an RMSE
@@ -303,6 +345,11 @@ pub enum SampleTag {
 
 /// One teacher evaluation: positions (Bohr), nuclear charges, total Kohn-Sham energy (Hartree)
 /// and forces (Hartree/Bohr), with a relative row weight (1.0 = normal).
+///
+/// `force_mask` and `use_energy` (M8a Task 10, "Train this segment"; module doc, "Masked
+/// samples"): a capped cut-out of a larger scene teaches only its **interior** atoms' forces
+/// (`force_mask[j]` true) and no energy (its total energy includes the caps). An ordinary sample
+/// has `force_mask: None` (every atom) and `use_energy: true`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     pub pos: Vec<[f64; 3]>,
@@ -312,9 +359,35 @@ pub struct Sample {
     pub forces: Vec<[f64; 3]>,
     pub tag: SampleTag,
     pub weight: f64,
+    /// Per atom: its force rows are fitted (`None` = every atom). A masked-out atom (a cap, an
+    /// edge atom whose r_cut neighbourhood differs from the source scene's) adds no row, no
+    /// envelope entry, no active-set atom and no key count: it describes no knowledge.
+    pub force_mask: Option<Vec<bool>>,
+    /// The energy row is fitted (false for a capped segment: its E includes the caps).
+    pub use_energy: bool,
 }
 
 impl Sample {
+    /// An ordinary sample: every atom's forces and the energy are fitted.
+    pub fn new(pos: Vec<[f64; 3]>, z: Vec<u8>, energy: f64, forces: Vec<[f64; 3]>, tag: SampleTag, weight: f64) -> Sample {
+        Sample { pos, z, energy, forces, tag, weight, force_mask: None, use_energy: true }
+    }
+
+    /// Atom `j`'s forces are fitted (its environment describes knowledge; struct doc).
+    pub fn trains_atom(&self, j: usize) -> bool {
+        self.force_mask.as_ref().is_none_or(|m| m.get(j).copied().unwrap_or(false))
+    }
+
+    /// The atoms whose forces are fitted.
+    pub fn trained_atoms(&self) -> usize {
+        self.force_mask.as_ref().map_or(self.pos.len(), |m| m.iter().filter(|&&b| b).count())
+    }
+
+    /// Neither a mask nor an unused energy: every row of the sample is fitted.
+    pub fn is_whole(&self) -> bool {
+        self.force_mask.is_none() && self.use_energy
+    }
+
     fn shape_ok(&self) -> Result<(), StoreError> {
         if self.pos.len() != self.z.len() || self.pos.len() != self.forces.len() {
             return Err(StoreError::ShapeMismatch {
@@ -325,6 +398,14 @@ impl Sample {
         }
         if !(self.weight > 0.0) || !self.weight.is_finite() {
             return Err(StoreError::NonPositiveWeight(self.weight));
+        }
+        if let Some(m) = &self.force_mask {
+            if m.len() != self.pos.len() {
+                return Err(StoreError::MaskMismatch { n_atoms: self.pos.len(), n_mask: m.len() });
+            }
+        }
+        if !self.use_energy && self.trained_atoms() == 0 {
+            return Err(StoreError::NothingTaught);
         }
         Ok(())
     }
@@ -351,6 +432,10 @@ pub enum StoreError {
     /// a second copy would double the geometry's weight and give it a leave-one-out twin
     /// (M8a Task 4a fix round 1; the shared collection's duplicate rule, `crate::collection`).
     Duplicate,
+    /// The force mask does not have one entry per atom.
+    MaskMismatch { n_atoms: usize, n_mask: usize },
+    /// No energy row and no masked-in atom: the sample would add no row.
+    NothingTaught,
 }
 
 impl fmt::Display for StoreError {
@@ -363,6 +448,8 @@ impl fmt::Display for StoreError {
             ),
             StoreError::NonPositiveWeight(w) => write!(f, "sample weight {w} is not positive"),
             StoreError::Duplicate => write!(f, "an identical teacher answer is already held"),
+            StoreError::MaskMismatch { n_atoms, n_mask } => write!(f, "sample has {n_atoms} atoms and a force mask of {n_mask}"),
+            StoreError::NothingTaught => write!(f, "sample teaches nothing (no energy row and no interior atom)"),
         }
     }
 }
@@ -549,9 +636,13 @@ pub struct Accumulator {
     pub yy_f: f64,
     pub n_f: usize,
     pub sum_log_w_f: f64,
-    /// Per feature k: Σ over energy rows and species blocks (duplicates included) of
-    /// φ_{E,(s,k)}² (for the scale).
+    /// Per feature k: Σ over scale rows and species blocks (duplicates included) of
+    /// φ_{E,(s,k)}² (for the scale). A scale row is a sample's energy row, or — for a sample
+    /// whose energy is not fitted — the per-atom mean descriptor of its masked-in atoms (module
+    /// doc, "Masked samples").
     pub sumsq: Vec<f64>,
+    /// Scale rows accumulated in `sumsq` (= `n_e` unless a sample's energy is unused).
+    pub n_scale: usize,
     /// Range and spread of the per-atom descriptors seen, per (species, feature): the
     /// out-of-distribution envelope of the provider (`envelope` module doc).
     pub envelope: Envelope,
@@ -599,6 +690,7 @@ impl Accumulator {
             n_f: 0,
             sum_log_w_f: 0.0,
             sumsq: vec![0.0; p],
+            n_scale: 0,
             envelope: Envelope::new(basis),
             n_samples: 0,
             energy_per_atom: None,
@@ -640,7 +732,9 @@ impl Accumulator {
         self.n_e + self.n_f
     }
 
-    /// Add one sample's energy row and 3N force rows.
+    /// Add one sample's energy row and 3N force rows — only the rows the sample fits: no energy
+    /// row when `use_energy` is false, force rows only for the atoms its `force_mask` keeps, and
+    /// only those atoms in the envelope (module doc, "Masked samples").
     ///
     /// # Panics
     /// If `basis` differs from the accumulator's, the sample's shapes disagree, `ref_energy`
@@ -670,14 +764,23 @@ impl Accumulator {
         let qr = self.q_prime;
         let n = sample.pos.len();
         let w = sample.weight;
+        let mask: Vec<bool> = (0..n).map(|j| sample.trains_atom(j)).collect();
+        let n_taught = mask.iter().filter(|&&b| b).count();
 
         // Energy row on the representatives (a duplicate column's value is its representative's).
+        // Without an energy row the same sum over the masked-in atoms (÷ their count) is the
+        // sample's scale row (module doc, "Masked samples").
         let mut phi = std::mem::take(&mut self.phi);
         phi.iter_mut().for_each(|v| *v = 0.0);
         let mut y = sample.energy;
         for (i, d) in desc.iter().enumerate() {
-            self.envelope.add_atom(s[i], &d.b);
+            if mask[i] {
+                self.envelope.add_atom(s[i], &d.b);
+            }
             y -= ref_energy[s[i]];
+            if !(sample.use_energy || mask[i]) {
+                continue;
+            }
             let off = s[i] * p;
             for k in 0..p {
                 if let Some(c) = self.col_index[off + k] {
@@ -685,21 +788,27 @@ impl Accumulator {
                 }
             }
         }
-        if per_atom {
-            let inv = 1.0 / n as f64;
+        if sample.use_energy {
+            if per_atom {
+                let inv = 1.0 / n as f64;
+                phi.iter_mut().for_each(|v| *v *= inv);
+                y *= inv;
+            }
+            rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
+            neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
+            self.n_e += 1;
+            self.sum_log_w_e += w.ln();
+        } else {
+            let inv = 1.0 / n_taught as f64; // n_taught ≥ 1: `shape_ok`
             phi.iter_mut().for_each(|v| *v *= inv);
-            y *= inv;
         }
-        rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
-        neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
-        self.n_e += 1;
-        self.sum_log_w_e += w.ln();
         for (c, class) in self.classes.iter().enumerate() {
             let v2 = phi[c] * phi[c];
             for &q in class {
                 self.sumsq[q % p] += v2;
             }
         }
+        self.n_scale += 1;
         self.phi = phi;
 
         // Force rows: φ_{F,(j,a)} block s = −Σ_{i: s_i = s} ∂B_i/∂r_{j,a}, 3N rows of Q′.
@@ -719,22 +828,37 @@ impl Accumulator {
                 }
             }
         }
+        // a masked sample: only the masked-in atoms' rows, compacted in atom order
+        if n_taught < n {
+            let mut k = 0;
+            for j in (0..n).filter(|&j| mask[j]) {
+                if k != j {
+                    rows.copy_within(3 * j * qr..3 * (j + 1) * qr, 3 * k * qr);
+                }
+                k += 1;
+            }
+        }
+        let taught: Vec<usize> = (0..n).filter(|&j| mask[j]).collect();
+        let n_rows3 = 3 * taught.len();
         if self.basis.body4 {
             // the large-basis path (module doc): the sample's 3N rows summed into one block first,
             // which is then added compensated — one Neumaier step per entry per sample instead of
             // per row, threaded over the Gram's rows
-            let ys: Vec<f64> = sample.forces.iter().flat_map(|f| f.iter().copied()).collect();
-            batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &rows[..3 * n * qr], &ys, w);
+            let ys: Vec<f64> = taught.iter().flat_map(|&j| sample.forces[j].iter().copied()).collect();
+            if !ys.is_empty() {
+                batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &rows[..n_rows3 * qr], &ys, w);
+            }
             for &f in &ys {
                 neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                 self.n_f += 1;
                 self.sum_log_w_f += w.ln();
             }
         } else {
-            for j in 0..n {
+            for (jc, &j) in taught.iter().enumerate() {
                 for a in 0..3 {
                     let f = sample.forces[j][a];
-                    let row = &rows[(3 * j + a) * qr..(3 * j + a + 1) * qr];
+                    // jc: the compacted row block of atom j (masked-out atoms' rows dropped above)
+                    let row = &rows[(3 * jc + a) * qr..(3 * jc + a + 1) * qr];
                     rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
                     neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                     self.n_f += 1;
@@ -743,7 +867,7 @@ impl Accumulator {
             }
         }
         if self.warm.is_some() {
-            self.pending.push(PendingRows { w, e: self.phi.clone(), f: rows[..3 * n * qr].to_vec() });
+            self.pending.push(PendingRows { w, e: sample.use_energy.then(|| self.phi.clone()), f: rows[..n_rows3 * qr].to_vec() });
         }
         self.rows = rows;
         self.n_samples += 1;
@@ -757,6 +881,7 @@ impl Accumulator {
         provenance: &Provenance,
         ref_energy: &[f64],
     ) -> Result<(Model, FitReport), FitError> {
+        let opts = &self.effective_options(opts);
         let (scale, d, problem) = self.prepare(ref_energy, None)?;
         let (hyper, sol) = problem.estimate(opts)?;
         let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
@@ -764,10 +889,21 @@ impl Accumulator {
         self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)
     }
 
+    /// `opts` with the energy noise pinned at [`SIGMA_E_WITHOUT_ENERGY_ROWS`] when no energy row has
+    /// been accumulated (module doc, "Masked samples"): nothing estimates s_E then, and every
+    /// energy term of A, m, γ and the evidence is exactly zero whatever its value.
+    fn effective_options(&self, opts: &FitOptions) -> FitOptions {
+        if self.n_e == 0 && self.n_samples > 0 {
+            FitOptions { sigma_e: Some(SIGMA_E_WITHOUT_ENERGY_ROWS), ..opts.clone() }
+        } else {
+            opts.clone()
+        }
+    }
+
     /// The standardisation (from the energy rows, or `frozen` = a warm state's (scale, d)) and the
     /// standardised two-noise problem (module doc). Refuses an empty or non-finite accumulator.
     fn prepare(&self, ref_energy: &[f64], frozen: Option<(&[f64], &[f64])>) -> Result<(Vec<f64>, Vec<f64>, TwoNoise), FitError> {
-        if self.n_samples == 0 || self.n_e == 0 {
+        if self.n_samples == 0 || self.n_scale == 0 {
             return Err(FitError::NoSamples);
         }
         check_references(&self.basis, ref_energy)?;
@@ -775,14 +911,16 @@ impl Accumulator {
         let q = self.q_prime;
         let n_e = self.n_e as f64;
         let n_f = self.n_f as f64;
+        let n_scale = self.n_scale as f64;
         let (scale, d) = match frozen {
             Some((s, d)) => (s.to_vec(), d.to_vec()),
             None => {
-                // Scale from the energy rows; D per representative column through k = q_full mod P.
+                // Scale from the scale rows (= the energy rows unless a sample's energy is unused:
+                // module doc, "Masked samples"); D per representative column through k = q_full mod P.
                 let scale: Vec<f64> = self
                     .sumsq
                     .iter()
-                    .map(|&ss| if ss > 0.0 { (ss / n_e).sqrt() } else { 1.0 })
+                    .map(|&ss| if ss > 0.0 { (ss / n_scale).sqrt() } else { 1.0 })
                     .collect();
                 let d: Vec<f64> = self.classes.iter().map(|c| 1.0 / scale[c[0] % p]).collect();
                 (scale, d)
@@ -815,7 +953,7 @@ impl Accumulator {
             n_f,
             q,
             sum_log_w: self.sum_log_w_e + self.sum_log_w_f,
-            floor_e2: (1e-16 * sums.yy_e / n_e).max(f64::MIN_POSITIVE),
+            floor_e2: if n_e > 0.0 { (1e-16 * sums.yy_e / n_e).max(f64::MIN_POSITIVE) } else { f64::MIN_POSITIVE },
             floor_f2: if n_f > 0.0 {
                 (1e-16 * sums.yy_f / n_f).max(f64::MIN_POSITIVE)
             } else {
@@ -929,6 +1067,11 @@ pub enum RefitKind {
     Warm { samples: usize },
 }
 
+/// The energy noise level (Hartree per atom) a fit without a single energy row is pinned at (module
+/// doc, "Masked samples"): with G_E = 0 it enters no posterior quantity; it only makes every
+/// predicted energy's std ≥ N Ha, so no energy is answered on a fit that never saw one.
+pub const SIGMA_E_WITHOUT_ENERGY_ROWS: f64 = 1.0;
+
 /// A warm refit searches the hyperparameters again once the stored samples have grown by this
 /// factor since the last search (module doc, "The large-basis path").
 pub const WARM_GROWTH: f64 = 1.25;
@@ -957,11 +1100,12 @@ struct WarmState {
 }
 
 /// One sample's raw rows on the Q′ columns, kept for the next warm refit: the energy row (÷ N
-/// when per atom) and its 3N force rows (row-major), with the sample weight.
+/// when per atom; `None` when the sample's energy is not fitted) and its fitted force rows
+/// (row-major, 3 per masked-in atom), with the sample weight.
 #[derive(Clone, Debug)]
 struct PendingRows {
     w: f64,
-    e: Vec<f64>,
+    e: Option<Vec<f64>>,
     f: Vec<f64>,
 }
 
@@ -971,6 +1115,7 @@ impl Accumulator {
     /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
     /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
     pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let opts = &self.effective_options(opts);
         if !self.basis.body4 {
             self.warm = None;
             self.pending.clear();
@@ -1060,18 +1205,25 @@ impl Accumulator {
             return Err(FitError::Singular);
         }
         // the standardised energy rows of the pending samples: G̃_E before sample j is the
-        // accumulator's minus the rows of samples j.. (they are already in its sums)
-        let e_rows: Vec<Vec<f64>> = pending.iter().map(|ps| (0..q).map(|i| w.d[i] * ps.e[i]).collect()).collect();
+        // accumulator's minus the rows of samples j.. (they are already in its sums); a sample
+        // whose energy is not fitted has none (module doc, "Masked samples")
+        let e_rows: Vec<Option<Vec<f64>>> = pending.iter().map(|ps| ps.e.as_ref().map(|e| (0..q).map(|i| w.d[i] * e[i]).collect())).collect();
         let mut tr_s = w.tr_sigma;
         let mut t_e = w.tr_sigma_ge;
         let mut gv = vec![0.0; q];
         for (j, ps) in pending.iter().enumerate() {
             let n3 = ps.f.len() / q;
-            let k = 1 + n3;
-            // U: the whitened rows (A += Σ u uᵀ)
+            let has_e = e_rows[j].is_some();
+            let k = usize::from(has_e) + n3;
+            if k == 0 {
+                continue; // no row (`Sample::shape_ok` refuses such a sample; kept defensive)
+            }
+            // U: the whitened rows (A += Σ u uᵀ), the energy row first when there is one
             let (se, sf) = ((ps.w * ie).sqrt(), (ps.w * i_f).sqrt());
             let mut u: Vec<Vec<f64>> = Vec::with_capacity(k);
-            u.push(e_rows[j].iter().map(|x| x * se).collect());
+            if let Some(e) = &e_rows[j] {
+                u.push(e.iter().map(|x| x * se).collect());
+            }
             for rr in 0..n3 {
                 u.push((0..q).map(|i| w.d[i] * ps.f[rr * q + i] * sf).collect());
             }
@@ -1117,25 +1269,28 @@ impl Accumulator {
             }
             tr_s -= tr_cinv(&vtv);
             // tr(Σ' G̃_pre) = tr(Σ G̃_pre) − tr(C⁻¹ Vᵀ G̃_pre V), G̃_pre = G̃_E − Σ_{i ≥ j} w_i ẽ_i ẽ_iᵀ
-            let ve: Vec<Vec<f64>> = (j..pending.len()).map(|i| v.iter().map(|vb| dot(vb, &e_rows[i])).collect()).collect();
+            let ve: Vec<(f64, Vec<f64>)> = (j..pending.len()).filter_map(|i| e_rows[i].as_ref().map(|e| (pending[i].w, v.iter().map(|vb| dot(vb, e)).collect()))).collect();
             let mut vgv = vec![0.0; k * k];
             for b in 0..k {
                 mat_vec_fast(&problem.g_e, q, &v[b], &mut gv);
                 for a in 0..=b {
                     let mut x = dot(&v[a], &gv);
-                    for (ii, row) in ve.iter().enumerate() {
-                        x -= pending[j + ii].w * row[a] * row[b];
+                    for (wi, row) in &ve {
+                        x -= wi * row[a] * row[b];
                     }
                     vgv[a * k + b] = x;
                     vgv[b * k + a] = x;
                 }
             }
             t_e -= tr_cinv(&vgv);
-            // + w ẽᵀ Σ' ẽ = s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀), M = UᵀV = C − I, M₀ its first column
-            let m0: Vec<f64> = (0..k).map(|a| c[a * k] - if a == 0 { 1.0 } else { 0.0 }).collect();
-            let mut x = m0.clone();
-            cholesky_solve(&cl, k, &mut x);
-            t_e += w.s_e2 * (m0[0] - dot(&m0, &x));
+            // + w ẽᵀ Σ' ẽ = s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀), M = UᵀV = C − I, M₀ its first column (the
+            // energy row's; a sample without one adds no energy row to G̃_E)
+            if has_e {
+                let m0: Vec<f64> = (0..k).map(|a| c[a * k] - if a == 0 { 1.0 } else { 0.0 }).collect();
+                let mut x = m0.clone();
+                cholesky_solve(&cl, k, &mut x);
+                t_e += w.s_e2 * (m0[0] - dot(&m0, &x));
+            }
             // fold the rows into the factor
             for mut col in u {
                 cholesky_update_upper(&mut w.r, q, &mut col);
@@ -1966,21 +2121,29 @@ pub fn fit(
     let (model, mut report) = acc.solve(opts, &store.provenance, ref_energy)?;
 
     // Exact residuals through the hot path (the statistics cancel below ~1e-8·rms(y)).
+    // (the fitted rows only: a masked sample's energy and masked-out forces were not fitted)
     let mut ss_e = 0.0;
+    let mut n_e = 0usize;
     let mut ss_f = 0.0;
     let mut n_f = 0usize;
     for s in &store.samples {
         let (e, f) = energy_and_forces(&model, &s.pos, &s.z)?;
         let scale = if opts.energy_per_atom { 1.0 / s.pos.len() as f64 } else { 1.0 };
-        ss_e += s.weight * ((e - s.energy) * scale).powi(2);
-        for (fj, tj) in f.iter().zip(&s.forces) {
+        if s.use_energy {
+            ss_e += s.weight * ((e - s.energy) * scale).powi(2);
+            n_e += 1;
+        }
+        for (j, (fj, tj)) in f.iter().zip(&s.forces).enumerate() {
+            if !s.trains_atom(j) {
+                continue;
+            }
             for a in 0..3 {
                 ss_f += s.weight * (fj[a] - tj[a]).powi(2);
                 n_f += 1;
             }
         }
     }
-    report.rmse_energy_per_atom = (ss_e / store.len() as f64).sqrt();
+    report.rmse_energy_per_atom = if n_e > 0 { (ss_e / n_e as f64).sqrt() } else { 0.0 };
     report.rmse_force = if n_f > 0 { (ss_f / n_f as f64).sqrt() } else { 0.0 };
     Ok((model, report))
 }
@@ -2068,6 +2231,7 @@ mod tests {
             forces,
             tag: SampleTag::Scan,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         }
     }
 
@@ -2162,6 +2326,7 @@ mod tests {
             forces: f,
             tag: SampleTag::Perturbation,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         }
     }
 
@@ -2594,6 +2759,195 @@ mod tests {
     }
 
     /// `n` noisy morse-bend samples of 5-atom H/O clusters (1e-5 Ha, 1e-4 Ha/Bohr scatter).
+    /// A 5-atom sample masked as a segment would be: atoms 0 and 2 interior, no energy.
+    fn masked(mut s: Sample) -> Sample {
+        let n = s.pos.len();
+        s.force_mask = Some((0..n).map(|j| j == 0 || j == 2).collect());
+        s.use_energy = false;
+        s
+    }
+
+    /// M8a Task 10 (module doc, "Masked samples"): a masked sample adds 3 force rows per interior
+    /// atom and no energy row; its Gram contribution is exactly the interior rows'; the envelope
+    /// sees only its interior atoms; a mask of the wrong length and a sample that teaches nothing
+    /// are refused.
+    #[test]
+    fn masked_samples_add_only_interior_force_rows() {
+        let mut rng = StdRng::seed_from_u64(1010);
+        let basis = Basis::new(&[H, O]);
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let base = morse_bend_samples(&mut rng, 3);
+        for body4 in [false, true] {
+            let basis = if body4 { small_body4_basis() } else { basis.clone() };
+            let mut acc = Accumulator::new(&basis);
+            acc.add(&base[0], &basis, &refs, &opts).unwrap();
+            let (n_e, n_f, n_scale) = (acc.n_e, acc.n_f, acc.n_scale);
+            assert_eq!((n_e, n_f, n_scale), (1, 15, 1));
+            let env_before = acc.envelope.clone();
+            let m = masked(base[1].clone());
+            acc.add(&m, &basis, &refs, &opts).unwrap();
+            assert_eq!(acc.n_e, n_e, "no energy row");
+            assert_eq!(acc.n_f, n_f + 3 * 2, "3 rows per interior atom");
+            assert_eq!(acc.n_scale, n_scale + 1, "a scale row");
+            assert_eq!(acc.n_samples, 2);
+            // the envelope: the two interior atoms only
+            let count: usize = acc.envelope.count.iter().sum::<usize>() - env_before.count.iter().sum::<usize>();
+            assert_eq!(count, 2);
+            // the force Gram added is exactly the interior atoms' rows: Σ over j ∈ {0, 2}, a of v vᵀ
+            let s_idx = basis.species_indices(&m.z).unwrap();
+            let desc = describe(&basis, &m.pos, &m.z).unwrap();
+            let p = basis.n_features();
+            let qr = acc.q_prime;
+            let mut want = vec![0.0; qr * qr];
+            let mut b_want = vec![0.0; qr];
+            let mut fresh = Accumulator::new(&basis);
+            fresh.add(&base[0], &basis, &refs, &opts).unwrap();
+            for j in [0usize, 2] {
+                for a in 0..3 {
+                    let mut v = vec![0.0; qr];
+                    for (i, d) in desc.iter().enumerate() {
+                        for (jj, g) in &d.grad {
+                            if *jj != j {
+                                continue;
+                            }
+                            for k in 0..p {
+                                if let Some(c) = fresh.col_index[s_idx[i] * p + k] {
+                                    v[c] -= g[k][a];
+                                }
+                            }
+                        }
+                    }
+                    for x in 0..qr {
+                        b_want[x] += v[x] * m.forces[j][a];
+                        for y in 0..qr {
+                            want[x * qr + y] += v[x] * v[y];
+                        }
+                    }
+                }
+            }
+            let (got, before) = (acc.sums(), fresh.sums());
+            let scale = want.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+            for x in 0..qr * qr {
+                assert!((got.gram_f[x] - before.gram_f[x] - want[x]).abs() <= 1e-12 * scale, "body4 {body4}: G_F[{x}]");
+            }
+            for x in 0..qr {
+                assert!((got.rhs_f[x] - before.rhs_f[x] - b_want[x]).abs() <= 1e-12 * scale.max(1.0), "body4 {body4}: b_F[{x}]");
+            }
+            assert_eq!(got.gram_e, before.gram_e, "the energy Gram is untouched");
+            assert_eq!(got.yy_e.to_bits(), before.yy_e.to_bits());
+            // a whole sample through the same path is bit-for-bit what it was before Task 10
+            let mut whole = Accumulator::new(&basis);
+            whole.add(&base[0], &basis, &refs, &opts).unwrap();
+            let mut with_all_true = Accumulator::new(&basis);
+            with_all_true.add(&Sample { force_mask: Some(vec![true; 5]), ..base[0].clone() }, &basis, &refs, &opts).unwrap();
+            assert_eq!(whole.sums(), with_all_true.sums());
+            assert_eq!(whole.sumsq, with_all_true.sumsq);
+        }
+        // refusals: a mask of the wrong length; a sample with no energy and no interior atom
+        let mut store = SampleStore::new(provenance());
+        let bad = Sample { force_mask: Some(vec![true; 3]), ..base[2].clone() };
+        assert_eq!(store.push(bad), Err(StoreError::MaskMismatch { n_atoms: 5, n_mask: 3 }));
+        let nothing = Sample { force_mask: Some(vec![false; 5]), use_energy: false, ..base[2].clone() };
+        assert_eq!(store.push(nothing), Err(StoreError::NothingTaught));
+        // energy kept, no atom masked in: legal (an energy row alone)
+        assert!(store.push(Sample { force_mask: Some(vec![false; 5]), ..base[2].clone() }).is_ok());
+    }
+
+    /// A fit from masked samples alone (no energy row anywhere) is the force-only fit: on a
+    /// noise-free linear teacher it recovers the teacher's forces on held-out geometries, s_E is
+    /// pinned at `SIGMA_E_WITHOUT_ENERGY_ROWS` with no energy residual dof, and the exact residual
+    /// RMSE of `fit` counts the fitted rows only. Mixed with whole samples, the warm refit of
+    /// masked samples is still the exact posterior at the standing hyperparameters.
+    #[test]
+    fn a_fit_without_energy_rows_learns_the_forces() {
+        let mut rng = StdRng::seed_from_u64(1011);
+        // the body-2 fixture of `fit_recovers_a_synthetic_linear_model_exactly`, every sample a
+        // segment teaching the forces of atoms 0 (H) and 1 (O) only
+        let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false;
+        basis.n_max = 4;
+        let teacher = random_teacher(&mut rng, &basis);
+        let mut store = SampleStore::new(provenance());
+        for i in 0..120 {
+            let (pos, z) = random_cluster(&mut rng, 3 + i % 3, 5.0);
+            let n = pos.len();
+            let s = teacher_sample(&teacher, pos, z, None);
+            store.push(Sample { force_mask: Some((0..n).map(|j| j < 2).collect()), use_energy: false, ..s }).unwrap();
+        }
+        let (model, report) = fit(&store, &basis, &teacher.ref_energy, &FitOptions::default()).unwrap();
+        assert_eq!(report.sigma_e, SIGMA_E_WITHOUT_ENERGY_ROWS);
+        assert_eq!(report.residual_dof_e, 0.0);
+        assert_eq!(report.rmse_energy_per_atom, 0.0);
+        assert_eq!(report.n_rows, 120 * 6);
+        assert!(report.rmse_force < 1e-10, "{:e}", report.rmse_force);
+        let mut worst: f64 = 0.0;
+        let mut f_scale: f64 = 0.0;
+        let mut worst_e: f64 = 0.0;
+        for i in 0..10 {
+            let (pos, z) = random_cluster(&mut rng, 3 + i % 3, 5.0);
+            let (et, _) = energy_and_forces(&teacher, &pos, &z).unwrap();
+            let (em, _) = energy_and_forces(&model, &pos, &z).unwrap();
+            worst_e = worst_e.max((et - em).abs());
+            let (_, ft) = energy_and_forces(&teacher, &pos, &z).unwrap();
+            let (_, fm) = energy_and_forces(&model, &pos, &z).unwrap();
+            for (a, b) in ft.iter().zip(&fm) {
+                for k in 0..3 {
+                    worst = worst.max((a[k] - b[k]).abs());
+                    f_scale = f_scale.max(a[k].abs());
+                }
+            }
+        }
+        eprintln!("force-only fit of a noise-free linear teacher: worst held-out |ΔF| {worst:.2e} of max |F| {f_scale:.2e}, |ΔE| {worst_e:.2e} (energies from the forces); σ_F {:.2e}, λ {:.2e}", report.sigma_f, report.lambda);
+        assert!(worst <= 1e-8 * f_scale, "held-out force error {worst:e} (max |F| {f_scale:e})");
+        // the forces determine the energy model (the references fix the constant): exact too
+        assert!(worst_e <= 1e-8, "held-out energy error {worst_e:e}");
+        // the predicted energy std says "no energy evidence": ≥ N·1 Ha
+        let (pos, z) = random_cluster(&mut rng, 5, 3.2);
+        assert!(model.predict(&pos, &z, true).unwrap().energy_std.unwrap() >= 5.0);
+
+        // the warm path with masked samples pending (body-4): the exact posterior at the standing
+        // hyperparameters, as for whole samples
+        let basis4 = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis4);
+        for s in morse_bend_samples(&mut rng, 120) {
+            acc.add(&s, &basis4, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut pending = morse_bend_samples(&mut rng, 4);
+        pending[0] = masked(pending[0].clone());
+        pending[2] = masked(pending[2].clone());
+        for s in &pending {
+            acc.add(s, &basis4, &refs, &opts).unwrap();
+        }
+        let (m_w, r_w) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 4 });
+        let w = acc.warm.as_ref().unwrap();
+        let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+        let (sol, _) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+        let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+        let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+        let mut worst_f: f64 = 0.0;
+        let mut worst_std: f64 = 0.0;
+        for s in morse_bend_samples(&mut StdRng::seed_from_u64(77), 10) {
+            let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                }
+            }
+            for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                worst_std = worst_std.max(rel_change(*x, y));
+            }
+        }
+        eprintln!("warm refit with masked samples: |ΔF|/σ_F {worst_f:.1e} (bound 10κε {bound:.1e}), std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}", r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f);
+        assert!(worst_f < bound && worst_std < 1e-5, "{worst_f:e} {worst_std:e}");
+        assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+    }
+
     fn morse_bend_samples(rng: &mut StdRng, n: usize) -> Vec<Sample> {
         morse_bend_noisy(rng, n, 1e-5, 1e-4)
     }
@@ -2609,7 +2963,7 @@ mod tests {
                         fj[a] += sf * normal(rng);
                     }
                 }
-                Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 }
+                Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }
             })
             .collect()
     }

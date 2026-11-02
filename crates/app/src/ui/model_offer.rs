@@ -339,6 +339,7 @@ mod tests {
             grid_h: 0.15,
             sigma: None,
             ionic: sim::IonicPolicy::CoresOnly,
+            train_mask: None,
         }
     }
 

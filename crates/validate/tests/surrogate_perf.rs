@@ -78,6 +78,7 @@ fn scene_of(pos: &[[f64; 3]], z: &[u8]) -> Scene {
         sigma: None,
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 
@@ -100,7 +101,7 @@ fn sample(rng: &mut StdRng, n: usize, s: usize, tag: SampleTag) -> (Sample, Scen
     let (e, f) = teacher(&pos, &z);
     let (e, f) = noisy(rng, e - 0.5 * z.len() as f64, f);
     let sc = scene_of(&pos, &z);
-    (Sample { pos, z, energy: e, forces: f, tag, weight: 1.0 }, sc)
+    (Sample { pos, z, energy: e, forces: f, tag, weight: 1.0, force_mask: None, use_energy: true }, sc)
 }
 
 /// A surrogate with `p` samples of `n_train`-atom clusters over `s` species; the wall of its first

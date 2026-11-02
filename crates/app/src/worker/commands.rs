@@ -131,12 +131,17 @@ impl Command {
                     }
                 }
             }
-            Command::AddNucleus { z, a, pos } => s.nuclei.push(crate::scene::SceneNucleus {
-                z: *z,
-                a: a.filter(|&a| units::isotope_mass_amu_a(*z, a).is_some()).and_then(|a| crate::scene::canonical_a(*z, a)),
-                pos: *pos,
-                vel: [0.0; 3],
-            }),
+            Command::AddNucleus { z, a, pos } => {
+                s.nuclei.push(crate::scene::SceneNucleus {
+                    z: *z,
+                    a: a.filter(|&a| units::isotope_mass_amu_a(*z, a).is_some()).and_then(|a| crate::scene::canonical_a(*z, a)),
+                    pos: *pos,
+                    vel: [0.0; 3],
+                });
+                // a capped segment's training mask describes its nuclei: an edit of the count ends
+                // it (M8a Task 10, ruling P10; `sim::Scene::drop_train_mask_on_edit`)
+                s.train_mask = None;
+            }
             // an isotope change shows at once when the driver will accept it (a listed A); the
             // mass itself lives in the driver's scene and follows with the snapshots
             Command::Dyn(DynCommand::SetIsotope { index, a }) => {
@@ -149,6 +154,7 @@ impl Command {
             Command::RemoveNucleus(i) => {
                 if *i < s.nuclei.len() {
                     s.nuclei.remove(*i);
+                    s.train_mask = None;
                 }
             }
             Command::SetCharge(c) => s.charge = *c,

@@ -1304,7 +1304,7 @@ mod tests {
     }
 
     fn scene(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
+        Scene { nuclei, cell: Cell { n, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None }
     }
 
     /// H₂ along x at bond length `r` (nucleus 0 at +r/2), grid n³ at h = 0.25.
@@ -2719,7 +2719,7 @@ mod tests {
     /// A lone O at the origin (triplet) in a cell of 6 Bohr half-width at spacing h.
     fn o_scene(h: f64, policy: sim::IonicPolicy) -> Scene {
         let n = 2 * (6.0 / h).round() as usize + 1;
-        Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(3), sigma: None, external_field: [0.0; 3], ionic: policy }
+        Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(3), sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None }
     }
 
     /// Spec §8 row 9 (§5.5, §4.8 T8): a scene coarser than a species' h_req is refused with
@@ -2763,7 +2763,7 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (radial Li atom); cargo test -p providers --release")]
     fn refused_species_falls_back_under_cores_only_and_is_invalid_under_all() {
-        let li = |policy| Scene { nuclei: vec![Nucleus::new(3, [0.0; 3])], cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy };
+        let li = |policy| Scene { nuclei: vec![Nucleus::new(3, [0.0; 3])], cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None };
         let mut notes = Vec::new();
         let (_, sys, settings) = super::problem(&li(sim::IonicPolicy::CoresOnly), 1e-6, &mut notes).expect("posed");
         assert!(sys.ionic.is_none(), "nothing pseudised: Li runs on today's all-electron path");

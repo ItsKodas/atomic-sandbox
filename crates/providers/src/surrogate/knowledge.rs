@@ -9,6 +9,11 @@
 //! `Q_NONE` (held, superseded, box-excluded, draft, and the provider-local `Q_LONE` and
 //! `Q_REF_WAIT`) is held out of the fit and teaches nothing, so it is no knowledge.
 //!
+//! **Capped segments** (M8a Task 10, `surrogate` module doc "Masked scenes"): only a masked
+//! sample's interior atoms are knowledge — an atom, its coordination, its angles and its keys are
+//! counted when its forces are fitted, a pair when at least one of its two atoms is (that atom's
+//! neighbourhood is the source scene's, so the pair is real); a cap or an edge atom adds nothing.
+//!
 //! **r_cut** is the model's cutoff ([`SurrogateKs::cutoff`]: its basis's — a shared collection's
 //! reach or a per-scene basis's), the cutoff the verdict's keys are formed with.
 //!
@@ -50,7 +55,7 @@ impl SurrogateKs {
             for a in 0..n {
                 for b in a + 1..n {
                     let r2 = d2(s.pos[a], s.pos[b]);
-                    if r2 >= rc2 {
+                    if r2 >= rc2 || !(s.trains_atom(a) || s.trains_atom(b)) {
                         continue;
                     }
                     coord[a] += 1;
@@ -64,7 +69,7 @@ impl SurrogateKs {
             for key in seen {
                 pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
             }
-            for (a, &c) in coord.iter().enumerate() {
+            for (a, &c) in coord.iter().enumerate().filter(|(a, _)| s.trains_atom(*a)) {
                 let e = atoms.entry(s.z[a]).or_insert_with(|| (0, Vec::new()));
                 e.0 += 1;
                 if e.1.len() <= c {
@@ -73,7 +78,7 @@ impl SurrogateKs {
                 e.1[c] += 1;
             }
             // the keys in which Z sees each neighbour species (the verdict's own keys)
-            for k in env_keys(&s.pos, &s.z, rc2).into_iter().flatten() {
+            for k in super::trust::trained_keys(s, env_keys(&s.pos, &s.z, rc2)).into_iter().flatten() {
                 for &nb in &k.neighbours {
                     pair_keys.entry((k.z.min(nb), k.z.max(nb))).or_default().insert(k.clone());
                 }
@@ -88,7 +93,7 @@ impl SurrogateKs {
         let mut angles: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
         for s in &fitted {
             let n = s.pos.len();
-            for i in 0..n {
+            for i in (0..n).filter(|&i| s.trains_atom(i)) {
                 let shell: Vec<[f64; 3]> = (0..n)
                     .filter(|&j| j != i)
                     .filter_map(|j| {

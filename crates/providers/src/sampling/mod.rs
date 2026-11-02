@@ -560,7 +560,10 @@ impl Sampler {
                     .collect();
                 let pair = scans.len();
                 let r_limit = SCAN_CUTOFF_FRACTION * r_cut;
-                let mut shell_planned = false;
+                // a capped segment (`Scene::train_mask`, M8a Task 10) plans no shell check: a check
+                // is judged on every atom, caps included, and could fence a band of the source's
+                // pair for an answer the caps distort — the segment teaches, it does not judge
+                let mut shell_planned = base.train_mask().is_some();
                 for (k, &rk) in r.iter().enumerate() {
                     if rk > r_limit && !shell_planned {
                         // the pair's shell check: its first point beyond the limit, never fitted
@@ -1598,6 +1601,7 @@ impl Sampler {
             forces: r.forces,
             tag,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         };
         let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
         let outcome = match surrogate.add_sample_answer(sample, scene, face, multiplicity) {

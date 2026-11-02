@@ -4462,7 +4462,7 @@ fn carbon_at_fast_shows_the_egg_box_line() {
         let a = 2.06 / 3f64.sqrt();
         let nuclei = [[0.0; 3], [a, a, a], [-a, -a, a], [-a, a, -a], [a, -a, -a]].iter().enumerate()
             .map(|(i, &pos)| crate::scene::SceneNucleus { z: if i == 0 { 6 } else { 1 }, a: None, pos, vel: [0.0; 3] }).collect();
-        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly }
+        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly, train_mask: None }
     };
     let fast = at(crate::quality::parse("fast").expect("Fast has an h"));
     let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());

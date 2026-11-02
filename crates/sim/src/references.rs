@@ -400,6 +400,7 @@ impl AtomScan {
             sigma: self.sigma,
             external_field: [0.0; 3],
             ionic: self.ionic,
+            train_mask: None,
         }
     }
 

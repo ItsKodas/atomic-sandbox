@@ -131,6 +131,7 @@ fn pair(z0: u8, z1: u8, r: f64, c: Cell) -> Scene {
         sigma: None,
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 
@@ -1000,7 +1001,7 @@ fn gpu_oxygen_reference_multiplicity() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let teacher = Recording { inner, seen: seen.clone() };
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
-    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly };
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly, train_mask: None };
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
@@ -1337,7 +1338,7 @@ fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
 /// An empty scene has no species: a pass over it is refused with the message the app shows.
 #[test]
 fn a_pass_over_an_empty_scene_is_refused() {
-    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
     let plan = SamplingPlan::default();
     assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
     assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
@@ -1351,7 +1352,7 @@ fn a_pass_over_an_empty_scene_is_refused() {
 fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let teacher = Shared::new(PairMorse::h2());
     let h = teacher.handle();
-    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
     let (p, sh) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(empty.clone(), p, 0.25, 1);
     let s0 = d.snapshot();
@@ -1618,6 +1619,7 @@ fn scf_stall_measurement() {
         sigma: None,
         external_field: [0.0; 3],
         ionic,
+        train_mask: None,
     };
 
     // 1. the all-electron presets at h = 0.25 (cold)
@@ -2314,6 +2316,7 @@ fn a_checkpointed_pass_resumes_with_the_same_remaining_jobs() {
         sigma: None,
         external_field: [0.0; 3],
         ionic: sim::IonicPolicy::None,
+        train_mask: None,
     };
     let plan = SamplingPlan { perturbations: 5, hot_burst_steps: 8, scan_points_per_pair: 6, seed: 11, ..SamplingPlan::default() };
     let new_surrogate = || SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);

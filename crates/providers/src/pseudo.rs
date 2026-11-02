@@ -1118,6 +1118,7 @@ mod tests {
             sigma: None,
             external_field: [0.0; 3],
             ionic: policy,
+            train_mask: None,
         }
     }
 

@@ -409,17 +409,20 @@ impl SurrogateKs {
             if self.excluded(i) {
                 continue;
             }
-            // the sample's largest atom class (a readout; the rule classes each atom: `class_loo`)
-            let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().filter_map(atom_class).max() else { continue };
+            // the sample's largest atom class over its fitted atoms (a readout; the rule classes
+            // each atom: `class_loo`)
+            let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, c)| atom_class(c)).max() else { continue };
             let n = s.pos.len().max(1) as f64;
             match surrogate::loo::leave_one_out(model, s) {
                 None => loo.push((i, c, f64::INFINITY, f64::INFINITY)),
                 Some(l) => {
-                    let e = if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n } / p.energy_std_per_atom;
+                    // the fitted rows only (M8a Task 10): no energy ratio without a fitted energy
+                    let e = l.energy.map_or(0.0, |e| if model.energy_per_atom { e.abs() } else { e.abs() / n } / p.energy_std_per_atom);
                     let f = l
                         .forces
                         .iter()
                         .zip(&s.forces)
+                        .filter_map(|(r, f)| r.map(|r| (r, f)))
                         .map(|(r, f)| {
                             let (d, bd) = p.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                             d / bd

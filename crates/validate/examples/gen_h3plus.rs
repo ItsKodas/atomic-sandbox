@@ -108,6 +108,7 @@ fn scene(pos: &[[f64; 3]], z: &[u8], charge: i32, multiplicity: u32) -> Scene {
         sigma: Some(SIGMA),
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 

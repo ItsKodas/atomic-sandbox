@@ -878,7 +878,7 @@ impl DynSnapshot {
 impl Default for DynSnapshot {
     fn default() -> DynSnapshot {
         DynSnapshot {
-            scene: Scene { nuclei: Vec::new(), cell: Cell { n: 0, h: 0.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None },
+            scene: Scene { nuclei: Vec::new(), cell: Cell { n: 0, h: 0.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None, train_mask: None },
             forces: Vec::new(),
             forces_stale: true,
             energy_ks: 0.0,
@@ -1400,6 +1400,8 @@ impl Dynamics {
                     return self.reject(format!("add nucleus at {:?} with mass {}: non-finite or non-positive", n.pos, n.mass));
                 }
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
+                // a segment's training mask describes its nuclei: an added one ends it (ruling P10)
+                self.scene.drop_train_mask_on_edit();
                 self.pins.push(false);
                 self.after_edit(false);
                 self.drop_bonds();
@@ -1426,6 +1428,7 @@ impl Dynamics {
                     return self.reject(format!("remove nucleus {i}: there are {}", self.scene.nuclei.len()));
                 }
                 self.scene.nuclei.remove(i);
+                self.scene.drop_train_mask_on_edit();
                 self.pins.remove(i);
                 self.drag = match self.drag {
                     Some((d, _)) if d == i => None,

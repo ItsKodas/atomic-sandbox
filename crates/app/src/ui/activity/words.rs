@@ -79,6 +79,7 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::NearQuarantine => "fence".into(),
         R::Audit => "8 audit".into(),
         R::RelaxVerification => "relax check".into(),
+        R::Segment => "segment".into(),
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("reference {} m{multiplicity}", symbol(z)),
         R::Pass(PassJob::Perturbation) => "nudge".into(),
         R::Pass(PassJob::Scan) => "bond scan".into(),
@@ -148,6 +149,7 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
             }
         }
         R::NonFiniteAnswer => "the model's answer was not a finite number, so it was not used — this answer is the teacher's".into(),
+        R::Segment => "this scene is a cut-out segment — DFT answers every step and teaches the model the forces of its interior atoms; the model does not answer here".into(),
         R::NearQuarantine => "this geometry is next to one the model could not learn".into(),
         R::Audit => "a routine check of the model against DFT".into(),
         R::RelaxVerification => "checking the relaxed geometry with DFT".into(),

@@ -439,7 +439,7 @@ mod tests {
         let (q, electrons) = hirshfeld(&[&atom], &pos, &[1.0], &cell, &rho);
         let pc = PartialCharges { q, counted: vec![1.0], z: vec![1], positions: pos.to_vec(), electrons, system_charge: 0, t: 0.0, step: 0, source: ChargeSource::Step, ionic: "none".into(), dipole: [0.0; 3] };
         assert!(!pc.balanced() && (pc.sum_error() + 2.0).abs() < 1e-3, "{}", pc.sum_error());
-        let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None };
+        let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None, train_mask: None };
         assert!(pc.is_current(&scene));
         let mut moved = scene.clone();
         moved.nuclei[0].pos[0] = 0.1;

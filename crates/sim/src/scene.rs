@@ -92,6 +92,15 @@ pub struct Scene {
     /// How the nuclei and their core electrons enter the solve (M7, spec §4.7): [`IonicPolicy`].
     /// A literal without it means `None` — an old scene keeps the physics it was written for.
     pub ionic: IonicPolicy,
+    /// A capped segment's training mask (M8a Task 10, "Train this segment"; ruling P10): per
+    /// nucleus, true when its forces may teach a model — its whole r_cut neighbourhood is the
+    /// source scene's (an interior atom); false for the caps and the edge atoms. Plain data: `sim`
+    /// never reads it; the surrogate provider's keep path turns it into the sample's force mask
+    /// with the energy unused (`providers::surrogate`, "Masked scenes"). `None` = an ordinary
+    /// scene. Adding or removing a nucleus drops it ([`Scene::drop_train_mask_on_edit`]): the
+    /// segment it described is gone. A mask whose length is not the nucleus count is never used
+    /// ([`Scene::train_mask`]).
+    pub train_mask: Option<Vec<bool>>,
 }
 
 /// Which species carry a pseudopotential (M7, spec §4.7): scene-wide, never per species. `sim` only
@@ -141,6 +150,18 @@ impl IonicPolicy {
 }
 
 impl Scene {
+    /// The training mask when it describes this scene's nuclei (one entry per nucleus), else `None`
+    /// (field doc).
+    pub fn train_mask(&self) -> Option<&[bool]> {
+        self.train_mask.as_deref().filter(|m| m.len() == self.nuclei.len())
+    }
+
+    /// Adding or removing nuclei ends a segment (field doc): the mask is dropped. Every edit that
+    /// changes the nucleus count calls this; moving nuclei keeps it (the same atoms).
+    pub fn drop_train_mask_on_edit(&mut self) {
+        self.train_mask = None;
+    }
+
     /// N = ΣZ − charge (negative for an impossible charge; the providers reject it).
     pub fn electrons(&self) -> i64 {
         self.nuclei.iter().map(|n| n.z as i64).sum::<i64>() - self.charge as i64
@@ -245,7 +266,21 @@ mod tests {
     use super::*;
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
+        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None, train_mask: None }
+    }
+
+    /// M8a Task 10 (ruling P10): a mask of the right length is the scene's; one of another length
+    /// is never used; the edit rule drops it.
+    #[test]
+    fn a_train_mask_describes_the_nuclei_and_edits_drop_it() {
+        let mut s = scene(vec![Nucleus::new(6, [0.0; 3]), Nucleus::new(1, [2.0, 0.0, 0.0])]);
+        assert_eq!(s.train_mask(), None);
+        s.train_mask = Some(vec![true, false]);
+        assert_eq!(s.train_mask(), Some(&[true, false][..]));
+        s.nuclei.push(Nucleus::new(1, [-2.0, 0.0, 0.0]));
+        assert_eq!(s.train_mask(), None, "a stale mask (3 nuclei, 2 entries) is not used");
+        s.drop_train_mask_on_edit();
+        assert_eq!(s.train_mask, None);
     }
 
     #[test]

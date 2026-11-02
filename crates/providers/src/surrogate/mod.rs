@@ -885,6 +885,51 @@
 //!   difference, cannot see a switch and switch-back between two calls); per-sample pattern storage would refine
 //!   it and is not built.
 //!
+//! # Masked scenes (M8a Task 10, "Train this segment"; spec §4.5, rulings P10/P15)
+//!
+//! A capped segment's scene carries `Scene::train_mask` (true = an interior atom: every source atom
+//! within r_cut of it is in the segment and no cap is). The sample's own semantics are
+//! `surrogate::fit`'s ("Masked samples"): its interior atoms' force rows, no energy row. Each
+//! consumer of samples here decides explicitly:
+//!
+//! - **Keep path.** A teacher answer of a masked scene — a live step, a sampling pass's geometry
+//!   (`add_sample`, `add_sample_answer` via `store::masked_by`) — is kept with `force_mask` = the
+//!   scene's mask and `use_energy` false. A mask whose length is not the nucleus count is never
+//!   used (`Scene::train_mask`); an answer with no interior atom is refused by the store (it teaches
+//!   nothing). A `.model` file or a collection reads a sample as it was stored.
+//! - **The model never answers in a masked scene** (`TeachRule::Segment`, checked in `evaluate`
+//!   before rule 1): every step is the teacher's and is kept; nothing is audited, judged as a fallback
+//!   point, thinned or held out there — the caps and edge atoms are not the source's, so a model
+//!   answer there would be judged on atoms it is not meant to know. The pass plans no **shell check**
+//!   in a masked scene (judged on every atom, it could fence a source pair for an answer the caps
+//!   distort). Dedup (`is_label_copy`) and the quarantine fences apply as for any answer (the
+//!   fence's nearness counts every atom: the conservative side).
+//! - **Leave-one-out, class and key verdicts** (`trust::compute_class_loo_full`): only the fitted
+//!   rows — a masked sample's energy LOO does not exist (`SampleLoo::energy` `None`), its masked-out
+//!   atoms have no force LOO and no class or key (`trust::trained_keys`). A class or key counts a
+//!   masked sample when it holds an interior atom of it; its energy statistics count the samples with
+//!   a fitted energy only, and a key with samples but **no** fitted energy reads as energy LOO ∞ —
+//!   refused for want of energy evidence (conservative; an item for the physics review: forces
+//!   determine the energy model, but no energy datum vouches for it). `loo_rms` and
+//!   `loo_force_errors` likewise.
+//! - **Sample floors** (`trust::key_column_counts`, the whole-model union floor, `fit_floor`'s
+//!   cache key): only interior atoms touch a key's columns and count as its samples.
+//! - **Training residuals, recovery and release** (`compute_training_residuals`, `worst_offenders`,
+//!   `reproduces_sample`): the fitted rows only, so a cap's force never quarantines a segment.
+//! - **Teach-around**: a masked sample is never a blocker (its geometry is a cut-out the segment
+//!   scene's own pass teaches); the failed-audit re-judgement (`judge_case`) of a masked sample —
+//!   unreachable, nothing is audited in a masked scene — takes the plain prediction for the rows its
+//!   fit left out.
+//! - **Envelope, active set (rule 5e), null space (rule 5d)**: interior atoms only (the envelope and
+//!   the null space from `Accumulator::add`'s rows; the active set filters the descriptor cache).
+//! - **Readouts** (the parity views, `inspect`, the knowledge map): interior atoms, no energy point
+//!   for a masked sample; a pair is knowledge when one of its atoms is interior.
+//!
+//! What the provider cannot check: the mask was computed at the cut geometry; a pass's perturbations,
+//! scans and hot bursts move atoms, and a cap can come within r_cut of an interior atom in a moved
+//! geometry (the mask is plain data, the provider does not know which atoms are caps). The cut
+//! (`app::segment`, Task 10b) should leave a margin for the pass's displacements.
+//!
 //! # Species, references, provenance
 //!
 //! The species list of the `Basis` is the sorted, deduplicated set of Z over the samples held
@@ -1525,7 +1570,8 @@ impl SurrogateKs {
             ));
             TeachOutcome::ShellNotKept
         } else {
-            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
+            // a capped segment's answer is kept with the scene's mask (module doc, "Masked scenes")
+            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
         };
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
@@ -1817,6 +1863,15 @@ impl ForceProvider for SurrogateKs {
         let prov = self.scene_provenance(scene);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        // a capped segment (module doc, "Masked scenes"): the teacher answers every step and the
+        // answer is kept with the scene's mask; the model is never consulted, so nothing is
+        // audited, judged or thinned against it
+        if scene.train_mask().is_some() {
+            let reason = Refusal::new("surrogate: a capped segment teaches its interior atoms — the model does not answer here (its caps and edge atoms are not the source scene's)", TeachRule::Segment, None);
+            let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
+            return self.teach(scene, h, t0, should_abort);
+        }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
         let draft = self.policy.never_fallback;
         let mut untrusted = None;
@@ -2311,6 +2366,8 @@ impl SurrogateKs {
         store.samples.len().hash(&mut h);
         for s in &store.samples {
             s.energy.to_bits().hash(&mut h);
+            // the fitted atoms of a capped segment are the ones counted (M8a Task 10)
+            (&s.force_mask, s.use_energy).hash(&mut h);
         }
         self.quarantine.hash(&mut h);
         (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.r_cut.to_bits()).hash(&mut h);

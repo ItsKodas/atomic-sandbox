@@ -75,6 +75,7 @@ pub fn replace_scene(now: &Scene, h: &Handoff) -> Scene {
         grid_h,
         sigma: now.sigma,
         ionic: now.ionic,
+        train_mask: None,
     }
 }
 
@@ -543,7 +544,7 @@ mod tests {
     }
 
     fn scene(n: usize, h: f64, charge: i32) -> Scene {
-        Scene { nuclei: vec![SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }], charge, multiplicity: Some(2), grid_n: n, grid_h: h, sigma: Some(0.2), ionic: sim::IonicPolicy::Accepted }
+        Scene { nuclei: vec![SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }], charge, multiplicity: Some(2), grid_n: n, grid_h: h, sigma: Some(0.2), ionic: sim::IonicPolicy::Accepted, train_mask: None }
     }
 
     fn handoff(replace: bool, charge: i32) -> Handoff {

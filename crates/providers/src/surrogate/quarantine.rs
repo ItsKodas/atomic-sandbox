@@ -429,6 +429,23 @@ impl SurrogateKs {
         Self::agree(&self.policy, pos.len(), pr.energy, &pr.forces, energy, forces)
     }
 
+    /// [`reproduces`](Self::reproduces) for a stored sample, on the rows it was fitted with (M8a Task
+    /// 10, a capped segment's: no energy when unused, the interior atoms' forces only — its caps
+    /// and edge atoms are no answer the model is held to).
+    pub(super) fn reproduces_sample(&self, s: &Sample) -> bool {
+        if s.is_whole() {
+            return self.reproduces(&s.pos, &s.z, s.energy, &s.forces);
+        }
+        let Some(model) = self.model.as_ref() else { return false };
+        let Ok(pr) = model.predict(&s.pos, &s.z, false) else { return false };
+        let p = &self.policy;
+        (!s.use_energy || (pr.energy - s.energy).abs() / s.pos.len().max(1) as f64 <= p.energy_std_per_atom)
+            && pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)).all(|(_, (a, b))| {
+                let (d, bound) = p.force_residual(a, b);
+                d <= bound
+            })
+    }
+
     /// Two answers agree within the policy's thresholds (per-atom energy; every atom's force
     /// against its bound for the reference force).
     pub(super) fn agree(p: &FallbackPolicy, n: usize, e_a: f64, f_a: &[[f64; 3]], e_b: f64, f_b: &[[f64; 3]]) -> bool {
@@ -448,7 +465,7 @@ impl SurrogateKs {
         let mut rejected = 0;
         for (k, origin) in pending {
             let Some(s) = self.store.as_ref().and_then(|st| st.samples.get(k)).cloned() else { continue };
-            if self.excluded(k) || self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
+            if self.excluded(k) || self.reproduces_sample(&s) {
                 continue;
             }
             self.quarantine.resize(self.samples(), Q_NONE);
@@ -467,7 +484,7 @@ impl SurrogateKs {
         let Some(store) = self.store.as_ref() else { return 0 };
         let back: Vec<usize> = held
             .into_iter()
-            .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces(&s.pos, &s.z, s.energy, &s.forces)))
+            .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces_sample(s)))
             .collect();
         for &i in &back {
             self.quarantine[i] = self.released_code(i);
@@ -557,8 +574,9 @@ impl SurrogateKs {
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
                 let n = s.pos.len().max(1) as f64;
-                let mut r = (pr.energy - s.energy).abs() / n / p.energy_std_per_atom;
-                for (fm, fs) in pr.forces.iter().zip(&s.forces) {
+                // the fitted rows only (a capped segment's: no energy, its interior atoms)
+                let mut r = if s.use_energy { (pr.energy - s.energy).abs() / n / p.energy_std_per_atom } else { 0.0 };
+                for (_, (fm, fs)) in pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
                     let (d, bound) = p.force_residual(fm, fs);
                     r = r.max(d / if absolute { p.force_std_abs } else { bound });
                 }
@@ -581,7 +599,12 @@ impl SurrogateKs {
             return;
         };
         let n = self.accumulated.min(self.desc_cache.len());
-        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().map(|(s, b)| (*s, &b[..])));
+        // a capped segment's interior atoms only: the active set is what the model has learned,
+        // and a cap or an edge atom is not (M8a Task 10; the cache keeps every atom, for the
+        // fences' nearness — the conservative side there)
+        let store = self.store.as_ref();
+        let trains = |i: usize, j: usize| store.and_then(|st| st.samples.get(i)).is_none_or(|s| s.trains_atom(j));
+        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().enumerate().filter(move |(j, _)| trains(i, *j)).map(|(_, (s, b))| (*s, &b[..])));
         let set = ActiveSet::build(basis, &model.scale, atoms);
         if !set.converged() {
             // the γ ≤ 1 + δ guarantee is void: every query falls back on 5e until a refit converges
@@ -728,7 +751,7 @@ impl SurrogateKs {
             let (mut released, mut superseded) = (0, 0);
             for &i in near {
                 let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
-                if self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
+                if self.reproduces_sample(&s) {
                     self.quarantine[i] = self.released_code(i);
                     released += 1;
                 } else {

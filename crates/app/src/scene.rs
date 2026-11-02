@@ -53,6 +53,10 @@ pub struct Scene {
     /// [`Scene::preset`] is the file as written (so `None`); the app applies
     /// [`crate::ui::DEFAULT_IONIC`] to the presets it starts with.
     pub ionic: sim::IonicPolicy,
+    /// A capped segment's training mask (`sim::Scene::train_mask`, M8a Task 10, ruling P10): the
+    /// optional line `train_mask b₁ … b_N` (one 0/1 per nucleus, in nucleus order; a count that
+    /// is not the nucleus count is refused). Adding or removing a nucleus drops it.
+    pub train_mask: Option<Vec<bool>>,
 }
 
 impl Scene {
@@ -83,6 +87,7 @@ impl Scene {
         let (mut grid, mut charge, mut mult, mut sigma, mut nuclei) =
             (None, 0i32, None, None, Vec::new());
         let mut ionic = sim::IonicPolicy::None;
+        let mut train_mask: Option<Vec<bool>> = None;
         for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             if line.is_empty() {
@@ -115,6 +120,17 @@ impl Scene {
                 "ionic" if t.len() == 2 => {
                     ionic = sim::IonicPolicy::parse(t[1])
                         .ok_or_else(|| format!("line {}: ionic takes none, cores or all, got '{}'", i + 1, t[1]))?;
+                }
+                "train_mask" if t.len() >= 2 => {
+                    let m = t[1..]
+                        .iter()
+                        .map(|w| match *w {
+                            "1" => Ok(true),
+                            "0" => Ok(false),
+                            other => Err(format!("line {}: train_mask takes 0 or 1 per nucleus, got '{other}'", i + 1)),
+                        })
+                        .collect::<Result<Vec<bool>, String>>()?;
+                    train_mask = Some(m);
                 }
                 "nucleus" if matches!(t.len(), 5 | 6 | 8 | 9) => {
                     let z = t[1]
@@ -153,6 +169,11 @@ impl Scene {
             }
         }
         let (grid_n, grid_h) = grid.ok_or("missing 'grid n h' line")?;
+        if let Some(m) = &train_mask {
+            if m.len() != nuclei.len() {
+                return Err(format!("train_mask has {} entries for {} nuclei", m.len(), nuclei.len()));
+            }
+        }
         Ok(Scene {
             nuclei,
             charge,
@@ -161,6 +182,7 @@ impl Scene {
             grid_h,
             sigma,
             ionic,
+            train_mask,
         })
     }
 
@@ -217,6 +239,7 @@ impl Scene {
             sigma: self.sigma,
             external_field: [0.0; 3],
             ionic: self.ionic,
+            train_mask: self.train_mask.clone(),
         })
     }
 
@@ -241,6 +264,7 @@ impl Scene {
             grid_h: s.cell.h,
             sigma: s.sigma,
             ionic: s.ionic,
+            train_mask: s.train_mask.clone(),
         }
     }
 
@@ -257,6 +281,13 @@ impl Scene {
         }
         if self.ionic != sim::IonicPolicy::None {
             s += &format!("ionic {}\n", self.ionic.word());
+        }
+        if let Some(m) = &self.train_mask {
+            s += "train_mask";
+            for &b in m {
+                s += if b { " 1" } else { " 0" };
+            }
+            s.push('\n');
         }
         for n in &self.nuclei {
             s += &format!("nucleus {}", n.z);
@@ -374,6 +405,35 @@ mod tests {
         assert!(with(&|s| s.sigma = Some(0.0)).is_err());
     }
 
+    /// M8a Task 10 (ruling P10): the optional `train_mask` line round-trips through the text and
+    /// the dynamics scene; a file without it is unchanged; a count that is not the nucleus count
+    /// or an entry that is not 0/1 is refused by line.
+    #[test]
+    fn the_train_mask_line_round_trips_and_is_checked() {
+        let text = "grid 49 0.25\ncharge 0\ntrain_mask 1 0 1\nnucleus 6 0 0 0\nnucleus 1 2 0 0\nnucleus 1 -2 0 0\n";
+        let s = Scene::parse(text).unwrap();
+        assert_eq!(s.train_mask, Some(vec![true, false, true]));
+        assert_eq!(Scene::parse(&s.to_text()).unwrap(), s);
+        let d = s.to_sim().unwrap();
+        assert_eq!(d.train_mask(), Some(&[true, false, true][..]));
+        assert_eq!(Scene::from_sim(&d), s);
+        let plain = Scene::preset("h2").unwrap();
+        assert!(!plain.to_text().contains("train_mask"));
+        assert_eq!(plain.to_sim().unwrap().train_mask, None);
+        assert!(Scene::parse("grid 49 0.25\ntrain_mask 1 0\nnucleus 1 0 0 0\n").unwrap_err().contains("2 entries for 1 nuclei"));
+        assert!(Scene::parse("grid 49 0.25\ntrain_mask 2\nnucleus 1 0 0 0\n").unwrap_err().contains("line 2"));
+        // the viewer's mirror: a move keeps the mask, an added or removed nucleus drops it
+        use crate::worker::Command;
+        let mut m = s.clone();
+        Command::MoveNucleus { index: 0, pos: [0.1, 0.0, 0.0] }.apply(&mut m);
+        assert_eq!(m.train_mask, s.train_mask);
+        Command::AddNucleus { z: 1, a: None, pos: [0.0, 3.0, 0.0] }.apply(&mut m);
+        assert_eq!(m.train_mask, None);
+        let mut m = s.clone();
+        Command::RemoveNucleus(2).apply(&mut m);
+        assert_eq!(m.train_mask, None);
+    }
+
     #[test]
     fn parses_the_documented_example() {
         let s = Scene::parse("# c\ngrid 49 0.25\ncharge 0\nmultiplicity 2\nsigma 0.3\nnucleus 1 0.7 0 0\nnucleus 1 -0.7 0 0 0.1 0 0\n").unwrap();
@@ -481,7 +541,7 @@ mod tests {
         let e = Scene::preset("empty").unwrap();
         assert_eq!(
             e,
-            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None, ionic: sim::IonicPolicy::None }
+            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None, ionic: sim::IonicPolicy::None, train_mask: None }
         );
         e.validate().unwrap();
         let text = e.to_text();

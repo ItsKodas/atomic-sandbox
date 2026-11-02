@@ -37,6 +37,7 @@ pub use sim::{AuditRecord, AuditVerdict};
 /// | 18 | `Audit` (an audit's own kind is `PointKind::Audit`; the code is for completeness) |
 /// | 19 | `RelaxVerification` |
 /// | 20 | `Pass` (a sampling-pass job; never a step) |
+/// | 22 | `Segment` (a capped segment's scene: teacher only, never recorded — no model answer; M8a Task 10) |
 /// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
 ///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
 ///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
@@ -64,6 +65,7 @@ pub fn history_rule_code(rule: TeachRule) -> u8 {
         TeachRule::Audit => 18,
         TeachRule::RelaxVerification => 19,
         TeachRule::Pass(_) => 20,
+        TeachRule::Segment => 22,
     }
 }
 
@@ -98,6 +100,7 @@ pub fn history_rule_name(code: u8) -> &'static str {
         19 => "relax verification",
         20 => "pass",
         21 => "rule 4b with rule 6/7 failing too",
+        22 => "capped segment (teacher only)",
         _ => "?",
     }
 }
@@ -180,7 +183,7 @@ pub(super) fn isolated_atom(z: u8, mass: Option<f64>, scene: &Scene) -> Scene {
     if let Some(m) = mass {
         nucleus.mass = m;
     }
-    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic }
+    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic, train_mask: None }
 }
 
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
@@ -809,7 +812,8 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, raw_energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
+        // (never a capped segment's: a masked scene is teacher-only, nothing is audited there)
+        let outcome = self.admit_and_keep(&pos, &z, energy, raw_energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, None, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
@@ -903,6 +907,7 @@ mod isolated_atom_tests {
             sigma: Some(0.3),
             external_field: [0.0; 3],
             ionic: sim::IonicPolicy::CoresOnly,
+            train_mask: None,
         };
         for p in sim::IonicPolicy::ALL {
             let atom = isolated_atom(8, None, &Scene { ionic: p, ..scene.clone() });

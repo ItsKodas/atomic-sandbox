@@ -38,6 +38,7 @@ fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3], z0: u8, z1: u8) -> Scene {
         sigma: None,
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 
@@ -79,7 +80,7 @@ fn unit_vector(rng: &mut StdRng) -> [f64; 3] {
 fn morse_sample(teacher: &MorseDimer, scene: &Scene) -> Sample {
     let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
     let (energy, forces) = teacher.energy_and_forces(&pos).unwrap();
-    Sample { pos, z: scene.nuclei.iter().map(|n| n.z).collect(), energy, forces, tag: SampleTag::Scan, weight: 1.0 }
+    Sample { pos, z: scene.nuclei.iter().map(|n| n.z).collect(), energy, forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }
 }
 
 /// A surrogate over a shared Morse teacher with `n` scan samples on r ∈ [lo, hi] (random
@@ -1792,7 +1793,7 @@ fn consistent_answers_inside_a_fence_teach_the_model_the_region() {
         let r = 1.0 + 0.6 * i as f64 / 59.0;
         let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
         let res = t.evaluate(&sc, &mut never()).unwrap();
-        let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 };
+        let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
         s.add_sample(smp, &sc).unwrap();
     }
     // the glitch: 0.1 Ha off at r = 1.9 — quarantined, fencing r ≈ 1.9
@@ -1864,7 +1865,7 @@ fn a_vibrating_turning_molecule_in_a_fence_still_votes() {
         let r = 1.0 + 0.6 * i as f64 / 59.0;
         let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
         let res = t.evaluate(&sc, &mut never()).unwrap();
-        let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 };
+        let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
         s.add_sample(smp, &sc).unwrap();
     }
     let stray = h2(1.9);
@@ -1907,7 +1908,7 @@ fn a_vibrating_turning_molecule_in_a_fence_still_votes() {
         let r = 1.0 + 0.6 * i as f64 / 59.0;
         let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
         let res = t.evaluate(&sc, &mut never()).unwrap();
-        s2.add_sample(Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 }, &sc).unwrap();
+        s2.add_sample(Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc).unwrap();
     }
     let mut bad = morse_sample(&MorseDimer::h2(), &stray);
     bad.energy += 0.1;
@@ -2120,7 +2121,7 @@ fn gpu_round_trip(ctx: gpu::GpuContext, n_grid: usize) -> (f64, f64, f64) {
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     // the H reference from the teacher itself (an isolated atom at the same settings)
-    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
     let e_h = s.evaluate(&atom, &mut never()).unwrap().energy;
     s.set_reference_energy(1, e_h);
     // 40 scan geometries on r ∈ [1.1, 2.0]: every fallback keeps its sample
@@ -2166,7 +2167,7 @@ fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
     fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3]) -> Scene {
         let p0: [f64; 3] = std::array::from_fn(|a| origin[a] - 0.5 * r * dir[a]);
         let p1: [f64; 3] = std::array::from_fn(|a| origin[a] + 0.5 * r * dir[a]);
-        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
+        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None }
     }
     fn bond(s: &Scene) -> f64 {
         let (a, b) = (s.nuclei[0].pos, s.nuclei[1].pos);
@@ -2193,7 +2194,7 @@ fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
         let sc = dimer(r, dir, origin);
         let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         let (energy, forces) = exact.energy_and_forces(&pos).unwrap();
-        s.add_sample(Sample { pos, z: vec![1, 1], energy, forces, tag: SampleTag::Scan, weight: 1.0 }, &sc).unwrap();
+        s.add_sample(Sample { pos, z: vec![1, 1], energy, forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc).unwrap();
     }
     let rep = s.refit().expect("refit");
     println!("model: 40 Morse samples r ∈ [1.2, 2.2], rmse E/atom {:.1e}, F {:.1e}; trusted {}", rep.rmse_energy_per_atom, rep.rmse_force, s.trusted());
@@ -3138,7 +3139,7 @@ fn random_h3(rng: &mut StdRng) -> Scene {
 /// The PairMorse sample of a scene (its exact answer).
 fn pair_morse_sample(sc: &Scene) -> Sample {
     let r = PairMorse(MorseDimer::h2()).evaluate(sc, &mut never()).unwrap();
-    Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: sc.nuclei.iter().map(|n| n.z).collect(), energy: r.energy, forces: r.forces, tag: SampleTag::Scan, weight: 1.0 }
+    Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: sc.nuclei.iter().map(|n| n.z).collect(), energy: r.energy, forces: r.forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }
 }
 
 /// Rule 5e on the dimer-only model plus k learned three-atom samples (pair-additive teacher),
@@ -5883,6 +5884,7 @@ fn the_provenance_carries_the_stop_rule_not_its_value() {
         sigma: None,
         external_field: [0.0; 3],
         ionic: sim::IonicPolicy::CoresOnly,
+        train_mask: None,
     };
     let (o2, co2) = (at(&[8, 8]), at(&[8, 6, 8]));
     let (a, b) = (s.provenance_for(&o2), s.provenance_for(&co2));
@@ -5939,6 +5941,7 @@ fn inspect_saved_model() {
         sigma: Some(prov.sigma),
         external_field: [0.0; 3],
         ionic,
+        train_mask: None,
     };
     let mut probes: Vec<(String, Scene)> = Vec::new();
     let mut lowest: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
@@ -7494,12 +7497,13 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
         assert_eq!(*e, d, "atom {j}");
     }
     // every code is distinct and named
-    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan)];
+    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment];
     let codes: std::collections::BTreeSet<u8> = rules.iter().map(|&r| history_rule_code(r)).collect();
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
-    assert_eq!(history_rule_name(22), "?");
+    // 22 is the capped segment's (M8a Task 10); the next code is unnamed
+    assert_eq!(history_rule_name(23), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -8724,7 +8728,7 @@ fn refused_answers_stay_per_scene_and_statuses_are_appended() {
     let sc = h2_at(1.65, &mut rng);
     let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
     let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
-    s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 }, &sc, Some(1.0), Some(1)).unwrap();
+    s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc, Some(1.0), Some(1)).unwrap();
     teacher.lock().unwrap().face = Some(0.0);
     let r = s.evaluate(&h2_at(1.55, &mut rng), &mut never()).unwrap();
     assert!(!r.stats.notes.iter().any(|n| n.contains("session only")), "{:?}", r.stats.notes);
@@ -8737,7 +8741,7 @@ fn refused_answers_stay_per_scene_and_statuses_are_appended() {
         let sc = h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng);
         let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
-        s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 }, &sc, Some(0.0), Some(1)).unwrap();
+        s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc, Some(0.0), Some(1)).unwrap();
     }
     s.refit().unwrap();
     assert_eq!(s.collection().unwrap().samples.len(), 42);
@@ -8792,7 +8796,7 @@ fn a_duplicate_answer_is_not_kept_twice() {
     // the pass's path refuses it too
     let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
     let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
-    let again = Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0 };
+    let again = Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
     assert_eq!(s.add_sample_answer(again, &sc, Some(0.0), Some(1)), Err(StoreError::Duplicate));
     assert_eq!(s.samples(), 1);
 }
@@ -9082,7 +9086,7 @@ fn class_loo_cost_at_collection_sizes() {
             let z: Vec<u8> = (0..k).map(|j| species[(i + j) % species.len()]).collect();
             let (energy, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
             let sc = Scene { nuclei: pos.iter().zip(&z).map(|(&p, &zi)| Nucleus::new(zi, p)).collect(), ..h2(1.4) };
-            s.add_sample_with_face(Sample { pos, z, energy, forces, tag: SampleTag::Perturbation, weight: 1.0 }, &sc, Some(0.0)).unwrap();
+            s.add_sample_with_face(Sample { pos, z, energy, forces, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }, &sc, Some(0.0)).unwrap();
         }
         let t_add = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
@@ -9127,7 +9131,7 @@ fn reference_lattice_phase_measurement() {
             for n in [n_odd, n_odd - 1] {
                 let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
                 t.set_display(false);
-                let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+                let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic, train_mask: None };
                 let t0 = Instant::now();
                 match t.evaluate(&sc, &mut never()) {
                     Ok(r) => out.push(Some((r.energy, r.stats.face_density.unwrap_or(f64::NAN), r.stats.scf_steps, t0.elapsed().as_secs_f64()))),
@@ -9150,7 +9154,7 @@ fn reference_lattice_phase_measurement() {
             for (name, p) in [("node", [0.0; 3]), ("edge", [half, 0.0, 0.0]), ("face", [half, half, 0.0]), ("cube", [half, half, half])] {
                 let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
                 t.set_display(false);
-                let sc = Scene { nuclei: vec![Nucleus::new(z, p)], cell: Cell { n: n_odd, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+                let sc = Scene { nuclei: vec![Nucleus::new(z, p)], cell: Cell { n: n_odd, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic, train_mask: None };
                 match t.evaluate(&sc, &mut never()) {
                     Ok(r) => sites.push((name, r.energy)),
                     Err(e) => {
@@ -9174,7 +9178,7 @@ fn reference_lattice_phase_measurement() {
         for n in ns {
             let mut t = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
             t.set_display(false);
-            let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic };
+            let sc = Scene { nuclei: vec![Nucleus::new(z, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(m), sigma: None, external_field: [0.0; 3], ionic, train_mask: None };
             match t.evaluate(&sc, &mut never()) {
                 Ok(r) => rows.push((n, (n - 1) as f64 * h, r.energy, r.stats.face_density.unwrap_or(f64::NAN))),
                 Err(e) => println!("Z {z} {ionic:?} h {h} n {n}: failed ({e})"),
@@ -9734,7 +9738,7 @@ fn lone_record(k: usize) -> surrogate::CollectionSample {
     let x = 0.05 * k as f64;
     let (pos, z) = if k % 2 == 0 { (vec![[x, 0.0, 0.0]], vec![1]) } else { (vec![[-2.5 + x, -2.5, 0.0], [2.5, 2.5, 0.0]], vec![1, 1]) };
     let n = z.len();
-    let sample = Sample { pos, z, energy: n as f64 * SpeciesMorse::atom(1) + 1e-4 * k as f64, forces: vec![[0.0; 3]; n], tag: SampleTag::Fallback, weight: 1.0 };
+    let sample = Sample { pos, z, energy: n as f64 * SpeciesMorse::atom(1) + 1e-4 * k as f64, forces: vec![[0.0; 3]; n], tag: SampleTag::Fallback, weight: 1.0, force_mask: None, use_energy: true };
     surrogate::CollectionSample { sample, grid_n: 33, multiplicity_forced: false, multiplicity: Some(2), scene: "H".into() }
 }
 
@@ -10064,3 +10068,121 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
+
+// ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
+
+/// H₂ + H with a training mask: atoms 0 and 1 interior, the third a "cap".
+fn masked_h3(d: f64) -> Scene {
+    let mut sc = h2_plus_h(d);
+    sc.train_mask = Some(vec![true, true, false]);
+    sc
+}
+
+/// The keep path (module doc, "Masked scenes"): in a masked scene the teacher answers every step
+/// (the model is never consulted, `TeachRule::Segment`) and the answer is kept with the scene's
+/// mask and its energy unused; a mask of the wrong length is not the scene's, and the model
+/// answers as for any scene.
+#[test]
+fn a_masked_scene_is_taught_by_the_teacher_with_its_mask() {
+    let mut s = dimer_model_three_atom_teacher();
+    let before = s.samples();
+    let sc = masked_h3(2.0);
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("capped segment")), "{:?}", r.stats.notes);
+    let e = drain(&mut s);
+    assert_eq!(e.last().unwrap().rule, sim::activity::TeachRule::Segment);
+    assert_eq!(s.samples(), before + 1);
+    let kept = s.store().unwrap().samples.last().unwrap().clone();
+    assert_eq!((kept.force_mask.clone(), kept.use_energy), (Some(vec![true, true, false]), false));
+    // the sampling pass's entry (`add_sample_answer`) masks the same way
+    s.add_sample_answer(pair_morse_sample(&masked_h3(2.5)), &masked_h3(2.5), Some(0.0), None).unwrap();
+    let kept = s.store().unwrap().samples.last().unwrap().clone();
+    assert_eq!((kept.force_mask.clone(), kept.use_energy), (Some(vec![true, true, false]), false));
+    // a stale mask (another nucleus count) is no mask: the model answers the dimer
+    let mut stale = in_cell_65(h2(1.4));
+    stale.train_mask = Some(vec![true, true, false]);
+    s.discontinuity();
+    let r = s.evaluate(&stale, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+}
+
+/// A masked sample's left-out rows are never read (module doc, "Masked scenes"): two providers
+/// given the same masked samples — one with the teacher's labels, one with a garbage energy and a
+/// garbage force on the masked-out atom — fit the same model bit for bit and report the same
+/// leave-one-out RMS, training residuals, class verdicts and knowledge map; the energy rows are
+/// the whole samples' only and the force rows 3 per interior atom; the knowledge map counts the
+/// interior atoms only.
+#[test]
+fn a_masked_sample_never_contributes_its_energy_or_its_masked_out_forces() {
+    let mut clean = dimer_model_three_atom_teacher();
+    let mut garbage = dimer_model_three_atom_teacher();
+    let whole = clean.samples();
+    let atoms_before = clean.knowledge_map().unwrap().elements[0].atoms_seen;
+    let mut rng = StdRng::seed_from_u64(1010);
+    let k = 12;
+    for _ in 0..k {
+        let mut sc = random_h3(&mut rng);
+        sc.train_mask = Some(vec![true, true, false]);
+        let good = pair_morse_sample(&sc);
+        let mut bad = good.clone();
+        bad.energy += 100.0;
+        bad.forces[2] = [50.0, -50.0, 50.0];
+        clean.add_sample(good, &sc).unwrap();
+        garbage.add_sample(bad, &sc).unwrap();
+    }
+    clean.refit().unwrap();
+    garbage.refit().unwrap();
+    let (ac, ag) = (clean.accumulator().unwrap(), garbage.accumulator().unwrap());
+    assert_eq!((ac.n_e, ac.n_f, ac.n_scale), (whole, 6 * whole + 6 * k, whole + k), "energy rows of the whole samples, 3 force rows per interior atom");
+    let (mc, mg) = (clean.model().unwrap(), garbage.model().unwrap());
+    assert_eq!(mc.coeffs, mg.coeffs, "the masked-out labels never reach the fit");
+    assert_eq!((mc.sigma_e, mc.sigma_f, mc.lambda), (mg.sigma_e, mg.sigma_f, mg.lambda));
+    assert_eq!(clean.loo_rms(), garbage.loo_rms());
+    assert_eq!(clean.training_residuals(), garbage.training_residuals());
+    assert_eq!(format!("{:?}", clean.class_loo()), format!("{:?}", garbage.class_loo()));
+    assert_eq!(clean.knowledge_map(), garbage.knowledge_map());
+    assert_eq!(clean.knowledge_map().unwrap().elements[0].atoms_seen, atoms_before + 2 * k, "the interior atoms only");
+    assert_eq!(clean.loo_rms().unwrap().samples, whole + k);
+    println!("masked samples: loo {:?}; trusted {}", clean.loo_rms(), clean.trusted());
+}
+
+/// A provider whose samples are all capped segments (the capping gate's collection B): the refit
+/// is the force-only fit (no energy row: `surrogate::fit`, "Masked samples"), the energy noise is
+/// pinned and no energy residual dof exists, and the trust rule refuses — no energy evidence —
+/// while the forces of the interior atoms are learned.
+#[test]
+fn a_store_of_masked_samples_alone_fits_its_forces_and_is_not_trusted() {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(1011);
+    for _ in 0..120 {
+        let sc = masked_h3_random(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    let rep = s.refit().expect("a force-only fit");
+    assert_eq!((rep.sigma_e, rep.residual_dof_e), (surrogate::fit::SIGMA_E_WITHOUT_ENERGY_ROWS, 0.0));
+    assert_eq!(s.accumulator().unwrap().n_e, 0);
+    assert!(!s.trusted(), "no energy evidence: not trusted");
+    // the interior atoms' forces are learned: held-out H₃ forces on atoms 0 and 1
+    let model = s.model().unwrap().clone();
+    let mut worst: f64 = 0.0;
+    for _ in 0..20 {
+        let sc = random_h3(&mut rng);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let t = PairMorse(MorseDimer::h2()).evaluate(&sc, &mut never()).unwrap();
+        let (_, f) = surrogate::energy_and_forces(&model, &pos, &[1, 1, 1]).unwrap();
+        worst = worst.max(max_force_diff(&f[..2], &t.forces[..2]));
+    }
+    println!("masked-only store: s_F {:.2e}, held-out worst |ΔF| on the taught atoms {worst:.2e}; untrusted: {:?}", rep.sigma_f, s.untrusted_reason());
+    // within the policy's absolute force tier (what a trusted answer is held to)
+    assert!(worst < FallbackPolicy::default().force_std_abs, "{worst:e}");
+}
+
+/// A random H₃ (`random_h3`) as a segment: atoms 0 and 1 interior.
+fn masked_h3_random(rng: &mut StdRng) -> Scene {
+    let mut sc = random_h3(rng);
+    sc.train_mask = Some(vec![true, true, false]);
+    sc
+}
