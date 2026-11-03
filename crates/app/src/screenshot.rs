@@ -28,8 +28,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// menu, shows the View panel), `tab=<panel>` shows that
 /// panel (its name, any case: `readouts|graph|model|knowledge|activity|orbitals|selection|log|view`;
 /// `UiState::open_tab`: the active tab of its leaf in the default layout, `ui::workspace`),
-/// `dock=closed` closes every panel (the 3D view fills the window; docking D2's Presenting layout
-/// will replace it), `hide=<panel>[,<panel>…]` auto-hides those panels (docking spec D-10: each to
+/// `layout=one|two|training|presenting` arranges the workspace as that built-in layout first
+/// (Window ▸ Layouts, docking spec D-11, `ui::workspace::presets`), `dock=closed` is
+/// `layout=presenting` (the 3D view fills the window, every panel auto-hidden; spec D-13),
+/// `hide=<panel>[,<panel>…]` auto-hides those panels (docking spec D-10: each to
 /// the strip of its side of the 3D view; with `tab=` naming one, its flyout is out), `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
@@ -76,7 +78,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub struct ShotUi {
     pub menu: Option<String>,
     pub tab: Option<String>,
-    pub dock_closed: bool,
+    /// `layout=<preset>` (and `dock=closed`, Presenting): applied before `hide=` and `tab=`.
+    pub layout: Option<crate::ui::LayoutPreset>,
     pub hide: Vec<String>,
     pub select: Option<usize>,
     pub tool: Option<String>,
@@ -145,7 +148,13 @@ impl ShotUi {
             match k.trim() {
                 "menu" => s.menu = Some(v.to_string()),
                 "tab" => s.tab = Some(v.to_string()),
-                "dock" => s.dock_closed = v == "closed",
+                "layout" => s.layout = Some(crate::ui::LayoutPreset::from_word(v).ok_or_else(|| format!("--ui: layout=one|two|training|presenting, got {v}"))?),
+                // the docks' old key (docking spec D-13): `dock=closed` is the Presenting layout
+                "dock" => {
+                    if v == "closed" {
+                        s.layout = Some(crate::ui::LayoutPreset::Presenting);
+                    }
+                }
                 "hide" => s.hide = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
                 "select" => s.select = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "tool" => s.tool = Some(v.to_string()),
@@ -364,6 +373,9 @@ impl ShotUi {
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
+        if let Some(p) = self.layout {
+            viewer.ui.apply_layout(p);
+        }
         for t in &self.hide {
             let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown panel {t}"))?;
             viewer.ui.workspace.pin(tab, false);
@@ -371,11 +383,6 @@ impl ShotUi {
         if let Some(t) = &self.tab {
             let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
             viewer.ui.open_tab(tab);
-        }
-        if self.dock_closed {
-            for t in DockTab::PANELS {
-                viewer.ui.workspace.close_panel(t);
-            }
         }
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
@@ -1006,5 +1013,19 @@ mod tests {
         assert_eq!(ShotUi::parse("angles=on;select=0").unwrap().angles, Some(true));
         assert_eq!(ShotUi::parse("select=0").unwrap().angles, None);
         assert!(ShotUi::parse("angles=maybe").is_err());
+    }
+
+    /// `layout=<preset>` names a built-in layout (docking spec D-13); `dock=closed`, the docks'
+    /// old key, still parses and is Presenting.
+    #[test]
+    fn layout_names_a_preset_and_dock_closed_is_presenting() {
+        use crate::ui::LayoutPreset as Preset;
+        for (v, p) in [("one", Preset::OneMonitor), ("two", Preset::TwoMonitors), ("training", Preset::Training), ("Presenting", Preset::Presenting)] {
+            assert_eq!(ShotUi::parse(&format!("layout={v};tab=graph")).unwrap().layout, Some(p), "{v}");
+        }
+        assert_eq!(ShotUi::parse("dock=closed").unwrap().layout, Some(Preset::Presenting));
+        assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
+        assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");
+        assert!(ShotUi::parse("layout=three").err().is_some_and(|e| e.contains("training")));
     }
 }

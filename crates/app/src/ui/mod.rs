@@ -47,6 +47,8 @@ pub use actions::Action;
 #[cfg(test)]
 pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
+/// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.
+pub use workspace::presets::Preset as LayoutPreset;
 
 use crate::scene::Scene;
 use crate::sim::{Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
@@ -784,10 +786,19 @@ impl UiState {
         self.workspace.visible(tab)
     }
 
-    /// The default layout back (the D1 default, `workspace::layout::default_layout`; nothing
-    /// auto-hidden).
+    /// The default layout back: the One monitor preset (the D1 default,
+    /// `workspace::layout::default_layout`; nothing auto-hidden).
     pub fn reset_layout(&mut self) {
-        self.workspace.set_node(workspace::layout::default_layout());
+        self.apply_layout(workspace::presets::Preset::OneMonitor);
+    }
+
+    /// Rearranges the workspace as the built-in layout `p` (Window ▸ Layouts, spec D-11): its tree
+    /// and its auto-hidden panels replace the current ones (floating windows and the flyout go);
+    /// the profile's autosave then keeps it. Display state, never recorded.
+    pub fn apply_layout(&mut self, p: workspace::presets::Preset) {
+        let (tree, hidden) = p.tree();
+        self.workspace.set_node(tree);
+        self.workspace.set_hidden(hidden);
     }
 
     pub fn new(preset: &str, scene: &Scene) -> UiState {

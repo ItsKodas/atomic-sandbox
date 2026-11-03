@@ -32,9 +32,9 @@
 //!
 //! The panels draw with `&mut UiState`, which also holds the tree, so the tree is lent to the dock
 //! area for the frame; what the panels ask of the workspace meanwhile (the Readouts' "open the
-//! Graph", say) is done when it comes back, and `visible` answers from what was visible when it
-//! left. Panels floated in a window are not part of [`Workspace::to_node`] (the profile's
-//! `layout = …`): [`Workspace::saved_hidden`] writes each as auto-hidden on the edge nearest its
+//! Graph", say) is done when it comes back, and `visible` / `present` answer from what was
+//! visible / present when it left. Panels floated in a window are not part of
+//! [`Workspace::to_node`] (the profile's `layout = …`): [`Workspace::saved_hidden`] writes each as auto-hidden on the edge nearest its
 //! window (`hidden = …`), so it comes back on that strip (recorded for review: a float is a
 //! moment's arrangement, and D3's `window = …` lines will keep detached windows).
 //! - **Saved fractions hold in a narrow window**: `egui_dock` clamps each split's fraction every
@@ -92,9 +92,9 @@ pub struct Workspace {
     /// The pointer's press origin while a button is held, and the split whose separator it was
     /// pressed on (`keep_fractions` leaves a dragged split alone).
     drag: Option<(Pos2, Option<NodePath>)>,
-    /// While the dock area draws: the panels visible when the tree left (what [`Workspace::visible`]
-    /// answers meanwhile).
-    lent: Option<Vec<DockTab>>,
+    /// While the dock area draws: the panels visible and the panels present when the tree left
+    /// (what [`Workspace::visible`] and [`Workspace::present`] answer meanwhile).
+    lent: Option<(Vec<DockTab>, Vec<DockTab>)>,
     pending: Vec<Change>,
 }
 
@@ -272,12 +272,21 @@ impl Workspace {
         if self.fly.open == Some(t) {
             return true;
         }
-        if let Some(shown) = &self.lent {
+        if let Some((shown, _)) = &self.lent {
             return shown.contains(&t);
         }
         self.dock
             .find_tab(&Tile::Panel(t))
             .is_some_and(|p| self.dock.leaf(p.node_path()).is_ok_and(|l| l.active == p.tab && !l.collapsed))
+    }
+
+    /// Whether `t` is in the workspace at all — a tab in the tree or a floating window (shown or
+    /// behind another tab), or auto-hidden — rather than closed: the Window menu's check.
+    pub fn present(&self, t: DockTab) -> bool {
+        if let Some((_, present)) = &self.lent {
+            return present.contains(&t);
+        }
+        self.is_hidden(t) || self.dock.find_tab(&Tile::Panel(t)).is_some()
     }
 
     /// Shows `t`: makes it the active tab of its leaf (and focuses the leaf); an auto-hidden panel
@@ -398,7 +407,9 @@ impl Workspace {
 
     /// Lends the tree to the dock area for the frame (a placeholder stays behind).
     fn lend(&mut self) -> DockState<Tile> {
-        self.lent = Some(DockTab::PANELS.into_iter().filter(|&t| self.visible(t)).collect());
+        let shown = DockTab::PANELS.into_iter().filter(|&t| self.visible(t)).collect();
+        let present = DockTab::PANELS.into_iter().filter(|&t| self.present(t)).collect();
+        self.lent = Some((shown, present));
         std::mem::replace(&mut self.dock, DockState::new(Vec::new()))
     }
 

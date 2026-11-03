@@ -133,7 +133,10 @@ pub const ENTRIES: &[Entry] = &[
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
     // Window (docking spec D-7)
     e("Show a panel", "window panels open reopen closed tab Model Knowledge Selection Readouts View Orbitals Log Activity Graph", Menu(M::Window), "m-panels"),
-    e("Layouts", "workspace arrangement one monitor preset", Menu(M::Window), "m-layout"),
+    e("Layout: One monitor", "layouts workspace arrangement preset default single screen", Menu(M::Window), "m-layout"),
+    e("Layout: Two monitors", "layouts workspace arrangement preset second screen dual display", Menu(M::Window), "m-layout"),
+    e("Layout: Training", "layouts workspace arrangement preset estimated solver teach model knowledge activity graph", Menu(M::Window), "m-layout"),
+    e("Layout: Presenting", "layouts workspace arrangement preset full screen 3D view only hide every panel demo talk", Menu(M::Window), "m-layout"),
     e("Reset layout", "workspace default arrangement docking panels back", Menu(M::Window), "m-layout"),
     // Readouts
     e("Temperature T", "kelvin", Dock(D::Readouts), "d-tiles"),

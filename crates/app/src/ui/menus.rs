@@ -4,7 +4,8 @@
 //! and the Ctrl K search button. In the compact layout the five menus fold into one "☰ Menu".
 //! Also the Help windows ("Physics, honestly").
 use super::search;
-use super::{gravity_au, icons, probed, theme, Action, DockTab, HelpTopic, PanelInput, UiState};
+use super::workspace::presets::Preset;
+use super::{gravity_au, icons, probe, probed, theme, Action, DockTab, HelpTopic, PanelInput, UiState};
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
@@ -58,11 +59,12 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
             ui.horizontal_centered(|ui| {
                 brand(ui, compact);
                 if compact {
-                    let r = ui.add(Button::new("☰ Menu").frame_when_inactive(false));
+                    let r = probed("menu-all", ui.add(Button::new("☰ Menu").frame_when_inactive(false)));
                     hot.push(r.rect);
                     menu_popup(&r, egui::Id::new("menu-all")).show(|ui| {
                         for m in MenuId::ALL {
-                            egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| scrolled(ui, 340.0, |ui| contents(ui, st, input, m, acts)));
+                            let (r, _) = egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| scrolled(ui, 340.0, |ui| contents(ui, st, input, m, acts)));
+                            probe(&format!("menu-{}", m.title()), &r);
                         }
                     });
                 } else {
@@ -70,12 +72,12 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                         let open = Popup::is_id_open(ui.ctx(), popup_id(m));
                         if m == MenuId::File {
                             // File: Open… (the File window) and Save… (the Save window), `files`
-                            let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
+                            let r = probed("menu-File", ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
                             hot.push(r.rect);
                             menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 200.0, |ui| file_items(ui, st)));
                             continue;
                         }
-                        let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
+                        let r = probed(&format!("menu-{}", m.title()), ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
                         hot.push(r.rect);
                         menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 350.0, |ui| contents(ui, st, input, m, acts)));
                     }
@@ -616,15 +618,16 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     }
 }
 
-/// Window (docking spec D-7): one row per panel — its icon and name, a check while it is on screen;
-/// a click shows it where it is (a closed one comes back beside the 3D view) — then Layouts ▸ (One
-/// monitor until docking Task 7 adds the rest) and Reset layout. Display state: none of it is an
-/// `Action`.
+/// Window (docking spec D-7): one row per panel — its icon and name, a check while it is in the
+/// workspace (shown, behind another tab, floating or auto-hidden; none when closed); a click shows
+/// it where it is (a closed one comes back beside the 3D view) — then Layouts ▸ (the four built-in
+/// layouts, spec D-11: `workspace::presets`) and Reset layout (One monitor). Display state: none
+/// of it is an `Action`.
 fn window_menu(ui: &mut Ui, st: &mut UiState) {
     anchored(ui, st, "m-panels", |ui, st| {
         theme::section(ui, "Panels");
         for t in DockTab::PANELS {
-            if panel_row(ui, t, st.tab_shown(t)).clicked() {
+            if panel_row(ui, t, st.workspace.present(t)).clicked() {
                 st.open_tab(t);
                 ui.close();
             }
@@ -632,12 +635,15 @@ fn window_menu(ui: &mut Ui, st: &mut UiState) {
     });
     ui.separator();
     anchored(ui, st, "m-layout", |ui, st| {
-        egui::containers::menu::SubMenuButton::new("Layouts").ui(ui, |ui| {
-            if probed("layout-one-monitor", ui.button("One monitor")).on_hover_text("the default: Model / Knowledge over Selection / Readouts on the left, the 3D view, View / Orbitals over Log / Activity / Graph on the right").clicked() {
-                st.reset_layout();
-                ui.close();
+        let (r, _) = egui::containers::menu::SubMenuButton::new("Layouts").ui(ui, |ui| {
+            for p in Preset::ALL {
+                if probed(&format!("layout-{}", p.word()), ui.button(p.title())).on_hover_text(p.tip()).clicked() {
+                    st.apply_layout(p);
+                    ui.close();
+                }
             }
         });
+        probe("layouts-submenu", &r);
         if probed("reset-layout", ui.button("Reset layout")).on_hover_text("every panel back where it starts (the One monitor layout)").clicked() {
             st.reset_layout();
             ui.close();
@@ -645,17 +651,17 @@ fn window_menu(ui: &mut Ui, st: &mut UiState) {
     });
 }
 
-/// A Window menu row: the panel's icon, its title and, while it is on screen, a check.
-fn panel_row(ui: &mut Ui, t: DockTab, shown: bool) -> egui::Response {
+/// A Window menu row: the panel's icon, its title and, while it is in the workspace, a check.
+fn panel_row(ui: &mut Ui, t: DockTab, present: bool) -> egui::Response {
     let r = probed(
         &format!("window-{}", t.name()),
         ui.add(Button::new(format!("      {}", t.title())).frame_when_inactive(false).min_size(Vec2::new(ui.available_width(), 24.0))),
     )
-    .on_hover_text(if shown { "on screen" } else { "show it" });
-    let ink = if shown || r.hovered() { theme::INK } else { theme::INK_DIM };
+    .on_hover_text(if present { "in the workspace: click to bring it to the front" } else { "closed: click to show it" });
+    let ink = if present || r.hovered() { theme::INK } else { theme::INK_DIM };
     let p = ui.painter();
     icons::paint(p, egui::Rect::from_center_size(egui::pos2(r.rect.left() + 14.0, r.rect.center().y), Vec2::splat(14.0)), super::dock::icon(t), ink);
-    if shown {
+    if present {
         let c = egui::pos2(r.rect.right() - 14.0, r.rect.center().y);
         p.add(egui::Shape::line(vec![c + Vec2::new(-4.5, 0.5), c + Vec2::new(-1.5, 3.5), c + Vec2::new(4.5, -3.5)], Stroke::new(1.8, theme::ACCENT)));
     }

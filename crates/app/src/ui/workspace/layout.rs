@@ -209,7 +209,6 @@ fn clean_in(n: Node, seen: &mut Vec<DockTab>, view_seen: &mut bool) -> Option<No
 }
 
 /// The tree's panels in reading order (depth first, each leaf's tabs in order); not the 3D view.
-#[cfg_attr(not(test), allow(dead_code))] // the tests' "every panel once"; the Window menu (Task 3)
 pub fn panels(n: &Node) -> Vec<DockTab> {
     fn walk(n: &Node, out: &mut Vec<DockTab>) {
         match n {

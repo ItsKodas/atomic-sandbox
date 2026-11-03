@@ -1036,20 +1036,25 @@ fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
 /// primary button on the centre of widget `name`, moving by `drag` (points, in steps) in between.
 /// Returns every frame's output.
 fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str, drag: f32) -> Vec<PanelOutput> {
+    press_widget_w(ctx, st, inp, 1400.0, name, drag)
+}
+
+/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact layout).
+fn press_widget_w(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, name: &str, drag: f32) -> Vec<PanelOutput> {
     for _ in 0..3 {
-        frame(ctx, st, inp, 1400.0, vec![]);
+        frame(ctx, st, inp, w, vec![]);
     }
     let c = probed_rect(name).center();
-    let mut outs = vec![frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerMoved(c), pointer(c, true)])];
+    let mut outs = vec![frame(ctx, st, inp, w, vec![egui::Event::PointerMoved(c), pointer(c, true)])];
     let mut at = c;
     for _ in 0..4 {
         if drag != 0.0 {
             at.x += drag / 4.0;
-            outs.push(frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerMoved(at)]));
+            outs.push(frame(ctx, st, inp, w, vec![egui::Event::PointerMoved(at)]));
         }
     }
-    outs.push(frame(ctx, st, inp, 1400.0, vec![pointer(at, false)]));
-    outs.push(frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerGone]));
+    outs.push(frame(ctx, st, inp, w, vec![pointer(at, false)]));
+    outs.push(frame(ctx, st, inp, w, vec![egui::Event::PointerGone]));
     outs
 }
 
@@ -6052,5 +6057,52 @@ mod view_panel {
         assert_eq!(open_menu(&ctx, &mut st, "Window"), Some(()));
         assert!(egui::Popup::is_id_open(&ctx, menus::popup_id(menus::MenuId::Window)));
         assert_eq!(open_menu(&ctx, &mut st, "bogus"), None);
+    }
+
+    /// Window ▸ Layouts ▸ <preset> clicked through the real menus — the top bar's Window button,
+    /// the Layouts submenu, the preset's row — in the full layout and in the compact one (where
+    /// Window is itself a submenu of "☰ Menu"): each click rearranges the workspace as the preset
+    /// (tree and hidden panels), closes every menu, and is no action. The Window menu's check
+    /// reads "in the workspace" (shown, behind a tab, or auto-hidden), not "on screen".
+    #[test]
+    fn window_layouts_applies_a_preset_and_closes_the_menu() {
+        use super::super::workspace::{layout, presets::Preset};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        let arrangement = |st: &UiState| (layout::encode(&st.workspace.to_node()), layout::encode_hidden(st.workspace.hidden()));
+        for (w, path) in [(1400.0, &["menu-Window", "layouts-submenu"][..]), (1200.0, &["menu-all", "menu-Window", "layouts-submenu"][..])] {
+            st.workspace.set_node(layout::parse("H(0.50,[Log*,Graph],V(0.30,3D,[Model*]))").unwrap());
+            for p in [Preset::Training, Preset::Presenting, Preset::TwoMonitors, Preset::Training, Preset::OneMonitor] {
+                let before = arrangement(&st);
+                let mut outs = Vec::new();
+                for step in path.iter().copied().chain([format!("layout-{}", p.word()).as_str()]) {
+                    PROBES.with(|m| m.borrow_mut().clear()); // only what this frame drew can be clicked
+                    outs.extend(press_widget_w(&ctx, &mut st, &inp, w, step, 0.0));
+                }
+                let (tree, hidden) = p.tree();
+                assert_eq!(arrangement(&st), (layout::encode(&tree), layout::encode_hidden(&hidden)), "{w}: {p:?}");
+                assert_ne!(arrangement(&st), before, "{w}: {p:?} changed the arrangement");
+                assert!(!egui::Popup::is_any_open(&ctx), "{w}: {p:?}: the menu closed");
+                assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+            }
+        }
+        // the check: in the workspace, not only on screen
+        st.apply_layout(Preset::Presenting);
+        assert!(DockTab::PANELS.into_iter().all(|t| st.workspace.present(t) && !st.tab_shown(t)), "hidden panels are present");
+        st.reset_layout();
+        assert!(st.workspace.present(DockTab::Graph) && !st.tab_shown(DockTab::Graph), "a tab behind Log is present");
+        st.workspace.close_panel(DockTab::Graph);
+        assert!(!st.workspace.present(DockTab::Graph), "a closed panel is not");
+        // Ctrl K finds each preset (and Reset layout) in the Window menu's Layouts group
+        for p in Preset::ALL {
+            let r = search::results(&format!("layout {}", p.title()), 1);
+            assert_eq!((r[0].name, r[0].anchor, r[0].place), (format!("Layout: {}", p.title()).as_str(), "m-layout", search::Place::Menu(menus::MenuId::Window)));
+        }
+        assert_eq!(search::results("presenting", 1)[0].name, "Layout: Presenting");
+        assert_eq!(search::results("reset layout", 1)[0].name, "Reset layout");
     }
 }
