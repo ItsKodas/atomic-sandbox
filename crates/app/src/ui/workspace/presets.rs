@@ -1,7 +1,8 @@
 //! The built-in layouts (docking spec D-11, D2; user decision 2026-11-03: layouts live in the
 //! profile, four built-ins ship, and choosing one rearranges the current profile, which then
 //! remembers it — the profile's autosave captures the tree and the hidden list like any other
-//! rearrangement). Window ▸ Layouts lists them (spec D-7), Reset layout applies One monitor, and
+//! rearrangement). Window ▸ Layouts lists them (spec D-7), Reset layout applies One monitor (Two
+//! monitors when a second monitor is connected), and
 //! the screenshot harness's `--ui layout=<one|two|training|presenting>` (and `dock=closed`, which
 //! is Presenting) poses them (spec D-13). Display state only: nothing here is an `Action`.
 //!

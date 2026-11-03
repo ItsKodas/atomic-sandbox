@@ -9,6 +9,7 @@ mod badge;
 mod builder;
 mod capture;
 mod cloud;
+mod detached;
 mod frame;
 mod icon;
 mod timings;
@@ -93,6 +94,13 @@ struct App {
     frames: FrameStats,
     /// The pop-out view's window (`capture::popout`), while `ui.capture.popout` asks for it.
     popout: Option<capture::popout::Popout>,
+    /// The detached panel windows (docking spec D-12, `detached`), in id order.
+    detached: Vec<detached::DetachedWindow>,
+    /// When the monitor list was last given to the UI (`detached::monitors`), and that list.
+    monitors_at: Option<Instant>,
+    monitors: Vec<ui::WinRect>,
+    /// `--layout <preset>`: applied once the monitors are known (Two monitors needs them).
+    start_layout: Option<ui::LayoutPreset>,
 }
 
 /// `--record`: the path until the window opens, then the recorder, and whether the worker was idle
@@ -353,6 +361,10 @@ fn main() {
     // screenshot only: the frame size and the chrome's state (`screenshot::ShotUi`)
     let (mut size, mut shot_ui, mut shot_ui_given) = (None, screenshot::ShotUi::default(), false);
     let mut flags = StartFlags::default();
+    // the window: panels to pop out into a detached window at start (docking spec D-12; a check)
+    let mut detach = None;
+    // the window: a built-in layout applied at start, as Window > Layouts would (docking spec D-11)
+    let mut start_layout = None;
     // input replay (M6 spec §8): record the window's session, or run a script headlessly
     let (mut record, mut replay_path) = (None, None);
     while let Some(a) = args.next() {
@@ -421,6 +433,11 @@ fn main() {
                 flags.quality = Some(quality::parse(&q).unwrap_or_else(|| panic!("--quality needs fast, balanced, accurate or precise, got {q:?}")));
             }
             "--draft" => flags.draft = true,
+            "--detach" => detach = Some(args.next().expect("--detach needs <panel>[,<panel>…]")),
+            "--layout" => {
+                let w = args.next().expect("--layout needs one, two, training or presenting");
+                start_layout = Some(ui::LayoutPreset::from_word(&w).unwrap_or_else(|| panic!("--layout needs one, two, training or presenting, got {w:?}")));
+            }
             "--ionic" => {
                 let w = args.next().expect("--ionic needs none, cores, accepted or all");
                 flags.ionic = Some(::sim::IonicPolicy::parse(&w).unwrap_or_else(|| panic!("--ionic needs none, cores, accepted or all, got {w:?}")));
@@ -508,6 +525,17 @@ fn main() {
     if let Some(n) = speed {
         viewer.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
     }
+    if let Some(list) = &detach {
+        match ui::panels_named(list) {
+            Ok(tabs) => {
+                viewer.ui.workspace.pop_out(&tabs, tabs[0]);
+            }
+            Err(e) => {
+                eprintln!("--detach: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let record = record.map(|path| {
         let u = &viewer.ui;
         // the scene file is not a preset: its own `scene` line (written first, below), with its own
@@ -554,6 +582,10 @@ fn main() {
         focused: true,
         frames: FrameStats::default(),
         popout: None,
+        detached: Vec::new(),
+        monitors_at: None,
+        monitors: Vec::new(),
+        start_layout,
     };
     event_loop.run_app(&mut app).expect("run");
     // the estimated solver's session autosave is for this session only
@@ -641,8 +673,11 @@ impl ApplicationHandler for App {
             painter,
         });
         self.window = Some(window.clone());
+        // the monitors before the first frame: a profile's detached window on none of them docks back
+        self.sync_monitors(el);
         self.redraw(&window);
         window.set_visible(true);
+        self.sync_detached(el);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -652,6 +687,11 @@ impl ApplicationHandler for App {
         if self.popout.as_ref().is_some_and(|p| p.window.id() == id) {
             self.popout_event(event);
             window.request_redraw(); // it is drawn with the main window's frame
+            return;
+        }
+        if let Some(i) = self.detached.iter().position(|d| d.window.id() == id) {
+            self.detached_event(i, event);
+            window.request_redraw(); // they are drawn with the main window's frame
             return;
         }
         if id != window.id() {
@@ -701,6 +741,8 @@ impl ApplicationHandler for App {
             return;
         }
         self.sync_popout(el);
+        self.sync_monitors(el);
+        self.sync_detached(el);
         let got = self.drain_sim();
         // `--record`: a `wait idle` each time the worker goes idle after something was sent
         if let Some(r) = &mut self.record {
@@ -718,7 +760,7 @@ impl ApplicationHandler for App {
             self.egui_repaint_at = None;
         }
         // the floating dots drift by themselves: keep drawing while they are shown and the window has focus
-        let floating = (self.focused || self.popout.as_ref().is_some_and(|p| p.focused)) && self.viewer.dots_floating();
+        let floating = (self.focused || self.popout.as_ref().is_some_and(|p| p.focused) || self.detached.iter().any(|d| d.focused)) && self.viewer.dots_floating();
         // a capture in progress keeps the frames coming (its readbacks land a frame or two later)
         let capturing = self.viewer.capture.active();
         // the pop-out shows an orbiting capture camera turning (as the view's gizmo previews it)
@@ -769,6 +811,95 @@ impl App {
         }
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// Gives the UI the connected monitors (the main window's first) at most every 2 s: a profile's
+    /// detached window on none of them docks back, the Two monitors layout fills the second.
+    fn sync_monitors(&mut self, el: &ActiveEventLoop) {
+        if self.monitors_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        let Some(w) = &self.window else { return };
+        let list = detached::monitors(el, w);
+        if list != self.monitors {
+            let words: Vec<String> = list.iter().map(|m| format!("{}x{} at {},{}", m.w, m.h, m.x, m.y)).collect();
+            eprintln!("monitors: {} ({}; the main window's first)", list.len(), words.join("; "));
+            self.monitors = list.clone();
+        }
+        self.viewer.ui.workspace.set_monitors(list);
+        self.monitors_at = Some(Instant::now());
+        if let Some(p) = self.start_layout.take() {
+            self.viewer.ui.apply_layout(p);
+        }
+    }
+
+    /// Acts on the detached windows' requests (docking spec D-12): opens a window (or, when that
+    /// fails, docks its panels back with an error line), closes one, brings one to the front.
+    fn sync_detached(&mut self, el: &ActiveEventLoop) {
+        let requests = self.viewer.take_window_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let Some(g) = &self.gfx else { return };
+        for r in requests {
+            match r {
+                ui::WindowRequest::Open { id, panels, rect, size, fill } => {
+                    if self.detached.iter().any(|d| d.id == id) {
+                        continue;
+                    }
+                    let title = self.viewer.ui.workspace.window_title(id);
+                    match detached::DetachedWindow::open(el, &g.ctx, id, &title, rect, size, fill) {
+                        Ok(d) => {
+                            let names: Vec<&str> = panels.iter().map(|t| t.name()).collect();
+                            let at = d.rect().map_or(String::new(), |r| format!(" at {},{} {}x{}", r.x, r.y, r.w, r.h));
+                            eprintln!("detached window {id} opened ({}){at}", names.join(", "));
+                            self.viewer.ui.workspace.set_window_rect(id, d.rect());
+                            let i = self.detached.iter().position(|w| w.id > id).unwrap_or(self.detached.len());
+                            self.detached.insert(i, d);
+                        }
+                        Err(e) => {
+                            self.viewer.ui.workspace.window_closed(id);
+                            self.viewer.last_error = Some(format!("detached window: {e}; its panels are back in the main window"));
+                        }
+                    }
+                }
+                ui::WindowRequest::Close { id } => {
+                    if self.detached.iter().any(|d| d.id == id) {
+                        eprintln!("detached window {id} closed");
+                    }
+                    self.detached.retain(|d| d.id != id);
+                }
+                ui::WindowRequest::Focus { id } => {
+                    if let Some(d) = self.detached.iter().find(|d| d.id == id) {
+                        d.focus();
+                    }
+                }
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// A detached window's events: egui's, then closing it docks its panels back (spec D-12),
+    /// moving or resizing it tells the UI where it is (the profile saves it).
+    fn detached_event(&mut self, i: usize, event: WindowEvent) {
+        let d = &mut self.detached[i];
+        d.on_event(&event);
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                let id = d.id;
+                self.detached.remove(i);
+                self.viewer.ui.workspace.window_closed(id);
+                eprintln!("detached window {id} closed by the user: its panels are back in the main window");
+            }
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                let (id, r) = (d.id, d.rect());
+                self.viewer.ui.workspace.set_window_rect(id, r);
+            }
+            WindowEvent::Focused(f) => d.focused = f,
+            _ => {}
         }
     }
 
@@ -842,7 +973,9 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let raw = egui_state.take_egui_input(window);
         frame::set_maximised(window.is_maximized());
-        let mut out = self.viewer.run_ui(raw);
+        // the detached windows' panels are drawn in the same frame, from the same state (spec D-12)
+        let windows = self.detached.iter_mut().map(|d| (d.id, d.egui.clone(), d.take_input())).collect();
+        let (mut out, detached_out) = self.viewer.run_ui_with(raw, windows);
         match frame::take_cmd() {
             Some(frame::Cmd::Minimise) => window.set_minimized(true),
             Some(frame::Cmd::ToggleMaximise) => window.set_maximized(!window.is_maximized()),
@@ -861,9 +994,13 @@ impl App {
             }
         }
         egui_state.handle_platform_output(window, std::mem::take(&mut out.platform_output));
-        let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
+        // the soonest frame any window's egui asks for (egui says Duration::MAX for none)
+        let delay = std::iter::once(&out)
+            .chain(detached_out.iter().map(|(_, o)| o))
+            .filter_map(|o| o.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay))
+            .min();
         self.egui_repaint = delay.is_some_and(|d| d.is_zero());
-        // a later frame (egui says Duration::MAX for none): the idle loop wakes for it
+        // a later frame: the idle loop wakes for it
         self.egui_repaint_at = delay.filter(|d| !d.is_zero() && *d < Duration::from_secs(60)).map(|d| Instant::now() + d);
         self.viewer.set_view(&mut g.painter, &g.ctx);
         let v = &self.viewer;
@@ -910,6 +1047,13 @@ impl App {
         g.ctx.queue.present(frame);
         if let Some(p) = &mut self.popout {
             p.present(&g.ctx);
+        }
+        // the detached windows, after the main window (their titles name their panels)
+        for (id, full) in detached_out {
+            if let Some(d) = self.detached.iter_mut().find(|d| d.id == id) {
+                d.set_title(self.viewer.ui.workspace.window_title(id));
+                d.paint(&g.ctx, full);
+            }
         }
         self.frames.frame(self.viewer.playing);
     }

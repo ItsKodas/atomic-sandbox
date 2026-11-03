@@ -19,6 +19,9 @@
 //! [`default_layout`]. [`encode`] writes `frac` with two decimals (1 % of the window, which is
 //! what a saved layout keeps) and always stars the active tab.
 //!
+//! A detached window's tree (spec D-12, D3) is the same grammar without the 3D view
+//! ([`parse_window`]; a `3D` in it is dropped).
+//!
 //! The auto-hidden panels (spec D-8, D-10; D2) are a second line, `hidden = Graph:left:340,
 //! Log:right:300`: each panel's name, the 3D view's edge it folded to and its remembered size in
 //! points (its width; its height on the bottom edge). [`parse_hidden`] is total too: names and

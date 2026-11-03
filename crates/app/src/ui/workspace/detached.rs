@@ -112,6 +112,16 @@ pub fn parse_window(s: &str) -> Option<(Option<WinRect>, Node)> {
     layout::parse_window(s).map(|n| (None, n))
 }
 
+/// Whether a window at `r` was maximised on monitor `m`: it spans the monitor's width (a
+/// maximised window's frame overhangs each side by a few pixels, so its outer position is a little
+/// left of the monitor's) and at least 85 % of its height (the taskbar and the title bar take the
+/// rest), its centre on it.
+fn fills(r: &WinRect, m: &WinRect) -> bool {
+    let (cx, cy) = (r.x as i64 + r.w as i64 / 2, r.y as i64 + r.h as i64 / 2);
+    let inside = (m.x as i64..m.x as i64 + m.w as i64).contains(&cx) && (m.y as i64..m.y as i64 + m.h as i64).contains(&cy);
+    inside && r.w >= m.w && r.h * 100 >= m.h * 85
+}
+
 /// The panels `t` shares its leaf with in the default layout (the stand-in origin).
 fn default_siblings(t: DockTab) -> Vec<DockTab> {
     fn walk(n: &Node, t: DockTab) -> Option<Vec<DockTab>> {
@@ -208,8 +218,17 @@ impl Workspace {
                 continue;
             }
             w.asked = true;
+            // a window saved maximised (its rect fills a monitor's width) reopens maximised there
+            let filled = match (&w.rect, &self.det.monitors) {
+                (Some(r), Some(m)) if !w.fill => m.iter().copied().find(|m| fills(r, m)),
+                _ => None,
+            };
+            let (rect, fill) = match filled {
+                Some(m) => (Some(m), true),
+                None => (w.rect, w.fill),
+            };
             let panels = node_of(w.dock.main_surface(), NodeIndex::root()).map(|n| layout::panels(&n)).unwrap_or_default();
-            out.push(WindowRequest::Open { id: w.id, panels, rect: w.rect, size: w.size, fill: w.fill });
+            out.push(WindowRequest::Open { id: w.id, panels, rect, size: w.size, fill });
         }
         for id in off {
             let names = self.window_panels(id).iter().map(|t| t.name()).collect::<Vec<_>>().join(", ");
@@ -638,6 +657,24 @@ mod tests {
         next.set_monitors(vec![primary]);
         assert!(opens(&next.take_requests()).is_empty() && next.windows().is_empty());
         assert!(layout::panels(&next.to_node()).contains(&Activity));
+    }
+
+    /// A window saved maximised (the Two monitors window: its rect as Windows reports a maximised
+    /// window on a 1920 × 1080 monitor, measured 2026-11-03) reopens maximised on that monitor; a
+    /// smaller one on it at its own rect.
+    #[test]
+    fn a_window_saved_maximised_reopens_maximised() {
+        let second = WinRect { x: 2560, y: 0, w: 1920, h: 1080 };
+        let mut w = Workspace::default();
+        w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+        w.set_windows(vec![
+            (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), layout::parse_window("[Activity*]").unwrap()),
+            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), layout::parse_window("[Graph*]").unwrap()),
+        ]);
+        w.set_monitors(vec![WinRect { x: 0, y: 0, w: 2560, h: 1440 }, second]);
+        let r = w.take_requests();
+        assert!(matches!(r[0], WindowRequest::Open { rect: Some(m), fill: true, .. } if m == second), "{r:?}");
+        assert!(matches!(r[1], WindowRequest::Open { rect: Some(WinRect { x: 2600, .. }), fill: false, .. }), "{r:?}");
     }
 
     #[test]

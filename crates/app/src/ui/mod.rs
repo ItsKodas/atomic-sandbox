@@ -1300,6 +1300,21 @@ pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
     out
 }
 
+/// The panels a comma-separated list names (`DockTab::name`, any case): the windowed app's
+/// `--detach` and the screenshot's `--ui detach=`. An unknown name or an empty list is an error.
+pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
+    let tabs = list
+        .split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w)).ok_or_else(|| format!("unknown panel {w}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if tabs.is_empty() {
+        return Err("no panel named".into());
+    }
+    Ok(tabs)
+}
+
 /// The workspace's requests for the window side, and its notes as the status line.
 fn window_requests(st: &mut UiState, out: &mut PanelOutput) {
     out.windows = st.workspace.take_requests();

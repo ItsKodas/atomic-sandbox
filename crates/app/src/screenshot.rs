@@ -32,7 +32,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// (Window ▸ Layouts, docking spec D-11, `ui::workspace::presets`), `dock=closed` is
 /// `layout=presenting` (the 3D view fills the window, every panel auto-hidden; spec D-13),
 /// `hide=<panel>[,<panel>…]` auto-hides those panels (docking spec D-10: each to
-/// the strip of its side of the 3D view; with `tab=` naming one, its flyout is out), `select=<i>` selects a nucleus,
+/// the strip of its side of the 3D view; with `tab=` naming one, its flyout is out),
+/// `detach=<panel>[,<panel>…]` pops those panels out into one detached window (docking spec D-12:
+/// headless there is no OS window, so the shot is the main window without them — the windowed
+/// app's `--detach` opens the real one), `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -81,6 +84,8 @@ pub struct ShotUi {
     /// `layout=<preset>` (and `dock=closed`, Presenting): applied before `hide=` and `tab=`.
     pub layout: Option<crate::ui::LayoutPreset>,
     pub hide: Vec<String>,
+    /// `detach=<panel>[,<panel>…]`: into one detached window, after `hide=`.
+    pub detach: Vec<String>,
     pub select: Option<usize>,
     pub tool: Option<String>,
     pub element: Option<u8>,
@@ -156,6 +161,7 @@ impl ShotUi {
                     }
                 }
                 "hide" => s.hide = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
+                "detach" => s.detach = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
                 "select" => s.select = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "tool" => s.tool = Some(v.to_string()),
                 "element" => s.element = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -379,6 +385,11 @@ impl ShotUi {
         for t in &self.hide {
             let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown panel {t}"))?;
             viewer.ui.workspace.pin(tab, false);
+        }
+        if !self.detach.is_empty() {
+            let tabs = crate::ui::panels_named(&self.detach.join(","))?;
+            let id = viewer.ui.workspace.pop_out(&tabs, tabs[0]);
+            eprintln!("--ui detach: {} in detached window {} (headless: no OS window; the shot is the main window without them)", self.detach.join(", "), id.map_or("-".into(), |i| i.to_string()));
         }
         if let Some(t) = &self.tab {
             let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
@@ -1024,6 +1035,10 @@ mod tests {
             assert_eq!(ShotUi::parse(&format!("layout={v};tab=graph")).unwrap().layout, Some(p), "{v}");
         }
         assert_eq!(ShotUi::parse("dock=closed").unwrap().layout, Some(Preset::Presenting));
+        // detach=: the panels to pop out (docking spec D-12), read as the window's --detach
+        assert_eq!(ShotUi::parse("detach=activity, Graph").unwrap().detach, ["activity", "Graph"]);
+        assert_eq!(crate::ui::panels_named("activity, Graph"), Ok(vec![crate::ui::DockTab::Activity, crate::ui::DockTab::Graph]));
+        assert!(crate::ui::panels_named("activity,bogus").is_err() && crate::ui::panels_named(" , ").is_err());
         assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
         assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");
         assert!(ShotUi::parse("layout=three").err().is_some_and(|e| e.contains("training")));

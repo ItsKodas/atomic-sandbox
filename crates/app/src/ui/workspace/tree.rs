@@ -16,12 +16,17 @@
 //! - **Tabs** (spec D-4): the panel's icon, its name and its status dot (`dock::status`: drift and
 //!   box health, work running, trust, the Log's unread count) are painted into the tab, whose
 //!   title reserves the room; hovering a tab peeks its key numbers (`dock::peek`); a middle click
-//!   or the context menu closes it, the menu also floats it or resets the layout. A leaf's tab bar
-//!   ends with its pin (auto-hides its active tab, D2: `egui_dock`'s add button, its plus left
-//!   transparent under the duotone Pin icon — the library has no custom bar buttons, and the add
-//!   button is a real widget that reports its leaf, so no private geometry is clicked) and its
-//!   close button (closes the leaf's panels: `egui_dock`'s close-all, painted with the Close
-//!   icon); pop-out comes with D3.
+//!   or the context menu closes it; the menu also floats it, moves it to a new detached window, to
+//!   the main window or to window N (spec D-12, `super::detached`), or resets the layout. A leaf's
+//!   tab bar ends with its pin (auto-hides its active tab, D2: `egui_dock`'s add button, its plus
+//!   left transparent under the duotone Pin icon — the library has no custom bar buttons, and the
+//!   add button is a real widget that reports its leaf, so no private geometry is clicked), its
+//!   pop-out (D3: the leaf's panels into a new OS window) and its close button (closes the leaf's
+//!   panels). The last two are our own widgets (`leaf_buttons`) in a 48-pt right margin the tab
+//!   bar's style keeps free of tabs (recorded for review: there is no free built-in slot left, and
+//!   egui_dock's close-all sat where the order pin · pop out · close needs the close).
+//! - **Detached windows** (spec D-12): [`show_window`] draws one window's own tree in its own egui
+//!   context with the same `Tiles`, no pin (its bars end Dock back · Close) and no floating.
 //! - **Auto-hidden panels** (spec D-10, `super::autohide`): [`Workspace::pin`] takes a panel out of
 //!   the tree onto the strip of the 3D view's edge its leaf lay beyond, remembering its size, and
 //!   docks it back beside the view on that edge; their strips and flyout are drawn round the 3D
@@ -36,7 +41,7 @@
 //! visible / present when it left. Panels floated in a window are not part of
 //! [`Workspace::to_node`] (the profile's `layout = …`): [`Workspace::saved_hidden`] writes each as auto-hidden on the edge nearest its
 //! window (`hidden = …`), so it comes back on that strip (recorded for review: a float is a
-//! moment's arrangement, and D3's `window = …` lines will keep detached windows).
+//! moment's arrangement; detached windows are kept by D3's `window = …` lines).
 //! - **Saved fractions hold in a narrow window**: `egui_dock` clamps each split's fraction every
 //!   frame to leave `separator.extra` either side; a fraction it only clamped — any split but the
 //!   one whose separator the pointer was pressed on — is put back after the frame

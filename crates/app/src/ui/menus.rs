@@ -621,8 +621,9 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
 /// Window (docking spec D-7): one row per panel — its icon and name, a check while it is in the
 /// workspace (shown, behind another tab, floating or auto-hidden; none when closed); a click shows
 /// it where it is (a closed one comes back beside the 3D view) — then Layouts ▸ (the four built-in
-/// layouts, spec D-11: `workspace::presets`) and Reset layout (One monitor). Display state: none
-/// of it is an `Action`.
+/// layouts, spec D-11: `workspace::presets`) and Reset layout (One monitor; Two monitors when a
+/// second monitor is connected). A panel in a detached window is brought to the front there (spec
+/// D-12). Display state: none of it is an `Action`.
 fn window_menu(ui: &mut Ui, st: &mut UiState) {
     anchored(ui, st, "m-panels", |ui, st| {
         theme::section(ui, "Panels");
@@ -644,7 +645,7 @@ fn window_menu(ui: &mut Ui, st: &mut UiState) {
             }
         });
         probe("layouts-submenu", &r);
-        if probed("reset-layout", ui.button("Reset layout")).on_hover_text("every panel back where it starts (the One monitor layout)").clicked() {
+        if probed("reset-layout", ui.button("Reset layout")).on_hover_text("every panel back where it starts: the One monitor layout (Two monitors when a second monitor is connected)").clicked() {
             st.reset_layout();
             ui.close();
         }
