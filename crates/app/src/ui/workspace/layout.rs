@@ -18,7 +18,6 @@
 //! [`MAX_DEPTH`], or a tree left without the 3D view does not parse — the caller then uses
 //! [`default_layout`]. [`encode`] writes `frac` with two decimals (1 % of the window, which is
 //! what a saved layout keeps) and always stars the active tab.
-#![cfg_attr(not(test), allow(dead_code))] // consumed by the workspace tree from docking Task 2 on
 
 use crate::ui::DockTab;
 use std::fmt::Write as _;
@@ -201,6 +200,7 @@ fn clean_in(n: Node, seen: &mut Vec<DockTab>, view_seen: &mut bool) -> Option<No
 }
 
 /// The tree's panels in reading order (depth first, each leaf's tabs in order); not the 3D view.
+#[cfg_attr(not(test), allow(dead_code))] // the tests' "every panel once"; the Window menu (Task 3)
 pub fn panels(n: &Node) -> Vec<DockTab> {
     fn walk(n: &Node, out: &mut Vec<DockTab>) {
         match n {
@@ -217,7 +217,8 @@ pub fn panels(n: &Node) -> Vec<DockTab> {
     out
 }
 
-fn has_view(n: &Node) -> bool {
+/// Whether the tree holds the 3D view (a main-window tree must, spec D-3).
+pub fn has_view(n: &Node) -> bool {
     match n {
         Node::View3d => true,
         Node::Leaf { .. } => false,
@@ -319,6 +320,12 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use DockTab::*;
+
+    /// The old docks' default tab lists (before docking Task 2), as an old profile holds them.
+    const OLD_LEFT: [DockTab; 3] = [Activity, Readouts, Graph];
+    const OLD_RIGHT: [DockTab; 5] = [Model, Knowledge, Orbitals, Selection, Log];
+    /// The old sweep constant's order (`DockTab::ALL` before docking Task 2: View was not a tab).
+    const OLD_ALL: [DockTab; 8] = [Activity, Readouts, Graph, Model, Knowledge, Orbitals, Selection, Log];
 
     /// Spec D-9's example, verbatim: the D1 default.
     const D9: &str = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts,Activity,Graph]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
@@ -436,7 +443,7 @@ mod tests {
 
     #[test]
     fn from_the_old_docks_default() {
-        let n = from_sides(&DockTab::LEFT, &DockTab::RIGHT);
+        let n = from_sides(&OLD_LEFT, &OLD_RIGHT);
         assert_all_once(&n);
         assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts,Graph],H(0.70,3D,V(0.62,[Model*,View,Knowledge,Orbitals,Selection],[Log*])))");
         assert_eq!(parse(&encode(&n)), Some(n));
@@ -449,7 +456,7 @@ mod tests {
         assert_all_once(&n);
         assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts,Graph,Log],H(0.70,3D,[Model*,View,Orbitals,Selection,Knowledge]))", "Knowledge was never listed: it joins the last right leaf");
         // nothing on the left: no left column
-        let n = from_sides(&[], &DockTab::ALL);
+        let n = from_sides(&[], &OLD_ALL);
         assert_all_once(&n);
         assert_eq!(encode(&n), "H(0.70,3D,V(0.62,[Activity*,View,Readouts,Graph,Model,Knowledge,Orbitals,Selection],[Log*]))");
         // nothing on the right: View alone leads the right column, the missing panels join it

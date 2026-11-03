@@ -4,15 +4,15 @@
 //! `ActivityDelta::knowledge`; `ActivityState::knowledge` keeps the last one). Everything that
 //! draws it lives here, self-contained, so the docking redesign can move it without unpicking it:
 //!
-//! - the **Knowledge tab** (right dock, [`tab`]) and the **pop-out window** ([`window`]) draw the
-//!   same [`body`]: the summary line, the graph (one node per element, its area ∝ the atoms the
+//! - the **Knowledge panel** ([`tab`]) draws [`body`]: the summary line, the graph (one node per element, its area ∝ the atoms the
 //!   fitted samples hold; one line per species pair, coloured by its confidence — green trusted,
 //!   amber thin, grey dashed never seen; same-element pairs are loops; line width ∝ log samples),
 //!   what the open scene asks (each pair within r_cut, its distances taught / thinly / never), and
 //!   the detail of the picked pair (its distance histogram with the "asked now" ticks and the
 //!   environment keys behind its verdict) or element (its neighbour counts and bond angles).
-//!   The window is an egui window inside the main one (resizable, movable), not a second OS window:
-//!   the app draws one egui viewport;
+//!   A wide panel (floated, or given a wide leaf) lays the map out in two columns. Its old pop-out
+//!   window is gone (docking spec D-5): floating the panel does that job, and detaching it to an
+//!   OS window (docking D3) will;
 //! - the **3D overlay** (View ▸ Display aids ▸ knowledge overlay, [`overlay_toggle`]): each atom
 //!   tinted by `sim::atom_coverage` ([`overlay_coverage`], [`tint_srgb`]: grey 0 never seen → amber
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).
@@ -49,12 +49,10 @@ pub enum Pick {
     Element(u8),
 }
 
-/// The map's own view state (display only): the pick (shared by the tab and the window) and
-/// whether the pop-out window is open.
+/// The map's own view state (display only): the pick.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KnowledgeView {
     pub pick: Pick,
-    pub window: bool,
 }
 
 /// How a distance is covered (module doc, "Bins and asked distances").
@@ -239,46 +237,19 @@ pub fn overlay_toggle(ui: &mut Ui, st: &mut UiState) {
     );
 }
 
-/// The Knowledge tab (right dock).
+/// The panel at least this wide draws the map in two columns (the old pop-out window's layout).
+const WIDE: f32 = 760.0;
+
+/// The Knowledge panel.
 pub fn tab(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     dock::group(ui, st, "d-knowledge", |ui, st| {
-        ui.horizontal(|ui| {
-            theme::section(ui, "Shared model");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if st.knowledge.window { "Close the window" } else { "Pop out" };
-                let r = super::probed("knowledge-popout", ui.add(egui::Button::new(RichText::new(label).size(12.0))))
-                    .on_hover_text("the same map in a larger window, with room for the histograms (the tab and the window show the same pick)");
-                super::search::mark(ui, st, "d-knowledge-popout", r.rect);
-                if r.clicked() {
-                    st.knowledge.window = !st.knowledge.window;
-                }
-            });
-        });
-        body(ui, st, input, false);
+        theme::section(ui, "Shared model");
+        let wide = ui.available_width() >= WIDE;
+        body(ui, st, input, wide);
     });
 }
 
-/// The pop-out window, while open: the same [`body`], laid out wide.
-pub fn window(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>) {
-    if !st.knowledge.window {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("Knowledge map")
-        .id(Id::new("knowledge-window"))
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_size(vec2(1000.0, 620.0))
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| body(ui, st, input, true));
-        });
-    if !open {
-        st.knowledge.window = false;
-    }
-}
-
-/// The map: summary, graph, what the scene asks and the detail (tab: one column; window: two).
+/// The map: summary, graph, what the scene asks and the detail (one column; two when `wide`).
 pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool) {
     let Some(map) = map_of(st, input) else {
         let text = if input.snapshot.is_some_and(|s| s.backend != Backend::Estimated) || st.backend != Backend::Estimated {

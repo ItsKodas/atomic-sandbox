@@ -22,7 +22,10 @@ pub enum Icon {
     Orbitals,
     Selection,
     Log,
+    /// The old docks' collapse chevrons; unused until the auto-hide strip (docking D2).
+    #[allow(dead_code)]
     ChevronLeft,
+    #[allow(dead_code)]
     ChevronRight,
     Search,
     /// A camera (the capture's Screenshot).
@@ -226,7 +229,9 @@ pub fn seg_button(ui: &mut Ui, icon: Icon, text: &str, selected: bool) -> Respon
     r
 }
 
-/// An unframed strip button for the dock (34 × 34), with the selected state.
+/// An unframed strip button (34 × 34), with the selected state: the old docks' icon strip, unused
+/// until the auto-hide strip comes back (docking spec D-10, D2).
+#[allow(dead_code)]
 pub fn strip_button(ui: &mut Ui, icon: Icon, selected: bool) -> Response {
     let (rect, r) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
     let bg = if selected {

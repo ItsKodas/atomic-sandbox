@@ -870,7 +870,7 @@ fn frame(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, ev
     out.unwrap()
 }
 
-/// Every layout (wide and compact; dock open on each tab and collapsed; every menu open; the
+/// Every layout (wide and compact; each panel shown and every panel closed; every menu open; the
 /// search with a query; a running pass with its card; the first-pass offer; a selection with
 /// its card) lays out without a panic and, with no input, sends nothing.
 #[test]
@@ -929,16 +929,18 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 last_error: sel.map(|_| "an error"),
                 ..input(&scene, snap.as_ref(), &cam)
             };
-            for tab in DockTab::ALL {
+            for tab in DockTab::PANELS {
                 st.open_tab(tab);
                 for _ in 0..2 {
                     let out = frame(&ctx, &mut st, &inp, w, vec![]);
                     assert!(out.commands.is_empty() && !out.toggle_play && !out.deselect && out.error.is_none(), "{tab:?} at {w}");
                 }
             }
-            (st.dock_open, st.left_open) = (false, false);
+            for tab in DockTab::PANELS {
+                st.workspace.close_panel(tab);
+            }
             frame(&ctx, &mut st, &inp, w, vec![]);
-            (st.dock_open, st.left_open) = (true, true);
+            st.reset_layout();
             for id in menus::MenuId::ALL.map(menus::popup_id).into_iter().chain([menus::scene_chip_id()]) {
                 egui::Popup::open_id(&ctx, id);
                 for _ in 0..2 {
@@ -968,7 +970,7 @@ fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
 }
 
-/// Ctrl K opens the search, Enter reveals the best match (its dock tab opens), Esc closes the
+/// Ctrl K opens the search, Enter reveals the best match (its panel is shown), Esc closes the
 /// search; Esc with nothing open deselects.
 #[test]
 fn ctrl_k_reveals_and_esc_deselects() {
@@ -980,10 +982,11 @@ fn ctrl_k_reveals_and_esc_deselects() {
     frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::K, egui::Modifiers::COMMAND)]);
     assert!(st.search.open);
     st.search.query = "distance guides".into();
-    st.dock_tab = DockTab::Log;
+    st.open_tab(DockTab::Readouts); // Selection's leaf shows another tab
+    assert!(!st.tab_shown(DockTab::Selection));
     frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
     assert!(!st.search.open);
-    assert_eq!(st.dock_tab, DockTab::Selection);
+    assert!(st.tab_shown(DockTab::Selection) && !st.tab_shown(DockTab::Readouts), "the control's panel is shown in its leaf");
     assert_eq!(st.search.revealing(), Some("d-guides"));
     frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     let out = frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
@@ -1037,6 +1040,14 @@ fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, nam
     outs.push(frame(ctx, st, inp, 1400.0, vec![pointer(at, false)]));
     outs.push(frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerGone]));
     outs
+}
+
+/// The old right dock's geometry, for a panel's click and on-screen-text tests written against it:
+/// `tab` alone in one leaf right of the 3D view — 336 pt wide at 1400 (24 %), the full height —
+/// where the default layout (docking spec D-9) gives it a shorter leaf that would clip the widget
+/// or text the test looks for. Another panel shown after it joins the same leaf.
+fn alone(st: &mut UiState, tab: DockTab) {
+    st.workspace.set_node(super::workspace::layout::parse(&format!("H(0.76,3D,[{}*])", tab.name())).unwrap());
 }
 
 fn click_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> Vec<PanelOutput> {
@@ -1171,7 +1182,7 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     apply_theme(&ctx);
     let mut st = UiState::new("ph3", &scene);
     st.backend = Backend::Estimated;
-    st.open_tab(DockTab::Model);
+    alone(&mut st, DockTab::Model);
     for _ in 0..3 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
@@ -1257,9 +1268,11 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     // walls are on by default since 2026-10-14: start from off (`--no-walls`) so the click turns
     // them on, then click again for off
     st.walls_on = false;
-    // the right dock opens on Model at start (2026-10-19), whose draft checkbox is probed as
-    // "draft" too and drawn after the menus: fold it to its strip so the probe is the menu's
-    st.dock_open = false;
+    // the Model panel shows at start (the default layout's first leaf), whose draft checkbox is
+    // probed as "draft" too and drawn after the menus: show Knowledge in its leaf instead so the
+    // probe is the menu's
+    st.open_tab(DockTab::Knowledge);
+    assert!(!st.tab_shown(DockTab::Model));
     let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
         let outs = click_widget(&ctx, st, &inp, name);
@@ -1472,7 +1485,7 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
     let outs = click_widget(&ctx, &mut st, &inp, "sample");
     assert!(outs.iter().all(|o| o.commands.is_empty()), "an empty scene cannot be sampled");
     for snap in [None, Some(&gpu), Some(&est)] {
-        for tab in DockTab::ALL {
+        for tab in DockTab::PANELS {
             st.open_tab(tab);
             for w in [1400.0, 1000.0] {
                 let inp = PanelInput { playing: true, ..input(&scene, snap, &cam) };
@@ -2076,7 +2089,7 @@ fn the_thermostat_target_is_typed_in_the_chosen_scale() {
     assert!(st.thermostat_t.abs() < 1e-9, "clamped at 0 K: {}", st.thermostat_t);
     st.temp_units = TempUnits::C;
     st.backend = Backend::Estimated;
-    for tab in DockTab::ALL {
+    for tab in DockTab::PANELS {
         st.open_tab(tab);
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
     }
@@ -2357,7 +2370,8 @@ mod orbital_viewer {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = false;
+        st.workspace.close_panel(DockTab::Orbitals);
+        assert!(!st.tab_shown(DockTab::Orbitals));
         egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
         let outs = click_widget(&ctx, &mut st, &inp, "menu-show-orbitals");
         egui::Popup::close_all(&ctx);
@@ -2366,7 +2380,7 @@ mod orbital_viewer {
         assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: crate::ui::HOMO_TRACK, squared: false });
         assert_eq!(sent[0].unoccupied, 0, "the eigensolve waits for the first payload (Viewer::drive_orbital_view)");
         assert!(st.unocc_deferred && st.show == ShowMode::Orbitals);
-        assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
+        assert!(st.tab_shown(DockTab::Orbitals), "the Orbitals panel opens");
         // the other modes
         for (mode, want) in [
             (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, look: Default::default() }),
@@ -2659,7 +2673,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.open_tab(DockTab::Orbitals);
+        alone(&mut st, DockTab::Orbitals);
         let outs = click_widget(&ctx, &mut st, &inp, "orbital-↓-2");
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -3010,7 +3024,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.open_tab(DockTab::Orbitals);
+        alone(&mut st, DockTab::Orbitals);
         let mut rows = vec![
             row(Spin::Up, 0, 1, 0, -9.66, 1.0, OrbitalLabel::Atomic { n: 1, l: 0, m: "" }),
             row(Spin::Up, 1, 2, 1, -0.82, 1.0, OrbitalLabel::Atomic { n: 2, l: 1, m: "x" }),
@@ -3428,8 +3442,13 @@ mod activity_tab {
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
         st.activity.views_sent = false; // Viewer::start
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
-        // closing the dock turns them off again
-        st.left_open = false;
+        // hiding the panel behind another tab of its leaf turns them off again, showing it on
+        st.open_tab(DockTab::Graph);
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
+        st.open_tab(DockTab::Activity);
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
+        // and closing it, off
+        st.workspace.close_panel(DockTab::Activity);
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
     }
 }
@@ -3803,9 +3822,9 @@ mod activity_headline {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.left_open = false;
+        st.workspace.close_panel(DockTab::Activity);
         click_widget(&ctx, &mut st, &inp, "activity-bar");
-        assert!(st.tab_shown(DockTab::Activity), "the bar opens the left dock on Activity");
+        assert!(st.tab_shown(DockTab::Activity), "the bar shows the Activity panel");
         // idle: nothing is drawn, so nothing is probed
         PROBES.with(|p| p.borrow_mut().clear());
         let idle = input(&scene, Some(&snap), &cam);
@@ -4565,77 +4584,198 @@ fn auto_audit_cadence_follows_the_play_speed() {
     assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
 }
 
-/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Knowledge
-/// (M8a Task 9), Orbitals, Selection and Log on the right; each side has its own open flag and selected tab, a strip button
-/// opens (or collapses) its own side only, and the search opens a control's own dock.
+/// Docking spec D-2..D-4: one workspace tree. The default (spec D-9) shows Model, Selection, View
+/// and Log, each the active tab of its leaf; clicking a tab shows it and hides only the other tabs
+/// of its leaf; `open_tab` shows a panel where it is, and brings a closed one back beside the 3D
+/// view on the right; Ctrl K reveals a control in its own panel; every arrangement draws without
+/// a command.
 #[test]
-fn the_two_docks_hold_their_own_tabs() {
-    use super::DockSide;
-    assert_eq!(DockTab::LEFT, [DockTab::Activity, DockTab::Readouts, DockTab::Graph], "the left dock's order");
-    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
-    assert!(DockTab::LEFT.iter().all(|t| t.side() == DockSide::Left) && DockTab::RIGHT.iter().all(|t| t.side() == DockSide::Right));
-    assert_eq!(DockTab::ALL.len(), DockTab::LEFT.len() + DockTab::RIGHT.len());
-    assert!(DockTab::ALL.iter().all(|t| t.side().tabs().contains(t)));
-
+fn the_workspace_shows_one_tab_per_leaf() {
+    use super::workspace::layout;
+    use DockTab::*;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    // the defaults (user request 2026-10-19): the left dock open on Activity, the right on Model
-    assert!(st.left_open && st.left_tab == DockTab::Activity && st.dock_open && st.dock_tab == DockTab::Model);
-    // the rest starts from the left on Readouts and the right folded to its strip
-    st.left_tab = DockTab::Readouts;
-    st.dock_open = false;
-    // a strip button opens its tab on its own side and leaves the other side alone
-    click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
-    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open, "Activity opens the left dock");
-    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
-    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity), "each side keeps its own tab");
+    let shown = |st: &UiState| DockTab::PANELS.into_iter().filter(|&t| st.tab_shown(t)).collect::<Vec<_>>();
+    assert_eq!(shown(&st), vec![Model, Selection, View, Log], "the D1 default");
+    assert_eq!(layout::encode(&st.workspace.to_node()), layout::encode(&layout::default_layout()));
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    // a tab click shows its panel, in its own leaf only
     click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
-    assert!(st.tab_shown(DockTab::Graph) && st.tab_shown(DockTab::Selection) && !st.tab_shown(DockTab::Activity));
-    // the selected tab's button collapses its dock, only that one
-    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
-    assert!(!st.dock_open && st.left_open && st.left_tab == DockTab::Graph);
-    assert_eq!(st.dock_tab, DockTab::Selection, "the folded dock remembers its tab");
-    // the chevrons: each toggles its own dock
-    click_widget(&ctx, &mut st, &inp, "dock-chevron-Right");
-    assert!(st.dock_open && st.left_open);
-    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
-    assert!(st.dock_open && !st.left_open && st.left_tab == DockTab::Graph);
-    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
-    assert!(st.left_open);
-    // Ctrl K reveals a control in its own dock: the solve log on the left, the isotope on the right
-    st.left_open = false;
-    st.dock_open = false;
+    assert_eq!(shown(&st), vec![Model, View, Log, Graph]);
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Knowledge");
+    assert_eq!(shown(&st), vec![Knowledge, View, Log, Graph]);
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Orbitals");
+    assert_eq!(shown(&st), vec![Knowledge, Orbitals, Log, Graph]);
+    // open_tab shows a panel where it is
+    st.open_tab(Selection);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Log]);
+    // closed, it is gone; open_tab brings it back in the right column's first leaf
+    st.workspace.close_panel(Graph);
+    assert!(!st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
+    st.open_tab(Graph);
+    assert!(st.tab_shown(Graph));
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection*,Readouts,Activity]),H(0.70,3D,V(0.62,[View,Orbitals,Graph*],[Log*])))");
+    // the right column closed: a panel shown again gets a new split right of the view
+    for t in [View, Orbitals, Graph, Log] {
+        st.workspace.close_panel(t);
+    }
+    st.open_tab(Log);
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection*,Readouts,Activity]),H(0.70,3D,[Log*]))");
+    st.reset_layout();
+    assert_eq!(shown(&st), vec![Model, Selection, View, Log], "Reset layout: the default back");
+    // Ctrl K reveals a control in its own panel: the solve log (Activity), then the distance
+    // guides (Selection, the same leaf: Activity goes behind it)
     let log = search::results("solve log", 1)[0];
-    assert_eq!(log.place, search::Place::Dock(DockTab::Activity));
+    assert_eq!(log.place, search::Place::Dock(Activity));
     search::pick(&ctx, &mut st, log);
-    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open);
+    assert!(st.tab_shown(Activity) && !st.tab_shown(Selection));
     let guides = search::results("distance guides", 1)[0];
     search::pick(&ctx, &mut st, guides);
-    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity));
-    // the chrome renders every combination without a command or an error
-    for (l, r) in [(false, false), (true, false), (false, true), (true, true)] {
-        (st.left_open, st.dock_open) = (l, r);
-        for w in [1400.0, 1000.0] {
-            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "left {l} right {r} at {w}");
+    assert!(st.tab_shown(Selection) && !st.tab_shown(Activity));
+    // the chrome renders every arrangement without a command or an error: the default, every
+    // panel in one leaf, the 3D view between stacked leaves, a floated panel, every panel closed
+    for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,Graph,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Graph*,Readouts]))")] {
+        match text {
+            Some(t) => st.workspace.set_node(layout::parse(t).unwrap()),
+            None => st.reset_layout(),
         }
+        assert!(layout::panels(&st.workspace.to_node()).len() == 9 || text.is_some());
+        for w in [1400.0, 1000.0] {
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{text:?} at {w}");
+        }
+    }
+    st.workspace.float_panel(Graph);
+    assert!(st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph), "floating: shown, not in the main tree");
+    for w in [1400.0, 1000.0] {
+        assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "floated at {w}");
+    }
+    for t in DockTab::PANELS {
+        st.workspace.close_panel(t);
+    }
+    assert!(shown(&st).is_empty());
+    for w in [1400.0, 1000.0] {
+        let out = frame(&ctx, &mut st, &inp, w, vec![]);
+        assert!(out.commands.is_empty(), "every panel closed at {w}");
     }
 }
 
-/// The docks' tab choice and open flags are display state: clicking them records no action.
+/// Docking spec D-3: the 3D view is the tile between the columns — its rect is
+/// `PanelOutput::view`, non-empty, right of the left column's tabs and left of the right
+/// column's — and the pointer over it is not over egui (the mouse tools get it, as over the
+/// space the old docks left), while over a panel it is. Wherever the tile sits.
 #[test]
-fn the_docks_state_is_not_recorded() {
+fn the_3d_view_is_the_tile_between_the_columns() {
+    use super::workspace::layout;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let outs = [click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log"), click_widget(&ctx, &mut st, &inp, "dock-chevron-Left")];
+    let mut view = egui::Rect::NOTHING;
+    for _ in 0..2 {
+        view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    }
+    let probe = |name: &str| PROBES.with(|p| p.borrow()[name]);
+    let (model, log) = (probe("dock-tab-Model"), probe("dock-tab-Log"));
+    assert!(view.width() > 500.0 && view.height() > 500.0, "{view:?}");
+    assert!(model.right() <= view.left() && view.right() <= log.left(), "model tab {model:?}, view {view:?}, log tab {log:?}");
+    assert!((330.0..350.0).contains(&view.left()) && (1060.0..1100.0).contains(&view.right()), "24 % of 1400, then 70 % of the rest: {view:?}");
+    let over = |st: &mut UiState, at: egui::Pos2| {
+        frame(&ctx, st, &inp, 1400.0, vec![egui::Event::PointerMoved(at)]);
+        (ctx.is_pointer_over_egui(), ctx.egui_wants_pointer_input())
+    };
+    assert_eq!(over(&mut st, view.center()), (false, false), "the 3D view is not egui's");
+    assert_eq!(over(&mut st, model.center() + egui::vec2(0.0, 120.0)), (true, true), "the Model panel's body is");
+    assert_eq!(over(&mut st, log.center()), (true, true), "a tab is");
+    // the view's tile in another place: under a panel, at the window's right
+    st.workspace.set_node(layout::parse("H(0.3,[Model*],V(0.4,[Log*],3D))").unwrap());
+    for _ in 0..2 {
+        view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    }
+    let (model, log) = (probe("dock-tab-Model"), probe("dock-tab-Log"));
+    assert!(model.right() <= view.left() && log.bottom() <= view.top() && view.width() > 500.0, "{view:?}");
+    assert_eq!(over(&mut st, view.center()), (false, false), "{view:?}");
+    assert_eq!(over(&mut st, log.center() + egui::vec2(0.0, 80.0)), (true, true), "the Log panel above it");
+}
+
+/// The workspace is display state: clicking its tabs, closing and showing panels records no
+/// action and sends no command.
+#[test]
+fn the_workspace_is_not_recorded() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let mut outs = vec![click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log")];
+    st.workspace.close_panel(DockTab::Log);
+    outs.push(vec![frame(&ctx, &mut st, &inp, 1400.0, vec![])]);
+    st.open_tab(DockTab::Log);
+    outs.push(click_widget(&ctx, &mut st, &inp, "dock-tab-Knowledge"));
     assert!(outs.iter().flatten().all(|o| o.actions.is_empty() && o.commands.is_empty()), "no action, no command");
+}
+
+/// Docking spec D-3: `egui_dock` cannot refuse a drop into the 3D view's leaf, so a panel found
+/// there is moved to a new split right of the view on the same frame (the pass is redrawn), still
+/// active; the view's leaf keeps only the view.
+#[test]
+fn a_panel_dropped_onto_the_3d_view_goes_beside_it() {
+    use super::workspace::layout;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.3,[Model*],3D)").unwrap());
+    st.workspace.drop_into_view_for_test(DockTab::Log);
+    let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.30,[Model*],H(0.70,3D,[Log*]))");
+    assert!(st.tab_shown(DockTab::Log));
+    let view = out.view.unwrap();
+    assert!(view.width() > 500.0, "the view is drawn, not the Log over it: {view:?}");
+}
+
+/// The profile keeps the workspace as one `layout = …` line (docking spec D-8) and no old dock
+/// keys; it reads back to the same tree; a layout that does not parse loads the default.
+#[test]
+fn the_profile_keeps_the_layout() {
+    use super::workspace::layout;
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    let text = profile::capture(&st);
+    assert!(text.contains(&format!("layout = {}\n", layout::encode(&layout::default_layout()))), "{text}");
+    for old in ["left_tab", "right_tab", "left_width", "right_width", "dock_open", "left_open"] {
+        assert!(!text.contains(old), "{old} in\n{text}");
+    }
+    assert_eq!(profile::defaults(&st), text, "a fresh state's profile is the defaults");
+    let custom = "V(0.30,[Log*,Graph],H(0.60,3D,[Model,View*]))";
+    st.workspace.set_node(layout::parse(custom).unwrap());
+    let text = profile::capture(&st);
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert_eq!(layout::encode(&back.workspace.to_node()), custom);
+    assert!(back.tab_shown(DockTab::Log) && back.tab_shown(DockTab::View) && !back.tab_shown(DockTab::Model));
+    // nonsense, or a tree without the 3D view: the default
+    for bad in ["layout = nonsense", "layout = [Model*,Log]", "layout = "] {
+        let mut s = UiState::new("h2", &scene);
+        s.workspace.set_node(layout::parse(custom).unwrap());
+        profile::apply(&mut s, bad);
+        assert_eq!(s.workspace.to_node(), layout::default_layout(), "{bad}");
+    }
+    // a profile without layout keys leaves the arrangement alone
+    let mut s = UiState::new("h2", &scene);
+    s.workspace.set_node(layout::parse(custom).unwrap());
+    profile::apply(&mut s, "show_bonds = false\n");
+    assert_eq!(layout::encode(&s.workspace.to_node()), custom);
 }
 
 // ---- the Play snapshot (`ui::rewind`) ----
@@ -4871,7 +5011,7 @@ mod knowledge_map {
         st.backend = Backend::Estimated;
         st.activity.absorb(&snap);
         assert!(st.activity.knowledge.is_some(), "the map is kept from the snapshot");
-        st.open_tab(DockTab::Knowledge);
+        alone(&mut st, DockTab::Knowledge);
         let t = texts(&ctx, &mut st, &inp);
         for want in ["lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a", "2140 samples · H C O", "3 trusted", "2 thin", "1 never seen", "C–C · never", "C–H · trusted", "H–H · thin", "2140 atoms", "THIS SCENE ASKS"] {
             assert!(t.contains(want), "{want:?} in the tab:\n{t}");
@@ -4889,11 +5029,11 @@ mod knowledge_map {
         assert_eq!(st.knowledge.pick, Pick::Element(6));
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("asked: #0") && t.contains("BOND ANGLES AT C"), "{t}");
-        // the pop-out window draws the same map
-        click_widget(&ctx, &mut st, &inp, "knowledge-popout");
-        assert!(st.knowledge.window);
+        // the pop-out window is gone (docking spec D-5): the panel in a wide leaf (or floated) lays
+        // the same map out in two columns, keeping the pick
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.25,3D,[Knowledge*])").unwrap());
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("Knowledge map") && t.matches("element · 610 atoms").count() == 2, "tab and window share the pick:\n{t}");
+        assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("BOND ANGLES AT C"), "the wide panel keeps the pick:\n{t}");
         // another solver: the empty state
         let gpu = snapshot(&scene, Backend::Gpu, None);
         st.backend = Backend::Gpu;
@@ -4933,7 +5073,7 @@ mod knowledge_map {
         let mut st = UiState::new("h2o", &scene);
         st.backend = Backend::Estimated;
         st.activity.absorb(&snap);
-        st.open_tab(DockTab::Knowledge);
+        alone(&mut st, DockTab::Knowledge);
         st.knowledge.pick = Pick::Pair(1, 1);
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("thin: taught, but not everywhere it was met"), "{t}");
@@ -4985,15 +5125,31 @@ mod knowledge_map {
         let mut fresh = UiState::new("h2o", &scene);
         profile::apply(&mut fresh, &text);
         assert!(fresh.show_knowledge);
-        // a profile saved before the Knowledge tab keeps its layout and gains the tab
+        // a profile saved before the workspace (and before the Knowledge tab) migrates into it
+        // (docking spec D-8): its docks' tabs in the matching columns, every panel once, the tab
+        // each dock showed active
+        use super::super::workspace::layout;
+        let once = |s: &UiState| {
+            let p = layout::panels(&s.workspace.to_node());
+            DockTab::PANELS.into_iter().all(|t| p.iter().filter(|&&x| x == t).count() == 1) && p.len() == DockTab::PANELS.len()
+        };
         let mut old = UiState::new("h2o", &scene);
-        profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\n");
-        assert_eq!(old.left_tabs, vec![DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Log], "the moved Log stays left");
-        assert_eq!(old.right_tabs, vec![DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection]);
-        assert_eq!(old.dock_tab, DockTab::Selection);
-        // a layout naming a tab twice is still ignored
+        profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\nleft_tab = Graph\nleft_width = 400\ndock_open = false\n");
+        assert!(once(&old), "{}", layout::encode(&old.workspace.to_node()));
+        assert_eq!(
+            layout::encode(&old.workspace.to_node()),
+            "H(0.24,[Activity,Readouts,Graph*,Log],H(0.70,3D,[Model,View,Orbitals,Selection*,Knowledge]))",
+            "the moved Log stays left; Knowledge, never listed, joins the right column"
+        );
+        assert!(old.tab_shown(DockTab::Selection) && old.tab_shown(DockTab::Graph));
+        // a tab named twice keeps its first place (it was ignored by the old docks' reader)
         let mut dup = UiState::new("h2o", &scene);
         profile::apply(&mut dup, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Log\n");
-        assert_eq!(dup.right_tabs, DockTab::RIGHT.to_vec());
+        assert!(once(&dup), "{}", layout::encode(&dup.workspace.to_node()));
+        assert!(layout::encode(&dup.workspace.to_node()).starts_with("H(0.24,[Activity*,Readouts,Graph,Log],"), "{}", layout::encode(&dup.workspace.to_node()));
+        // only one of the two lists: the other column gets the panels it does not name
+        let mut half = UiState::new("h2o", &scene);
+        profile::apply(&mut half, "right_tabs = Log Model\n");
+        assert!(once(&half), "{}", layout::encode(&half.workspace.to_node()));
     }
 }

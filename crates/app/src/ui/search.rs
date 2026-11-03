@@ -167,7 +167,6 @@ pub const ENTRIES: &[Entry] = &[
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
     // Knowledge (M8a Task 9)
     e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
-    e("Open the knowledge map window", "pop out knowledge map larger window", Dock(D::Knowledge), "d-knowledge-popout"),
     // Activity
     e("Jobs (what is running)", "activity progress cancel pause stop sampling refit audit solve work", Dock(D::Activity), "d-jobs"),
     e("Counters (samples, teacher solves)", "activity samples in the model teacher solves this session ticks", Dock(D::Activity), "d-counters"),

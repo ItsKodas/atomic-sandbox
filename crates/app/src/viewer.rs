@@ -911,17 +911,20 @@ impl Viewer {
     }
 
     /// The window was resized to `w × h` physical pixels: until the next frame lays the chrome out,
-    /// the viewport keeps its margins to the window's edges (the panels have fixed widths), so a
-    /// cursor event before that frame maps through the new rect, not the old one. The next
-    /// `run_ui` replaces the estimate with the chrome's own rect (a layout switch to compact).
+    /// the viewport is estimated — across, it scales with the width (the workspace spans the
+    /// window and its splits are fractions, `ui::workspace`); down, it keeps its margins (the top
+    /// bar and the toolbar have fixed heights) — so a cursor event before that frame maps through
+    /// the new rect, not the old one. Exact for the default layout, whose 3D tile spans the
+    /// workspace's height; the next `run_ui` replaces the estimate with the chrome's own rect (a
+    /// stacked layout, a switch to compact).
     fn resize_viewport(&mut self, w: f32, h: f32) {
-        let Some((sw, sh)) = self.screen.filter(|_| w > 0.0 && h > 0.0) else { return };
+        let Some((sw, sh)) = self.screen.filter(|&(sw, _)| w > 0.0 && h > 0.0 && sw > 0.0) else { return };
         let vp = self.viewport;
-        let right = sw - (vp.origin[0] + vp.size[0]);
+        let sx = w / sw;
         let bottom = sh - (vp.origin[1] + vp.size[1]);
         self.viewport = Viewport {
-            origin: vp.origin,
-            size: [(w - vp.origin[0] - right).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+            origin: [vp.origin[0] * sx, vp.origin[1]],
+            size: [(vp.size[0] * sx).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
         };
         self.screen = Some((w, h));
     }
@@ -3249,8 +3252,8 @@ nucleus 1 {a} {} {}
         assert!((v.ui.drag_force - 0.15625).abs() < 1e-15, "the pull stays for the next drag");
     }
 
-    /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and
-    /// strip on the right), in physical pixels, snapped to whole pixels at a fractional scale.
+    /// The frame's viewport is the 3D view's tile (top bar above, toolbar below, the workspace's
+    /// panels either side), in physical pixels, snapped to whole pixels at a fractional scale.
     #[test]
     fn the_viewport_is_the_rect_the_chrome_leaves() {
         let mut v = Viewer::new("h2").unwrap();
@@ -3267,33 +3270,38 @@ nucleus 1 {a} {} {}
             }
             v.viewport
         };
-        // the default (2026-10-19): both docks open — the left on Activity, the right on Model —
-        // each 336 pt wide (`UiState::dock_w`) beside its icon strip
+        // the default workspace (docking spec D-9): the left column at 24 % of the window, the 3D
+        // view, the right column at 30 % of what is left
+        use crate::ui::DockTab;
         let both = v.viewport;
         eprintln!("viewport at 1400×900: {both:?}");
-        assert!((360.0..400.0).contains(&both.origin[0]), "the left dock and its strip are on the left: {both:?}");
+        assert!((330.0..350.0).contains(&both.origin[0]), "the left column is on the left: {both:?}");
         assert!((30.0..60.0).contains(&both.origin[1]), "the top bar is above: {both:?}");
         let bottom = both.origin[1] + both.size[1];
-        assert!((1000.0..1040.0).contains(&(both.origin[0] + both.size[0])), "the right dock and its strip are on the right: {both:?}");
+        assert!((1060.0..1100.0).contains(&(both.origin[0] + both.size[0])), "the right column is on the right: {both:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
-        // folding the right dock gives its width back, up to its strip
-        v.ui.dock_open = false;
+        // closing the right column's panels gives its width back, to the window's edge
+        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log] {
+            v.ui.workspace.close_panel(t);
+        }
         let left_only = frames(&mut v);
-        assert_eq!(left_only.origin, both.origin, "the left dock did not move");
-        assert!((1330.0..1360.0).contains(&(left_only.origin[0] + left_only.size[0])), "only the right dock's strip is on the right: {left_only:?}");
-        // opening it again (another tab) takes the width back from the right
-        v.ui.open_tab(crate::ui::DockTab::Selection);
-        assert_eq!(frames(&mut v), both, "the right dock keeps its width across tabs");
-        // folding the left dock widens the view on the left, to its strip
-        v.ui.left_open = false;
+        assert_eq!(left_only.origin, both.origin, "the left column did not move");
+        assert!((1390.0..=1400.0).contains(&(left_only.origin[0] + left_only.size[0])), "nothing is on the right: {left_only:?}");
+        // a panel shown again goes back beside the view, at the default's share
+        v.ui.open_tab(DockTab::Log);
+        assert_eq!(frames(&mut v), both, "the right column is back at its width");
+        // closing the left column's panels widens the view on the left, to the window's edge
+        for t in [DockTab::Model, DockTab::Knowledge, DockTab::Selection, DockTab::Readouts, DockTab::Activity, DockTab::Graph] {
+            v.ui.workspace.close_panel(t);
+        }
         let right_only = frames(&mut v);
-        assert!((30.0..60.0).contains(&right_only.origin[0]), "{right_only:?}");
-        assert!(right_only.size[0] > both.size[0] + 250.0, "{right_only:?}");
-        // both folded: the view spans the window between the two strips
-        v.ui.dock_open = false;
+        assert!(right_only.origin[0] < 10.0, "{right_only:?}");
+        assert!(right_only.size[0] > both.size[0] + 200.0, "the left column's 24 %, less the right column's share of it: {right_only:?}");
+        // every panel closed: the view spans the window
+        v.ui.workspace.close_panel(DockTab::Log);
         let none = frames(&mut v);
         assert!(none.size[0] > right_only.size[0] + 250.0, "{none:?}");
-        assert!((1340.0..1370.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 60.0, "{none:?}");
+        assert!((1390.0..=1400.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 10.0, "{none:?}");
         // points → physical pixels, whole pixels
         let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
         assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });

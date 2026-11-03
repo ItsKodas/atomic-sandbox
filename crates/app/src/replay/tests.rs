@@ -417,7 +417,9 @@ fn a_recorded_session_replays_to_the_same_snapshot_sequence() {
 fn view_coordinates_survive_a_window_size_change() {
     let mut v = Viewer::new("h2").unwrap();
     let mut host = Bare;
-    let sizes = [(1400, 900), (1000, 640)];
+    // the second size changes the aspect as well: the workspace's splits are fractions, so a
+    // uniform scale would keep the 3D tile's aspect
+    let sizes = [(1400, 900), (1000, 760)];
     let mut viewports = Vec::new();
     let mut placed = Vec::new();
     let (n1, q) = {
@@ -585,9 +587,11 @@ fn mark_relative_expectations_and_scene_lines() {
     assert!(e.starts_with("line 1: scene no-such.scene: "), "{e}");
 }
 
-/// A resize keeps the viewport's margins until the next frame lays the chrome out (fixed-width
-/// panels: the estimate is the chrome's own rect), so a cursor between the two maps through the new
-/// rect: the same view point picks the same nucleus before and after that frame.
+/// A resize scales the viewport across and keeps its vertical margins until the next frame lays
+/// the chrome out (the workspace's splits are fractions of the width, the bars have fixed
+/// heights: for the default layout the estimate is the chrome's own rect), so a cursor between
+/// the two maps through the new rect: the same view point picks the same nucleus before and after
+/// that frame.
 #[test]
 fn a_cursor_after_a_resize_maps_through_the_new_viewport() {
     let mut v = Viewer::new("h2").unwrap();

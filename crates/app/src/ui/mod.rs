@@ -6,12 +6,14 @@
 //!   the scene chip (preset picker and Reset), and the Ctrl K control search (`search`);
 //! - a **bottom toolbar** (`toolbar`) for what the hands do: time, speed with the measured fs/s,
 //!   dt, the tool, the element to place, the selection's actions, the solver with its trust light;
-//! - a **right dock** (`dock`) for what is read: Readouts, Graph, Model, Selection and Log tabs,
-//!   collapsible to an icon strip whose dots keep drift, trust and errors visible;
+//! - the **workspace** (`workspace`, docking spec D-2..D-5): the 3D view and the panels (`dock`:
+//!   Model, Knowledge, Selection, Readouts, Activity, Graph, View, Orbitals, Log) as one tree of
+//!   splits and tabbed leaves the user rearranges, whose tabs keep drift, trust and errors visible;
 //! - **overlays** in the 3D view (`overlays`): the status chip, the atom card, the faded-density
 //!   label, toasts, the sampling and first-pass cards, the Volume / Isosurface switch and the axes
-//!   gizmo. The view is the space the panels leave (no `CentralPanel`: egui would then count the
-//!   pointer over the 3D view as over egui, and the mouse tools would stop working).
+//!   gizmo. The view is the 3D tile's rect, and the root `Ui` is left holding exactly that rect
+//!   (`workspace::tree::show`; no `CentralPanel`): egui counts the pointer there as not over egui,
+//!   so the mouse tools keep working wherever the tile sits.
 //!
 //! The chrome never edits the scene directly: widgets emit [`Action`]s, and [`actions::apply`]
 //! turns them into the same [`Command`]s the old side panel sent (the viewer sends them to the
@@ -212,16 +214,9 @@ pub enum ToolMode {
     Edit,
 }
 
-/// Which edge a dock sits on (user request 2026-10-19: the left dock is what is going on — stats —
-/// the right is what you configure).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockSide {
-    Left,
-    Right,
-}
-
-/// The docks' tabs: [`DockTab::LEFT`] on the left dock, [`DockTab::RIGHT`] on the right.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The workspace's panels (docking spec D-2: "dock tab" now means "panel"); every one is in
+/// [`DockTab::PANELS`]. Where each sits is the workspace tree's (`UiState::workspace`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
     Readouts,
     Graph,
@@ -234,18 +229,15 @@ pub enum DockTab {
     Log,
     /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
     Knowledge,
-    /// Every control of the old View menu, regrouped (docking spec D-6). A workspace panel only:
-    /// it is in [`DockTab::PANELS`], not in [`DockTab::ALL`] / [`DockTab::RIGHT`], so the old docks
-    /// never show it.
+    /// Every control of the old View menu (docking spec D-6; until docking Task 4 regroups it, the
+    /// View menu's own contents, `menus::view_menu`).
     View,
 }
 
 impl DockTab {
-    /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser). The old
-    /// docks' tabs only: the View panel is in [`DockTab::PANELS`].
-    pub const ALL: [DockTab; 8] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
-    /// Every panel of the workspace (docking spec D-2), View included (the workspace's sweep; the
-    /// order a migrated layout adds panels an old profile never listed, `workspace::layout`).
+    /// Every panel of the workspace (docking spec D-2), View included (the tests' sweep, the saved
+    /// layout's parser, the screenshot harness's `tab=`; the order a migrated layout adds panels
+    /// an old profile never listed, `workspace::layout`).
     pub const PANELS: [DockTab; 9] = [
         DockTab::Model,
         DockTab::Knowledge,
@@ -257,22 +249,9 @@ impl DockTab {
         DockTab::Activity,
         DockTab::Graph,
     ];
-    /// The left dock's tabs, in strip order: stats and what is going on.
-    pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
-    /// The right dock's tabs, in strip order: configuring things.
-    pub const RIGHT: [DockTab; 5] = [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
-
-    /// The dock this tab starts in (the tests; the layout can move it: `UiState::side_of`).
-    #[cfg(test)]
-    pub fn side(self) -> DockSide {
-        match self {
-            DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
-            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log | DockTab::View => DockSide::Right,
-        }
-    }
-
-    /// The panel's one-word name in a saved layout (docking spec D-9: `[Model*,Knowledge]`) — the
-    /// same word the profile's `left_tabs` / `right_tabs` lines use (`format!("{tab:?}")`).
+    /// The panel's one-word name: its tab's label (docking spec D-4), its word in a saved layout
+    /// (spec D-9: `[Model*,Knowledge]`) and in an old profile's `left_tabs` / `right_tabs` lines,
+    /// and the screenshot harness's `tab=` (any case).
     pub fn name(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
@@ -298,17 +277,6 @@ impl DockTab {
             DockTab::Log => "Log",
             DockTab::Knowledge => "Knowledge · what the model knows",
             DockTab::View => "View",
-        }
-    }
-}
-
-impl DockSide {
-    /// The tabs this dock starts with, in strip order (the tests; the layout: `UiState::tabs`).
-    #[cfg(test)]
-    pub fn tabs(self) -> &'static [DockTab] {
-        match self {
-            DockSide::Left => &DockTab::LEFT,
-            DockSide::Right => &DockTab::RIGHT,
         }
     }
 }
@@ -761,28 +729,11 @@ pub struct UiState {
     /// (display only; empty outside the Edit tool).
     pub edit_group: Vec<usize>,
     // ---- the chrome's own view state (M6 redesign) ----
-    /// The RIGHT dock's tab (one of [`DockTab::RIGHT`]), and whether it is open (else only its icon
-    /// strip shows). Display state: not recorded.
-    pub dock_tab: DockTab,
-    pub dock_open: bool,
-    /// The LEFT dock's tab (one of [`DockTab::LEFT`]) and whether it is open — its own state, a width
-    /// of its own (user request 2026-10-19). Display state: not recorded.
-    pub left_tab: DockTab,
-    pub left_open: bool,
-    /// Each dock's tabs in strip order (user request 2026-10-19: drag a strip icon up or down, or
-    /// across to the other dock). Starts as [`DockTab::LEFT`] / [`DockTab::RIGHT`]; the window
-    /// keeps it in `layout_file`. Every tab is in exactly one of them.
-    pub left_tabs: Vec<DockTab>,
-    pub right_tabs: Vec<DockTab>,
-    /// The strip icon being dragged, and each strip's rect and button rects this frame (left, right).
-    pub drag_tab: Option<DockTab>,
-    pub strip_geom: [Option<(egui::Rect, Vec<(DockTab, egui::Rect)>)>; 2],
-    /// Where the window saves the tab layout (`None`: headless, never saved).
-    pub layout_file: Option<std::path::PathBuf>,
-    /// Each dock's panel width as last drawn (left, right), and a width a profile asks for
-    /// (applied for one frame).
-    pub dock_w: [f32; 2],
-    pub dock_w_set: Option<[f32; 2]>,
+    /// The workspace (docking spec D-2, D-3): the 3D view and the panels as one tree of splits and
+    /// tabbed leaves, plus panels floated out of it. Starts as the D1 default
+    /// (`workspace::layout::default_layout`); the profile keeps it (`layout = …`). Display state:
+    /// not recorded.
+    pub workspace: workspace::Workspace,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -817,95 +768,22 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Opens `tab`'s dock on it (a dock is only ever asked for its own tabs): the search, the
-    /// Activity bar, a view mode that needs the Orbitals tab. Display state, never recorded.
+    /// Shows `tab` (`Workspace::show_panel`: made the active tab of its leaf, or put back beside
+    /// the 3D view when it was closed): the search, the Activity bar, a view mode that needs the
+    /// Orbitals tab. Display state, never recorded.
     pub fn open_tab(&mut self, tab: DockTab) {
-        match self.side_of(tab) {
-            DockSide::Left => (self.left_open, self.left_tab) = (true, tab),
-            DockSide::Right => (self.dock_open, self.dock_tab) = (true, tab),
-        }
+        self.workspace.show_panel(tab);
     }
 
-    /// Whether `tab` is on screen: its dock is open and showing it.
+    /// Whether `tab` is on screen: in the workspace and the active tab of its leaf
+    /// (`Workspace::visible`).
     pub fn tab_shown(&self, tab: DockTab) -> bool {
-        match self.side_of(tab) {
-            DockSide::Left => self.left_open && self.left_tab == tab,
-            DockSide::Right => self.dock_open && self.dock_tab == tab,
-        }
+        self.workspace.visible(tab)
     }
 
-    /// The dock `tab` is in now (the layout can move it).
-    pub fn side_of(&self, tab: DockTab) -> DockSide {
-        if self.left_tabs.contains(&tab) { DockSide::Left } else { DockSide::Right }
-    }
-
-    /// A dock's tabs in strip order.
-    pub fn tabs(&self, side: DockSide) -> &[DockTab] {
-        match side {
-            DockSide::Left => &self.left_tabs,
-            DockSide::Right => &self.right_tabs,
-        }
-    }
-
-    /// Moves `tab` to `side` at `index` (clamped) and opens it there; the dock it left shows its
-    /// first remaining tab, or folds when it has none. Saves the layout.
-    pub fn move_tab(&mut self, tab: DockTab, side: DockSide, index: usize) {
-        let from = self.side_of(tab);
-        let was_shown = self.tab_shown(tab);
-        self.left_tabs.retain(|&t| t != tab);
-        self.right_tabs.retain(|&t| t != tab);
-        let list = match side {
-            DockSide::Left => &mut self.left_tabs,
-            DockSide::Right => &mut self.right_tabs,
-        };
-        list.insert(index.min(list.len()), tab);
-        self.fix_selection(from);
-        if from != side || was_shown {
-            self.open_tab(tab);
-        }
-        self.save_layout();
-    }
-
-    /// A dock whose selected tab left it shows its first tab, or folds when it has none.
-    fn fix_selection(&mut self, side: DockSide) {
-        let tabs = self.tabs(side).to_vec();
-        let (open, sel) = self.dock_mut(side);
-        match tabs.first() {
-            None => *open = false,
-            Some(&f) => {
-                if !tabs.contains(sel) {
-                    *sel = f;
-                }
-            }
-        }
-    }
-
-    /// The default tab layout back.
+    /// The default layout back (the D1 default, `workspace::layout::default_layout`).
     pub fn reset_layout(&mut self) {
-        self.left_tabs = DockTab::LEFT.to_vec();
-        self.right_tabs = DockTab::RIGHT.to_vec();
-        self.fix_selection(DockSide::Left);
-        self.fix_selection(DockSide::Right);
-        self.save_layout();
-    }
-
-    fn save_layout(&self) {
-        let Some(p) = &self.layout_file else { return };
-        let names = |v: &[DockTab]| v.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(p, format!("left {}
-right {}
-", names(&self.left_tabs), names(&self.right_tabs)));
-    }
-
-    /// A dock's open flag and tab, to read or change.
-    pub fn dock_mut(&mut self, side: DockSide) -> (&mut bool, &mut DockTab) {
-        match side {
-            DockSide::Left => (&mut self.left_open, &mut self.left_tab),
-            DockSide::Right => (&mut self.dock_open, &mut self.dock_tab),
-        }
+        self.workspace.set_node(workspace::layout::default_layout());
     }
 
     pub fn new(preset: &str, scene: &Scene) -> UiState {
@@ -1024,17 +902,7 @@ right {}
             bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
-            dock_tab: DockTab::Model,
-            dock_open: true,
-            left_tab: DockTab::Activity,
-            left_open: true,
-            left_tabs: DockTab::LEFT.to_vec(),
-            right_tabs: DockTab::RIGHT.to_vec(),
-            drag_tab: None,
-            strip_geom: [None, None],
-            layout_file: None,
-            dock_w: [336.0, 336.0],
-            dock_w_set: None,
+            workspace: workspace::Workspace::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
@@ -1301,8 +1169,8 @@ pub struct PanelOutput {
     pub deselect: bool,
     /// A UI-side failure (invalid grid, unreadable file) to show in red.
     pub error: Option<String>,
-    /// The 3D view: the rect (points) the top bar, toolbar and dock leave. The viewer turns it into
-    /// the frame's `render::camera::Viewport`.
+    /// The 3D view: its tile's rect (points) in the workspace (`workspace::tree::show`). The viewer
+    /// turns it into the frame's `render::camera::Viewport`.
     pub view: Option<egui::Rect>,
     /// The actions the chrome's own widgets and keys emitted this frame, in order (not the ones
     /// queued from the 3D view, which the recorder already has as input events): what
@@ -1349,9 +1217,12 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     menus::top_bar(root, st, input, compact, &mut acts);
     let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
     activity::bar(root, st, input, bar_rect);
-    dock::show(root, st, input, &mut acts);
-    let view = root.available_rect_before_wrap();
+    let view = workspace::tree::show(root, st, input, &mut acts);
     out.view = Some(view);
+    // the Log's unread count is read once the Log is on screen (its tab's badge goes)
+    if st.tab_shown(DockTab::Log) {
+        st.log.unread = 0;
+    }
     // the training views are built only while shown (activity spec §6)
     let want = st.tab_shown(DockTab::Activity) && st.activity.training_open;
     if want != st.activity.views_sent {
@@ -1360,7 +1231,6 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     }
     overlays::show(root.ctx(), view, st, input, &mut acts);
     knowledge::legend(root.ctx(), view, st, input);
-    knowledge::window(root.ctx(), st, input);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
@@ -1380,6 +1250,23 @@ thread_local! {
     /// Test hook: the rect of each probed widget in the last frame (`probe`), so the headless click
     /// tests can press the real widget.
     pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<String, egui::Rect>> = Default::default();
+    /// Test hook: a prefix [`probe`] puts before every name while set — the View panel draws the
+    /// View menu's widgets a second time (`with_probe_prefix`), under `view-panel/<name>`, so a
+    /// test clicking a menu item still finds the menu's own.
+    static PROBE_PREFIX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Runs `f` with every probe name prefixed by `prefix` (tests; a plain call outside them).
+#[inline]
+fn with_probe_prefix<R>(prefix: &'static str, f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    let before = PROBE_PREFIX.with(|p| p.replace(prefix));
+    #[cfg(not(test))]
+    let _ = prefix;
+    let r = f();
+    #[cfg(test)]
+    PROBE_PREFIX.with(|p| p.set(before));
+    r
 }
 
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
@@ -1387,7 +1274,7 @@ thread_local! {
 fn probe(name: &str, r: &egui::Response) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(name.to_string(), r.rect);
+        p.borrow_mut().insert(format!("{}{name}", PROBE_PREFIX.with(|x| x.get())), r.rect);
     });
     #[cfg(not(test))]
     let _ = (name, r);

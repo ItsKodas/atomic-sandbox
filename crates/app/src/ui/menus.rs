@@ -681,7 +681,8 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     }
 }
 
-fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+/// The View menu's contents (also the View panel's body until docking Task 4 regroups them).
+pub(super) fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     anchored(ui, st, "m-density", |ui, st| {
         theme::section(ui, "Density");
         // orbital-viewer spec §3: what the view shows; the Orbitals dock tab holds the list and the per-mode controls

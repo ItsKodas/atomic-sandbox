@@ -24,10 +24,11 @@ const H: u32 = 900;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
-/// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// knowledge|activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
-/// others on the right; the left dock starts open on Readouts, the right one collapsed), `dock=closed`
-/// collapses both, `select=<i>` selects a nucleus,
+/// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=<panel>` shows that
+/// panel (its name, any case: `readouts|graph|model|knowledge|activity|orbitals|selection|log|view`;
+/// `UiState::open_tab`: the active tab of its leaf in the default layout, `ui::workspace`),
+/// `dock=closed` closes every panel (the 3D view fills the window; docking D2's Presenting layout
+/// will replace it), `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -55,7 +56,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// simulated femtoseconds, 5–10 000; 100 by default) and `trail_opacity=<0-100>` (percent; 70 by
 /// default). They are set before the play, so the history is collected while it runs.
 ///
-/// The knowledge map (M8a Task 9): `tab=knowledge` opens its tab (right dock), `knowledge=on|off`
+/// The knowledge map (M8a Task 9): `tab=knowledge` shows its panel, `knowledge=on|off`
 /// switches View ▸ Display aids ▸ knowledge overlay (the atoms' tint and its legend; off by
 /// default). Both need the estimated solver's map to show more than their empty state.
 ///
@@ -360,23 +361,13 @@ impl ShotUi {
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
         if let Some(t) = &self.tab {
-            let tab = match t.as_str() {
-                "readouts" => DockTab::Readouts,
-                "graph" => DockTab::Graph,
-                "model" => DockTab::Model,
-                "knowledge" => DockTab::Knowledge,
-                "activity" => DockTab::Activity,
-                "orbitals" => DockTab::Orbitals,
-                "selection" => DockTab::Selection,
-                "log" => DockTab::Log,
-                other => return Err(format!("--ui: unknown tab {other}")),
-            };
-            // each tab opens its own dock (activity, readouts, graph: the left one)
+            let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
             viewer.ui.open_tab(tab);
         }
         if self.dock_closed {
-            viewer.ui.dock_open = false;
-            viewer.ui.left_open = false;
+            for t in DockTab::PANELS {
+                viewer.ui.workspace.close_panel(t);
+            }
         }
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
