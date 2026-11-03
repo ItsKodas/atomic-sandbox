@@ -60,11 +60,9 @@ pub enum Icon {
     Knowledge,
     /// An eye: the eye shape filled, the pupil stroked (the View tab).
     View,
-    /// A push-pin, its head filled (D2's pin a panel open; unused until then).
-    #[allow(dead_code)]
+    /// A push-pin, its head filled (a docked leaf's pin: auto-hide its active tab, D2).
     Pin,
-    /// The push-pin tilted 45° (D2's unpin: the panel auto-hides to its strip).
-    #[allow(dead_code)]
+    /// The push-pin tilted 45° (an auto-hidden panel's flyout: pin it back, D2).
     Unpin,
     /// A window, filled, with an arrow entering it (D3's dock a detached panel back).
     #[allow(dead_code)]
@@ -418,9 +416,8 @@ pub fn seg_button(ui: &mut Ui, icon: Icon, text: &str, selected: bool) -> Respon
     r
 }
 
-/// An unframed strip button (34 × 34), with the selected state: the old docks' icon strip, unused
-/// until the auto-hide strip comes back (docking spec D-10, D2).
-#[allow(dead_code)]
+/// An unframed strip button (34 × 34), with the selected state: the auto-hide strips' (docking
+/// spec D-10, D2; the old docks' icon strip).
 pub fn strip_button(ui: &mut Ui, icon: Icon, selected: bool) -> Response {
     let (rect, r) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
     let bg = if selected {

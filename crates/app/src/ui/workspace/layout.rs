@@ -18,6 +18,13 @@
 //! [`MAX_DEPTH`], or a tree left without the 3D view does not parse — the caller then uses
 //! [`default_layout`]. [`encode`] writes `frac` with two decimals (1 % of the window, which is
 //! what a saved layout keeps) and always stars the active tab.
+//!
+//! The auto-hidden panels (spec D-8, D-10; D2) are a second line, `hidden = Graph:left:340,
+//! Log:right:300`: each panel's name, the 3D view's edge it folded to and its remembered size in
+//! points (its width; its height on the bottom edge). [`parse_hidden`] is total too: names and
+//! edges are read in any case, a size is clamped to [`HIDDEN_MIN`]..=[`HIDDEN_MAX`], an entry
+//! whose name, edge or size cannot be read is dropped, and a panel listed twice keeps its first
+//! entry.
 
 use crate::ui::DockTab;
 use std::fmt::Write as _;
@@ -226,6 +233,62 @@ pub fn has_view(n: &Node) -> bool {
         Node::Leaf { .. } => false,
         Node::Split { a, b, .. } => has_view(a) || has_view(b),
     }
+}
+
+/// The edge of the 3D view an auto-hidden panel folds to (spec D-10): its strip and its flyout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Edge {
+    Left,
+    Right,
+    Bottom,
+}
+
+impl Edge {
+    pub const ALL: [Edge; 3] = [Edge::Left, Edge::Right, Edge::Bottom];
+
+    /// The profile's word for the edge.
+    pub fn word(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Bottom => "bottom",
+        }
+    }
+}
+
+/// An auto-hidden panel (spec D-10): the edge it folded to and its remembered size in points —
+/// its leaf's width, or height on the bottom edge — which its flyout opens at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hidden {
+    pub tab: DockTab,
+    pub edge: Edge,
+    pub size: f32,
+}
+
+/// The bounds of a hidden panel's remembered size (points).
+pub const HIDDEN_MIN: f32 = 160.0;
+pub const HIDDEN_MAX: f32 = 900.0;
+
+/// The `hidden = …` line's value: `Name:edge:size` entries joined by `, `, sizes in whole points.
+pub fn encode_hidden(h: &[Hidden]) -> String {
+    h.iter().map(|h| format!("{}:{}:{:.0}", h.tab.name(), h.edge.word(), h.size)).collect::<Vec<_>>().join(", ")
+}
+
+/// Reads a `hidden = …` value (see the module doc: total, sizes clamped, the unreadable dropped,
+/// a duplicate keeps its first entry).
+pub fn parse_hidden(s: &str) -> Vec<Hidden> {
+    let mut out: Vec<Hidden> = Vec::new();
+    for entry in s.split(',') {
+        let mut parts = entry.split(':').map(str::trim);
+        let (Some(name), Some(edge), Some(size), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        let Some(tab) = tab_named(name) else { continue };
+        let Some(edge) = Edge::ALL.into_iter().find(|e| edge.eq_ignore_ascii_case(e.word())) else { continue };
+        let Some(size) = size.parse::<f32>().ok().filter(|x| !x.is_nan()) else { continue };
+        if !out.iter().any(|h| h.tab == tab) {
+            out.push(Hidden { tab, edge, size: size.clamp(HIDDEN_MIN, HIDDEN_MAX) });
+        }
+    }
+    out
 }
 
 /// The panel a saved name means: its [`DockTab::name`] or [`DockTab::title`], any case.
@@ -489,5 +552,28 @@ mod tests {
     #[test]
     fn from_two_empty_lists_is_the_default() {
         assert_eq!(from_sides(&[], &[]), default_layout());
+    }
+
+    #[test]
+    fn hidden_panels_round_trip() {
+        let h = vec![Hidden { tab: Graph, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Right, size: 300.0 }, Hidden { tab: View, edge: Edge::Bottom, size: 260.4 }];
+        assert_eq!(encode_hidden(&h), "Graph:left:340, Log:right:300, View:bottom:260");
+        assert_eq!(parse_hidden("Graph:left:340, Log:right:300"), h[..2].to_vec(), "the spec's example");
+        assert_eq!(encode_hidden(&parse_hidden(&encode_hidden(&h))), encode_hidden(&h));
+        assert_eq!(encode_hidden(&[]), "");
+        assert_eq!(parse_hidden(""), vec![]);
+    }
+
+    #[test]
+    fn hidden_names_and_edges_are_case_insensitive_sizes_clamped_unknown_dropped() {
+        assert_eq!(
+            parse_hidden(" graph : LEFT : 340 ,LOG:Bottom:5000, model:right:12"),
+            vec![Hidden { tab: Graph, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Bottom, size: HIDDEN_MAX }, Hidden { tab: Model, edge: Edge::Right, size: HIDDEN_MIN }]
+        );
+        // an unknown name, an unknown edge, an unreadable size, a missing or extra field: dropped
+        assert_eq!(parse_hidden("Bogus:left:300, Graph:top:300, Log:left:wide, Model:left, View:left:300:9, Orbitals:left:NaN, Readouts:right:inf"), vec![Hidden { tab: Readouts, edge: Edge::Right, size: HIDDEN_MAX }]);
+        // a title reads as its panel; a duplicate keeps its first entry
+        assert_eq!(parse_hidden("Model · estimated solver:left:300, Model:right:400"), vec![Hidden { tab: Model, edge: Edge::Left, size: 300.0 }]);
+        assert_eq!(parse_hidden("garbage, ,:::,"), vec![]);
     }
 }

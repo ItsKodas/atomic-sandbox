@@ -1,6 +1,8 @@
 //! Profiles (user request 2026-10-19): the viewer's own look and layout — the workspace's
 //! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
-//! and active tabs in `workspace::layout`'s grammar), the view and density-look settings and which
+//! and active tabs in `workspace::layout`'s grammar; `hidden = Graph:left:340, …`, the auto-hidden
+//! panels with their edge and size, spec D-10 — a panel floating in a window is saved there too,
+//! on the edge nearest its window: `Workspace::saved_hidden`), the view and density-look settings and which
 //! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
@@ -61,12 +63,14 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
     out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
+    out += &format!("hidden = {}\n", layout::encode_hidden(&st.workspace.saved_hidden()));
     out += &format!("view_sections = {}\n", st.view_sections.encode());
     out
 }
 
 /// Applies a profile's text to `st`: unknown keys and unreadable values are skipped. `layout` sets
-/// the workspace (a tree that does not parse, or has no 3D view, gives the default); without it,
+/// the workspace (a tree that does not parse, or has no 3D view, gives the default) and `hidden`
+/// its auto-hidden panels (none without the line; one already in the tree stays there); without it,
 /// an old profile's `left_tabs` / `right_tabs` are migrated (every panel placed once, the ones
 /// they do not name added: `layout::from_sides`); a profile with neither leaves the arrangement
 /// as it is.
@@ -106,6 +110,7 @@ pub fn apply(st: &mut UiState, text: &str) {
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
     if let Some(v) = kv.get("layout") {
         st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
+        st.workspace.set_hidden(layout::parse_hidden(kv.get("hidden").copied().unwrap_or_default()));
     } else if kv.contains_key("left_tabs") || kv.contains_key("right_tabs") {
         let side = |k: &str| kv.get(k).map(|v| tabs_of(v)).unwrap_or_default();
         st.workspace.set_node(layout::from_sides(&side("left_tabs"), &side("right_tabs")));

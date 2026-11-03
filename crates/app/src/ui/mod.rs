@@ -771,20 +771,21 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Shows `tab` (`Workspace::show_panel`: made the active tab of its leaf, or put back beside
-    /// the 3D view when it was closed): the search, the Activity bar, a view mode that needs the
+    /// Shows `tab` (`Workspace::show_panel`: made the active tab of its leaf, its flyout opened
+    /// when it is auto-hidden, or put back beside the 3D view when it was closed): the search, the Activity bar, a view mode that needs the
     /// Orbitals tab. Display state, never recorded.
     pub fn open_tab(&mut self, tab: DockTab) {
         self.workspace.show_panel(tab);
     }
 
-    /// Whether `tab` is on screen: in the workspace and the active tab of its leaf
-    /// (`Workspace::visible`).
+    /// Whether `tab` is on screen: in the workspace and the active tab of its leaf, or out in the
+    /// auto-hide flyout (`Workspace::visible`).
     pub fn tab_shown(&self, tab: DockTab) -> bool {
         self.workspace.visible(tab)
     }
 
-    /// The default layout back (the D1 default, `workspace::layout::default_layout`).
+    /// The default layout back (the D1 default, `workspace::layout::default_layout`; nothing
+    /// auto-hidden).
     pub fn reset_layout(&mut self) {
         self.workspace.set_node(workspace::layout::default_layout());
     }
@@ -1553,7 +1554,7 @@ pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()
 }
 
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
-/// open menu or the search).
+/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`).
 fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
         st.search.toggle();
@@ -1562,6 +1563,7 @@ fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
         && !st.builder.open
         && !ctx.egui_wants_keyboard_input()
         && !egui::Popup::is_any_open(ctx)
+        && st.workspace.flyout().is_none()
         && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     {
         acts.push(Action::Deselect);

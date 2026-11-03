@@ -29,7 +29,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// panel (its name, any case: `readouts|graph|model|knowledge|activity|orbitals|selection|log|view`;
 /// `UiState::open_tab`: the active tab of its leaf in the default layout, `ui::workspace`),
 /// `dock=closed` closes every panel (the 3D view fills the window; docking D2's Presenting layout
-/// will replace it), `select=<i>` selects a nucleus,
+/// will replace it), `hide=<panel>[,<panel>…]` auto-hides those panels (docking spec D-10: each to
+/// the strip of its side of the 3D view; with `tab=` naming one, its flyout is out), `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -76,6 +77,7 @@ pub struct ShotUi {
     pub menu: Option<String>,
     pub tab: Option<String>,
     pub dock_closed: bool,
+    pub hide: Vec<String>,
     pub select: Option<usize>,
     pub tool: Option<String>,
     pub element: Option<u8>,
@@ -144,6 +146,7 @@ impl ShotUi {
                 "menu" => s.menu = Some(v.to_string()),
                 "tab" => s.tab = Some(v.to_string()),
                 "dock" => s.dock_closed = v == "closed",
+                "hide" => s.hide = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
                 "select" => s.select = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "tool" => s.tool = Some(v.to_string()),
                 "element" => s.element = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -361,6 +364,10 @@ impl ShotUi {
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
+        for t in &self.hide {
+            let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown panel {t}"))?;
+            viewer.ui.workspace.pin(tab, false);
+        }
         if let Some(t) = &self.tab {
             let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
             viewer.ui.open_tab(tab);
@@ -983,6 +990,8 @@ mod tests {
         assert_eq!((off.trails, off.trail_fs, off.trail_opacity), (Some(false), None, None));
         let none = ShotUi::parse("tab=graph").unwrap();
         assert_eq!((none.trails, none.trail_fs, none.trail_opacity), (None, None, None));
+        assert!(none.hide.is_empty());
+        assert_eq!(ShotUi::parse("hide=graph, Log;tab=graph").unwrap().hide, vec!["graph".to_string(), "Log".to_string()]);
         // the ends of both ranges are accepted, outside them and nonsense are refused
         assert!(ShotUi::parse("trail_fs=5;trail_opacity=0").is_ok());
         assert!(ShotUi::parse("trail_fs=10000;trail_opacity=100").is_ok());

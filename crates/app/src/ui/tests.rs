@@ -4904,6 +4904,468 @@ fn the_profile_keeps_the_layout() {
     assert_eq!(layout::encode(&s.workspace.to_node()), custom);
 }
 
+// ---- auto-hide (docking spec D-10) ----
+
+/// One 1400 × 900 frame at input time `time` (s): the auto-hide timers run on egui's input time.
+fn frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, time: f64, events: Vec<egui::Event>) -> PanelOutput {
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), time: Some(time), events, ..Default::default() };
+    let mut out = None;
+    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    full.textures_delta.clear();
+    out.unwrap()
+}
+
+/// Spec D-10: unpinning takes a panel out of the tree onto the strip of the 3D view's edge its
+/// leaf lay beyond, remembering its size (the left column's Readouts: left, its 24 % width; the
+/// right column's Graph: right; a leaf under the view: bottom, its height); the strips are carved
+/// from the 3D view; `open_tab` opens its flyout at that edge (`tab_shown` while it is out); its
+/// pin docks it back beside the 3D view on that edge.
+#[test]
+fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
+    use super::workspace::layout::{self, Edge};
+    use DockTab::*;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let mut tile = egui::Rect::NOTHING;
+    for _ in 0..2 {
+        tile = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    }
+    st.open_tab(Readouts);
+    st.workspace.pin(Readouts, false);
+    assert!(!layout::panels(&st.workspace.to_node()).contains(&Readouts) && !st.tab_shown(Readouts), "out of the tree");
+    let h = st.workspace.hidden()[0];
+    assert_eq!((h.tab, h.edge), (Readouts, Edge::Left));
+    assert!((320.0..345.0).contains(&h.size), "the left column's width, 24 % of 1400: {}", h.size);
+    st.workspace.pin(Graph, false);
+    assert_eq!(st.workspace.hidden()[1].edge, Edge::Right);
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity])))");
+    let mut view = egui::Rect::NOTHING;
+    for _ in 0..2 {
+        view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    }
+    let (left, right) = (probed_rect("strip-Left"), probed_rect("strip-Right"));
+    assert!(left.contains_rect(probed_rect("strip-icon-Readouts")) && right.contains_rect(probed_rect("strip-icon-Graph")), "each on its edge's strip");
+    assert!((left.left() - tile.left()).abs() < 1.0 && (left.right() - view.left()).abs() < 1.0, "the left strip at the view's left: {left:?}, view {view:?}");
+    assert!((right.right() - tile.right()).abs() < 1.0 && (right.left() - view.right()).abs() < 1.0, "{right:?}, view {view:?}");
+    assert!((tile.width() - view.width() - 2.0 * super::workspace::autohide::STRIP).abs() < 1.0, "the strips are carved from the tile: {tile:?} → {view:?}");
+    // open_tab: its flyout, against the left strip at its remembered width
+    st.open_tab(Readouts);
+    assert!(st.tab_shown(Readouts) && st.workspace.flyout() == Some(Readouts));
+    for _ in 0..12 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]); // past the slide
+    }
+    let fly = probed_rect("flyout-Readouts");
+    assert!((fly.left() - view.left()).abs() < 1.0 && (fly.width() - h.size).abs() < 1.0 && (fly.height() - view.height()).abs() < 1.0, "{fly:?} in {view:?}");
+    // its pin: back beside the 3D view on the left
+    let outs = click_widget(&ctx, &mut st, &inp, "flyout-pin-Readouts");
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+    assert_eq!(st.workspace.flyout(), None);
+    assert_eq!(st.workspace.hidden().iter().map(|h| h.tab).collect::<Vec<_>>(), vec![Graph]);
+    let enc = layout::encode(&st.workspace.to_node());
+    assert!(enc.starts_with("H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,H(") && enc.contains(",[Readouts*],3D),"), "{enc}");
+    assert!(st.tab_shown(Readouts));
+    // a leaf under the 3D view folds to the bottom at its height, and docks back there
+    st.workspace.set_node(layout::parse("H(0.70,V(0.60,3D,[Log*]),[Model*])").unwrap());
+    assert!(st.workspace.hidden().is_empty(), "a new layout: nothing hidden");
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.workspace.pin(Log, false);
+    let h = st.workspace.hidden()[0];
+    assert_eq!((h.tab, h.edge), (Log, Edge::Bottom));
+    assert!((250.0..360.0).contains(&h.size), "40 % of the column's height: {}", h.size);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let bottom = probed_rect("strip-Bottom");
+    assert!(bottom.width() > bottom.height() && bottom.contains_rect(probed_rect("strip-icon-Log")), "the bottom strip runs along the view");
+    st.workspace.pin(Log, true);
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,V(0.60,3D,[Log*]),[Model*])", "back where it was");
+    // a closed panel unpins to the right edge; pinning a closed panel shows it
+    st.workspace.close_panel(Graph);
+    st.workspace.pin(Graph, false);
+    assert_eq!(st.workspace.hidden()[0].edge, Edge::Right);
+    st.workspace.close_panel(Graph);
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph), "closing a hidden panel takes it off its strip");
+    st.workspace.pin(Graph, true);
+    assert!(st.tab_shown(Graph) && layout::panels(&st.workspace.to_node()).contains(&Graph));
+    st.reset_layout();
+    assert!(st.workspace.hidden().is_empty());
+}
+
+/// Unpinned before the tree is first drawn (a layout just set, a preset): the edge is the side of
+/// the 3D view the panel sits on in the tree, at the default size.
+#[test]
+fn a_panel_unpinned_before_drawing_folds_to_its_side_in_the_tree() {
+    use super::workspace::layout::{self, Edge};
+    use DockTab::*;
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    for t in [Readouts, Model, Graph, View] {
+        st.workspace.pin(t, false);
+    }
+    let edges: Vec<_> = st.workspace.hidden().iter().map(|h| (h.tab, h.edge, h.size)).collect();
+    let d = super::workspace::autohide::DEFAULT_SIZE;
+    assert_eq!(edges, vec![(Readouts, Edge::Left, d), (Model, Edge::Left, d), (Graph, Edge::Right, d), (View, Edge::Right, d)]);
+    st.workspace.set_node(layout::parse("V(0.30,[Model*],V(0.60,3D,[Log*]))").unwrap());
+    st.workspace.pin(Log, false);
+    st.workspace.pin(Model, false);
+    let edges: Vec<_> = st.workspace.hidden().iter().map(|h| (h.tab, h.edge)).collect();
+    assert_eq!(edges, vec![(Log, Edge::Bottom), (Model, Edge::Right)], "below the view: bottom; above it (no top strip): right");
+}
+
+/// Spec D-10's timings, on egui's input time: hovering a strip icon for 300 ms (frames at 60 Hz)
+/// opens its flyout — not before 250 ms — and leaving the flyout and the strip for 600 ms hides
+/// it — not at 400 ms; over the flyout it stays.
+#[test]
+fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
+    use super::workspace::layout;
+    use DockTab::Graph;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    let dt = 1.0 / 60.0;
+    let mut t = 10.0;
+    let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
+        let out = frame_at(&ctx, st, &inp, t, events);
+        t += dt;
+        out
+    };
+    for _ in 0..2 {
+        step(&mut st, vec![]);
+    }
+    st.workspace.pin(Graph, false);
+    let mut view = egui::Rect::NOTHING;
+    for _ in 0..2 {
+        view = step(&mut st, vec![]).view.unwrap();
+    }
+    let icon = probed_rect("strip-icon-Graph").center();
+    for i in 0..=18 {
+        step(&mut st, vec![egui::Event::PointerMoved(icon)]);
+        if i <= 13 {
+            assert_eq!(st.workspace.flyout(), None, "{} ms of hover", i * 1000 / 60);
+        }
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "open after 300 ms of hover");
+    assert!(st.tab_shown(Graph));
+    // over the flyout it stays out
+    for _ in 0..12 {
+        step(&mut st, vec![]);
+    }
+    let fly = probed_rect("flyout-Graph");
+    for _ in 0..40 {
+        step(&mut st, vec![egui::Event::PointerMoved(fly.center())]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "the pointer on the flyout");
+    // away from both: still out at 400 ms, gone by 600 ms
+    let away = egui::pos2(view.right() - 40.0, view.center().y);
+    assert!(!fly.contains(away));
+    for i in 0..=36 {
+        step(&mut st, vec![egui::Event::PointerMoved(away)]);
+        if i <= 24 {
+            assert_eq!(st.workspace.flyout(), Some(Graph), "{} ms away", i * 1000 / 60);
+        }
+    }
+    assert_eq!(st.workspace.flyout(), None, "hidden after 600 ms away");
+    assert!(!st.tab_shown(Graph));
+}
+
+/// Spec D-10: a click on a strip icon keeps the flyout out until the next click elsewhere (the
+/// pointer away for a second does not hide it); Esc hides it — and does not also deselect
+/// (`keys`); so does a click elsewhere after `open_tab`. A press inside the flyout keeps a
+/// hover-opened flyout out too (working in it). Nothing is recorded.
+#[test]
+fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
+    use super::workspace::layout;
+    use DockTab::Graph;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    let mut outs = Vec::new();
+    let mut t = 10.0;
+    macro_rules! step {
+        ($st:expr, $events:expr) => {{
+            outs.push(frame_at(&ctx, $st, &inp, t, $events));
+            t += 1.0 / 60.0;
+        }};
+    }
+    for _ in 0..2 {
+        step!(&mut st, vec![]);
+    }
+    st.workspace.pin(Graph, false);
+    for _ in 0..2 {
+        step!(&mut st, vec![]);
+    }
+    let icon = probed_rect("strip-icon-Graph").center();
+    step!(&mut st, vec![egui::Event::PointerMoved(icon), pointer(icon, true)]);
+    step!(&mut st, vec![pointer(icon, false)]);
+    assert_eq!(st.workspace.flyout(), Some(Graph), "a click opens it at once");
+    for _ in 0..12 {
+        step!(&mut st, vec![]);
+    }
+    let fly = probed_rect("flyout-Graph");
+    let away = egui::pos2(fly.right() + 200.0, fly.center().y);
+    for _ in 0..60 {
+        step!(&mut st, vec![egui::Event::PointerMoved(away)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "clicked open: a second away does not hide it");
+    // a click inside it does not hide it either
+    step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
+    step!(&mut st, vec![pointer(fly.center(), false)]);
+    assert_eq!(st.workspace.flyout(), Some(Graph));
+    // a click elsewhere does
+    step!(&mut st, vec![egui::Event::PointerMoved(away), pointer(away, true)]);
+    step!(&mut st, vec![pointer(away, false)]);
+    assert_eq!(st.workspace.flyout(), None, "a click on the 3D view hides it");
+    // open_tab opens it the same way; Esc hides it and does not deselect
+    st.open_tab(Graph);
+    for _ in 0..60 {
+        step!(&mut st, vec![egui::Event::PointerMoved(away)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "open_tab: stuck open");
+    step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+    assert_eq!(st.workspace.flyout(), None, "Esc hides it");
+    // hover-opened, then worked in: it stays when the pointer leaves
+    for _ in 0..20 {
+        step!(&mut st, vec![egui::Event::PointerMoved(icon)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph));
+    step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
+    step!(&mut st, vec![pointer(fly.center(), false)]);
+    for _ in 0..60 {
+        step!(&mut st, vec![egui::Event::PointerMoved(away)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "a press inside keeps it out");
+    step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty() && !o.deselect), "display state; Esc on a flyout does not deselect");
+    // with no flyout, Esc deselects as before
+    step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+    let _ = t;
+    assert!(outs.last().unwrap().actions.contains(&Action::Deselect));
+}
+
+/// The flyout takes the pointer over itself — egui's, so the 3D view does not orbit through it —
+/// and only there: the 3D view beside it keeps its input; the strip is egui's; the view the frame
+/// hands the viewer is what the strip leaves.
+#[test]
+fn the_flyout_takes_the_pointer_and_the_3d_view_keeps_the_rest() {
+    use super::workspace::layout;
+    use DockTab::Graph;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.30,[Model*],H(0.70,3D,[Graph*]))").unwrap());
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.workspace.pin(Graph, false);
+    st.open_tab(Graph);
+    let mut view = egui::Rect::NOTHING;
+    for _ in 0..12 {
+        view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    }
+    let (fly, strip) = (probed_rect("flyout-Graph"), probed_rect("strip-Right"));
+    assert!((fly.right() - view.right()).abs() < 1.0 && (strip.left() - view.right()).abs() < 1.0, "the flyout against the right strip: {fly:?} {strip:?} {view:?}");
+    let over = |st: &mut UiState, at: egui::Pos2| {
+        frame(&ctx, st, &inp, 1400.0, vec![egui::Event::PointerMoved(at)]);
+        (ctx.is_pointer_over_egui(), ctx.egui_wants_pointer_input())
+    };
+    assert_eq!(over(&mut st, fly.center()), (true, true), "the flyout is egui's");
+    assert_eq!(over(&mut st, egui::pos2(fly.left() + 4.0, fly.bottom() - 4.0)), (true, true), "all of it");
+    assert_eq!(over(&mut st, egui::pos2(fly.left() - 60.0, fly.center().y)), (false, false), "the 3D view beside it is not");
+    assert_eq!(over(&mut st, strip.center()), (true, true), "the strip is egui's");
+    assert_eq!(st.workspace.flyout(), Some(Graph), "opened by open_tab: still out");
+}
+
+/// A leaf's tab bar ends with its pin, left of the close button: clicking where the Pin icon is
+/// painted unpins the leaf's active tab (only it); the flyout's close button closes the panel.
+#[test]
+fn the_tab_bar_pin_unpins_the_active_tab() {
+    use super::workspace::layout::{self, Edge};
+    use DockTab::*;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let (pin, close, graph) = (probed_rect("dock-pin-Graph"), probed_rect("dock-close-Graph"), probed_rect("dock-tab-Graph"));
+    assert!(pin.left() > graph.right() && (pin.right() - close.left()).abs() < 0.5 && (pin.center().y - close.center().y).abs() < 0.5, "pin {pin:?} just left of close {close:?}");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-pin-Graph");
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
+    let h = st.workspace.hidden();
+    assert_eq!((h.len(), h[0].tab, h[0].edge), (1, Graph, Edge::Right));
+    // its flyout's close button closes it (the Window menu brings it back)
+    st.open_tab(Graph);
+    for _ in 0..12 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]); // past the slide
+    }
+    let outs = click_widget(&ctx, &mut st, &inp, "flyout-close-Graph");
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
+}
+
+/// The profile keeps the auto-hidden panels (`hidden = …`, spec D-8) and reads them back onto
+/// their strips; a profile with a layout and no `hidden` line hides nothing; a hidden entry for a
+/// panel the layout already places is dropped (its first place wins).
+#[test]
+fn the_profile_keeps_the_hidden_panels() {
+    use super::workspace::layout::{self, Edge};
+    use DockTab::*;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert!(profile::capture(&st).contains("\nhidden = \n"), "a fresh profile hides nothing");
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.workspace.pin(Graph, false);
+    st.workspace.pin(Readouts, false);
+    let text = profile::capture(&st);
+    let line = text.lines().find(|l| l.starts_with("hidden = ")).unwrap();
+    assert!(line.starts_with("hidden = Graph:right:") && line.contains(", Readouts:left:"), "{line}");
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert_eq!(back.workspace.to_node(), st.workspace.to_node());
+    assert_eq!(layout::encode_hidden(back.workspace.hidden()), layout::encode_hidden(st.workspace.hidden()));
+    back.open_tab(Graph);
+    assert!(back.tab_shown(Graph), "reachable: open_tab opens its flyout");
+    for _ in 0..2 {
+        frame(&ctx, &mut back, &inp, 1400.0, vec![]);
+    }
+    probed_rect("strip-icon-Graph");
+    probed_rect("strip-icon-Readouts");
+    // a layout line without a hidden line: nothing hidden
+    let mut s = UiState::new("h2", &scene);
+    s.workspace.set_hidden(vec![layout::Hidden { tab: Graph, edge: Edge::Left, size: 300.0 }]);
+    profile::apply(&mut s, &format!("layout = {}\n", layout::encode(&st.workspace.to_node())));
+    assert!(s.workspace.hidden().is_empty());
+    // a hidden panel the layout places: the layout's
+    profile::apply(&mut s, &format!("layout = {}\nhidden = Log:left:300, Graph:bottom:250\n", layout::encode(&layout::default_layout())));
+    assert_eq!(s.workspace.hidden(), &[]);
+    profile::apply(&mut s, "layout = H(0.70,3D,[Log*])\nhidden = log:left:300, GRAPH:bottom:5000, Bogus:left:300\n");
+    assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Graph, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
+}
+
+/// Deferred finding (docking D1 review): a panel floated in a window is not in the profile's
+/// layout tree, so it was lost on restart. It is saved as auto-hidden on the 3D view's edge
+/// nearest its window, and comes back there, reachable.
+#[test]
+fn a_floated_panel_survives_the_profile() {
+    use super::workspace::layout::{self, Edge};
+    use DockTab::*;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.workspace.float_panel(Graph); // from the lower-right leaf: its window opens off the lower right
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    assert!(st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph), "floating");
+    let text = profile::capture(&st);
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    let h = back.workspace.hidden();
+    // its window hangs off the view's lower right: the edge it lies farthest beyond
+    assert!(h.len() == 1 && h[0].tab == Graph && matches!(h[0].edge, Edge::Right | Edge::Bottom), "{text}");
+    assert!((layout::HIDDEN_MIN..=layout::HIDDEN_MAX).contains(&h[0].size));
+    back.open_tab(Graph);
+    assert!(back.tab_shown(Graph), "reachable");
+    // every panel is somewhere: in the tree or on a strip
+    let placed = layout::panels(&back.workspace.to_node()).len() + back.workspace.hidden().len();
+    assert_eq!(placed, DockTab::PANELS.len());
+}
+
+/// Deferred finding (docking D1 review): `egui_dock` clamps each split's fraction to leave 80 pt
+/// either side, which below ≈ 333 pt rewrote the default's 24 % (and the autosave kept it). At
+/// 300 pt wide the default's encoding is unchanged after a few frames — and a separator drag at
+/// full width still moves its split.
+#[test]
+fn a_very_narrow_window_keeps_the_saved_fractions() {
+    use super::workspace::layout;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let before = layout::encode(&st.workspace.to_node());
+    for _ in 0..4 {
+        frame(&ctx, &mut st, &inp, 300.0, vec![]);
+    }
+    assert_eq!(layout::encode(&st.workspace.to_node()), before, "at 300 pt wide");
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    assert_eq!(layout::encode(&st.workspace.to_node()), before, "and back at 1400");
+    // the left column's separator, 24 % of 1400, dragged 100 pt right
+    let at = egui::pos2(336.0, 600.0);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+    for i in 1..=4 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at + egui::vec2(25.0 * i as f32, 0.0))]);
+    }
+    frame(&ctx, &mut st, &inp, 1400.0, vec![pointer(at + egui::vec2(100.0, 0.0), false)]);
+    let layout::Node::Split { frac, .. } = st.workspace.to_node() else { panic!() };
+    assert!((0.29..0.33).contains(&frac), "dragged to ≈ 436 / 1400: {frac}");
+}
+
+/// Every panel draws in its flyout (no panic, no command), on each edge.
+#[test]
+fn every_panel_draws_in_its_flyout() {
+    use super::workspace::layout::{self, Edge, Hidden};
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2o", &scene);
+    for snap in [None, Some(snapshot(&scene, Backend::Gpu, None)), Some(snapshot(&scene, Backend::Estimated, Some(model())))] {
+        let inp = input(&scene, snap.as_ref(), &cam);
+        for (i, t) in DockTab::PANELS.into_iter().enumerate() {
+            st.workspace.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+            if t == DockTab::Log {
+                st.workspace.close_panel(t);
+            }
+            st.workspace.set_hidden(vec![Hidden { tab: t, edge: Edge::ALL[i % 3], size: 360.0 }]);
+            st.open_tab(t);
+            for _ in 0..3 {
+                let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+                assert!(out.commands.is_empty() && out.actions.is_empty(), "{t:?}");
+            }
+            assert!(st.tab_shown(t), "{t:?}");
+            probed_rect(&format!("flyout-{t:?}"));
+        }
+    }
+}
+
 // ---- the Play snapshot (`ui::rewind`) ----
 
 /// Play from paused stores the scene (velocities and isotopes included), the driver's pins, the

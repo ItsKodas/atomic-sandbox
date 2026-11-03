@@ -17,8 +17,15 @@
 //!   box health, work running, trust, the Log's unread count) are painted into the tab, whose
 //!   title reserves the room; hovering a tab peeks its key numbers (`dock::peek`); a middle click
 //!   or the context menu closes it, the menu also floats it or resets the layout. A leaf's tab bar
-//!   ends with its close button (closes the leaf's panels: `egui_dock`'s, painted with the
-//!   duotone Close icon); pin and pop-out come with D2 and D3.
+//!   ends with its pin (auto-hides its active tab, D2: `egui_dock`'s add button, its plus left
+//!   transparent under the duotone Pin icon — the library has no custom bar buttons, and the add
+//!   button is a real widget that reports its leaf, so no private geometry is clicked) and its
+//!   close button (closes the leaf's panels: `egui_dock`'s close-all, painted with the Close
+//!   icon); pop-out comes with D3.
+//! - **Auto-hidden panels** (spec D-10, `super::autohide`): [`Workspace::pin`] takes a panel out of
+//!   the tree onto the strip of the 3D view's edge its leaf lay beyond, remembering its size, and
+//!   docks it back beside the view on that edge; their strips and flyout are drawn round the 3D
+//!   view's tile after the tree.
 //! - **Panels stay where the user put them**: [`Workspace::show_panel`] makes a panel the active
 //!   tab of its leaf, or — when it was closed — adds it to the right column's first leaf (the one
 //!   right of the 3D view), else to a new split right of the view.
@@ -27,11 +34,17 @@
 //! area for the frame; what the panels ask of the workspace meanwhile (the Readouts' "open the
 //! Graph", say) is done when it comes back, and `visible` answers from what was visible when it
 //! left. Panels floated in a window are not part of [`Workspace::to_node`] (the profile's
-//! `layout = …`); D3's `window = …` lines will keep detached ones.
-use super::layout::{self, Node};
+//! `layout = …`): [`Workspace::saved_hidden`] writes each as auto-hidden on the edge nearest its
+//! window (`hidden = …`), so it comes back on that strip (recorded for review: a float is a
+//! moment's arrangement, and D3's `window = …` lines will keep detached windows).
+//! - **Saved fractions hold in a narrow window**: `egui_dock` clamps each split's fraction every
+//!   frame to leave `separator.extra` either side; a fraction it only clamped (no separator drag)
+//!   is put back after the frame (`keep_fractions`), so the profile keeps the user's.
+use super::autohide::{self, Flyout};
+use super::layout::{self, Edge, Hidden, Node};
 use crate::ui::{dock, icons, theme, Action, DockTab, PanelInput, UiState};
-use egui::{pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, LayerId, Layout, Margin, Rect, Response, Stroke, Ui, UiBuilder, WidgetText};
-use egui_dock::{DockArea, DockState, NodeIndex, Split, TabBodyStyle, TabIndex, TabStyle, TabViewer, Tree};
+use egui::{pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, LayerId, Layout, Margin, Painter, Pos2, Rect, Response, Stroke, Ui, UiBuilder, WidgetText};
+use egui_dock::{DockArea, DockState, NodeIndex, NodePath, Split, TabBodyStyle, TabIndex, TabPath, TabStyle, TabViewer, Tree};
 use std::collections::HashMap;
 
 /// One tile of the tree: the 3D view, or a panel.
@@ -64,11 +77,17 @@ enum Change {
     Close(DockTab),
     Float(DockTab),
     Set(Node),
+    Pin(DockTab, bool),
+    SetHidden(Vec<Hidden>),
 }
 
-/// The workspace: the dock tree, and what the panels asked of it while it was lent out.
+/// The workspace: the dock tree, the auto-hidden panels and their flyout, and what the panels
+/// asked of it while the tree was lent out.
 pub struct Workspace {
     dock: DockState<Tile>,
+    /// The auto-hidden panels, in the order they were unpinned (each strip's order).
+    hidden: Vec<Hidden>,
+    pub(super) fly: Flyout,
     /// While the dock area draws: the panels visible when the tree left (what [`Workspace::visible`]
     /// answers meanwhile).
     lent: Option<Vec<DockTab>>,
@@ -84,7 +103,7 @@ impl Default for Workspace {
 
 impl Workspace {
     fn from_node(n: &Node) -> Workspace {
-        let mut w = Workspace { dock: build(n), lent: None, pending: Vec::new() };
+        let mut w = Workspace { dock: build(n), hidden: Vec::new(), fly: Flyout::default(), lent: None, pending: Vec::new() };
         w.normalize();
         w
     }
@@ -97,7 +116,7 @@ impl Workspace {
     }
 
     /// Replaces the arrangement with `n` (a tree without the 3D view gives the default); panels
-    /// floating in a window go.
+    /// floating in a window and the auto-hidden ones go ([`Workspace::set_hidden`] adds those).
     pub fn set_node(&mut self, n: Node) {
         if self.lent.is_some() {
             self.pending.push(Change::Set(n));
@@ -106,10 +125,149 @@ impl Workspace {
         let n = layout::clean(n).filter(layout::has_view).unwrap_or_else(layout::default_layout);
         self.dock = build(&n);
         self.normalize();
+        self.hidden.clear();
+        self.fly.close();
     }
 
-    /// Whether `t` is on screen: in the tree (or a floating window) and the active tab of its leaf.
+    /// The auto-hidden panels (spec D-10), in each strip's order.
+    pub fn hidden(&self) -> &[Hidden] {
+        &self.hidden
+    }
+
+    /// Replaces the auto-hidden panels (the profile's `hidden = …`): a panel already in the tree
+    /// keeps its place there (as in the grammar, its first place wins), a duplicate its first
+    /// entry.
+    pub fn set_hidden(&mut self, list: Vec<Hidden>) {
+        if self.lent.is_some() {
+            self.pending.push(Change::SetHidden(list));
+            return;
+        }
+        self.hidden.clear();
+        for h in list {
+            if self.dock.find_tab(&Tile::Panel(h.tab)).is_none() && !self.is_hidden(h.tab) {
+                self.hidden.push(Hidden { size: h.size.clamp(layout::HIDDEN_MIN, layout::HIDDEN_MAX), ..h });
+            }
+        }
+        if self.fly.open.is_some_and(|t| !self.is_hidden(t)) {
+            self.fly.close();
+        }
+    }
+
+    /// The auto-hidden panels as the profile saves them: [`Workspace::hidden`], then each panel
+    /// floating in a window as hidden on the 3D view's edge nearest its window, at its width (its
+    /// height on the bottom edge).
+    pub fn saved_hidden(&self) -> Vec<Hidden> {
+        let mut out = self.hidden.clone();
+        for (path, leaf) in self.dock.iter_leaves() {
+            if path.surface.is_main() {
+                continue;
+            }
+            let (edge, size) = self.fold(leaf.rect);
+            for tile in &leaf.tabs {
+                if let Tile::Panel(t) = *tile {
+                    out.push(Hidden { tab: t, edge, size: size.clamp(layout::HIDDEN_MIN, layout::HIDDEN_MAX) });
+                }
+            }
+        }
+        out
+    }
+
+    /// The panel whose flyout is out.
+    pub fn flyout(&self) -> Option<DockTab> {
+        self.fly.open
+    }
+
+    fn is_hidden(&self, t: DockTab) -> bool {
+        self.hidden.iter().any(|h| h.tab == t)
+    }
+
+    /// Pins or unpins `t` (spec D-10). Unpinning a panel in the tree (or a floating window) takes
+    /// it out onto the strip of the 3D view's edge its leaf lay beyond, remembering the leaf's
+    /// width (height, on the bottom edge) — before the tree is drawn, the side of the view it sits
+    /// on in the tree at [`autohide::DEFAULT_SIZE`]; a closed panel goes to the right edge. Pinning a hidden
+    /// panel docks it back beside the 3D view on its edge at its remembered size (a closed one is
+    /// shown, [`Workspace::show_panel`]); either is a no-op when the panel already is so.
+    pub fn pin(&mut self, t: DockTab, pinned: bool) {
+        if self.lent.is_some() {
+            self.pending.push(Change::Pin(t, pinned));
+            return;
+        }
+        if pinned {
+            match self.hidden.iter().position(|h| h.tab == t) {
+                Some(i) => {
+                    let h = self.hidden.remove(i);
+                    if self.fly.open == Some(t) {
+                        self.fly.close();
+                    }
+                    self.dock_beside_view(h);
+                }
+                None => self.show_panel(t),
+            }
+            return;
+        }
+        if self.is_hidden(t) {
+            return;
+        }
+        let (edge, size) = match self.dock.find_tab(&Tile::Panel(t)) {
+            Some(p) => {
+                let folded = self.fold_tab(p);
+                self.dock.remove_tab(p);
+                folded
+            }
+            None => (Edge::Right, autohide::DEFAULT_SIZE),
+        };
+        self.hidden.push(Hidden { tab: t, edge, size: size.clamp(layout::HIDDEN_MIN, layout::HIDDEN_MAX) });
+    }
+
+    /// The edge and size the tab at `p` folds to: its leaf's ([`Workspace::fold`]).
+    fn fold_tab(&self, p: TabPath) -> (Edge, f32) {
+        let r = self.dock.leaf(p.node_path()).map_or(Rect::NOTHING, |l| l.rect);
+        if !(r.is_positive() && self.view_rect().is_some_and(|v| v.is_positive())) && p.surface.is_main() {
+            // not drawn yet (a layout just set): the side of the view it sits on in the tree
+            let main = self.dock.main_surface();
+            if let Some((view, _)) = main.find_tab(&Tile::View3d) {
+                return (side_in_tree(main, p.node, view), autohide::DEFAULT_SIZE);
+            }
+        }
+        self.fold(r)
+    }
+
+    /// The edge a leaf drawn at `r` folds to ([`autohide::edge_of`]: where its centre lies
+    /// relative to the 3D view's tile) and its size (width; height for the bottom edge). Right at
+    /// [`autohide::DEFAULT_SIZE`] when the tree has not been drawn yet.
+    fn fold(&self, r: Rect) -> (Edge, f32) {
+        match (Some(r).filter(|r| r.is_positive()), self.view_rect().filter(|v| v.is_positive())) {
+            (Some(r), Some(v)) => {
+                let e = autohide::edge_of(r.center(), v);
+                (e, if e == Edge::Bottom { r.height() } else { r.width() })
+            }
+            _ => (Edge::Right, autohide::DEFAULT_SIZE),
+        }
+    }
+
+    /// Docks a hidden panel back: a new split beside the 3D view on its edge, giving it its size
+    /// of the view's tile (10..90 %; 30 % before the tree is drawn).
+    fn dock_beside_view(&mut self, h: Hidden) {
+        let extent = self.view_rect().filter(|v| v.is_positive()).map(|v| if h.edge == Edge::Bottom { v.height() } else { v.width() });
+        let share = extent.map_or(1.0 - VIEW_SHARE, |w| (h.size / w).clamp(0.1, 0.9));
+        let main = self.dock.main_surface_mut();
+        let Some((view, _)) = main.find_tab(&Tile::View3d) else { return };
+        // `frac` is the first child's share: the new leaf's on the left, the view's otherwise
+        let (split, frac) = match h.edge {
+            Edge::Left => (Split::Left, share),
+            Edge::Right => (Split::Right, 1.0 - share),
+            Edge::Bottom => (Split::Below, 1.0 - share),
+        };
+        let [_, new] = main.split(view, split, frac, egui_dock::Node::leaf(Tile::Panel(h.tab)));
+        main.set_focused_node(new);
+    }
+
+    /// Whether `t` is on screen: in the tree (or a floating window) and the active tab of its
+    /// leaf, or out in the flyout.
     pub fn visible(&self, t: DockTab) -> bool {
+        if self.fly.open == Some(t) {
+            return true;
+        }
         if let Some(shown) = &self.lent {
             return shown.contains(&t);
         }
@@ -118,11 +276,16 @@ impl Workspace {
             .is_some_and(|p| self.dock.leaf(p.node_path()).is_ok_and(|l| l.active == p.tab && !l.collapsed))
     }
 
-    /// Shows `t`: makes it the active tab of its leaf (and focuses the leaf); a closed panel joins
-    /// the right column's first leaf, or a new split right of the 3D view when there is none.
+    /// Shows `t`: makes it the active tab of its leaf (and focuses the leaf); an auto-hidden panel
+    /// opens its flyout, stuck open (spec D-10); a closed panel joins the right column's first
+    /// leaf, or a new split right of the 3D view when there is none.
     pub fn show_panel(&mut self, t: DockTab) {
         if self.lent.is_some() {
             self.pending.push(Change::Show(t));
+            return;
+        }
+        if self.is_hidden(t) {
+            self.fly.open(t, true);
             return;
         }
         let tile = Tile::Panel(t);
@@ -144,10 +307,18 @@ impl Workspace {
         }
     }
 
-    /// Closes `t` (its leaf goes when it was the last tab there).
+    /// Closes `t` (its leaf goes when it was the last tab there; an auto-hidden panel leaves its
+    /// strip).
     pub fn close_panel(&mut self, t: DockTab) {
         if self.lent.is_some() {
             self.pending.push(Change::Close(t));
+            return;
+        }
+        if self.is_hidden(t) {
+            self.hidden.retain(|h| h.tab != t);
+            if self.fly.open == Some(t) {
+                self.fly.close();
+            }
             return;
         }
         if let Some(p) = self.dock.find_tab(&Tile::Panel(t)) {
@@ -181,7 +352,7 @@ impl Workspace {
         }
     }
 
-    /// The 3D view's body rect as last drawn.
+    /// The 3D view's tile as last drawn (its strips included).
     fn view_rect(&self) -> Option<Rect> {
         let p = self.dock.find_tab(&Tile::View3d)?;
         self.dock.leaf(p.node_path()).ok().map(|l| l.viewport)
@@ -240,6 +411,8 @@ impl Workspace {
                 Change::Close(t) => self.close_panel(t),
                 Change::Float(t) => self.float_panel(t),
                 Change::Set(n) => self.set_node(n),
+                Change::Pin(t, pinned) => self.pin(t, pinned),
+                Change::SetHidden(h) => self.set_hidden(h),
             }
         }
         moved
@@ -312,6 +485,29 @@ fn node_of(tree: &Tree<Tile>, at: NodeIndex) -> Option<Node> {
     }
 }
 
+/// The side of the 3D view (at `view`) the leaf at `leaf` sits on in the tree: at the lowest split
+/// holding both, left or right of it side by side, below it stacked (above it — there is no top
+/// strip — right).
+fn side_in_tree(tree: &Tree<Tile>, leaf: NodeIndex, view: NodeIndex) -> Edge {
+    let mut ancestors = vec![leaf];
+    while let Some(p) = ancestors.last().and_then(|n| n.parent()) {
+        ancestors.push(p);
+    }
+    let mut n = view;
+    while let Some(parent) = n.parent() {
+        if let Some(i) = ancestors.iter().position(|&a| a == parent) {
+            let leaf_first = i > 0 && ancestors[i - 1].is_left();
+            return match (tree[parent].is_horizontal(), leaf_first) {
+                (true, true) => Edge::Left,
+                (false, false) => Edge::Bottom,
+                _ => Edge::Right,
+            };
+        }
+        n = parent;
+    }
+    Edge::Right
+}
+
 /// The right column: the subtree right of the 3D view in the nearest side-by-side split that has
 /// the view on its left.
 fn right_column(tree: &Tree<Tile>, view: NodeIndex) -> Option<NodeIndex> {
@@ -344,8 +540,10 @@ struct Tiles<'a, 'i> {
     acts: &'a mut Vec<Action>,
     asked: Vec<Change>,
     /// The layer each tab drawn this frame was drawn on (its leaf's: the main area's, or a
-    /// floating window's), where its leaf's close icon is painted.
+    /// floating window's), where its leaf's pin and close icons are painted.
     layers: HashMap<Tile, LayerId>,
+    /// The leaves whose pin (`egui_dock`'s add button) was clicked: their active tabs unpin.
+    pins: Vec<NodePath>,
 }
 
 /// A panel's tab title: its name, with room before it for the icon and, on a tab that can carry
@@ -398,21 +596,10 @@ impl TabViewer for Tiles<'_, '_> {
         let icon = Rect::from_center_size(pos2(r.rect.left() + PAD + ICON / 2.0, r.rect.center().y), egui::Vec2::splat(ICON));
         icons::paint(&p, icon, dock::icon(t), ink);
         // the status is asked once per tab and frame: here (the title only reserves its room)
-        if let Some((c, count)) = dock::status(t, self.st, self.input) {
+        if let Some(s) = dock::status(t, self.st, self.input) {
             debug_assert!(dock::can_flag(t), "{t:?} has a status but its title keeps no room for it");
             let at = pos2(r.rect.right() - PAD - dot_room(t).unwrap_or(DOT_GAP) / 2.0 + 2.0, r.rect.center().y);
-            match count {
-                Some(n) => {
-                    p.circle_filled(at, 7.5, c);
-                    p.text(at, Align2::CENTER_CENTER, n, FontId::monospace(9.0), Color32::WHITE);
-                }
-                None => {
-                    // the Activity dot pulses while work runs
-                    let pulse = if t == DockTab::Activity { 0.85 + 0.15 * (r.ctx.input(|i| i.time) * 7.0).sin() as f32 } else { 1.0 };
-                    p.circle_filled(at, 4.5, theme::PANEL);
-                    p.circle_filled(at, 3.5 * pulse, c);
-                }
-            }
+            paint_status(&p, at, s, t, r.ctx.input(|i| i.time));
         }
         if r.middle_clicked() {
             self.asked.push(Change::Close(t));
@@ -436,6 +623,12 @@ impl TabViewer for Tiles<'_, '_> {
                 ui.close();
             }
         });
+    }
+
+    /// The leaf's add button is its pin (spec D-4, D-10): the active tab unpins once the tree is
+    /// back (`show`).
+    fn on_add(&mut self, path: NodePath) {
+        self.pins.push(path);
     }
 
     fn is_closeable(&self, tab: &Tile) -> bool {
@@ -497,6 +690,12 @@ fn style(egui_style: &egui::Style) -> egui_dock::Style {
     s.buttons.close_all_tabs_disabled_color = Color32::TRANSPARENT;
     s.buttons.close_all_tabs_bg_fill = theme::PANEL_2;
     s.buttons.close_all_tabs_border_color = theme::LINE_SOFT;
+    // the leaf's pin: egui_dock's add button, its plus left transparent under the Pin icon
+    s.buttons.add_tab_align = egui_dock::TabAddAlign::Right;
+    s.buttons.add_tab_color = Color32::TRANSPARENT;
+    s.buttons.add_tab_active_color = Color32::TRANSPARENT;
+    s.buttons.add_tab_bg_fill = theme::PANEL_2;
+    s.buttons.add_tab_border_color = theme::LINE_SOFT;
     s.separator.color_idle = theme::LINE;
     s.separator.color_hovered = theme::ACCENT;
     s.separator.color_dragged = theme::GLOW;
@@ -509,14 +708,17 @@ fn style(egui_style: &egui::Style) -> egui_dock::Style {
 
 /// The least a split leaves either side of its separator (`egui_dock`'s `separator.extra`).
 const SEPARATOR_EXTRA: f32 = 80.0;
-/// `egui_dock`'s close-all button at a tab bar's end (its `TAB_CLOSE_ALL_BUTTON_SIZE`: 24 pt wide,
-/// the bar's height less 2), and the Close icon painted in it.
+/// `egui_dock`'s close-all and add buttons at a tab bar's end (its `TAB_CLOSE_ALL_BUTTON_SIZE` and
+/// `TAB_ADD_BUTTON_SIZE`: each 24 pt wide, the bar's height less 2; the add button, right-aligned,
+/// just left of the close), and the icons painted in them.
 const CLOSE_BUTTON: f32 = 24.0;
+const PIN_BUTTON: f32 = 24.0;
 const CLOSE_ICON: f32 = 13.0;
 
-/// Paints the duotone Close icon in each shown tab bar's close button (whose own X is left
-/// transparent, `style`), on the layer its leaf was drawn on; brighter while hovered.
-fn paint_close_icons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashMap<Tile, LayerId>, bar: f32) {
+/// Paints the duotone Pin and Close icons in each shown tab bar's pin and close buttons (whose
+/// own marks are left transparent, `style`), on the layer its leaf was drawn on; brighter while
+/// hovered.
+fn paint_leaf_buttons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashMap<Tile, LayerId>, bar: f32) {
     for (_, leaf) in dock.iter_leaves() {
         if leaf.tab_bar_hidden || !leaf.rect.is_positive() {
             continue;
@@ -524,42 +726,112 @@ fn paint_close_icons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashM
         // any tab of the leaf drawn this frame names its layer (the first may not have been)
         let Some(&layer) = leaf.tabs.iter().find_map(|t| layers.get(t)) else { continue };
         let r = leaf.rect;
-        let button = Rect::from_min_max(pos2(r.right() - CLOSE_BUTTON, r.top()), pos2(r.right(), r.top() + bar - 2.0));
+        let close = Rect::from_min_max(pos2(r.right() - CLOSE_BUTTON, r.top()), pos2(r.right(), r.top() + bar - 2.0));
+        let pin = close.translate(vec2(-PIN_BUTTON, 0.0));
         if let Some(Tile::Panel(t)) = leaf.tabs.first() {
-            crate::ui::probe_rect(&format!("dock-close-{t:?}"), button);
+            crate::ui::probe_rect(&format!("dock-close-{t:?}"), close);
+            crate::ui::probe_rect(&format!("dock-pin-{t:?}"), pin);
         }
-        let ink = if ctx.rect_contains_pointer(layer, button) { theme::INK } else { theme::INK_DIM };
         let p = ctx.layer_painter(layer).with_clip_rect(r);
-        icons::paint(&p, Rect::from_center_size(button.center(), egui::Vec2::splat(CLOSE_ICON)), icons::Icon::Close, ink);
+        for (button, icon) in [(close, icons::Icon::Close), (pin, icons::Icon::Pin)] {
+            let ink = if ctx.rect_contains_pointer(layer, button) { theme::INK } else { theme::INK_DIM };
+            icons::paint(&p, Rect::from_center_size(button.center(), egui::Vec2::splat(CLOSE_ICON)), icon, ink);
+        }
     }
 }
 
-/// Draws the workspace into what the top bar and the toolbar leave of `root`; returns the 3D
-/// view's rect, which is then all the root `Ui` has left (so egui counts the pointer over it as
-/// not over egui).
+/// Every split's fraction, by node, in the dock's own order.
+fn fractions(dock: &DockState<Tile>) -> Vec<(NodePath, f32)> {
+    dock.iter_all_nodes()
+        .filter_map(|(p, n)| match n {
+            egui_dock::Node::Horizontal(s) | egui_dock::Node::Vertical(s) => Some((p, s.fraction)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Puts back each split fraction `egui_dock` only clamped this frame (`before`: the fractions
+/// when the tree was lent): it clamps a split's fraction every frame to leave `separator.extra`
+/// either side, which in a narrow window rewrote the user's (and the profile saved it). A
+/// fraction that is exactly its old value clamped to that range was not dragged — a drag moves
+/// it off its clamped value, or was past the bound the old value already lay beyond — so the old
+/// value goes back. Nothing is put back when the tree changed shape this frame.
+fn keep_fractions(dock: &mut DockState<Tile>, before: &[(NodePath, f32)]) {
+    let after = fractions(dock);
+    if after.len() != before.len() || after.iter().zip(before).any(|(a, b)| a.0 != b.0) {
+        return;
+    }
+    for ((_, node), &(_, old)) in dock.iter_all_nodes_mut().filter(|(_, n)| n.is_parent()).zip(before) {
+        let horizontal = node.is_horizontal();
+        if let egui_dock::Node::Horizontal(s) | egui_dock::Node::Vertical(s) = node {
+            let range = if horizontal { s.rect.width() } else { s.rect.height() };
+            if s.fraction == old || !(range > 0.0) {
+                continue;
+            }
+            // egui_dock's own bounds (`show_separator`)
+            let min = (SEPARATOR_EXTRA / range).min(1.0);
+            let max = 1.0 - min;
+            let (min, max) = (min.min(max), max.max(min));
+            if (s.fraction - old.clamp(min, max)).abs() < 1e-5 {
+                s.fraction = old;
+            }
+        }
+    }
+}
+
+/// Paints a status (`dock::status`: its colour, and its count when it counts) centred at `at`:
+/// a tab's and a strip icon's. The Activity dot pulses while work runs (`time`: egui's input time).
+pub(super) fn paint_status(p: &Painter, at: Pos2, (c, count): (Color32, Option<String>), t: DockTab, time: f64) {
+    match count {
+        Some(n) => {
+            p.circle_filled(at, 7.5, c);
+            p.text(at, Align2::CENTER_CENTER, n, FontId::monospace(9.0), Color32::WHITE);
+        }
+        None => {
+            let pulse = if t == DockTab::Activity { 0.85 + 0.15 * (time * 7.0).sin() as f32 } else { 1.0 };
+            p.circle_filled(at, 4.5, theme::PANEL);
+            p.circle_filled(at, 3.5 * pulse, c);
+        }
+    }
+}
+
+/// Draws the workspace into what the top bar and the toolbar leave of `root`, then the auto-hide
+/// strips and flyout round the 3D view's tile (`autohide::show`); returns the 3D view the strips
+/// leave, which is then all the root `Ui` has left (so egui counts the pointer over it as not over
+/// egui).
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Rect {
     let area = root.available_rect_before_wrap();
     let style = style(root.style());
     let mut dock = st.workspace.lend();
+    let before = fractions(&dock);
     let asked = {
-        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new() };
+        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new() };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt("workspace"));
         DockArea::new(&mut dock)
             .id(Id::new("workspace"))
             .style(style)
             .show_close_buttons(false) // the leaf's close button ends its tab bar (spec D-4)
             .show_leaf_close_all_buttons(true)
+            .show_add_buttons(true) // the leaf's pin (`on_add`)
             .show_leaf_collapse_buttons(false)
             .hidable_tab_bars(true) // only the 3D view's leaf hides its bar (`normalize`)
             .tab_context_menus(false) // our own (`on_tab_button`): float, close, reset
             .show_inside(&mut ui, &mut tiles);
-        paint_close_icons(root.ctx(), &dock, &tiles.layers, TAB_BAR);
-        tiles.asked
+        paint_leaf_buttons(root.ctx(), &dock, &tiles.layers, TAB_BAR);
+        keep_fractions(&mut dock, &before);
+        let mut asked = tiles.asked;
+        for path in tiles.pins {
+            if let Some(Tile::Panel(t)) = dock.leaf(path).ok().and_then(|l| l.tabs.get(l.active.0)) {
+                asked.push(Change::Pin(*t, false));
+            }
+        }
+        asked
     };
     if st.workspace.give_back(dock, asked) {
         root.ctx().request_discard("a panel dropped into the 3D view's leaf went beside it");
     }
-    let view = st.workspace.view_rect().filter(|r| r.is_positive() && area.expand(1.0).contains_rect(*r)).unwrap_or(area);
+    let tile = st.workspace.view_rect().filter(|r| r.is_positive() && area.expand(1.0).contains_rect(*r)).unwrap_or(area);
+    let view = autohide::show(root, st, input, acts, tile);
     leave_only(root, view);
     view
 }
