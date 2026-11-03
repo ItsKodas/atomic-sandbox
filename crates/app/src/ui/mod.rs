@@ -39,6 +39,7 @@ mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
+mod workspace;
 
 pub use actions::Action;
 #[cfg(test)]
@@ -233,11 +234,29 @@ pub enum DockTab {
     Log,
     /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
     Knowledge,
+    /// Every control of the old View menu, regrouped (docking spec D-6). A workspace panel only:
+    /// it is in [`DockTab::PANELS`], not in [`DockTab::ALL`] / [`DockTab::RIGHT`], so the old docks
+    /// never show it.
+    View,
 }
 
 impl DockTab {
-    /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser).
+    /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser). The old
+    /// docks' tabs only: the View panel is in [`DockTab::PANELS`].
     pub const ALL: [DockTab; 8] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    /// Every panel of the workspace (docking spec D-2), View included (the workspace's sweep; the
+    /// order a migrated layout adds panels an old profile never listed, `workspace::layout`).
+    pub const PANELS: [DockTab; 9] = [
+        DockTab::Model,
+        DockTab::Knowledge,
+        DockTab::Selection,
+        DockTab::Readouts,
+        DockTab::View,
+        DockTab::Orbitals,
+        DockTab::Log,
+        DockTab::Activity,
+        DockTab::Graph,
+    ];
     /// The left dock's tabs, in strip order: stats and what is going on.
     pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
     /// The right dock's tabs, in strip order: configuring things.
@@ -248,7 +267,23 @@ impl DockTab {
     pub fn side(self) -> DockSide {
         match self {
             DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
-            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log | DockTab::View => DockSide::Right,
+        }
+    }
+
+    /// The panel's one-word name in a saved layout (docking spec D-9: `[Model*,Knowledge]`) — the
+    /// same word the profile's `left_tabs` / `right_tabs` lines use (`format!("{tab:?}")`).
+    pub fn name(self) -> &'static str {
+        match self {
+            DockTab::Readouts => "Readouts",
+            DockTab::Graph => "Graph",
+            DockTab::Model => "Model",
+            DockTab::Activity => "Activity",
+            DockTab::Orbitals => "Orbitals",
+            DockTab::Selection => "Selection",
+            DockTab::Log => "Log",
+            DockTab::Knowledge => "Knowledge",
+            DockTab::View => "View",
         }
     }
 
@@ -262,6 +297,7 @@ impl DockTab {
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
             DockTab::Knowledge => "Knowledge · what the model knows",
+            DockTab::View => "View",
         }
     }
 }

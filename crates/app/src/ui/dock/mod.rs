@@ -87,6 +87,7 @@ fn icon(tab: DockTab) -> Icon {
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
         DockTab::Knowledge => Icon::Knowledge,
+        DockTab::View => Icon::Sliders, // a workspace panel; the old docks never show it
     }
 }
 
@@ -156,6 +157,7 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
             None => "Selection\nnothing selected".into(),
         },
         DockTab::Knowledge => super::knowledge::peek(st),
+        DockTab::View => "View".into(), // a workspace panel; the old docks never show it
         DockTab::Log => {
             let newest = st.log.entries.back().map_or(String::new(), |e| format!("\n{}: {}", e.kind.label(), e.text));
             format!("Log\n{} entries, {} unread errors or refusals{newest}", st.log.entries.len(), st.log.unread)
@@ -314,6 +316,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
                 DockTab::Knowledge => super::knowledge::tab(ui, st, input),
+                DockTab::View => {} // a workspace panel (docking Task 4); the old docks never show it
             }
         });
 }
