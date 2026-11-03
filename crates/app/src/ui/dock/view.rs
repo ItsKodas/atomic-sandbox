@@ -276,7 +276,8 @@ fn dots_look(ui: &mut Ui, st: &mut UiState) {
     }
     ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount (× the default)"));
     // the view switch's feather (`overlays::view_switch`), the same setting
-    ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).text("feather"))
+    // clamped only when typed or dragged: drawing never rewrites a profile's value outside the range
+    ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).clamping(egui::SliderClamping::Edits).text("feather"))
         .on_hover_text("fade out the faint outskirts: the dots where the field is low disappear softly, leaving the main lobes (0 = every dot)");
     ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size"));
     ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).text("blur (0 crisp … 1 soft)"));
@@ -467,7 +468,8 @@ fn nucleus_size(ui: &mut Ui, st: &mut UiState) {
             st.nucleus_scale = if auto { None } else { Some(1.0) };
         }
         if let Some(s) = &mut st.nucleus_scale {
-            ui.add(egui::Slider::new(s, 0.1..=2.0).fixed_decimals(2).suffix("×")).on_hover_text("× each element's display radius");
+            // the profile and `--ui nuclei=` take any factor: drawing must not clamp it to the slider's range
+            ui.add(egui::Slider::new(s, 0.1..=2.0).clamping(egui::SliderClamping::Edits).fixed_decimals(2).suffix("×")).on_hover_text("× each element's display radius");
         }
     });
 }

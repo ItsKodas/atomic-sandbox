@@ -5397,6 +5397,28 @@ mod view_panel {
         assert!(t.contains("What you see") && t.contains("Display aids") && !t.contains("dot size") && !t.contains("partial charges"), "{t}");
     }
 
+    /// Drawing the panel never rewrites a stored value outside a slider's range (the review of
+    /// Task 4: egui clamps on every draw by default): a profile's (or `--ui nuclei=`'s) nucleus
+    /// size of 3.0 stays 3.0. (The dots' feather was already held to 0–0.8 by the view switch's
+    /// own slider, drawn whenever the dots are.)
+    #[test]
+    fn drawing_does_not_clamp_stored_values() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        profile::apply(&mut st, "nucleus_scale = 3\nview_sections = aids\n");
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        probed_rect("nucleus-auto"); // the Display aids were drawn
+        assert_eq!(st.nucleus_scale, Some(3.0));
+        assert!(profile::capture(&st).contains("\nnucleus_scale = 3\n"));
+    }
+
     /// The sections fold and unfold by their headers; their open state is kept in the profile
     /// (`view_sections`), What you see and How it looks open in a profile without it.
     #[test]

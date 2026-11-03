@@ -318,6 +318,7 @@ pub fn mark(ui: &egui::Ui, st: &mut UiState, anchor: &str, rect: egui::Rect) {
         m.borrow_mut().insert(anchor.to_string());
     });
     // its rect, for the tests' reveal checks (`anchor-<name>`)
+    #[cfg(test)]
     super::probe_rect(&format!("anchor-{anchor}"), rect);
     if st.search.revealing() != Some(anchor) {
         return;

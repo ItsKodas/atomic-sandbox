@@ -92,7 +92,7 @@ another monitor, with saved layouts and one consistent icon set.
   view on that edge. An edge with no hidden panels shows no strip.
 - **D-11 Presets (D2):** One monitor (the D1 default); Two monitors (the default minus Activity and
   Graph, which go to a detached window on the second monitor — until D3 ships, or with one
-  monitor, they stay tabbed on the left); Training (left column Model / Knowledge at 34 %, right
+  monitor, they stay tabbed with Log on the right, as in the default); Training (left column Model / Knowledge at 34 %, right
   column Activity over Graph at 30 %, View / Orbitals / Selection / Readouts / Log auto-hidden on the
   right); Presenting (every panel auto-hidden, the 3D view fills the window). Window ▸ Layouts lists
   them; Reset layout applies One monitor (or Two monitors when a second monitor is present, D3).
