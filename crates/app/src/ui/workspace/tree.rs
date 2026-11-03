@@ -38,8 +38,9 @@
 //! window (`hidden = …`), so it comes back on that strip (recorded for review: a float is a
 //! moment's arrangement, and D3's `window = …` lines will keep detached windows).
 //! - **Saved fractions hold in a narrow window**: `egui_dock` clamps each split's fraction every
-//!   frame to leave `separator.extra` either side; a fraction it only clamped (no separator drag)
-//!   is put back after the frame (`keep_fractions`), so the profile keeps the user's.
+//!   frame to leave `separator.extra` either side; a fraction it only clamped — any split but the
+//!   one whose separator the pointer was pressed on — is put back after the frame
+//!   (`keep_fractions`), so the profile keeps the user's and a drag still moves its separator.
 use super::autohide::{self, Flyout};
 use super::layout::{self, Edge, Hidden, Node};
 use crate::ui::{dock, icons, theme, Action, DockTab, PanelInput, UiState};
@@ -88,6 +89,9 @@ pub struct Workspace {
     /// The auto-hidden panels, in the order they were unpinned (each strip's order).
     hidden: Vec<Hidden>,
     pub(super) fly: Flyout,
+    /// The pointer's press origin while a button is held, and the split whose separator it was
+    /// pressed on (`keep_fractions` leaves a dragged split alone).
+    drag: Option<(Pos2, Option<NodePath>)>,
     /// While the dock area draws: the panels visible when the tree left (what [`Workspace::visible`]
     /// answers meanwhile).
     lent: Option<Vec<DockTab>>,
@@ -103,7 +107,7 @@ impl Default for Workspace {
 
 impl Workspace {
     fn from_node(n: &Node) -> Workspace {
-        let mut w = Workspace { dock: build(n), hidden: Vec::new(), fly: Flyout::default(), lent: None, pending: Vec::new() };
+        let mut w = Workspace { dock: build(n), hidden: Vec::new(), fly: Flyout::default(), drag: None, lent: None, pending: Vec::new() };
         w.normalize();
         w
     }
@@ -750,18 +754,37 @@ fn fractions(dock: &DockState<Tile>) -> Vec<(NodePath, f32)> {
         .collect()
 }
 
+/// The split whose separator (its interact band, `half` either side of the line) is at `p`.
+fn separator_at(dock: &DockState<Tile>, p: Pos2, half: f32) -> Option<NodePath> {
+    dock.iter_all_nodes().find_map(|(path, n)| match n {
+        egui_dock::Node::Horizontal(s) if s.rect.is_positive() => {
+            let x = s.rect.left() + s.rect.width() * s.fraction;
+            ((p.x - x).abs() <= half && s.rect.y_range().contains(p.y)).then_some(path)
+        }
+        egui_dock::Node::Vertical(s) if s.rect.is_positive() => {
+            let y = s.rect.top() + s.rect.height() * s.fraction;
+            ((p.y - y).abs() <= half && s.rect.x_range().contains(p.x)).then_some(path)
+        }
+        _ => None,
+    })
+}
+
 /// Puts back each split fraction `egui_dock` only clamped this frame (`before`: the fractions
 /// when the tree was lent): it clamps a split's fraction every frame to leave `separator.extra`
-/// either side, which in a narrow window rewrote the user's (and the profile saved it). A
-/// fraction that is exactly its old value clamped to that range was not dragged — a drag moves
-/// it off its clamped value, or was past the bound the old value already lay beyond — so the old
-/// value goes back. Nothing is put back when the tree changed shape this frame.
-fn keep_fractions(dock: &mut DockState<Tile>, before: &[(NodePath, f32)]) {
+/// either side, which in a narrow window rewrote the user's (and the profile saved it). The split
+/// whose separator is being dragged (`dragged`) keeps what egui_dock made of it — a fraction
+/// outside the bounds jumps to the bound and moves on from there; any other split whose fraction
+/// is exactly its old value clamped to that range was only clamped, and the old value goes back.
+/// Nothing is put back when the tree changed shape this frame.
+fn keep_fractions(dock: &mut DockState<Tile>, before: &[(NodePath, f32)], dragged: Option<NodePath>) {
     let after = fractions(dock);
     if after.len() != before.len() || after.iter().zip(before).any(|(a, b)| a.0 != b.0) {
         return;
     }
-    for ((_, node), &(_, old)) in dock.iter_all_nodes_mut().filter(|(_, n)| n.is_parent()).zip(before) {
+    for ((path, node), &(_, old)) in dock.iter_all_nodes_mut().filter(|(_, n)| n.is_parent()).zip(before) {
+        if Some(path) == dragged {
+            continue;
+        }
         let horizontal = node.is_horizontal();
         if let egui_dock::Node::Horizontal(s) | egui_dock::Node::Vertical(s) = node {
             let range = if horizontal { s.rect.width() } else { s.rect.height() };
@@ -804,6 +827,15 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     let style = style(root.style());
     let mut dock = st.workspace.lend();
     let before = fractions(&dock);
+    // the separator being dragged, if any: latched at its press, kept through the release frame
+    // (whose movement is the drag's last)
+    let origin = root.ctx().input(|i| i.pointer.press_origin());
+    let half = style.separator.width / 2.0 + style.separator.extra_interact_width / 2.0 + 1.0;
+    let dragged = match (origin, st.workspace.drag) {
+        (Some(o), Some((from, split))) if o == from => split,
+        (Some(o), _) => separator_at(&dock, o, half),
+        (None, latched) => latched.and_then(|(_, split)| split),
+    };
     let asked = {
         let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new() };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt("workspace"));
@@ -818,7 +850,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             .tab_context_menus(false) // our own (`on_tab_button`): float, close, reset
             .show_inside(&mut ui, &mut tiles);
         paint_leaf_buttons(root.ctx(), &dock, &tiles.layers, TAB_BAR);
-        keep_fractions(&mut dock, &before);
+        keep_fractions(&mut dock, &before, dragged);
         let mut asked = tiles.asked;
         for path in tiles.pins {
             if let Some(Tile::Panel(t)) = dock.leaf(path).ok().and_then(|l| l.tabs.get(l.active.0)) {
@@ -827,6 +859,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         }
         asked
     };
+    st.workspace.drag = origin.map(|o| (o, dragged));
     if st.workspace.give_back(dock, asked) {
         root.ctx().request_discard("a panel dropped into the 3D view's leaf went beside it");
     }

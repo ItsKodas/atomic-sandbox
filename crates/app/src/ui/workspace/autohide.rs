@@ -43,6 +43,9 @@ pub struct Flyout {
     stuck: bool,
     /// The strip icon under the pointer, and since when (input time, s).
     hover: Option<(DockTab, f64)>,
+    /// The strip icon the pointer rested on when the flyout was hidden (Esc, say): resting there
+    /// does not reopen it; leaving the icon re-arms its hover.
+    quiet: Option<DockTab>,
     /// Since when the pointer has been off the flyout and the strips.
     left_at: Option<f64>,
     /// When the open flyout was first drawn (its slide).
@@ -56,14 +59,15 @@ impl Flyout {
         if self.open == Some(t) {
             self.stuck |= stuck;
         } else {
-            *self = Flyout { open: Some(t), stuck, hover: self.hover, left_at: None, opened_at: None };
+            *self = Flyout { open: Some(t), stuck, hover: self.hover, quiet: None, left_at: None, opened_at: None };
         }
         self.left_at = None;
     }
 
-    /// Hides the flyout.
+    /// Hides the flyout; the strip icon under the pointer, if any, stays quiet until the pointer
+    /// leaves it (its hover timer restarts then, rather than reopening at once).
     pub(super) fn close(&mut self) {
-        *self = Flyout { hover: self.hover, ..Flyout::default() };
+        *self = Flyout { quiet: self.hover.map(|(t, _)| t), ..Flyout::default() };
     }
 }
 
@@ -185,7 +189,11 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         (i.time, i.pointer.hover_pos(), i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten(), i.pointer.any_down(), i.key_pressed(Key::Escape))
     });
     let fly = &mut st.workspace.fly;
+    if fly.quiet.is_some() && fly.quiet != hovered {
+        fly.quiet = None; // the pointer left the icon it rested on
+    }
     match hovered {
+        Some(t) if fly.quiet == Some(t) => {}
         Some(t) => {
             let since = match fly.hover {
                 Some((h, since)) if h == t => since,
@@ -272,16 +280,19 @@ fn icon_button(ui: &mut Ui, icon: icons::Icon, tip: &str) -> Response {
 /// over the panel's body. Returns whether its pin, its close button was clicked.
 fn flyout(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, t: DockTab, rect: Rect, view: Rect) -> (bool, bool) {
     let (mut pin, mut close) = (false, false);
+    // the area is only the part over the view: while it slides out, the part still clipped away
+    // must not take the pointer over the strip it slides from
+    let shown = rect.intersect(view);
     egui::Area::new(flyout_layer().id)
         .order(flyout_layer().order)
-        .fixed_pos(rect.min)
+        .fixed_pos(shown.min)
         .constrain(false)
         .movable(false)
         .show(ctx, |ui| {
             ui.set_clip_rect(view);
             probe_rect(&format!("flyout-{t:?}"), rect);
-            // the whole rect is the flyout's (the pointer anywhere on it is over egui)
-            ui.allocate_rect(rect, Sense::hover());
+            // the whole of it on screen is the flyout's (the pointer anywhere on it is over egui)
+            ui.allocate_rect(shown, Sense::hover());
             let p = ui.painter();
             p.add(egui::Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(120) }.as_shape(rect, 6.0));
             p.rect(rect, 6.0, theme::PANEL, Stroke::new(1.0, theme::LINE), StrokeKind::Inside);

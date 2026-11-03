@@ -4817,6 +4817,31 @@ fn a_tiny_window_draws() {
             assert!(out.commands.is_empty(), "at {size:?}");
         }
     }
+    // with panels auto-hidden on every edge and a flyout out (docking spec D-10)
+    use super::workspace::layout::{Edge, Hidden};
+    st.reset_layout();
+    st.workspace.set_hidden(vec![]);
+    for (t, edge) in [(DockTab::Graph, Edge::Left), (DockTab::Log, Edge::Right), (DockTab::Readouts, Edge::Bottom)] {
+        st.workspace.close_panel(t);
+        st.workspace.pin(t, false);
+        let h = st.workspace.hidden().iter().position(|h| h.tab == t).unwrap();
+        let mut all = st.workspace.hidden().to_vec();
+        all[h] = Hidden { tab: t, edge, size: 400.0 };
+        st.workspace.set_hidden(all);
+    }
+    assert_eq!(st.workspace.hidden().len(), 3);
+    for t in [DockTab::Graph, DockTab::Log, DockTab::Readouts] {
+        st.open_tab(t);
+        for size in [egui::vec2(320.0, 240.0), egui::vec2(1.0, 1.0), egui::vec2(320.0, 240.0)] {
+            for _ in 0..3 {
+                let out = frame_sized(&ctx, &mut st, &inp, size, vec![]);
+                let view = out.view.unwrap_or_else(|| panic!("no view at {size:?}"));
+                assert!(view.min.is_finite() && view.max.is_finite(), "{view:?} at {size:?} with {t:?} out");
+                assert!(out.commands.is_empty(), "at {size:?}");
+            }
+        }
+        assert_eq!(st.workspace.flyout(), Some(t), "still out (opened by open_tab)");
+    }
 }
 
 /// Docking spec D-4: a tab that can carry a status dot keeps the dot's room whether the dot is
@@ -5156,6 +5181,50 @@ fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
     assert!(outs.last().unwrap().actions.contains(&Action::Deselect));
 }
 
+/// Esc while the pointer rests on the strip icon hides the flyout and it stays hidden — the hover
+/// timer starts again only once the pointer has left the icon and come back.
+#[test]
+fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
+    use super::workspace::layout;
+    use DockTab::Graph;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    let mut t = 10.0;
+    let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
+        frame_at(&ctx, st, &inp, t, events);
+        t += 1.0 / 60.0;
+    };
+    for _ in 0..2 {
+        step(&mut st, vec![]);
+    }
+    st.workspace.pin(Graph, false);
+    for _ in 0..2 {
+        step(&mut st, vec![]);
+    }
+    let icon = probed_rect("strip-icon-Graph").center();
+    for _ in 0..20 {
+        step(&mut st, vec![egui::Event::PointerMoved(icon)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "hover-opened");
+    step(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+    assert_eq!(st.workspace.flyout(), None, "Esc");
+    for _ in 0..40 {
+        step(&mut st, vec![egui::Event::PointerMoved(icon)]);
+    }
+    assert_eq!(st.workspace.flyout(), None, "resting on the icon does not reopen it");
+    let view = probed_rect("strip-Left").right() + 300.0;
+    step(&mut st, vec![egui::Event::PointerMoved(egui::pos2(view, icon.y))]);
+    for _ in 0..20 {
+        step(&mut st, vec![egui::Event::PointerMoved(icon)]);
+    }
+    assert_eq!(st.workspace.flyout(), Some(Graph), "back on the icon: the hover opens it again");
+}
+
 /// The flyout takes the pointer over itself — egui's, so the 3D view does not orbit through it —
 /// and only there: the 3D view beside it keeps its input; the strip is egui's; the view the frame
 /// hands the viewer is what the strip leaves.
@@ -5336,6 +5405,21 @@ fn a_very_narrow_window_keeps_the_saved_fractions() {
     frame(&ctx, &mut st, &inp, 1400.0, vec![pointer(at + egui::vec2(100.0, 0.0), false)]);
     let layout::Node::Split { frac, .. } = st.workspace.to_node() else { panic!() };
     assert!((0.29..0.33).contains(&frac), "dragged to ≈ 436 / 1400: {frac}");
+    // at 300 pt the saved 24 % lies below egui_dock's bound (80 / 300): a slow drag (2 pt a frame)
+    // of that separator still moves it — the clamp is not undone while it is dragged
+    st.reset_layout();
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 300.0, vec![]);
+    }
+    let at = egui::pos2(0.24 * 300.0, 600.0);
+    frame(&ctx, &mut st, &inp, 300.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+    for i in 1..=12 {
+        frame(&ctx, &mut st, &inp, 300.0, vec![egui::Event::PointerMoved(at + egui::vec2(2.0 * i as f32, 0.0))]);
+    }
+    frame(&ctx, &mut st, &inp, 300.0, vec![pointer(at + egui::vec2(24.0, 0.0), false)]);
+    frame(&ctx, &mut st, &inp, 300.0, vec![egui::Event::PointerGone]);
+    let layout::Node::Split { frac, .. } = st.workspace.to_node() else { panic!() };
+    assert!(frac > 0.27, "a slow drag at 300 pt moves the separator right: {frac}");
 }
 
 /// Every panel draws in its flyout (no panic, no command), on each edge.
