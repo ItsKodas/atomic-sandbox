@@ -8,8 +8,12 @@
 //! The arrangements, as the profile writes them (`layout = …` / `hidden = …`):
 //!
 //! - **One monitor** — the D1 default ([`layout::default_layout`]), nothing hidden.
-//! - **Two monitors** — One monitor until detached windows land (D3: Activity and Graph then go to
-//!   a window on the second monitor; with one monitor they stay tabbed with Log, as here).
+//! - **Two monitors** — the default minus Activity and Graph, `H(0.24,V(0.55,[Model*,Knowledge],
+//!   [Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))`, and Activity over Graph,
+//!   `V(0.50,[Activity*],[Graph*])`, in a detached window filling the second monitor's work area
+//!   (maximised there, not full screen: [`Preset::window`], D3, `super::detached`). With one monitor
+//!   (or none known, headless) it is One monitor and the status says "Only one monitor found"
+//!   (`UiState::apply_layout`).
 //! - **Training** — `H(0.34,[Model*,Knowledge],H(0.55,3D,V(0.50,[Activity*],[Graph*])))`: Model /
 //!   Knowledge on the left at 34 % of the window, Activity over Graph on the right at 30 % of the
 //!   window (0.45 of the 66 % the left column leaves; controller ruling, Task 7 review: at 30 % of
@@ -74,7 +78,7 @@ impl Preset {
     pub fn tip(self) -> &'static str {
         match self {
             Preset::OneMonitor => "the default: Model / Knowledge over Selection / Readouts on the left, the 3D view, View / Orbitals over Log / Activity / Graph on the right",
-            Preset::TwoMonitors => "for now the same as One monitor: Activity and Graph will move to a window on the second monitor once panels can leave the main window",
+            Preset::TwoMonitors => "the default, with Activity over Graph in their own window filling the second monitor (with one monitor: One monitor)",
             Preset::Training => "for teaching the estimated solver: Model / Knowledge on the left, Activity over Graph on the right; View, Orbitals, Selection, Readouts and Log fold to the right edge (hover their icons)",
             Preset::Presenting => "the 3D view fills the window: every panel folds to an icon on the view's left or right edge (hover one to slide it out)",
         }
@@ -84,7 +88,16 @@ impl Preset {
     pub fn tree(self) -> (Node, Vec<Hidden>) {
         use DockTab::*;
         match self {
-            Preset::OneMonitor | Preset::TwoMonitors => (layout::default_layout(), Vec::new()),
+            Preset::OneMonitor => (layout::default_layout(), Vec::new()),
+            Preset::TwoMonitors => {
+                let main = split(
+                    true,
+                    0.24,
+                    split(false, 0.55, leaf(&[Model, Knowledge]), leaf(&[Selection, Readouts])),
+                    split(true, 0.70, Node::View3d, split(false, 0.62, leaf(&[View, Orbitals]), leaf(&[Log]))),
+                );
+                (main, Vec::new())
+            }
             Preset::Training => {
                 let tree = split(true, 0.34, leaf(&[Model, Knowledge]), split(true, 0.55, Node::View3d, split(false, 0.50, leaf(&[Activity]), leaf(&[Graph]))));
                 let hidden = [View, Orbitals, Selection, Readouts, Log].map(|tab| Hidden { tab, edge: Edge::Right, size: TRAINING_HIDDEN });
@@ -103,6 +116,15 @@ impl Preset {
                 (Node::View3d, fold(l, Edge::Left, LEFT_SIZE).chain(fold(r, Edge::Right, RIGHT_SIZE)).collect())
             }
         }
+    }
+}
+
+impl Preset {
+    /// The detached window's tree (spec D-11, D-12): Two monitors' Activity over Graph, for the
+    /// second monitor; the others have none.
+    pub fn window(self) -> Option<Node> {
+        use DockTab::*;
+        (self == Preset::TwoMonitors).then(|| split(false, 0.50, leaf(&[Activity]), leaf(&[Graph])))
     }
 }
 
@@ -126,6 +148,7 @@ mod tests {
             assert!(layout::has_view(&tree), "{p:?}");
             let mut all = layout::panels(&tree);
             all.extend(hidden.iter().map(|h| h.tab));
+            all.extend(p.window().map(|w| layout::panels(&w)).unwrap_or_default());
             for t in DockTab::PANELS {
                 assert_eq!(all.iter().filter(|&&x| x == t).count(), 1, "{p:?}: {t:?} once in {} + {}", layout::encode(&tree), layout::encode_hidden(&hidden));
             }
@@ -138,7 +161,11 @@ mod tests {
     fn the_presets_are_the_spec_arrangements() {
         let (one, h) = Preset::OneMonitor.tree();
         assert_eq!((one.clone(), h.is_empty()), (layout::default_layout(), true));
-        assert_eq!(Preset::TwoMonitors.tree(), (one, vec![]), "Two monitors is One monitor until D3");
+        let (two, h) = Preset::TwoMonitors.tree();
+        assert_eq!((layout::encode(&two), h.is_empty()), ("H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))".to_string(), true));
+        assert_eq!(layout::encode(&Preset::TwoMonitors.window().unwrap()), "V(0.50,[Activity*],[Graph*])");
+        assert!(Preset::ALL.iter().filter(|p| **p != Preset::TwoMonitors).all(|p| p.window().is_none()));
+        let _ = one;
         let (tree, hidden) = Preset::Training.tree();
         assert_eq!(layout::encode(&tree), "H(0.34,[Model*,Knowledge],H(0.55,3D,V(0.50,[Activity*],[Graph*])))");
         assert_eq!(layout::encode_hidden(&hidden), "View:right:340, Orbitals:right:340, Selection:right:340, Readouts:right:340, Log:right:340");

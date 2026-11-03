@@ -68,6 +68,32 @@ pub fn parse(s: &str) -> Option<Node> {
     clean(n).filter(has_view)
 }
 
+/// Reads a detached window's tree (spec D-12: the grammar without the 3D view) and [`clean`]s it;
+/// a `3D` in it is dropped (a window never holds the view). `None` when the text is not the
+/// grammar or no panel is left.
+pub fn parse_window(s: &str) -> Option<Node> {
+    let mut r = Reader { s, at: 0 };
+    let n = r.node(0)?;
+    if r.peek().is_some() {
+        return None; // trailing text
+    }
+    clean(n).and_then(without_view)
+}
+
+/// The tree with the 3D view taken out (its split collapses into the other child); `None` when
+/// nothing else is left.
+pub fn without_view(n: Node) -> Option<Node> {
+    match n {
+        Node::View3d => None,
+        Node::Leaf { .. } => Some(n),
+        Node::Split { horizontal, frac, a, b } => match (without_view(*a), without_view(*b)) {
+            (Some(a), Some(b)) => Some(split(horizontal, frac, a, b)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        },
+    }
+}
+
 /// The tree as text, in the grammar [`parse`] reads.
 pub fn encode(n: &Node) -> String {
     let mut out = String::new();
@@ -551,6 +577,16 @@ mod tests {
     #[test]
     fn from_two_empty_lists_is_the_default() {
         assert_eq!(from_sides(&[], &[]), default_layout());
+    }
+
+    #[test]
+    fn a_window_tree_parses_without_the_3d_view() {
+        let n = parse_window("V(0.50,[Activity*],[Graph*])").unwrap();
+        assert_eq!(encode(&n), "V(0.50,[Activity*],[Graph*])");
+        assert_eq!(parse_window("H(0.3,3D,[Log*,Graph])"), Some(leaf(&[Log, Graph], 0)), "a 3D in a window's tree is dropped");
+        for bad in ["3D", "", "[Bogus]", "V(0.5,[],[Nope])", "[Log] trailing", "H("] {
+            assert_eq!(parse_window(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

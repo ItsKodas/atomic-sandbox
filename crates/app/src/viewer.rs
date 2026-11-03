@@ -457,8 +457,12 @@ pub struct Viewer {
     pub trails: crate::trails::Trails,
     /// The 3D view's mouse ([`Viewer::input`]).
     pub mouse: Mouse,
-    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
+    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`; the main
+    /// window's, then each detached window's by id), for `--record`.
     pub chrome_actions: Vec<ui::Action>,
+    /// What the detached windows asked of the window side (docking spec D-12; `PanelOutput::windows`),
+    /// until `main.rs` takes them ([`Viewer::take_window_requests`]).
+    pub window_requests: Vec<ui::WindowRequest>,
     /// The window size of the last `run_ui` (physical pixels): a resize's viewport estimate
     /// ([`Viewer::input`]) keeps the margins to it.
     screen: Option<(f32, f32)>,
@@ -531,6 +535,7 @@ impl Viewer {
             trails: Default::default(),
             mouse: Mouse::default(),
             chrome_actions: Vec::new(),
+            window_requests: Vec::new(),
             screen: None,
             last_play_log: None,
             ghost: Default::default(),
@@ -1221,7 +1226,8 @@ impl Viewer {
 
     /// What a frame's (or one action's) chrome output implies: the error line, the selection, the
     /// camera focus, play / pause, the commands, and a worker re-spawn when the solver changed.
-    fn act_on(&mut self, out: ui::PanelOutput) {
+    fn act_on(&mut self, mut out: ui::PanelOutput) {
+        self.window_requests.append(&mut out.windows);
         if let Some(e) = out.error {
             self.last_error = Some(e);
         }
@@ -2490,6 +2496,20 @@ impl Viewer {
 
     /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
+        self.run_ui_with(raw, Vec::new()).0
+    }
+
+    /// The detached windows' requests since the last call (`main.rs` opens, closes and focuses
+    /// the OS windows; docking spec D-12).
+    pub fn take_window_requests(&mut self) -> Vec<ui::WindowRequest> {
+        std::mem::take(&mut self.window_requests)
+    }
+
+    /// [`Viewer::run_ui`] for the main window, then each detached window's panels (docking spec
+    /// D-12) in its own egui context — `windows`: (id, context, its input), in id order — from
+    /// the same state and the same `PanelInput`; their actions follow the main window's, in that
+    /// order. Returns each context's output, the detached windows' with their ids.
+    pub fn run_ui_with(&mut self, raw: egui::RawInput, windows: Vec<(u32, egui::Context, egui::RawInput)>) -> (egui::FullOutput, Vec<(u32, egui::FullOutput)>) {
         let mut outs = Vec::new();
         self.poll_retiring();
         // Trails switched off forget their history; switched on while paused (no snapshot comes)
@@ -2574,6 +2594,30 @@ impl Viewer {
             self.label_overlay(root, &shown, viewport, &lv);
             self.reference_arrows(root, &shown, viewport);
         });
+        // the detached windows' panels, after the main window's, by id
+        let mut fulls = Vec::with_capacity(windows.len());
+        for (id, wctx, wraw) in windows {
+            let input = ui::PanelInput {
+                scene: &self.scene,
+                snapshot: self.snapshot.as_ref(),
+                busy: self.busy,
+                playing: self.playing,
+                last_error: self.last_error.as_deref(),
+                selected: self.tool.selected,
+                measured_fs_per_s,
+                camera: &self.camera,
+                density_label: density_label.clone(),
+                orbital_label: orbital_label.clone(),
+                orbital_waiting,
+                pseudo_generating: providers::pseudo::generating(),
+                draft_banner: draft_banner.clone(),
+                bonds_label: bonds_label.clone(),
+                probe,
+            };
+            let ui_state = &mut self.ui;
+            let full = wctx.run_ui(wraw, |root| outs.push(ui::show_window(root, ui_state, &input, id)));
+            fulls.push((id, full));
+        }
         self.viewport = viewport;
         let ppp = ctx.pixels_per_point();
         if let Some(s) = screen_points {
@@ -2586,7 +2630,7 @@ impl Viewer {
             self.chrome_actions.append(&mut out.actions);
             self.act_on(out);
         }
-        full
+        (full, fulls)
     }
 }
 

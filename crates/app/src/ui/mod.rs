@@ -49,6 +49,8 @@ pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
 /// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.
 pub use workspace::presets::Preset as LayoutPreset;
+/// Detached windows (docking spec D-12): what the UI asks of the window side, and where a window is.
+pub use workspace::detached::{WinRect, WindowRequest};
 
 use crate::scene::Scene;
 use crate::sim::{Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
@@ -786,19 +788,36 @@ impl UiState {
         self.workspace.visible(tab)
     }
 
-    /// The default layout back: the One monitor preset (the D1 default,
-    /// `workspace::layout::default_layout`; nothing auto-hidden).
+    /// The default layout back (spec D-11): the One monitor preset (the D1 default,
+    /// `workspace::layout::default_layout`; nothing auto-hidden), or Two monitors when a second
+    /// monitor is connected.
     pub fn reset_layout(&mut self) {
-        self.apply_layout(workspace::presets::Preset::OneMonitor);
+        use workspace::presets::Preset;
+        self.apply_layout(if self.workspace.monitor_count() >= 2 { Preset::TwoMonitors } else { Preset::OneMonitor });
     }
 
     /// Rearranges the workspace as the built-in layout `p` (Window ▸ Layouts, spec D-11): its tree
-    /// and its auto-hidden panels replace the current ones (floating windows and the flyout go);
-    /// the profile's autosave then keeps it. Display state, never recorded.
+    /// and its auto-hidden panels replace the current ones (floating windows, detached windows and
+    /// the flyout go); Two monitors also opens its detached window filling the second monitor
+    /// (spec D-12) — with one monitor it is One monitor and the status says so. The profile's
+    /// autosave then keeps it. Display state, never recorded.
     pub fn apply_layout(&mut self, p: workspace::presets::Preset) {
+        use workspace::presets::Preset;
+        let second = self.workspace.second_monitor();
+        let p = match (p, second) {
+            (Preset::TwoMonitors, None) => {
+                self.set_status("Only one monitor found: the Two monitors layout is One monitor here (Activity and Graph stay tabbed with Log)");
+                Preset::OneMonitor
+            }
+            _ => p,
+        };
         let (tree, hidden) = p.tree();
+        self.workspace.close_windows();
         self.workspace.set_node(tree);
         self.workspace.set_hidden(hidden);
+        if let Some(w) = p.window() {
+            self.workspace.open_window(w, second, true);
+        }
     }
 
     pub fn new(preset: &str, scene: &Scene) -> UiState {
@@ -1197,6 +1216,9 @@ pub struct PanelOutput {
     /// The interrupted training's offer was answered: resume it (true) or discard it (false)
     /// (`Viewer::resume_training`).
     pub training: Option<bool>,
+    /// What the detached windows need of the window side (docking spec D-12: open, close, bring
+    /// to the front; `workspace::detached`), in order — the UI cannot create OS windows.
+    pub windows: Vec<workspace::detached::WindowRequest>,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
@@ -1258,7 +1280,32 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
+    window_requests(st, &mut out);
     out
+}
+
+/// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the
+/// same frame as [`show`] and after it, from the same state: its panels' actions are applied as
+/// the main window's are, and the viewer appends them to the frame's (main window first, then
+/// the windows by id), so `--record` sees them. An unknown `id` draws nothing.
+pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>, id: u32) -> PanelOutput {
+    let mut out = PanelOutput::default();
+    let mut acts = Vec::new();
+    workspace::tree::show_window(root, st, input, &mut acts, id);
+    out.actions = acts.clone();
+    for a in acts {
+        actions::apply(st, input, a, &mut out);
+    }
+    window_requests(st, &mut out);
+    out
+}
+
+/// The workspace's requests for the window side, and its notes as the status line.
+fn window_requests(st: &mut UiState, out: &mut PanelOutput) {
+    out.windows = st.workspace.take_requests();
+    for n in st.workspace.take_notes() {
+        st.set_status(n);
+    }
 }
 
 #[cfg(test)]
