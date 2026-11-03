@@ -6092,6 +6092,14 @@ mod view_panel {
         }
         // the check: in the workspace, not only on screen
         st.apply_layout(Preset::Presenting);
+        // and the profile keeps the preset (its autosave writes what `capture` gives)
+        let saved = profile::capture(&st);
+        assert!(saved.contains("
+layout = 3D
+"), "{saved}");
+        assert!(saved.contains(&format!("
+hidden = {}
+", layout::encode_hidden(&Preset::Presenting.tree().1))), "{saved}");
         assert!(DockTab::PANELS.into_iter().all(|t| st.workspace.present(t) && !st.tab_shown(t)), "hidden panels are present");
         st.reset_layout();
         assert!(st.workspace.present(DockTab::Graph) && !st.tab_shown(DockTab::Graph), "a tab behind Log is present");

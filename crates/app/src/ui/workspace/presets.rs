@@ -10,10 +10,11 @@
 //! - **One monitor** — the D1 default ([`layout::default_layout`]), nothing hidden.
 //! - **Two monitors** — One monitor until detached windows land (D3: Activity and Graph then go to
 //!   a window on the second monitor; with one monitor they stay tabbed with Log, as here).
-//! - **Training** — `H(0.34,[Model*,Knowledge],H(0.70,3D,V(0.50,[Activity*],[Graph*])))`: Model /
-//!   Knowledge on the left at 34 %, Activity over Graph on the right at 30 % of what the left
-//!   column leaves (the same reading of a column's share as the default's "right column at 30 %":
-//!   ≈ 20 % of the window); View / Orbitals / Selection / Readouts / Log auto-hidden on the right
+//! - **Training** — `H(0.34,[Model*,Knowledge],H(0.55,3D,V(0.50,[Activity*],[Graph*])))`: Model /
+//!   Knowledge on the left at 34 % of the window, Activity over Graph on the right at 30 % of the
+//!   window (0.45 of the 66 % the left column leaves; controller ruling, Task 7 review: at 30 % of
+//!   that 66 % the Graph's controls were clipped), the 3D view ≈ 36 % between them; View /
+//!   Orbitals / Selection / Readouts / Log auto-hidden on the right
 //!   edge at [`TRAINING_HIDDEN`] points (recorded for review).
 //! - **Presenting** — the tree is just `3D`; every panel is auto-hidden, the default layout's left
 //!   column (Model, Knowledge, Selection, Readouts) on the left edge at [`LEFT_SIZE`], the rest on
@@ -85,7 +86,7 @@ impl Preset {
         match self {
             Preset::OneMonitor | Preset::TwoMonitors => (layout::default_layout(), Vec::new()),
             Preset::Training => {
-                let tree = split(true, 0.34, leaf(&[Model, Knowledge]), split(true, 0.70, Node::View3d, split(false, 0.50, leaf(&[Activity]), leaf(&[Graph]))));
+                let tree = split(true, 0.34, leaf(&[Model, Knowledge]), split(true, 0.55, Node::View3d, split(false, 0.50, leaf(&[Activity]), leaf(&[Graph]))));
                 let hidden = [View, Orbitals, Selection, Readouts, Log].map(|tab| Hidden { tab, edge: Edge::Right, size: TRAINING_HIDDEN });
                 (tree, hidden.to_vec())
             }
@@ -139,7 +140,7 @@ mod tests {
         assert_eq!((one.clone(), h.is_empty()), (layout::default_layout(), true));
         assert_eq!(Preset::TwoMonitors.tree(), (one, vec![]), "Two monitors is One monitor until D3");
         let (tree, hidden) = Preset::Training.tree();
-        assert_eq!(layout::encode(&tree), "H(0.34,[Model*,Knowledge],H(0.70,3D,V(0.50,[Activity*],[Graph*])))");
+        assert_eq!(layout::encode(&tree), "H(0.34,[Model*,Knowledge],H(0.55,3D,V(0.50,[Activity*],[Graph*])))");
         assert_eq!(layout::encode_hidden(&hidden), "View:right:340, Orbitals:right:340, Selection:right:340, Readouts:right:340, Log:right:340");
         let (tree, hidden) = Preset::Presenting.tree();
         assert_eq!(tree, Node::View3d, "Presenting's tree is just the 3D view");
