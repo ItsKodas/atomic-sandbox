@@ -230,7 +230,8 @@ pub fn peek(st: &UiState) -> String {
     }
 }
 
-/// View ▸ Display aids ▸ knowledge overlay (display only, not recorded; kept in the profile).
+/// View ▸ Display aids ▸ knowledge overlay (the View panel, `dock::view`; display only, not
+/// recorded; kept in the profile).
 pub fn overlay_toggle(ui: &mut Ui, st: &mut UiState) {
     super::probed("show-knowledge", ui.checkbox(&mut st.show_knowledge, "knowledge overlay")).on_hover_text(
         "tints each atom by how well the estimated solver's model knows its surroundings: 0 never seen (grey) … 0.5 thin (amber) … 1 well known (green), the knowledge map's colours. Per atom it is its least-known neighbour within the model's cutoff — that pair's verdict and how many distances like this one were taught. Needs the estimated solver's map (Knowledge tab). Display only, not recorded",

@@ -12,6 +12,7 @@ pub mod model;
 pub mod orbitals;
 mod readouts;
 mod selection;
+pub mod view;
 
 #[cfg(test)]
 pub use log::last_refusal;
@@ -174,9 +175,7 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
                 DockTab::Knowledge => super::knowledge::tab(ui, st, input),
-                // today's View menu, unchanged, until docking Task 4 regroups it (its widgets' test
-                // probes are prefixed so the menu's own stay findable)
-                DockTab::View => super::with_probe_prefix("view-panel/", || super::menus::view_menu(ui, st, acts)),
+                DockTab::View => view::show(ui, st, acts),
             }
         });
 }

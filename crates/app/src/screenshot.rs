@@ -24,7 +24,8 @@ const H: u32 = 900;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
-/// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=<panel>` shows that
+/// of the mockup): `menu=file|scene|physics|window|help` opens a menu (`menu=view`, the old View
+/// menu, shows the View panel), `tab=<panel>` shows that
 /// panel (its name, any case: `readouts|graph|model|knowledge|activity|orbitals|selection|log|view`;
 /// `UiState::open_tab`: the active tab of its leaf in the default layout, `ui::workspace`),
 /// `dock=closed` closes every panel (the 3D view fills the window; docking D2's Presenting layout
@@ -425,7 +426,7 @@ impl ShotUi {
             viewer.ui.search.query = q.clone();
         }
         if let Some(m) = &self.menu {
-            crate::ui::open_menu(&viewer.egui_ctx, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
+            crate::ui::open_menu(&viewer.egui_ctx, &mut viewer.ui, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
         }
         if let Some(n) = self.names {
             viewer.ui.name_style = n;

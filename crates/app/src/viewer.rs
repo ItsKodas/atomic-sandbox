@@ -3281,7 +3281,8 @@ nucleus 1 {a} {} {}
         assert!((1060.0..1100.0).contains(&(both.origin[0] + both.size[0])), "the right column is on the right: {both:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
         // closing the right column's panels gives its width back, to the window's edge
-        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log] {
+        // (Activity and Graph are tabbed with the Log since docking Task 4)
+        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity, DockTab::Graph] {
             v.ui.workspace.close_panel(t);
         }
         let left_only = frames(&mut v);
@@ -3291,7 +3292,7 @@ nucleus 1 {a} {} {}
         v.ui.open_tab(DockTab::Log);
         assert_eq!(frames(&mut v), both, "the right column is back at its width");
         // closing the left column's panels widens the view on the left, to the window's edge
-        for t in [DockTab::Model, DockTab::Knowledge, DockTab::Selection, DockTab::Readouts, DockTab::Activity, DockTab::Graph] {
+        for t in [DockTab::Model, DockTab::Knowledge, DockTab::Selection, DockTab::Readouts] {
             v.ui.workspace.close_panel(t);
         }
         let right_only = frames(&mut v);

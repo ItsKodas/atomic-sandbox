@@ -229,8 +229,8 @@ pub enum DockTab {
     Log,
     /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
     Knowledge,
-    /// Every control of the old View menu (docking spec D-6; until docking Task 4 regroups it, the
-    /// View menu's own contents, `menus::view_menu`).
+    /// Every control of the old View menu, regrouped into folding sections (docking spec D-6,
+    /// `dock::view`).
     View,
 }
 
@@ -734,6 +734,9 @@ pub struct UiState {
     /// (`workspace::layout::default_layout`); the profile keeps it (`layout = …`). Display state:
     /// not recorded.
     pub workspace: workspace::Workspace,
+    /// The View panel's folding sections that are open (`dock::view`; the profile's
+    /// `view_sections`). Display state: not recorded.
+    pub view_sections: dock::view::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -903,6 +906,7 @@ impl UiState {
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
             workspace: workspace::Workspace::default(),
+            view_sections: dock::view::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
@@ -1250,23 +1254,6 @@ thread_local! {
     /// Test hook: the rect of each probed widget in the last frame (`probe`), so the headless click
     /// tests can press the real widget.
     pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<String, egui::Rect>> = Default::default();
-    /// Test hook: a prefix [`probe`] puts before every name while set — the View panel draws the
-    /// View menu's widgets a second time (`with_probe_prefix`), under `view-panel/<name>`, so a
-    /// test clicking a menu item still finds the menu's own.
-    static PROBE_PREFIX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
-}
-
-/// Runs `f` with every probe name prefixed by `prefix` (tests; a plain call outside them).
-#[inline]
-fn with_probe_prefix<R>(prefix: &'static str, f: impl FnOnce() -> R) -> R {
-    #[cfg(test)]
-    let before = PROBE_PREFIX.with(|p| p.replace(prefix));
-    #[cfg(not(test))]
-    let _ = prefix;
-    let r = f();
-    #[cfg(test)]
-    PROBE_PREFIX.with(|p| p.set(before));
-    r
 }
 
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
@@ -1280,7 +1267,7 @@ fn probe(name: &str, r: &egui::Response) {
 fn probe_rect(name: &str, rect: egui::Rect) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(format!("{}{name}", PROBE_PREFIX.with(|x| x.get())), rect);
+        p.borrow_mut().insert(name.to_string(), rect);
     });
     #[cfg(not(test))]
     let _ = (name, rect);
@@ -1552,9 +1539,14 @@ pub fn open_ptable(ctx: &egui::Context) {
     egui::Popup::open_id(ctx, ptable::popup_id());
 }
 
-/// Opens a top-bar menu by its name ("file", "scene", "view", "physics", "help"); `None` for an
-/// unknown name (the screenshot flag's `menu=`).
-pub fn open_menu(ctx: &egui::Context, name: &str) -> Option<()> {
+/// Opens a top-bar menu by its name ("file", "scene", "physics", "window", "help"); "view", the
+/// View menu before the View panel replaced it (docking spec D-6), shows the View panel instead.
+/// `None` for an unknown name (the screenshot flag's `menu=`).
+pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()> {
+    if name.eq_ignore_ascii_case("view") {
+        st.open_tab(DockTab::View);
+        return Some(());
+    }
     let m = menus::MenuId::ALL.into_iter().find(|m| m.title().eq_ignore_ascii_case(name))?;
     egui::Popup::open_id(ctx, menus::popup_id(m));
     Some(())

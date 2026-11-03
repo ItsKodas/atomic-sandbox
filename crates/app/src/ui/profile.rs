@@ -1,7 +1,8 @@
 //! Profiles (user request 2026-10-19): the viewer's own look and layout — the workspace's
 //! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
-//! and active tabs in `workspace::layout`'s grammar), the view and density-look settings, the
-//! units — as a small text file of `key = value` lines. Display state only: nothing here is an `Action`
+//! and active tabs in `workspace::layout`'s grammar), the view and density-look settings and which
+//! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
+//! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
 //!
 //! The window keeps the state in force in `%LOCALAPPDATA%\atomic-sandbox\current.profile`
@@ -60,6 +61,7 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
     out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
+    out += &format!("view_sections = {}\n", st.view_sections.encode());
     out
 }
 
@@ -100,6 +102,8 @@ pub fn apply(st: &mut UiState, text: &str) {
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
     }
+    // the View panel's open sections (docking Task 4); a profile from before it opens the default two
+    st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
     if let Some(v) = kv.get("layout") {
         st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
     } else if kv.contains_key("left_tabs") || kv.contains_key("right_tabs") {

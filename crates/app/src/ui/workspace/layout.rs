@@ -95,15 +95,17 @@ fn encode_into(n: &Node, out: &mut String) {
     }
 }
 
-/// The D1 default (spec D-9's example, exactly): Model / Knowledge over Selection / Readouts /
-/// Activity / Graph on the left (24 %), the 3D view, View / Orbitals over Log on the right (30 %).
+/// The D1 default (spec D-9's example, exactly): Model / Knowledge over Selection / Readouts on the
+/// left (24 %), the 3D view, View / Orbitals over Log / Activity / Graph on the right (30 %).
+/// Activity and Graph sat in the lower-left leaf until docking Task 4 (2026-11-03): with four tabs
+/// there the Graph tab was scrolled off its bar at 1400 pt.
 pub fn default_layout() -> Node {
     use DockTab::*;
     split(
         true,
         0.24,
-        split(false, 0.55, leaf(vec![Model, Knowledge], 0), leaf(vec![Selection, Readouts, Activity, Graph], 0)),
-        split(true, 0.70, Node::View3d, split(false, 0.62, leaf(vec![View, Orbitals], 0), leaf(vec![Log], 0))),
+        split(false, 0.55, leaf(vec![Model, Knowledge], 0), leaf(vec![Selection, Readouts], 0)),
+        split(true, 0.70, Node::View3d, split(false, 0.62, leaf(vec![View, Orbitals], 0), leaf(vec![Log, Activity, Graph], 0))),
     )
 }
 
@@ -328,7 +330,7 @@ mod tests {
     const OLD_ALL: [DockTab; 8] = [Activity, Readouts, Graph, Model, Knowledge, Orbitals, Selection, Log];
 
     /// Spec D-9's example, verbatim: the D1 default.
-    const D9: &str = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts,Activity,Graph]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
+    const D9: &str = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Graph])))";
 
     fn leaf(tabs: &[DockTab], active: usize) -> Node {
         Node::Leaf { tabs: tabs.to_vec(), active }
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(parse(D9), Some(d.clone()));
         assert_eq!(parse(&encode(&d)), Some(d.clone()));
         assert_all_once(&d);
-        assert_eq!(panels(&d), vec![Model, Knowledge, Selection, Readouts, Activity, Graph, View, Orbitals, Log], "reading order: depth first");
+        assert_eq!(panels(&d), vec![Model, Knowledge, Selection, Readouts, View, Orbitals, Log, Activity, Graph], "reading order: depth first");
     }
 
     #[test]
@@ -416,7 +418,7 @@ mod tests {
 
     #[test]
     fn whitespace_is_tolerated() {
-        let spaced = " H ( 0.24 , V( 0.55,[ Model * , Knowledge ],[Selection*, Readouts,Activity,Graph]) ,\n H(0.70, 3D ,V(0.62,[View*,Orbitals],[ Log* ] ) ) ) ";
+        let spaced = " H ( 0.24 , V( 0.55,[ Model * , Knowledge ],[Selection*, Readouts]) ,\n H(0.70, 3D ,V(0.62,[View*,Orbitals],[ Log* ,Activity, Graph] ) ) ) ";
         assert_eq!(parse(spaced), Some(default_layout()));
     }
 

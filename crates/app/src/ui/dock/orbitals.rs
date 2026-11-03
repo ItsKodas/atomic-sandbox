@@ -524,7 +524,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         }
     });
     if st.show == ShowMode::Density {
-        theme::note(ui, "pick Orbitals, All orbitals coloured or Spin density above (or View ▸ Density ▸ show) to see the Kohn–Sham orbitals; they need a DFT step.");
+        theme::note(ui, "pick Orbitals, All orbitals coloured or Spin density above (or View ▸ What you see) to see the Kohn–Sham orbitals; they need a DFT step.");
     }
     controls(ui, st, payload, input.orbital_waiting, acts);
     super::group(ui, st, "d-orb-spin", |ui, st| {
@@ -574,7 +574,7 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, wai
         let iso_on = st.volume_mode == super::super::VOLUME_ISO;
         let iso = if spin { &mut st.spin_iso } else { &mut st.phase_iso };
         ui.add_enabled(signed && iso_on, egui::Slider::new(iso, 0.02..=0.9).logarithmic(true).text(if spin { "iso (× the spin scale)" } else { "iso (× max|ψ|)" }))
-            .on_hover_text("the ± isosurface (View ▸ Density ▸ render as isosurface, or the Isosurface switch in the view): surfaces at ±iso times the field's scale. For an orbital the scale is the largest |ψ| over its degenerate set");
+            .on_hover_text("the ± isosurface (View ▸ How it looks ▸ render as isosurface, or the Isosurface switch in the view): surfaces at ±iso times the field's scale. For an orbital the scale is the largest |ψ| over its degenerate set");
     });
     super::group(ui, st, "d-orb-colour", |ui, st| {
         ui.add_enabled_ui(st.show == ShowMode::Coloured, |ui| {

@@ -77,7 +77,10 @@ another monitor, with saved layouts and one consistent icon set.
   split := ("H" | "V") "(" frac "," node "," node ")"   frac = the first child's share, 0.05..0.95
   ```
   `H` puts children side by side, `V` stacks them. Example (the D1 default):
-  `H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts,Activity,Graph]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))`.
+  `H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Graph])))`.
+  Opening the app for the first time, Activity and Graph are tabbed with Log on the right (ruling
+  2026-11-03, docking Task 4: in the lower-left leaf beside Selection and Readouts the Graph tab was
+  scrolled off its bar at 1400 pt); the Two monitors preset (D-11) moves them to the second monitor.
   Parsing is total: unknown names are dropped, empty leaves removed, a duplicated panel keeps its
   first place, a tree without `3D` (or that fails to parse) falls back to the default.
 - **D-10 Auto-hide (D2):** unpinning a panel takes it out of the tree onto the strip of the edge it

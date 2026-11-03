@@ -450,7 +450,7 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
 /// Camera (the fourth choice) is the glow view (`UiState::camera_view`), its shutter and exposure
 /// beside the switch while it is on.
 fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    let dots_tip = format!("random samples of the field drawn, resampled every frame (View › Density › shimmer). {}", super::dock::orbitals::dots_note(st));
+    let dots_tip = format!("random samples of the field drawn, resampled every frame (View › How it looks › shimmer). {}", super::dock::orbitals::dots_note(st));
     egui::Area::new(Id::new("view-switch"))
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 14.0))
@@ -470,7 +470,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                             ui.add_space(8.0);
                             ui.label("drift");
                             ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
-                                .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
+                                .on_hover_text("how fast the dots drift (View ▸ How it looks ▸ floating)");
                             ui.add_space(8.0);
                             ui.label("feather");
                             ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).show_value(false))
@@ -512,8 +512,8 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                         ui,
                         st.volume_mode,
                         &[
-                            (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › Density for gamma and opacity)"),
-                            (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › Density, and the iso slider in the Orbitals tab)"),
+                            (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › How it looks for gamma and opacity)"),
+                            (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › How it looks, and the iso slider in the Orbitals tab)"),
                             (2, "Dots", dots_tip.as_str()),
                         ],
                     ) {

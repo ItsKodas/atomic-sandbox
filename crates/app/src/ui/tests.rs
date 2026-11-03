@@ -684,24 +684,27 @@ fn trail_controls_are_display_only_and_searchable() {
     assert!(!st.show_trails);
     assert_eq!((st.trail_fs, st.trail_opacity), (100.0, 0.7));
     let r = search::results("trails", 3);
-    assert_eq!((r[0].name, r[0].anchor), ("Trails", "m-display"));
+    assert_eq!((r[0].name, r[0].anchor, r[0].place), ("Trails", "m-display", search::Place::Dock(DockTab::View)));
     assert!(search::results("decay", 50).iter().any(|e| e.name == "Trails"));
     let inp = input(&scene, None, &cam);
     st.show_trails = true;
-    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+    // the View panel with every section open (its Display aids hold the trails)
+    view_panel(&mut st, &dock::view::Section::ALL);
     for w in [1400.0, 1000.0] {
         for _ in 0..2 {
             assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
         }
     }
-    egui::Popup::close_all(&ctx);
+    probed_rect("anchor-m-display"); // drawn
     assert!(st.show_trails && st.trail_fs == 100.0 && st.trail_opacity == 0.7, "drawing changes nothing");
 }
 
 /// Every menu popup (and the scene chip's) fits inside the default 1400 × 900 window, at the
-/// start and with every conditional row shown (dots look, Camera, trails, the estimated solver's
-/// draft line): the View menu once measured 1011 pt tall (2026-10-20), its last rows out of reach.
-/// Past the space below the top bar a menu scrolls (`menus::menu_popup`).
+/// start and with every conditional row shown (the estimated solver's draft line): the View menu
+/// once measured 1011 pt tall (2026-10-20), its last rows out of reach. Past the space below the
+/// top bar a menu scrolls (`menus::menu_popup`). The View menu's controls are the View panel's
+/// since docking Task 4: with every section open and every conditional row shown (dots look,
+/// Camera, trails) it scrolls, and Ctrl K still reveals its groups inside it.
 #[test]
 fn every_menu_popup_fits_the_default_window() {
     let scene = Scene::preset("h2o").unwrap();
@@ -740,21 +743,24 @@ fn every_menu_popup_fits_the_default_window() {
             }
         }
         if worst {
-            // with every row shown the View menu scrolls, and Ctrl K still reveals its last group
-            let bonds = search::results("bond lines", 1)[0];
-            assert_eq!(bonds.anchor, "m-bonds");
-            search::pick(&ctx, &mut st, bonds);
-            // the scroll is animated: these frames carry a clock (`frame`'s do not)
-            for i in 0..20 {
-                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(100.0 + 0.05 * i as f64), ..Default::default() };
-                let mut full = ctx.run_ui(raw, |root| {
-                    show(root, &mut st, &inp);
-                });
-                full.textures_delta.clear();
+            // with every section open and every row shown the View panel scrolls, and Ctrl K still
+            // reveals its groups: Bonds & labels, then the last, Display aids
+            st.view_sections = dock::view::Sections::all(true);
+            for (query, anchor, probe) in [("bond lines", "m-bonds", "show-bonds"), ("training is solving", "m-display", "show-ghost")] {
+                let e = search::results(query, 1)[0];
+                assert_eq!(e.anchor, anchor);
+                search::pick(&ctx, &mut st, e);
+                // the scroll is animated: these frames carry a clock (`frame`'s do not)
+                for i in 0..20 {
+                    let raw = egui::RawInput { screen_rect: Some(screen), time: Some(100.0 + 0.05 * i as f64), ..Default::default() };
+                    let mut full = ctx.run_ui(raw, |root| {
+                        show(root, &mut st, &inp);
+                    });
+                    full.textures_delta.clear();
+                }
+                let (b, panel) = (probed_rect(probe), probed_rect("view-panel"));
+                assert!(screen.contains_rect(b) && panel.contains_rect(b), "the revealed {probe} {b:?} is scrolled into the View panel's view {panel:?}");
             }
-            let b = probed_rect("show-bonds");
-            assert!(screen.contains_rect(b), "the revealed Bonds checkbox {b:?} is scrolled into view");
-            egui::Popup::close_all(&ctx);
         }
     }
 }
@@ -916,6 +922,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     rich.activity.knowledge = Some(std::sync::Arc::new(knowledge::fixture_map()));
     st.activity.absorb(&rich);
     st.show_knowledge = true; // the overlay's legend over every layout
+    st.view_sections = super::dock::view::Sections::all(true); // every View-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -1052,6 +1059,16 @@ fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, nam
 /// or text the test looks for. Another panel shown after it joins the same leaf.
 fn alone(st: &mut UiState, tab: DockTab) {
     st.workspace.set_node(super::workspace::layout::parse(&format!("H(0.76,3D,[{}*])", tab.name())).unwrap());
+}
+
+/// The View panel (docking Task 4: the View menu's controls) as [`alone`] gives it, with only the
+/// sections `open` unfolded, so the control a test clicks is on screen.
+fn view_panel(st: &mut UiState, open: &[dock::view::Section]) {
+    alone(st, DockTab::View);
+    st.view_sections = dock::view::Sections::all(false);
+    for &s in open {
+        st.view_sections.set(s, true);
+    }
 }
 
 fn click_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> Vec<PanelOutput> {
@@ -1257,8 +1274,8 @@ fn the_model_tab_says_where_the_model_learns() {
     assert_eq!(source_line(&spec), "file: hc.model (specialised)");
 }
 
-/// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the
-/// cloud refresh, Physics ▸ draft mode (estimated solver).
+/// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, the View
+/// panel's cloud refresh, Physics ▸ draft mode (estimated solver).
 #[test]
 fn clicking_the_m5b_controls_sends_their_commands() {
     let scene = Scene::preset("h2").unwrap();
@@ -1287,7 +1304,9 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(Some(w))] if w.half_width == 4.5), "{c:?}");
     let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(None)]), "{c:?}");
-    let outs = in_menu(&mut st, menus::MenuId::View, "cloud-refresh");
+    // the View panel's What you see (the panel alone: the Model panel, and its "draft", go)
+    view_panel(&mut st, &[dock::view::Section::What]);
+    let outs = click_widget(&ctx, &mut st, &inp, "cloud-refresh");
     let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
     assert_eq!(clouds.len(), 1);
     let outs = in_menu(&mut st, menus::MenuId::Physics, "draft");
@@ -1778,19 +1797,22 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
     let c = dyn_commands(&in_menu(&mut st, &inp_r, menus::MenuId::Physics, "m-relax-stop"));
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
-    assert!(in_menu(&mut st, &inp, menus::MenuId::View, "show-bonds").iter().all(|o| o.commands.is_empty()));
+    // the View panel: Bonds & labels, then Display aids
+    view_panel(&mut st, &[dock::view::Section::Bonds]);
+    assert!(click_widget(&ctx, &mut st, &inp, "show-bonds").iter().all(|o| o.commands.is_empty()));
     assert!(!st.show_bonds);
     // View ▸ Display aids ▸ show what training is solving: on by default, display only (no command,
     // no recorded action), and found by Ctrl K
     assert!(st.show_ghost);
-    let outs = in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    view_panel(&mut st, &[dock::view::Section::Aids]);
+    let outs = click_widget(&ctx, &mut st, &inp, "show-ghost");
     assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
     assert!(!st.show_ghost);
-    in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    click_widget(&ctx, &mut st, &inp, "show-ghost");
     assert!(st.show_ghost);
     assert_eq!(search::results("training is solving", 3)[0].name, "Show what training is solving");
     assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
-    assert!(matches!(search::results("what training", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
+    assert!(matches!(search::results("what training", 1)[0].place, search::Place::Dock(DockTab::View)));
     st.open_tab(DockTab::Selection);
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
@@ -2376,9 +2398,9 @@ mod orbital_viewer {
         let mut st = UiState::new("h2", &scene);
         st.workspace.close_panel(DockTab::Orbitals);
         assert!(!st.tab_shown(DockTab::Orbitals));
-        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+        // the View panel's What you see (on screen in the default layout)
+        assert!(st.tab_shown(DockTab::View) && st.view_sections.is_open(crate::ui::dock::view::Section::What));
         let outs = click_widget(&ctx, &mut st, &inp, "menu-show-orbitals");
-        egui::Popup::close_all(&ctx);
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "one request");
         assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: crate::ui::HOMO_TRACK, squared: false });
@@ -2860,7 +2882,7 @@ mod orbital_viewer {
         assert_eq!(search::results("all orbitals", 1)[0].name, "All orbitals coloured");
         assert_eq!(search::results("density", 1)[0].name, "Density");
         for name in ["Density", "Orbitals", "All orbitals coloured", "Spin density"] {
-            assert!(search::ENTRIES.iter().any(|e| e.name == name && matches!(e.place, search::Place::Menu(menus::MenuId::View))), "{name}");
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
         }
         assert_eq!(search::results("unoccupied", 1)[0].place, search::Place::Dock(DockTab::Orbitals));
     }
@@ -4609,39 +4631,46 @@ fn the_workspace_shows_one_tab_per_leaf() {
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    // a tab click shows its panel, in its own leaf only
+    // a tab click shows its panel, in its own leaf only (Activity and Graph are tabbed with the
+    // Log since docking Task 4)
     click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
-    assert_eq!(shown(&st), vec![Model, View, Log, Graph]);
+    assert_eq!(shown(&st), vec![Model, Selection, View, Graph]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Knowledge");
-    assert_eq!(shown(&st), vec![Knowledge, View, Log, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, View, Graph]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Orbitals");
-    assert_eq!(shown(&st), vec![Knowledge, Orbitals, Log, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Graph]);
     // open_tab shows a panel where it is
-    st.open_tab(Selection);
-    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Log]);
+    st.open_tab(Readouts);
+    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Graph]);
+    st.open_tab(Log);
+    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Log]);
     // closed, it is gone; open_tab brings it back in the right column's first leaf
     st.workspace.close_panel(Graph);
     assert!(!st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
     st.open_tab(Graph);
     assert!(st.tab_shown(Graph));
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection*,Readouts,Activity]),H(0.70,3D,V(0.62,[View,Orbitals,Graph*],[Log*])))");
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,V(0.62,[View,Orbitals,Graph*],[Log*,Activity])))");
     // the right column closed: a panel shown again gets a new split right of the view
-    for t in [View, Orbitals, Graph, Log] {
+    for t in [View, Orbitals, Graph, Log, Activity] {
         st.workspace.close_panel(t);
     }
     st.open_tab(Log);
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection*,Readouts,Activity]),H(0.70,3D,[Log*]))");
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,[Log*]))");
     st.reset_layout();
     assert_eq!(shown(&st), vec![Model, Selection, View, Log], "Reset layout: the default back");
-    // Ctrl K reveals a control in its own panel: the solve log (Activity), then the distance
-    // guides (Selection, the same leaf: Activity goes behind it)
-    let log = search::results("solve log", 1)[0];
-    assert_eq!(log.place, search::Place::Dock(Activity));
+    // Ctrl K reveals a control in its own panel: the solve log (Activity), then the log itself
+    // (the same leaf: Activity goes behind it)
+    let solves = search::results("solve log", 1)[0];
+    assert_eq!(solves.place, search::Place::Dock(Activity));
+    search::pick(&ctx, &mut st, solves);
+    assert!(st.tab_shown(Activity) && !st.tab_shown(Log));
+    let log = search::ENTRIES.iter().find(|e| e.anchor == "d-log").unwrap();
     search::pick(&ctx, &mut st, log);
-    assert!(st.tab_shown(Activity) && !st.tab_shown(Selection));
-    let guides = search::results("distance guides", 1)[0];
-    search::pick(&ctx, &mut st, guides);
-    assert!(st.tab_shown(Selection) && !st.tab_shown(Activity));
+    assert!(st.tab_shown(Log) && !st.tab_shown(Activity));
+    // and a View-panel control shows the View panel
+    st.open_tab(Orbitals);
+    search::pick(&ctx, &mut st, search::results("bond angles", 1)[0]);
+    assert!(st.tab_shown(View) && !st.tab_shown(Orbitals));
     // the chrome renders every arrangement without a command or an error: the default, every
     // panel in one leaf, the 3D view between stacked leaves, a floated panel, every panel closed
     for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,Graph,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Graph*,Readouts]))")] {
@@ -5199,9 +5228,8 @@ mod knowledge_map {
         assert!(!st.show_knowledge, "off by default");
         assert!(knowledge::overlay_coverage(&st, &scene.nuclei).is_empty(), "off: no tint");
         // View ▸ Display aids ▸ knowledge overlay: no command, no recorded action
-        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+        super::view_panel(&mut st, &[crate::ui::dock::view::Section::Aids]);
         let outs = click_widget(&ctx, &mut st, &inp, "show-knowledge");
-        egui::Popup::close_all(&ctx);
         assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
         assert!(st.show_knowledge);
         // the tint: the carbons see C–C, never seen
@@ -5213,8 +5241,8 @@ mod knowledge_map {
         assert_eq!(knowledge::tint_srgb(1.0), [110, 210, 120]);
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("knowledge overlay") && t.contains("1 well known") && t.contains("per atom: its least-known neighbour within 6.0 Bohr"), "the legend:\n{t}");
-        // Ctrl K finds it in the View menu, and the map in the dock
-        assert!(matches!(search::results("knowledge overlay", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
+        // Ctrl K finds it in the View panel, and the map in its own
+        assert_eq!(search::results("knowledge overlay", 1)[0].place, search::Place::Dock(DockTab::View));
         assert_eq!(search::results("knowledge map", 1)[0].place, search::Place::Dock(DockTab::Knowledge));
         // the profile keeps it
         let text = profile::capture(&st);
@@ -5248,5 +5276,213 @@ mod knowledge_map {
         let mut half = UiState::new("h2o", &scene);
         profile::apply(&mut half, "right_tabs = Log Model\n");
         assert!(once(&half), "{}", layout::encode(&half.workspace.to_node()));
+    }
+}
+
+/// Docking Task 4 (spec D-6, D-7): the View panel holds the View menu's controls in five folding
+/// sections, and the Window menu lists the panels.
+mod view_panel {
+    use super::super::dock::view::{Section, Sections};
+    use super::*;
+
+    /// The View menu's Ctrl K entries before the panel (27): each lives in the View panel now.
+    const FORMER: [&str; 27] = [
+        "Density", "Orbitals", "All orbitals coloured", "Spin density", "Colour dots by density / orbital", "Density: volume / isosurface", "Gamma",
+        "Opacity", "Iso level (× ρ max)", "Refresh cloud every", "Atomic superposition between DFT clouds", "Cell box", "Floor grid", "Axes",
+        "Placement plane", "Grid spacing 1 Bohr / 1 Å", "Partial core density", "Smooth motion", "Show what training is solving",
+        "Knowledge overlay", "Trails", "Bonds", "Molecule names", "Name style", "Composition badge on hover", "Bond angles", "Partial charges",
+    ];
+
+    /// Ctrl K: every View-panel entry — the 27 former View-menu ones and the panel's own — shows the
+    /// View panel (from behind another tab, every section folded), unfolds the section holding its
+    /// anchor and scrolls the anchor's group into the panel's visible part.
+    #[test]
+    fn every_former_view_menu_entry_reveals_inside_the_view_panel() {
+        for name in FORMER {
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
+        }
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let entries: Vec<&search::Entry> = search::ENTRIES.iter().filter(|e| e.place == search::Place::Dock(DockTab::View)).collect();
+        assert!(entries.len() > FORMER.len());
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        for e in entries {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx);
+            let mut st = UiState::new("h2", &scene);
+            st.backend = Backend::Estimated;
+            st.open_tab(DockTab::Orbitals); // the View panel behind it
+            st.view_sections = Sections::all(false);
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            assert!(!st.tab_shown(DockTab::View));
+            search::pick(&ctx, &mut st, e);
+            for i in 0..20 {
+                if i == 19 {
+                    PROBES.with(|p| p.borrow_mut().clear()); // only the last frame's rects
+                }
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(100.0 + 0.05 * i as f64), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+            }
+            assert!(st.tab_shown(DockTab::View), "{}: the View panel is shown", e.name);
+            if let Some(s) = Section::ALL.into_iter().find(|s| s.anchor() == e.anchor) {
+                assert!(st.view_sections.is_open(s), "{}: its section {s:?} unfolds", e.name);
+                assert_eq!(Section::ALL.into_iter().filter(|&x| st.view_sections.is_open(x)).count(), 1, "{}: only its own", e.name);
+            }
+            let (a, panel) = (probed_rect(&format!("anchor-{}", e.anchor)), probed_rect("view-panel"));
+            assert!(panel.intersects(a) && a.left() >= panel.left() - 1.0 && a.right() <= panel.right() + 1.0, "{}: anchor {a:?} inside the View panel {panel:?}", e.name);
+        }
+    }
+
+    /// Hidden, not greyed: the volume's sliders only as a volume, the iso level only as an
+    /// isosurface, the dots' look only as dots (their orbital colouring only under All orbitals
+    /// coloured), the Camera view's settings only while it is on, the cloud's estimated-only
+    /// options only under that solver, bloom's threshold only with bloom.
+    #[test]
+    fn controls_that_do_not_apply_are_hidden() {
+        fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+            fn walk(s: &egui::epaint::Shape, out: &mut String) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = String::new();
+            for _ in 0..2 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0))), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, st, inp);
+                });
+                full.textures_delta.clear();
+                out.clear();
+                full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            }
+            out
+        }
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &Section::ALL);
+        st.volume_mode = VOLUME_VOLUME;
+        st.bloom = 0.0;
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("gamma") && !t.contains("iso (× ρ max)") && !t.contains("dot size"), "{t}");
+        assert!(!t.contains("refresh cloud every") && t.contains("cloud options apply to the estimated solver"), "{t}");
+        assert!(!t.contains("exposure") && !t.contains("bloom from"), "{t}");
+        st.volume_mode = VOLUME_ISO;
+        st.camera_view = true;
+        st.backend = Backend::Estimated;
+        st.bloom = 0.5;
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(!t.contains("gamma") && t.contains("iso (× ρ max)") && t.contains("exposure") && t.contains("refresh cloud every") && t.contains("bloom from"), "{t}");
+        st.volume_mode = VOLUME_DOTS;
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("dot size") && !t.contains("colour dots by"), "{t}");
+        st.show = ShowMode::Coloured;
+        assert!(texts(&ctx, &mut st, &inp).contains("colour dots by"));
+        // a folded section draws nothing of its own
+        st.view_sections = Sections::all(false);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("What you see") && t.contains("Display aids") && !t.contains("dot size") && !t.contains("partial charges"), "{t}");
+    }
+
+    /// The sections fold and unfold by their headers; their open state is kept in the profile
+    /// (`view_sections`), What you see and How it looks open in a profile without it.
+    #[test]
+    fn sections_fold_and_the_profile_keeps_them() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(st.view_sections, Sections::default());
+        assert!(profile::capture(&st).contains("\nview_sections = what,looks\n"));
+        alone(&mut st, DockTab::View);
+        let outs = click_widget(&ctx, &mut st, &inp, "view-bonds");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        click_widget(&ctx, &mut st, &inp, "view-looks");
+        assert_eq!(st.view_sections.encode(), "what,bonds");
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.view_sections.encode(), "what,bonds");
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.view_sections, Sections::default(), "absent: the default two");
+        profile::apply(&mut fresh, "view_sections = \n");
+        assert_eq!(fresh.view_sections, Sections::all(false), "empty: every section folded");
+    }
+
+    /// Reset view settings: the look, Camera, Bonds & labels and Display aids back to their
+    /// defaults — the settings that are actions by their actions (recorded), the rest directly —
+    /// and What you see left alone.
+    #[test]
+    fn reset_view_settings_puts_back_the_defaults() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        let d = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        (st.gamma, st.camera_view, st.show_cell, st.label_opacity, st.nucleus_scale, st.background) = (0.3, true, !d.show_cell, 0.2, Some(1.5), Some([0, 0, 0]));
+        st.show_bonds = !d.show_bonds;
+        st.hide_cloud = true;
+        let outs = click_widget(&ctx, &mut st, &inp, "view-reset");
+        let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+        assert!(matches!(acts.as_slice(), [Action::ShowBonds(b)] if *b == d.show_bonds), "{acts:?}");
+        assert_eq!((st.gamma, st.camera_view, st.show_cell, st.label_opacity, st.nucleus_scale, st.background), (d.gamma, d.camera_view, d.show_cell, d.label_opacity, None, None));
+        assert_eq!(st.show_bonds, d.show_bonds);
+        assert!(st.hide_cloud, "What you see stays");
+        assert_eq!(st.view_sections, Sections::all(false), "the folds stay");
+    }
+
+    /// The Window menu (spec D-7): one row per panel, a click shows it (a closed one comes back);
+    /// Reset layout gives the default; none of it is an action. The View menu is gone.
+    #[test]
+    fn the_window_menu_shows_panels_and_resets_the_layout() {
+        use super::super::workspace::layout;
+        assert_eq!(menus::MenuId::ALL.map(menus::MenuId::title), ["File", "Scene", "Physics", "Window", "Help"]);
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        let in_window = |st: &mut UiState, name: &str| {
+            egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Window));
+            let outs = click_widget(&ctx, st, &inp, name);
+            egui::Popup::close_all(&ctx);
+            outs
+        };
+        let mut outs = Vec::new();
+        assert!(!st.tab_shown(DockTab::Graph));
+        outs.extend(in_window(&mut st, "window-Graph"));
+        assert!(st.tab_shown(DockTab::Graph) && !st.tab_shown(DockTab::Log));
+        st.workspace.close_panel(DockTab::Knowledge);
+        outs.extend(in_window(&mut st, "window-Knowledge"));
+        assert!(st.tab_shown(DockTab::Knowledge), "a closed panel comes back");
+        outs.extend(in_window(&mut st, "reset-layout"));
+        assert_eq!(layout::encode(&st.workspace.to_node()), layout::encode(&layout::default_layout()));
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        // the screenshot harness: menu=view shows the View panel, menu=window opens the menu
+        st.open_tab(DockTab::Orbitals);
+        assert_eq!(open_menu(&ctx, &mut st, "view"), Some(()));
+        assert!(st.tab_shown(DockTab::View));
+        assert_eq!(open_menu(&ctx, &mut st, "Window"), Some(()));
+        assert!(egui::Popup::is_id_open(&ctx, menus::popup_id(menus::MenuId::Window)));
+        assert_eq!(open_menu(&ctx, &mut st, "bogus"), None);
     }
 }

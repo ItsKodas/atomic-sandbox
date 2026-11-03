@@ -399,6 +399,7 @@ impl TabViewer for Tiles<'_, '_> {
         icons::paint(&p, icon, dock::icon(t), ink);
         // the status is asked once per tab and frame: here (the title only reserves its room)
         if let Some((c, count)) = dock::status(t, self.st, self.input) {
+            debug_assert!(dock::can_flag(t), "{t:?} has a status but its title keeps no room for it");
             let at = pos2(r.rect.right() - PAD - dot_room(t).unwrap_or(DOT_GAP) / 2.0 + 2.0, r.rect.center().y);
             match count {
                 Some(n) => {
@@ -520,7 +521,8 @@ fn paint_close_icons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashM
         if leaf.tab_bar_hidden || !leaf.rect.is_positive() {
             continue;
         }
-        let Some(&layer) = leaf.tabs.first().and_then(|t| layers.get(t)) else { continue };
+        // any tab of the leaf drawn this frame names its layer (the first may not have been)
+        let Some(&layer) = leaf.tabs.iter().find_map(|t| layers.get(t)) else { continue };
         let r = leaf.rect;
         let button = Rect::from_min_max(pos2(r.right() - CLOSE_BUTTON, r.top()), pos2(r.right(), r.top() + bar - 2.0));
         if let Some(Tile::Panel(t)) = leaf.tabs.first() {

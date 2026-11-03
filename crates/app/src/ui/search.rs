@@ -79,34 +79,43 @@ pub const ENTRIES: &[Entry] = &[
     e("Grid spacing h", "Bohr resolution", Menu(M::Scene), "m-grid"),
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),
     e("Container walls", "box piston size half-width", Menu(M::Scene), "m-container"),
-    // View
-    e("Density", "show what the view shows total electron density default", Menu(M::View), "m-density"),
-    e("Orbitals", "show orbital one Kohn-Sham phase lobe psi p s d HOMO LUMO", Menu(M::View), "m-density"),
-    e("All orbitals coloured", "show every orbital colour shells inner spheres", Menu(M::View), "m-density"),
-    e("Spin density", "show up down magnetisation rho up minus rho down m amber teal", Menu(M::View), "m-density"),
-    e("Colour dots by density / orbital", "dots probability samples colour", Menu(M::View), "m-density"),
-    e("Density: volume / isosurface", "render cloud dots", Menu(M::View), "m-density"),
-    e("Gamma", "density look", Menu(M::View), "m-density"),
-    e("Opacity", "density look", Menu(M::View), "m-density"),
-    e("Iso level (× ρ max)", "isosurface threshold", Menu(M::View), "m-density"),
-    e("Refresh cloud every", "live density estimated", Menu(M::View), "m-density"),
-    e("Atomic superposition between DFT clouds", "cloud estimated density", Menu(M::View), "m-density"),
-    e("Cell box", "simulation box display", Menu(M::View), "m-display"),
-    e("Floor grid", "display", Menu(M::View), "m-display"),
-    e("Axes", "xyz display gizmo", Menu(M::View), "m-display"),
-    e("Placement plane", "place grid blue", Menu(M::View), "m-display"),
-    e("Grid spacing 1 Bohr / 1 Å", "angstrom display", Menu(M::View), "m-display"),
-    e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Menu(M::View), "m-density"),
-    e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
-    e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Menu(M::View), "m-display"),
-    e("Knowledge overlay", "tint atoms coverage how well known model learned never seen thin trusted 3D colour", Menu(M::View), "m-display"),
-    e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
-    e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
-    e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
-    e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
-    e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
-    e("Bond angles", "angle degrees geometry bonds HOH water", Menu(M::View), "m-bonds"),
-    e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Menu(M::View), "m-bonds"),
+    // the View panel (docking spec D-6: the View menu's controls, one anchor per section)
+    e("Density", "show what the view shows total electron density default", Dock(D::View), "m-density"),
+    e("Orbitals", "show orbital one Kohn-Sham phase lobe psi p s d HOMO LUMO", Dock(D::View), "m-density"),
+    e("All orbitals coloured", "show every orbital colour shells inner spheres", Dock(D::View), "m-density"),
+    e("Spin density", "show up down magnetisation rho up minus rho down m amber teal", Dock(D::View), "m-density"),
+    e("Refresh cloud every", "live density estimated", Dock(D::View), "m-density"),
+    e("Atomic superposition between DFT clouds", "cloud estimated density", Dock(D::View), "m-density"),
+    e("Colour dots by density / orbital", "dots probability samples colour", Dock(D::View), "m-looks"),
+    e("Density: volume / isosurface", "render cloud dots", Dock(D::View), "m-looks"),
+    e("Gamma", "density look", Dock(D::View), "m-looks"),
+    e("Opacity", "density look", Dock(D::View), "m-looks"),
+    e("Iso level (× ρ max)", "isosurface threshold", Dock(D::View), "m-looks"),
+    e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Dock(D::View), "m-looks"),
+    e("Dots look", "floating glow drift amount feather size blur brightness shimmer probability samples", Dock(D::View), "m-looks"),
+    e("Bloom", "glow bright threshold", Dock(D::View), "m-looks"),
+    e("Camera view", "glow solid balls exposure shutter field of view fov lens solidity smooth surface photo realistic", Dock(D::View), "m-camera"),
+    e("Motion blur", "streak smear copies fast vibration", Dock(D::View), "m-camera"),
+    e("Background colour", "backdrop black white grey slate charcoal", Dock(D::View), "m-camera"),
+    e("Cell box", "simulation box display", Dock(D::View), "m-display"),
+    e("Floor grid", "display", Dock(D::View), "m-display"),
+    e("Axes", "xyz display gizmo", Dock(D::View), "m-display"),
+    e("Placement plane", "place grid blue", Dock(D::View), "m-display"),
+    e("Grid spacing 1 Bohr / 1 Å", "angstrom display", Dock(D::View), "m-display"),
+    e("Smooth motion", "interpolate glide", Dock(D::View), "m-display"),
+    e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Dock(D::View), "m-display"),
+    e("Knowledge overlay", "tint atoms coverage how well known model learned never seen thin trusted 3D colour", Dock(D::View), "m-display"),
+    e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Dock(D::View), "m-display"),
+    e("Nucleus size", "sphere radius atom ball scale small big", Dock(D::View), "m-display"),
+    e("Bonds", "bond lines density graph show hide", Dock(D::View), "m-bonds"),
+    e("Molecule names", "labels formula name water show hide", Dock(D::View), "m-bonds"),
+    e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Dock(D::View), "m-bonds"),
+    e("Composition badge on hover", "isotope protons neutrons force hover", Dock(D::View), "m-bonds"),
+    e("Bond angles", "angle degrees geometry bonds HOH water", Dock(D::View), "m-bonds"),
+    e("Bond lengths", "distance Å angstrom label", Dock(D::View), "m-bonds"),
+    e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Dock(D::View), "m-bonds"),
+    e("Label opacity", "labels transparent faint names lengths angles charges", Dock(D::View), "m-bonds"),
+    e("Reset view settings", "defaults look display aids camera bonds restore", Dock(D::View), "m-view-reset"),
     // Physics
     e("Ionic potential", "pseudopotential all-electron cores valence nlcc ionic policy none cores only all species h_req egg-box", Menu(M::Physics), "m-ionic"),
     e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
@@ -122,6 +131,10 @@ pub const ENTRIES: &[Entry] = &[
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
+    // Window (docking spec D-7)
+    e("Show a panel", "window panels open reopen closed tab Model Knowledge Selection Readouts View Orbitals Log Activity Graph", Menu(M::Window), "m-panels"),
+    e("Layouts", "workspace arrangement one monitor preset", Menu(M::Window), "m-layout"),
+    e("Reset layout", "workspace default arrangement docking panels back", Menu(M::Window), "m-layout"),
     // Readouts
     e("Temperature T", "kelvin", Dock(D::Readouts), "d-tiles"),
     e("Drift", "energy conservation Ha/ps health", Dock(D::Readouts), "d-tiles"),
@@ -227,6 +240,12 @@ impl SearchState {
     pub fn revealing(&self) -> Option<&'static str> {
         self.reveal.filter(|(_, t, _)| t.elapsed() < REVEAL_FOR).map(|(a, _, _)| a)
     }
+
+    /// The anchor being revealed whose widget group has not scrolled into view yet (a folding
+    /// section holding it unfolds meanwhile: the View panel's).
+    pub fn unrevealed(&self) -> Option<&'static str> {
+        self.reveal.filter(|(_, t, done)| !done && t.elapsed() < REVEAL_FOR).map(|(a, _, _)| a)
+    }
 }
 
 /// Subsequence match score (higher is better), `None` when `query` is not a subsequence of the
@@ -275,7 +294,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
         Place::Toolbar => {}
         Place::SceneChip => egui::Popup::open_id(ctx, super::menus::scene_chip_id()),
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
-        // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
+        // the panel is shown where it is (a closed one comes back beside the 3D view); the View
+        // panel unfolds the section holding the anchor (`dock::view`)
         Place::Dock(tab) => st.open_tab(tab),
         // the buttons are always there; the settings open beside them (the pop-out's button is in them)
         Place::View => st.capture.open = entry.anchor == "v-capture-popout" || entry.name == "Capture settings",
@@ -297,6 +317,8 @@ pub fn mark(ui: &egui::Ui, st: &mut UiState, anchor: &str, rect: egui::Rect) {
     MARKED.with(|m| {
         m.borrow_mut().insert(anchor.to_string());
     });
+    // its rect, for the tests' reveal checks (`anchor-<name>`)
+    super::probe_rect(&format!("anchor-{anchor}"), rect);
     if st.search.revealing() != Some(anchor) {
         return;
     }
