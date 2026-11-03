@@ -858,8 +858,12 @@ fn the_status_chip_shows_the_bond_references_in_the_background() {
 // ---- headless smoke runs of the whole chrome ----
 
 fn frame(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, events: Vec<egui::Event>) -> PanelOutput {
+    frame_sized(ctx, st, inp, egui::vec2(w, 900.0), events)
+}
+
+fn frame_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2, events: Vec<egui::Event>) -> PanelOutput {
     let raw = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0))),
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
         events,
         ..Default::default()
     };
@@ -4741,7 +4745,100 @@ fn a_panel_dropped_onto_the_3d_view_goes_beside_it() {
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.30,[Model*],H(0.70,3D,[Log*]))");
     assert!(st.tab_shown(DockTab::Log));
     let view = out.view.unwrap();
-    assert!(view.width() > 500.0, "the view is drawn, not the Log over it: {view:?}");
+    // the pass with the Log over the whole 70 % (≈ 980 pt) is discarded: the frame hands back the
+    // redrawn one, the view in 70 % of that (≈ 686 pt), the same rect the next frame draws
+    let next = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+    assert_eq!(view, next, "the drop frame's view is the redrawn pass's");
+    assert!((500.0..700.0).contains(&view.width()), "the view beside the Log, not under it: {view:?}");
+}
+
+/// `egui_dock` clamps each split's fraction every frame to keep `separator.extra` on both sides,
+/// and the profile saves what it left: a narrow window must not rewrite the default layout.
+#[test]
+fn a_narrow_window_keeps_the_saved_fractions() {
+    use super::workspace::layout;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let before = layout::encode(&st.workspace.to_node());
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 700.0, vec![]);
+    }
+    assert_eq!(layout::encode(&st.workspace.to_node()), before, "at 700 pt wide");
+}
+
+/// A tiny window (320 × 240, and 1 × 1) draws the whole chrome with the default layout for a few
+/// frames without a panic; the 3D view's rect is there and finite.
+#[test]
+fn a_tiny_window_draws() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    for size in [egui::vec2(320.0, 240.0), egui::vec2(1.0, 1.0), egui::vec2(320.0, 240.0)] {
+        for _ in 0..3 {
+            let out = frame_sized(&ctx, &mut st, &inp, size, vec![]);
+            let view = out.view.unwrap_or_else(|| panic!("no view at {size:?}"));
+            assert!(view.min.is_finite() && view.max.is_finite(), "{view:?} at {size:?}");
+            assert!(out.commands.is_empty(), "at {size:?}");
+        }
+    }
+}
+
+/// Docking spec D-4: a tab that can carry a status dot keeps the dot's room whether the dot is
+/// there or not, so the tab bar does not jump when work starts or stops (or the Log's count
+/// comes and goes).
+#[test]
+fn a_tab_keeps_its_width_when_its_dot_comes_and_goes() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    // the Log behind another tab (on screen, it reads its count away)
+    st.workspace.set_node(super::workspace::layout::parse("H(0.70,3D,[Graph*,Log,View])").unwrap());
+    let probe = |name: &str| PROBES.with(|p| p.borrow()[name]);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let (quiet, view) = (probe("dock-tab-Log"), probe("dock-tab-View"));
+    st.log.unread = 3;
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    assert!(dock::status(DockTab::Log, &st, &inp).is_some(), "the Log's count shows");
+    assert_eq!(probe("dock-tab-Log"), quiet, "the Log's tab with and without its count");
+    assert_eq!(probe("dock-tab-View"), view, "the tab after it holds still");
+    assert_eq!(dock::icon(DockTab::View), super::icons::Icon::View, "the View panel has its own icon");
+}
+
+/// A leaf's close button paints the duotone Close icon over `egui_dock`'s close-all button:
+/// clicking where it is painted closes the leaf's panels.
+#[test]
+fn the_painted_close_button_closes_its_leaf() {
+    use super::workspace::layout;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let close = probed_rect("dock-close-Graph");
+    let graph = probed_rect("dock-tab-Graph");
+    assert!(close.left() > graph.right() && (close.center().y - graph.center().y).abs() < 4.0, "close {close:?} at the bar's end, tab {graph:?}");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-close-Graph");
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
 }
 
 /// The profile keeps the workspace as one `layout = …` line (docking spec D-8) and no old dock

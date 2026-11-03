@@ -17,7 +17,8 @@
 //!   box health, work running, trust, the Log's unread count) are painted into the tab, whose
 //!   title reserves the room; hovering a tab peeks its key numbers (`dock::peek`); a middle click
 //!   or the context menu closes it, the menu also floats it or resets the layout. A leaf's tab bar
-//!   ends with its close button (closes the leaf's panels); pin and pop-out come with D2 and D3.
+//!   ends with its close button (closes the leaf's panels: `egui_dock`'s, painted with the
+//!   duotone Close icon); pin and pop-out come with D2 and D3.
 //! - **Panels stay where the user put them**: [`Workspace::show_panel`] makes a panel the active
 //!   tab of its leaf, or — when it was closed — adds it to the right column's first leaf (the one
 //!   right of the 3D view), else to a new split right of the view.
@@ -29,8 +30,9 @@
 //! `layout = …`); D3's `window = …` lines will keep detached ones.
 use super::layout::{self, Node};
 use crate::ui::{dock, icons, theme, Action, DockTab, PanelInput, UiState};
-use egui::{pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, Layout, Margin, Rect, Response, Stroke, Ui, UiBuilder, WidgetText};
+use egui::{pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, LayerId, Layout, Margin, Rect, Response, Stroke, Ui, UiBuilder, WidgetText};
 use egui_dock::{DockArea, DockState, NodeIndex, Split, TabBodyStyle, TabIndex, TabStyle, TabViewer, Tree};
+use std::collections::HashMap;
 
 /// One tile of the tree: the 3D view, or a panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,8 +49,12 @@ const PAD: f32 = 8.0;
 /// The icon drawn at the start of a tab, and the room its title leaves for it.
 const ICON: f32 = 14.0;
 const ICON_GAP: f32 = ICON + 6.0;
-/// The room a tab's title leaves at its end for the status dot (or the Log's count).
-const DOT_GAP: f32 = 18.0;
+/// The room a tab's title leaves at its end for the status dot, and for the Log's count (kept
+/// small: the default layout's lower-left leaf already scrolls its four tabs at 1400 pt).
+const DOT_GAP: f32 = 12.0;
+const COUNT_GAP: f32 = 18.0;
+/// A tab bar's height.
+const TAB_BAR: f32 = 28.0;
 /// A floated panel's first size.
 const FLOAT_SIZE: egui::Vec2 = vec2(380.0, 480.0);
 
@@ -337,19 +343,28 @@ struct Tiles<'a, 'i> {
     input: &'a PanelInput<'i>,
     acts: &'a mut Vec<Action>,
     asked: Vec<Change>,
+    /// The layer each tab drawn this frame was drawn on (its leaf's: the main area's, or a
+    /// floating window's), where its leaf's close icon is painted.
+    layers: HashMap<Tile, LayerId>,
 }
 
-/// A panel's tab title: its name, with room before it for the icon and after it for the status
-/// dot when it has one (`on_tab_button` paints both). The colour is left to the tab's style.
-fn title(t: DockTab, dot: bool) -> egui::text::LayoutJob {
+/// A panel's tab title: its name, with room before it for the icon and, on a tab that can carry
+/// one (`dock::can_flag`), after it for the status dot whether it shows or not, so the tab's width
+/// holds still (`on_tab_button` paints both). The colour is left to the tab's style.
+fn title(t: DockTab) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let format = TextFormat { font_id: FontId::proportional(13.0), color: Color32::PLACEHOLDER, ..Default::default() };
     let mut job = LayoutJob::default();
     job.append(t.name(), ICON_GAP, format.clone());
-    if dot {
-        job.append(" ", DOT_GAP - 3.0, format);
+    if let Some(room) = dot_room(t) {
+        job.append(" ", room - 3.0, format);
     }
     job
+}
+
+/// The room `t`'s title keeps for its status (`None`: it never has one).
+fn dot_room(t: DockTab) -> Option<f32> {
+    dock::can_flag(t).then_some(if t == DockTab::Log { COUNT_GAP } else { DOT_GAP })
 }
 
 impl TabViewer for Tiles<'_, '_> {
@@ -362,7 +377,7 @@ impl TabViewer for Tiles<'_, '_> {
     fn title(&mut self, tab: &mut Tile) -> WidgetText {
         match *tab {
             Tile::View3d => "3D view".into(),
-            Tile::Panel(t) => title(t, dock::status(t, self.st, self.input).is_some()).into(),
+            Tile::Panel(t) => title(t).into(),
         }
     }
 
@@ -375,13 +390,16 @@ impl TabViewer for Tiles<'_, '_> {
 
     fn on_tab_button(&mut self, tab: &mut Tile, r: &Response) {
         let Tile::Panel(t) = *tab else { return };
-        crate::ui::probe(&format!("dock-tab-{t:?}"), r);
+        // the part that can be clicked (a tab scrolled past its bar's end is clipped)
+        crate::ui::probe_rect(&format!("dock-tab-{t:?}"), r.interact_rect);
+        self.layers.insert(*tab, r.layer_id);
         let p = r.ctx.layer_painter(r.layer_id).with_clip_rect(r.interact_rect);
         let ink = if self.st.tab_shown(t) || r.hovered() { theme::INK } else { theme::INK_DIM };
         let icon = Rect::from_center_size(pos2(r.rect.left() + PAD + ICON / 2.0, r.rect.center().y), egui::Vec2::splat(ICON));
         icons::paint(&p, icon, dock::icon(t), ink);
+        // the status is asked once per tab and frame: here (the title only reserves its room)
         if let Some((c, count)) = dock::status(t, self.st, self.input) {
-            let at = pos2(r.rect.right() - PAD - DOT_GAP / 2.0 + 2.0, r.rect.center().y);
+            let at = pos2(r.rect.right() - PAD - dot_room(t).unwrap_or(DOT_GAP) / 2.0 + 2.0, r.rect.center().y);
             match count {
                 Some(n) => {
                     p.circle_filled(at, 7.5, c);
@@ -453,7 +471,7 @@ fn style(egui_style: &egui::Style) -> egui_dock::Style {
     let mut s = egui_dock::Style::from_egui(egui_style);
     s.main_surface_border_stroke = Stroke::NONE;
     s.tab_bar.bg_fill = theme::APP;
-    s.tab_bar.height = 28.0;
+    s.tab_bar.height = TAB_BAR;
     s.tab_bar.hline_color = theme::LINE;
     s.tab_bar.fill_tab_bar = false;
     s.tab.minimum_width = None; // a tab is as wide as its title: the icon and the dot sit at its ends
@@ -471,10 +489,47 @@ fn style(egui_style: &egui::Style) -> egui_dock::Style {
     s.tab.tab_body.hidden_tab_bar_drag_height = Some(0.0);
     s.buttons.show_tab_bar_size = 0.0;
     s.buttons.show_tab_bar_hover_expand = 0.0;
+    // the leaf's close button: egui_dock's, its X left transparent under the duotone Close icon
+    // (`paint_close_icons`)
+    s.buttons.close_all_tabs_color = Color32::TRANSPARENT;
+    s.buttons.close_all_tabs_active_color = Color32::TRANSPARENT;
+    s.buttons.close_all_tabs_disabled_color = Color32::TRANSPARENT;
+    s.buttons.close_all_tabs_bg_fill = theme::PANEL_2;
+    s.buttons.close_all_tabs_border_color = theme::LINE_SOFT;
     s.separator.color_idle = theme::LINE;
     s.separator.color_hovered = theme::ACCENT;
     s.separator.color_dragged = theme::GLOW;
+    // egui_dock clamps each split's fraction every frame to leave this much either side, and the
+    // profile saves what it left: 175 pt (its default) rewrote the default layout's 24 % column in
+    // a 700-pt window; 80 still leaves a panel room for its title and a control
+    s.separator.extra = SEPARATOR_EXTRA;
     s
+}
+
+/// The least a split leaves either side of its separator (`egui_dock`'s `separator.extra`).
+const SEPARATOR_EXTRA: f32 = 80.0;
+/// `egui_dock`'s close-all button at a tab bar's end (its `TAB_CLOSE_ALL_BUTTON_SIZE`: 24 pt wide,
+/// the bar's height less 2), and the Close icon painted in it.
+const CLOSE_BUTTON: f32 = 24.0;
+const CLOSE_ICON: f32 = 13.0;
+
+/// Paints the duotone Close icon in each shown tab bar's close button (whose own X is left
+/// transparent, `style`), on the layer its leaf was drawn on; brighter while hovered.
+fn paint_close_icons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashMap<Tile, LayerId>, bar: f32) {
+    for (_, leaf) in dock.iter_leaves() {
+        if leaf.tab_bar_hidden || !leaf.rect.is_positive() {
+            continue;
+        }
+        let Some(&layer) = leaf.tabs.first().and_then(|t| layers.get(t)) else { continue };
+        let r = leaf.rect;
+        let button = Rect::from_min_max(pos2(r.right() - CLOSE_BUTTON, r.top()), pos2(r.right(), r.top() + bar - 2.0));
+        if let Some(Tile::Panel(t)) = leaf.tabs.first() {
+            crate::ui::probe_rect(&format!("dock-close-{t:?}"), button);
+        }
+        let ink = if ctx.rect_contains_pointer(layer, button) { theme::INK } else { theme::INK_DIM };
+        let p = ctx.layer_painter(layer).with_clip_rect(r);
+        icons::paint(&p, Rect::from_center_size(button.center(), egui::Vec2::splat(CLOSE_ICON)), icons::Icon::Close, ink);
+    }
 }
 
 /// Draws the workspace into what the top bar and the toolbar leave of `root`; returns the 3D
@@ -485,7 +540,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     let style = style(root.style());
     let mut dock = st.workspace.lend();
     let asked = {
-        let mut tiles = Tiles { st, input, acts, asked: Vec::new() };
+        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new() };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt("workspace"));
         DockArea::new(&mut dock)
             .id(Id::new("workspace"))
@@ -496,6 +551,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             .hidable_tab_bars(true) // only the 3D view's leaf hides its bar (`normalize`)
             .tab_context_menus(false) // our own (`on_tab_button`): float, close, reset
             .show_inside(&mut ui, &mut tiles);
+        paint_close_icons(root.ctx(), &dock, &tiles.layers, TAB_BAR);
         tiles.asked
     };
     if st.workspace.give_back(dock, asked) {

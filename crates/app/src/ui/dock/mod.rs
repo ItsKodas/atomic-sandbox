@@ -44,7 +44,7 @@ pub(super) fn icon(tab: DockTab) -> Icon {
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
         DockTab::Knowledge => Icon::Knowledge,
-        DockTab::View => Icon::Sliders, // docking Task 3 draws it its own icon
+        DockTab::View => Icon::View,
     }
 }
 
@@ -67,9 +67,15 @@ fn activity_dot(input: &PanelInput<'_>) -> bool {
     input.sampling() || input.probe.is_some_and(|p| p.main.running || p.side.running || p.refit.is_some())
 }
 
+/// Whether `tab` can carry a status dot ([`status`]): its tab keeps the dot's room always, so its
+/// width holds still when the dot comes and goes.
+pub(super) fn can_flag(tab: DockTab) -> bool {
+    matches!(tab, DockTab::Readouts | DockTab::Model | DockTab::Activity | DockTab::Log)
+}
+
 /// What a panel's tab shows after its name (docking spec D-4, the old strip's dots): the dot's
 /// colour, and the text in it when it counts something (the Log's unread errors and refusals).
-/// `None`: nothing to flag.
+/// `None`: nothing to flag. Only the [`can_flag`] tabs have one.
 pub(super) fn status(tab: DockTab, st: &UiState, input: &PanelInput<'_>) -> Option<(Color32, Option<String>)> {
     match tab {
         DockTab::Readouts => readouts_dot(input).map(|c| (c, None)),

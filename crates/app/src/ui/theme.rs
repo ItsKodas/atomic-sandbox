@@ -24,6 +24,9 @@ pub const ACCENT: Color32 = rgb(0xa78bfa);
 pub const ACCENT_INK: Color32 = rgb(0xcbbcff);
 pub const ACCENT_BG: Color32 = rgb(0x2d2547);
 pub const GLOW: Color32 = rgb(0x8b5cf6);
+/// The duotone icons' fill (`icons::paint`): the accent at 32 % (alpha 82), whatever the stroke
+/// colour; half that on a disabled control.
+pub const ICON_FILL: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 82);
 /// A danger button's text.
 pub const DANGER_INK: Color32 = rgb(0xffb4b4);
 /// The overlays' translucent card fill.

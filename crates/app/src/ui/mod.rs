@@ -1272,12 +1272,18 @@ fn with_probe_prefix<R>(prefix: &'static str, f: impl FnOnce() -> R) -> R {
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
 #[inline]
 fn probe(name: &str, r: &egui::Response) {
+    probe_rect(name, r.rect);
+}
+
+/// [`probe`] for a rect painted without a widget of its own (the workspace's leaf close icon).
+#[inline]
+fn probe_rect(name: &str, rect: egui::Rect) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(format!("{}{name}", PROBE_PREFIX.with(|x| x.get())), r.rect);
+        p.borrow_mut().insert(format!("{}{name}", PROBE_PREFIX.with(|x| x.get())), rect);
     });
     #[cfg(not(test))]
-    let _ = (name, r);
+    let _ = (name, rect);
 }
 
 /// [`probe`] in expression position: records and passes the response on.
