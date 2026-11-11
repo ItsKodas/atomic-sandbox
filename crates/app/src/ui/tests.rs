@@ -3353,6 +3353,53 @@ mod activity_tab {
         assert!(rows(&input(&scene, Some(&idle), &cam), Some(&sim::ProbeView::default())).is_empty());
     }
 
+    /// User request 2026-11-11: while playing, the Activity tab's groups below the job list stay put
+    /// as each step's solve starts (no iterations yet), runs (its line and sparkline) and ends (no
+    /// row between steps); paused and idle the list shrinks back to "nothing running".
+    #[test]
+    fn the_job_list_keeps_its_height_between_steps() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let live = sim::ScfLive {
+            attempt: 1,
+            iteration: 6,
+            max_iter: 200,
+            delta_rho: 5.2e-4,
+            tol: 1e-5,
+            energy: -1.13,
+            d_energy: 5.2e-8,
+            ms_per_iteration: 69.0,
+            since_gain: 1,
+            window: 50,
+            best_delta_rho: 5.2e-4,
+            stall_level: 8e-3,
+            spark: [-3.0; sim::activity::SPARK_POINTS],
+            spark_len: 6,
+            spark_stride: 1,
+        };
+        let slot = |running, step, live| sim::ProbeView { main: sim::activity::SlotView { running, scf_step: step, elapsed_s: 0.1, solves: 1, live }, ..Default::default() };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.open_tab(DockTab::Activity);
+        let mut counters_at = |playing, probe| {
+            let inp = PanelInput { playing, probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+            for _ in 0..2 {
+                frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            }
+            probed_rect("anchor-d-counters").top()
+        };
+        let starting = counters_at(true, slot(true, 1, None));
+        let solving = counters_at(true, slot(true, 6, Some(live)));
+        let between = counters_at(true, slot(false, 0, None));
+        let again = counters_at(true, slot(true, 1, None));
+        assert!((starting - solving).abs() < 0.5, "a step's first iteration keeps the solve block: {starting} vs {solving}");
+        assert!((between - solving).abs() < 0.5 && (again - solving).abs() < 0.5, "between steps the list keeps its height: {between}, {again} vs {solving}");
+        let idle = counters_at(false, slot(false, 0, None));
+        assert!(idle < solving - 20.0, "paused and idle the list shrinks: {idle} vs {solving}");
+    }
+
     /// Task 5 review I2: the views are dropped when a snapshot has no fitted model (a Forget) and
     /// kept across snapshots whose `views` is `None` while the model is fitted.
     #[test]

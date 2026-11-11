@@ -54,6 +54,9 @@ pub struct JobRow {
     pub no_control_why: Option<&'static str>,
     /// The running solve's iterations (the detail line, the sparkline and the stall tag).
     pub scf: Option<sim::ScfLive>,
+    /// The row keeps the solve block's height while it has nothing to show (a sample or step
+    /// setting up, its first iteration), so the rows below never jump.
+    pub keeps_block: bool,
 }
 
 /// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration") and, once
@@ -96,6 +99,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             // starts (user request 2026-10-17: the block hid between samples), so it stays on
             // screen and is replaced, not blanked, as each sample begins
             scf: probe.and_then(|p| p.main.live),
+            keeps_block: true,
         });
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
@@ -115,6 +119,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: input.playing.then(|| ("Pause".into(), Action::Pause)),
             no_control_why: (!input.playing).then_some("a paused step finishes; edits abandon it at the next SCF iteration (CPU: after the solve)"),
             scf: pv.main.live,
+            keeps_block: !cpu,
         });
     }
     if let Some((s, m)) = probe.and_then(|p| p.display) {
@@ -128,6 +133,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: None,
             no_control_why: Some("display only: it never feeds the solve, and any command (an edit, Play, a slider) interrupts it at once; 0 unoccupied orbitals in the Orbitals tab turns it off"),
             scf: None,
+            keeps_block: false,
         });
     }
     if let Some((s, n)) = probe.and_then(|p| p.refit) {
@@ -141,6 +147,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: None,
             no_control_why: Some("a refit takes milliseconds to a few seconds and runs between steps"),
             scf: None,
+            keeps_block: false,
         });
     }
     if m.is_some_and(|m| m.audit_in_flight) {
@@ -158,6 +165,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: None,
             no_control_why: Some("an audit finishes its solve on the background teacher; the model keeps answering meanwhile"),
             scf: probe.filter(|p| p.side.running).and_then(|p| p.side.live),
+            keeps_block: false,
         });
     } else if let Some(p) = probe.filter(|p| p.side.running && d.and_then(|d| d.bond_reference).is_none()) {
         // the auditor's other jobs (spec A8): a density refresh or an isolated-atom density
@@ -171,6 +179,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: None,
             no_control_why: Some("a display-only solve on the background teacher; it teaches nothing and never delays a step"),
             scf: None,
+            keeps_block: false,
         });
     }
     if let Some(r) = d.and_then(|d| d.bond_reference) {
@@ -184,6 +193,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: None,
             no_control_why: Some("isolated-atom solves for the bond detector, off the stepping path"),
             scf: None,
+            keeps_block: false,
         });
     }
     if let Some(r) = d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
@@ -197,6 +207,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: Some(("Stop".into(), Action::StopRelax)),
             no_control_why: None,
             scf: None,
+            keeps_block: false,
         });
     }
     if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !input.sampling()) {
@@ -210,12 +221,14 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             control: Some(("Start anyway".into(), Action::StartOffered(o.plan.clone()))),
             no_control_why: None,
             scf: None,
+            keeps_block: false,
         });
     }
     v
 }
 
-/// The height of [`scf_detail`]'s line and sparkline, reserved while a pass's next sample starts.
+/// The height of [`scf_detail`]'s line and sparkline, reserved while a pass's next sample or a
+/// live solve's next step starts.
 const SCF_BLOCK_HEIGHT: f32 = 22.0 + 2.0 * 16.0 + 6.0;
 
 /// The running solve's line, its stall tag and the Δρ sparkline (log Δρ over the iterations so
@@ -294,9 +307,10 @@ pub fn show(ui: &mut Ui, rows: &[JobRow], acts: &mut Vec<Action>) {
         });
         ui.add(egui::Label::new(RichText::new(&r.detail).size(11.5).color(theme::INK_DIM)).wrap());
         match r.scf.as_ref().filter(|l| l.iteration > 0) {
-            // a pass's block always takes the same height — filled, or empty while the next sample
-            // sets up — so the rows below never jump between samples (user requests 2026-10-18/19)
-            Some(l) if r.key == JobKey::Pass => {
+            // a pass's or a live solve's block always takes the same height — filled, or empty while
+            // the next sample or step sets up — so the rows below never jump (user requests
+            // 2026-10-18/19, 2026-11-11)
+            Some(l) if r.keeps_block => {
                 let w = ui.available_width();
                 ui.allocate_ui_with_layout(egui::vec2(w, SCF_BLOCK_HEIGHT), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_min_height(SCF_BLOCK_HEIGHT);
@@ -304,7 +318,7 @@ pub fn show(ui: &mut Ui, rows: &[JobRow], acts: &mut Vec<Action>) {
                 });
             }
             Some(l) => scf_detail(ui, l),
-            None if r.key == JobKey::Pass => {
+            None if r.keeps_block => {
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), SCF_BLOCK_HEIGHT), egui::Sense::hover());
             }
             None => {}
