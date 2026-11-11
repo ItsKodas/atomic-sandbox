@@ -38,6 +38,15 @@
 //!   ≥ 0.9); labelled (all s: closed by the occupation rule).
 //! - `diag_unoccupied_cost_at_the_default_grid` (`#[ignore]`d measurement): the display
 //!   eigensolve's cost and convergence at the app's default h = 0.15 (Task 4 measured h = 0.25).
+//!
+//! Orbital shares (orbital-atom-shares plan Task 5; `GpuKs` with this solver's own free-atom
+//! references as share tables, the app's path; numbers in `references.md` "Orbital shares"):
+//! - `h2_sigma_g_is_shared_evenly`: H₂ 49³, σ_g |s₀ − s₁| ≤ 1e-4, |Σ − 1| ≤ 1e-4.
+//! - `lih_li_core_sits_on_li`: LiH 57³ `none`, the lowest occupied row ≥ 0.95 on Li.
+//! - `ch4_t2_members_share_one_answer`: CH₄ 49³ `Accepted` at two lattice offsets, the t₂
+//!   members' shares equal to 1e-12 (set average), the four H's within 1e-3.
+//! - `h2o_accepted_shares_sum_to_one`: H₂O 81³ × 0.15 `Accepted`, every occupied |Σ − 1| ≤
+//!   `SUM_TOL`; the lone pairs (3a₁, 1b₁) ≥ 0.55 on O.
 
 use gpu::{GpuContext, Volume3D};
 use qm::orbitals::{self as qo, LoneAtom, Spin, Row, SPIN_FLOOR};
@@ -791,4 +800,231 @@ fn diag_spin_noise_by_quality() {
             }
         }
     }
+}
+
+// ---- orbital shares (orbital-atom-shares plan Task 5; spec docs/superpowers/specs/2026-11-12-orbital-atom-shares-design.md) ----
+
+/// The share an atom needs for a row to be listed under it (and lit by its selection).
+/// `MAJORITY` copies `app::ui::dock::orbitals::MAJORITY` (the `app` binary crate cannot be
+/// imported here): change the two together.
+const MAJORITY: f64 = 0.55;
+
+/// The app's display request: the list (no field), no unoccupied rows, a payload every step.
+fn share_request() -> sim::OrbitalViewRequest {
+    sim::OrbitalViewRequest { what: sim::OrbitalRequest::List, unoccupied: 0, force_every_step: true }
+}
+
+/// This solver's own free-atom references for `scene`'s species, as the driver gets them
+/// (`sim::dynamics`, "Orbital share tables"): `sim::solve_atom` — every allowed multiplicity cold,
+/// the lowest energy kept with its shell-binned density — on the scene's cell, σ and ionic policy,
+/// solved by the provider itself at its own tolerance (`Dynamics::reference_solver_of`); one
+/// table per nucleus in scene order, one `Arc` per species (`sync_share_tables`). Rule 1: every
+/// table is a solve, none is written by hand.
+fn share_tables(g: &mut providers::GpuKs, scene: &sim::Scene) -> std::sync::Arc<sim::ShareTables> {
+    use std::sync::Arc;
+    let mut made: Vec<(u8, Arc<sim::RadialDensity>)> = Vec::new();
+    for n in &scene.nuclei {
+        if made.iter().any(|(z, _)| *z == n.z) {
+            continue;
+        }
+        let t = Instant::now();
+        let r = sim::solve_atom(g, &scene.cell, scene.sigma, scene.ionic, n.z, n.mass, &mut || false)
+            .unwrap_or_else(|e| panic!("the Z = {} reference on {}³ × {} ({:?}): {e}", n.z, scene.cell.n, scene.cell.h, scene.ionic));
+        assert!(!r.radial.is_empty(), "Z = {}: a reference without a table", n.z);
+        println!("  reference Z = {} ({:?}): multiplicity {:?}, E {:.6} Ha, 4π∫r²ρ̄ dr = {:.4} e, {} entries, {:.1} s",
+                 n.z, scene.ionic, r.multiplicity, r.energy, r.radial.electrons(), r.radial.r.len(), t.elapsed().as_secs_f64());
+        made.push((n.z, Arc::new(r.radial)));
+    }
+    let table = |z: u8| made.iter().find(|(m, _)| *m == z).expect("made above").1.clone();
+    Arc::new(sim::ShareTables { tables: scene.nuclei.iter().map(|n| table(n.z)).collect(), z: scene.nuclei.iter().map(|n| n.z).collect() })
+}
+
+/// `GpuKs`'s orbital payload for `scene` with `tables` set — the app's path: the GPU share pass on
+/// the displayed ψ̃, then `providers::orbitals::settle_shares` (the Σ check against `SUM_TOL` and
+/// the degenerate-set average). Asserts the payload carries shares (`share_z` is the scene's).
+fn shares_payload(g: &mut providers::GpuKs, scene: &sim::Scene, tables: &std::sync::Arc<sim::ShareTables>) -> sim::OrbitalDisplay {
+    use sim::ForceProvider;
+    g.set_orbital_view(share_request());
+    g.set_share_tables(Some(tables.clone()));
+    let t = Instant::now();
+    let r = g.evaluate(scene, &mut || false).unwrap_or_else(|e| panic!("{}³ × {} {:?}: {e}", scene.cell.n, scene.cell.h, scene.ionic));
+    let o = r.orbitals.expect("a payload (force_every_step)");
+    println!("  solve + payload {:.1} s; E {:.6} Ha; Z_v per nucleus {:?}; surface {}; notes {:?}",
+             t.elapsed().as_secs_f64(), r.energy, providers::pseudo::valence_charges(scene), g.ionic_tag(scene), o.notes);
+    assert_eq!(o.share_z, Some(scene.nuclei.iter().map(|n| n.z).collect::<Vec<u8>>()), "shares on the payload: notes {:?}", o.notes);
+    o
+}
+
+/// The occupied rows of one channel in index (energy) order.
+fn occupied(o: &sim::OrbitalDisplay, spin: sim::Spin) -> Vec<&sim::OrbitalInfo> {
+    let mut r: Vec<&sim::OrbitalInfo> = o.rows.iter().filter(|r| r.spin == spin && r.occupation > 0.0).collect();
+    r.sort_by_key(|r| r.index);
+    r
+}
+
+fn shares_of(r: &sim::OrbitalInfo) -> &[f64] {
+    r.shares.as_deref().unwrap_or_else(|| panic!("{} {:?} #{}: no shares", r.label, r.spin, r.index))
+}
+
+fn print_rows(o: &sim::OrbitalDisplay) {
+    for spin in [sim::Spin::Up, sim::Spin::Down] {
+        for r in occupied(o, spin) {
+            let s = shares_of(r);
+            println!("    {spin:?} #{} {} ε {:+.6} Ha, set {:?}: shares {:.6?}, Σ − 1 = {:+.2e}",
+                     r.index, r.label, r.energy, r.cluster.map(|c| c.0), s, sim::share_sum(s) - 1.0);
+        }
+    }
+}
+
+/// Spec "builder: symmetric H₂ 50/50" (plan Task 5): H₂ at R = 1.4 Bohr, 49³ × 0.25 (σ = h,
+/// all-electron, `ionic none`), the nuclei at ±0.7 Bohr on x: the grid (odd n, a node at the
+/// origin) maps to itself under x → −x, so the even split is a symmetry and any difference is
+/// the f32 solve's and the kernel's rounding. The tables are this solver's own H atom on the same
+/// surface. σ_g ↑ and ↓: |s₀ − s₁| ≤ 1e-4 and |Σ_A s − 1| ≤ 1e-4. Measured (2026-11-12, tol
+/// 1e-5): s = 0.49999998 / 0.49999999, |s₀ − s₁| ≤ 2.7e-9, |Σ − 1| ≤ 3.2e-8 (`references.md`
+/// "Orbital shares").
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn h2_sigma_g_is_shared_evenly() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let scene = common::h2(1.4);
+    println!("H₂ R = 1.4 Bohr, {}³ × {}, σ = h, {:?}, tol {INTERACTIVE_TOL:.0e}", scene.cell.n, scene.cell.h, scene.ionic);
+    let mut g = providers::GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    let tables = share_tables(&mut g, &scene);
+    let o = shares_payload(&mut g, &scene, &tables);
+    print_rows(&o);
+    for spin in [sim::Spin::Up, sim::Spin::Down] {
+        let rows = occupied(&o, spin);
+        assert_eq!(rows.len(), 1, "{spin:?}: σ_g alone");
+        let s = shares_of(rows[0]);
+        let (diff, sum) = ((s[0] - s[1]).abs(), sim::share_sum(s));
+        println!("  σ_g {spin:?}: s₀ = {:.9}, s₁ = {:.9}, |s₀ − s₁| = {diff:.2e}, |Σ − 1| = {:.2e}", s[0], s[1], (sum - 1.0).abs());
+        assert!(diff <= 1e-4, "σ_g {spin:?}: |s₀ − s₁| = {diff:.2e}");
+        assert!((sum - 1.0).abs() <= 1e-4, "σ_g {spin:?}: Σ = {sum}");
+    }
+}
+
+/// Spec "builder: separated atoms ≈ 100 % on their own atom" (plan Task 5): LiH at R = 3.015 Bohr
+/// (experiment), 57³ × 0.25, `ionic none`, the tables this solver's own all-electron Li and H
+/// atoms. The lowest occupied row of each channel is the Li 1s core: its share on Li ≥ 0.95.
+/// Measured (2026-11-12, tol 1e-5): 0.971454 on Li, 0.028545 on H, both channels; the bond
+/// row 0.330 / 0.670. The 2.9 % on H is the part of this row the H's weight takes. A likely
+/// contributor, not isolated: the σ = h = 0.25 nucleus (Zσ = 0.75) lifts this 1s to
+/// ε = −1.085 Ha (NIST LSD Li atom, point nucleus: −1.875 Ha), so the core is wider than a
+/// point-nucleus core (rule 7; `references.md` "Orbital shares").
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn lih_li_core_sits_on_li() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let scene = common::lih(57, 3.015);
+    println!("LiH R = 3.015 Bohr, {}³ × {}, σ = h, {:?}, tol {INTERACTIVE_TOL:.0e}", scene.cell.n, scene.cell.h, scene.ionic);
+    let mut g = providers::GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    let tables = share_tables(&mut g, &scene);
+    let o = shares_payload(&mut g, &scene, &tables);
+    print_rows(&o);
+    for spin in [sim::Spin::Up, sim::Spin::Down] {
+        let rows = occupied(&o, spin);
+        assert_eq!(rows.len(), 2, "{spin:?}: Li 1s and the bond");
+        let s = shares_of(rows[0]);
+        println!("  lowest occupied {spin:?} ({}): on Li {:.6}, on H {:.6}", rows[0].label, s[0], s[1]);
+        assert!(s[0] >= 0.95, "{spin:?}: the Li 1s core's share on Li is {:.6}", s[0]);
+    }
+}
+
+/// Review Focus 3 (plan Task 5): CH₄'s t₂ set (three degenerate rows whose single-member shares
+/// depend on the rotation the display picked) shows one answer. Tetrahedral CH₄, r(C–H) =
+/// 1.0947 Å (2.0687 Bohr; the pseudo oracles' reference), 49³ × 0.25 under the app's default
+/// `Accepted` policy (C and H pseudised at h = 0.25; the tables the pseudo-atoms' valence
+/// densities), at two lattice offsets: C on a node (the cubic grid holds T_d, so the t₂ split is
+/// the SCF's noise) and off-grid at (0.37, −0.21, 0.12)·h (the egg-box splits it). At each, for
+/// ↑ and ↓: the t₂ rows are one set (`cluster` d = 3) whose members' shares are equal to 1e-12
+/// (the set average), and the four H's shares of that average agree within 1e-3 (T_d makes them
+/// equal). Measured (2026-11-12, tol 1e-5; pseudo-C Z_v = 4, multiplicity 3, and pseudo-H on
+/// `Accepted`'s surface, which is `All`'s tag): the members' shares are identical (max|Δs| = 0);
+/// the averaged t₂ is C 0.498333 / each H 0.125417 on the node (H spread ≤ 2.2e-8, t₂ ε split
+/// 1.9e-8 Ha) and C 0.498324 / H 0.125399–0.125451 off-grid (spread 5.1e-5, ε split 6.3e-6 Ha,
+/// inside τ = 1 mHa); `references.md` "Orbital shares".
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn ch4_t2_members_share_one_answer() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (n, h) = (49usize, 0.25);
+    let a = units::angstrom_to_bohr(1.0947) / 3f64.sqrt();
+    let ch4 = |o: [f64; 3]| {
+        let at = |s: [f64; 3]| [o[0] + s[0] * a, o[1] + s[1] * a, o[2] + s[2] * a];
+        let mut s = common::scene(n, vec![sim::Nucleus::new(6, o), sim::Nucleus::new(1, at([1.0, 1.0, 1.0])), sim::Nucleus::new(1, at([1.0, -1.0, -1.0])),
+                                          sim::Nucleus::new(1, at([-1.0, 1.0, -1.0])), sim::Nucleus::new(1, at([-1.0, -1.0, 1.0]))]);
+        s.cell.h = h;
+        s.ionic = sim::IonicPolicy::Accepted;
+        s
+    };
+    let mut g = providers::GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    println!("CH₄ r(C–H) = {:.4} Bohr, {n}³ × {h}, σ = h, Accepted, tol {INTERACTIVE_TOL:.0e}", a * 3f64.sqrt());
+    // the references do not depend on where the molecule sits: one scan for both offsets
+    let tables = share_tables(&mut g, &ch4([0.0; 3]));
+    for (site, off) in [("C on a node", [0.0; 3]), ("C off-grid", [0.37 * h, -0.21 * h, 0.12 * h])] {
+        let scene = ch4(off);
+        println!(" {site} {off:?}");
+        let o = shares_payload(&mut g, &scene, &tables);
+        print_rows(&o);
+        for spin in [sim::Spin::Up, sim::Spin::Down] {
+            let rows = occupied(&o, spin);
+            let t2: Vec<&&sim::OrbitalInfo> = rows.iter().filter(|r| r.cluster.is_some_and(|c| c.0 == 3)).collect();
+            assert_eq!(t2.len(), 3, "{site} {spin:?}: one three-member set among {:?}", rows.iter().map(|r| (r.index, r.cluster)).collect::<Vec<_>>());
+            let first = shares_of(t2[0]);
+            let set = t2.iter().flat_map(|r| shares_of(r).iter().zip(first).map(|(x, y)| (x - y).abs())).fold(0.0f64, f64::max);
+            let on_h = &first[1..];
+            let h_spread = spread(on_h);
+            let eps: Vec<f64> = t2.iter().map(|r| r.energy).collect();
+            println!("  {site} {spin:?}: t₂ ε split {:.2e} Ha; members' max|Δs| = {set:.1e}; averaged shares C {:.6}, H {:.6?}, H spread {h_spread:.2e}; Σ − 1 = {:+.2e}",
+                     spread(&eps), first[0], on_h, sim::share_sum(first) - 1.0);
+            assert!(set <= 1e-12, "{site} {spin:?}: the t₂ members' shares differ by {set:.2e}");
+            assert!(h_spread <= 1e-3, "{site} {spin:?}: the four H's t₂ shares spread {h_spread:.2e}");
+        }
+    }
+}
+
+/// Review Focus 2 (plan Task 5): pseudised atoms (`Accepted`, the app's default: O and H
+/// pseudised, the tables the pseudo-atoms' valence densities, the orbitals valence-only) still
+/// split each orbital completely. H₂O at the suite's fixture geometry (r(O–H) 1.810 Bohr, ∠HOH
+/// 104.4°), 81³ × 0.15 (O's h_req under the recipe), the tables this solver's own pseudo-O and
+/// pseudo-H. Every occupied row's |Σ_A s − 1| ≤ `SUM_TOL`; the lone pairs' O shares recorded:
+/// 3a₁ and 1b₁, the two highest occupied rows (2a₁ < 1b₂ < 3a₁ < 1b₁; 1b₁ the out-of-plane p),
+/// and both must be listed under O: share ≥ `MAJORITY` (the spec's "an O lone pair mostly on
+/// O"). Measured (2026-11-12, tol 1e-5; pseudo-O Z_v = 6, multiplicity 3; pseudo-H): worst
+/// |Σ − 1| = 8.7e-8; O shares 2a₁ 0.793, 1b₂ 0.666, 3a₁ 0.828, 1b₁ 0.862. These are shares of
+/// valence-only orbitals against pseudo-atom valence tables, which are nodeless and smaller
+/// than the all-electron ones inside r_c, so they need not equal an all-electron split (rule 7;
+/// `references.md` "Orbital shares").
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn h2o_accepted_shares_sum_to_one() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (n, h) = (81usize, 0.15);
+    let mut scene = common::scene(n, vec![sim::Nucleus::new(8, [0.0; 3]), sim::Nucleus::new(1, [1.43, 1.11, 0.0]), sim::Nucleus::new(1, [-1.43, 1.11, 0.0])]);
+    scene.cell.h = h;
+    scene.ionic = sim::IonicPolicy::Accepted;
+    println!("H₂O, {n}³ × {h}, σ = h, {:?}, tol {INTERACTIVE_TOL:.0e}", scene.ionic);
+    let mut g = providers::GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    let tables = share_tables(&mut g, &scene);
+    let o = shares_payload(&mut g, &scene, &tables);
+    print_rows(&o);
+    let mut worst = 0.0f64;
+    for spin in [sim::Spin::Up, sim::Spin::Down] {
+        let rows = occupied(&o, spin);
+        assert_eq!(rows.len(), 4, "{spin:?}: four valence orbitals (2a₁, 1b₂, 3a₁, 1b₁)");
+        for r in &rows {
+            let e = (sim::share_sum(shares_of(r)) - 1.0).abs();
+            worst = worst.max(e);
+            assert!(e <= sim::charges::SUM_TOL, "{spin:?} #{}: |Σ − 1| = {e:.2e}", r.index);
+        }
+        let (a1, b1) = (shares_of(rows[2]), shares_of(rows[3]));
+        println!("  {spin:?}: lone pairs on O: 3a₁ {:.6}, 1b₁ {:.6} (1b₁ on the H's {:.6} / {:.6})", a1[0], b1[0], b1[1], b1[2]);
+        assert!(a1[0] >= MAJORITY && b1[0] >= MAJORITY, "{spin:?}: the lone pairs' O shares 3a₁ {:.6}, 1b₁ {:.6} < {MAJORITY}", a1[0], b1[0]);
+    }
+    println!("  worst |Σ_A s − 1| = {worst:.2e} (bound SUM_TOL {:.0e})", sim::charges::SUM_TOL);
 }

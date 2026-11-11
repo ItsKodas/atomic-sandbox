@@ -119,7 +119,10 @@
 //!   as m + ln((1 − f)e^{L_i − m} + f e^{L_{i+1} − m}), m = max(L_i, L_{i+1}), and the weight as
 //!   exp(L_A − L_max)/Σ_B exp(L_B − L_max) — the ratio of the same two numbers, without
 //!   underflow. An exact ρ_k = 0 (the CPU's own underflow, a table cut to 0) is a sentinel, so
-//!   "every ρ_A⁰ = 0" means what it means on the CPU.
+//!   "every ρ_A⁰ = 0" means what it means on the CPU. Where every table is 0, the nearest nucleus
+//!   is judged on f32 r² in grid units here and on f64 r² in Bohr on the CPU, so a node at a
+//!   near-tie may go to the other nucleus on one side than on the other; that is negligible,
+//!   since ψ² ≈ 0 wherever every free atom's density is 0 (Task 3 review Minor 3).
 //! - **Precision.** Per node, w_A carries the f32 rounding of L (|L|·2⁻²⁴ absolute: ≤ 2e-6
 //!   relative where |L| ≤ 30, i.e. where ρ⁰ ≳ 1e-13 and the bound orbitals live) and of the
 //!   distance (relative 2⁻²⁴ on (i − cell) − frac); ψ̃² is the displayed f32 field. Each thread
@@ -131,7 +134,8 @@
 //! - **Cost** (`providers::ks::tests::gpu_shares_cost_is_reported`, H₂O 95³ × 0.15, 10 rows × 3
 //!   nuclei, 3 dispatches): the pass 0.45 ms min, 0.50 ms median of 20 (submission and map
 //!   included); the payload +0.5 ms. Measured: |s_gpu − s_cpu| ≤ 2.4e-8 on the same ψ̃ there,
-//!   ≤ 1.2e-8 at 49³ (four H₂/HeH⁺ cases, `gpu_shares_match_cpu`).
+//!   ≤ 1.2e-8 at 49³ (four H₂/HeH⁺ cases and HeH⁺ with two unoccupied rows,
+//!   `gpu_shares_match_cpu`); both tests assert the derived 5e-6.
 //!
 //! # Display fields and VRAM (spec §4.4)
 //! The view owns its fields (its own pool, never the solver's): the previous displayed set

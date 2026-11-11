@@ -2946,11 +2946,21 @@ mod tests {
     /// - **the same state on both providers**: `GpuKs`'s payload shares vs `CpuKs`'s, rows matched
     ///   by (spin, index) — the kernel plus the f32 solve's difference from the f64 one.
     ///
-    /// Each to |Δs| ≤ 1e-4 per row and nucleus, and Σ_A s_gpu within 1e-4 of 1. Cases: H₂ with
-    /// one shared table (one packed table, two nuclei), with two different tables (nucleus 0's
-    /// H-like, nucleus 1's broader: an uneven split), with both tables cut at 2 Bohr (most nodes go
-    /// to the nearest nucleus by the underflow rule; the mid-plane nodes x = 0 are exact ties,
-    /// which both sides give to nucleus 0), and HeH⁺ (He-like and H-like tables).
+    /// The same-ψ̃ comparison to |Δs| ≤ 5e-6 per row and nucleus (Task 3 review Minor 1: the
+    /// derived bound, ≈ 1.3e-6 from the f32 sums plus ≤ 0.25·5e-6 from the f32 log lookup;
+    /// measured ≤ 1.2e-8), the providers' to |Δs| ≤ 1e-4 (it includes the f32 solve), and Σ_A
+    /// s_gpu within 1e-4 of 1. Cases: H₂ with one shared table (one packed table, two nuclei),
+    /// with two different tables (nucleus 0's H-like, nucleus 1's broader: an uneven split), with
+    /// both tables cut at 2 Bohr (most nodes go to the nearest nucleus by the underflow rule; the
+    /// mid-plane nodes x = 0 are exact ties, which both sides give to nucleus 0), and HeH⁺
+    /// (He-like and H-like tables). Then HeH⁺ with two unoccupied orbitals (Task 3 review Minor
+    /// 2): the display eigensolve's vectors are rows n_σ.. of the view's shown fields, and the
+    /// payload's unoccupied rows must carry the shares of exactly those fields — the same-ψ̃
+    /// comparison over every shown row, each payload row of its own (no set average) holding the
+    /// raw GPU shares of its (channel, index) bit for bit, and a box state holding none. A cation,
+    /// because its lowest unoccupied orbitals are bound: H₂'s at 49³ are all box states (measured),
+    /// which carry no shares, so they cannot show the mapping. That case has no provider
+    /// comparison: the two providers' unoccupied vectors are separate eigensolves.
     #[test]
     #[cfg_attr(debug_assertions, ignore)]
     fn gpu_shares_match_cpu() {
@@ -2958,15 +2968,16 @@ mod tests {
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
         let mut heh = scene(49, vec![Nucleus::new(2, [0.73, 0.0, 0.0]), Nucleus::new(1, [-0.73, 0.0, 0.0])]);
         heh.charge = 1;
-        let cases: Vec<(&str, Scene, Arc<sim::ShareTables>)> = vec![
-            ("H₂, one shared H-like table", h2(49, 1.4), h_like_tables(&[1, 1])),
-            ("H₂, H-like and broad tables", h2(49, 1.4), tables_with(&[1, 1], &[h_like, broad], 12.0, false)),
-            ("H₂, tables cut at 2 Bohr", h2(49, 1.4), tables_with(&[1, 1], &[h_like, h_like], 2.0, true)),
-            ("HeH⁺, He-like and H-like tables", heh, tables_with(&[2, 1], &[he_like, h_like], 12.0, false)),
+        let cases: Vec<(&str, Scene, Arc<sim::ShareTables>, u8)> = vec![
+            ("H₂, one shared H-like table", h2(49, 1.4), h_like_tables(&[1, 1]), 0),
+            ("H₂, H-like and broad tables", h2(49, 1.4), tables_with(&[1, 1], &[h_like, broad], 12.0, false), 0),
+            ("H₂, tables cut at 2 Bohr", h2(49, 1.4), tables_with(&[1, 1], &[h_like, h_like], 2.0, true), 0),
+            ("HeH⁺, He-like and H-like tables", heh.clone(), tables_with(&[2, 1], &[he_like, h_like], 12.0, false), 0),
+            ("HeH⁺, He-like and H-like tables, 2 unoccupied", heh.clone(), tables_with(&[2, 1], &[he_like, h_like], 12.0, false), 2),
         ];
-        for (name, s, tables) in cases {
+        for (name, s, tables, m) in cases {
             let mut g = GpuKs::new(ctx.clone(), 1e-6);
-            g.set_orbital_view(view(OrbitalRequest::List));
+            g.set_orbital_view(with_unoccupied(OrbitalRequest::List, m, true));
             g.set_share_tables(Some(tables.clone()));
             let pg = g.evaluate(&s, &mut never()).expect("GpuKs").orbitals.expect("a GPU payload");
             // the kernel alone, on the same fields
@@ -2974,6 +2985,31 @@ mod tests {
             assert!(!same.is_empty());
             let d_same = worst(same.iter().flat_map(|(_, _, c, q)| c.iter().copied().zip(q.iter().copied())));
             let sum_same = worst(same.iter().map(|(_, _, _, q)| (sim::share_sum(q), 1.0)));
+            assert!(d_same <= 5e-6 && sum_same <= 1e-4, "{name}: the kernel on the same ψ̃: {d_same:.2e}, Σ {sum_same:.2e}");
+            if m > 0 {
+                assert_eq!(pg.share_z, Some(s.nuclei.iter().map(|n| n.z).collect::<Vec<_>>()), "{name}: {:?}", pg.notes);
+                let unocc: Vec<&sim::OrbitalInfo> = pg.rows.iter().filter(|r| r.occupation == 0.0).collect();
+                assert!(!unocc.is_empty(), "{name}: unoccupied rows shown");
+                for (ch, spin) in [(0, Spin::Up), (1, Spin::Down)] {
+                    assert_eq!(same.iter().filter(|e| e.0 == ch).count(), pg.rows.iter().filter(|r| r.spin == spin).count(),
+                               "{name} {spin:?}: one shown field per payload row");
+                }
+                let mut checked = 0;
+                for r in &pg.rows {
+                    let ch = if r.spin == Spin::Up { 0 } else { 1 };
+                    let raw = same.iter().find(|e| e.0 == ch && e.1 == r.index).unwrap_or_else(|| panic!("{name}: no shown field for {} {:?} #{}", r.label, r.spin, r.index));
+                    println!("{name}: {} {:?} #{} occ {} box {} set {:?}: payload {:.7?}, raw GPU {:.7?}, CPU on the same ψ̃ {:.7?}",
+                             r.label, r.spin, r.index, r.occupation, r.box_state, r.cluster.map(|c| c.0), r.shares, raw.3, raw.2);
+                    assert!(!(r.box_state && r.shares.is_some()), "{name}: the box state {} {:?} #{} carries shares", r.label, r.spin, r.index);
+                    if let (Some(sh), true) = (&r.shares, r.cluster.is_none_or(|c| c.0 == 1)) {
+                        assert_eq!(sh, &raw.3, "{name}: {} {:?} #{} carries another field's shares", r.label, r.spin, r.index);
+                        checked += usize::from(r.occupation == 0.0);
+                    }
+                }
+                assert!(checked > 0, "{name}: no unoccupied row of its own with shares to check the mapping on");
+                println!("{name}: same ψ̃ max|Δs| = {d_same:.2e}, max|Σ−1| = {sum_same:.2e} over {} shown rows; {checked} unoccupied rows carry their own field's shares", same.len());
+                continue;
+            }
             // the providers, on the same scene
             let mut c = CpuKs::new(1e-6);
             c.set_orbital_view(view(OrbitalRequest::List));
@@ -2991,7 +3027,6 @@ mod tests {
                 sum_prov = sum_prov.max((sim::share_sum(sg) - 1.0).abs());
             }
             println!("{name}: same ψ̃ max|Δs| = {d_same:.2e}, max|Σ−1| = {sum_same:.2e}; GpuKs vs CpuKs max|Δs| = {d_prov:.2e}, max|Σ−1| = {sum_prov:.2e}");
-            assert!(d_same <= 1e-4 && sum_same <= 1e-4, "{name}: the kernel on the same ψ̃: {d_same:.2e}, Σ {sum_same:.2e}");
             assert!(d_prov <= 1e-4 && sum_prov <= 1e-4, "{name}: GpuKs vs CpuKs: {d_prov:.2e}, Σ {sum_prov:.2e}");
         }
     }
@@ -3001,7 +3036,8 @@ mod tests {
     /// (dispatches, one submission, one map), min and median of 20, and the payload's wall time
     /// with and without tables (min of 10 each: the time the shares add to a payload, which is
     /// built inside `evaluate` when a refresh is due, after the energy and forces). Also the same-ψ̃
-    /// agreement at this size. Asserts the pass's minimum ≤ 50 ms.
+    /// agreement at this size, to the derived 5e-6 of `gpu_shares_match_cpu` (measured 2.3e-8).
+    /// Asserts the pass's minimum ≤ 50 ms.
     #[test]
     #[cfg_attr(debug_assertions, ignore)]
     fn gpu_shares_cost_is_reported() {
@@ -3052,7 +3088,7 @@ mod tests {
         let without = payload_ms(&mut g);
         println!("H₂O 95³: {} rows × 3 nuclei: share pass min {:.2} ms, median {:.2} ms, max {:.2} ms; payload min {with:.2} ms with tables, {without:.2} ms without ({:+.2} ms); same ψ̃ max|Δs| = {d_same:.2e}, max|Σ−1| = {sum_same:.2e}",
                  same.len(), pass_ms[0], pass_ms[pass_ms.len() / 2], pass_ms[pass_ms.len() - 1], with - without);
-        assert!(d_same <= 1e-4 && sum_same <= 1e-4, "the kernel on the same ψ̃ at 95³: {d_same:.2e}, Σ {sum_same:.2e}");
+        assert!(d_same <= 5e-6 && sum_same <= 1e-4, "the kernel on the same ψ̃ at 95³: {d_same:.2e}, Σ {sum_same:.2e}");
         assert!(pass_ms[0] <= 50.0, "share pass {:.2} ms > 50 ms", pass_ms[0]);
     }
 

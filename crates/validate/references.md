@@ -1854,6 +1854,24 @@ Frame times, 97³ in a 1400 × 900 headless frame, mean of 20 submitted-and-wait
 
 Filtered against manual sampling (signed isosurface): 4 of 16384 pixels, a symmetric ring on the lobe's rim where a ray grazes the iso threshold, flip between two lit values (46/255) because the hardware quantises its interpolation weights; everywhere else < 8/255. The signed volume agrees to 1/255.
 
+### Orbital shares (orbital-atom-shares plan Task 5; 2026-11-12, RX 7900 XTX)
+
+Display numerics only: nothing here changes a solve. Spec `docs/superpowers/specs/2026-11-12-orbital-atom-shares-design.md`; physics in the `sim::charges` module doc ("Orbital shares"), the GPU kernel in `qm_gpu::orbitals` ("Orbital shares"). s_iA = h³ Σ_nodes w_A ψ̃_i², with w_A the Hirshfeld weights of **this solver's own free atoms** solved on the same grid, σ and ionic surface (`sim::solve_atom` by the same `GpuKs`, the driver's rule; rule 1: no table is written by hand). The oracles (`tests/orbitals.rs`) run the app's path: `GpuKs` with the tables set, the GPU share pass, then `providers::orbitals::settle_shares` (the Σ check against `SUM_TOL` = 1e-3 and the degenerate-set average). SCF tol 1e-5 (`INTERACTIVE_TOL`, the app's display tolerance); σ = h.
+
+| oracle | system, grid, policy | measured | bound | meaning |
+|---|---|---|---|---|
+| `h2_sigma_g_is_shared_evenly` | H₂ R = 1.4 Bohr, 49³ × 0.25, `none` (H ref: doublet, E −0.424224 Ha) | σ_g s = 0.49999998 / 0.49999999; \|s₀ − s₁\| ≤ 2.7e-9; \|Σ − 1\| ≤ 3.2e-8 | \|s₀ − s₁\| ≤ 1e-4, \|Σ − 1\| ≤ 1e-4 | the grid maps to itself under x → −x, so 50/50 is a symmetry; the residual is f32 rounding |
+| `lih_li_core_sits_on_li` | LiH R = 3.015 Bohr, 57³ × 0.25, `none` (Li ref: doublet, E −4.798895 Ha; H −0.424670) | lowest occupied row (Li 1s, ε −1.085 Ha) on Li **0.971454** (H 0.028545), both channels; bond row Li 0.330 / H 0.670 | ≥ 0.95 | a core orbital is listed under its atom |
+| `ch4_t2_members_share_one_answer` | CH₄ r(C–H) 1.0947 Å, 49³ × 0.25, `Accepted` (C and H pseudised: Z_v 4, 1, …; surface tag = `All`'s; C ref triplet −5.536112 Ha, H −0.477852) | node: t₂ C 0.498333, each H 0.125417 (H spread ≤ 2.2e-8; t₂ ε split 1.9e-8 Ha); off-grid (0.37, −0.21, 0.12)·h: C 0.498324, H 0.125399–0.125451 (spread 5.1e-5; ε split 6.3e-6 Ha, inside τ = 1 mHa); members' max\|Δs\| = 0 at both; a₁ C 0.586 / H 0.103 | members equal to 1e-12; H spread ≤ 1e-3 | a degenerate set shows one rotation-invariant answer (Review Focus 3); T_d holds the four H equal |
+| `h2o_accepted_shares_sum_to_one` | H₂O r(O–H) 1.810 Bohr, ∠ 104.4°, 81³ × 0.15, `Accepted` (O and H pseudised: Z_v 6, 1, 1; O ref triplet −16.104697 Ha, H −0.477787) | worst \|Σ − 1\| = 8.7e-8 over 8 rows; O shares 2a₁ 0.793, 1b₂ 0.666, **3a₁ 0.828, 1b₁ 0.862** (1b₁ on each H 0.069) | \|Σ − 1\| ≤ `SUM_TOL` (1e-3); lone pairs ≥ 0.55 (`MAJORITY`) | pseudised tables and valence-only orbitals still split completely (Review Focus 2); both lone pairs list under O |
+
+`Accepted` pseudises C at h = 0.25 (its recipe is accepted there; the egg-box record at 0.25 is in "M7 `All` (Task 11)") and H after the dimer gate (53 s in the CH₄ test, the first H use of the process). Suite wall: the four oracles 124 s together (the H dimer gate and the O/C/Li reference scans most of it: O 31 s, C 23 s, Li 8 s).
+
+**What a share is (rule 7).** A share is a **split of space**, not an observable: Hirshfeld's free-atom weights decide which atom each point belongs to, and another scheme (Mulliken, Löwdin, Bader) gives other numbers for the same orbital. The app's tooltip says so. Gaps to keep in mind when reading these numbers:
+- **Pseudised atoms.** Under `Accepted` the tables are the pseudo-atoms' valence densities and the orbitals are valence-only pseudo-orbitals. Both are nodeless and smaller than the all-electron ones inside r_c, so H₂O's 0.862 on O for 1b₁ is a pseudo-surface number. It need not equal an all-electron split (as for the charges, `sim::charges` SHOULD-4a). A pseudo-atom's core has no row.
+- **The smeared nucleus.** At σ = h the Li 1s sits at ε = −1.085 Ha, against NIST's LSD −1.875 Ha for the point-nucleus atom (`NIST_LSD_LI_1S_MAJORITY`), so the core is wider than a point-nucleus core. A likely contributor to the 2.9 % the H's weight takes, not isolated.
+- **Grid noise.** Off a node, the egg-box splits CH₄'s t₂ by 6.3e-6 Ha and the H shares by 5.1e-5. The 0.55 grouping margin is far wider than either.
+
 ## Quality presets (user request 2026-10-14, branch `empty-preset`; report-only)
 
 The app's Scene ▸ Quality levels (`crates/app/src/quality.rs`) trade speed for accuracy through the
