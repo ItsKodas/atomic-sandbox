@@ -99,6 +99,9 @@ struct App {
     /// When the monitor list was last given to the UI (`detached::monitors`), and that list.
     monitors_at: Option<Instant>,
     monitors: Vec<ui::WinRect>,
+    /// The app's windows, the last focused first (`None`: the main one; detached window N): the
+    /// z-order a tab dragged between windows is hit-tested in (docking spec D-15).
+    z: Vec<Option<u32>>,
     /// `--layout <preset>`: applied once the monitors are known (Two monitors needs them).
     start_layout: Option<ui::LayoutPreset>,
 }
@@ -585,6 +588,7 @@ fn main() {
         detached: Vec::new(),
         monitors_at: None,
         monitors: Vec::new(),
+        z: vec![None],
         start_layout,
     };
     event_loop.run_app(&mut app).expect("run");
@@ -697,10 +701,15 @@ impl ApplicationHandler for App {
         if id != window.id() {
             return; // a window already closed
         }
-        let consumed = match &mut self.egui_state {
+        let mut consumed = match &mut self.egui_state {
             Some(s) => s.on_window_event(&window, &event).consumed,
             None => false,
         };
+        // a press the chrome's hit test takes — a separator's or a grip's grab margin over the 3D
+        // view, which egui-winit's `consumed` misses — is the chrome's alone (docking spec D-16)
+        if matches!(event, WindowEvent::MouseInput { state: winit::event::ElementState::Pressed, .. }) {
+            consumed |= self.viewer.ui_takes_press();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 ui::profile::flush(&mut self.viewer.ui); // the layout and look as left
@@ -722,6 +731,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.redraw(&window),
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                if f {
+                    self.raise(None);
+                }
                 window.request_redraw();
             }
             e => {
@@ -821,13 +833,14 @@ impl App {
             return;
         }
         let Some(w) = &self.window else { return };
-        let list = detached::monitors(el, w);
+        let (list, work): (Vec<ui::WinRect>, Vec<ui::WinRect>) = detached::monitors(el, w).into_iter().unzip();
         if list != self.monitors {
             let words: Vec<String> = list.iter().map(|m| format!("{}x{} at {},{}", m.w, m.h, m.x, m.y)).collect();
             eprintln!("monitors: {} ({}; the main window's first)", list.len(), words.join("; "));
             self.monitors = list.clone();
         }
         self.viewer.ui.workspace.set_monitors(list);
+        self.viewer.ui.workspace.set_work_areas(work);
         self.monitors_at = Some(Instant::now());
         if let Some(p) = self.start_layout.take() {
             self.viewer.ui.apply_layout(p);
@@ -858,6 +871,9 @@ impl App {
                             self.viewer.ui.workspace.set_window_rect(id, d.rect(), d.maximized());
                             let i = self.detached.iter().position(|w| w.id > id).unwrap_or(self.detached.len());
                             self.detached.insert(i, d);
+                            // a new window opens in front
+                            self.z.retain(|w| *w != Some(id));
+                            self.z.insert(0, Some(id));
                         }
                         Err(e) => {
                             self.viewer.ui.workspace.window_closed(id);
@@ -870,6 +886,7 @@ impl App {
                         eprintln!("detached window {id} closed");
                     }
                     self.detached.retain(|d| d.id != id);
+                    self.z.retain(|w| *w != Some(id));
                 }
                 ui::WindowRequest::Focus { id } => {
                     if let Some(d) = self.detached.iter().find(|d| d.id == id) {
@@ -892,6 +909,7 @@ impl App {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 let id = d.id;
                 self.detached.remove(i);
+                self.z.retain(|w| *w != Some(id));
                 self.viewer.ui.workspace.window_closed(id);
                 eprintln!("detached window {id} closed by the user: its panels are back in the main window");
             }
@@ -899,9 +917,33 @@ impl App {
                 let (id, r, max) = (d.id, d.rect(), d.maximized());
                 self.viewer.ui.workspace.set_window_rect(id, r, max);
             }
-            WindowEvent::Focused(f) => d.focused = f,
+            WindowEvent::Focused(f) => {
+                d.focused = f;
+                if f {
+                    let id = d.id;
+                    self.raise(Some(id));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Window `w` (`None`: the main one) came to the front: first in the drag's z-order.
+    fn raise(&mut self, w: Option<u32>) {
+        self.z.retain(|x| *x != w);
+        self.z.insert(0, w);
+    }
+
+    /// Where every window is (`detached::place`), the last focused first, for the UI's drag
+    /// between windows (docking spec D-15).
+    fn places(&self, main: &Window) -> Vec<ui::Place> {
+        self.z
+            .iter()
+            .filter_map(|&w| match w {
+                None => detached::place(None, main),
+                Some(id) => self.detached.iter().find(|d| d.id == id).and_then(|d| detached::place(Some(id), &d.window)),
+            })
+            .collect()
     }
 
     /// The pop-out window's events: closing it clears the flag; F11 toggles full screen, Esc
@@ -942,6 +984,9 @@ impl App {
     }
 
     fn redraw(&mut self, window: &Window) {
+        // where the windows are now: a tab dragged between them is hit-tested there (spec D-15)
+        let places = self.places(window);
+        self.viewer.ui.workspace.set_places(places);
         let (Some(g), Some(egui_state)) = (&mut self.gfx, &mut self.egui_state) else {
             return;
         };

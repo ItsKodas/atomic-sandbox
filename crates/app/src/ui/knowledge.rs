@@ -10,9 +10,9 @@
 //!   what the open scene asks (each pair within r_cut, its distances taught / thinly / never), and
 //!   the detail of the picked pair (its distance histogram with the "asked now" ticks and the
 //!   environment keys behind its verdict) or element (its neighbour counts and bond angles).
-//!   A wide panel (floated, or given a wide leaf) lays the map out in two columns. Its old pop-out
-//!   window is gone (docking spec D-5): floating the panel does that job, and detaching it to an
-//!   OS window (docking D3) will;
+//!   A wide panel (a wide leaf, or a detached window) lays the map out in two columns. Its old
+//!   pop-out window is gone (docking spec D-5): detaching the panel to an OS window (docking D3)
+//!   does that job;
 //! - the **3D overlay** (View ▸ Display aids ▸ knowledge overlay, [`overlay_toggle`]): each atom
 //!   tinted by `sim::atom_coverage` ([`overlay_coverage`], [`tint_srgb`]: grey 0 never seen → amber
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).

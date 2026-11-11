@@ -1,8 +1,11 @@
 //! The workspace on screen (docking spec D-2..D-5; user decision 6, "approach 1": `egui_dock` for
 //! the in-window tree): one tree of splits and tabbed leaves holding the 3D view and every panel,
 //! replacing the two fixed docks. Drag a tab onto another leaf's tab bar to tab it there, onto an
-//! edge to split, out of the tree to float it in a window inside the app (spec D-5); the
-//! separators resize. All of it is display state (spec D-13): nothing here is an `Action`.
+//! edge to split; dragged out of the window it detaches into a new OS window, and onto another of
+//! the app's windows it docks there (spec D-15, `super::drag`) — nothing floats inside a window
+//! (spec D-5, user decision 2026-11-12: `allowed_in_windows` is false, so a drop on an empty spot
+//! inside a window cancels); the separators resize. All of it is display state (spec D-13):
+//! nothing here is an `Action`.
 //!
 //! - **The 3D view is a tile, not a panel** (spec D-3, [`Tile::View3d`]): never closable, never in
 //!   a window, no background (the scene shows through) and no tab bar of its own (its leaf's bar
@@ -12,12 +15,13 @@
 //!   Its body rect is `PanelOutput::view`, and the root `Ui` is left holding exactly that rect
 //!   (`leave_only`): egui counts the pointer as over egui outside the root's remaining rect, so the
 //!   3D view keeps its orbit / place / grab / edit input wherever its tile sits, as the space the
-//!   old docks left did.
+//!   old docks left did. A press that a widget's grab margin reaches into the tile (a separator's)
+//!   is the UI's all the same (spec D-16: `ui::takes_press`, which the window asks).
 //! - **Tabs** (spec D-4): the panel's icon, its name and its status dot (`dock::status`: drift and
 //!   box health, work running, trust, the Log's unread count) are painted into the tab, whose
 //!   title reserves the room; hovering a tab peeks its key numbers (`dock::peek`); a middle click
-//!   or the context menu closes it; the menu also floats it, moves it to a new detached window, to
-//!   the main window or to window N (spec D-12, `super::detached`), or resets the layout. A leaf's
+//!   or the context menu closes it; the menu also moves it to a new detached window, to the main
+//!   window or to window N (spec D-12, `super::detached`), or resets the layout. A leaf's
 //!   tab bar ends with its pin (auto-hides its active tab, D2: `egui_dock`'s add button, its plus
 //!   left transparent under the duotone Pin icon — the library has no custom bar buttons, and the
 //!   add button is a real widget that reports its leaf, so no private geometry is clicked), its
@@ -26,7 +30,7 @@
 //!   bar's style keeps free of tabs (recorded for review: there is no free built-in slot left, and
 //!   egui_dock's close-all sat where the order pin · pop out · close needs the close).
 //! - **Detached windows** (spec D-12): [`show_window`] draws one window's own tree in its own egui
-//!   context with the same `Tiles`, no pin (its bars end Dock back · Close) and no floating.
+//!   context with the same `Tiles`, no pin (its bars end Dock back · Close).
 //! - **Auto-hidden panels** (spec D-10, `super::autohide`): [`Workspace::pin`] takes a panel out of
 //!   the tree onto the strip of the 3D view's edge its leaf lay beyond, remembering its size, and
 //!   docks it back beside the view on that edge; their strips and flyout are drawn round the 3D
@@ -38,10 +42,7 @@
 //! The panels draw with `&mut UiState`, which also holds the tree, so the tree is lent to the dock
 //! area for the frame; what the panels ask of the workspace meanwhile (the Readouts' "open the
 //! Graph", say) is done when it comes back, and `visible` / `present` answer from what was
-//! visible / present when it left. Panels floated in a window are not part of
-//! [`Workspace::to_node`] (the profile's `layout = …`): [`Workspace::saved_hidden`] writes each as auto-hidden on the edge nearest its
-//! window (`hidden = …`), so it comes back on that strip (recorded for review: a float is a
-//! moment's arrangement; detached windows are kept by D3's `window = …` lines).
+//! visible / present when it left.
 //! - **Saved fractions hold in a narrow window**: `egui_dock` clamps each split's fraction every
 //!   frame to leave `separator.extra` either side; a fraction it only clamped — any split but the
 //!   one whose separator the pointer was pressed on — is put back after the frame
@@ -73,15 +74,12 @@ const ICON_GAP: f32 = ICON + 6.0;
 const DOT_GAP: f32 = 12.0;
 const COUNT_GAP: f32 = 18.0;
 /// A tab bar's height.
-const TAB_BAR: f32 = 28.0;
-/// A floated panel's first size.
-const FLOAT_SIZE: egui::Vec2 = vec2(380.0, 480.0);
+pub(super) const TAB_BAR: f32 = 28.0;
 
 /// A change the panels asked for while a tree was lent out (done when it is back).
 pub(super) enum Change {
     Show(DockTab),
     Close(DockTab),
-    Float(DockTab),
     Set(Node),
     Pin(DockTab, bool),
     SetHidden(Vec<Hidden>),
@@ -95,6 +93,12 @@ pub(super) enum Change {
     CloseWindows,
     OpenWindow(Node, Option<super::detached::WinRect>, bool),
     SetWindows(Vec<super::detached::SavedWindow>),
+    /// A tab dragged onto another window's drop target (spec D-15, `super::drag`): the panel, the
+    /// window (`None`: the main one), the target, and the panels it shared its main-tree leaf
+    /// with when the drag began (`None`: it came from a detached window).
+    DropTab(DockTab, Option<u32>, super::drag::Target, Option<Vec<DockTab>>),
+    /// A tab dragged out of every window: into a new detached window at that rect (spec D-15).
+    TearOut(DockTab, super::detached::WinRect, Option<Vec<DockTab>>),
 }
 
 /// The workspace: the dock tree, the auto-hidden panels and their flyout, the detached windows,
@@ -113,6 +117,8 @@ pub struct Workspace {
     pub(super) pending: Vec<Change>,
     /// The detached windows (spec D-12, `super::detached`).
     pub(super) det: super::detached::Windows,
+    /// A tab dragged between windows and where the windows are (spec D-15, `super::drag`).
+    pub(super) xd: super::drag::Drags,
 }
 
 impl Default for Workspace {
@@ -124,21 +130,20 @@ impl Default for Workspace {
 
 impl Workspace {
     fn from_node(n: &Node) -> Workspace {
-        let mut w = Workspace { dock: build(n), hidden: Vec::new(), fly: Flyout::default(), drag: None, lent: None, pending: Vec::new(), det: Default::default() };
+        let mut w = Workspace { dock: build(n), hidden: Vec::new(), fly: Flyout::default(), drag: None, lent: None, pending: Vec::new(), det: Default::default(), xd: Default::default() };
         w.normalize();
         w
     }
 
-    /// The main tree as a layout (the profile's `layout = …`), cleaned; panels floating in a window
-    /// are left out.
+    /// The main tree as a layout (the profile's `layout = …`), cleaned.
     pub fn to_node(&self) -> Node {
         let main = self.dock.main_surface();
         node_of(main, NodeIndex::root()).and_then(layout::clean).filter(layout::has_view).unwrap_or_else(layout::default_layout)
     }
 
-    /// Replaces the arrangement with `n` (a tree without the 3D view gives the default); panels
-    /// floating in a window and the auto-hidden ones go ([`Workspace::set_hidden`] adds those), and
-    /// the panels `n` holds leave their detached windows (an emptied one closes).
+    /// Replaces the arrangement with `n` (a tree without the 3D view gives the default); the
+    /// auto-hidden panels go ([`Workspace::set_hidden`] adds those), and the panels `n` holds
+    /// leave their detached windows (an emptied one closes).
     pub fn set_node(&mut self, n: Node) {
         if self.lent.is_some() {
             self.pending.push(Change::Set(n));
@@ -176,25 +181,6 @@ impl Workspace {
         }
     }
 
-    /// The auto-hidden panels as the profile saves them: [`Workspace::hidden`], then each panel
-    /// floating in a window as hidden on the 3D view's edge nearest its window, at its width (its
-    /// height on the bottom edge).
-    pub fn saved_hidden(&self) -> Vec<Hidden> {
-        let mut out = self.hidden.clone();
-        for (path, leaf) in self.dock.iter_leaves() {
-            if path.surface.is_main() {
-                continue;
-            }
-            let (edge, size) = self.fold(leaf.rect);
-            for tile in &leaf.tabs {
-                if let Tile::Panel(t) = *tile {
-                    out.push(Hidden { tab: t, edge, size: size.clamp(layout::HIDDEN_MIN, layout::HIDDEN_MAX) });
-                }
-            }
-        }
-        out
-    }
-
     /// The panel whose flyout is out.
     pub fn flyout(&self) -> Option<DockTab> {
         self.fly.open
@@ -204,8 +190,8 @@ impl Workspace {
         self.hidden.iter().any(|h| h.tab == t)
     }
 
-    /// Pins or unpins `t` (spec D-10). Unpinning a panel in the tree (or a floating window) takes
-    /// it out onto the strip of the 3D view's edge its leaf lay beyond, remembering the leaf's
+    /// Pins or unpins `t` (spec D-10). Unpinning a panel in the tree takes it out onto the strip
+    /// of the 3D view's edge its leaf lay beyond, remembering the leaf's
     /// width (height, on the bottom edge) — before the tree is drawn, the side of the view it sits
     /// on in the tree at [`autohide::DEFAULT_SIZE`]; a closed panel, or one in a detached window
     /// (whose window closes when it was its last), goes to the main window's right edge. Pinning a hidden
@@ -289,8 +275,8 @@ impl Workspace {
         main.set_focused_node(new);
     }
 
-    /// Whether `t` is on screen: in the tree (a floating window, a detached window) and the
-    /// active tab of its leaf, or out in the flyout.
+    /// Whether `t` is on screen: in the tree (or a detached window's) and the active tab of its
+    /// leaf, or out in the flyout.
     pub fn visible(&self, t: DockTab) -> bool {
         if self.fly.open == Some(t) {
             return true;
@@ -304,8 +290,8 @@ impl Workspace {
             || self.visible_in_window(t)
     }
 
-    /// Whether `t` is in the workspace at all — a tab in the tree, a floating or a detached window
-    /// (shown or behind another tab), or auto-hidden — rather than closed: the Window menu's check.
+    /// Whether `t` is in the workspace at all — a tab in the tree or a detached window (shown or
+    /// behind another tab), or auto-hidden — rather than closed: the Window menu's check.
     pub fn present(&self, t: DockTab) -> bool {
         if let Some((_, present)) = &self.lent {
             return present.contains(&t);
@@ -372,17 +358,10 @@ impl Workspace {
         }
     }
 
-    /// Floats `t` in a window over the workspace, near where it was (a no-op when it already
-    /// floats, or is closed): the tab's context menu.
-    pub fn float_panel(&mut self, t: DockTab) {
-        if self.lent.is_some() {
-            self.pending.push(Change::Float(t));
-            return;
-        }
-        let Some(p) = self.dock.find_tab(&Tile::Panel(t)).filter(|p| p.surface.is_main()) else { return };
-        // a leaf not drawn yet has no rect
-        let at = self.dock.leaf(p.node_path()).ok().map(|l| l.rect.min).filter(|m| m.is_finite()).map_or(pos2(80.0, 80.0), |m| m + vec2(24.0, 32.0));
-        self.dock.detach_tab(p, Rect::from_min_size(at, FLOAT_SIZE));
+    /// Test hook: how many in-app floating windows the tree has (spec D-5: never any).
+    #[cfg(test)]
+    pub fn floats_for_test(&self) -> usize {
+        self.dock.iter_surfaces().count() - 1 + self.det.list.iter().map(|w| w.dock.iter_surfaces().count() - 1).sum::<usize>()
     }
 
     /// Test hook: what `egui_dock` does when a dragged tab is dropped on the middle of the 3D
@@ -408,7 +387,7 @@ impl Workspace {
     /// alone in its leaf, whose tab bar is hidden; every other leaf shows its tab bar. A panel found
     /// in the 3D view's leaf (a drop `egui_dock` could not refuse) goes to a new split right of the
     /// view, still active if it was. True when it moved something (the pass is redrawn).
-    fn normalize(&mut self) -> bool {
+    pub(super) fn normalize(&mut self) -> bool {
         let Some(p) = self.dock.find_tab(&Tile::View3d).filter(|p| p.surface.is_main()) else {
             // cannot happen (the view is neither closable nor floatable); never leave it missing
             self.dock = build(&layout::default_layout());
@@ -468,7 +447,6 @@ impl Workspace {
             match c {
                 Change::Show(t) => self.show_panel(t),
                 Change::Close(t) => self.close_panel(t),
-                Change::Float(t) => self.float_panel(t),
                 Change::Set(n) => self.set_node(n),
                 Change::Pin(t, pinned) => self.pin(t, pinned),
                 Change::SetHidden(h) => self.set_hidden(h),
@@ -482,6 +460,8 @@ impl Workspace {
                     self.open_window(tree, rect, fill);
                 }
                 Change::SetWindows(list) => self.set_windows(list),
+                Change::DropTab(t, to, at, mates) => self.drop_tab(t, to, at, mates),
+                Change::TearOut(t, rect, mates) => self.tear_out(t, rect, mates),
             }
         }
     }
@@ -607,8 +587,8 @@ struct Tiles<'a, 'i> {
     input: &'a PanelInput<'i>,
     acts: &'a mut Vec<Action>,
     asked: Vec<Change>,
-    /// The layer each tab drawn this frame was drawn on (its leaf's: the main area's, or a
-    /// floating window's), where its leaf's pin and close icons are painted.
+    /// The layer each tab drawn this frame was drawn on (its leaf's), where its leaf's pin and
+    /// close icons are painted.
     layers: HashMap<Tile, LayerId>,
     /// The leaves whose pin (`egui_dock`'s add button) was clicked: their active tabs unpin.
     pins: Vec<NodePath>,
@@ -617,6 +597,12 @@ struct Tiles<'a, 'i> {
     window: Option<u32>,
     windows: Vec<u32>,
     window_tabs: usize,
+    /// Each tab button drawn this frame and its rect (a drop onto another window's tab bar inserts
+    /// before the tab under the pointer, spec D-15), and the tab being dragged (`egui_dock` draws
+    /// a dragged tab's button as its own widget, `id.with("dragged")`, over the tab's original
+    /// rect: its response is how a drag is latched without the library's private state).
+    bars: Vec<(Tile, Rect)>,
+    dragged: Option<Tile>,
 }
 
 /// A panel's tab title: its name, with room before it for the icon and, on a tab that can carry
@@ -664,6 +650,10 @@ impl TabViewer for Tiles<'_, '_> {
         // the part that can be clicked (a tab scrolled past its bar's end is clipped)
         crate::ui::probe_rect(&format!("dock-tab-{t:?}"), r.interact_rect);
         self.layers.insert(*tab, r.layer_id);
+        self.bars.push((*tab, r.rect));
+        if r.ctx.dragged_id().is_some_and(|d| d.with("dragged") == r.id) {
+            self.dragged = Some(*tab);
+        }
         let p = r.ctx.layer_painter(r.layer_id).with_clip_rect(r.interact_rect);
         let ink = if self.st.tab_shown(t) || r.hovered() { theme::INK } else { theme::INK_DIM };
         let icon = Rect::from_center_size(pos2(r.rect.left() + PAD + ICON / 2.0, r.rect.center().y), egui::Vec2::splat(ICON));
@@ -679,10 +669,9 @@ impl TabViewer for Tiles<'_, '_> {
         }
         if r.hovered() {
             let tip = dock::peek(self.st, self.input, t);
-            let _ = r.clone().on_hover_text(format!("{tip}\n(drag the tab to another tab bar, to an edge to split, or out to float it; right-click for more)"));
+            let _ = r.clone().on_hover_text(format!("{tip}\n(drag the tab to another tab bar, to an edge to split, onto another window, or out of the window into a new one; right-click for more)"));
         }
-        // float (main window only), the detached windows (spec D-12: tabs cross OS windows by
-        // this menu, never by dragging), close, reset
+        // the detached windows (spec D-12; dragging the tab does it too, spec D-15), close, reset
         r.context_menu(|ui| {
             let ask = |ui: &mut Ui, label: &str, probe: &str, tip: &str, c: Change, asked: &mut Vec<Change>| {
                 if crate::ui::probed(probe, ui.button(label)).on_hover_text(tip).clicked() {
@@ -692,7 +681,6 @@ impl TabViewer for Tiles<'_, '_> {
             };
             match self.window {
                 None => {
-                    ask(ui, "Float in a window", "tab-menu-float", "a window inside the app, over the workspace", Change::Float(t), &mut self.asked);
                     ask(ui, "Move to new window", "tab-menu-new-window", "its own OS window: move it to another monitor", Change::PopOut(vec![t], t), &mut self.asked);
                 }
                 Some(_) => {
@@ -727,9 +715,11 @@ impl TabViewer for Tiles<'_, '_> {
         *tab != Tile::View3d
     }
 
-    /// Floating inside the main window only (a detached window's tabs stay in its tree).
-    fn allowed_in_windows(&self, tab: &mut Tile) -> bool {
-        *tab != Tile::View3d && self.window.is_none()
+    /// Nothing floats inside a window (spec D-5, user decision 2026-11-12): a tab dragged out of
+    /// its window detaches into a new OS window instead (spec D-15, `super::drag`), and with this
+    /// false `egui_dock` leaves a release outside every leaf (or on no drop button) alone.
+    fn allowed_in_windows(&self, _tab: &mut Tile) -> bool {
+        false
     }
 
     fn clear_background(&self, tab: &Tile) -> bool {
@@ -808,9 +798,9 @@ const CLOSE_ICON: f32 = 13.0;
 
 /// Each shown tab bar's end (spec D-4: pin, pop out, close): paints the duotone Pin icon in
 /// `egui_dock`'s add button (its plus left transparent, `style`) and draws our pop-out and close
-/// buttons in the bar's right margin, on the layer its leaf was drawn on (the main area's or a
-/// floating window's: they are real widgets there, over the bar). In a detached window (`window`)
-/// there is no pin and the pop-out button is Dock back (its panels to the main window). Returns
+/// buttons in the bar's right margin, on the layer its leaf was drawn on (they are real widgets
+/// there, over the bar). In a detached window (`window`) there is no pin and the pop-out button
+/// is Dock back (its panels to the main window). Returns
 /// what was clicked: the leaf popped out (all its panels, its shown one shown), docked back, or
 /// closed.
 fn leaf_buttons(ctx: &egui::Context, dock: &DockState<Tile>, layers: &HashMap<Tile, LayerId>, bar: f32, window: Option<u32>) -> Vec<Change> {
@@ -941,10 +931,12 @@ pub(super) fn paint_status(p: &Painter, at: Pos2, (c, count): (Color32, Option<S
 /// Draws the workspace into what the top bar and the toolbar leave of `root`, then the auto-hide
 /// strips and flyout round the 3D view's tile (`autohide::show`); returns the 3D view the strips
 /// leave, which is then all the root `Ui` has left (so egui counts the pointer over it as not over
-/// egui).
+/// egui). A tab dragged between windows (spec D-15) is followed, dropped or torn out here, and
+/// another window's drag over this one draws its drop targets (`super::drag`).
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Rect {
     let area = root.available_rect_before_wrap();
     let style = style(root.style());
+    let overlay = style.overlay.clone();
     let mut dock = st.workspace.lend();
     let before = fractions(&dock);
     // the separator being dragged, if any: latched at its press, kept through the release frame
@@ -957,8 +949,8 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         (None, latched) => latched.and_then(|(_, split)| split),
     };
     let windows = st.workspace.windows();
-    let asked = {
-        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: None, windows, window_tabs: 0 };
+    let (mut asked, bars, dragged_tab) = {
+        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: None, windows, window_tabs: 0, bars: Vec::new(), dragged: None };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt("workspace"));
         DockArea::new(&mut dock)
             .id(Id::new("workspace"))
@@ -968,7 +960,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             .show_add_buttons(true) // the leaf's pin (`on_add`)
             .show_leaf_collapse_buttons(false)
             .hidable_tab_bars(true) // only the 3D view's leaf hides its bar (`normalize`)
-            .tab_context_menus(false) // our own (`on_tab_button`): float, the windows, close, reset
+            .tab_context_menus(false) // our own (`on_tab_button`): the windows, close, reset
             .show_inside(&mut ui, &mut tiles);
         let buttons = leaf_buttons(root.ctx(), &dock, &tiles.layers, TAB_BAR, None);
         keep_fractions(&mut dock, &before, dragged);
@@ -979,8 +971,9 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
                 asked.push(Change::Pin(*t, false));
             }
         }
-        asked
+        (asked, tiles.bars, tiles.dragged)
     };
+    asked.extend(st.workspace.drag_frame(root.ctx(), None, &dock, &bars, dragged_tab, &overlay));
     st.workspace.drag = origin.map(|o| (o, dragged));
     if st.workspace.give_back(dock, asked) {
         root.ctx().request_discard("a panel dropped into the 3D view's leaf went beside it");
@@ -993,16 +986,18 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
 
 /// Draws detached window `id`'s tree (spec D-12) into all of `root` (the window's own egui
 /// context, the same frame as the main window's): its panels with the same `UiState` and
-/// `PanelInput`, their actions into `acts`; no 3D view, no strips, no floating; its tab bars end
-/// with Dock back and Close. False when there is no such window.
+/// `PanelInput`, their actions into `acts`; no 3D view, no strips; its tab bars end with Dock back
+/// and Close. Tabs dragged out of it or over it are handled as in the main window ([`show`]).
+/// False when there is no such window.
 pub fn show_window(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, id: u32) -> bool {
     let tabs = st.workspace.window_panels(id).len();
     let windows = st.workspace.windows();
     let Some(mut dock) = st.workspace.lend_window(id) else { return false };
     let area = root.available_rect_before_wrap();
     let style = style(root.style());
-    let asked = {
-        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: Some(id), windows, window_tabs: tabs };
+    let overlay = style.overlay.clone();
+    let (mut asked, bars, dragged) = {
+        let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: Some(id), windows, window_tabs: tabs, bars: Vec::new(), dragged: None };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt(("detached", id)));
         DockArea::new(&mut dock)
             .id(Id::new(("detached-workspace", id)))
@@ -1016,8 +1011,9 @@ pub fn show_window(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts
         let buttons = leaf_buttons(root.ctx(), &dock, &tiles.layers, TAB_BAR, Some(id));
         let mut asked = tiles.asked;
         asked.extend(buttons);
-        asked
+        (asked, tiles.bars, tiles.dragged)
     };
+    asked.extend(st.workspace.drag_frame(root.ctx(), Some(id), &dock, &bars, dragged, &overlay));
     st.workspace.give_back_window(id, dock, asked);
     true
 }

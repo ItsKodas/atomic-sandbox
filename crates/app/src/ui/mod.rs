@@ -51,6 +51,7 @@ pub use theme::apply as apply_theme;
 pub use workspace::presets::Preset as LayoutPreset;
 /// Detached windows (docking spec D-12): what the UI asks of the window side, and where a window is.
 pub use workspace::detached::{WinRect, WindowRequest};
+pub use workspace::drag::Place;
 
 use crate::scene::Scene;
 use crate::sim::{Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
@@ -734,7 +735,7 @@ pub struct UiState {
     pub edit_group: Vec<usize>,
     // ---- the chrome's own view state (M6 redesign) ----
     /// The workspace (docking spec D-2, D-3): the 3D view and the panels as one tree of splits and
-    /// tabbed leaves, plus panels floated out of it. Starts as the D1 default
+    /// tabbed leaves, plus the auto-hidden panels and the detached windows. Starts as the D1 default
     /// (`workspace::layout::default_layout`); the profile keeps it (`layout = …`). Display state:
     /// not recorded.
     pub workspace: workspace::Workspace,
@@ -797,9 +798,9 @@ impl UiState {
     }
 
     /// Rearranges the workspace as the built-in layout `p` (Window ▸ Layouts, spec D-11): its tree
-    /// and its auto-hidden panels replace the current ones (floating windows, detached windows and
-    /// the flyout go); Two monitors also opens its detached window filling the second monitor
-    /// (spec D-12) — with one monitor it is One monitor and the status says so. The profile's
+    /// and its auto-hidden panels replace the current ones (detached windows and the flyout go);
+    /// Two monitors also opens its detached window filling the second monitor (spec D-12) — with
+    /// one monitor it is One monitor and the status says so. The profile's
     /// autosave then keeps it. Display state, never recorded. From a tab's menu (the tree lent
     /// out) every part of it — windows, tree, hidden panels, the new window — is done in order when
     /// the tree is back.
@@ -1315,6 +1316,19 @@ pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
         return Err("no panel named".into());
     }
     Ok(tabs)
+}
+
+/// Whether the chrome takes a press at `p` (points) — docking spec D-16, user report 2026-11-12:
+/// pressing a panel's resize grip just outside its drawn edge also orbited the camera. egui-winit's
+/// `consumed` for a press is the last frame's `wants_pointer_input`, which looks at the layer
+/// under the pointer and the root's remaining rect (the 3D view's tile: `workspace::tree::show`
+/// leaves the root exactly that), not at widgets: a separator's or a grip's grab band reaching
+/// into the tile, and egui's hit test, which takes a widget within `interact_radius` of the
+/// pointer, were the UI's and the 3D view's at once. This asks what egui's hit test asks: any
+/// widget that can take a click or a drag (the last pass's) within `interact_radius` of `p`.
+pub fn takes_press(ctx: &egui::Context, p: egui::Pos2) -> bool {
+    let radius = ctx.global_style().interaction.interact_radius;
+    ctx.interactive_rects_last_pass().iter().any(|r| r.expand(radius).contains(p))
 }
 
 /// The workspace's requests for the window side, and its notes as the status line.

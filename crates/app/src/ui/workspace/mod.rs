@@ -9,9 +9,12 @@
 //! - `presets`: the four built-in layouts of Window ▸ Layouts (spec D-11, D2);
 //! - `detached`: panels in their own OS windows — the trees, moving panels between windows,
 //!   docking back, the requests to the window side (`crate::detached`) and the profile's
-//!   `window = …` lines (spec D-12, D3).
+//!   `window = …` lines (spec D-12, D3);
+//! - `drag`: a tab dragged onto another window or out of every window (spec D-15; nothing floats
+//!   inside a window, spec D-5).
 pub mod autohide;
 pub mod detached;
+pub mod drag;
 pub mod layout;
 pub mod presets;
 pub mod tree;

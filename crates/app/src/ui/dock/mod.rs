@@ -2,8 +2,8 @@
 //! (`body`: its title row, then its own scroll area round the per-panel `show`), its icon, its
 //! status (`status`: drift and box health on Readouts, work running on Activity, trust on Model,
 //! the unread error / refusal count on Log — the old icon strip's dots, spec D-4) and the key
-//! numbers its tab peeks on hover (`peek`). Where a panel sits — which leaf, which split, floating
-//! — is the workspace tree's (`super::workspace::tree`), which draws the tabs and frames these
+//! numbers its tab peeks on hover (`peek`). Where a panel sits — which leaf, which split, which
+//! window — is the workspace tree's (`super::workspace::tree`), which draws the tabs and frames these
 //! bodies. All of it is display state: none of it is an `Action`, so nothing here is recorded.
 mod compare;
 mod graph;

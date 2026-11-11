@@ -102,8 +102,8 @@ another monitor, with saved layouts and one consistent icon set.
   surface, egui `Context`, egui-winit `State` and egui-wgpu renderer, holding its own `egui_dock`
   tree. It is drawn each time the main window draws; its panels read the same `UiState` and
   `PanelInput`, and their `Action`s are appended to the main frame's (so `--record` sees them).
-  Tabs move between OS windows by the tab menu ("Move to main window", "Move to window N"), not by
-  dragging across windows. Closing a detached window docks its panels back into the main tree
+  Tabs move between OS windows by the tab menu ("Move to main window", "Move to window N"), and by
+  dragging since D-15. Closing a detached window docks its panels back into the main tree
   (each to the leaf it left, else beside the 3D view on the right; a panel with no recorded leaf,
   e.g. from a window read from a profile, docks beside its default-layout leaf-mates). The
   window's rectangle — absolute desktop pixels, its outer position and inner size — whether it

@@ -4830,7 +4830,7 @@ fn the_workspace_shows_one_tab_per_leaf() {
     search::pick(&ctx, &mut st, search::results("bond angles", 1)[0]);
     assert!(st.tab_shown(View) && !st.tab_shown(Orbitals));
     // the chrome renders every arrangement without a command or an error: the default, every
-    // panel in one leaf, the 3D view between stacked leaves, a floated panel, every panel closed
+    // panel in one leaf, the 3D view between stacked leaves, every panel closed
     for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,Graph,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Graph*,Readouts]))")] {
         match text {
             Some(t) => st.workspace.set_node(layout::parse(t).unwrap()),
@@ -4840,11 +4840,6 @@ fn the_workspace_shows_one_tab_per_leaf() {
         for w in [1400.0, 1000.0] {
             assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{text:?} at {w}");
         }
-    }
-    st.workspace.float_panel(Graph);
-    assert!(st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph), "floating: shown, not in the main tree");
-    for w in [1400.0, 1000.0] {
-        assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "floated at {w}");
     }
     for t in DockTab::PANELS {
         st.workspace.close_panel(t);
@@ -5499,41 +5494,6 @@ fn the_profile_keeps_the_hidden_panels() {
     assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Graph, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
 }
 
-/// Deferred finding (docking D1 review): a panel floated in a window is not in the profile's
-/// layout tree, so it was lost on restart. It is saved as auto-hidden on the 3D view's edge
-/// nearest its window, and comes back there, reachable.
-#[test]
-fn a_floated_panel_survives_the_profile() {
-    use super::workspace::layout::{self, Edge};
-    use DockTab::*;
-    let scene = Scene::preset("h2").unwrap();
-    let cam = camera();
-    let inp = input(&scene, None, &cam);
-    let ctx = egui::Context::default();
-    apply_theme(&ctx);
-    let mut st = UiState::new("h2", &scene);
-    for _ in 0..2 {
-        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
-    }
-    st.workspace.float_panel(Graph); // from the lower-right leaf: its window opens off the lower right
-    for _ in 0..2 {
-        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
-    }
-    assert!(st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph), "floating");
-    let text = profile::capture(&st);
-    let mut back = UiState::new("h2", &scene);
-    profile::apply(&mut back, &text);
-    let h = back.workspace.hidden();
-    // its window hangs off the view's lower right: the edge it lies farthest beyond
-    assert!(h.len() == 1 && h[0].tab == Graph && matches!(h[0].edge, Edge::Right | Edge::Bottom), "{text}");
-    assert!((layout::HIDDEN_MIN..=layout::HIDDEN_MAX).contains(&h[0].size));
-    back.open_tab(Graph);
-    assert!(back.tab_shown(Graph), "reachable");
-    // every panel is somewhere: in the tree or on a strip
-    let placed = layout::panels(&back.workspace.to_node()).len() + back.workspace.hidden().len();
-    assert_eq!(placed, DockTab::PANELS.len());
-}
-
 /// Deferred finding (docking D1 review): `egui_dock` clamps each split's fraction to leave 80 pt
 /// either side, which below ≈ 333 pt rewrote the default's 24 % (and the autosave kept it). At
 /// 300 pt wide the default's encoding is unchanged after a few frames — and a separator drag at
@@ -5861,8 +5821,8 @@ mod knowledge_map {
         assert_eq!(st.knowledge.pick, Pick::Element(6));
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("asked: #0") && t.contains("BOND ANGLES AT C"), "{t}");
-        // the pop-out window is gone (docking spec D-5): the panel in a wide leaf (or floated) lays
-        // the same map out in two columns, keeping the pick
+        // the pop-out window is gone (docking spec D-5): the panel in a wide leaf (or a detached
+        // window) lays the same map out in two columns, keeping the pick
         st.workspace.set_node(super::super::workspace::layout::parse("H(0.25,3D,[Knowledge*])").unwrap());
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("BOND ANGLES AT C"), "the wide panel keeps the pick:\n{t}");
@@ -6596,5 +6556,265 @@ mod detached_windows {
         let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         assert_eq!(out.windows, vec![WindowRequest::Focus { id }]);
         assert!(st.tab_shown(DockTab::Activity) && st.workspace.window_of(DockTab::Activity) == Some(id), "shown in its window, not moved");
+    }
+
+    // ---- dragging tabs between windows (docking spec D-15, D-5; user decision 2026-11-12) ----
+
+    /// Window `win` (`None`: the main one) on the desktop: its client area at `(x, y)`, `w × h`
+    /// points at `ppp` pixels per point, its native frame round it (8 px borders, a 31 px title
+    /// bar; the main window's custom frame has none).
+    fn place(win: Option<u32>, x: i32, y: i32, w: f32, h: f32, ppp: f32) -> Place {
+        let inner = WinRect { x, y, w: (w * ppp) as u32, h: (h * ppp) as u32 };
+        let outer = match win {
+            None => inner,
+            Some(_) => WinRect { x: x - 8, y: y - 31, w: inner.w + 16, h: inner.h + 39 },
+        };
+        Place { win, inner, outer }
+    }
+
+    /// [`window_frame`] at `ppp` pixels per point (its 600 × 800 points then `600 ppp × 800 ppp`
+    /// pixels: a window on a monitor of another scale).
+    fn window_frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, id: u32, ppp: f32, events: Vec<egui::Event>) -> PanelOutput {
+        let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 800.0))), events, ..Default::default() };
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let mut out = None;
+        let mut full = ctx.run_ui(raw, |root| out = Some(show_window(root, st, inp, id)));
+        full.textures_delta.clear();
+        out.unwrap()
+    }
+
+    /// Drags tab `t` in one window (`src` draws that window's frame with the events given) and
+    /// releases it at the end of `path` (the source window's points, past its edges too: a held
+    /// button's pointer goes on being reported to the window it was pressed in), `esc` pressed
+    /// on the way when asked. The other windows (`others`) draw after each of the source's frames,
+    /// as every window draws in each of the main window's frames. Returns every frame's output
+    /// and the drop target the others drew just before the release (`None`: none).
+    #[allow(clippy::type_complexity)]
+    fn drag_tab(st: &mut UiState, t: DockTab, path: &[egui::Pos2], esc: bool, src: &mut dyn FnMut(&mut UiState, Vec<egui::Event>) -> PanelOutput, others: &mut dyn FnMut(&mut UiState) -> Vec<PanelOutput>) -> (Vec<PanelOutput>, Option<egui::Rect>) {
+        for _ in 0..3 {
+            src(st, vec![]);
+            others(st);
+        }
+        let c = probed_rect(&format!("dock-tab-{t:?}")).center();
+        let mut outs = vec![src(st, vec![egui::Event::PointerMoved(c), pointer(c, true)])];
+        outs.extend(others(st));
+        // decidedly dragging (egui), then past egui_dock's 30-pt threshold, then the path
+        let mut steps = vec![c + egui::vec2(12.0, 0.0), c + egui::vec2(50.0, 0.0)];
+        steps.extend_from_slice(path);
+        let end = *steps.last().unwrap();
+        for (i, &p) in steps.iter().enumerate() {
+            let mut ev = vec![egui::Event::PointerMoved(p)];
+            if esc && i == 2 {
+                ev.push(key(egui::Key::Escape, egui::Modifiers::NONE));
+            }
+            outs.push(src(st, ev));
+            if i == 1 {
+                assert_eq!(st.workspace.dragging(), Some(t), "the drag is latched from its tab button");
+            }
+            outs.extend(others(st));
+        }
+        PROBES.with(|m| m.borrow_mut().remove("drop-target"));
+        // held still a moment at the end (egui_dock keeps its first target for 0.3 s; a frame is
+        // 1/60 s headless)
+        for _ in 0..24 {
+            outs.push(src(st, vec![egui::Event::PointerMoved(end)]));
+            outs.extend(others(st));
+        }
+        let drawn = PROBES.with(|m| m.borrow().get("drop-target").copied());
+        outs.push(src(st, vec![pointer(end, false)]));
+        outs.extend(others(st));
+        outs.push(src(st, vec![egui::Event::PointerGone]));
+        outs.extend(others(st));
+        assert_eq!(st.workspace.dragging(), None, "the drag is over");
+        (outs, drawn)
+    }
+
+    fn opened(outs: &[PanelOutput]) -> Vec<(u32, Vec<DockTab>, Option<WinRect>)> {
+        requests(outs)
+            .into_iter()
+            .filter_map(|r| match r {
+                WindowRequest::Open { id, panels, rect, .. } => Some((id, panels, rect)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tab dragged out of the main window and released over none of the app's windows opens
+    /// one new window holding it (spec D-15): its top-left at the release point, the panel's leaf
+    /// size, kept inside the work area of the monitor under the cursor (here pushed up off the
+    /// taskbar). The tab leaves the main tree; nothing floats; none of it is an action. Esc on
+    /// the way cancels.
+    #[test]
+    fn a_tab_dragged_out_of_every_window_opens_one_at_the_release_point() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+        st.workspace.set_monitors(vec![PRIMARY, SECOND]);
+        st.workspace.set_work_areas(vec![WinRect { x: 0, y: 0, w: 2560, h: 1400 }, SECOND]);
+        st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let leaf = st.workspace.leaf_rect(DockTab::Graph).unwrap();
+        let (w, h) = (leaf.width().round() as u32, leaf.height().round() as u32);
+        let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(1700.0, 1300.0)], false, &mut main, &mut |_| vec![]);
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        assert_eq!(drawn, None, "no window under the cursor draws a target");
+        let id = st.workspace.window_of(DockTab::Graph).expect("in a new window");
+        assert_eq!(opened(&outs), vec![(id, vec![DockTab::Graph], Some(WinRect { x: 1700, y: 1400 - h as i32, w, h }))]);
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
+        assert_eq!(st.workspace.floats_for_test(), 0);
+        // on the second monitor, beyond its right edge less the window's width: kept on it
+        let (outs, _) = drag_tab(&mut st, DockTab::Orbitals, &[egui::pos2(4400.0, 50.0)], false, &mut main, &mut |_| vec![]);
+        let r = opened(&outs)[0].2.unwrap();
+        assert!(r.x + r.w as i32 == 2560 + 1920 && r.y == 50, "{r:?}");
+        // Esc on the way: the release does nothing
+        let (outs, _) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1700.0, 500.0)], true, &mut main, &mut |_| vec![]);
+        assert!(opened(&outs).is_empty() && st.workspace.window_of(DockTab::Log).is_none());
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
+    }
+
+    /// A tab dragged from the main window over a detached window: that window draws the drop
+    /// targets at the cursor, and the release on its leaf's centre tabs the panel in, on an edge
+    /// button splits, on its tab bar inserts before the tab under the pointer (spec D-15). The
+    /// detached window is at 2 pixels per point and the main one at 1 (mixed DPI: each converts
+    /// with its own).
+    #[test]
+    fn a_drag_over_a_detached_window_docks_the_tab_there() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, wctx) = (egui::Context::default(), egui::Context::default());
+        apply_theme(&ctx);
+        apply_theme(&wctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Model,Activity]))").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
+        st.workspace.take_requests();
+        st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 2.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        // a point of the detached window (its points) as the main window sees it (its points)
+        let at = |x: f32, y: f32| egui::pos2(1500.0 + 2.0 * x, 100.0 + 2.0 * y);
+        let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
+        let mut win = |st: &mut UiState| vec![window_frame_at(&wctx, st, &inp, id, 2.0, vec![])];
+        // its leaf's centre (the leaf fills its 600 × 800 points)
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Log, &[at(300.0, 400.0)], false, &mut main, &mut win);
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        assert!(drawn.is_some_and(|r| r.contains(egui::pos2(300.0, 400.0))), "the centre button is lit: {drawn:?}");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "[Activity,Log*]");
+        assert!(opened(&outs).is_empty() && st.workspace.windows() == vec![id]);
+        // the left edge button: a 100-pt button 10 pt left of the centre one
+        let (_, drawn) = drag_tab(&mut st, DockTab::Model, &[at(190.0, 400.0)], false, &mut main, &mut win);
+        assert!(drawn.is_some_and(|r| r.contains(egui::pos2(190.0, 400.0))), "{drawn:?}");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Activity,Log*])");
+        // its tab bar, on the Activity tab: Graph goes before it
+        for _ in 0..2 {
+            win(&mut st);
+        }
+        let tab = probed_rect("dock-tab-Activity").center();
+        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(tab.x, tab.y)], false, &mut main, &mut win);
+        assert!(drawn.is_some_and(|r| r.contains(tab)), "the tab is lit: {drawn:?}");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Graph*,Activity,Log])");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Orbitals*])");
+        assert_eq!(st.workspace.floats_for_test(), 0);
+        // over the window's title bar (its frame, not its client area): no target, nothing moves
+        let (_, drawn) = drag_tab(&mut st, DockTab::Orbitals, &[egui::pos2(1800.0, 80.0)], false, &mut main, &mut win);
+        assert_eq!(drawn, None);
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Orbitals*])");
+        assert!(st.workspace.windows() == vec![id]);
+    }
+
+    /// A tab dragged from a detached window into the main window: its 3D view's tile takes edge
+    /// splits only (spec D-3: the centre is refused, the tab stays), its left edge button splits
+    /// the panel in beside the view; the window, left empty, closes.
+    #[test]
+    fn a_drag_from_a_detached_window_docks_into_the_main_window_and_the_empty_window_closes() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, wctx) = (egui::Context::default(), egui::Context::default());
+        apply_theme(&ctx);
+        apply_theme(&wctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.take_requests();
+        st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        let view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
+        // a point of the main window (its points) as the detached one sees it
+        let at = |p: egui::Pos2| egui::pos2(p.x - 1500.0, p.y - 100.0);
+        let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
+        let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
+        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(view.center())], false, &mut win, &mut main);
+        assert_eq!(drawn, None, "the 3D view's tile has no centre target");
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph], "refused: it stays");
+        let left = view.center() - egui::vec2(110.0, 0.0);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(left)], false, &mut win, &mut main);
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        assert!(drawn.is_some_and(|r| r.contains(left)), "{drawn:?}");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.50,[Graph*],3D),[Log*])");
+        assert!(st.workspace.windows().is_empty());
+        assert!(requests(&outs).contains(&WindowRequest::Close { id }), "{:?}", requests(&outs));
+    }
+
+    /// Detached window → detached window: the tab moves, and the window it left, emptied,
+    /// closes.
+    #[test]
+    fn a_drag_between_detached_windows_moves_the_tab() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, actx, bctx) = (egui::Context::default(), egui::Context::default(), egui::Context::default());
+        for c in [&ctx, &actx, &bctx] {
+            apply_theme(c);
+        }
+        let mut st = UiState::new("h2", &scene);
+        let a = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        let b = st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
+        st.workspace.take_requests();
+        st.workspace.set_places(vec![place(Some(b), 2200, 100, 600.0, 800.0, 1.0), place(Some(a), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        let mut src = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&bctx, st, &inp, b, 1.0, ev);
+        let mut others = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![]), window_frame_at(&actx, st, &inp, a, 1.0, vec![])];
+        // window a's leaf centre, from window b's points
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1800.0 - 2200.0, 500.0 - 100.0)], false, &mut src, &mut others);
+        assert!(drawn.is_some());
+        assert_eq!(layout::encode(&st.workspace.window_node(a).unwrap()), "[Graph,Log*]");
+        assert_eq!(st.workspace.windows(), vec![a]);
+        assert!(requests(&outs).contains(&WindowRequest::Close { id: b }));
+    }
+
+    /// No drag-release inside a window floats a panel (spec D-5): released on a leaf's body off
+    /// its drop buttons, or on the 3D view's corner, nothing moves; on a leaf's centre button
+    /// `egui_dock`'s own drop still tabs it in. No window opens.
+    #[test]
+    fn no_drag_released_inside_a_window_floats_a_panel() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
+        st.workspace.set_node(layout::parse(tree).unwrap());
+        st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let (log, view) = (st.workspace.leaf_rect(DockTab::Log).unwrap(), frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap());
+        let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
+        for spot in [log.left_bottom() + egui::vec2(12.0, -12.0), view.left_top() + egui::vec2(20.0, 20.0)] {
+            let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[spot], false, &mut main, &mut |_| vec![]);
+            assert!(opened(&outs).is_empty(), "{spot:?}");
+            assert_eq!(layout::encode(&st.workspace.to_node()), layout::encode(&layout::parse(tree).unwrap()), "{spot:?}");
+            assert_eq!(st.workspace.floats_for_test(), 0, "{spot:?}");
+        }
+        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[log.center()], false, &mut main, &mut |_| vec![]);
+        assert!(opened(&outs).is_empty());
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Graph*]))");
+        assert_eq!(st.workspace.floats_for_test(), 0);
     }
 }

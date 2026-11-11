@@ -619,7 +619,7 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
 }
 
 /// Window (docking spec D-7): one row per panel — its icon and name, a check while it is in the
-/// workspace (shown, behind another tab, floating or auto-hidden; none when closed); a click shows
+/// workspace (shown, behind another tab, in a detached window or auto-hidden; none when closed); a click shows
 /// it where it is (a closed one comes back beside the 3D view) — then Layouts ▸ (the four built-in
 /// layouts, spec D-11: `workspace::presets`) and Reset layout (One monitor; Two monitors when a
 /// second monitor is connected). A panel in a detached window is brought to the front there (spec

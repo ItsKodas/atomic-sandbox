@@ -10,7 +10,8 @@
 //!   (1, 2, … — "window N" in the tab menus). A leaf's pop-out button, or a tab's "Move to new
 //!   window", moves the panel(s) into a new one ([`Workspace::pop_out`]); "Move to main window"
 //!   and "Move to window N" move one tab between windows ([`Workspace::move_to_main`],
-//!   [`Workspace::move_to_window`]) — tabs never cross windows by dragging (spec D-12).
+//!   [`Workspace::move_to_window`]), and so does dragging it onto another window or out of every
+//!   window (spec D-15, user request 2026-11-12: `super::drag`).
 //! - **Docking back** ([`Workspace::window_closed`], "Move to main window"): each panel goes to the
 //!   leaf it left — the main-tree leaf holding any of the panels it shared its leaf with when it
 //!   left ([`Windows::origins`]; a panel with no recorded origin, e.g. one from a window read from
@@ -23,7 +24,8 @@
 //!   e.g. headless); a window saved maximised reopens maximised on the monitor holding its centre.
 //!   A window read back that is usable on no connected monitor ([`WinRect::usable_on`]: too little
 //!   of its title-bar strip on any one; [`Workspace::set_monitors`], injected by the window side
-//!   from `available_monitors`) docks back instead of opening, with a status note.
+//!   from `available_monitors`) docks back instead of opening, with a status note. The monitors'
+//!   work areas ([`Workspace::set_work_areas`]) keep a tab torn out of every window on its monitor.
 //! - **Requests** ([`Workspace::take_requests`]): each window not yet asked for is opened
 //!   (`Open`), closing one asks `Close`, and showing a panel that lives in one (the Window menu,
 //!   Ctrl K's reveal: `UiState::open_tab`) asks `Focus`.
@@ -102,10 +104,11 @@ pub(super) struct Windows {
     last: u32,
     requests: Vec<WindowRequest>,
     /// The connected monitors, the main window's first (`None`: not known — headless, or the OS
-    /// listed none).
+    /// listed none), and their work areas (the monitor less the taskbar), in the same order.
     monitors: Option<Vec<WinRect>>,
+    work: Vec<WinRect>,
     /// The panels each detached panel shared its main-tree leaf with when it left.
-    origins: HashMap<DockTab, Vec<DockTab>>,
+    pub(super) origins: HashMap<DockTab, Vec<DockTab>>,
     /// Status lines for the user (a window docked back for want of a monitor).
     notes: Vec<String>,
 }
@@ -214,6 +217,21 @@ impl Workspace {
         self.det.monitors = (!monitors.is_empty()).then_some(monitors);
     }
 
+    /// The monitors' work areas (physical pixels), in [`Workspace::set_monitors`]' order: a tab
+    /// dragged out of every window opens its window inside the work area under the cursor.
+    pub fn set_work_areas(&mut self, work: Vec<WinRect>) {
+        self.det.work = work;
+    }
+
+    /// The work area of the monitor holding desktop point `(x, y)` (its whole rect when the work
+    /// areas are not known; `None` when no monitor is, or none holds it).
+    pub(super) fn work_area_at(&self, x: i32, y: i32) -> Option<WinRect> {
+        let m = self.det.monitors.as_ref()?;
+        let at = |r: &WinRect| (r.x as i64..r.x as i64 + r.w as i64).contains(&(x as i64)) && (r.y as i64..r.y as i64 + r.h as i64).contains(&(y as i64));
+        let i = m.iter().position(at)?;
+        Some(if self.det.work.len() == m.len() { self.det.work[i] } else { m[i] })
+    }
+
     /// The number of connected monitors (one while unknown).
     pub fn monitor_count(&self) -> usize {
         self.det.monitors.as_ref().map_or(1, |m| m.len().max(1))
@@ -271,8 +289,8 @@ impl Workspace {
         std::mem::take(&mut self.det.notes)
     }
 
-    /// Moves `tabs` (where they are: the main tree, a floating window, another detached window or
-    /// a strip) into a new detached window, one leaf with `active` shown; returns its id (`None`
+    /// Moves `tabs` (where they are: the main tree, another detached window or a strip) into a
+    /// new detached window, one leaf with `active` shown; returns its id (`None`
     /// while the tree is lent out — done when it is back — or when none of them is anywhere).
     pub fn pop_out(&mut self, tabs: &[DockTab], active: DockTab) -> Option<u32> {
         if self.lent.is_some() {
@@ -404,7 +422,7 @@ impl Workspace {
         keep(layout::clean(n)?, &|t| self.present(t))
     }
 
-    fn new_window(&mut self, tree: Node, rect: Option<WinRect>, max: bool, size: Option<[f32; 2]>, fill: bool) -> u32 {
+    pub(super) fn new_window(&mut self, tree: Node, rect: Option<WinRect>, max: bool, size: Option<[f32; 2]>, fill: bool) -> u32 {
         self.det.last += 1;
         let id = self.det.last;
         self.det.list.push(Window { id, dock: build(&tree), rect, max, size, fill, asked: false });
@@ -412,14 +430,14 @@ impl Workspace {
     }
 
     /// The rect of the leaf `t` is drawn in (main tree or a detached window), as last drawn.
-    fn leaf_rect(&self, t: DockTab) -> Option<egui::Rect> {
+    pub(crate) fn leaf_rect(&self, t: DockTab) -> Option<egui::Rect> {
         let find = |d: &DockState<Tile>| d.find_tab(&Tile::Panel(t)).and_then(|p| d.leaf(p.node_path()).ok().map(|l| l.rect));
         find(&self.dock).or_else(|| self.det.list.iter().find_map(|w| find(&w.dock)))
     }
 
-    /// Takes `t` out of wherever it is (the main tree or a floating window — remembering the
-    /// panels it shared its leaf with —, a detached window, a strip). False when it was closed.
-    fn take_out(&mut self, t: DockTab) -> bool {
+    /// Takes `t` out of wherever it is (the main tree — remembering the panels it shared its leaf
+    /// with —, a detached window, a strip). False when it was closed.
+    pub(super) fn take_out(&mut self, t: DockTab) -> bool {
         if let Some(p) = self.dock.find_tab(&Tile::Panel(t)) {
             let mates = self.dock.leaf(p.node_path()).map(|l| panels_of(&l.tabs)).unwrap_or_default();
             self.det.origins.insert(t, mates.into_iter().filter(|&x| x != t).collect());

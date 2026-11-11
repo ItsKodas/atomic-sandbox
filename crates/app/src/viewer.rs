@@ -915,6 +915,15 @@ impl Viewer {
         }
     }
 
+    /// Whether the chrome takes a button press at the cursor now (docking spec D-16: a press the
+    /// UI takes — a widget, a separator or a grip, its grab margin just outside the drawn edge
+    /// included — never moves the camera or starts a tool; `ui::takes_press`). The window ORs it
+    /// into egui-winit's `consumed` for a press, which misses those margins.
+    pub fn ui_takes_press(&self) -> bool {
+        let ppp = self.egui_ctx.pixels_per_point();
+        ui::takes_press(&self.egui_ctx, egui::pos2(self.mouse.pos.0 / ppp, self.mouse.pos.1 / ppp))
+    }
+
     /// The window was resized to `w × h` physical pixels: until the next frame lays the chrome out,
     /// the viewport is estimated — across, it scales with the width (the workspace spans the
     /// window and its splits are fractions, `ui::workspace`); down, it keeps its margins (the top
@@ -3268,6 +3277,57 @@ nucleus 1 {a} {} {}
     /// marked handled (epaint asserts in debug builds that none is dropped unapplied).
     fn discard(mut full: egui::FullOutput) {
         full.textures_delta.clear();
+    }
+
+    /// Docking spec D-16 (user report 2026-11-12: resizing a panel near its edge also orbited the
+    /// camera): a press 3 pt into the 3D view beside the separator on its left — outside the
+    /// separator's drawn line and its 1.5-pt grab band, inside egui's `interact_radius` (5 pt) of
+    /// it, so egui's hit test gives it the press — is the UI's alone. egui-winit's own `consumed`
+    /// (the last frame's `wants_pointer_input`) misses it; with `ui_takes_press` the window's path
+    /// (cursor, `consumed`, press, a 60-px drag, release; a frame drawn after each, as the window
+    /// does) moves the separator and leaves the camera alone. In the middle of the view the same
+    /// drag still orbits.
+    #[test]
+    fn a_press_the_ui_takes_never_moves_the_camera() {
+        use crate::replay::{to_view, Button, Event};
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.mode = ui::ToolMode::Orbit; // a left drag on the view orbits
+        let run = |v: &mut Viewer, events: Vec<egui::Event>| discard(v.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), events, ..Default::default() }));
+        for _ in 0..3 {
+            run(&mut v, vec![]);
+        }
+        // one press as the window delivers it: (egui-winit's `consumed`, the window's)
+        let press = |v: &mut Viewer, at: (f32, f32)| -> (bool, bool) {
+            let cursor = |v: &mut Viewer, (x, y): (f32, f32)| {
+                run(v, vec![egui::Event::PointerMoved(egui::pos2(x, y))]);
+                let (vx, vy) = to_view((x, y), v.viewport);
+                v.input(&Event::Cursor { x: vx, y: vy }, false);
+            };
+            let button = |v: &mut Viewer, (x, y): (f32, f32), down: bool, consumed: bool| {
+                v.input(&Event::Button { which: Button::Left, down }, consumed);
+                run(v, vec![egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: down, modifiers: egui::Modifiers::NONE }]);
+            };
+            cursor(v, at);
+            let winit = v.egui_ctx.egui_wants_pointer_input();
+            let consumed = winit || v.ui_takes_press();
+            button(v, at, true, consumed);
+            for k in 1..=3 {
+                cursor(v, (at.0 + 20.0 * k as f32, at.1));
+            }
+            button(v, (at.0 + 60.0, at.1), false, false);
+            (winit, consumed)
+        };
+        let vp = v.viewport;
+        let (left, mid) = (vp.origin[0], vp.origin[1] + vp.size[1] / 2.0);
+        let cam = v.camera;
+        assert_eq!(press(&mut v, (left + 3.0, mid)), (false, true), "egui-winit misses the margin; the hit test does not");
+        assert_eq!(v.camera, cam, "the camera never moved");
+        assert!(v.viewport.origin[0] > left + 30.0, "the separator took the drag: {} → {}", left, v.viewport.origin[0]);
+        let vp = v.viewport;
+        let cam = v.camera;
+        assert_eq!(press(&mut v, (vp.origin[0] + vp.size[0] / 2.0, mid)), (false, false), "the middle of the view is the view's");
+        assert_ne!(v.camera, cam, "it orbits");
+        assert_eq!(v.viewport, vp, "and moves no separator");
     }
 
     /// The wheel over the 3D view: without a drag it zooms; during a Select-drag it leaves the

@@ -1,8 +1,7 @@
 //! Profiles (user request 2026-10-19): the viewer's own look and layout — the workspace's
 //! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
 //! and active tabs in `workspace::layout`'s grammar; `hidden = Graph:left:340, …`, the auto-hidden
-//! panels with their edge and size, spec D-10 — a panel floating in a window is saved there too,
-//! on the edge nearest its window: `Workspace::saved_hidden`; `window = 2552,-8,1920,1009 max
+//! panels with their edge and size, spec D-10; `window = 2552,-8,1920,1009 max
 //! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
 //! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
 //! `workspace::detached`), the view and density-look settings and which
@@ -66,7 +65,7 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
     out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
-    out += &format!("hidden = {}\n", layout::encode_hidden(&st.workspace.saved_hidden()));
+    out += &format!("hidden = {}\n", layout::encode_hidden(st.workspace.hidden()));
     for (rect, max, tree) in st.workspace.saved_windows() {
         out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
     }

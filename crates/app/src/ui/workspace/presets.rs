@@ -191,7 +191,7 @@ mod tests {
             w.set_hidden(hidden.clone());
             assert_eq!(w.to_node(), tree, "{p:?}");
             assert_eq!(w.hidden(), &hidden[..], "{p:?}");
-            let (text, htext) = (layout::encode(&w.to_node()), layout::encode_hidden(&w.saved_hidden()));
+            let (text, htext) = (layout::encode(&w.to_node()), layout::encode_hidden(w.hidden()));
             assert_eq!(layout::parse(&text), Some(tree.clone()), "{p:?}: {text}");
             assert_eq!(layout::parse_hidden(&htext), hidden, "{p:?}: {htext}");
         }

@@ -12,12 +12,14 @@
 //!   where the OS puts it, its leaf's size; the Two monitors layout's maximised on the second
 //!   monitor (placed inside it first, so Windows maximises it there: its work area, not full
 //!   screen). Where it is and whether it is maximised go back to the UI as it moves
-//!   (`Workspace::set_window_rect`), which the profile saves.
+//!   (`Workspace::set_window_rect`), which the profile saves. Every window's client area and
+//!   outer frame ([`place`]) go to the UI each frame, top-most first, for a tab dragged between
+//!   windows (spec D-15, `ui::workspace::drag`), and the monitors' work areas with the monitors.
 //! - **Frames:** its input is taken when the main window's is; a frame is drawn only while the
 //!   window has a size (minimised: skipped, its texture uploads still applied). Its present mode is
 //!   Mailbox when the GPU has it, so its vsync never holds the main window's frames (as the
 //!   pop-out's).
-use crate::ui::{theme, WinRect};
+use crate::ui::{theme, Place, WinRect};
 use gpu::{GpuContext, SurfaceState};
 use std::sync::Arc;
 use winit::event::WindowEvent;
@@ -192,17 +194,48 @@ impl DetachedWindow {
     }
 }
 
-/// The connected monitors' rects (physical pixels), the one holding `main` first (the UI's
-/// "second monitor" is then the next).
-pub fn monitors(el: &ActiveEventLoop, main: &Window) -> Vec<WinRect> {
+/// The connected monitors' rects and work areas (physical pixels; the work area is the monitor
+/// less the taskbar — the monitor itself where the OS cannot say), the one holding `main` first
+/// (the UI's "second monitor" is then the next).
+pub fn monitors(el: &ActiveEventLoop, main: &Window) -> Vec<(WinRect, WinRect)> {
     let rect = |m: &winit::monitor::MonitorHandle| {
         let (p, s) = (m.position(), m.size());
         WinRect { x: p.x, y: p.y, w: s.width, h: s.height }
     };
-    let mut list: Vec<WinRect> = el.available_monitors().map(|m| rect(&m)).filter(|r| r.w > 0 && r.h > 0).collect();
-    if let Some(at) = main.current_monitor().map(|m| rect(&m)).and_then(|r| list.iter().position(|x| *x == r)) {
+    let mut list: Vec<(WinRect, WinRect)> = el.available_monitors().map(|m| (rect(&m), work_area(&m).unwrap_or(rect(&m)))).filter(|(r, _)| r.w > 0 && r.h > 0).collect();
+    if let Some(at) = main.current_monitor().map(|m| rect(&m)).and_then(|r| list.iter().position(|x| x.0 == r)) {
         let m = list.remove(at);
         list.insert(0, m);
     }
     list
+}
+
+/// A monitor's work area (Win32 `GetMonitorInfoW`'s `rcWork`; winit has none).
+#[cfg(windows)]
+fn work_area(m: &winit::monitor::MonitorHandle) -> Option<WinRect> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    use winit::platform::windows::MonitorHandleExtWindows;
+    // SAFETY: a zeroed MONITORINFO with its size set is what GetMonitorInfoW fills; the handle is winit's live monitor
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let ok = unsafe { GetMonitorInfoW(m.hmonitor() as *mut core::ffi::c_void, &mut info) } != 0;
+    let r = info.rcWork;
+    (ok && r.right > r.left && r.bottom > r.top).then(|| WinRect { x: r.left, y: r.top, w: (r.right - r.left) as u32, h: (r.bottom - r.top) as u32 })
+}
+
+#[cfg(not(windows))]
+fn work_area(_: &winit::monitor::MonitorHandle) -> Option<WinRect> {
+    None
+}
+
+/// Where window `w` is on the desktop (spec D-15): its client area (inner position and size) and
+/// its outer frame, physical pixels; `None` while minimised or when the OS cannot say.
+pub fn place(win: Option<u32>, w: &Window) -> Option<Place> {
+    let (i, s) = (w.inner_position().ok()?, w.inner_size());
+    let (o, os) = (w.outer_position().ok()?, w.outer_size());
+    (s.width > 0 && s.height > 0 && w.is_minimized() != Some(true)).then_some(Place {
+        win,
+        inner: WinRect { x: i.x, y: i.y, w: s.width, h: s.height },
+        outer: WinRect { x: o.x, y: o.y, w: os.width, h: os.height },
+    })
 }
