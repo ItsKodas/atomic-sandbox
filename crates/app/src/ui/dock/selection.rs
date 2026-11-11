@@ -119,7 +119,11 @@ pub const TRAIN_SEGMENT_TIP: &str = "teach the shared model the selected atoms' 
 
 /// "Train this segment" (M8a Task 10; Dock ▸ Selection and the Model tab): `Action::TrainSegment`
 /// with [`segment_atoms`]; disabled, with the reason, with nothing selected or during a pass.
+/// Not drawn while the feature is deferred ([`crate::segment::SEGMENT_TRAINING`]).
 pub fn segment_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, anchor: &str, acts: &mut Vec<Action>) {
+    if !crate::segment::SEGMENT_TRAINING {
+        return;
+    }
     let atoms = segment_atoms(st, input);
     let sampling = input.snapshot.is_some_and(|s| crate::sim::sampling_active(&s.dynamics));
     super::group(ui, st, anchor, |ui, _| {

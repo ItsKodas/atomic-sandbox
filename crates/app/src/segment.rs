@@ -43,6 +43,21 @@ use crate::builder::chem;
 use crate::quality::VramBudget;
 use crate::scene::{Scene, SceneNucleus};
 
+/// Whether "Train this segment" is offered to the user: **off — deferred** (the user's decision,
+/// 2026-11-12). The capping gate (`validate/tests/capping.rs`, `references.md` "M8a capping
+/// gate") failed at **11.96×** against its 1.5× limit with the r_cut cut; the diagnosis (ruling P26
+/// in the M8a ledger): a force row F_i = −Σ_j ∂E_j/∂r_i is an exact equation of the source molecule
+/// only when everything within 2·r_cut of atom i is the source's, so a segment needs ≈ 14 Bohr of
+/// matching surroundings (2 × 6 Bohr + the Standard pass's ≈ 2 Bohr largest planned move) — butane
+/// has no interior atom in any proper segment, and a useful segment is a large cell. The corrected
+/// cut (2·r_cut + δ, the module doc) is implemented and unit-tested but **not validated by a gate**;
+/// a long-chain gate (decane or longer) is the follow-up. With this `false` the entry points are
+/// hidden — the Selection and Model tabs' buttons (`ui::dock::selection::segment_row`) and the Ctrl K
+/// entry (`ui::search::SEGMENT_ENTRY`) — while `Action::TrainSegment`, the preview card, the "back to
+/// the scene" chip, the masked-sample plumbing (`surrogate`, `providers`, `sim::Scene::train_mask`)
+/// and their tests stay compiled and tested.
+pub const SEGMENT_TRAINING: bool = false;
+
 /// The box margin around the segment's atoms on every side (Bohr; mockup (d), approved: "the
 /// segment plus 5 Bohr each side").
 pub const BOX_MARGIN: f64 = 5.0;

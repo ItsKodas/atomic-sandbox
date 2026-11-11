@@ -666,7 +666,12 @@ fn the_control_search_finds_controls_by_fuzzy_name() {
     assert_eq!(search::results("forget", 1)[0].name, "Forget model");
     assert_eq!(search::results("apply grid", 1)[0].name, "Apply grid");
     assert!(search::results("zzzzqq", 5).is_empty());
-    assert_eq!(search::results("", 1000).len(), search::ENTRIES.len());
+    assert_eq!(search::results("", 1000).len(), search::ENTRIES.len() + usize::from(crate::segment::SEGMENT_TRAINING));
+    // Train this segment is deferred: Ctrl K does not offer it while the const is off
+    assert_eq!(
+        search::results("train this segment", 1000).iter().any(|e| std::ptr::eq(*e, &search::SEGMENT_ENTRY)),
+        crate::segment::SEGMENT_TRAINING
+    );
     for e in search::ENTRIES {
         assert!(!e.anchor.is_empty() && !e.name.is_empty());
     }
@@ -5002,7 +5007,9 @@ mod knowledge_map {
 /// selection and opens the preview (the run untouched otherwise: no scene change); the card's Open
 /// saves the scene, switches to the estimated solver on the segment with the Standard plan ready and
 /// shows the "back to" chip, whose click brings the saved scene back on the solver it had. The
-/// Model tab has the same button; an empty selection disables it.
+/// Model tab has the same button; an empty selection disables it. While the feature is deferred
+/// (`segment::SEGMENT_TRAINING` off) neither tab draws the button, and the same flow is driven by
+/// the action itself — the preview card, Open and the chip are unchanged.
 #[test]
 fn the_train_segment_button_opens_the_segment_and_the_chip_goes_back() {
     let scene = crate::segment::alkane(10);
@@ -5016,9 +5023,19 @@ fn the_train_segment_button_opens_the_segment_and_the_chip_goes_back() {
     st.plan.perturbations = 3; // a custom plan: the segment opens with Standard instead
     st.open_tab(DockTab::Selection);
     let inp = PanelInput { selected: Some(0), ..input(&scene, None, &cam) };
-    let outs = click_widget(&ctx, &mut st, &inp, "train-segment");
-    let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
-    assert_eq!(acts, vec![&Action::TrainSegment(vec![0])]);
+    let outs = if crate::segment::SEGMENT_TRAINING {
+        let outs = click_widget(&ctx, &mut st, &inp, "train-segment");
+        let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+        assert_eq!(acts, vec![&Action::TrainSegment(vec![0])]);
+        outs
+    } else {
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("train-segment")), "deferred: no button in the Selection tab");
+        vec![act(&mut st, &inp, Action::TrainSegment(vec![0]))]
+    };
     assert!(outs.iter().all(|o| o.error.is_none() && o.switch_scene.is_none() && o.commands.is_empty()), "a preview changes nothing");
     let seg = st.segment_preview.clone().expect("the preview");
     assert!(seg.interior[0] && !seg.caps.is_empty());
@@ -5052,12 +5069,20 @@ fn the_train_segment_button_opens_the_segment_and_the_chip_goes_back() {
     let _ = std::fs::remove_file(&back.path);
     // the Model tab has it too; nothing selected: disabled (no action)
     st.open_tab(DockTab::Model);
-    let outs = click_widget(&ctx, &mut st, &inp, "train-segment-model");
-    assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), vec![&Action::TrainSegment(vec![0])]);
-    st.segment_preview = None;
-    let none = input(&scene, None, &cam);
-    let outs = click_widget(&ctx, &mut st, &none, "train-segment-model");
-    assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled without a selection");
+    if crate::segment::SEGMENT_TRAINING {
+        let outs = click_widget(&ctx, &mut st, &inp, "train-segment-model");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), vec![&Action::TrainSegment(vec![0])]);
+        st.segment_preview = None;
+        let none = input(&scene, None, &cam);
+        let outs = click_widget(&ctx, &mut st, &none, "train-segment-model");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled without a selection");
+    } else {
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("train-segment-model")), "deferred: no button in the Model tab");
+    }
     // the actions are recorded, never replayed
     for a in [Action::TrainSegment(vec![0]), Action::OpenSegment, Action::CancelSegment, Action::BackToScene] {
         assert_eq!((a.describe(), crate::replay::unreplayable_kind(&a)), (None, Some("segment")));

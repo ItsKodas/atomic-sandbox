@@ -28,7 +28,7 @@ Tag every plan task and dispatch subagents accordingly: **Fable 5.1** (`claude-f
 
 ## Crates
 
-`units` · `qm` (CPU f64 reference solver) · `qm-gpu` (the GPU solver) · `gpu` · `render` · `sim` (scene, integrator, thermostat, the `Dynamics` driver, relax, bonds, charges; the `ForceProvider`/`Trainable` boundary) · `providers` (Kohn-Sham adapters `ks.rs`; the surrogate provider `surrogate/` — its decision list is `mod.rs`'s module doc; the sampling pass `sampling/`; the pseudopotential cache `pseudo`) · `surrogate` (the model: descriptors, basis, Bayesian fit, sidecar) · `app` (the viewer; worker in `src/worker/`, UI in `src/ui/`, builder in `src/builder/`, replay in `src/replay.rs`) · `validate` (the suites).
+`units` · `qm` (CPU f64 reference solver) · `qm-gpu` (the GPU solver) · `gpu` · `render` · `sim` (scene, integrator, thermostat, the `Dynamics` driver, relax, bonds, charges; the `ForceProvider`/`Trainable` boundary) · `providers` (Kohn-Sham adapters `ks.rs`; the surrogate provider `surrogate/` — its decision list is `mod.rs`'s module doc; the sampling pass `sampling/`; the pseudopotential cache `pseudo`) · `surrogate` (the model: descriptors, basis, Bayesian fit, sidecar, the shared collections) · `app` (the viewer; worker in `src/worker/`, UI in `src/ui/`, builder in `src/builder/`, replay in `src/replay.rs`) · `validate` (the suites).
 
 ## Build and run
 
@@ -48,6 +48,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~31 min, ~3.5 min |
 | dynamics | `cargo test -p validate --release --test dynamics` | ~6 min |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~12–17 min |
+| shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
 | bonds / relax / isotopes | `cargo test -p validate --release --test tools` | ~3–10 min |
 | charges | `cargo test -p validate --release --test charges` (CPU) | ~11 min |
 | pseudopotentials | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | ~1 h, ~9 min, ~1.5–2 h |
