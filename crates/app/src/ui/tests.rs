@@ -3305,7 +3305,7 @@ mod orbital_viewer {
     }
 
     fn heads(g: &[orbitals::Group], z: &[u8]) -> Vec<String> {
-        g.iter().map(|g| orbitals::heading(&g.owner, z)).collect()
+        g.iter().map(|g| orbitals::heading(&g.owner, g.others, z)).collect()
     }
 
     /// An H₂O-like list: two rows mostly on O (0.92, 0.60 — the 0.55 line), one spread over all
@@ -3333,7 +3333,10 @@ mod orbital_viewer {
         assert!(hover.starts_with("O #0 50 % · H #1 25 % · H #2 25 %"), "{hover}");
         assert!(hover.contains("a split of space between the atoms (Hirshfeld, like the partial charges), not something measured"), "{hover}");
         // below 1 % is left out of the hover
-        assert!(orbitals::share_hover(&[0.995, 0.004, 0.001], &z).starts_with("O #0 100 %\n"));
+        // review Minor 3: in a molecule a share that rounds to 100 % reads "> 99 %"
+        assert!(orbitals::share_hover(&[0.995, 0.004, 0.001], &z).starts_with("O #0 > 99 %\n"));
+        assert_eq!(orbitals::share_text(&[0.9993, 0.0004, 0.0003], &z), "O #0 > 99 %");
+        assert_eq!(orbitals::share_text(&[0.994, 0.003, 0.003], &z), "O #0 99 %");
     }
 
     /// Near and exact 50/50 read `shared`, never one atom (the 0.55 margin); equal at the whole
@@ -3373,7 +3376,8 @@ mod orbital_viewer {
         let t2_groups: Vec<&orbitals::Group> = g.iter().filter(|g| g.rows.contains(&1)).collect();
         assert_eq!(t2_groups.len(), 1);
         assert_eq!(t2_groups[0].rows, [1, 3, 4], "{g:?}");
-        assert_eq!(heads(&g, &z), ["C #0", "H #1", "shared · C #0"]);
+        // ruling (f): the heading counts the atoms it does not name (each H at 15 %)
+        assert_eq!(heads(&g, &z), ["C #0", "H #1", "shared · C #0 + 4 others"]);
     }
 
     /// Text shapes with their colour (a `RichText` colour, else the fallback), drawn in a window
@@ -3585,8 +3589,120 @@ mod orbital_viewer {
         assert_eq!(orbitals::shares_note(&bare, &scene_z, true).as_deref(), Some(orbitals::SHARES_PENDING));
         assert!(orbitals::shares_note(&bare, &scene_z, false).unwrap().starts_with("atom shares need the atom references"));
         bare.notes.push("orbital shares off: Σ = 1.002500 outside 1 ± 1e-3".into());
-        assert!(orbitals::shares_note(&bare, &scene_z, true).unwrap().contains("orbital shares off: Σ = 1.002500"), "the payload's own reason");
+        // review Minor 4: the producer's note is drawn above with the payload's notes; this one
+        // points at it instead of repeating it
+        let n = orbitals::shares_note(&bare, &scene_z, true).unwrap();
+        assert!(n.contains("failed their own check") && !n.contains("1.002500"), "{n}");
         assert!(orbitals::shares_note(&bare, &[2], true).is_none(), "a lone atom: no note");
+    }
+
+    /// Ruling (f): a shared heading names the atoms holding ≥ 25 % and counts the others holding
+    /// ≥ 1 % of one of its rows ("+ 1 other", "+ k others"), or reads "spread over k atoms" when
+    /// none holds 25 %. The count is for display: a tail crossing 1 % never splits the group.
+    #[test]
+    fn shared_headings_count_the_other_atoms() {
+        let z = [6, 1, 1, 1, 1];
+        let refs = |rows: &[OrbitalInfo]| -> Vec<orbitals::Group> { orbitals::groups(&rows.iter().collect::<Vec<_>>(), &z, true) };
+        // five atoms at 20 % each: nobody named
+        let spread = [on(row(Spin::Up, 0, 1, 0, -0.5, 1.0, idx(1)), &[0.2; 5])];
+        let g = refs(&spread);
+        assert_eq!(g[0].owner, orbitals::Owner::Shared(vec![]));
+        assert_eq!(heads(&g, &z), ["shared · spread over 5 atoms"]);
+        // one other atom; the same named atoms with and without a tail above 1 %: one group
+        let rows = [
+            on(row(Spin::Up, 0, 1, 0, -0.6, 1.0, idx(1)), &[0.50, 0.45, 0.05, 0.0, 0.0]),
+            on(row(Spin::Up, 1, 2, 1, -0.5, 1.0, idx(2)), &[0.52, 0.48, 0.0, 0.004, 0.0]),
+        ];
+        let g = refs(&rows);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!((g[0].rows.as_slice(), g[0].others), (&[0, 1][..], 1));
+        assert_eq!(heads(&g, &z), ["shared · C #0–H #1 + 1 other"]);
+        // no other atom at 1 %: no suffix
+        let rows = [on(row(Spin::Up, 0, 1, 0, -0.6, 1.0, idx(1)), &[0.50, 0.496, 0.004, 0.0, 0.0])];
+        assert_eq!(heads(&refs(&rows), &z), ["shared · C #0–H #1"]);
+        assert!(heads(&refs(&rows), &z)[0].starts_with("shared · ") && orbitals::heading(&orbitals::Owner::Atom(0), 3, &z) == "C #0", "an atom's heading has no count");
+    }
+
+    /// Review Minor 2: the 0.55 and 0.25 lines are judged at the whole percent the row prints, so a
+    /// row reading "55 %" is never under shared and an atom whose hover reads "25 %" is named.
+    #[test]
+    fn thresholds_are_judged_at_the_percent_shown() {
+        use orbitals::Owner;
+        assert_eq!(orbitals::share_text(&[0.546, 0.454], &[8, 1]), "O #0 55 %");
+        assert_eq!(orbitals::owner_of(&[0.546, 0.454]), Owner::Atom(0), "prints 55 %: under the atom");
+        assert_eq!(orbitals::owner_of(&[0.544, 0.456]), Owner::Shared(vec![0, 1]), "prints 54 %: shared");
+        assert_eq!(orbitals::owner_of(&[0.508, 0.246, 0.246]), Owner::Shared(vec![0, 1, 2]), "0.246 prints 25 %: named");
+        assert_eq!(orbitals::owner_of(&[0.51, 0.244, 0.246]), Owner::Shared(vec![0, 2]), "0.244 prints 24 %: not named");
+        assert!(orbitals::lit(&[0.546, 0.454], &[0]) && !orbitals::lit(&[0.544, 0.456], &[0]));
+    }
+
+    /// A closed-shell water-like payload (↑↓ paired) with shares on the scene's atoms: O 1s, an O
+    /// lone pair, an O–H bond on H #1 whose ↓ member carries no shares, and an unoccupied row on
+    /// H #1 (tracks ↑ 1, 3, 5, 7; ↓ 2, 4, 6, 8).
+    fn water_closed_by_atom() -> OrbitalDisplay {
+        let pair = |index: usize, track: u32, e: f64, occ: f64, s: &[f64]| {
+            [on(row(Spin::Up, index, track, index as u8, e, occ, idx(index + 1)), s), on(row(Spin::Down, index, track + 1, index as u8, e + 5e-9, occ, idx(index + 1)), s)]
+        };
+        let mut rows: Vec<OrbitalInfo> = Vec::new();
+        rows.extend(pair(0, 1, -0.9, 1.0, &[0.996, 0.002, 0.002]));
+        rows.extend(pair(1, 3, -0.5, 1.0, &[0.70, 0.15, 0.15]));
+        let mut bond = pair(2, 5, -0.4, 1.0, &[0.15, 0.80, 0.05]);
+        bond[1].shares = None; // the pair is placed and labelled by its ↑ member
+        rows.extend(bond);
+        rows.extend(pair(3, 7, 0.05, 0.0, &[0.15, 0.79, 0.06]));
+        let mut o = payload(rows, OrbitalRequest::List);
+        o.spin = closed_spin();
+        o.positions = vec![[0.0; 3]; 3];
+        o.share_z = Some(vec![8, 1, 1]);
+        o
+    }
+
+    /// Review I2: the common case — a closed-shell molecule — grouped by atom keeps the ↑↓ fold in
+    /// each group: one pair row and one share per pair, the "↑↓ unoccupied" heading inside the
+    /// group holding the unoccupied pair, a pair placed by its ↑ member's shares (its ↓ has none),
+    /// the O pairs faint under H #1, a faint pair still a picker, and a picked pair never faint.
+    #[test]
+    fn grouped_closed_shell_keeps_pairs() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let o = water_closed_by_atom();
+        assert!(orbitals::paired(&o.rows, &o.spin));
+        let snap = with_payload(&scene, Backend::Gpu, o.clone());
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        let none = input(&scene, Some(&snap), &cam);
+        PROBES.with(|p| p.borrow_mut().clear());
+        let texts = coloured_texts(&ctx, &mut st, &none);
+        let count = |prefix: &str| PROBES.with(|p| p.borrow().keys().filter(|k| k.starts_with(prefix)).count());
+        assert_eq!((count("orbital-↑↓-"), count("share-↑↓-")), (4, 4), "one row and one share per pair");
+        assert_eq!(count("orbital-↑-") + count("orbital-↓-"), 0, "no row per member");
+        for t in [1, 3, 5, 7] {
+            assert!(PROBES.with(|p| p.borrow().contains_key(&format!("share-↑↓-{t}"))), "share of pair {t}");
+        }
+        let at = |needle: &str| texts.iter().position(|(t, _)| t == needle).unwrap_or_else(|| panic!("{needle}: {texts:?}"));
+        // O #0 holds #1, #2; H #1 holds #3 and, under its own unoccupied heading, #4
+        assert!(at("O #0") < at("#1 ↑↓") && at("#2 ↑↓") < at("H #1") && at("H #1") < at("#3 ↑↓"), "{texts:?}");
+        assert!(at("#3 ↑↓") < at("↑↓ unoccupied") && at("↑↓ unoccupied") < at("#4 ↑↓"), "the unoccupied heading inside H #1's group");
+        assert!(texts.iter().any(|(t, _)| t == "H #1 80 %"), "the ↑ member's share, though the ↓ has none");
+        assert!(texts.iter().any(|(t, _)| t == "O #0 > 99 %"));
+        // H #1 selected: the O pairs faint, the H #1 pairs lit
+        let h1 = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
+        let faint = |texts: &[(String, egui::Color32)]| -> Vec<String> {
+            texts.iter().filter(|(t, c)| t.ends_with(" ↑↓") && *c == theme::INK_FAINT).map(|(t, _)| t.clone()).collect()
+        };
+        assert_eq!(faint(&coloured_texts(&ctx, &mut st, &h1)), ["#1 ↑↓", "#2 ↑↓"]);
+        // a faint pair is still a picker: the ↑ member
+        let outs = click_widget(&ctx, &mut st, &h1, "orbital-↑↓-1");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::PickOrbital { spin: Spin::Up, track: 1 }));
+        // the payload answering that pick: the picked pair keeps its full ink (review Minor 5)
+        let mut picked = o;
+        picked.what = OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false };
+        let snap = with_payload(&scene, Backend::Gpu, picked);
+        let h1 = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(faint(&coloured_texts(&ctx, &mut st, &h1)), ["#2 ↑↓"], "picked and not lit: still readable");
     }
 }
 
