@@ -2748,8 +2748,15 @@ mod orbital_viewer {
         let mut occ = o.rows.clone();
         occ[2].occupation = 0.5;
         assert!(!orbitals::paired(&occ, &closed), "occupations differ");
-        assert!(!orbitals::paired(&o.rows[..3], &closed), "↑ has two rows, ↓ one");
-        assert!(!orbitals::paired(&h2_rows(), &closed), "the older fixture: the ↓ σ_u is missing");
+        // user report 2026-11-12 (He, 4 unoccupied per spin): an unoccupied row only one channel
+        // shows still pairs; an occupied one does not
+        assert!(orbitals::paired(&o.rows[..3], &closed), "↑ shows σ_u, ↓ does not: still one closed shell");
+        assert!(orbitals::paired(&h2_rows(), &closed), "the older fixture: the ↓ σ_u is not shown");
+        let no_dn_occ = [o.rows[0].clone(), o.rows[1].clone(), o.rows[3].clone()];
+        assert!(!orbitals::paired(&no_dn_occ, &closed), "↓ lacks the occupied σ_g");
+        let mut far_unocc = o.rows.clone();
+        far_unocc[3].energy = 0.02 + 2e-4;
+        assert!(!orbitals::paired(&far_unocc, &closed), "an unoccupied pair 2e-4 Ha apart: two levels");
         let broken = SpinSummary { abs_integral: 0.6, max_abs: 0.1, ..closed };
         assert!(!orbitals::paired(&o.rows, &broken), "a broken-symmetry singlet: same ε, not the same shapes");
         assert!(!orbitals::paired(&o.rows, &SpinSummary::default()), "no noise budget: no verdict");

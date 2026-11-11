@@ -498,15 +498,52 @@ fn channels(rows: &[OrbitalInfo]) -> [Vec<&OrbitalInfo>; 2] {
 /// Whether the two channels are one closed shell, so the list folds them into one ↑↓ list (user
 /// request 2026-11-11: "fold them in … when they're the exact same, less confusing"): the spin
 /// readout says no net spin ([`SpinSummary::no_net_spin`]: ∫|m| inside the solver's noise, so a
-/// broken-symmetry singlet — equal ε, different shapes — stays split), both channels hold as many
-/// rows, and the rows matched by index have equal occupations and ε within [`SAME_LEVEL`] (the
-/// solver's spin noise is ≤ 3e-6 Ha). A list without an occupied row is not paired.
+/// broken-symmetry singlet — equal ε, different shapes — stays split), both channels hold the same
+/// occupied rows, and every row both channels show, matched by index, has the same occupation and
+/// ε within [`SAME_LEVEL`] (the solver's spin noise is ≤ 3e-6 Ha). An unoccupied row only one
+/// channel shows still pairs (He with 4 unoccupied per spin: a degenerate set cut by the block
+/// edge is hidden in one channel and not the other — user report 2026-11-12; with no net spin
+/// both channels see the same potential); [`merged`] lists it on its own. A list without an
+/// occupied row is not paired.
 pub fn paired(rows: &[OrbitalInfo], spin: &SpinSummary) -> bool {
     let [up, dn] = channels(rows);
+    let occupied = |c: &[&OrbitalInfo]| c.iter().filter(|r| r.occupation > 0.0).count();
     spin.no_net_spin()
-        && up.len() == dn.len()
-        && up.iter().any(|r| r.occupation > 0.0)
-        && up.iter().zip(&dn).all(|(u, d)| u.index == d.index && (u.occupation - d.occupation).abs() < 1e-9 && (u.energy - d.energy).abs() <= SAME_LEVEL)
+        && occupied(&up) > 0
+        && occupied(&up) == occupied(&dn)
+        && merged(&up, &dn).iter().all(|m| match m {
+            (u, Some(d)) => (u.occupation - d.occupation).abs() < 1e-9 && (u.energy - d.energy).abs() <= SAME_LEVEL,
+            (r, None) => r.occupation == 0.0,
+        })
+}
+
+/// The two channels' rows merged by index: a pair where both show the row, else the one row alone.
+fn merged<'a>(up: &[&'a OrbitalInfo], dn: &[&'a OrbitalInfo]) -> Vec<(&'a OrbitalInfo, Option<&'a OrbitalInfo>)> {
+    let mut out = Vec::with_capacity(up.len().max(dn.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < up.len() || j < dn.len() {
+        match (up.get(i), dn.get(j)) {
+            (Some(u), Some(d)) if u.index == d.index => {
+                out.push((*u, Some(*d)));
+                i += 1;
+                j += 1;
+            }
+            (Some(u), Some(d)) if u.index < d.index => {
+                out.push((*u, None));
+                i += 1;
+            }
+            (Some(u), None) => {
+                out.push((*u, None));
+                i += 1;
+            }
+            (_, Some(d)) => {
+                out.push((*d, None));
+                j += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    out
 }
 
 // ---- the tab ----
@@ -777,7 +814,7 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
                 theme::info(ui, PAIRED_TIP);
             });
             let mut shown_unocc = false;
-            for (u, d) in up.into_iter().zip(dn) {
+            for (u, d) in merged(&up, &dn) {
                 if u.occupation == 0.0 && !shown_unocc {
                     shown_unocc = true;
                     ui.horizontal_wrapped(|ui| {
@@ -786,8 +823,8 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
                     });
                 }
                 // either member picked shows the pair as selected
-                let on = picked == Some((u.spin, u.track)) || picked == Some((d.spin, d.track));
-                row(ui, st, u, Some(d), &levels, on, acts);
+                let on = picked == Some((u.spin, u.track)) || d.is_some_and(|d| picked == Some((d.spin, d.track)));
+                row(ui, st, u, d, &levels, on, acts);
             }
         } else {
             for (spin, rows) in [(Spin::Up, up), (Spin::Down, dn)] {
