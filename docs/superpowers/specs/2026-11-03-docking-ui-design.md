@@ -103,10 +103,14 @@ another monitor, with saved layouts and one consistent icon set.
   `PanelInput`, and their `Action`s are appended to the main frame's (so `--record` sees them).
   Tabs move between OS windows by the tab menu ("Move to main window", "Move to window N"), not by
   dragging across windows. Closing a detached window docks its panels back into the main tree
-  (each to the leaf it left, else beside the 3D view on the right). The window's monitor-relative
-  position, size and sub-tree are saved: `window = x,y,w,h <tree-without-3D>`; on load a window
-  whose rectangle is on no connected monitor docks back instead. Ctrl K revealing a panel in a
-  detached window focuses that window.
+  (each to the leaf it left, else beside the 3D view on the right; a panel with no recorded leaf,
+  e.g. from a window read from a profile, docks beside its default-layout leaf-mates). The
+  window's rectangle — absolute desktop pixels, its outer position and inner size — whether it
+  is maximised, and its sub-tree are saved: `window = x,y,w,h[ max] <tree-without-3D>` (a
+  maximised one reopens maximised on the monitor holding its centre); on load a window not
+  usable on any connected monitor (less than 64 × 8 px of its title-bar strip, the top 32 px
+  inset 8 px each side, on one) docks back instead. Ctrl K revealing a panel in a detached window
+  focuses that window.
 - **D-13 Recording:** all of this is display state — nothing becomes an `Action`, nothing reaches
   the worker. The screenshot harness gains `--ui layout=<preset>` and keeps `tab=` (shows that
   panel) and `dock=closed` (Presenting).

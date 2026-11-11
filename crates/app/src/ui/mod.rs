@@ -800,7 +800,9 @@ impl UiState {
     /// and its auto-hidden panels replace the current ones (floating windows, detached windows and
     /// the flyout go); Two monitors also opens its detached window filling the second monitor
     /// (spec D-12) — with one monitor it is One monitor and the status says so. The profile's
-    /// autosave then keeps it. Display state, never recorded.
+    /// autosave then keeps it. Display state, never recorded. From a tab's menu (the tree lent
+    /// out) every part of it — windows, tree, hidden panels, the new window — is done in order when
+    /// the tree is back.
     pub fn apply_layout(&mut self, p: workspace::presets::Preset) {
         use workspace::presets::Preset;
         let second = self.workspace.second_monitor();

@@ -837,11 +837,12 @@ impl App {
     /// Acts on the detached windows' requests (docking spec D-12): opens a window (or, when that
     /// fails, docks its panels back with an error line), closes one, brings one to the front.
     fn sync_detached(&mut self, el: &ActiveEventLoop) {
+        // no GPU yet: the requests wait (taken now they would be lost)
+        let Some(g) = &self.gfx else { return };
         let requests = self.viewer.take_window_requests();
         if requests.is_empty() {
             return;
         }
-        let Some(g) = &self.gfx else { return };
         for r in requests {
             match r {
                 ui::WindowRequest::Open { id, panels, rect, size, fill } => {
@@ -854,7 +855,7 @@ impl App {
                             let names: Vec<&str> = panels.iter().map(|t| t.name()).collect();
                             let at = d.rect().map_or(String::new(), |r| format!(" at {},{} {}x{}", r.x, r.y, r.w, r.h));
                             eprintln!("detached window {id} opened ({}){at}", names.join(", "));
-                            self.viewer.ui.workspace.set_window_rect(id, d.rect());
+                            self.viewer.ui.workspace.set_window_rect(id, d.rect(), d.maximized());
                             let i = self.detached.iter().position(|w| w.id > id).unwrap_or(self.detached.len());
                             self.detached.insert(i, d);
                         }
@@ -895,8 +896,8 @@ impl App {
                 eprintln!("detached window {id} closed by the user: its panels are back in the main window");
             }
             WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
-                let (id, r) = (d.id, d.rect());
-                self.viewer.ui.workspace.set_window_rect(id, r);
+                let (id, r, max) = (d.id, d.rect(), d.maximized());
+                self.viewer.ui.workspace.set_window_rect(id, r, max);
             }
             WindowEvent::Focused(f) => d.focused = f,
             _ => {}

@@ -90,6 +90,11 @@ pub(super) enum Change {
     /// Back into the main tree, together (spec D-12: Move to main window, Dock back).
     ToMain(Vec<DockTab>),
     ToWindow(DockTab, u32),
+    /// A layout's or a profile's detached windows (`UiState::apply_layout` from a tab's menu):
+    /// every window closes, a new one opens, the profile's replace them.
+    CloseWindows,
+    OpenWindow(Node, Option<super::detached::WinRect>, bool),
+    SetWindows(Vec<super::detached::SavedWindow>),
 }
 
 /// The workspace: the dock tree, the auto-hidden panels and their flyout, the detached windows,
@@ -472,6 +477,11 @@ impl Workspace {
                 }
                 Change::ToMain(tabs) => self.move_to_main(&tabs),
                 Change::ToWindow(t, id) => self.move_to_window(t, id),
+                Change::CloseWindows => self.close_windows(),
+                Change::OpenWindow(tree, rect, fill) => {
+                    self.open_window(tree, rect, fill);
+                }
+                Change::SetWindows(list) => self.set_windows(list),
             }
         }
     }
@@ -698,8 +708,9 @@ impl TabViewer for Tiles<'_, '_> {
             ask(ui, "Close", "tab-menu-close", "close the panel (Window brings it back)", Change::Close(t), &mut self.asked);
             if self.window.is_none() {
                 ui.separator();
-                if ui.button("Reset the layout").clicked() {
-                    self.st.reset_layout(); // done when the tree is back (`Workspace::set_node`)
+                if crate::ui::probed("tab-menu-reset", ui.button("Reset the layout")).clicked() {
+                    // done when the tree is back, windows too (`Change::{CloseWindows, Set, SetHidden, OpenWindow}`)
+                    self.st.reset_layout();
                     ui.close();
                 }
             }

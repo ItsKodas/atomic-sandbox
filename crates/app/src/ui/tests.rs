@@ -6197,6 +6197,103 @@ mod detached_windows {
         outs.iter().flat_map(|o| o.windows.clone()).collect()
     }
 
+    fn secondary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// Right-clicks tab `t` in the main window (1400 points wide), so its context menu opens, then
+    /// clicks the menu's entry `item` (a `tab-menu-*` probe). Every frame's output.
+    fn tab_menu(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, t: DockTab, item: &str) -> Vec<PanelOutput> {
+        for _ in 0..3 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        let c = probed_rect(&format!("dock-tab-{t:?}")).center();
+        let mut outs = vec![frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerMoved(c), secondary(c, true)]), frame(ctx, st, inp, 1400.0, vec![secondary(c, false)])];
+        outs.extend(click_widget(ctx, st, inp, item));
+        outs
+    }
+
+    /// [`tab_menu`] in detached window `id` (its own context).
+    fn tab_menu_in_window(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, id: u32, t: DockTab, item: &str) -> Vec<PanelOutput> {
+        for _ in 0..3 {
+            window_frame(ctx, st, inp, id, vec![]);
+        }
+        let c = probed_rect(&format!("dock-tab-{t:?}")).center();
+        let mut outs = vec![window_frame(ctx, st, inp, id, vec![egui::Event::PointerMoved(c), secondary(c, true)]), window_frame(ctx, st, inp, id, vec![secondary(c, false)])];
+        outs.extend(click_in_window(ctx, st, inp, id, item));
+        outs
+    }
+
+    /// Review M8: the tab menu's move entries, clicked (their `Change`s routed through
+    /// `on_tab_button`): Move to new window, Move to window N, then Move to main window from
+    /// inside the detached window. None of it is an action.
+    #[test]
+    fn the_tab_menu_moves_tabs_between_windows() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Graph, "tab-menu-new-window");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        let id = match st.workspace.windows().as_slice() {
+            [id] => *id,
+            w => panic!("{w:?}"),
+        };
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
+        assert!(matches!(requests(&outs).as_slice(), [WindowRequest::Open { panels, .. }] if *panels == vec![DockTab::Graph]), "{:?}", requests(&outs));
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
+        // Orbitals into that window by its number
+        tab_menu(&ctx, &mut st, &inp, DockTab::Orbitals, &format!("tab-menu-window-{id}"));
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph, DockTab::Orbitals]);
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
+        // from inside the window, Orbitals back to the main window: it left a leaf of its own, so
+        // beside the 3D view on the right
+        let wctx = egui::Context::default();
+        apply_theme(&wctx);
+        PROBES.with(|m| m.borrow_mut().clear());
+        let outs = tab_menu_in_window(&wctx, &mut st, &inp, id, DockTab::Orbitals, "tab-menu-main");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Orbitals*]),[Log*])");
+    }
+
+    /// Review I2: the tab menu's Reset the layout with two monitors (it runs while the main tree
+    /// is lent out) applies Two monitors whole: one detached window holding Activity over Graph,
+    /// both in the workspace — from the default layout, and again from Two monitors itself (the
+    /// old window closes, a new one opens).
+    #[test]
+    fn reset_from_the_tab_menu_with_two_monitors_opens_the_window() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_monitors(vec![PRIMARY, SECOND]);
+        let check = |st: &UiState, outs: &[PanelOutput]| -> u32 {
+            assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+            let id = match st.workspace.windows().as_slice() {
+                [id] => *id,
+                w => panic!("one window: {w:?}"),
+            };
+            assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity, DockTab::Graph]);
+            assert!(st.workspace.present(DockTab::Activity) && st.workspace.present(DockTab::Graph), "neither closed");
+            assert_eq!(st.workspace.to_node(), Preset::TwoMonitors.tree().0);
+            let open = WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Graph], rect: Some(SECOND), size: None, fill: true };
+            assert!(requests(outs).contains(&open), "{:?}", requests(outs));
+            id
+        };
+        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Log, "tab-menu-reset");
+        let first = check(&st, &outs);
+        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Log, "tab-menu-reset");
+        let second = check(&st, &outs);
+        assert_ne!(first, second);
+        assert!(requests(&outs).contains(&WindowRequest::Close { id: first }), "{:?}", requests(&outs));
+    }
+
     /// The leaf's pop-out button (between its pin and its close) moves the leaf's panels into a
     /// new window and asks the window side to open it; the window draws them in its own context
     /// (their tabs and bodies, no pin); its Dock back button returns them to the main window and
@@ -6310,10 +6407,10 @@ mod detached_windows {
         let mut st = UiState::new("h2", &scene);
         assert!(!profile::capture(&st).contains("window ="), "none by default");
         let a = st.workspace.pop_out(&[DockTab::Activity, DockTab::Graph], DockTab::Graph).unwrap();
-        st.workspace.set_window_rect(a, Some(WinRect { x: 2600, y: 30, w: 900, h: 1000 }));
+        st.workspace.set_window_rect(a, Some(WinRect { x: 2600, y: 30, w: 900, h: 1000 }), true);
         st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
         let text = profile::capture(&st);
-        assert!(text.contains("\nwindow = 2600,30,900,1000 [Activity,Graph*]\nwindow = [Log*]\n"), "{text}");
+        assert!(text.contains("\nwindow = 2600,30,900,1000 max [Activity,Graph*]\nwindow = [Log*]\n"), "{text}");
         assert!(text.contains(&format!("\nlayout = {}\n", layout::encode(&st.workspace.to_node()))), "{text}");
         let mut back = UiState::new("h2", &scene);
         profile::apply(&mut back, &text);

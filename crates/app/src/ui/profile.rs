@@ -2,9 +2,10 @@
 //! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
 //! and active tabs in `workspace::layout`'s grammar; `hidden = Graph:left:340, …`, the auto-hidden
 //! panels with their edge and size, spec D-10 — a panel floating in a window is saved there too,
-//! on the edge nearest its window: `Workspace::saved_hidden`; `window = 1920,0,1920,1040
+//! on the edge nearest its window: `Workspace::saved_hidden`; `window = 2552,-8,1920,1009 max
 //! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
-//! pixels and its tree without the 3D view, spec D-12, `workspace::detached`), the view and density-look settings and which
+//! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
+//! `workspace::detached`), the view and density-look settings and which
 //! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
@@ -66,8 +67,8 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("temp_units = {:?}\n", st.temp_units);
     out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
     out += &format!("hidden = {}\n", layout::encode_hidden(&st.workspace.saved_hidden()));
-    for (rect, tree) in st.workspace.saved_windows() {
-        out += &format!("window = {}\n", detached::encode_window(rect, &tree));
+    for (rect, max, tree) in st.workspace.saved_windows() {
+        out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
     }
     out += &format!("view_sections = {}\n", st.view_sections.encode());
     out
@@ -77,18 +78,20 @@ pub fn capture(st: &UiState) -> String {
 /// the workspace (a tree that does not parse, or has no 3D view, gives the default), `hidden`
 /// its auto-hidden panels (none without the line; one already in the tree stays there) and the
 /// `window` lines its detached windows, in order (none without them; a panel already placed
-/// keeps that place; a window whose rect is on no connected monitor docks back when the window
-/// side would open it, `Workspace::take_requests`); without it,
+/// keeps that place; a window usable on no connected monitor docks back when the window side
+/// would open it, `Workspace::take_requests`); without it,
 /// an old profile's `left_tabs` / `right_tabs` are migrated (every panel placed once, the ones
 /// they do not name added: `layout::from_sides`); a profile with neither leaves the arrangement
 /// as it is.
 pub fn apply(st: &mut UiState, text: &str) {
-    let kv: std::collections::HashMap<&str, &str> = text
+    // the `key = value` lines, in order (`window` may repeat; the map keeps one of each key)
+    let lines: Vec<(&str, &str)> = text
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim(), v.trim()))
         .collect();
+    let kv: std::collections::HashMap<&str, &str> = lines.iter().copied().collect();
     macro_rules! get {
         ($($b:ident),*; $($n:ident),*) => {
             $(if let Some(v) = kv.get(stringify!($b)).and_then(|v| v.parse().ok()) { st.$b = v; })*
@@ -120,14 +123,8 @@ pub fn apply(st: &mut UiState, text: &str) {
         st.workspace.close_windows();
         st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
         st.workspace.set_hidden(layout::parse_hidden(kv.get("hidden").copied().unwrap_or_default()));
-        // `window` may repeat: every line, in order (the map keeps one)
-        let windows = text
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .filter(|(k, _)| k.trim() == "window")
-            .filter_map(|(_, v)| detached::parse_window(v))
-            .collect();
+        // every `window` line, in order
+        let windows = lines.iter().filter(|(k, _)| *k == "window").filter_map(|(_, v)| detached::parse_window(v)).collect();
         st.workspace.set_windows(windows);
     } else if kv.contains_key("left_tabs") || kv.contains_key("right_tabs") {
         let side = |k: &str| kv.get(k).map(|v| tabs_of(v)).unwrap_or_default();

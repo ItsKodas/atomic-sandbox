@@ -13,14 +13,16 @@
 //!   [`Workspace::move_to_window`]) — tabs never cross windows by dragging (spec D-12).
 //! - **Docking back** ([`Workspace::window_closed`], "Move to main window"): each panel goes to the
 //!   leaf it left — the main-tree leaf holding any of the panels it shared its leaf with when it
-//!   left ([`Windows::origins`]; a window read from the profile has none, so the panels it shared
-//!   its leaf with in the default layout stand in, recorded for review) — else, together, into a
-//!   new leaf right of the 3D view.
+//!   left ([`Windows::origins`]; a panel with no recorded origin, e.g. one from a window read from
+//!   the profile, has the panels it shares its leaf with in the default layout stand in) — else (it
+//!   was alone in its leaf, or that leaf is gone), together, into a new leaf right of the 3D view.
 //! - **Where it is** ([`WinRect`]): the window's outer position and inner size in physical pixels
-//!   on the desktop (winit's units, the monitors' too), reported by the window side as it moves.
-//!   The profile keeps one line per window, `window = x,y,w,h <tree>` ([`encode_window`]; the rect
-//!   is left out while the window side has not reported one, e.g. headless). A window read back
-//!   whose rect is on no connected monitor ([`Workspace::set_monitors`], injected by the window side
+//!   on the desktop (winit's units, the monitors' too) and whether it is maximised, reported by the
+//!   window side as it moves. The profile keeps one line per window, `window = x,y,w,h[ max]
+//!   <tree>` ([`encode_window`]; the rect is left out while the window side has not reported one,
+//!   e.g. headless); a window saved maximised reopens maximised on the monitor holding its centre.
+//!   A window read back that is usable on no connected monitor ([`WinRect::usable_on`]: too little
+//!   of its title-bar strip on any one; [`Workspace::set_monitors`], injected by the window side
 //!   from `available_monitors`) docks back instead of opening, with a status note.
 //! - **Requests** ([`Workspace::take_requests`]): each window not yet asked for is opened
 //!   (`Open`), closing one asks `Close`, and showing a panel that lives in one (the Window menu,
@@ -40,11 +42,29 @@ pub struct WinRect {
     pub h: u32,
 }
 
+/// The title-bar strip [`WinRect::usable_on`] looks at: the window's top `STRIP_H` px, `STRIP_INSET`
+/// px in from each side (Windows reports a maximised window's outer position 8 px outside its
+/// monitor, so a window maximised on the monitor to the right overhangs its left neighbour by 8 px:
+/// review I1), of which at least `MIN_ON` × `MIN_ON_H` px must be on one monitor.
+const STRIP_H: i64 = 32;
+const STRIP_INSET: i64 = 8;
+const MIN_ON: i64 = 64;
+const MIN_ON_H: i64 = 8;
+
 impl WinRect {
-    /// Whether the two overlap by at least a pixel.
-    pub fn intersects(&self, o: &WinRect) -> bool {
-        let (ax, ay, bx, by) = (self.x as i64, self.y as i64, o.x as i64, o.y as i64);
-        ax < bx + o.w as i64 && bx < ax + self.w as i64 && ay < by + o.h as i64 && by < ay + self.h as i64
+    /// Whether a window at `self` is usable on monitor `m`: at least 64 × 8 px of its title-bar
+    /// strip (its top 32 px, 8 px in from each side) are on it — enough to see it and drag it.
+    pub fn usable_on(&self, m: &WinRect) -> bool {
+        let overlap = |a0: i64, a1: i64, b0: i64, b1: i64| (a1.min(b1) - a0.max(b0)).max(0);
+        let (x, y, w, h) = (self.x as i64, self.y as i64, self.w as i64, self.h as i64);
+        let (mx, my) = (m.x as i64, m.y as i64);
+        overlap(x + STRIP_INSET, x + w - STRIP_INSET, mx, mx + m.w as i64) >= MIN_ON && overlap(y, y + STRIP_H.min(h), my, my + m.h as i64) >= MIN_ON_H
+    }
+
+    /// Whether `m` holds this rect's centre.
+    fn centre_on(&self, m: &WinRect) -> bool {
+        let (cx, cy) = (self.x as i64 + self.w as i64 / 2, self.y as i64 + self.h as i64 / 2);
+        (m.x as i64..m.x as i64 + m.w as i64).contains(&cx) && (m.y as i64..m.y as i64 + m.h as i64).contains(&cy)
     }
 }
 
@@ -66,6 +86,8 @@ pub(super) struct Window {
     pub(super) id: u32,
     pub(super) dock: DockState<Tile>,
     pub(super) rect: Option<WinRect>,
+    /// It is maximised (as the window side last reported it; the profile's `max`).
+    max: bool,
     size: Option<[f32; 2]>,
     fill: bool,
     /// Its `Open` has been handed out.
@@ -79,7 +101,8 @@ pub(super) struct Windows {
     /// The last id handed out (ids are never reused within a session).
     last: u32,
     requests: Vec<WindowRequest>,
-    /// The connected monitors, the main window's first (`None`: not known — headless).
+    /// The connected monitors, the main window's first (`None`: not known — headless, or the OS
+    /// listed none).
     monitors: Option<Vec<WinRect>>,
     /// The panels each detached panel shared its main-tree leaf with when it left.
     origins: HashMap<DockTab, Vec<DockTab>>,
@@ -87,18 +110,23 @@ pub(super) struct Windows {
     notes: Vec<String>,
 }
 
-/// The `window = …` line's value (spec D-12): `x,y,w,h <tree>`, or just the tree when the window
-/// side has not reported where it is.
-pub fn encode_window(rect: Option<WinRect>, tree: &Node) -> String {
+/// A `window = …` line: where the window is (`None`: not reported), whether it is maximised, and
+/// its tree without the 3D view.
+pub type SavedWindow = (Option<WinRect>, bool, Node);
+
+/// The `window = …` line's value (spec D-12): `x,y,w,h <tree>`, `x,y,w,h max <tree>` for a
+/// maximised window, or just the tree when the window side has not reported where it is.
+pub fn encode_window(rect: Option<WinRect>, max: bool, tree: &Node) -> String {
     match rect {
-        Some(r) => format!("{},{},{},{} {}", r.x, r.y, r.w, r.h, layout::encode(tree)),
+        Some(r) => format!("{},{},{},{}{} {}", r.x, r.y, r.w, r.h, if max { " max" } else { "" }, layout::encode(tree)),
         None => layout::encode(tree),
     }
 }
 
-/// Reads a `window = …` value: an optional `x,y,w,h` (a size of 0 reads as unknown) and the
-/// window's tree (`layout::parse_window`). `None` when no panel is left.
-pub fn parse_window(s: &str) -> Option<(Option<WinRect>, Node)> {
+/// Reads a `window = …` value: an optional `x,y,w,h` (a size of 0 reads as unknown), `max` after
+/// it for a maximised window, then the window's tree (`layout::parse_window`). `None` when no
+/// panel is left. A line without `max` (as written before the flag was saved) is not maximised.
+pub fn parse_window(s: &str) -> Option<SavedWindow> {
     let s = s.trim();
     let (head, tail) = s.split_once(char::is_whitespace).unwrap_or((s, ""));
     let parts: Vec<&str> = head.split(',').map(str::trim).collect();
@@ -107,19 +135,14 @@ pub fn parse_window(s: &str) -> Option<(Option<WinRect>, Node)> {
             let r = WinRect { x: parts[0].parse().ok()?, y: parts[1].parse().ok()?, w: parts[2].parse().ok()?, h: parts[3].parse().ok()? };
             (r.w > 0 && r.h > 0).then_some(r)
         })();
-        return layout::parse_window(tail).map(|n| (rect, n));
+        let tail = tail.trim_start();
+        let (max, tail) = match tail.strip_prefix("max") {
+            Some(rest) if rest.starts_with(char::is_whitespace) => (true, rest),
+            _ => (false, tail),
+        };
+        return layout::parse_window(tail).map(|n| (rect, max && rect.is_some(), n));
     }
-    layout::parse_window(s).map(|n| (None, n))
-}
-
-/// Whether a window at `r` was maximised on monitor `m`: it spans the monitor's width (a
-/// maximised window's frame overhangs each side by a few pixels, so its outer position is a little
-/// left of the monitor's) and at least 85 % of its height (the taskbar and the title bar take the
-/// rest), its centre on it.
-fn fills(r: &WinRect, m: &WinRect) -> bool {
-    let (cx, cy) = (r.x as i64 + r.w as i64 / 2, r.y as i64 + r.h as i64 / 2);
-    let inside = (m.x as i64..m.x as i64 + m.w as i64).contains(&cx) && (m.y as i64..m.y as i64 + m.h as i64).contains(&cy);
-    inside && r.w >= m.w && r.h * 100 >= m.h * 85
+    layout::parse_window(s).map(|n| (None, false, n))
 }
 
 /// The panels `t` shares its leaf with in the default layout (the stand-in origin).
@@ -172,21 +195,23 @@ impl Workspace {
         format!("{} — Atomic Sandbox", if names.is_empty() { "Panels".to_string() } else { names.join(" · ") })
     }
 
-    /// Where window `id` is now (the window side reports it as the window moves; the profile
-    /// saves it).
-    pub fn set_window_rect(&mut self, id: u32, rect: Option<WinRect>) {
+    /// Where window `id` is now and whether it is maximised (the window side reports it as the
+    /// window moves; the profile saves it).
+    pub fn set_window_rect(&mut self, id: u32, rect: Option<WinRect>, max: bool) {
         if let Some(w) = self.det.list.iter_mut().find(|w| w.id == id) {
             if rect.is_some() {
                 w.rect = rect;
+                w.max = max;
             }
         }
     }
 
     /// The connected monitors (physical pixels, the main window's first): windows read from a
-    /// profile that are on none of them dock back instead of opening, and the Two monitors layout
-    /// fills the second.
+    /// profile that are usable on none of them dock back instead of opening, and the Two monitors
+    /// layout fills the second. An empty list is "not known" (as headless), not "no monitors":
+    /// nothing docks back for it.
     pub fn set_monitors(&mut self, monitors: Vec<WinRect>) {
-        self.det.monitors = Some(monitors);
+        self.det.monitors = (!monitors.is_empty()).then_some(monitors);
     }
 
     /// The number of connected monitors (one while unknown).
@@ -200,8 +225,9 @@ impl Workspace {
     }
 
     /// The requests for the window side since the last call: an `Open` for each window not yet
-    /// asked for (one read from a profile whose rect is on no known monitor docks back instead,
-    /// with a note), then the queued `Close`s and `Focus`es.
+    /// asked for (one read from a profile that is usable on no known monitor docks back instead,
+    /// with a note; one saved maximised opens maximised on its monitor), then the queued `Close`s
+    /// and `Focus`es.
     pub fn take_requests(&mut self) -> Vec<WindowRequest> {
         if self.lent.is_some() {
             return Vec::new();
@@ -210,7 +236,7 @@ impl Workspace {
         let mut off = Vec::new();
         for w in self.det.list.iter_mut().filter(|w| !w.asked) {
             let on_none = match (&w.rect, &self.det.monitors) {
-                (Some(r), Some(m)) => !w.fill && !m.iter().any(|m| r.intersects(m)),
+                (Some(r), Some(m)) => !w.fill && !m.iter().any(|m| r.usable_on(m)),
                 _ => false,
             };
             if on_none {
@@ -218,14 +244,15 @@ impl Workspace {
                 continue;
             }
             w.asked = true;
-            // a window saved maximised (its rect fills a monitor's width) reopens maximised there
-            let filled = match (&w.rect, &self.det.monitors) {
-                (Some(r), Some(m)) if !w.fill => m.iter().copied().find(|m| fills(r, m)),
-                _ => None,
-            };
-            let (rect, fill) = match filled {
-                Some(m) => (Some(m), true),
-                None => (w.rect, w.fill),
+            // a window saved maximised reopens maximised on its monitor: the one holding its
+            // centre, else one it is usable on (monitors unknown: its own rect, which the window
+            // side maximises on whichever monitor that is)
+            let (rect, fill) = match w.rect {
+                Some(r) if w.max && !w.fill => {
+                    let on = self.det.monitors.as_ref().and_then(|m| m.iter().find(|m| r.centre_on(m)).or_else(|| m.iter().find(|m| r.usable_on(m)))).copied();
+                    (Some(on.unwrap_or(r)), true)
+                }
+                _ => (w.rect, w.fill),
             };
             let panels = node_of(w.dock.main_surface(), NodeIndex::root()).map(|n| layout::panels(&n)).unwrap_or_default();
             out.push(WindowRequest::Open { id: w.id, panels, rect, size: w.size, fill });
@@ -262,7 +289,7 @@ impl Workspace {
             return None;
         }
         let active = moved.iter().position(|&t| t == active).unwrap_or(0);
-        Some(self.new_window(Node::Leaf { tabs: moved, active }, None, size, false))
+        Some(self.new_window(Node::Leaf { tabs: moved, active }, None, false, size, false))
     }
 
     /// Moves `tabs` from their detached windows back into the main tree, together (each to the
@@ -308,8 +335,13 @@ impl Workspace {
     }
 
     /// Closes every detached window, its panels dropped (a layout that places every panel is
-    /// being applied).
+    /// being applied). While a tree is lent out (Reset from a tab's menu) it is done when the tree
+    /// is back, in order with the rest of the layout (review I2).
     pub fn close_windows(&mut self) {
+        if self.lent.is_some() {
+            self.pending.push(Change::CloseWindows);
+            return;
+        }
         for w in std::mem::take(&mut self.det.list) {
             if w.asked {
                 self.det.requests.push(WindowRequest::Close { id: w.id });
@@ -319,27 +351,36 @@ impl Workspace {
     }
 
     /// Opens a new detached window holding `tree` (the Two monitors layout): filling the monitor
-    /// `rect` when `fill`. Panels already elsewhere in the workspace keep their place.
+    /// `rect` when `fill`. Panels already elsewhere in the workspace keep their place. `None` when
+    /// every panel is placed, or while a tree is lent out (done when it is back).
     pub fn open_window(&mut self, tree: Node, rect: Option<WinRect>, fill: bool) -> Option<u32> {
+        if self.lent.is_some() {
+            self.pending.push(Change::OpenWindow(tree, rect, fill));
+            return None;
+        }
         let tree = self.unplaced(tree)?;
-        Some(self.new_window(tree, rect, None, fill))
+        Some(self.new_window(tree, rect, false, None, fill))
     }
 
     /// Replaces the detached windows with the profile's (`window = …` lines, in order): the old
     /// ones close, a panel already in the main tree, on a strip or in an earlier window keeps that
     /// place, a window left empty is dropped.
-    pub fn set_windows(&mut self, list: Vec<(Option<WinRect>, Node)>) {
+    pub fn set_windows(&mut self, list: Vec<SavedWindow>) {
+        if self.lent.is_some() {
+            self.pending.push(Change::SetWindows(list));
+            return;
+        }
         self.close_windows();
-        for (rect, tree) in list {
+        for (rect, max, tree) in list {
             if let Some(tree) = self.unplaced(tree) {
-                self.new_window(tree, rect, None, false);
+                self.new_window(tree, rect, max, None, false);
             }
         }
     }
 
-    /// The windows as the profile saves them: each one's rect and tree, in order.
-    pub fn saved_windows(&self) -> Vec<(Option<WinRect>, Node)> {
-        self.det.list.iter().filter_map(|w| Some((w.rect, self.window_node(w.id)?))).collect()
+    /// The windows as the profile saves them: each one's rect, maximised flag and tree, in order.
+    pub fn saved_windows(&self) -> Vec<SavedWindow> {
+        self.det.list.iter().filter_map(|w| Some((w.rect, w.max, self.window_node(w.id)?))).collect()
     }
 
     /// Takes the panels of `n` already placed (the main tree, a strip, a window) out of it.
@@ -363,10 +404,10 @@ impl Workspace {
         keep(layout::clean(n)?, &|t| self.present(t))
     }
 
-    fn new_window(&mut self, tree: Node, rect: Option<WinRect>, size: Option<[f32; 2]>, fill: bool) -> u32 {
+    fn new_window(&mut self, tree: Node, rect: Option<WinRect>, max: bool, size: Option<[f32; 2]>, fill: bool) -> u32 {
         self.det.last += 1;
         let id = self.det.last;
-        self.det.list.push(Window { id, dock: build(&tree), rect, size, fill, asked: false });
+        self.det.list.push(Window { id, dock: build(&tree), rect, max, size, fill, asked: false });
         id
     }
 
@@ -448,15 +489,21 @@ impl Workspace {
     }
 
     /// Docks `tabs` back into the main tree, each into the leaf holding any panel it left beside
-    /// (or, unknown, shares a leaf with in the default layout); the rest together into a new leaf
-    /// right of the 3D view.
+    /// (or, with no recorded origin, shares a leaf with in the default layout); the rest — a panel
+    /// that was alone in its leaf, or whose leaf-mates are all gone — together into a new leaf
+    /// right of the 3D view (spec D-12).
     fn dock_back(&mut self, tabs: Vec<DockTab>) {
         let mut rest = Vec::new();
         for t in tabs {
             if self.present(t) {
                 continue;
             }
-            let mates = self.det.origins.remove(&t).filter(|m| !m.is_empty()).unwrap_or_else(|| default_siblings(t));
+            // a known origin, even an empty one (it was alone in its leaf), is never replaced by
+            // the default layout's leaf-mates (review M1)
+            let mates = match self.det.origins.remove(&t) {
+                Some(m) => m,
+                None => default_siblings(t),
+            };
             let leaf = self
                 .dock
                 .iter_leaves()
@@ -620,14 +667,21 @@ mod tests {
     fn the_window_line_round_trips() {
         let tree = layout::parse_window("V(0.50,[Activity*],[Graph*])").unwrap();
         let r = WinRect { x: 1920, y: 0, w: 1920, h: 1040 };
-        let line = encode_window(Some(r), &tree);
+        let line = encode_window(Some(r), false, &tree);
         assert_eq!(line, "1920,0,1920,1040 V(0.50,[Activity*],[Graph*])");
-        assert_eq!(parse_window(&line), Some((Some(r), tree.clone())));
-        assert_eq!(parse_window("-1280,100,1280,1000   [Log*]"), Some((Some(WinRect { x: -1280, y: 100, w: 1280, h: 1000 }), layout::parse_window("[Log*]").unwrap())));
-        assert_eq!(encode_window(None, &tree), "V(0.50,[Activity*],[Graph*])");
-        assert_eq!(parse_window("V(0.50,[Activity*],[Graph*])"), Some((None, tree)));
-        assert_eq!(parse_window("0,0,0,0 [Log]").map(|(r, _)| r), Some(None), "a zero size reads as unknown");
-        for bad in ["", "1,2,3,4", "1,2,3,4 3D", "x,y,w,h [Bogus]", "nonsense"] {
+        assert_eq!(parse_window(&line), Some((Some(r), false, tree.clone())));
+        // maximised: `max` after the rect (review M4)
+        let max = WinRect { x: 2552, y: -8, w: 1920, h: 1009 };
+        let line = encode_window(Some(max), true, &tree);
+        assert_eq!(line, "2552,-8,1920,1009 max V(0.50,[Activity*],[Graph*])");
+        assert_eq!(parse_window(&line), Some((Some(max), true, tree.clone())));
+        assert_eq!(parse_window("2552,-8,1920,1009   max   [Log*]"), Some((Some(max), true, layout::parse_window("[Log*]").unwrap())));
+        assert_eq!(parse_window("-1280,100,1280,1000   [Log*]"), Some((Some(WinRect { x: -1280, y: 100, w: 1280, h: 1000 }), false, layout::parse_window("[Log*]").unwrap())));
+        assert_eq!(encode_window(None, true, &tree), "V(0.50,[Activity*],[Graph*])", "no rect: no max");
+        assert_eq!(parse_window("V(0.50,[Activity*],[Graph*])"), Some((None, false, tree)));
+        assert_eq!(parse_window("0,0,0,0 [Log]").map(|(r, m, _)| (r, m)), Some((None, false)), "a zero size reads as unknown");
+        assert_eq!(parse_window("0,0,0,0 max [Log]").map(|(r, m, _)| (r, m)), Some((None, false)), "max means nothing without a rect");
+        for bad in ["", "1,2,3,4", "1,2,3,4 3D", "1,2,3,4 max", "1,2,3,4 maximal [Log]", "x,y,w,h [Bogus]", "nonsense"] {
             assert_eq!(parse_window(bad), None, "{bad:?}");
         }
     }
@@ -639,8 +693,8 @@ mod tests {
         let mut w = Workspace::default();
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
-            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), layout::parse_window("[Activity*]").unwrap()),
-            (Some(WinRect { x: 5000, y: 40, w: 800, h: 900 }), layout::parse_window("[Graph*]").unwrap()),
+            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Activity*]").unwrap()),
+            (Some(WinRect { x: 5000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap()),
         ]);
         assert_eq!(w.windows().len(), 2);
         w.set_monitors(vec![primary, second]);
@@ -659,22 +713,89 @@ mod tests {
         assert!(layout::panels(&next.to_node()).contains(&Activity));
     }
 
-    /// A window saved maximised (the Two monitors window: its rect as Windows reports a maximised
-    /// window on a 1920 × 1080 monitor, measured 2026-11-03) reopens maximised on that monitor; a
-    /// smaller one on it at its own rect.
+    /// A window saved maximised (`max`; the Two monitors window: its rect as Windows reports a
+    /// maximised window on a 1920 × 1080 monitor, measured 2026-11-03) reopens maximised on the
+    /// monitor holding its centre; one not maximised at its own rect, even when it spans the
+    /// monitor (review M4: the flag, not a guess from the rect — an old line without `max` reads
+    /// as not maximised).
     #[test]
     fn a_window_saved_maximised_reopens_maximised() {
         let second = WinRect { x: 2560, y: 0, w: 1920, h: 1080 };
         let mut w = Workspace::default();
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
-            (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), layout::parse_window("[Activity*]").unwrap()),
-            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), layout::parse_window("[Graph*]").unwrap()),
+            (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), true, layout::parse_window("[Activity*]").unwrap()),
+            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap()),
+            (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), false, layout::parse_window("[Model*]").unwrap()),
         ]);
         w.set_monitors(vec![WinRect { x: 0, y: 0, w: 2560, h: 1440 }, second]);
         let r = w.take_requests();
         assert!(matches!(r[0], WindowRequest::Open { rect: Some(m), fill: true, .. } if m == second), "{r:?}");
         assert!(matches!(r[1], WindowRequest::Open { rect: Some(WinRect { x: 2600, .. }), fill: false, .. }), "{r:?}");
+        assert!(matches!(r[2], WindowRequest::Open { rect: Some(WinRect { x: 2552, .. }), fill: false, .. }), "{r:?}");
+        // the window side reports it restored: saved without `max`
+        let id = w.windows()[0];
+        w.set_window_rect(id, Some(WinRect { x: 2700, y: 100, w: 900, h: 700 }), false);
+        assert!(!w.saved_windows()[0].1);
+        w.set_window_rect(id, None, true);
+        assert!(!w.saved_windows()[0].1, "an unknown rect changes nothing");
+    }
+
+    /// Review I1: a window maximised on the monitor right of the primary (`2552,-8,1920,1009`:
+    /// 8 px of its frame overhang the primary) with that monitor unplugged docks back — its
+    /// title bar is not on the primary; with both monitors it opens, maximised on the second.
+    #[test]
+    fn a_window_maximised_on_an_unplugged_monitor_docks_back() {
+        let primary = WinRect { x: 0, y: 0, w: 2560, h: 1440 };
+        let second = WinRect { x: 2560, y: 0, w: 1920, h: 1080 };
+        let saved = || vec![(Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), true, layout::parse_window("V(0.50,[Activity*],[Graph*])").unwrap())];
+        let mut w = Workspace::default();
+        w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+        w.set_windows(saved());
+        w.set_monitors(vec![primary]);
+        assert!(opens(&w.take_requests()).is_empty() && w.windows().is_empty(), "docked back");
+        assert!(w.present(Activity) && w.present(Graph) && w.window_of(Activity).is_none());
+        assert_eq!(w.take_notes().len(), 1);
+        // both monitors connected: it stays detached
+        let mut both = Workspace::default();
+        both.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+        both.set_windows(saved());
+        both.set_monitors(vec![primary, second]);
+        let r = both.take_requests();
+        assert!(matches!(r.as_slice(), [WindowRequest::Open { rect: Some(m), fill: true, .. }] if *m == second), "{r:?}");
+        assert!(both.window_of(Activity).is_some() && both.take_notes().is_empty());
+    }
+
+    /// Review M2: an empty monitor list (the OS listed none) is "not known", as headless: a saved
+    /// window opens instead of docking back, and there is one monitor and no second.
+    #[test]
+    fn an_empty_monitor_list_is_unknown() {
+        let mut w = Workspace::default();
+        w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+        w.set_windows(vec![(Some(WinRect { x: 9000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap())]);
+        w.set_monitors(vec![]);
+        assert_eq!(opens(&w.take_requests()).len(), 1);
+        assert!(w.take_notes().is_empty());
+        assert_eq!((w.monitor_count(), w.second_monitor()), (1, None));
+    }
+
+    /// Review M1: a panel that was alone in its leaf docks back beside the 3D view on the right
+    /// (spec D-12), not next to its default-layout leaf-mates; with no recorded origin (a window
+    /// from a profile) the default-layout leaf-mates stand in.
+    #[test]
+    fn a_panel_alone_in_its_leaf_docks_back_beside_the_view() {
+        let mut w = Workspace::default();
+        w.set_node(layout::parse("H(0.70,3D,V(0.50,[Log*],[Graph*]))").unwrap());
+        let id = w.pop_out(&[Graph], Graph).unwrap();
+        w.window_closed(id);
+        assert_eq!(layout::encode(&w.to_node()), "H(0.70,H(0.70,3D,[Graph*]),[Log*])");
+        // the same window read from a profile: Graph has no origin, so beside Log (its default leaf-mate)
+        let mut p = Workspace::default();
+        p.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
+        p.set_windows(vec![(None, false, layout::parse_window("[Graph*]").unwrap())]);
+        let id = p.windows()[0];
+        p.window_closed(id);
+        assert_eq!(layout::encode(&p.to_node()), "H(0.70,3D,[Log,Graph*])");
     }
 
     #[test]
@@ -682,9 +803,9 @@ mod tests {
         let mut w = Workspace::default(); // every panel in the main tree
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
-            (None, layout::parse_window("V(0.5,[Activity*,Log],[Graph])").unwrap()),
-            (None, layout::parse_window("[Graph*,Model]").unwrap()),
-            (None, layout::parse_window("[Log*]").unwrap()),
+            (None, false, layout::parse_window("V(0.5,[Activity*,Log],[Graph])").unwrap()),
+            (None, false, layout::parse_window("[Graph*,Model]").unwrap()),
+            (None, false, layout::parse_window("[Log*]").unwrap()),
         ]);
         let ids = w.windows();
         assert_eq!(ids.len(), 2, "the third held only Log, already placed");
@@ -704,12 +825,18 @@ mod tests {
         assert!(DockTab::PANELS.iter().all(|t| all.contains(t)));
     }
 
+    /// A window is usable on a monitor when 64 × 8 px of its title-bar strip (top 32 px, 8 px in
+    /// from each side) are on it.
     #[test]
-    fn rects_intersect() {
-        let a = WinRect { x: 0, y: 0, w: 100, h: 100 };
-        assert!(a.intersects(&WinRect { x: 99, y: 99, w: 10, h: 10 }));
-        assert!(!a.intersects(&WinRect { x: 100, y: 0, w: 10, h: 10 }), "touching is not overlapping");
-        assert!(!a.intersects(&WinRect { x: -10, y: 0, w: 10, h: 10 }));
-        assert!(a.intersects(&WinRect { x: -10, y: -10, w: 200, h: 200 }));
+    fn a_window_is_usable_where_its_title_bar_is() {
+        let m = WinRect { x: 0, y: 0, w: 1000, h: 800 };
+        let at = |x, y| WinRect { x, y, w: 400, h: 300 };
+        assert!(at(100, 100).usable_on(&m));
+        assert!(at(-8, -8).usable_on(&m), "maximised-style overhang");
+        assert!(at(1000 - 8 - 64, 0).usable_on(&m) && !at(1000 - 8 - 63, 0).usable_on(&m), "64 px of the strip, inset 8");
+        assert!(at(-400 + 8 + 64, 0).usable_on(&m) && !at(-400 + 8 + 63, 0).usable_on(&m));
+        assert!(at(100, 800 - 8).usable_on(&m) && !at(100, 800 - 7).usable_on(&m), "8 px of its height");
+        assert!(!at(100, -32 + 7).usable_on(&m), "its title bar above the monitor");
+        assert!(!at(1000, 0).usable_on(&m) && !at(-400, 0).usable_on(&m), "beside it");
     }
 }

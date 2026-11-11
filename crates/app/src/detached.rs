@@ -11,8 +11,8 @@
 //! - **Placement:** at its saved rect (outer position and inner size, physical pixels); a new one
 //!   where the OS puts it, its leaf's size; the Two monitors layout's maximised on the second
 //!   monitor (placed inside it first, so Windows maximises it there: its work area, not full
-//!   screen). Where it is goes back to the UI as it moves (`Workspace::set_window_rect`), which the
-//!   profile saves.
+//!   screen). Where it is and whether it is maximised go back to the UI as it moves
+//!   (`Workspace::set_window_rect`), which the profile saves.
 //! - **Frames:** its input is taken when the main window's is; a frame is drawn only while the
 //!   window has a size (minimised: skipped, its texture uploads still applied). Its present mode is
 //!   Mailbox when the GPU has it, so its vsync never holds the main window's frames (as the
@@ -92,6 +92,11 @@ impl DetachedWindow {
         let p = self.window.outer_position().ok()?;
         let s = self.window.inner_size();
         (s.width > 0 && s.height > 0).then_some(WinRect { x: p.x, y: p.y, w: s.width, h: s.height })
+    }
+
+    /// Whether the window is maximised (the profile's `max`: it reopens maximised).
+    pub fn maximized(&self) -> bool {
+        self.window.is_maximized()
     }
 
     /// Feeds one of its window events to its egui state.
