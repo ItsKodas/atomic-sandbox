@@ -287,16 +287,28 @@ impl RowView {
             label: r.label.to_string(),
             ha: energy_ha(r.energy),
             ev: energy_ev(r.energy),
-            occupation: if (r.occupation - r.occupation.round()).abs() < 1e-9 { format!("{}", r.occupation.round() as i64) } else { format!("{:.2}", r.occupation) },
+            occupation: occupation_text(r.occupation),
             occupied: r.occupation > 0.0,
             tags,
         }
+    }
+
+    /// One row for a closed shell's pair ([`paired`]; user request 2026-11-11): the ↑ member's ε
+    /// and tags, the two occupations summed (H₂'s σ_g reads 2; a fractional shell sums its two
+    /// fractions).
+    pub fn pair(up: &OrbitalInfo, dn: &OrbitalInfo, levels: &Levels) -> RowView {
+        RowView { occupation: occupation_text(up.occupation + dn.occupation), ..RowView::of(up, levels) }
     }
 
     /// The label's tooltip: what is on screen when this orbital is picked.
     pub fn label_tip(&self) -> String {
         format!("{KS_NOTE} Click to show it (the selection follows this orbital as the levels reorder). {SIGN_TIP}.")
     }
+}
+
+/// An occupation as the list prints it: an integer bare, a fraction to two places.
+fn occupation_text(f: f64) -> String {
+    if (f - f.round()).abs() < 1e-9 { format!("{}", f.round() as i64) } else { format!("{f:.2}") }
 }
 
 /// The lone-atom verdict as a line under the list (`None` for molecules and for a labelled atom
@@ -469,6 +481,32 @@ pub fn included(st: &UiState, r: &OrbitalInfo) -> bool {
         None => r.occupation > 0.0,
         Some(set) => set.contains(&r.track),
     }
+}
+
+/// The paired heading's tooltip.
+pub const PAIRED_TIP: &str = "each orbital holds one ↑ and one ↓ electron with the same shape and energy (a closed shell); the lists split into ↑ and ↓ as soon as the two spins differ by more than 0.1 mHa";
+
+/// The rows of each channel, ↑ then ↓, in index (energy) order.
+fn channels(rows: &[OrbitalInfo]) -> [Vec<&OrbitalInfo>; 2] {
+    [Spin::Up, Spin::Down].map(|s| {
+        let mut v: Vec<&OrbitalInfo> = rows.iter().filter(|r| r.spin == s).collect();
+        v.sort_by_key(|r| r.index);
+        v
+    })
+}
+
+/// Whether the two channels are one closed shell, so the list folds them into one ↑↓ list (user
+/// request 2026-11-11: "fold them in … when they're the exact same, less confusing"): the spin
+/// readout says no net spin ([`SpinSummary::no_net_spin`]: ∫|m| inside the solver's noise, so a
+/// broken-symmetry singlet — equal ε, different shapes — stays split), both channels hold as many
+/// rows, and the rows matched by index have equal occupations and ε within [`SAME_LEVEL`] (the
+/// solver's spin noise is ≤ 3e-6 Ha). A list without an occupied row is not paired.
+pub fn paired(rows: &[OrbitalInfo], spin: &SpinSummary) -> bool {
+    let [up, dn] = channels(rows);
+    spin.no_net_spin()
+        && up.len() == dn.len()
+        && up.iter().any(|r| r.occupation > 0.0)
+        && up.iter().zip(&dn).all(|(u, d)| u.index == d.index && (u.occupation - d.occupation).abs() < 1e-9 && (u.energy - d.energy).abs() <= SAME_LEVEL)
 }
 
 // ---- the tab ----
@@ -729,25 +767,47 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
             OrbitalRequest::Orbital { spin, track, .. } => Some((*spin, *track)),
             _ => None,
         };
-        for spin in [Spin::Up, Spin::Down] {
-            let mut rows: Vec<&OrbitalInfo> = o.rows.iter().filter(|r| r.spin == spin).collect();
-            rows.sort_by_key(|r| r.index);
-            let n_occ = rows.iter().filter(|r| r.occupation > 0.0).count();
-            if n_occ == 0 {
-                ui.label(RichText::new(format!("{}: none occupied", arrow(spin))).color(theme::INK_DIM));
-            } else {
-                ui.label(RichText::new(format!("{} spin · {n_occ} occupied", arrow(spin))).strong());
-            }
+        let [up, dn] = channels(&o.rows);
+        if paired(&o.rows, &o.spin) {
+            // a closed shell: one row per ↑↓ pair instead of two identical blocks (user request
+            // 2026-11-11); any difference between the spins splits the list again
+            let n_occ = up.iter().filter(|r| r.occupation > 0.0).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("↑↓ paired · {n_occ} occupied")).strong());
+                theme::info(ui, PAIRED_TIP);
+            });
             let mut shown_unocc = false;
-            for r in rows {
-                if r.occupation == 0.0 && !shown_unocc {
+            for (u, d) in up.into_iter().zip(dn) {
+                if u.occupation == 0.0 && !shown_unocc {
                     shown_unocc = true;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("{} unoccupied", arrow(spin))).color(theme::INK_DIM));
+                        ui.label(RichText::new("↑↓ unoccupied").color(theme::INK_DIM));
                         theme::info(ui, UNOCCUPIED_TIP);
                     });
                 }
-                row(ui, st, r, &levels, picked == Some((r.spin, r.track)), acts);
+                // either member picked shows the pair as selected
+                let on = picked == Some((u.spin, u.track)) || picked == Some((d.spin, d.track));
+                row(ui, st, u, Some(d), &levels, on, acts);
+            }
+        } else {
+            for (spin, rows) in [(Spin::Up, up), (Spin::Down, dn)] {
+                let n_occ = rows.iter().filter(|r| r.occupation > 0.0).count();
+                if n_occ == 0 {
+                    ui.label(RichText::new(format!("{}: none occupied", arrow(spin))).color(theme::INK_DIM));
+                } else {
+                    ui.label(RichText::new(format!("{} spin · {n_occ} occupied", arrow(spin))).strong());
+                }
+                let mut shown_unocc = false;
+                for r in rows {
+                    if r.occupation == 0.0 && !shown_unocc {
+                        shown_unocc = true;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("{} unoccupied", arrow(spin))).color(theme::INK_DIM));
+                            theme::info(ui, UNOCCUPIED_TIP);
+                        });
+                    }
+                    row(ui, st, r, None, &levels, picked == Some((r.spin, r.track)), acts);
+                }
             }
         }
         if o.rows.iter().any(|r| r.occupation == 0.0) {
@@ -757,32 +817,53 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
 }
 
 /// One orbital: swatch, include box (all-coloured mode), the label as the picker, ε, occupation,
-/// then its tags.
-fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, levels: &Levels, picked: bool, acts: &mut Vec<Action>) {
-    let v = RowView::of(r, levels);
+/// then its tags. With `partner` (the ↓ member of a closed shell's pair, [`paired`]; user request
+/// 2026-11-11) `r` is the ↑ member and the row stands for both: labelled `↑↓`, probed
+/// `orbital-↑↓-{↑ track}`, the occupations summed; a click picks the ↑ orbital and the include
+/// box toggles both tracks.
+fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalInfo>, levels: &Levels, picked: bool, acts: &mut Vec<Action>) {
+    let v = match partner {
+        Some(d) => RowView::pair(r, d, levels),
+        None => RowView::of(r, levels),
+    };
+    let arrows = if partner.is_some() { "↑↓" } else { arrow(r.spin) };
     let colour = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
     ui.horizontal(|ui| {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         ui.painter().rect_filled(rect, 3.0, swatch(colour));
         resp.on_hover_text(if st.show == ShowMode::Coloured { "this orbital's colour in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)" } else { "this orbital's colour in All orbitals coloured" });
         if st.show == ShowMode::Coloured {
-            let mut on = included(st, r);
-            let cb = ui.checkbox(&mut on, "").on_hover_text(if r.occupation > 0.0 { "include this orbital in the colour volume" } else { UNOCC_INCLUDE_TIP });
+            // a pair's box is on while either member is drawn, and switches both
+            let mut on = included(st, r) || partner.is_some_and(|d| included(st, d));
+            let tip = match (partner.is_some(), r.occupation > 0.0) {
+                (_, false) => UNOCC_INCLUDE_TIP,
+                (true, true) => "include this pair (its ↑ and its ↓ orbital) in the colour volume",
+                (false, true) => "include this orbital in the colour volume",
+            };
+            let cb = ui.checkbox(&mut on, "").on_hover_text(tip);
             super::super::probe(&format!("include-{}", r.track), &cb);
             if cb.changed() {
                 acts.push(Action::Include { track: r.track, on });
+                if let Some(d) = partner.filter(|d| d.track != r.track) {
+                    acts.push(Action::Include { track: d.track, on });
+                }
             }
         }
-        let name = RichText::new(format!("{} {}", v.label, arrow(r.spin))).monospace();
+        let name = RichText::new(format!("{} {arrows}", v.label)).monospace();
         let b = ui.add(egui::Button::selectable(picked, name));
         let b = b.on_hover_text(v.label_tip());
-        super::super::probe(&format!("orbital-{}-{}", arrow(r.spin), r.track), &b);
+        super::super::probe(&format!("orbital-{arrows}-{}", r.track), &b);
         if b.clicked() {
             acts.push(Action::PickOrbital { spin: r.spin, track: r.track });
         }
         ui.label(RichText::new(&v.ha).monospace()).on_hover_text("ε in Hartree: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow");
         ui.label(RichText::new(&v.ev).monospace().color(theme::INK_DIM)).on_hover_text("ε in eV (1 Ha = 27.2114 eV; converted for display only)");
-        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(theme::INK_DIM)).on_hover_text("occupation: 1 or 0 (integer aufbau); a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)");
+        let occ_tip = if partner.is_some() {
+            "occupation of the pair: the sum of its ↑ and its ↓ orbital's (1 + 1 = 2 for a closed shell; a fraction is a degenerate shell shared equally, summed over both spins — pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
+        } else {
+            "occupation: 1 or 0 (integer aufbau); a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
+        };
+        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(theme::INK_DIM)).on_hover_text(occ_tip);
     });
     if !v.tags.is_empty() {
         ui.horizontal_wrapped(|ui| {

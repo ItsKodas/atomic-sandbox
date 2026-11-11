@@ -2715,6 +2715,105 @@ mod orbital_viewer {
         assert_eq!(orbital_view_commands(&outs)[0].what, OrbitalRequest::SpinDensity);
     }
 
+    /// A closed-shell spin readout: ∫|m| inside the solver's noise budget (no net spin).
+    fn closed_spin() -> SpinSummary {
+        SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 1e-7, rho_max: 0.4, scale: 4e-4, noise: 1.4e-4 }
+    }
+
+    /// A closed-shell H₂ list: σ_g and σ_u in both channels (↓ on ↑'s slots), the ↓ energies off by
+    /// the solver's spin noise, tracks ↑ 1, 3 and ↓ 2, 4, with a readout that says no net spin.
+    fn h2_closed() -> OrbitalDisplay {
+        let rows = vec![
+            row(Spin::Up, 0, 1, 0, -0.5, 1.0, idx(1)),
+            row(Spin::Up, 1, 3, 1, 0.02, 0.0, idx(2)),
+            row(Spin::Down, 0, 2, 0, -0.5 + 5e-9, 1.0, idx(1)),
+            row(Spin::Down, 1, 4, 1, 0.02 - 5e-9, 0.0, idx(2)),
+        ];
+        let mut o = payload(rows, OrbitalRequest::List);
+        o.spin = closed_spin();
+        o
+    }
+
+    /// The fold test (user request 2026-11-11): the channels are one closed shell only when every
+    /// pair matched by index has the same occupation and ε within the 1e-4 Ha level window, the rows
+    /// count the same, and the spin readout says no net spin; the pair's row sums the occupations.
+    #[test]
+    fn a_closed_shell_pairs_its_channels() {
+        let o = h2_closed();
+        let closed = closed_spin();
+        assert!(orbitals::paired(&o.rows, &closed), "H₂: ↑ and ↓ differ by 5e-9 Ha");
+        let mut far = o.rows.clone();
+        far[2].energy = -0.5 + 2e-4;
+        assert!(!orbitals::paired(&far, &closed), "2e-4 Ha apart: two levels");
+        let mut occ = o.rows.clone();
+        occ[2].occupation = 0.5;
+        assert!(!orbitals::paired(&occ, &closed), "occupations differ");
+        assert!(!orbitals::paired(&o.rows[..3], &closed), "↑ has two rows, ↓ one");
+        assert!(!orbitals::paired(&h2_rows(), &closed), "the older fixture: the ↓ σ_u is missing");
+        let broken = SpinSummary { abs_integral: 0.6, max_abs: 0.1, ..closed };
+        assert!(!orbitals::paired(&o.rows, &broken), "a broken-symmetry singlet: same ε, not the same shapes");
+        assert!(!orbitals::paired(&o.rows, &SpinSummary::default()), "no noise budget: no verdict");
+        let lone_h = [row(Spin::Up, 0, 1, 0, -0.24, 1.0, idx(1))];
+        assert!(!orbitals::paired(&lone_h, &SpinSummary { n_dn: 0, integral: 1.0, abs_integral: 1.0, ..closed }));
+        assert!(!orbitals::paired(&[], &closed), "no electrons");
+        // the pair's row: ε and tags of the ↑ member, the occupations summed
+        let l = Levels::of(&o.rows);
+        let v = RowView::pair(&o.rows[0], &o.rows[2], &l);
+        assert_eq!((v.occupation.as_str(), v.ha.as_str()), ("2", RowView::of(&o.rows[0], &l).ha.as_str()));
+        assert!(v.tags.iter().any(|t| t.text == "HOMO"), "{:?}", v.tags);
+        let mut third = o.rows.clone();
+        third[0].occupation = 1.0 / 3.0;
+        third[2].occupation = 1.0 / 3.0;
+        assert_eq!(RowView::pair(&third[0], &third[2], &Levels::of(&third)).occupation, "0.67", "a fractional shell sums too");
+    }
+
+    /// On screen, a closed shell is one ↑↓ list (user request 2026-11-11): one heading, one row per
+    /// pair probed `orbital-↑↓-{↑ track}` reading `occ 2`, no ↓ block; a click picks the ↑ member,
+    /// the include box of a pair toggles both tracks; an open shell keeps its two blocks.
+    #[test]
+    fn a_closed_shell_is_one_paired_list_on_screen() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+        assert!(has("↑↓ paired · 1 occupied") && has("↑↓ unoccupied") && has("#1 ↑↓") && has("occ 2"), "{texts:?}");
+        assert!(!has("↑ spin") && !has("↓ spin") && !has("↓: none occupied"), "{texts:?}");
+        let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
+        assert!(probed("orbital-↑↓-1") && probed("orbital-↑↓-3"));
+        assert!(!probed("orbital-↑-1") && !probed("orbital-↓-2"), "no row per member");
+        let outs = click_widget(&ctx, &mut st, &inp, "orbital-↑↓-1");
+        assert_eq!(orbital_view_commands(&outs)[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
+        assert_eq!(st.orbital_pick, Some((Spin::Up, 1)));
+        // All orbitals coloured: the pair's box takes both members out
+        st.show = ShowMode::Coloured;
+        click_widget(&ctx, &mut st, &inp, "include-1");
+        assert_eq!(st.included, Some(std::collections::BTreeSet::new()), "σ_g ↑ (1) and ↓ (2) both off");
+        // an open shell (a lone H: one ↑ electron, no ↓) draws as before
+        let lone = payload(vec![row(Spin::Up, 0, 1, 0, -0.24, 1.0, idx(1))], OrbitalRequest::List);
+        let mut lone = lone;
+        lone.spin = SpinSummary { n_dn: 0, integral: 1.0, abs_integral: 1.0, ..closed_spin() };
+        let snap = with_payload(&scene, Backend::Gpu, lone);
+        let inp = input(&scene, Some(&snap), &cam);
+        st.show = ShowMode::Orbitals;
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 6.0).into_iter().map(|(t, _)| t).collect();
+        let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+        assert!(has("↑ spin · 1 occupied") && has("↓: none occupied") && !has("↑↓ paired"), "{texts:?}");
+    }
+
     /// Every pinned honesty string is in the text its widget shows (tooltips are built by these
     /// functions and constants; the layout test draws them).
     #[test]
