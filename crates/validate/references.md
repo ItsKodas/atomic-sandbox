@@ -4174,7 +4174,7 @@ Standard pass's job count — CH₄ 81³ 384 jobs, 69.9 s (incl. pseudopotential
 95³ 600 jobs, 8.5 / 8.0 s; C₃H₈ 107³ 840 jobs, 37.6 / 30.6 s; H₂O 95³ 300 jobs, 18.7 / 2.8 s; (H₂O)₂
 start 101³ (a 4 Bohr margin then; the test now boxes training clusters at 5) 384 jobs, 22.6 / 10.2 s; (H₂O)₃ start 101³ 588 jobs, 65.0 / 48.9 s.
 
-## M8a capping gate (Task 10a, 2026-11-02; `tests/capping.rs` `capped_segments_train_like_the_whole_molecule`, `#[ignore]`d) — **not yet run**
+## M8a capping gate (Task 10a, 2026-11-02; run 2026-11-12; `tests/capping.rs` `capped_segments_train_like_the_whole_molecule`, `#[ignore]`d) — **FAILS: 11.96× (limit 1.5×)**
 
 Spec §4.5's condition: a collection taught on capped segments of n-butane (the two end cuts, each a
 propane-like 10 + 1-cap segment whose interior is the methyl group, at `COLLECTION_R_CUT` = 6 Bohr)
@@ -4187,7 +4187,32 @@ pseudopotential generation, 95 s warm, 90 s cold after a reset; an end segment i
 cold, 37 s warm. Estimated GPU wall: `relax_butane` (ruling P7: the scene must be relaxed by this
 solver first) 2.6–5.3 h for 100–200 FIRE steps, then the gate 1.5 h (20 training geometries) to
 2.6 h (40) at the probe's times — up to 3.8–6.4 h at Task 6's measured 2.5× run-over-probe factor.
-Over the task's 3 h budget: not run; `scenes/butane.scene` not made. Run, alone: `relax_butane`, then
+Over the task's 3 h budget at first; ruling P22 cut it (segments in their own scene-margin box, 113³;
+20 training geometries; `relax_butane` stopped at FIRE max|F| 2e-3 or 60 steps). Run, alone: `relax_butane`, then
 `cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`
 (`CAPPING_TRAIN=n` sets the training geometries, `CAPPING_REUSE=1` continues a stopped run from
 its stored answers).
+
+**Run (RX 7900 XTX; `ollama` resident and idle, no app.exe open, nothing else on the GPU).**
+`scenes/butane.scene`: 27 FIRE steps, E = −29.237850 Ha, max|F| 1.4e-3 Ha/Bohr, C–C 2.854/2.861/2.854 Bohr.
+The teacher answers were solved 2026-11-02 (≈ 12:58–15:11, ≈ 2.2 h wall including one restart after a
+box-affected draw) by a session that died before reporting; the 2026-11-12 run continued them with
+`CAPPING_REUSE=1` (no solver, `qm`/`qm-gpu`/`sim` or `providers::ks` change between the two; the fits
+and trust verdicts are the fixed code's, 1da27b1) — 2 more held-out solves (161 s, 229 s; 16 SCF/solve)
+and the three fits, 394 s. Box rule 7.2e-6 e/Bohr³: draws "whole 11", "held-out 19", "held-out 20"
+skipped as box-affected. References: 125³ H −0.478151, C −5.536958 Ha; segments' 113³ H −0.478144,
+C −5.536935 Ha. Cap length 2.0839 Bohr; interior class atoms [0, 3, 4, 5, 6, 11, 12, 13] (8 of 14);
+segments 11.0 atoms, 4.00 interior.
+
+| Collection | Samples (fitted) | Energy / force rows | Train rmse F | Held-out F RMSE, interior class | all atoms | Trusted interior-class atoms |
+|---|---|---|---|---|---|---|
+| A (whole) | 20 stored, 18 fitted (2 held by the collection) | 18 / 756 | 1.62e-3 | **3.007e-3** Ha/Bohr | 3.233e-3 | 0/160 |
+| control (whole answers, interior rows) | 20 | 0 / 480 | 1.10e-3 | 3.022e-3 | 2.496e-2 | 0/160 |
+| B (capped segments) | 40 | 0 / 480 | 9.29e-4 | **3.598e-2** | 3.767e-2 | 0/160 |
+
+B/A = **11.96×** (limit 1.5×) — **FAIL**; B/control 11.91× (the capping error alone); control/A 1.00×
+(the interior rows alone lose nothing). No model is trusted (every collection: n_samples < Q′ 284;
+answered geometries 0/20): the comparison is on force RMSE, i.e. whether the two training methods are
+equivalent — they are not. Per spec §4.5 capping is to be replaced by the uncapped two-shell cut and
+the gate rerun (not done here: physics code). Reproduce (≈ 7 min with the stored answers, hours without):
+`CAPPING_REUSE=1 cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`.
