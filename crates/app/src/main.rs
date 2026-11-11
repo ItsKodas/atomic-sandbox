@@ -22,6 +22,7 @@ mod reference;
 mod replay;
 mod scene;
 mod screenshot;
+mod segment;
 mod sim;
 mod tools;
 mod trails;

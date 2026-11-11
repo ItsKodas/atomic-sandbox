@@ -20,6 +20,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
     });
     resume_row(ui, st, input, acts);
+    super::selection::segment_row(ui, st, input, "d-model-segment", acts);
     if st.backend != Backend::Estimated {
         theme::note(ui, "The estimated solver is not running: pick Estimated in the toolbar's Solver group. Its model, sampling pass and audits show here.");
         return;

@@ -209,6 +209,18 @@ pub enum Action {
     /// accepted, then Relax. Recorded as `# not replayable: builder` (a script does not carry the
     /// drawing).
     Builder(crate::builder::Handoff),
+    /// "Train this segment" (Dock ▸ Selection, the Model tab; M8a Task 10, `crate::segment`): cut
+    /// these atoms (the selection) out with their surroundings, capped, for the Standard plan — the
+    /// preview and its confirmation card, the run paused; a refusal names its reason and changes
+    /// nothing. Recorded as `# not replayable: segment` (it opens a scene of its own).
+    TrainSegment(Vec<usize>),
+    /// The confirmation's "Open the segment": the scene saved to a temp file, the segment opened in
+    /// the estimated solver with the Standard plan ready (not started), the "back to the scene" chip.
+    OpenSegment,
+    /// The confirmation's "Cancel": the preview closes, nothing changes.
+    CancelSegment,
+    /// The chip "← back to <scene>": the saved scene again, on the solver it had.
+    BackToScene,
     /// The capture's Screenshot button (`crate::capture`; display only, writes a file — not
     /// replayable).
     Screenshot,
@@ -651,6 +663,10 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::ColourBlend { additive } => st.colour_additive = additive,
         Action::Builder(h) => builder_hand_off(st, input, h, out),
+        Action::TrainSegment(atoms) => train_segment(st, input, &atoms, out),
+        Action::OpenSegment => open_segment(st, input, out),
+        Action::CancelSegment => st.segment_preview = None,
+        Action::BackToScene => back_to_scene(st, out),
         Action::ColourScale { physical } => {
             st.colour_physical = physical;
             if st.show == ShowMode::Coloured {
@@ -723,6 +739,124 @@ fn builder_hand_off(st: &mut UiState, input: &PanelInput<'_>, h: crate::builder:
             out.commands.push(Command::Dyn(DynCommand::Relax));
         }
     }
+}
+
+/// The model's cutoff for a cut: the attached model's (its knowledge map carries it), else the one
+/// every new model is built with (`surrogate::Basis::new`).
+pub fn model_cutoff(st: &UiState) -> f64 {
+    st.activity.knowledge.as_ref().map_or_else(|| surrogate::Basis::new(&[]).r_cut, |k| k.r_cut)
+}
+
+/// The plan a segment opens with: Standard (mockup (d)), the panel's seed kept.
+pub fn segment_plan(st: &UiState) -> SamplingPlan {
+    let standard = super::sampling_presets::PRESETS.iter().find(|p| p.name == "Standard").expect("the Standard preset");
+    standard.plan(st.plan.seed)
+}
+
+/// `Action::TrainSegment`: the cut for the Standard plan (`segment::cut_for_plan`) and the
+/// segment's own refusals (`segment::check_budget`, for the estimated solver's GPU solvers) — the
+/// preview on success, the reason otherwise (no scene change either way).
+fn train_segment(st: &mut UiState, input: &PanelInput<'_>, atoms: &[usize], out: &mut PanelOutput) {
+    if input.sampling() {
+        out.error = Some("Train this segment: a sampling pass is running — let it finish (or Cancel it) first".into());
+        return;
+    }
+    let bonds = input.snapshot.and_then(|s| s.dynamics.bonds.as_deref());
+    let solvers = crate::quality::gpu_solvers(Backend::Estimated, st.gpu_available);
+    let cut = crate::segment::cut_for_plan(input.scene, atoms, model_cutoff(st), &segment_plan(st), bonds)
+        .and_then(|seg| crate::segment::check_budget(&seg, solvers, crate::quality::vram_budget()).map(|()| seg));
+    match cut {
+        Ok(seg) => {
+            if input.playing {
+                out.commands.push(Command::Dyn(DynCommand::Pause));
+            }
+            st.set_status(format!(
+                "segment preview: {} atoms + {} caps, {} to teach — Open the segment or Cancel (the card over the view)",
+                seg.source_indices.iter().flatten().count(),
+                seg.caps.len(),
+                seg.n_interior()
+            ));
+            st.segment_preview = Some(seg);
+        }
+        Err(e) => {
+            st.segment_preview = None;
+            out.error = Some(format!("Train this segment: {e}"));
+        }
+    }
+}
+
+/// Where the scene a segment leaves is kept: the system temp folder (a file per opening).
+fn segment_source_path() -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    std::env::temp_dir().join("atomic-sandbox").join(format!("segment-source-{}-{stamp}.scene", std::process::id()))
+}
+
+/// `Action::OpenSegment` (module doc of `crate::segment`; mockup (d) 3.).
+fn open_segment(st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelOutput) {
+    let Some(seg) = st.segment_preview.take() else { return };
+    let path = segment_source_path();
+    let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, input.scene.to_text()));
+    if let Err(e) = saved {
+        out.error = Some(format!("Train this segment: the scene could not be saved for the way back ({}: {e}) — the segment was not opened", path.display()));
+        return;
+    }
+    // a chain of segments goes back to the first scene, not to the segment before
+    let back = match st.segment_back.take().filter(|_| matches!(st.source, super::SceneSource::Segment(_))) {
+        Some(b) => super::SegmentBack { caps: seg.caps.clone(), taught: seg.n_interior(), ..b },
+        None => super::SegmentBack {
+            path: path.clone(),
+            label: st.source.label(),
+            source: st.source.clone(),
+            scene_path: st.scene_path.clone(),
+            backend: st.backend,
+            ionic: st.ionic,
+            quality_h: st.quality_h,
+            caps: seg.caps.clone(),
+            taught: seg.n_interior(),
+        },
+    };
+    st.source = super::SceneSource::Segment(back.label.clone());
+    st.segment_back = Some(back);
+    st.backend = Backend::Estimated;
+    st.adopt(&seg.scene);
+    st.wall_half_width = super::default_wall_half_width(&seg.scene);
+    st.plan = segment_plan(st);
+    st.open_tab(DockTab::Model);
+    if st.walls_on {
+        out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+    }
+    st.set_status(format!(
+        "segment ready: {} atoms to teach — Model ▸ Start sampling (the Standard plan; the cut is for it). The scene was saved as {}",
+        seg.n_interior(),
+        path.display()
+    ));
+    out.switch_scene = Some(seg.scene);
+}
+
+/// `Action::BackToScene`: the saved scene and the panel's settings for it, on the solver it had.
+fn back_to_scene(st: &mut UiState, out: &mut PanelOutput) {
+    let Some(b) = st.segment_back.take() else { return };
+    let s = match std::fs::read_to_string(&b.path).map_err(|e| e.to_string()).and_then(|t| Scene::parse(&t)) {
+        Ok(s) => s,
+        Err(e) => {
+            out.error = Some(format!("back to {}: {} cannot be read ({e})", b.label, b.path.display()));
+            st.segment_back = Some(b);
+            return;
+        }
+    };
+    st.source = b.source;
+    st.scene_path = b.scene_path;
+    st.ionic = b.ionic;
+    st.adopt(&s);
+    st.quality_h = b.quality_h;
+    st.quality_slider = b.quality_h;
+    st.wall_half_width = super::default_wall_half_width(&s);
+    st.backend = b.backend;
+    if st.walls_on {
+        out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
+    }
+    st.set_status(format!("back to {}", b.label));
+    out.switch_scene = Some(s);
 }
 
 /// The orbital view as the panel now means it, to the worker (display only).
@@ -911,7 +1045,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) => return None,
         })
     }
 

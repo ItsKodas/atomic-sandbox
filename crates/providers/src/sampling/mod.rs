@@ -826,6 +826,38 @@ impl Sampler {
         &self.scans
     }
 
+    /// How far the pass's **planned** fitted geometries move the scene (Bohr): the largest change,
+    /// over the queued perturbations and scan points, of a nucleus's position or of an interatomic
+    /// distance (a perturbation moves every nucleus, so a distance can change by up to twice a
+    /// displacement; a scan point moves one nucleus, by |r_k − r₀|). Not counted: the hot burst (a
+    /// trajectory, not planned up front), shell checks (never fitted; a capped segment plans none),
+    /// references and skipped geometries. What M8a ruling P24 reads: a capped segment's interior
+    /// test uses r_cut + this, so no planned move brings a cap within r_cut of an interior atom
+    /// (the app's `segment` cut). Informational for the pass itself: decides nothing here.
+    pub fn largest_planned_displacement(&self) -> f64 {
+        let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        let dist = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+        let mut worst = 0.0f64;
+        for job in &self.queue {
+            let sc = match job {
+                Job::Perturbation(sc) | Job::Scan(sc, _, _) => sc,
+                _ => continue,
+            };
+            let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+            let moved: Vec<usize> = (0..pos.len()).filter(|&i| pos[i] != base[i]).collect();
+            for &i in &moved {
+                worst = worst.max(dist(pos[i], base[i]));
+                // every pair with a moved end (a pair of two moved ends is seen from both)
+                for j in 0..pos.len() {
+                    if j != i {
+                        worst = worst.max((dist(pos[i], pos[j]) - dist(base[i], base[j])).abs());
+                    }
+                }
+            }
+        }
+        worst
+    }
+
     /// Samples handed to the surrogate so far.
     pub fn samples_added(&self) -> usize {
         self.added

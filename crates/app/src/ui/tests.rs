@@ -4997,3 +4997,89 @@ mod knowledge_map {
         assert_eq!(dup.right_tabs, DockTab::RIGHT.to_vec());
     }
 }
+
+/// Train this segment (M8a Task 10): the Selection tab's button sends `Action::TrainSegment` with the
+/// selection and opens the preview (the run untouched otherwise: no scene change); the card's Open
+/// saves the scene, switches to the estimated solver on the segment with the Standard plan ready and
+/// shows the "back to" chip, whose click brings the saved scene back on the solver it had. The
+/// Model tab has the same button; an empty selection disables it.
+#[test]
+fn the_train_segment_button_opens_the_segment_and_the_chip_goes_back() {
+    let scene = crate::segment::alkane(10);
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.adopt_file("decane.scene", &scene);
+    st.backend = Backend::Gpu;
+    st.plan.seed = 7;
+    st.plan.perturbations = 3; // a custom plan: the segment opens with Standard instead
+    st.open_tab(DockTab::Selection);
+    let inp = PanelInput { selected: Some(0), ..input(&scene, None, &cam) };
+    let outs = click_widget(&ctx, &mut st, &inp, "train-segment");
+    let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+    assert_eq!(acts, vec![&Action::TrainSegment(vec![0])]);
+    assert!(outs.iter().all(|o| o.error.is_none() && o.switch_scene.is_none() && o.commands.is_empty()), "a preview changes nothing");
+    let seg = st.segment_preview.clone().expect("the preview");
+    assert!(seg.interior[0] && !seg.caps.is_empty());
+    // Open: the scene saved, the segment in the estimated solver, Standard ready, the chip
+    let outs = click_widget(&ctx, &mut st, &inp, "segment-open");
+    let opened = outs.iter().find_map(|o| o.switch_scene.clone()).expect("the segment opens");
+    assert_eq!(opened, seg.scene);
+    assert!(st.segment_preview.is_none());
+    assert_eq!(st.backend, Backend::Estimated);
+    assert_eq!(st.source, SceneSource::Segment("decane.scene".into()));
+    assert_eq!(st.source.label(), "decane.scene · segment");
+    assert_eq!(st.plan, sim::SamplingPlan { seed: 7, ..sim::SamplingPlan::default() }, "Standard, the seed kept");
+    assert_eq!((st.grid_n, st.grid_h), (seg.scene.grid_n, seg.scene.grid_h));
+    let back = st.segment_back.clone().expect("the way back");
+    assert_eq!((back.backend, back.label.as_str(), back.caps.clone()), (Backend::Gpu, "decane.scene", seg.caps.clone()));
+    let saved = Scene::parse(&std::fs::read_to_string(&back.path).unwrap()).unwrap();
+    assert_eq!(saved.nuclei.len(), scene.nuclei.len());
+    // the segment's view: the chip goes back
+    let inp2 = input(&opened, None, &cam);
+    let outs = click_widget(&ctx, &mut st, &inp2, "segment-back");
+    assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::BackToScene));
+    let again = outs.iter().find_map(|o| o.switch_scene.clone()).expect("the scene comes back");
+    assert_eq!(again, saved);
+    assert_eq!(again.nuclei.iter().map(|n| n.z).collect::<Vec<_>>(), scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>());
+    assert!(again.nuclei.iter().zip(&scene.nuclei).all(|(a, b)| (0..3).all(|k| (a.pos[k] - b.pos[k]).abs() < 1e-3)));
+    assert_eq!((st.backend, st.source.clone(), st.scene_path.as_str()), (Backend::Gpu, SceneSource::File("decane.scene".into()), "decane.scene"));
+    assert!(st.segment_back.is_none());
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let _ = std::fs::remove_file(&back.path);
+    // the Model tab has it too; nothing selected: disabled (no action)
+    st.open_tab(DockTab::Model);
+    let outs = click_widget(&ctx, &mut st, &inp, "train-segment-model");
+    assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), vec![&Action::TrainSegment(vec![0])]);
+    st.segment_preview = None;
+    let none = input(&scene, None, &cam);
+    let outs = click_widget(&ctx, &mut st, &none, "train-segment-model");
+    assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled without a selection");
+    // the actions are recorded, never replayed
+    for a in [Action::TrainSegment(vec![0]), Action::OpenSegment, Action::CancelSegment, Action::BackToScene] {
+        assert_eq!((a.describe(), crate::replay::unreplayable_kind(&a)), (None, Some("segment")));
+    }
+}
+
+/// A refused segment says why and changes nothing: an empty selection, a lone atom, the whole
+/// molecule (butane-sized: twice the cutoff reaches every atom).
+#[test]
+fn a_refused_segment_names_the_reason_and_changes_nothing() {
+    let cam = camera();
+    let h2 = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &h2);
+    let inp = input(&h2, None, &cam);
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![]));
+    assert_eq!(out.error.as_deref(), Some(format!("Train this segment: {}", crate::segment::NOTHING_SELECTED).as_str()));
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![0]));
+    assert!(out.error.as_deref().unwrap().contains("the whole molecule — train the scene itself"), "{:?}", out.error);
+    let mut far = h2.clone();
+    far.nuclei.push(crate::scene::SceneNucleus { z: 2, a: None, pos: [0.0, 9.0, 0.0], vel: [0.0; 3] });
+    let inp = input(&far, None, &cam);
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![2]));
+    assert!(out.error.as_deref().unwrap().contains("He #2 has no neighbour within 6.0 Bohr"), "{:?}", out.error);
+    assert!(out.commands.is_empty() && out.switch_scene.is_none() && st.segment_preview.is_none() && st.segment_back.is_none());
+}

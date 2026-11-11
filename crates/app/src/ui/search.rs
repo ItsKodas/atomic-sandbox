@@ -185,6 +185,7 @@ pub const ENTRIES: &[Entry] = &[
     // Selection
     e("Selected nucleus", "position composition electrons", Dock(D::Selection), "d-selection"),
     e("Distance guides", "bond length Bohr Å", Dock(D::Selection), "d-guides"),
+    e("Train this segment", "cut out capped fragment teach the selection shared model collection large molecule", Dock(D::Selection), "d-segment"),
     e("Isotope of the selected nucleus", "mass number deuterium tritium swap", Dock(D::Selection), "d-selection"),
     e("Bonds of the selected nucleus", "bonded pair verdict density", Dock(D::Selection), "d-bonds"),
     e("Partial charges of every atom", "Hirshfeld charge list sum δ+ δ− polarity", Dock(D::Selection), "d-charges"),

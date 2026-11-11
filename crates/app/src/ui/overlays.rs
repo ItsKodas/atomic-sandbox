@@ -45,6 +45,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     model_offer_card(ctx, view, st, input, acts);
+    segment_card(ctx, view, st, input, acts);
     // the teach-around prompt: one click, never run by itself
     if let Some(m) = input.model().filter(|_| teach_prompt(input).is_some()) {
         egui::Area::new(Id::new("teach-prompt-card"))
@@ -347,6 +348,66 @@ fn model_offer_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &Panel
                     }
                     if ui.button(OFFER_CANCEL).on_hover_text("close this card; nothing is changed or loaded").clicked() {
                         acts.push(Action::CancelModelOffer);
+                    }
+                });
+            });
+        });
+}
+
+/// What the segment confirmation's note says (mockup (d) 2.).
+pub const SEGMENT_NOTE: &str = "The segment is the selection plus every atom within the reach (twice the model's cutoff, plus the Standard pass's largest planned move, so every force it teaches is an equation of this scene's own); a hydrogen goes with its partner. Each cut bond gets a capping H placed with the molecule builder's tables (placement only). Only the green-ringed atoms are taught; the caps (teal) and the edge atoms are context. The cut is for the Standard plan: another plan may move a cap closer than it allows.";
+
+/// Train this segment's preview card (mockup (d) 2.): the counts, the reach, the box, the GPU
+/// memory and the plan, with "Open the segment" / "Cancel" (`Action::OpenSegment` / `CancelSegment`).
+fn segment_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let Some(seg) = st.segment_preview.as_ref() else { return };
+    let kept = seg.source_indices.iter().flatten().count();
+    let s = &seg.scene;
+    let sym = |i: usize| input.scene.nuclei.get(i).map_or("?", |n| render::elements::symbol(n.z));
+    let solvers = crate::quality::gpu_solvers(Backend::Estimated, st.gpu_available);
+    let gpu = if solvers == 0 {
+        "the CPU teacher: no GPU budget".to_string()
+    } else {
+        let need = solvers * s.to_sim().map(|x| providers::gpu_footprint_bytes(&x)).unwrap_or(0);
+        format!("≈ {:.1} GB of {} ({solvers} solvers: teacher + auditor)", need as f64 / 1e9, crate::quality::vram_budget().gb())
+    };
+    let bonds: Vec<String> = seg.cut_bonds.iter().map(|&(k, o)| format!("{}#{k}–{}#{o}", sym(k), sym(o))).collect();
+    let rows: Vec<(&str, String)> = vec![
+        ("atoms", format!("{} = {kept} from {} + {} caps", s.nuclei.len(), st.source.label(), seg.caps.len())),
+        ("caps", if bonds.is_empty() { "none: no bond is cut".into() } else { format!("{} H on {}", seg.caps.len(), bonds.join(", ")) }),
+        ("trained on", format!("{} atoms ({} selected)", seg.n_interior(), seg.selected.len())),
+        ("not trained", format!("{} edge atoms + {} caps", kept - seg.n_interior(), seg.caps.len())),
+        ("reach", format!("{:.2} Bohr = 2 × r_cut {:.1} + δ {:.2}", seg.reach, seg.r_cut, seg.delta)),
+        ("solver", format!("estimated · ionic {} (the scene's key)", s.ionic.word())),
+        ("box", format!("{:.1} Bohr · {}³ × {} Bohr", crate::quality::box_len(s), s.grid_n, s.grid_h)),
+        ("GPU memory", gpu),
+        ("plan", "Standard, ready — not started".into()),
+    ];
+    egui::Area::new(Id::new("segment-card"))
+        .pivot(Align2::RIGHT_TOP)
+        .fixed_pos(pos2(view.right() - 12.0, view.top() + 56.0))
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card().stroke(Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6))).show(ui, |ui| {
+                ui.set_width(400.0f32.min(view.width() - 40.0));
+                ui.label(RichText::new("Train this segment").strong().size(14.0));
+                egui::Grid::new("segment-rows").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                    for (k, v) in rows {
+                        ui.label(RichText::new(k).color(theme::INK_DIM));
+                        ui.add(egui::Label::new(RichText::new(v).monospace().size(11.5)).wrap());
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                theme::note(ui, SEGMENT_NOTE);
+                ui.horizontal(|ui| {
+                    let open = egui::Button::new(RichText::new("Open the segment").strong().color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT);
+                    if super::probed("segment-open", ui.add(open)).on_hover_text("save this scene to a temp file and open the segment in the estimated solver, the Standard plan ready (press Start sampling to teach it); the chip by the scene chip brings you back").clicked() {
+                        acts.push(Action::OpenSegment);
+                    }
+                    if super::probed("segment-cancel", ui.button("Cancel")).on_hover_text("close the preview; nothing changes").clicked() {
+                        acts.push(Action::CancelSegment);
                     }
                 });
             });
