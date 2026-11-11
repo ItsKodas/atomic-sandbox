@@ -193,12 +193,18 @@ impl StartFlags {
         }
         if let Some(path) = &self.scene {
             let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
-            let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
+            let mut s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
             s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
+            // final review 4: a segment's mask is not loaded while the feature is deferred
+            let ignored = s.drop_deferred_train_mask(crate::segment::SEGMENT_TRAINING);
             // the chip names the file, Reset and Save / Load point at it, and the Custom slider
             // shows the file's spacing (its grid beats any --quality) — as File ▸ Load does
             v.ui.adopt_file(path, &s);
             v.scene = s;
+            if let Some(note) = ignored {
+                eprintln!("--scene {path}: {note}");
+                v.ui.set_status(format!("--scene {path}: {note}"));
+            }
         }
         if let Some(h) = self.quality.filter(|_| self.scene.is_none()) {
             // the quality applies to the preset; an explicit grid (a scene file) beats it

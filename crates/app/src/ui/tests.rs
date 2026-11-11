@@ -1377,6 +1377,41 @@ fn empty_snapshot(backend: Backend, model: Option<ModelStatus>) -> Snapshot {
     s
 }
 
+/// Final review 4: while Train this segment is deferred, File ▸ Load (and a replay's `scene` line,
+/// the same action) loads a scene file's `train_mask` line as nothing — the scene sent has no mask
+/// — and the status line says so.
+#[test]
+fn a_scene_files_train_mask_is_ignored_while_segments_are_deferred() {
+    let dir = std::env::temp_dir().join(format!("atomic-ui-mask-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("seg.scene").display().to_string();
+    std::fs::write(&path, "grid 49 0.25
+train_mask 1 0 1
+nucleus 6 0 0 0
+nucleus 1 2 0 0
+nucleus 1 -2 0 0
+").unwrap();
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.scene_path = path.clone();
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: false });
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let sent = match out.commands.first() {
+        Some(Command::SetScene(s)) => s.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sent.nuclei.len(), 3, "the scene loads");
+    if crate::segment::SEGMENT_TRAINING {
+        assert_eq!(sent.train_mask, Some(vec![true, false, true]));
+    } else {
+        assert_eq!(sent.train_mask, None, "the mask is not loaded");
+        assert!(st.status.contains("train_mask ignored: Train this segment is deferred"), "{}", st.status);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scene loaded from a file is the chip's source (final review app I1/I3): the chip names the
 /// file, the file's spacing becomes the quality later presets load at, no preset is highlighted so
 /// a click on `h2` loads it, and Reset reloads the file — even after the path field was edited.

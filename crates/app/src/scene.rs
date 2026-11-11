@@ -41,6 +41,10 @@ pub(crate) fn canonical_a(z: u8, a: u16) -> Option<u16> {
     if units::most_abundant_a(z) == Some(a) { None } else { Some(a) }
 }
 
+/// The note of a scene file whose `train_mask` line the app ignored
+/// ([`Scene::drop_deferred_train_mask`]).
+pub const TRAIN_MASK_IGNORED: &str = "train_mask ignored: Train this segment is deferred";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub nuclei: Vec<SceneNucleus>,
@@ -184,6 +188,20 @@ impl Scene {
             ionic,
             train_mask,
         })
+    }
+
+    /// A scene file's `train_mask` line as the app loads it (final review 4): while Train this
+    /// segment is deferred (`enabled` = [`crate::segment::SEGMENT_TRAINING`] false) the mask is
+    /// dropped — the scene loads without it and its answers teach whole, never as a masked segment
+    /// the hidden feature's gate has not validated — and the note says so ([`TRAIN_MASK_IGNORED`]);
+    /// `None` when there was no mask or the feature is on. [`Scene::parse`] keeps reading the line
+    /// (the feature returns with it).
+    pub fn drop_deferred_train_mask(&mut self, enabled: bool) -> Option<&'static str> {
+        if enabled || self.train_mask.is_none() {
+            return None;
+        }
+        self.train_mask = None;
+        Some(TRAIN_MASK_IGNORED)
     }
 
     /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=201,
@@ -432,6 +450,29 @@ mod tests {
         let mut m = s.clone();
         Command::RemoveNucleus(2).apply(&mut m);
         assert_eq!(m.train_mask, None);
+    }
+
+    /// Final review 4: while Train this segment is deferred the app loads a scene file's
+    /// `train_mask` line as nothing, with the note; with the feature on, or without the line,
+    /// nothing changes. The parser itself keeps the mask.
+    #[test]
+    fn a_deferred_train_mask_is_dropped_with_a_note() {
+        let text = "grid 49 0.25
+train_mask 1 0 1
+nucleus 6 0 0 0
+nucleus 1 2 0 0
+nucleus 1 -2 0 0
+";
+        let parsed = Scene::parse(text).unwrap();
+        assert_eq!(parsed.train_mask, Some(vec![true, false, true]), "the parser keeps it");
+        let mut off = parsed.clone();
+        assert_eq!(off.drop_deferred_train_mask(false), Some(TRAIN_MASK_IGNORED));
+        assert_eq!(off, Scene { train_mask: None, ..parsed.clone() }, "only the mask goes");
+        let mut on = parsed.clone();
+        assert_eq!(on.drop_deferred_train_mask(true), None);
+        assert_eq!(on, parsed);
+        let mut plain = Scene::preset("h2").unwrap();
+        assert_eq!(plain.drop_deferred_train_mask(false), None, "no mask, no note");
     }
 
     #[test]

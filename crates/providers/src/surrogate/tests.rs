@@ -10309,3 +10309,151 @@ fn masked_h3_random(rng: &mut StdRng) -> Scene {
     sc.train_mask = Some(vec![true, true, false]);
     sc
 }
+
+// ---- the M8a whole-branch final review's fixes ----
+
+/// An H₂ sample of the [`SpeciesMorse`] teacher at r along x (the session-only file's rows).
+fn morse_h2_sample(r: f64, tag: SampleTag) -> Sample {
+    let pos: Vec<[f64; 3]> = h2(r).nuclei.iter().map(|n| n.pos).collect();
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+    Sample::new(pos, vec![1, 1], e, f, tag, 1.0)
+}
+
+/// Final review 1 (MUST): a session-only file's samples held out of the fit — held, superseded,
+/// box-affected, a draft guess's audit — keep their codes when they come back in a box that has no
+/// reference yet; only the one the fit would take waits (`Q_REF_WAIT`). When the reference arrives
+/// the waiting one enters the fit and the held-out ones stay out (before the fix every one became
+/// `Q_REF_WAIT`, and the rebase released them all into the fit).
+#[test]
+fn session_only_samples_held_out_of_the_fit_stay_out_when_their_reference_arrives() {
+    let dir = collection_root("session-held");
+    let (mut s, _t) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(s.collection().unwrap().references.is_empty(), "premise: no reference of any box");
+    let set = surrogate::SampleSet {
+        provenance: super::shared::shared_provenance(&s.collection().unwrap().key),
+        samples: vec![
+            morse_h2_sample(1.40, SampleTag::Fallback),
+            morse_h2_sample(1.50, SampleTag::Fallback),
+            morse_h2_sample(1.60, SampleTag::DraftAudit),
+            morse_h2_sample(1.70, SampleTag::Fallback),
+            morse_h2_sample(1.80, SampleTag::Fallback),
+        ],
+        references: Vec::new(),
+        reference_rule: Some(surrogate::sidecar::REFERENCE_RULE.to_string()),
+        quarantine: vec![Q_NONE, Q_HELD, Q_NONE, Q_SUPERSEDED, Q_BOX],
+        face_density: vec![0.0, 0.0, 0.0, 0.0, 1.0],
+        sample_box: vec![41; 5],
+        specialised: Vec::new(),
+        box_references: Vec::new(),
+        teacher_solves: None,
+        teacher_solves_note: None,
+        created_by: surrogate::sidecar::CREATED_BY.to_string(),
+    };
+    let path = dir.join("session-only.model");
+    surrogate::sidecar::write_samples(&path, &set).unwrap();
+    assert_eq!(s.load_session_only(&path), Ok(5));
+    assert_eq!(s.quarantine, vec![Q_REF_WAIT, Q_HELD, Q_DRAFT, Q_SUPERSEDED, Q_BOX], "only the sample the fit would take waits");
+    assert_eq!(s.waiting_for_reference(), 1);
+    // the 41³ box's reference arrives: the waiting sample enters the fit, the others stay out
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
+    assert_eq!(s.quarantine, vec![Q_NONE, Q_HELD, Q_DRAFT, Q_SUPERSEDED, Q_BOX], "held out of the fit as before");
+    let raw: Vec<f64> = set.samples.iter().map(|x| x.energy).collect();
+    let fit: Vec<f64> = s.store().unwrap().samples.iter().map(|x| x.energy).collect();
+    assert_eq!(fit, raw, "every energy rebased (the only box is the canonical one: offset 0)");
+}
+
+/// Final review 2: a draft guess's audit kept in a box without its reference holds the teacher's
+/// raw energy, off the canonical surface — `judge_held_out` leaves it waiting (before the fix a
+/// refit judged and promoted it: a spurious failed audit, up to ~1e-2 Ha off); once the reference
+/// arrives the next refit promotes it.
+#[test]
+fn a_draft_guess_is_promoted_only_once_its_box_has_its_reference() {
+    let dir = collection_root("draft-wait");
+    let (mut s, _t) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let mut rng = StdRng::seed_from_u64(11);
+    // a model over the window in the 33³ box, its reference known
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    for i in 0..40 {
+        let sc = h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+        s.add_sample_answer(Sample::new(pos, vec![1, 1], e, f, SampleTag::Scan, 1.0), &sc, Some(0.0), Some(1)).unwrap();
+    }
+    s.refit().unwrap();
+    // a draft guess's audit inside the window, solved in a 41³ box (no reference there)
+    let prov = s.provenance_for(&in_cell(h2(1.4), 41));
+    let sc = h2_at(1.62, &mut rng);
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+    let mut notes = Vec::new();
+    assert!(s.keep_sample(&pos, &[1, 1], e, &f, Some(0.0), Some(1), &prov, SampleTag::DraftAudit, &mut notes));
+    let draft = s.samples() - 1;
+    assert_eq!(s.quarantine[draft], Q_DRAFT);
+    assert_eq!(s.judge_held_out(), 0, "its box has no reference: not judged");
+    s.refit().unwrap();
+    assert_eq!(s.quarantine[draft], Q_DRAFT, "a refit leaves it waiting");
+    assert_eq!(s.store().unwrap().samples[draft].tag, SampleTag::DraftAudit);
+    assert!(s.failed_audits.is_empty());
+    // the reference arrives: the next refit judges and promotes it
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
+    s.refit().unwrap();
+    assert_eq!(s.quarantine.get(draft).copied().unwrap_or(Q_NONE), Q_NONE, "promoted once its reference is known");
+    assert_eq!(s.store().unwrap().samples[draft].tag, SampleTag::Audit);
+    assert!(s.failed_audits.is_empty(), "on the canonical surface the model agrees");
+}
+
+/// Final review 7: the canonical (largest-box) reference is one the collection stored — a refused
+/// one (an even n, a box-affected atom) is used for its own box only, never as the canonical one,
+/// even when its box is larger. While the collection stores none of a species the session's own
+/// largest box stands in (documented fallback), and a stored one replaces it.
+#[test]
+fn the_canonical_reference_is_never_a_refused_one() {
+    let dir = collection_root("canonical-stored");
+    let (mut s, _t) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let (a, b, c) = (-0.48, -0.47, -0.46);
+    // only a refused one so far (even n): the fallback
+    s.set_reference_solved(1, b, 50, Some(0.0));
+    assert!(s.collection().unwrap().references.is_empty(), "the even-n box is refused");
+    assert_eq!(s.display_reference(1), Some(b), "nothing stored yet: the session's own stands in");
+    // a stored one (odd n, smaller box) becomes canonical over the larger refused one
+    s.set_reference_solved(1, a, 41, Some(0.0));
+    assert_eq!(s.collection().unwrap().references.keys().copied().collect::<Vec<_>>(), vec![(1, 41)]);
+    assert_eq!(s.display_reference(1), Some(a), "the stored 41³ reference, not the refused 50³ one");
+    assert_eq!(s.box_offset(&[1, 1], 50), Some(2.0 * (b - a)), "the refused box is fitted against its own reference");
+    assert_eq!(s.box_offset(&[1, 1], 41), Some(0.0));
+    // a box-affected one in a larger odd box is refused too
+    s.set_reference_solved(1, c, 61, Some(1.0));
+    assert!(!s.collection().unwrap().references.contains_key(&(1, 61)), "box-affected: refused");
+    assert_eq!(s.display_reference(1), Some(a));
+    assert_eq!(s.box_offset(&[1, 1], 61), Some(2.0 * (c - a)));
+}
+
+/// Final review 5: an environment key no fitted atom holds (n_k = 0) is refused on the sample
+/// floor (`ClassKey::Samples`, 0 < q_k) — never judged on its class's leave-one-out, which
+/// measures other keys' atoms (before the fix an H{He} pair key was trusted on H₂'s numbers).
+#[test]
+fn a_key_no_fitted_atom_holds_is_refused_on_the_sample_floor() {
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert!(s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let unseen = surrogate::EnvKey { class: 1, z: 1, neighbours: vec![2] };
+    // a key neither a fitted atom nor an attributed point holds
+    let (r, short) = s.class_untrusted(&[Some(unseen.clone())]).expect("an unseen key is refused");
+    assert!(short, "refused on the sample floor");
+    let q = s.report().unwrap().q_prime;
+    assert!(r.text.contains(&format!("0 of {q} samples needed")), "{}", r.text);
+    assert!(s.class_untrusted(&h_keys(&[1, 1])).is_none(), "H₂'s own key stays trusted");
+    // a key with attributed evidence but no fitted atom: its verdict is the same refusal
+    s.audit_history.push(surrogate::AuditPoint { model_gen: s.model_gen, species: vec![(1, vec![2]); 2], ..history_point(PointKind::Audit, 2, 1, z_at(0.1)) });
+    s.refresh_class_loo();
+    let v = s.class_loo()[0].species.iter().find(|v| v.neighbours == vec![2]).expect("a verdict of the attributed key").clone();
+    assert!(!v.trusted && v.samples == 0, "{v:?}");
+    assert_eq!(v.refusal.map(|r| (r.0, r.1)), Some((ClassKey::Samples, 0.0)), "{v:?}");
+    let h = s.class_loo()[0].species.iter().find(|v| v.neighbours == vec![1]).expect("H₂'s key").clone();
+    assert!(h.trusted, "H₂'s own key is judged on its own numbers: {h:?}");
+    assert!(s.class_untrusted(&h_keys(&[1, 1])).is_none());
+}

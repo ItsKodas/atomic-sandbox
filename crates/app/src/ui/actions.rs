@@ -396,8 +396,12 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             Err(e) => out.error = Some(format!("save {}: {e}", st.scene_path)),
         },
         Action::LoadScene { sidecar } => match load(&st.scene_path) {
-            Ok(s) => {
+            Ok(mut s) => {
                 let mut msg = format!("loaded {}", st.scene_path);
+                // final review 4: a segment's mask is not loaded while the feature is deferred
+                if let Some(note) = s.drop_deferred_train_mask(crate::segment::SEGMENT_TRAINING) {
+                    msg += &format!(" — {note}");
+                }
                 let path = st.scene_path.clone();
                 st.adopt_file(&path, &s);
                 out.commands.push(Command::SetScene(s));
@@ -836,7 +840,7 @@ fn open_segment(st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelOutput)
 /// `Action::BackToScene`: the saved scene and the panel's settings for it, on the solver it had.
 fn back_to_scene(st: &mut UiState, out: &mut PanelOutput) {
     let Some(b) = st.segment_back.take() else { return };
-    let s = match std::fs::read_to_string(&b.path).map_err(|e| e.to_string()).and_then(|t| Scene::parse(&t)) {
+    let mut s = match std::fs::read_to_string(&b.path).map_err(|e| e.to_string()).and_then(|t| Scene::parse(&t)) {
         Ok(s) => s,
         Err(e) => {
             out.error = Some(format!("back to {}: {} cannot be read ({e})", b.label, b.path.display()));
@@ -855,7 +859,10 @@ fn back_to_scene(st: &mut UiState, out: &mut PanelOutput) {
     if st.walls_on {
         out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
     }
-    st.set_status(format!("back to {}", b.label));
+    match s.drop_deferred_train_mask(crate::segment::SEGMENT_TRAINING) {
+        Some(note) => st.set_status(format!("back to {} — {note}", b.label)),
+        None => st.set_status(format!("back to {}", b.label)),
+    }
     out.switch_scene = Some(s);
 }
 

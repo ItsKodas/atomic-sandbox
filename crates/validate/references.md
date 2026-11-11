@@ -4180,7 +4180,7 @@ Spec §4.5's condition: a collection taught on capped segments of n-butane (the 
 propane-like 10 + 1-cap segment whose interior is the methyl group, at `COLLECTION_R_CUT` = 6 Bohr)
 must reproduce held-out whole-molecule DFT forces on the interior-class atoms (both methyls, 8 of 14
 atoms) within **1.5×** of a collection taught on the whole molecule's own answers; a control (the
-whole answers restricted to the same rows) separates the capping error from the data volume. The
+whole answers restricted to the same rows) separates the segments' error from the data volume. The
 test-local cut is checked on the CPU (`the_test_cut_keeps_the_selected_atoms_interior`, runs in the
 default suite). Cost probe (`capping_cost_probe`, RX 7900 XTX): butane 125³ — 159 s cold incl. the
 pseudopotential generation, 95 s warm, 90 s cold after a reset; an end segment in the same box 48 s
@@ -4210,11 +4210,14 @@ segments 11.0 atoms, 4.00 interior.
 | control (whole answers, interior rows) | 20 | 0 / 480 | 1.10e-3 | 3.022e-3 | 2.496e-2 | 0/160 |
 | B (capped segments) | 40 | 0 / 480 | 9.29e-4 | **3.598e-2** | 3.767e-2 | 0/160 |
 
-B/A = **11.96×** (limit 1.5×) — **FAIL**; B/control 11.91× (the capping error alone); control/A 1.00×
-(the interior rows alone lose nothing). No model is trusted (every collection: n_samples < Q′ 284;
-answered geometries 0/20): the comparison is on force RMSE, i.e. whether the two training methods are
-equivalent — they are not. Per spec §4.5 capping is to be replaced by the uncapped two-shell cut and
-the gate rerun (not done here: physics code). Reproduce (≈ 7 min with the stored answers, hours without):
+B/A = **11.96×** (limit 1.5×) — **FAIL**; B/control 11.91× (the segments' error with the data volume
+held equal: the r_cut-interior error of ruling P26, the paragraph below — an interior atom's force row
+is an exact equation of the source molecule only with 2·r_cut + δ of matching surroundings, which a
+cut keeping r_cut does not give; the caps are part of it, not all of it); control/A 1.00× (the interior
+rows alone lose nothing). No model is trusted (every collection: n_samples < Q′ 284; answered
+geometries 0/20): the comparison is on force RMSE, i.e. whether the two training methods are
+equivalent — they are not. The follow-up is the 2·r_cut + δ cut and a long-chain gate (below), not a
+rerun of this one: butane has no interior atom under that cut. Reproduce (≈ 7 min with the stored answers, hours without):
 `CAPPING_REUSE=1 cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`.
 
 **Train this segment is deferred (user decision 2026-11-12):** the gate above failed with the r_cut cut;

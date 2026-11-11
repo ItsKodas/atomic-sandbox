@@ -49,7 +49,8 @@
 //!   sample's fit target is E − Σ ref of its own box**. The provider keeps every collection-mode
 //!   sample's teacher energy and box (`SharedCollection::raw`, `box_n`) and fits
 //!   E_raw − Σ_i (ref(Z_i, its box) − ref_canonical(Z_i)) — with the model's references the
-//!   **canonical** ones (each species' largest box: [`SurrogateKs::display_reference`], the
+//!   **canonical** ones (each species' largest box among those the collection stored — never a
+//!   refused one —: `canonical_ref`, [`SurrogateKs::display_reference`], the
 //!   reference for absolute energies), this is exactly E_raw − Σ ref(own box) as the fit's target,
 //!   and every model-vs-sample comparison downstream (residuals, leave-one-out, quarantine, fences,
 //!   audits) stays on one surface. A teacher answer entering a comparison is put on that surface the
@@ -66,7 +67,10 @@
 //!   stays continuous (`book_reference_arrival`, fix round 3). Only a reference requested by a
 //!   scene of the collection's own surface is offered to it (`RefJob::collection`); the driver's
 //!   requests are always answered, one job per (Z, box). A reference the collection refuses
-//!   (even n, box-affected) is used for its box in this session only.
+//!   (even n, box-affected) is used for its box in this session only (never as the canonical one).
+//!   A sample held out of the fit (held, superseded, box-affected, a draft guess) keeps its code
+//!   while it waits: only one the fit would take is `Q_REF_WAIT`, and a draft guess is judged for
+//!   promotion only once its box has its references (`judge_held_out`).
 //! * **The audit history** is the collection's (`history.bin`): installed at attach, written back
 //!   (with `README.txt`) after every refit, at detach and when the provider is dropped. The class
 //!   verdict's hysteresis memory is not persisted in a collection (a reattached collection starts
@@ -171,6 +175,17 @@ pub(super) fn shared_provenance(key: &SurfaceKey) -> Provenance {
         masses: Vec::new(),
         ionic: key.ionic.clone(),
     }
+}
+
+/// The canonical reference of species `z` (module doc, "References per box"): its largest box's
+/// among the references **the collection stored** — never one it refused (an even n, a
+/// box-affected atom: those are used for their own box only; final review 7), so the canonical
+/// surface is the collection's for every session — or, while the collection stores none of `z`
+/// (none solved yet, or a read-only collection), the largest box's this session uses; a stored one
+/// replaces it when it arrives (a rebase, booked like any reference arrival). `None` without any.
+fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
+    let species = (z, 0)..=(z, usize::MAX);
+    sh.coll.references.range(species.clone()).next_back().map(|(_, r)| r.energy).or_else(|| sh.box_refs.range(species).next_back().map(|(_, &e)| e))
 }
 
 /// What changes when the audit history changes: its recorded points and its unrecorded counts.
@@ -698,13 +713,9 @@ impl SurrogateKs {
         }
     }
 
-    /// The canonical reference of each species: its largest box's (module doc, "References per box").
-    fn canonical_refs(box_refs: &BTreeMap<(u8, usize), f64>) -> BTreeMap<u8, f64> {
-        let mut out = BTreeMap::new();
-        for (&(z, _), &e) in box_refs {
-            out.insert(z, e); // ascending n: the largest box's comes last
-        }
-        out
+    /// The canonical reference of each species in use ([`canonical_ref`]).
+    fn canonical_refs(sh: &SharedCollection) -> BTreeMap<u8, f64> {
+        sh.box_refs.keys().filter_map(|&(z, _)| canonical_ref(sh, z).map(|e| (z, e))).collect()
     }
 
     /// The reference for absolute (display) energies of species `z`: in collection mode its largest
@@ -721,7 +732,7 @@ impl SurrogateKs {
         let mut off = 0.0;
         for &zi in z {
             let own = sh.box_refs.get(&(zi, n))?;
-            let canon = sh.box_refs.range((zi, 0)..=(zi, usize::MAX)).next_back().map(|(_, &e)| e)?;
+            let canon = canonical_ref(sh, zi)?;
             off += own - canon;
         }
         Some(off)
@@ -754,7 +765,7 @@ impl SurrogateKs {
     /// waits; anything changed rebuilds the fit at the next refit.
     pub(super) fn rebase_collection(&mut self) {
         let Some(sh) = self.shared.as_ref() else { return };
-        let canon = Self::canonical_refs(&sh.box_refs);
+        let canon = Self::canonical_refs(sh);
         if canon != self.refs {
             self.refs = canon;
             self.refs_dirty = true;
@@ -958,11 +969,14 @@ impl SurrogateKs {
             if store.push(s).is_err() {
                 continue;
             }
-            let q = match (offset, set.quarantine.get(i).copied().unwrap_or(Q_NONE)) {
-                (None, _) => Q_REF_WAIT,
-                (Some(_), Q_NONE) if draft => Q_DRAFT,
-                (Some(_), q) => q,
+            // the file's code stands (held, superseded, box-affected; a draft guess's tag gives
+            // `Q_DRAFT`): only a sample the fit would take waits for its box's reference — a held
+            // one must not leave its hold when the reference arrives (final review 1)
+            let q0 = match set.quarantine.get(i).copied().unwrap_or(Q_NONE) {
+                Q_NONE if draft => Q_DRAFT,
+                q => q,
             };
+            let q = if offset.is_none() && q0 == Q_NONE { Q_REF_WAIT } else { q0 };
             if !self.quarantine.is_empty() || q != Q_NONE {
                 self.quarantine.resize(n, Q_NONE);
                 self.quarantine.push(q);
