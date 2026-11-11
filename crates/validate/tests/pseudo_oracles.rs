@@ -153,7 +153,7 @@ fn h_for(zs: &[u8], wanted: f64) -> f64 {
 /// A neutral scene of `nuclei` on the odd cube of ≈ `box_bohr` at spacing h (a grid point at the origin).
 fn pseudo_scene(nuclei: Vec<Nucleus>, h: f64, box_bohr: f64, policy: IonicPolicy) -> Scene {
     let n = 2 * (box_bohr / (2.0 * h)).round() as usize + 1;
-    Scene { nuclei, cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy }
+    Scene { nuclei, cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None }
 }
 
 /// The angle at nucleus `v` between the bonds to `a` and `b` (degrees).

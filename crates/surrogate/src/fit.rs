@@ -170,6 +170,130 @@
 //! `force_std[j]` is the expected ‖δF_j‖, floor √3·s_F — a per-component threshold such as C5's
 //! 2e-3 Ha/Bohr compares against force_std/√3.
 //!
+//! # The large-basis path (M8a Task 5: a shared collection's body-4 basis)
+//!
+//! A body-4 basis (`Basis::body4`, a shared collection's) has Q′ up to 2 688 at four species, where
+//! the search above — a few hundred factorisations and inverses of Q′, ≈ 2.4 Q′³ each — took 639 s
+//! already at Q′ 1 232. [`Accumulator::refit`] (what the provider calls) therefore solves a body-4
+//! basis by two exact reformulations; every other basis goes through [`Accumulator::solve`]
+//! unchanged, bit for bit.
+//!
+//! **Spectral search.** Write ρ = s_F²/s_E² and t = s_F². Then
+//!
+//!   A = G̃_E/s_E² + G̃_F/s_F² + λ_eff I = (H_ρ + μ I)/t,   H_ρ = G̃_F + ρ G̃_E,   μ = λ_eff·t,
+//!
+//! so one eigen-decomposition H_ρ = U diag(h) Uᵀ gives, for every (λ, t) at that ratio, with
+//! ĉ = Uᵀ(b̃_F + ρ b̃_E) and m̂_k = ĉ_k/(h_k + μ) (m = U m̂ does not depend on t at fixed μ):
+//!
+//!   ln det A = Σ_k ln((h_k + μ)/t),   ‖m‖² = Σ_k m̂_k²,   γ = Σ_k h_k/(h_k + μ),
+//!   RSS_E/s_E² + RSS_F/s_F² = (ρ yᵀWy_E + yᵀWy_F − 2 m̂·ĉ + Σ_k h_k m̂_k²)/t,
+//!
+//! i.e. the whole evidence (the formula above, with the nominal λ in (Q′/2) ln λ and λ‖m‖²) in O(Q′)
+//! per evaluation. No eigenvectors are formed: H_ρ is reduced to tridiagonal form by Householder
+//! reflections (`linalg::Tridiagonal`, 2Q′³) and diagonalised by implicit QL, the reflections and
+//! rotations applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
+//! golden section, now O(Q′) per point) and — with neither noise level pinned — the common scale t
+//! by MacKay's β update at fixed ρ, t = ρRSS_E + RSS_F over n_E + n_F − γ (stationarity in t:
+//! d ln p/dt = [−(n_E + n_F) + γ]/(2t) + (ρRSS_E + RSS_F)/(2t²)), alternated to 1e-6; then one
+//! exact factorisation and inverse at (λ, s_E², s_F²) (the vectorised kernels, ≈ Q′³) gives
+//! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ, as a
+//! step in ln ρ whose multiplier halves each time the step reverses direction (the bare fixed point
+//! cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection fixture; an evidence
+//! comparison cannot steer it: ln p carries ~5e-6 relative of rounding between two spectra, the
+//! near-null eigenvalues' ε‖H‖ against the ridge floor). A multiplier below 2⁻¹² without the
+//! stopping test met is reported as a stall (`RefitKind::Spectral::stalled`, `converged` false).
+//! The stopping test, the floors, the pins and `sigma_f_min` are the reference search's; the
+//! returned posterior is factored at the final levels. A numerical failure of the spectral search
+//! falls back to the reference search. Measured on a Q′ 250 body-4 fixture
+//! (`large_basis_search_finds_the_reference_search_optimum`): λ equal to 5 digits, σ_E within
+//! 0.05 %, ln p equal to 7 digits, 49 ms against 4 007 ms; at Q′ 2 688 and 10 000 samples a search
+//! takes 27.8 s (6 rounds; `references.md` "M8a body-4").
+//!
+//! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
+//! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1
+//! whitened rows √w Dφ/s_κ. The upper factor R = Lᵀ is updated by k rank-one Givens updates
+//! (`linalg::cholesky_update_upper`, O(Q′²) each), the mean solved with it, and γ carried exactly
+//! by Woodbury: with V = ΣU and C = I + UᵀV (k×k),
+//!
+//!   Σ' = Σ − V C⁻¹ Vᵀ,   tr Σ' = tr Σ − tr(C⁻¹ VᵀV),
+//!   tr(Σ' G̃_E') = tr(Σ G̃_E) − tr(C⁻¹ Vᵀ G̃_E V) + s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀),   M = UᵀV,
+//!
+//! (G̃_E the energy Gram before the sample, M₀ the energy row's column; the last term is the new
+//! energy row's own w ẽᵀΣ'ẽ), γ_E = tr(Σ G̃_E)/s_E², γ = Q′ − λ_eff tr Σ, γ_F = γ − γ_E. The result
+//! is the exact posterior at those hyperparameters — not an approximation of it:
+//! `warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters` finds the factor's backward
+//! error at 0.5–1.3e-15 and predictions within the spread of two fresh factorisations (both are
+//! determined only to κ(A)·ε, κ ~ 6e12 there). What it does not do is re-choose λ and the noise
+//! levels; the search runs again once the store has grown by [`WARM_GROWTH`] (×1.25) since the
+//! last one, after more than [`WARM_MAX_PENDING`] (64) samples at once, when the options change, or
+//! when the accumulator is rebuilt. Every search starts from the data's own levels (never from an
+//! earlier search's), so it is a function of the accumulated statistics alone: the warm refit is
+//! where the evidence is "warm", and a reopened collection's first fit equals the session's last
+//! search bit for bit. The report of a warm refit carries the search's
+//! `condition_estimate` and `converged` and 0 `hyper_iterations`. At Q′ 2 688 and 10 000 samples a
+//! sample's add + warm refit takes 0.17 s. The warm refit also declines (searches) once the ridge
+//! floor 4Q′ε·max diag A of the grown data passes the standing λ_eff: the frozen ridge would no
+//! longer be a fresh solve's (`a_long_warm_chain_stays_the_exact_posterior`: after 800 + 10 × 19
+//! samples, std within 4.5e-6 and γ within 2e-6 of a fresh solve where λ is above the floor; where
+//! the floor binds the chain searches again after 8 warm refits) (`surrogate_perf`, `refit_is_interactive_at_ten_thousand_samples`).
+//!
+//! **The accumulation** of a body-4 basis sums a sample's 3N force rows into one block first and
+//! adds that compensated (one Neumaier step per entry per sample, not per row; threaded over the
+//! Gram's rows): the block's own plain sum of ≤ 3N terms is a few ε relative, the totals stay
+//! compensated (CLAUDE.md rule 4).
+//!
+//! **No truncated Σ.** The predictive variance keeps the exact posterior factor. The M5 handoff's
+//! truncation Σ ≈ Σ_{k<K} s_k u_k u_kᵀ + s_min I is conservative with s_min = s_K (T − Σ ⪰ 0) but
+//! measured useless with it — on a collection-sized body-4 fit (Q′ 284) the floored variance is
+//! 39–3·10⁴× the exact one at K = 200 and 10⁹–10¹¹× at K = 50, because the top of Σ's spectrum is
+//! the prior's 1/λ on the directions no sample spans (54 of 284 there) — and biased low without
+//! it (median ratio 0.004 at K = 50, 0.63 at K = 200):
+//! `spectral_truncation_of_the_covariance_is_measured_and_floored`.
+//!
+//! # Masked samples (M8a Task 10, "Train this segment"; spec §4.5, controller ruling P10)
+//!
+//! A capped cut-out of a larger scene (the segment: selected atoms, their neighbours within
+//! r_cut, a hydrogen on every cut bond) is a real closed-shell molecule, and its teacher answer
+//! is exact for it — but only its **interior** atoms (every source atom within r_cut of them is
+//! in the segment and no cap is within r_cut: ruling P15) have the environment they have in the
+//! source scene. The sample therefore carries `force_mask` (true = interior) and
+//! `use_energy = false` (E includes the caps and the edge atoms, whose per-atom energies are not
+//! the source's and cannot be separated from the total). [`Accumulator::add`] then adds:
+//!
+//! * **no energy row** (n_E unchanged);
+//! * the **3 force rows of each interior atom j** only: F_{j,a} = −Σ_i ∂E_i/∂r_{j,a}, the sum over
+//!   every centre i within r_cut of j — edge atoms and caps included, since they are real atoms of
+//!   the segment whose E_i depend on r_j. Those rows are the segment's own exact equations; what
+//!   differs from the source is the physics beyond the model (the DFT force on j in the capped
+//!   molecule against the whole one's, and the many-body terms of a centre i whose own
+//!   neighbourhood holds a cap — a force's model reach is 2 r_cut). That difference is the
+//!   capping error the validate gate `capping.rs` measures; it is not hidden here.
+//! * a **scale row** (`sumsq`, `n_scale`): the standardisation D is a property of the features,
+//!   not of the targets, so a sample without an energy row still contributes the per-atom mean of
+//!   its interior atoms' descriptors (Σ_{i interior} B_i / n_interior) — the same quantity an
+//!   energy row holds for a whole sample (÷ N). Without `energy_per_atom` the whole sample's row
+//!   is extensive (Σ over all N atoms), and the masked one is scaled to match:
+//!   (N / n_interior) Σ_{i interior} B_i. For every unmasked sample the scale row IS its energy
+//!   row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
+//! * the **envelope** (`Envelope::add_atom`) of the interior atoms only: a cap or an edge atom
+//!   describes no knowledge of the source (the conservative ruling — the provider's active set
+//!   and key counts follow it).
+//!
+//! **A fit without energy rows** (a collection taught only by segments): G_E = b_E = yᵀWy_E = 0,
+//! so s_E enters neither A, m, γ nor the evidence (every energy term is 0 · something finite). It
+//! cannot be estimated (no residual) and is pinned at [`SIGMA_E_WITHOUT_ENERGY_ROWS`] = 1 Ha per
+//! atom, which leaves the force fit exactly what the force rows alone give and makes every
+//! predicted energy std ≥ N Ha — and `residual_dof_e` is 0 — so the provider's trust rule answers
+//! no energy from such a fit. Forces determine the energy model's coefficients too (every
+//! feature has a non-zero gradient somewhere; the constant per species is the fixed reference),
+//! so the predicted energies are meaningful; they are just not vouched for by energy data.
+//!
+//! The warm refit folds a masked sample's rows like any other (k = 3·n_interior, plus 1 when the
+//! energy is fitted): the Woodbury update of tr Σ is unchanged, tr(Σ G̃_E) gains no own-row term
+//! for a sample without an energy row, and G̃_E before sample j subtracts only the pending energy
+//! rows that exist. [`fit`]'s exact residual RMSEs and `loo::leave_one_out` use the fitted rows
+//! only.
+//!
 //! # Accuracy notes
 //!
 //! * RSS from the statistics cancels to ~ε·yᵀWy, so `Accumulator::solve` cannot report an RMSE
@@ -186,7 +310,8 @@
 use crate::descriptor::{describe, Basis, DescribeError};
 use crate::envelope::Envelope;
 use crate::linalg::{
-    cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, mat_vec,
+    cholesky_in_place, cholesky_in_place_fast, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot,
+    inverse_from_lower_inverse, lower_inverse_transposed, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve, Tridiagonal,
 };
 use crate::model::{energy_and_forces, Model, Provenance};
 use std::fmt;
@@ -222,6 +347,11 @@ pub enum SampleTag {
 
 /// One teacher evaluation: positions (Bohr), nuclear charges, total Kohn-Sham energy (Hartree)
 /// and forces (Hartree/Bohr), with a relative row weight (1.0 = normal).
+///
+/// `force_mask` and `use_energy` (M8a Task 10, "Train this segment"; module doc, "Masked
+/// samples"): a capped cut-out of a larger scene teaches only its **interior** atoms' forces
+/// (`force_mask[j]` true) and no energy (its total energy includes the caps). An ordinary sample
+/// has `force_mask: None` (every atom) and `use_energy: true`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     pub pos: Vec<[f64; 3]>,
@@ -231,9 +361,35 @@ pub struct Sample {
     pub forces: Vec<[f64; 3]>,
     pub tag: SampleTag,
     pub weight: f64,
+    /// Per atom: its force rows are fitted (`None` = every atom). A masked-out atom (a cap, an
+    /// edge atom whose r_cut neighbourhood differs from the source scene's) adds no row, no
+    /// envelope entry, no active-set atom and no key count: it describes no knowledge.
+    pub force_mask: Option<Vec<bool>>,
+    /// The energy row is fitted (false for a capped segment: its E includes the caps).
+    pub use_energy: bool,
 }
 
 impl Sample {
+    /// An ordinary sample: every atom's forces and the energy are fitted.
+    pub fn new(pos: Vec<[f64; 3]>, z: Vec<u8>, energy: f64, forces: Vec<[f64; 3]>, tag: SampleTag, weight: f64) -> Sample {
+        Sample { pos, z, energy, forces, tag, weight, force_mask: None, use_energy: true }
+    }
+
+    /// Atom `j`'s forces are fitted (its environment describes knowledge; struct doc).
+    pub fn trains_atom(&self, j: usize) -> bool {
+        self.force_mask.as_ref().is_none_or(|m| m.get(j).copied().unwrap_or(false))
+    }
+
+    /// The atoms whose forces are fitted.
+    pub fn trained_atoms(&self) -> usize {
+        self.force_mask.as_ref().map_or(self.pos.len(), |m| m.iter().filter(|&&b| b).count())
+    }
+
+    /// Neither a mask nor an unused energy: every row of the sample is fitted.
+    pub fn is_whole(&self) -> bool {
+        self.force_mask.is_none() && self.use_energy
+    }
+
     fn shape_ok(&self) -> Result<(), StoreError> {
         if self.pos.len() != self.z.len() || self.pos.len() != self.forces.len() {
             return Err(StoreError::ShapeMismatch {
@@ -244,6 +400,14 @@ impl Sample {
         }
         if !(self.weight > 0.0) || !self.weight.is_finite() {
             return Err(StoreError::NonPositiveWeight(self.weight));
+        }
+        if let Some(m) = &self.force_mask {
+            if m.len() != self.pos.len() {
+                return Err(StoreError::MaskMismatch { n_atoms: self.pos.len(), n_mask: m.len() });
+            }
+        }
+        if !self.use_energy && self.trained_atoms() == 0 {
+            return Err(StoreError::NothingTaught);
         }
         Ok(())
     }
@@ -266,6 +430,14 @@ pub enum StoreError {
         n_forces: usize,
     },
     NonPositiveWeight(f64),
+    /// The same teacher answer (atoms, positions, energy and forces, bit for bit) is already held:
+    /// a second copy would double the geometry's weight and give it a leave-one-out twin
+    /// (M8a Task 4a fix round 1; the shared collection's duplicate rule, `crate::collection`).
+    Duplicate,
+    /// The force mask does not have one entry per atom.
+    MaskMismatch { n_atoms: usize, n_mask: usize },
+    /// No energy row and no masked-in atom: the sample would add no row.
+    NothingTaught,
 }
 
 impl fmt::Display for StoreError {
@@ -277,6 +449,9 @@ impl fmt::Display for StoreError {
                 "sample has {n_pos} positions, {n_z} charges and {n_forces} forces"
             ),
             StoreError::NonPositiveWeight(w) => write!(f, "sample weight {w} is not positive"),
+            StoreError::Duplicate => write!(f, "an identical teacher answer is already held"),
+            StoreError::MaskMismatch { n_atoms, n_mask } => write!(f, "sample has {n_atoms} atoms and a force mask of {n_mask}"),
+            StoreError::NothingTaught => write!(f, "sample teaches nothing (no energy row and no interior atom)"),
         }
     }
 }
@@ -375,9 +550,11 @@ pub struct FitReport {
     pub n_samples: usize,
     /// Independent columns Q′ (trust rule: n_samples ≳ Q′).
     pub q_prime: usize,
-    /// κ₂ estimate of the posterior precision A.
+    /// κ₂ estimate of the posterior precision A. **After a warm refit** (`Accumulator::refit` on a
+    /// body-4 basis, module doc "The large-basis path"): the last search's, not re-estimated.
     pub condition_estimate: f64,
-    /// Outer alternation rounds of the hyperparameter search, and whether it met 1e-3.
+    /// Outer alternation rounds of the hyperparameter search, and whether it met 1e-3. **After a
+    /// warm refit**: 0 rounds, and `converged` is the last search's (no search ran).
     pub hyper_iterations: usize,
     pub converged: bool,
 }
@@ -387,7 +564,30 @@ impl FitReport {
     pub fn residual_dof(&self) -> f64 {
         self.residual_dof_e + self.residual_dof_f
     }
+
+    /// Whether the fit had an energy row (module doc, "Masked samples"). Without one G_E = 0, so
+    /// γ_E = 0 and the residual dof n_E − γ_E = 0 exactly; with n_E ≥ 1 rows γ_E < n_E strictly
+    /// (a finite prior), so the residual dof is > 0.
+    pub fn has_energy_rows(&self) -> bool {
+        self.residual_dof_e != 0.0 || self.gamma_e != 0.0
+    }
+
+    /// s_E as the fit measured it; `None` for a fit without energy rows, whose s_E is the pin
+    /// [`SIGMA_E_WITHOUT_ENERGY_ROWS`] (no residual to estimate it from) — what a readout shows
+    /// instead of a number (Task 10a review, finding 5).
+    pub fn measured_sigma_e(&self) -> Option<f64> {
+        self.has_energy_rows().then_some(self.sigma_e)
+    }
+
+    /// The readout of s_E: the number (`{:.2e}`), or "no energy rows" for the pin.
+    pub fn sigma_e_text(&self) -> String {
+        self.measured_sigma_e().map_or_else(|| NO_ENERGY_ROWS.to_string(), |s| format!("{s:.2e}"))
+    }
 }
+
+/// What a readout shows for the energy numbers of a fit without energy rows (s_E, the energy
+/// rmse): no number is measured.
+pub const NO_ENERGY_ROWS: &str = "no energy rows";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FitError {
@@ -461,9 +661,13 @@ pub struct Accumulator {
     pub yy_f: f64,
     pub n_f: usize,
     pub sum_log_w_f: f64,
-    /// Per feature k: Σ over energy rows and species blocks (duplicates included) of
-    /// φ_{E,(s,k)}² (for the scale).
+    /// Per feature k: Σ over scale rows and species blocks (duplicates included) of
+    /// φ_{E,(s,k)}² (for the scale). A scale row is a sample's energy row, or — for a sample
+    /// whose energy is not fitted — the per-atom mean descriptor of its masked-in atoms (module
+    /// doc, "Masked samples").
     pub sumsq: Vec<f64>,
+    /// Scale rows accumulated in `sumsq` (= `n_e` unless a sample's energy is unused).
+    pub n_scale: usize,
     /// Range and spread of the per-atom descriptors seen, per (species, feature): the
     /// out-of-distribution envelope of the provider (`envelope` module doc).
     pub envelope: Envelope,
@@ -475,6 +679,12 @@ pub struct Accumulator {
     classes: Vec<Vec<usize>>,
     /// Neumaier compensations of gram_e, rhs_e, yy_e, gram_f, rhs_f, yy_f (struct doc).
     comp: Compensation,
+    /// The large-basis path (module doc): the warm state of the last search, the rows of the
+    /// samples added since the last refit (kept only while a warm state stands), how the last
+    /// refit went.
+    warm: Option<Box<WarmState>>,
+    pending: Vec<PendingRows>,
+    last_refit: RefitKind,
     // Scratch buffers reused across `add` calls.
     phi: Vec<f64>,
     rows: Vec<f64>,
@@ -505,6 +715,7 @@ impl Accumulator {
             n_f: 0,
             sum_log_w_f: 0.0,
             sumsq: vec![0.0; p],
+            n_scale: 0,
             envelope: Envelope::new(basis),
             n_samples: 0,
             energy_per_atom: None,
@@ -518,6 +729,9 @@ impl Accumulator {
                 rhs_f: vec![0.0; qr],
                 yy_f: 0.0,
             },
+            warm: None,
+            pending: Vec::new(),
+            last_refit: RefitKind::None,
             phi: vec![0.0; qr],
             rows: Vec::new(),
             support: Vec::with_capacity(qr),
@@ -543,7 +757,9 @@ impl Accumulator {
         self.n_e + self.n_f
     }
 
-    /// Add one sample's energy row and 3N force rows.
+    /// Add one sample's energy row and 3N force rows — only the rows the sample fits: no energy
+    /// row when `use_energy` is false, force rows only for the atoms its `force_mask` keeps, and
+    /// only those atoms in the envelope (module doc, "Masked samples").
     ///
     /// # Panics
     /// If `basis` differs from the accumulator's, the sample's shapes disagree, `ref_energy`
@@ -573,14 +789,23 @@ impl Accumulator {
         let qr = self.q_prime;
         let n = sample.pos.len();
         let w = sample.weight;
+        let mask: Vec<bool> = (0..n).map(|j| sample.trains_atom(j)).collect();
+        let n_taught = mask.iter().filter(|&&b| b).count();
 
         // Energy row on the representatives (a duplicate column's value is its representative's).
+        // Without an energy row the same sum over the masked-in atoms (÷ their count) is the
+        // sample's scale row (module doc, "Masked samples").
         let mut phi = std::mem::take(&mut self.phi);
         phi.iter_mut().for_each(|v| *v = 0.0);
         let mut y = sample.energy;
         for (i, d) in desc.iter().enumerate() {
-            self.envelope.add_atom(s[i], &d.b);
+            if mask[i] {
+                self.envelope.add_atom(s[i], &d.b);
+            }
             y -= ref_energy[s[i]];
+            if !(sample.use_energy || mask[i]) {
+                continue;
+            }
             let off = s[i] * p;
             for k in 0..p {
                 if let Some(c) = self.col_index[off + k] {
@@ -588,21 +813,30 @@ impl Accumulator {
                 }
             }
         }
-        if per_atom {
-            let inv = 1.0 / n as f64;
+        if sample.use_energy {
+            if per_atom {
+                let inv = 1.0 / n as f64;
+                phi.iter_mut().for_each(|v| *v *= inv);
+                y *= inv;
+            }
+            rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
+            neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
+            self.n_e += 1;
+            self.sum_log_w_e += w.ln();
+        } else {
+            // the interior mean (per atom), or the interior sum scaled to N atoms (extensive, as a
+            // whole sample's Σ over all N): the quantity a whole sample's energy row holds.
+            // n_taught ≥ 1: `shape_ok`
+            let inv = if per_atom { 1.0 / n_taught as f64 } else { n as f64 / n_taught as f64 };
             phi.iter_mut().for_each(|v| *v *= inv);
-            y *= inv;
         }
-        rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
-        neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
-        self.n_e += 1;
-        self.sum_log_w_e += w.ln();
         for (c, class) in self.classes.iter().enumerate() {
             let v2 = phi[c] * phi[c];
             for &q in class {
                 self.sumsq[q % p] += v2;
             }
         }
+        self.n_scale += 1;
         self.phi = phi;
 
         // Force rows: φ_{F,(j,a)} block s = −Σ_{i: s_i = s} ∂B_i/∂r_{j,a}, 3N rows of Q′.
@@ -622,15 +856,46 @@ impl Accumulator {
                 }
             }
         }
-        for j in 0..n {
-            for a in 0..3 {
-                let f = sample.forces[j][a];
-                let row = &rows[(3 * j + a) * qr..(3 * j + a + 1) * qr];
-                rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+        // a masked sample: only the masked-in atoms' rows, compacted in atom order
+        if n_taught < n {
+            let mut k = 0;
+            for j in (0..n).filter(|&j| mask[j]) {
+                if k != j {
+                    rows.copy_within(3 * j * qr..3 * (j + 1) * qr, 3 * k * qr);
+                }
+                k += 1;
+            }
+        }
+        let taught: Vec<usize> = (0..n).filter(|&j| mask[j]).collect();
+        let n_rows3 = 3 * taught.len();
+        if self.basis.body4 {
+            // the large-basis path (module doc): the sample's 3N rows summed into one block first,
+            // which is then added compensated — one Neumaier step per entry per sample instead of
+            // per row, threaded over the Gram's rows
+            let ys: Vec<f64> = taught.iter().flat_map(|&j| sample.forces[j].iter().copied()).collect();
+            if !ys.is_empty() {
+                batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &rows[..n_rows3 * qr], &ys, w);
+            }
+            for &f in &ys {
                 neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                 self.n_f += 1;
                 self.sum_log_w_f += w.ln();
             }
+        } else {
+            for (jc, &j) in taught.iter().enumerate() {
+                for a in 0..3 {
+                    let f = sample.forces[j][a];
+                    // jc: the compacted row block of atom j (masked-out atoms' rows dropped above)
+                    let row = &rows[(3 * jc + a) * qr..(3 * jc + a + 1) * qr];
+                    rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+                    neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
+                    self.n_f += 1;
+                    self.sum_log_w_f += w.ln();
+                }
+            }
+        }
+        if self.warm.is_some() {
+            self.pending.push(PendingRows { w, e: sample.use_energy.then(|| self.phi.clone()), f: rows[..n_rows3 * qr].to_vec() });
         }
         self.rows = rows;
         self.n_samples += 1;
@@ -644,25 +909,51 @@ impl Accumulator {
         provenance: &Provenance,
         ref_energy: &[f64],
     ) -> Result<(Model, FitReport), FitError> {
-        if self.n_samples == 0 || self.n_e == 0 {
+        let opts = &self.effective_options(opts);
+        let (scale, d, problem) = self.prepare(ref_energy, None)?;
+        let (hyper, sol) = problem.estimate(opts)?;
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let condition = condition_estimate(&sol.a, &sol.chol, self.q_prime);
+        self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)
+    }
+
+    /// `opts` with the energy noise pinned at [`SIGMA_E_WITHOUT_ENERGY_ROWS`] when no energy row has
+    /// been accumulated (module doc, "Masked samples"): nothing estimates s_E then, and every
+    /// energy term of A, m, γ and the evidence is exactly zero whatever its value.
+    fn effective_options(&self, opts: &FitOptions) -> FitOptions {
+        if self.n_e == 0 && self.n_samples > 0 {
+            FitOptions { sigma_e: Some(SIGMA_E_WITHOUT_ENERGY_ROWS), ..opts.clone() }
+        } else {
+            opts.clone()
+        }
+    }
+
+    /// The standardisation (from the energy rows, or `frozen` = a warm state's (scale, d)) and the
+    /// standardised two-noise problem (module doc). Refuses an empty or non-finite accumulator.
+    fn prepare(&self, ref_energy: &[f64], frozen: Option<(&[f64], &[f64])>) -> Result<(Vec<f64>, Vec<f64>, TwoNoise), FitError> {
+        if self.n_samples == 0 || self.n_scale == 0 {
             return Err(FitError::NoSamples);
         }
         check_references(&self.basis, ref_energy)?;
-        let basis = &self.basis;
-        let p = basis.n_features();
-        let n_s = basis.n_species();
+        let p = self.basis.n_features();
         let q = self.q_prime;
         let n_e = self.n_e as f64;
         let n_f = self.n_f as f64;
-        let n_rows = self.n_e + self.n_f;
-
-        // Scale from the energy rows; D per representative column through k = q_full mod P.
-        let scale: Vec<f64> = self
-            .sumsq
-            .iter()
-            .map(|&ss| if ss > 0.0 { (ss / n_e).sqrt() } else { 1.0 })
-            .collect();
-        let d: Vec<f64> = self.classes.iter().map(|c| 1.0 / scale[c[0] % p]).collect();
+        let n_scale = self.n_scale as f64;
+        let (scale, d) = match frozen {
+            Some((s, d)) => (s.to_vec(), d.to_vec()),
+            None => {
+                // Scale from the scale rows (= the energy rows unless a sample's energy is unused:
+                // module doc, "Masked samples"); D per representative column through k = q_full mod P.
+                let scale: Vec<f64> = self
+                    .sumsq
+                    .iter()
+                    .map(|&ss| if ss > 0.0 { (ss / n_scale).sqrt() } else { 1.0 })
+                    .collect();
+                let d: Vec<f64> = self.classes.iter().map(|c| 1.0 / scale[c[0] % p]).collect();
+                (scale, d)
+            }
+        };
         let standardise = |g: &[f64]| -> Vec<f64> {
             let mut out = vec![0.0; q * q];
             for i in 0..q {
@@ -690,17 +981,41 @@ impl Accumulator {
             n_f,
             q,
             sum_log_w: self.sum_log_w_e + self.sum_log_w_f,
-            floor_e2: (1e-16 * sums.yy_e / n_e).max(f64::MIN_POSITIVE),
+            floor_e2: if n_e > 0.0 { (1e-16 * sums.yy_e / n_e).max(f64::MIN_POSITIVE) } else { f64::MIN_POSITIVE },
             floor_f2: if n_f > 0.0 {
                 (1e-16 * sums.yy_f / n_f).max(f64::MIN_POSITIVE)
             } else {
                 f64::MIN_POSITIVE
             },
         };
-        let (hyper, sol) = problem.estimate(opts)?;
+        Ok((scale, d, problem))
+    }
+
+    /// The model and the report from a solve (module doc): the reduced solution expanded over the
+    /// column classes, every non-finite outcome refused.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        &self,
+        opts: &FitOptions,
+        provenance: &Provenance,
+        ref_energy: &[f64],
+        scale: &[f64],
+        d: &[f64],
+        hyper: &Hyper,
+        sol: &Solved,
+        log_evidence: f64,
+        condition: f64,
+    ) -> Result<(Model, FitReport), FitError> {
+        let basis = &self.basis;
+        let p = basis.n_features();
+        let n_s = basis.n_species();
+        let q = self.q_prime;
+        let n_e = self.n_e as f64;
+        let n_f = self.n_f as f64;
+        let n_rows = self.n_e + self.n_f;
+        let finite = |v: &[f64]| v.iter().all(|x| x.is_finite());
         let sigma_e = hyper.s_e2.sqrt();
         let sigma_f = hyper.s_f2.sqrt();
-        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
 
         // Expand the reduced solution: raw θ̃ = θ/scale_rep, split equally over the class, and
         // re-standardise each full column by its own feature scale (`Model::coeffs` contract).
@@ -729,7 +1044,7 @@ impl Accumulator {
             basis: basis.clone(),
             coeffs,
             mean: vec![0.0; p],
-            scale,
+            scale: scale.to_vec(),
             ref_energy: ref_energy.to_vec(),
             sigma_e,
             sigma_f,
@@ -755,11 +1070,282 @@ impl Accumulator {
             n_rows,
             n_samples: self.n_samples,
             q_prime: q,
-            condition_estimate: condition_estimate(&sol.a, &sol.chol, q),
+            condition_estimate: condition,
             hyper_iterations: hyper.iterations,
             converged: hyper.converged,
         };
         Ok((model, report))
+    }
+}
+
+/// How the last [`Accumulator::refit`] solved (module doc, "The large-basis path").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefitKind {
+    /// Not refitted yet.
+    None,
+    /// A basis without body-4 (every per-scene model): [`Accumulator::solve`], bit for bit.
+    Full,
+    /// A body-4 basis: the hyperparameters searched spectrally, `rounds` outer rounds (one
+    /// factorisation and ≥ 1 tridiagonalisations each); `stalled` when the ρ step found no ascent
+    /// before the 1e-3 test was met (the search stopped at the profile's maximum to the evidence's
+    /// resolution; the report says `converged: false` then).
+    Spectral { rounds: usize, stalled: bool },
+    /// A body-4 basis: the samples added since the last refit folded into the posterior at the
+    /// standing hyperparameters and standardisation by rank-one updates of its factor.
+    Warm { samples: usize },
+}
+
+/// The energy noise level (Hartree per atom) a fit without a single energy row is pinned at (module
+/// doc, "Masked samples"): with G_E = 0 it enters no posterior quantity; it only makes every
+/// predicted energy's std ≥ N Ha, so no energy is answered on a fit that never saw one.
+pub const SIGMA_E_WITHOUT_ENERGY_ROWS: f64 = 1.0;
+
+/// A warm refit searches the hyperparameters again once the stored samples have grown by this
+/// factor since the last search (module doc, "The large-basis path").
+pub const WARM_GROWTH: f64 = 1.25;
+/// … or when more than this many samples arrived since the last refit (each costs ≈ (3N+1)·8Q′²
+/// flops warm; a search costs ≈ 3Q′³ per round).
+pub const WARM_MAX_PENDING: usize = 64;
+
+/// What a warm refit continues from (module doc, "The large-basis path"): the last search's
+/// standardisation and hyperparameters, the upper factor R = Lᵀ of the posterior precision at
+/// them, tr Σ and tr(Σ G̃_E) (γ by Sherman–Morrison–Woodbury), and the bookkeeping of the search.
+#[derive(Clone, Debug)]
+struct WarmState {
+    scale: Vec<f64>,
+    d: Vec<f64>,
+    lambda: f64,
+    lambda_eff: f64,
+    s_e2: f64,
+    s_f2: f64,
+    r: Vec<f64>,
+    tr_sigma: f64,
+    tr_sigma_ge: f64,
+    opts: FitOptions,
+    n_search: usize,
+    converged: bool,
+    condition: f64,
+}
+
+/// One sample's raw rows on the Q′ columns, kept for the next warm refit: the energy row (÷ N
+/// when per atom; `None` when the sample's energy is not fitted) and its fitted force rows
+/// (row-major, 3 per masked-in atom), with the sample weight.
+#[derive(Clone, Debug)]
+struct PendingRows {
+    w: f64,
+    e: Option<Vec<f64>>,
+    f: Vec<f64>,
+}
+
+impl Accumulator {
+    /// The refit the provider calls (module doc, "The large-basis path"): [`Accumulator::solve`]
+    /// for a basis without body-4 (bit for bit); for a body-4 basis a warm refit when one is
+    /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
+    /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
+    pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let opts = &self.effective_options(opts);
+        if !self.basis.body4 {
+            self.warm = None;
+            self.pending.clear();
+            self.last_refit = RefitKind::Full;
+            return self.solve(opts, provenance, ref_energy);
+        }
+        let pending = self.pending.len();
+        let warm_ok = self.warm.as_ref().is_some_and(|w| {
+            w.opts == *opts && (self.n_samples as f64) < WARM_GROWTH * w.n_search as f64 && pending <= WARM_MAX_PENDING
+        });
+        if warm_ok {
+            if let Ok(out) = self.solve_warm(opts, provenance, ref_energy) {
+                self.last_refit = RefitKind::Warm { samples: pending };
+                return Ok(out);
+            }
+        }
+        match self.solve_spectral(opts, provenance, ref_energy) {
+            Ok(out) => Ok(out),
+            // the reference search as the fallback (slow at a large Q′, never wrong): a spectral
+            // failure is numerical, not the data's verdict
+            Err(FitError::Singular) => {
+                self.last_refit = RefitKind::Full;
+                self.solve(opts, provenance, ref_energy)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// How the last [`refit`](Self::refit) solved.
+    pub fn last_refit(&self) -> RefitKind {
+        self.last_refit
+    }
+
+    /// The spectral search (module doc), from the data's own starting levels — never from an
+    /// earlier search's, so a search is a function of the accumulated statistics alone (a
+    /// reopened collection's first fit equals the session's last search, bit for bit); leaves a
+    /// warm state for the next refit.
+    fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let start = None;
+        self.warm = None;
+        self.pending.clear();
+        let (scale, d, problem) = self.prepare(ref_energy, None)?;
+        let (hyper, sol, extra) = problem.estimate_spectral(opts, start)?;
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let q = self.q_prime;
+        let condition = condition_estimate(&sol.a, &sol.chol, q);
+        let out = self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)?;
+        let mut r = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..=i {
+                r[j * q + i] = sol.chol[i * q + j];
+            }
+        }
+        self.warm = Some(Box::new(WarmState {
+            scale,
+            d,
+            lambda: hyper.lambda,
+            lambda_eff: extra.lambda_eff,
+            s_e2: hyper.s_e2,
+            s_f2: hyper.s_f2,
+            r,
+            tr_sigma: extra.tr_sigma,
+            tr_sigma_ge: extra.tr_sigma_ge,
+            opts: opts.clone(),
+            n_search: self.n_samples,
+            converged: hyper.converged,
+            condition,
+        }));
+        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations, stalled: extra.stalled };
+        Ok(out)
+    }
+
+    /// The warm refit (module doc): every pending sample's rows folded into R by rank-one updates,
+    /// tr Σ and tr(Σ G̃_E) carried by Woodbury, the mean solved with the updated factor. On any
+    /// failure the warm state is dropped (the caller searches).
+    fn solve_warm(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let mut w = self.warm.take().expect("refit checked the warm state");
+        let pending = std::mem::take(&mut self.pending);
+        let (_, _, problem) = self.prepare(ref_energy, Some((&w.scale, &w.d)))?;
+        let q = self.q_prime;
+        let (ie, i_f) = (1.0 / w.s_e2, 1.0 / w.s_f2);
+        // the ridge floor 4Q′ε·max diag A grows with the data; once it passes the standing λ_eff
+        // the warm posterior (whose ridge is frozen) is no longer the one a fresh solve gives —
+        // search instead (fix round 1, the review's M2: a long chain measured the gap)
+        let max_diag = (0..q).map(|i| problem.g_e[i * q + i] * ie + problem.g_f[i * q + i] * i_f).fold(0.0f64, f64::max);
+        if 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag > w.lambda_eff {
+            return Err(FitError::Singular);
+        }
+        // the standardised energy rows of the pending samples: G̃_E before sample j is the
+        // accumulator's minus the rows of samples j.. (they are already in its sums); a sample
+        // whose energy is not fitted has none (module doc, "Masked samples")
+        let e_rows: Vec<Option<Vec<f64>>> = pending.iter().map(|ps| ps.e.as_ref().map(|e| (0..q).map(|i| w.d[i] * e[i]).collect())).collect();
+        let mut tr_s = w.tr_sigma;
+        let mut t_e = w.tr_sigma_ge;
+        let mut gv = vec![0.0; q];
+        for (j, ps) in pending.iter().enumerate() {
+            let n3 = ps.f.len() / q;
+            let has_e = e_rows[j].is_some();
+            let k = usize::from(has_e) + n3;
+            if k == 0 {
+                continue; // no row (`Sample::shape_ok` refuses such a sample; kept defensive)
+            }
+            // U: the whitened rows (A += Σ u uᵀ), the energy row first when there is one
+            let (se, sf) = ((ps.w * ie).sqrt(), (ps.w * i_f).sqrt());
+            let mut u: Vec<Vec<f64>> = Vec::with_capacity(k);
+            if let Some(e) = &e_rows[j] {
+                u.push(e.iter().map(|x| x * se).collect());
+            }
+            for rr in 0..n3 {
+                u.push((0..q).map(|i| w.d[i] * ps.f[rr * q + i] * sf).collect());
+            }
+            // V = Σ U, C = I + UᵀV (k×k, symmetric positive definite)
+            let v: Vec<Vec<f64>> = u
+                .iter()
+                .map(|x| {
+                    let mut y = x.clone();
+                    upper_solve(&w.r, q, &mut y);
+                    y
+                })
+                .collect();
+            let mut c = vec![0.0; k * k];
+            for a in 0..k {
+                for b in a..k {
+                    let m = 0.5 * (dot(&u[a], &v[b]) + dot(&u[b], &v[a]));
+                    c[a * k + b] = m + if a == b { 1.0 } else { 0.0 };
+                    c[b * k + a] = c[a * k + b];
+                }
+            }
+            let mut cl = c.clone();
+            cholesky_in_place(&mut cl, k).map_err(|_| FitError::Singular)?;
+            // tr(C⁻¹ X) for a symmetric k×k X
+            let tr_cinv = |x: &[f64]| -> f64 {
+                let mut t = 0.0;
+                let mut col = vec![0.0; k];
+                for b in 0..k {
+                    for a in 0..k {
+                        col[a] = x[a * k + b];
+                    }
+                    cholesky_solve(&cl, k, &mut col);
+                    t += col[b];
+                }
+                t
+            };
+            // tr Σ' = tr Σ − tr(C⁻¹ VᵀV)
+            let mut vtv = vec![0.0; k * k];
+            for a in 0..k {
+                for b in a..k {
+                    vtv[a * k + b] = dot(&v[a], &v[b]);
+                    vtv[b * k + a] = vtv[a * k + b];
+                }
+            }
+            tr_s -= tr_cinv(&vtv);
+            // tr(Σ' G̃_pre) = tr(Σ G̃_pre) − tr(C⁻¹ Vᵀ G̃_pre V), G̃_pre = G̃_E − Σ_{i ≥ j} w_i ẽ_i ẽ_iᵀ
+            let ve: Vec<(f64, Vec<f64>)> = (j..pending.len()).filter_map(|i| e_rows[i].as_ref().map(|e| (pending[i].w, v.iter().map(|vb| dot(vb, e)).collect()))).collect();
+            let mut vgv = vec![0.0; k * k];
+            for b in 0..k {
+                mat_vec_fast(&problem.g_e, q, &v[b], &mut gv);
+                for a in 0..=b {
+                    let mut x = dot(&v[a], &gv);
+                    for (wi, row) in &ve {
+                        x -= wi * row[a] * row[b];
+                    }
+                    vgv[a * k + b] = x;
+                    vgv[b * k + a] = x;
+                }
+            }
+            t_e -= tr_cinv(&vgv);
+            // + w ẽᵀ Σ' ẽ = s_E² (M₀₀ − M₀ᵀ C⁻¹ M₀), M = UᵀV = C − I, M₀ its first column (the
+            // energy row's; a sample without one adds no energy row to G̃_E)
+            if has_e {
+                let m0: Vec<f64> = (0..k).map(|a| c[a * k] - if a == 0 { 1.0 } else { 0.0 }).collect();
+                let mut x = m0.clone();
+                cholesky_solve(&cl, k, &mut x);
+                t_e += w.s_e2 * (m0[0] - dot(&m0, &x));
+            }
+            // fold the rows into the factor
+            for mut col in u {
+                cholesky_update_upper(&mut w.r, q, &mut col);
+            }
+        }
+        let mut m: Vec<f64> = (0..q).map(|i| problem.b_e[i] * ie + problem.b_f[i] * i_f).collect();
+        upper_solve(&w.r, q, &mut m);
+        let rss_e = residual_ss(&problem.g_e, &problem.b_e, problem.yy_e, q, &m);
+        let rss_f = residual_ss(&problem.g_f, &problem.b_f, problem.yy_f, q, &m);
+        let gamma_e = t_e * ie;
+        let gamma = q as f64 - w.lambda_eff * tr_s;
+        let mut chol = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..=i {
+                chol[i * q + j] = w.r[j * q + i];
+            }
+        }
+        let logdet = cholesky_logdet(&chol, q);
+        let m_norm2 = m.iter().map(|v| v * v).sum();
+        let sol = Solved { a: Vec::new(), chol, m, rss_e, rss_f, gamma_e, gamma_f: gamma - gamma_e, logdet, m_norm2 };
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: w.converged };
+        let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
+        let out = self.assemble(opts, provenance, ref_energy, &w.scale, &w.d, &hyper, &sol, log_evidence, w.condition)?;
+        w.tr_sigma = tr_s;
+        w.tr_sigma_ge = t_e;
+        self.warm = Some(w);
+        Ok(out)
     }
 }
 
@@ -840,6 +1426,65 @@ fn rank1_update(
             neumaier_add(&mut gram[k], &mut gc[k], wi * v[j]);
         }
     }
+}
+
+/// G += w Σ_r v_r v_rᵀ, b += w Σ_r y_r v_r for the k rows v_r of `rows` (k×q row-major): the block
+/// summed plainly over its k rows (k ≤ 3N: a few ε relative per entry), then added to each entry
+/// with one compensated step (`neumaier_add`) — the large-basis path's form of [`rank1_update`],
+/// threaded over the rows of G (each entry written by one thread; G stays exactly symmetric,
+/// the block's (i, j) and (j, i) being the same commutative sums).
+#[allow(clippy::too_many_arguments)]
+fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64], q: usize, rows: &[f64], ys: &[f64], w: f64) {
+    let k = ys.len();
+    debug_assert_eq!(rows.len(), k * q);
+    let support: Vec<usize> = (0..q).filter(|&i| (0..k).any(|r| rows[r * q + i] != 0.0)).collect();
+    if support.is_empty() {
+        return;
+    }
+    // column-major copy of the support: t[s] = (rows[r][support[s]])_r, contiguous in r
+    let t: Vec<Vec<f64>> = support.iter().map(|&i| (0..k).map(|r| rows[r * q + i]).collect()).collect();
+    for (s, &i) in support.iter().enumerate() {
+        neumaier_add(&mut rhs[i], &mut bc[i], w * crate::linalg::dot(&t[s], ys));
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1);
+    let per = support.len().div_ceil(threads);
+    // each thread owns whole rows i of G: split the rows of the support among them
+    let mut row_ids: Vec<Vec<usize>> = support.chunks(per).map(|c| c.to_vec()).collect();
+    let mut work: Vec<Vec<(usize, &mut [f64], &mut [f64])>> = (0..row_ids.len()).map(|_| Vec::new()).collect();
+    {
+        let mut owner = vec![usize::MAX; q];
+        for (c, ids) in row_ids.iter().enumerate() {
+            for &i in ids {
+                owner[i] = c;
+            }
+        }
+        for (i, (g_row, c_row)) in gram.chunks_mut(q).zip(gc.chunks_mut(q)).enumerate() {
+            if owner[i] != usize::MAX {
+                work[owner[i]].push((i, g_row, c_row));
+            }
+        }
+    }
+    row_ids.clear();
+    let index: Vec<usize> = {
+        let mut ix = vec![usize::MAX; q];
+        for (s, &i) in support.iter().enumerate() {
+            ix[i] = s;
+        }
+        ix
+    };
+    let (t, support, index) = (&t, &support, &index);
+    std::thread::scope(|scope| {
+        for chunk in work {
+            scope.spawn(move || {
+                for (i, g_row, c_row) in chunk {
+                    let ti = &t[index[i]];
+                    for (sj, &j) in support.iter().enumerate() {
+                        neumaier_add(&mut g_row[j], &mut c_row[j], w * crate::linalg::dot(ti, &t[sj]));
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// yᵀWy − 2 mᵀb + mᵀGm, clamped at 0 (cancellation).
@@ -1032,71 +1677,7 @@ impl TwoNoise {
                 Err(_) => f64::NEG_INFINITY,
             }
         };
-        let half_decade = 10f64.sqrt();
-        let mut grid: Vec<(f64, f64)> = Vec::new(); // (ln λ, evidence)
-        let mut lambda = LAMBDA_GRID_LO;
-        while lambda <= LAMBDA_GRID_HI * 1.0001 {
-            grid.push((lambda.ln(), at(lambda)));
-            lambda *= half_decade;
-        }
-        if grid.iter().all(|g| g.1 == f64::NEG_INFINITY) {
-            return Err(FitError::Singular);
-        }
-        let best_index = |g: &[(f64, f64)]| {
-            g.iter()
-                .enumerate()
-                .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-                .unwrap()
-        };
-        loop {
-            let i = best_index(&grid);
-            if i == grid.len() - 1 && grid[i].0.exp() < LAMBDA_EXTEND_HI {
-                let l = grid[i].0.exp() * half_decade;
-                grid.push((l.ln(), at(l)));
-            } else if i == 0 && grid[0].0.exp() > LAMBDA_EXTEND_LO {
-                let l = grid[0].0.exp() / half_decade;
-                grid.insert(0, (l.ln(), at(l)));
-            } else {
-                break;
-            }
-        }
-        let i = best_index(&grid);
-        let (mut lo, mut hi) = (
-            grid[i.saturating_sub(1)].0,
-            grid[(i + 1).min(grid.len() - 1)].0,
-        );
-        let mut best = grid[i];
-        if hi > lo {
-            let phi = 0.5 * (3.0 - 5f64.sqrt());
-            let mut x1 = lo + phi * (hi - lo);
-            let mut x2 = hi - phi * (hi - lo);
-            let mut f1 = at(x1.exp());
-            let mut f2 = at(x2.exp());
-            // 20 steps resolve ln λ to 0.618²⁰·2.3 ≈ 1.5e-4, below the outer tolerance (the
-            // alternation cannot converge if the λ search is coarser than its own test).
-            for _ in 0..20 {
-                if f1 > f2 {
-                    hi = x2;
-                    x2 = x1;
-                    f2 = f1;
-                    x1 = lo + phi * (hi - lo);
-                    f1 = at(x1.exp());
-                } else {
-                    lo = x1;
-                    x1 = x2;
-                    f1 = f2;
-                    x2 = hi - phi * (hi - lo);
-                    f2 = at(x2.exp());
-                }
-            }
-            for (x, f) in [(x1, f1), (x2, f2)] {
-                if f > best.1 {
-                    best = (x, f);
-                }
-            }
-        }
-        Ok(best.0.exp())
+        lambda_search_with(at)
     }
 
     /// [`estimate_free`](Self::estimate_free), then — when `FitOptions::sigma_f_min` is set and the estimated
@@ -1187,6 +1768,327 @@ impl TwoNoise {
     }
 }
 
+/// What the large-basis solve adds to [`Solved`] for a warm state: λ_eff, tr Σ and tr(Σ G̃_E).
+struct LargeExtra {
+    lambda_eff: f64,
+    tr_sigma: f64,
+    tr_sigma_ge: f64,
+    /// The spectral search stopped on a ρ stall (`RefitKind::Spectral::stalled`).
+    stalled: bool,
+}
+
+/// The spectrum of H_ρ = G̃_F + ρ G̃_E for one noise ratio ρ = s_F²/s_E² (module doc, "The
+/// large-basis path"): eigenvalues h_k and ĉ = Uᵀ(b̃_F + ρ b̃_E), with the floor μ of λ_eff·s_F².
+struct Spectrum {
+    rho: f64,
+    h: Vec<f64>,
+    c: Vec<f64>,
+    mu_floor: f64,
+}
+
+impl Spectrum {
+    /// (evidence, ρ·RSS_E + RSS_F, γ) at (λ, s_F² = t, s_E² = t/ρ); `None` when a shifted
+    /// eigenvalue is not positive (the spectral twin of a failed factorisation).
+    fn at(&self, tn: &TwoNoise, lambda: f64, t: f64) -> Option<(f64, f64, f64)> {
+        let mu = (lambda * t).max(self.mu_floor);
+        let (mut mc, mut hm2, mut mn2, mut logdet, mut gamma) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (&h, &c) in self.h.iter().zip(&self.c) {
+            let den = h + mu;
+            if !(den > 0.0) {
+                return None;
+            }
+            let mk = c / den;
+            mc += mk * c;
+            hm2 += h * mk * mk;
+            mn2 += mk * mk;
+            logdet += (den / t).ln();
+            gamma += h / den;
+        }
+        let comb = (self.rho * tn.yy_e + tn.yy_f - 2.0 * mc + hm2).max(0.0);
+        let (s_e2, s_f2) = (t / self.rho, t);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let ev = -0.5 * tn.n_e * (two_pi * s_e2).ln() - 0.5 * tn.n_f * (two_pi * s_f2).ln() + 0.5 * tn.q as f64 * lambda.ln() - 0.5 * logdet - 0.5 * comb / t - 0.5 * lambda * mn2 + 0.5 * tn.sum_log_w;
+        Some((ev, comb, gamma))
+    }
+}
+
+impl TwoNoise {
+    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ and an implicit QL
+    /// iteration that carries Qᵀc along (no eigenvectors are formed).
+    fn spectrum(&self, rho: f64) -> Result<Spectrum, FitError> {
+        let q = self.q;
+        let mut h = vec![0.0; q * q];
+        let mut max_diag = 0.0f64;
+        for i in 0..q {
+            for j in 0..q {
+                h[i * q + j] = self.g_f[i * q + j] + rho * self.g_e[i * q + j];
+            }
+            max_diag = max_diag.max(h[i * q + i]);
+        }
+        let tri = Tridiagonal::of(&h, q);
+        let mut c: Vec<f64> = (0..q).map(|i| self.b_f[i] + rho * self.b_e[i]).collect();
+        tri.apply_qt(&mut c);
+        let (mut d, mut e) = (tri.d.clone(), tri.e.clone());
+        tridiagonal_ql(&mut d, &mut e, |i, cc, ss| {
+            let (x, y) = (c[i], c[i + 1]);
+            c[i] = cc * x - ss * y;
+            c[i + 1] = ss * x + cc * y;
+        })
+        .map_err(|_| FitError::Singular)?;
+        Ok(Spectrum { rho, h: d, c, mu_floor: 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag })
+    }
+
+    /// [`TwoNoise::solve`] with the large-basis kernels (the vectorised Cholesky and the
+    /// triangular inverse: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
+    fn solve_large(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<(Solved, LargeExtra), FitError> {
+        let q = self.q;
+        let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
+        let mut a = vec![0.0; q * q];
+        let mut max_diag = 0.0f64;
+        for i in 0..q {
+            for j in 0..q {
+                a[i * q + j] = self.g_e[i * q + j] * ie + self.g_f[i * q + j] * i_f;
+            }
+            max_diag = max_diag.max(a[i * q + i]);
+        }
+        let lambda_eff = lambda.max(4.0 * q.max(1) as f64 * f64::EPSILON * max_diag);
+        for i in 0..q {
+            a[i * q + i] += lambda_eff;
+        }
+        let mut chol = a.clone();
+        cholesky_in_place_fast(&mut chol, q).map_err(|_| FitError::Singular)?;
+        let mut m: Vec<f64> = (0..q).map(|i| self.b_e[i] * ie + self.b_f[i] * i_f).collect();
+        cholesky_solve(&chol, q, &mut m);
+        let rss_e = residual_ss(&self.g_e, &self.b_e, self.yy_e, q, &m);
+        let rss_f = residual_ss(&self.g_f, &self.b_f, self.yy_f, q, &m);
+        let inv = inverse_from_lower_inverse(&lower_inverse_transposed(&chol, q), q);
+        let tr_sigma_ge = trace_product(&inv, &self.g_e, q);
+        let gamma_e = tr_sigma_ge * ie;
+        let gamma_f = trace_product(&inv, &self.g_f, q) * i_f;
+        let tr_sigma = (0..q).map(|i| inv[i * q + i]).sum();
+        let logdet = cholesky_logdet(&chol, q);
+        let m_norm2 = m.iter().map(|v| v * v).sum();
+        Ok((Solved { a, chol, m, rss_e, rss_f, gamma_e, gamma_f, logdet, m_norm2 }, LargeExtra { lambda_eff, tr_sigma, tr_sigma_ge, stalled: false }))
+    }
+
+    /// [`TwoNoise::estimate`] on the large-basis path: the same stationarity conditions and
+    /// tolerances, the same `sigma_f_min` rule.
+    fn estimate_spectral(&self, opts: &FitOptions, start: Option<(f64, f64, f64)>) -> Result<(Hyper, Solved, LargeExtra), FitError> {
+        assert!(opts.sigma_f_min >= 0.0 && opts.sigma_f_min.is_finite(), "FitOptions::sigma_f_min must be ≥ 0");
+        let free = self.estimate_spectral_free(opts, start)?;
+        if opts.sigma_f.is_none() && self.n_f > 0.0 && free.0.s_f2 < opts.sigma_f_min * opts.sigma_f_min {
+            return self.estimate_spectral_free(&FitOptions { sigma_f: Some(opts.sigma_f_min), ..opts.clone() }, start);
+        }
+        Ok(free)
+    }
+
+    /// The search over the noise ratio ρ (module doc, "The large-basis path"). The profile
+    /// E(ρ) = max over λ and — with neither level pinned — the common scale t = s_F² of ln p, each
+    /// from one spectrum of H_ρ (λ by the grid-and-golden search, t by MacKay's β update
+    /// t = (ρ RSS_E + RSS_F)/(n − γ), alternated to 1e-6; with a pinned level t follows the pin).
+    /// At the profile's point one exact solve gives RSS_κ and γ_κ per kind, and the per-kind fixed
+    /// points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ — taken as a step in ln ρ whose multiplier halves
+    /// each time the step reverses direction (the bare fixed point can cycle: ρ 460 → 2.1e4 → 1.4e3
+    /// → 460 on a near-noise-free collection fixture). Converged when λ, s_E² and s_F² all move by
+    /// less than 1e-3 (the original alternation's test); a multiplier below 2⁻¹² without that is a
+    /// stall (`LargeExtra::stalled`, `converged` false). The returned solve is at the final levels.
+    fn estimate_spectral_free(&self, opts: &FitOptions, start: Option<(f64, f64, f64)>) -> Result<(Hyper, Solved, LargeExtra), FitError> {
+        let pin_e = opts.sigma_e.is_some();
+        let pin_f = opts.sigma_f.is_some();
+        for (name, v) in [("sigma_e", opts.sigma_e), ("sigma_f", opts.sigma_f)] {
+            if let Some(v) = v {
+                assert!(v > 0.0 && v.is_finite(), "FitOptions::{name} must be positive");
+            }
+        }
+        if let Some(l) = opts.lambda {
+            assert!(l >= 0.0 && l.is_finite(), "FitOptions::lambda must be ≥ 0");
+        }
+        let start = start.filter(|(l, e, f)| l.is_finite() && *l > 0.0 && e.is_finite() && *e > 0.0 && f.is_finite() && *f > 0.0);
+        let s_e2_0 = opts
+            .sigma_e
+            .map(|s| s * s)
+            .or(start.map(|s| s.1 * s.1))
+            .unwrap_or(self.yy_e / self.n_e)
+            .max(self.floor_e2);
+        let s_f2_0 = opts
+            .sigma_f
+            .map(|s| s * s)
+            .or(start.map(|s| s.2 * s.2))
+            .unwrap_or(if self.n_f > 0.0 { self.yy_f / self.n_f } else { 1.0 })
+            .max(self.floor_f2);
+        if let (Some(lambda), true, true) = (opts.lambda, pin_e, pin_f) {
+            let (sol, extra) = self.solve_large(lambda, s_e2_0, s_f2_0)?;
+            return Ok((Hyper { lambda, s_e2: s_e2_0, s_f2: s_f2_0, iterations: 0, converged: true }, sol, extra));
+        }
+        let floored = |rss: f64, dof: f64, floor: f64| {
+            let v = rss / dof.max(1.0);
+            if v < 100.0 * floor {
+                floor
+            } else {
+                v
+            }
+        };
+        let n_all = self.n_e + self.n_f;
+        // the profile at ρ: (λ, t, ln p); `t0` starts the β update
+        let profile = |rho: f64, t0: f64| -> Result<(f64, f64, f64), FitError> {
+            let spec = self.spectrum(rho)?;
+            let t_floor = self.floor_f2.max(rho * self.floor_e2);
+            let mut t = match (pin_e, pin_f) {
+                (_, true) => s_f2_0,
+                (true, false) => (rho * s_e2_0).max(self.floor_f2),
+                (false, false) => t0.max(t_floor),
+            };
+            let mut lambda = opts.lambda.unwrap_or(1.0);
+            for _ in 0..NOISE_STEPS {
+                lambda = match opts.lambda {
+                    Some(l) => l,
+                    None => lambda_search_with(|l| spec.at(self, l, t).map_or(f64::NEG_INFINITY, |x| x.0))?,
+                };
+                if pin_e || pin_f {
+                    break;
+                }
+                let (_, comb, gamma) = spec.at(self, lambda, t).ok_or(FitError::Singular)?;
+                let t_new = floored(comb, n_all - gamma, t_floor);
+                let done = rel_change(t_new, t) <= self.resolution_tol(NOISE_TOL, rho * self.yy_e + self.yy_f, comb);
+                t = t_new;
+                if done {
+                    break;
+                }
+            }
+            let ev = spec.at(self, lambda, t).ok_or(FitError::Singular)?.0;
+            Ok((lambda, t, ev))
+        };
+        let mut rho = s_f2_0 / s_e2_0;
+        let (mut lambda, mut t, _) = profile(rho, s_f2_0)?;
+        let levels = |rho: f64, t: f64| -> (f64, f64) {
+            match (pin_e, pin_f) {
+                (true, _) => (s_e2_0, t),
+                (false, _) => ((t / rho).max(self.floor_e2), t),
+            }
+        };
+        let mut lambda_prev: Option<f64> = None;
+        let mut iterations = 0;
+        let mut converged = false;
+        let mut stalled = false;
+        let (mut alpha, mut prev_step) = (1.0f64, None);
+        for round in 0..OUTER_ROUNDS {
+            iterations = round + 1;
+            let (s_e2, s_f2) = levels(rho, t);
+            let (sol, _) = self.solve_large(lambda, s_e2, s_f2)?;
+            let next_e = if pin_e { s_e2 } else { floored(sol.rss_e, self.n_e - sol.gamma_e, self.floor_e2) };
+            let next_f = if pin_f { s_f2 } else { floored(sol.rss_f, self.n_f - sol.gamma_f, self.floor_f2) };
+            let noise_ok = rel_change(next_e, s_e2) <= self.resolution_tol(OUTER_TOL, self.yy_e, sol.rss_e)
+                && rel_change(next_f, s_f2) <= self.resolution_tol(OUTER_TOL, self.yy_f, sol.rss_f);
+            let lambda_change = match (opts.lambda, lambda_prev) {
+                (Some(_), _) => 0.0,
+                (None, Some(prev)) => rel_change(lambda, prev),
+                (None, None) => f64::INFINITY,
+            };
+            lambda_prev = Some(lambda);
+            if noise_ok && lambda_change <= OUTER_TOL {
+                converged = true;
+                break;
+            }
+            if noise_ok && (pin_e && pin_f) {
+                converged = true;
+                break;
+            }
+            // the step in ln ρ the per-kind fixed points ask for, damped: the multiplier halves
+            // whenever the step reverses the previous one's direction (the bare fixed point can
+            // cycle). Not an evidence comparison: the profile's ln p carries ~5e-6 relative of
+            // rounding between two spectra (the near-null eigenvalues' ε‖H‖ against the ridge
+            // floor), more than a converging step changes it.
+            let step = (next_f / next_e).ln() - rho.ln();
+            if prev_step.is_some_and(|p: f64| p * step < 0.0) {
+                alpha *= 0.5;
+            }
+            if alpha < 1.0 / 4096.0 {
+                // damped to nothing without meeting the test: stopped, reported as a stall and
+                // not as converged (review M5)
+                stalled = true;
+                break;
+            }
+            prev_step = Some(step);
+            rho *= (alpha * step).exp();
+            let t_try = if pin_e || pin_f { t } else { next_f };
+            (lambda, t, _) = profile(rho, t_try)?;
+        }
+        let (s_e2, s_f2) = levels(rho, t);
+        let (sol, mut extra) = self.solve_large(lambda, s_e2, s_f2)?;
+        extra.stalled = stalled;
+        Ok((Hyper { lambda, s_e2, s_f2, iterations, converged }, sol, extra))
+    }
+}
+
+/// The λ search of [`TwoNoise::lambda_search`] over an evidence `at(λ)` (−∞ where a solve fails).
+fn lambda_search_with(at: impl Fn(f64) -> f64) -> Result<f64, FitError> {
+    let half_decade = 10f64.sqrt();
+    let mut grid: Vec<(f64, f64)> = Vec::new(); // (ln λ, evidence)
+    let mut lambda = LAMBDA_GRID_LO;
+    while lambda <= LAMBDA_GRID_HI * 1.0001 {
+        grid.push((lambda.ln(), at(lambda)));
+        lambda *= half_decade;
+    }
+    if grid.iter().all(|g| g.1 == f64::NEG_INFINITY) {
+        return Err(FitError::Singular);
+    }
+    let best_index = |g: &[(f64, f64)]| {
+        g.iter()
+            .enumerate()
+            .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    loop {
+        let i = best_index(&grid);
+        if i == grid.len() - 1 && grid[i].0.exp() < LAMBDA_EXTEND_HI {
+            let l = grid[i].0.exp() * half_decade;
+            grid.push((l.ln(), at(l)));
+        } else if i == 0 && grid[0].0.exp() > LAMBDA_EXTEND_LO {
+            let l = grid[0].0.exp() / half_decade;
+            grid.insert(0, (l.ln(), at(l)));
+        } else {
+            break;
+        }
+    }
+    let i = best_index(&grid);
+    let (mut lo, mut hi) = (
+        grid[i.saturating_sub(1)].0,
+        grid[(i + 1).min(grid.len() - 1)].0,
+    );
+    let mut best = grid[i];
+    if hi > lo {
+        let phi = 0.5 * (3.0 - 5f64.sqrt());
+        let mut x1 = lo + phi * (hi - lo);
+        let mut x2 = hi - phi * (hi - lo);
+        let mut f1 = at(x1.exp());
+        let mut f2 = at(x2.exp());
+        // 20 steps resolve ln λ to 0.618²⁰·2.3 ≈ 1.5e-4, below the outer tolerance (the
+        // alternation cannot converge if the λ search is coarser than its own test).
+        for _ in 0..20 {
+            if f1 > f2 {
+                hi = x2;
+                x2 = x1;
+                f2 = f1;
+                x1 = lo + phi * (hi - lo);
+                f1 = at(x1.exp());
+            } else {
+                lo = x1;
+                x1 = x2;
+                f1 = f2;
+                x2 = hi - phi * (hi - lo);
+                f2 = at(x2.exp());
+            }
+        }
+        for (x, f) in [(x1, f1), (x2, f2)] {
+            if f > best.1 {
+                best = (x, f);
+            }
+        }
+    }
+    Ok(best.0.exp())
+}
+
 fn rel_change(a: f64, b: f64) -> f64 {
     (a - b).abs() / a.abs().max(b.abs()).max(f64::MIN_POSITIVE)
 }
@@ -1247,21 +2149,29 @@ pub fn fit(
     let (model, mut report) = acc.solve(opts, &store.provenance, ref_energy)?;
 
     // Exact residuals through the hot path (the statistics cancel below ~1e-8·rms(y)).
+    // (the fitted rows only: a masked sample's energy and masked-out forces were not fitted)
     let mut ss_e = 0.0;
+    let mut n_e = 0usize;
     let mut ss_f = 0.0;
     let mut n_f = 0usize;
     for s in &store.samples {
         let (e, f) = energy_and_forces(&model, &s.pos, &s.z)?;
         let scale = if opts.energy_per_atom { 1.0 / s.pos.len() as f64 } else { 1.0 };
-        ss_e += s.weight * ((e - s.energy) * scale).powi(2);
-        for (fj, tj) in f.iter().zip(&s.forces) {
+        if s.use_energy {
+            ss_e += s.weight * ((e - s.energy) * scale).powi(2);
+            n_e += 1;
+        }
+        for (j, (fj, tj)) in f.iter().zip(&s.forces).enumerate() {
+            if !s.trains_atom(j) {
+                continue;
+            }
             for a in 0..3 {
                 ss_f += s.weight * (fj[a] - tj[a]).powi(2);
                 n_f += 1;
             }
         }
     }
-    report.rmse_energy_per_atom = (ss_e / store.len() as f64).sqrt();
+    report.rmse_energy_per_atom = if n_e > 0 { (ss_e / n_e as f64).sqrt() } else { 0.0 };
     report.rmse_force = if n_f > 0 { (ss_f / n_f as f64).sqrt() } else { 0.0 };
     Ok((model, report))
 }
@@ -1349,6 +2259,7 @@ mod tests {
             forces,
             tag: SampleTag::Scan,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         }
     }
 
@@ -1443,6 +2354,7 @@ mod tests {
             forces: f,
             tag: SampleTag::Perturbation,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         }
     }
 
@@ -1540,6 +2452,7 @@ mod tests {
             report.rmse_force
         );
         assert!(report.sigma_e < 1e-7 && report.sigma_f < 1e-7, "noise-free data: s_E {:e}, s_F {:e}", report.sigma_e, report.sigma_f);
+        assert!(report.has_energy_rows() && report.measured_sigma_e() == Some(report.sigma_e));
         let s0 = &store.samples[0];
         let pred = model.predict(&s0.pos, &s0.z, true).unwrap();
         let e_std = pred.energy_std.expect("variance requested");
@@ -1813,6 +2726,616 @@ mod tests {
         assert!(e_out >= 5.0 * e_in, "energy std out/in = {}", e_out / e_in);
         // Inside the window the std is at the noise floor (within a factor 2).
         assert!(f_in < 2.0 * 3f64.sqrt() * report.sigma_f, "in-window force std {f_in:e}");
+    }
+
+    /// A smooth non-linear teacher for the large-basis tests: pairwise Morse terms whose depth
+    /// depends on the pair's species, plus a three-body bend term at the H–O–H vertex; exact forces.
+    fn morse_bend(pos: &[[f64; 3]], z: &[u8]) -> (f64, Vec<[f64; 3]>) {
+        let n = pos.len();
+        let mut e = z.iter().map(|&zz| if zz == H { -0.478 } else { -74.8 }).sum::<f64>();
+        let mut f = vec![[0.0; 3]; n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let d: [f64; 3] = std::array::from_fn(|a| pos[j][a] - pos[i][a]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let depth = if z[i] == z[j] { 0.05 } else { 0.17 };
+                let x = (-(r - 1.8)).exp();
+                e += depth * ((1.0 - x) * (1.0 - x) - 1.0);
+                let de = 2.0 * depth * (1.0 - x) * x;
+                for a in 0..3 {
+                    f[i][a] += de * d[a] / r;
+                    f[j][a] -= de * d[a] / r;
+                }
+            }
+        }
+        // bend: k (cos θ − cos θ₀)² at every O vertex over its H pairs within 3 Bohr, by central
+        // differences of this term alone (smooth; the test needs a non-pair surface, not its gradient analytically)
+        let bend = |p: &[[f64; 3]]| -> f64 {
+            let mut eb = 0.0;
+            for c in 0..n {
+                if z[c] != O {
+                    continue;
+                }
+                for a in 0..n {
+                    for b in a + 1..n {
+                        if z[a] != H || z[b] != H {
+                            continue;
+                        }
+                        let u: [f64; 3] = std::array::from_fn(|k| p[a][k] - p[c][k]);
+                        let v: [f64; 3] = std::array::from_fn(|k| p[b][k] - p[c][k]);
+                        let (ru, rv) = ((u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt(), (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                        let w = (-(ru - 1.8).powi(2)).exp() * (-(rv - 1.8).powi(2)).exp();
+                        let cos = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (ru * rv);
+                        eb += 0.02 * w * (cos + 0.25).powi(2);
+                    }
+                }
+            }
+            eb
+        };
+        e += bend(pos);
+        let h = 1e-6;
+        for j in 0..n {
+            for a in 0..3 {
+                let mut p = pos.to_vec();
+                p[j][a] += h;
+                let up = bend(&p);
+                p[j][a] -= 2.0 * h;
+                let dn = bend(&p);
+                f[j][a] -= (up - dn) / (2.0 * h);
+            }
+        }
+        (e, f)
+    }
+
+    /// `n` noisy morse-bend samples of 5-atom H/O clusters (1e-5 Ha, 1e-4 Ha/Bohr scatter).
+    /// A 5-atom sample masked as a segment would be: atoms 0 and 2 interior, no energy.
+    fn masked(mut s: Sample) -> Sample {
+        let n = s.pos.len();
+        s.force_mask = Some((0..n).map(|j| j == 0 || j == 2).collect());
+        s.use_energy = false;
+        s
+    }
+
+    /// M8a Task 10 (module doc, "Masked samples"): a masked sample adds 3 force rows per interior
+    /// atom and no energy row; its Gram contribution is exactly the interior rows'; the envelope
+    /// sees only its interior atoms; a mask of the wrong length and a sample that teaches nothing
+    /// are refused.
+    #[test]
+    fn masked_samples_add_only_interior_force_rows() {
+        let mut rng = StdRng::seed_from_u64(1010);
+        let basis = Basis::new(&[H, O]);
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let base = morse_bend_samples(&mut rng, 3);
+        for body4 in [false, true] {
+            let basis = if body4 { small_body4_basis() } else { basis.clone() };
+            let mut acc = Accumulator::new(&basis);
+            acc.add(&base[0], &basis, &refs, &opts).unwrap();
+            let (n_e, n_f, n_scale) = (acc.n_e, acc.n_f, acc.n_scale);
+            assert_eq!((n_e, n_f, n_scale), (1, 15, 1));
+            let env_before = acc.envelope.clone();
+            let m = masked(base[1].clone());
+            acc.add(&m, &basis, &refs, &opts).unwrap();
+            assert_eq!(acc.n_e, n_e, "no energy row");
+            assert_eq!(acc.n_f, n_f + 3 * 2, "3 rows per interior atom");
+            assert_eq!(acc.n_scale, n_scale + 1, "a scale row");
+            assert_eq!(acc.n_samples, 2);
+            // the envelope: the two interior atoms only
+            let count: usize = acc.envelope.count.iter().sum::<usize>() - env_before.count.iter().sum::<usize>();
+            assert_eq!(count, 2);
+            // the force Gram added is exactly the interior atoms' rows: Σ over j ∈ {0, 2}, a of v vᵀ
+            let s_idx = basis.species_indices(&m.z).unwrap();
+            let desc = describe(&basis, &m.pos, &m.z).unwrap();
+            let p = basis.n_features();
+            let qr = acc.q_prime;
+            let mut want = vec![0.0; qr * qr];
+            let mut b_want = vec![0.0; qr];
+            let mut fresh = Accumulator::new(&basis);
+            fresh.add(&base[0], &basis, &refs, &opts).unwrap();
+            for j in [0usize, 2] {
+                for a in 0..3 {
+                    let mut v = vec![0.0; qr];
+                    for (i, d) in desc.iter().enumerate() {
+                        for (jj, g) in &d.grad {
+                            if *jj != j {
+                                continue;
+                            }
+                            for k in 0..p {
+                                if let Some(c) = fresh.col_index[s_idx[i] * p + k] {
+                                    v[c] -= g[k][a];
+                                }
+                            }
+                        }
+                    }
+                    for x in 0..qr {
+                        b_want[x] += v[x] * m.forces[j][a];
+                        for y in 0..qr {
+                            want[x * qr + y] += v[x] * v[y];
+                        }
+                    }
+                }
+            }
+            let (got, before) = (acc.sums(), fresh.sums());
+            let scale = want.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+            for x in 0..qr * qr {
+                assert!((got.gram_f[x] - before.gram_f[x] - want[x]).abs() <= 1e-12 * scale, "body4 {body4}: G_F[{x}]");
+            }
+            for x in 0..qr {
+                assert!((got.rhs_f[x] - before.rhs_f[x] - b_want[x]).abs() <= 1e-12 * scale.max(1.0), "body4 {body4}: b_F[{x}]");
+            }
+            assert_eq!(got.gram_e, before.gram_e, "the energy Gram is untouched");
+            assert_eq!(got.yy_e.to_bits(), before.yy_e.to_bits());
+            // a whole sample through the same path is bit-for-bit what it was before Task 10
+            let mut whole = Accumulator::new(&basis);
+            whole.add(&base[0], &basis, &refs, &opts).unwrap();
+            let mut with_all_true = Accumulator::new(&basis);
+            with_all_true.add(&Sample { force_mask: Some(vec![true; 5]), ..base[0].clone() }, &basis, &refs, &opts).unwrap();
+            assert_eq!(whole.sums(), with_all_true.sums());
+            assert_eq!(whole.sumsq, with_all_true.sumsq);
+        }
+        // refusals: a mask of the wrong length; a sample with no energy and no interior atom
+        let mut store = SampleStore::new(provenance());
+        let bad = Sample { force_mask: Some(vec![true; 3]), ..base[2].clone() };
+        assert_eq!(store.push(bad), Err(StoreError::MaskMismatch { n_atoms: 5, n_mask: 3 }));
+        let nothing = Sample { force_mask: Some(vec![false; 5]), use_energy: false, ..base[2].clone() };
+        assert_eq!(store.push(nothing), Err(StoreError::NothingTaught));
+        // energy kept, no atom masked in: legal (an energy row alone)
+        assert!(store.push(Sample { force_mask: Some(vec![false; 5]), ..base[2].clone() }).is_ok());
+    }
+
+    /// A fit from masked samples alone (no energy row anywhere) is the force-only fit: on a
+    /// noise-free linear teacher it recovers the teacher's forces on held-out geometries, s_E is
+    /// pinned at `SIGMA_E_WITHOUT_ENERGY_ROWS` with no energy residual dof, and the exact residual
+    /// RMSE of `fit` counts the fitted rows only. Mixed with whole samples, the warm refit of
+    /// masked samples is still the exact posterior at the standing hyperparameters.
+    #[test]
+    fn a_fit_without_energy_rows_learns_the_forces() {
+        let mut rng = StdRng::seed_from_u64(1011);
+        // the body-2 fixture of `fit_recovers_a_synthetic_linear_model_exactly`, every sample a
+        // segment teaching the forces of atoms 0 (H) and 1 (O) only
+        let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false;
+        basis.n_max = 4;
+        let teacher = random_teacher(&mut rng, &basis);
+        let mut store = SampleStore::new(provenance());
+        for i in 0..120 {
+            let (pos, z) = random_cluster(&mut rng, 3 + i % 3, 5.0);
+            let n = pos.len();
+            let s = teacher_sample(&teacher, pos, z, None);
+            store.push(Sample { force_mask: Some((0..n).map(|j| j < 2).collect()), use_energy: false, ..s }).unwrap();
+        }
+        let (model, report) = fit(&store, &basis, &teacher.ref_energy, &FitOptions::default()).unwrap();
+        assert_eq!(report.sigma_e, SIGMA_E_WITHOUT_ENERGY_ROWS);
+        assert_eq!(report.residual_dof_e, 0.0);
+        assert_eq!(report.rmse_energy_per_atom, 0.0);
+        // the pin is not a measurement (Task 10a review, finding 5): readouts say so
+        assert!(!report.has_energy_rows());
+        assert_eq!((report.measured_sigma_e(), report.sigma_e_text()), (None, "no energy rows".to_string()));
+        assert_eq!(report.n_rows, 120 * 6);
+        assert!(report.rmse_force < 1e-10, "{:e}", report.rmse_force);
+        let mut worst: f64 = 0.0;
+        let mut f_scale: f64 = 0.0;
+        let mut worst_e: f64 = 0.0;
+        for i in 0..10 {
+            let (pos, z) = random_cluster(&mut rng, 3 + i % 3, 5.0);
+            let (et, _) = energy_and_forces(&teacher, &pos, &z).unwrap();
+            let (em, _) = energy_and_forces(&model, &pos, &z).unwrap();
+            worst_e = worst_e.max((et - em).abs());
+            let (_, ft) = energy_and_forces(&teacher, &pos, &z).unwrap();
+            let (_, fm) = energy_and_forces(&model, &pos, &z).unwrap();
+            for (a, b) in ft.iter().zip(&fm) {
+                for k in 0..3 {
+                    worst = worst.max((a[k] - b[k]).abs());
+                    f_scale = f_scale.max(a[k].abs());
+                }
+            }
+        }
+        eprintln!("force-only fit of a noise-free linear teacher: worst held-out |ΔF| {worst:.2e} of max |F| {f_scale:.2e}, |ΔE| {worst_e:.2e} (energies from the forces); σ_F {:.2e}, λ {:.2e}", report.sigma_f, report.lambda);
+        assert!(worst <= 1e-8 * f_scale, "held-out force error {worst:e} (max |F| {f_scale:e})");
+        // the forces determine the energy model (the references fix the constant): exact too
+        assert!(worst_e <= 1e-8, "held-out energy error {worst_e:e}");
+        // the predicted energy std says "no energy evidence": ≥ N·1 Ha
+        let (pos, z) = random_cluster(&mut rng, 5, 3.2);
+        assert!(model.predict(&pos, &z, true).unwrap().energy_std.unwrap() >= 5.0);
+
+        // the warm path with masked samples pending (body-4): the exact posterior at the standing
+        // hyperparameters, as for whole samples
+        let basis4 = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis4);
+        for s in morse_bend_samples(&mut rng, 120) {
+            acc.add(&s, &basis4, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut pending = morse_bend_samples(&mut rng, 4);
+        pending[0] = masked(pending[0].clone());
+        pending[2] = masked(pending[2].clone());
+        for s in &pending {
+            acc.add(s, &basis4, &refs, &opts).unwrap();
+        }
+        let (m_w, r_w) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 4 });
+        let w = acc.warm.as_ref().unwrap();
+        let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+        let (sol, _) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+        let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+        let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+        let mut worst_f: f64 = 0.0;
+        let mut worst_std: f64 = 0.0;
+        for s in morse_bend_samples(&mut StdRng::seed_from_u64(77), 10) {
+            let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                }
+            }
+            for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                worst_std = worst_std.max(rel_change(*x, y));
+            }
+        }
+        eprintln!("warm refit with masked samples: |ΔF|/σ_F {worst_f:.1e} (bound 10κε {bound:.1e}), std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}", r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f);
+        assert!(worst_f < bound && worst_std < 1e-5, "{worst_f:e} {worst_std:e}");
+        assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+    }
+
+    /// A masked sample's scale row is the quantity a whole sample's energy row holds (module doc,
+    /// "Masked samples"): the interior mean of the descriptors with `energy_per_atom` (÷ N for a
+    /// whole sample), the interior sum × N / n_interior without it (extensive, like Σ over all N).
+    /// On an equilateral H₃ every atom's descriptor is the same B, so the whole sample's scale row
+    /// (B per atom, 3B extensive) and the masked one's (2 of the 3 atoms interior) must agree.
+    #[test]
+    fn a_masked_scale_row_is_intensive_or_extensive_as_a_whole_samples() {
+        let basis = Basis::new(&[H, O]);
+        let refs = [-0.478, -74.8];
+        let a = 1.5;
+        let pos = vec![[0.0, 0.0, 0.0], [a, 0.0, 0.0], [0.5 * a, 0.5 * 3f64.sqrt() * a, 0.0]];
+        let whole = Sample::new(pos, vec![1, 1, 1], -1.6, vec![[0.0; 3]; 3], SampleTag::Perturbation, 1.0);
+        let seg = Sample { force_mask: Some(vec![true, true, false]), use_energy: false, ..whole.clone() };
+        for per_atom in [true, false] {
+            let opts = FitOptions { energy_per_atom: per_atom, ..Default::default() };
+            let (mut aw, mut am) = (Accumulator::new(&basis), Accumulator::new(&basis));
+            aw.add(&whole, &basis, &refs, &opts).unwrap();
+            am.add(&seg, &basis, &refs, &opts).unwrap();
+            assert_eq!((aw.n_scale, am.n_scale, am.n_e), (1, 1, 0));
+            let scale = aw.sumsq.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            assert!(scale > 0.0);
+            for (k, (w, m)) in aw.sumsq.iter().zip(&am.sumsq).enumerate() {
+                assert!((w - m).abs() <= 1e-12 * scale, "energy_per_atom {per_atom}: sumsq[{k}] whole {w:e} masked {m:e}");
+            }
+        }
+    }
+
+    fn morse_bend_samples(rng: &mut StdRng, n: usize) -> Vec<Sample> {
+        morse_bend_noisy(rng, n, 1e-5, 1e-4)
+    }
+
+    fn morse_bend_noisy(rng: &mut StdRng, n: usize, se: f64, sf: f64) -> Vec<Sample> {
+        (0..n)
+            .map(|_| {
+                let (pos, z) = random_cluster(rng, 5, 3.2);
+                let (mut e, mut f) = morse_bend(&pos, &z);
+                e += se * normal(rng);
+                for fj in &mut f {
+                    for a in 0..3 {
+                        fj[a] += sf * normal(rng);
+                    }
+                }
+                Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }
+            })
+            .collect()
+    }
+
+    /// A small body-4 basis for the large-basis path tests (Q′ in the low hundreds).
+    fn small_body4_basis() -> Basis {
+        let mut b = Basis::new(&[H, O]);
+        b.body4 = true;
+        b.n_max = 4;
+        b.l_max = 2;
+        b
+    }
+
+    /// The large-basis path (module doc) on a body-4 basis: the spectral search lands on the
+    /// reference search's evidence maximum (both stop at 1e-3 relative), and its posterior is the
+    /// reference's at that maximum.
+    #[test]
+    fn large_basis_search_finds_the_reference_search_optimum() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 150) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        let t = std::time::Instant::now();
+        let (m_ref, r_ref) = acc.solve(&opts, &provenance(), &refs).unwrap();
+        let t_ref = t.elapsed();
+        let t = std::time::Instant::now();
+        let (m_sp, r_sp) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        let t_sp = t.elapsed();
+        let rounds = match acc.last_refit() {
+            RefitKind::Spectral { rounds, .. } => rounds,
+            k => panic!("expected a spectral search, got {k:?}"),
+        };
+        eprintln!(
+            "Q′ {}: reference λ {:.4e} σ_E {:.4e} σ_F {:.4e} ln p {:.6e} γ {:.2}/{:.2} ({} rounds, {:.0} ms); spectral λ {:.4e} σ_E {:.4e} σ_F {:.4e} ln p {:.6e} γ {:.2}/{:.2} ({rounds} rounds, {:.0} ms)",
+            r_ref.q_prime, r_ref.lambda, r_ref.sigma_e, r_ref.sigma_f, r_ref.log_evidence, r_ref.gamma_e, r_ref.gamma_f, r_ref.hyper_iterations, t_ref.as_secs_f64() * 1e3,
+            r_sp.lambda, r_sp.sigma_e, r_sp.sigma_f, r_sp.log_evidence, r_sp.gamma_e, r_sp.gamma_f, t_sp.as_secs_f64() * 1e3
+        );
+        assert!(r_ref.converged && r_sp.converged);
+        // both searches stop when λ and the noise levels move by < 1e-3 per round: the optima agree
+        // to a few times that
+        for (what, a, b) in [("λ", r_ref.lambda, r_sp.lambda), ("σ_E²", r_ref.sigma_e.powi(2), r_sp.sigma_e.powi(2)), ("σ_F²", r_ref.sigma_f.powi(2), r_sp.sigma_f.powi(2))] {
+            assert!(rel_change(a, b) < 1e-2, "{what}: reference {a:e} vs spectral {b:e}");
+        }
+        // the evidence at the two optima: equal to the curvature of a flat maximum
+        assert!((r_ref.log_evidence - r_sp.log_evidence).abs() < 1e-6 * r_ref.log_evidence.abs().max(1.0), "{} vs {}", r_ref.log_evidence, r_sp.log_evidence);
+        // predictions and stds on held-out clusters agree far below the noise levels
+        for s in morse_bend_samples(&mut rng, 20) {
+            let (a, b) = (m_ref.predict(&s.pos, &s.z, true).unwrap(), m_sp.predict(&s.pos, &s.z, true).unwrap());
+            assert!((a.energy - b.energy).abs() < 0.05 * r_ref.sigma_e * 5.0, "energy {} vs {}", a.energy, b.energy);
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    assert!((fa[k] - fb[k]).abs() < 0.05 * r_ref.sigma_f, "force {} vs {}", fa[k], fb[k]);
+                }
+            }
+            for (x, y) in a.force_std.unwrap().iter().zip(b.force_std.unwrap()) {
+                assert!(rel_change(*x, y) < 1e-2, "force std {x} vs {y}");
+            }
+        }
+    }
+
+    /// The warm refit (module doc) is the exact posterior at the standing hyperparameters and
+    /// standardisation: after samples arrive, its mean, factor, γ_E and γ_F equal a fresh
+    /// factorisation's to rounding; growth beyond `WARM_GROWTH` searches again.
+    #[test]
+    fn a_long_warm_chain_stays_the_exact_posterior() {
+        // fix round 1 (the review's M2): γ is carried by Woodbury subtraction across up to a
+        // quarter of the store; ten warm refits of 19 samples each after a search at 800 (190
+        // updates, ≈ 3 000 rank-one steps) against a fresh solve at the standing settings
+        let mut rng = StdRng::seed_from_u64(79);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        // labels at a DFT-like scatter (1e-4 Ha, 2e-3 Ha/Bohr): λ above the ridge floor; at the
+        // 1e-4 Ha/Bohr scatter the floor binds and grows with the data, and the warm refit
+        // correctly declines (asserted below)
+        for s in morse_bend_noisy(&mut rng, 800, 1e-4, 2e-3) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut last = None;
+        for _ in 0..10 {
+            for s in morse_bend_noisy(&mut rng, 19, 1e-4, 2e-3) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            last = Some(acc.refit(&opts, &provenance(), &refs).unwrap());
+            assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 19 });
+        }
+        let (m_w, r_w) = last.unwrap();
+        let w = acc.warm.as_ref().unwrap();
+        let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+        let (sol, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+        eprintln!("λ {:e}, λ_eff warm {:e}, fresh {:e}", w.lambda, w.lambda_eff, extra.lambda_eff);
+        let q = acc.q_prime;
+        let chol = m_w.sigma_inv_chol.as_ref().unwrap();
+        let amax = sol.a.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+        let mut worst_a: f64 = 0.0;
+        for i in 0..q {
+            for j in 0..=i {
+                worst_a = worst_a.max((dot(&chol[i * q..i * q + j + 1], &chol[j * q..j * q + j + 1]) - sol.a[i * q + j]).abs() / amax);
+            }
+        }
+        let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+        let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+        let (mut worst_f, mut worst_std): (f64, f64) = (0.0, 0.0);
+        for s in morse_bend_samples(&mut StdRng::seed_from_u64(600), 10) {
+            let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+            for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                for k in 0..3 {
+                    worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                }
+            }
+            for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                worst_std = worst_std.max(rel_change(*x, y));
+            }
+        }
+        let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+        eprintln!(
+            "long warm chain (800 + 10×19, Q′ {q}): backward error {worst_a:.1e}, |ΔF|/σ_F {worst_f:.1e} (bound {bound:.1e}), std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}",
+            r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f
+        );
+        assert_eq!(extra.lambda_eff, w.lambda_eff, "λ above the floor");
+        assert!(worst_a < 1e-13 && worst_f < bound && worst_std < 1e-5);
+        assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+        // the floor-bound case: the warm refit declines once the floor passes the standing λ_eff
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 800) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        let mut kinds = Vec::new();
+        for _ in 0..10 {
+            for s in morse_bend_samples(&mut rng, 19) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            acc.refit(&opts, &provenance(), &refs).unwrap();
+            kinds.push(acc.last_refit());
+            let w = acc.warm.as_ref().unwrap();
+            let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+            let (_, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+            assert_eq!(extra.lambda_eff, w.lambda_eff, "whatever the kind, the standing posterior's ridge is the fresh one's ({kinds:?})");
+        }
+        eprintln!("floor-bound chain: {kinds:?}");
+    }
+
+    #[test]
+    fn warm_refit_is_the_exact_posterior_at_the_standing_hyperparameters() {
+        let mut rng = StdRng::seed_from_u64(78);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 120) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert!(matches!(acc.last_refit(), RefitKind::Spectral { .. }));
+        for round in 0..3 {
+            for s in morse_bend_samples(&mut rng, 3 + round) {
+                acc.add(&s, &basis, &refs, &opts).unwrap();
+            }
+            let (m_w, r_w) = acc.refit(&opts, &provenance(), &refs).unwrap();
+            assert_eq!(acc.last_refit(), RefitKind::Warm { samples: 3 + round });
+            // the reference: a fresh dense solve at the warm state's frozen standardisation and
+            // hyperparameters
+            let w = acc.warm.as_ref().unwrap();
+            let (_, _, problem) = acc.prepare(&refs, Some((&w.scale, &w.d))).unwrap();
+            let (sol, extra) = problem.solve_large(w.lambda, w.s_e2, w.s_f2).unwrap();
+            assert_eq!(extra.lambda_eff, w.lambda_eff, "noisy data: λ is far above the floor");
+            let q = acc.q_prime;
+            // the factor: backward error of L Lᵀ against the fresh precision A (the factor itself is
+            // only determined to κ(A)·ε in its weak directions — κ ~ 1e9 here — like the mean)
+            let chol = m_w.sigma_inv_chol.as_ref().unwrap();
+            let amax = sol.a.iter().fold(0.0f64, |x, v| x.max(v.abs()));
+            let mut worst_a: f64 = 0.0;
+            for i in 0..q {
+                for j in 0..=i {
+                    let llt = dot(&chol[i * q..i * q + j + 1], &chol[j * q..j * q + j + 1]);
+                    worst_a = worst_a.max((llt - sol.a[i * q + j]).abs() / amax);
+                }
+            }
+            // the fresh model at the same hyperparameters and standardisation
+            let hyper = Hyper { lambda: w.lambda, s_e2: w.s_e2, s_f2: w.s_f2, iterations: 0, converged: true };
+            let (m_f, _) = acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol, 0.0, 1.0).unwrap();
+            let (mut worst_e, mut worst_f, mut worst_std): (f64, f64, f64) = (0.0, 0.0, 0.0);
+            for s in morse_bend_samples(&mut StdRng::seed_from_u64(500 + round as u64), 10) {
+                let (a, b) = (m_w.predict(&s.pos, &s.z, true).unwrap(), m_f.predict(&s.pos, &s.z, true).unwrap());
+                worst_e = worst_e.max((a.energy - b.energy).abs() / (5.0 * r_w.sigma_e));
+                for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                    for k in 0..3 {
+                        worst_f = worst_f.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                    }
+                }
+                for (x, y) in a.force_std_epistemic.unwrap().iter().zip(b.force_std_epistemic.unwrap()) {
+                    worst_std = worst_std.max(rel_change(*x, y));
+                }
+                worst_std = worst_std.max(rel_change(a.energy_std.unwrap(), b.energy_std.unwrap()));
+            }
+            eprintln!(
+                "warm round {round}: Q′ {q}, κ(A) {:.1e}, backward error of LLᵀ {worst_a:.1e}, held-out |ΔE|/(Nσ_E) {worst_e:.1e} |ΔF|/σ_F {worst_f:.1e}, std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}",
+                r_w.condition_estimate, r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f
+            );
+            // two backward-stable factorisations of the same A (κ ~ 6e12 on this fixture) give
+            // solutions that differ by up to ~κ(A)·ε relative — the reference path's own Cholesky
+            // against the vectorised one differs by as much (printed) — so the prediction bound
+            // is 10 κ ε in noise units, the std's 1e-5 (a quadratic form: far less sensitive)
+            let (m_old, _) = {
+                let sol_old = problem.solve(w.lambda, w.s_e2, w.s_f2).unwrap();
+                acc.assemble(&opts, &provenance(), &refs, &w.scale, &w.d, &hyper, &sol_old, 0.0, 1.0).unwrap()
+            };
+            let mut spread: f64 = 0.0;
+            for s in morse_bend_samples(&mut StdRng::seed_from_u64(500 + round as u64), 10) {
+                let (a, b) = (m_old.predict(&s.pos, &s.z, false).unwrap(), m_f.predict(&s.pos, &s.z, false).unwrap());
+                for (fa, fb) in a.forces.iter().zip(&b.forces) {
+                    for k in 0..3 {
+                        spread = spread.max((fa[k] - fb[k]).abs() / r_w.sigma_f);
+                    }
+                }
+            }
+            let bound = 10.0 * r_w.condition_estimate * f64::EPSILON;
+            eprintln!("  the two fresh Cholesky kernels against each other: |ΔF|/σ_F {spread:.1e}; bound 10κε = {bound:.1e}");
+            assert!(worst_a < 1e-13, "backward error {worst_a:e}");
+            assert!(worst_e < bound && worst_f < bound && worst_std < 1e-5, "predictions {worst_e:e} {worst_f:e} {worst_std:e} (bound {bound:e})");
+            assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+            assert!(rel_change(r_w.rmse_force, (sol.rss_f / problem.n_f).sqrt()) < 1e-6);
+        }
+        // past the growth bound the hyperparameters are searched again
+        let n_now = acc.n_samples;
+        for s in morse_bend_samples(&mut rng, (n_now as f64 * (WARM_GROWTH - 1.0)) as usize + 1) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        acc.refit(&opts, &provenance(), &refs).unwrap();
+        assert!(matches!(acc.last_refit(), RefitKind::Spectral { .. }), "{:?}", acc.last_refit());
+        // a basis without body-4 never takes the large-basis path
+        let mut plain = Accumulator::new(&h2_basis(4));
+        let mut rng2 = StdRng::seed_from_u64(3);
+        for s in morse_store(&mut rng2, 1.0, 3.0, 40, Some((1e-5, 1e-4))).samples {
+            plain.add(&s, &h2_basis(4), &[E_ATOM_H], &opts).unwrap();
+        }
+        let (a, _) = plain.refit(&opts, &provenance(), &[E_ATOM_H]).unwrap();
+        let (b, _) = plain.solve(&opts, &provenance(), &[E_ATOM_H]).unwrap();
+        assert_eq!(plain.last_refit(), RefitKind::Full);
+        assert_eq!(a.coeffs, b.coeffs);
+    }
+
+    /// The spectral truncation of the posterior covariance Σ ≈ Σ_{k<K} s_k u_k u_kᵀ + s_min I
+    /// (the M5 handoff's remedy for the O(N·Q′²) variance; M8a Task 5 ruling: measure what it does
+    /// to the calibration, floor it so it never claims more confidence than Σ). With s_min = s_K —
+    /// the largest dropped eigenvalue — T − Σ = Σ_{k<K} s_K u_k u_kᵀ + Σ_{k≥K} (s_K − s_k) u_k u_kᵀ ⪰ 0,
+    /// so the truncated variance is never below the exact one (asserted on held-out rows); without
+    /// the floor it is biased low. Printed: the ratios on the held-out design rows of a collection-
+    /// sized body-4 fit (S = 2, Q′ 284) — the numbers of record in `references.md` ("M8a body-4").
+    #[test]
+    fn spectral_truncation_of_the_covariance_is_measured_and_floored() {
+        let mut rng = StdRng::seed_from_u64(91);
+        let mut basis = Basis::new(&[H, O]);
+        basis.body4 = true;
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut acc = Accumulator::new(&basis);
+        for s in morse_bend_samples(&mut rng, 400) {
+            acc.add(&s, &basis, &refs, &opts).unwrap();
+        }
+        let (model, report) = acc.refit(&opts, &provenance(), &refs).unwrap();
+        let q = report.q_prime;
+        let l = model.sigma_inv_chol.as_ref().unwrap();
+        let sigma = inverse_from_lower_inverse(&lower_inverse_transposed(l, q), q);
+        let (s, u) = crate::linalg::symmetric_eigen_householder(&sigma, q);
+        let mut order: Vec<usize> = (0..q).collect();
+        order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+        let prior = 1.0 / report.lambda;
+        let at_prior = s.iter().filter(|&&v| v > 0.5 * prior).count();
+        // held-out design rows (energy and force rows, standardised as the fit's)
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for smp in morse_bend_samples(&mut rng, 40) {
+            let (e, f) = crate::loo::design_rows(&model, &smp.pos, &smp.z).unwrap();
+            rows.push(e);
+            rows.extend(f);
+        }
+        let proj: Vec<Vec<f64>> = rows.iter().map(|r| order.iter().map(|&k| (0..q).map(|i| u[i * q + k] * r[i]).sum::<f64>()).collect()).collect();
+        let sorted: Vec<f64> = order.iter().map(|&k| s[k]).collect();
+        eprintln!("Q′ {q}, λ {:.3e} (prior variance {prior:.3e}); eigenvalues of Σ above half the prior's: {at_prior}; s_1 {:.3e}, s_50 {:.3e}, s_100 {:.3e}, s_Q′ {:.3e}", report.lambda, sorted[0], sorted[49], sorted[99], sorted[q - 1]);
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() - 1) as f64 * p).round() as usize]
+        };
+        for k_keep in [25usize, 50, 100, 200] {
+            let s_min = sorted[k_keep];
+            let (mut floored, mut bare) = (Vec::new(), Vec::new());
+            for p in &proj {
+                let exact: f64 = p.iter().zip(&sorted).map(|(x, s)| s * x * x).sum();
+                let kept: f64 = p[..k_keep].iter().zip(&sorted).map(|(x, s)| s * x * x).sum();
+                let norm2: f64 = p.iter().map(|x| x * x).sum();
+                if exact > 0.0 {
+                    floored.push((kept + s_min * norm2) / exact);
+                    bare.push(kept / exact);
+                }
+            }
+            let min_f = floored.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(min_f >= 1.0 - 1e-9, "K {k_keep}: the floored truncation claimed more confidence than Σ ({min_f})");
+            eprintln!(
+                "K {k_keep}: floored (s_min = s_K {s_min:.2e}) variance ratio truncated/exact min {min_f:.3} median {:.3} p95 {:.3e} max {:.3e}; unfloored min {:.3e} median {:.3}",
+                pct(&mut floored.clone(), 0.5),
+                pct(&mut floored.clone(), 0.95),
+                pct(&mut floored, 1.0),
+                pct(&mut bare.clone(), 0.0),
+                pct(&mut bare, 0.5)
+            );
+        }
     }
 
     #[test]

@@ -34,6 +34,12 @@ const fn e(name: &'static str, also: &'static str, place: Place, anchor: &'stati
     Entry { name, also, place, anchor }
 }
 
+/// "Train this segment" (Dock ▸ Selection): searchable only while the feature is offered
+/// ([`crate::segment::SEGMENT_TRAINING`]; deferred), so it sits outside [`ENTRIES`] and
+/// [`results`] adds it.
+pub static SEGMENT_ENTRY: Entry =
+    e("Train this segment", "cut out capped fragment teach the selection shared model collection large molecule", Dock(D::Selection), "d-segment");
+
 /// Every control of the chrome by name (Appendix A of the mockup, grouped by anchor).
 pub const ENTRIES: &[Entry] = &[
     // toolbar
@@ -99,6 +105,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Menu(M::View), "m-density"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
     e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Menu(M::View), "m-display"),
+    e("Knowledge overlay", "tint atoms coverage how well known model learned never seen thin trusted 3D colour", Menu(M::View), "m-display"),
     e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
@@ -159,8 +166,14 @@ pub const ENTRIES: &[Entry] = &[
     e("Cancel sampling", "pass", Dock(D::Model), "d-sample"),
     e("Teach around blockers", "untrusted class leave-one-out blocker targeted pass teach", Dock(D::Model), "d-model"),
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
+    e("Shared collection / model file", "model source shared collection learn one big model file specialised switch", Dock(D::Model), "d-model-source"),
+    e("Import a model file", "import .model samples into shared collection merge", Dock(D::Model), "d-model-source"),
+    e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    // Knowledge (M8a Task 9)
+    e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
+    e("Open the knowledge map window", "pop out knowledge map larger window", Dock(D::Knowledge), "d-knowledge-popout"),
     // Activity
     e("Jobs (what is running)", "activity progress cancel pause stop sampling refit audit solve work", Dock(D::Activity), "d-jobs"),
     e("Counters (samples, teacher solves)", "activity samples in the model teacher solves this session ticks", Dock(D::Activity), "d-counters"),
@@ -257,8 +270,9 @@ pub fn score(query: &str, entry: &Entry) -> Option<i32> {
 
 /// The results for `query`, best first (at most `n`).
 pub fn results(query: &str, n: usize) -> Vec<&'static Entry> {
+    let segment = crate::segment::SEGMENT_TRAINING.then_some(&SEGMENT_ENTRY);
     let mut v: Vec<(i32, usize, &Entry)> =
-        ENTRIES.iter().enumerate().filter_map(|(i, e)| score(query, e).map(|s| (s, i, e))).collect();
+        ENTRIES.iter().chain(segment).enumerate().filter_map(|(i, e)| score(query, e).map(|s| (s, i, e))).collect();
     v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     v.into_iter().take(n).map(|(_, _, e)| e).collect()
 }
@@ -363,9 +377,9 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                         Place::Toolbar => "toolbar".to_string(),
                         Place::SceneChip => "scene chip".to_string(),
                         Place::Menu(m) => format!("menu › {}", m.title()),
-                        // the Model tab shows its controls only with the estimated solver
-                        Place::Dock(DockTab::Model) if st.backend != crate::sim::Backend::Estimated => {
-                            format!("dock › {} (pick Estimated first)", DockTab::Model.title())
+                        // the Model and Knowledge tabs show their contents only with the estimated solver
+                        Place::Dock(t @ (DockTab::Model | DockTab::Knowledge)) if st.backend != crate::sim::Backend::Estimated => {
+                            format!("dock › {} (pick Estimated first)", t.title())
                         }
                         // the Activity tab shows its trust, training and timeline groups likewise
                         Place::Dock(DockTab::Activity) if st.backend != crate::sim::Backend::Estimated && matches!(entry.anchor, "d-trust" | "d-training" | "d-timeline") => {

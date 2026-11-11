@@ -52,6 +52,14 @@
 //! **`views: None` means "no new build", not "no views"**: the UI keeps the last views it got
 //! and drops them itself when `ModelStatus::fitted` is false (a Forget, no model) and when it
 //! starts a new worker (plan Task 6, `ActivityState::absorb` / `Viewer::start`).
+//!
+//! # The knowledge map (M8a Task 9)
+//! `sim::KnowledgeMap` is built whenever the model is fitted and what it shows may have changed
+//! ([`KnowledgeKey`]: the model generation, the trust rule, the exclusions and every per-key class
+//! verdict — not the store's size, since samples kept since the last refit are not in the fit the
+//! map counts), whether or not the views are on: one pass over the fitted samples, no prediction
+//! (milliseconds for thousands of samples), in `activity_ms`. Shipped like the views:
+//! `ActivityDelta::knowledge`, `None` = no new build.
 use super::*;
 
 /// The fewest seconds between two training-view builds (spec §6).
@@ -93,6 +101,9 @@ pub struct ActivityDelta {
     /// ones) — **not** "no views": the UI drops its views when `ModelStatus::fitted` is false and
     /// when it starts a new worker (module doc).
     pub views: Option<Arc<sim::TrainingViews>>,
+    /// The knowledge map, when rebuilt for this snapshot (module doc, "The knowledge map"); `None`
+    /// = no new build, as `views`.
+    pub knowledge: Option<Arc<sim::KnowledgeMap>>,
     /// This worker's activity bookkeeping and teacher time so far (ms; spec §6): the drains, the
     /// fit history and the view builds, against the events' `solve_ms`.
     pub activity_ms: f64,
@@ -124,6 +135,32 @@ pub(super) struct ViewKey {
     unfitted: usize,
 }
 
+/// What the knowledge map depends on (module doc, "The knowledge map"): the model generation, the
+/// trust rule, the exclusions, and the per-key class verdicts (a re-judge between refits moves
+/// them without a new generation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct KnowledgeKey {
+    model_gen: u64,
+    trusted: bool,
+    quarantined: usize,
+    superseded: usize,
+    box_excluded: usize,
+    verdicts: Vec<bool>,
+}
+
+impl KnowledgeKey {
+    fn of(m: &ModelStatus) -> KnowledgeKey {
+        KnowledgeKey {
+            model_gen: m.model_gen,
+            trusted: m.trusted,
+            quarantined: m.quarantined,
+            superseded: m.superseded,
+            box_excluded: m.box_excluded,
+            verdicts: m.class_loo.iter().flat_map(|c| std::iter::once(c.trusted).chain(c.species.iter().map(|s| s.trusted))).collect(),
+        }
+    }
+}
+
 impl ViewKey {
     fn of(m: &ModelStatus) -> ViewKey {
         ViewKey {
@@ -149,6 +186,8 @@ pub(super) struct ActivityWork {
     /// ended and its `build_ms`.
     built_key: Option<ViewKey>,
     built_at: Option<(Instant, f64)>,
+    /// What the last knowledge map showed (module doc, "The knowledge map").
+    knowledge_key: Option<KnowledgeKey>,
     /// A build deferred by the interval is due at this instant (module doc; [`Worker::views_wake`]).
     views_due_at: Option<Instant>,
     /// The latest run start not yet published, and the current run's start (module doc, "Runs").
@@ -249,6 +288,12 @@ impl Worker {
                     self.activity.last_fit = Some(key);
                     d.fit_points.push(FitPoint { epoch: m.epoch, samples: n, rmse_e: e, rmse_f: f, trusted: m.trusted, at: Instant::now() });
                 }
+            }
+            let kkey = KnowledgeKey::of(m);
+            if self.activity.knowledge_key.as_ref() != Some(&kkey) {
+                // a refused build records its key too: no retry until something changes
+                self.activity.knowledge_key = Some(kkey);
+                d.knowledge = trainable(&mut self.dy).and_then(|s| s.knowledge_map()).map(Arc::new);
             }
             let key = ViewKey::of(m);
             let a = &self.activity;

@@ -178,7 +178,7 @@ pub(crate) fn model() -> ModelStatus {
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -190,8 +190,9 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, species: Vec::new() }],
         last_audit_this_fit: true,
+        audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
         trust_checks: Vec::new(),
         stuck_info: None,
@@ -202,6 +203,14 @@ pub(crate) fn model() -> ModelStatus {
         pass_offer: None,
         no_model: None,
         retry_fit: false,
+        source: sim::ModelSource::None,
+        lone_note: None,
+        collections: false,
+        last_import: None,
+        use_collection: false,
+        source_is_autosave: false,
+        specialised: Vec::new(),
+        model_species: Vec::new(),
     }
 }
 
@@ -657,7 +666,12 @@ fn the_control_search_finds_controls_by_fuzzy_name() {
     assert_eq!(search::results("forget", 1)[0].name, "Forget model");
     assert_eq!(search::results("apply grid", 1)[0].name, "Apply grid");
     assert!(search::results("zzzzqq", 5).is_empty());
-    assert_eq!(search::results("", 1000).len(), search::ENTRIES.len());
+    assert_eq!(search::results("", 1000).len(), search::ENTRIES.len() + usize::from(crate::segment::SEGMENT_TRAINING));
+    // Train this segment is deferred: Ctrl K does not offer it while the const is off
+    assert_eq!(
+        search::results("train this segment", 1000).iter().any(|e| std::ptr::eq(*e, &search::SEGMENT_ENTRY)),
+        crate::segment::SEGMENT_TRAINING
+    );
     for e in search::ENTRIES {
         assert!(!e.anchor.is_empty() && !e.name.is_empty());
     }
@@ -900,7 +914,9 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     let mut rich = snapshot(&scene, Backend::Estimated, Some(model()));
     rich.activity.events = activity_tab::every_kind_of_event();
     rich.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    rich.activity.knowledge = Some(std::sync::Arc::new(knowledge::fixture_map()));
     st.activity.absorb(&rich);
+    st.show_knowledge = true; // the overlay's legend over every layout
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -1175,6 +1191,62 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
 }
 
+/// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
+/// the import's outcome line; the tab draws them (and the switch) without sending anything; the
+/// switch's and the import's actions send their commands and are recorded as not replayable.
+#[test]
+fn the_model_tab_says_where_the_model_learns() {
+    use crate::sim::source_line;
+    let coll = |read_only| sim::ModelSource::Collection { slug: "h0.15-auto-accepted-gpu-1e-6".into(), samples: 412, read_only };
+    let m = ModelStatus { source: coll(false), collections: true, ..model() };
+    assert_eq!(source_line(&m), "model: shared — h0.15-auto-accepted-gpu-1e-6 · 412 samples");
+    assert_eq!(source_line(&ModelStatus { source: coll(true), ..m.clone() }), "model: shared — h0.15-auto-accepted-gpu-1e-6 · 412 samples · read-only — open in another window");
+    assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::File("C:/m/h2o.model".into()), ..m.clone() }), "file: h2o.model");
+    assert_eq!(source_line(&ModelStatus { source: sim::ModelSource::None, ..m.clone() }), "model: this scene only (not shared)");
+    // fix round 1 (review Minor 2): this session's autosave of a picked file is named by the pick
+    let auto = ModelStatus { source: sim::ModelSource::File("C:/t/atomic-sandbox-42-1.model".into()), source_is_autosave: true, ..m.clone() };
+    assert_eq!(crate::sim::source_line_with(&auto, Some(std::path::Path::new("C:/m/water.model"))), "file: water.model");
+    assert_eq!(source_line(&auto), "file: the model file picked earlier in this session");
+    let r = sim::ImportSummary { imported: 30, refused: vec![(Some(4), "box status unknown".into()), (None, "another solver surface".into())], notes: vec![] };
+    assert_eq!(super::dock::model::import_line(&r), "last import: imported 30, refused 2");
+    // drawn (with an import's outcome) without sending anything
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus { last_import: Some(Ok(r)), ..m };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    // the actions
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::UseCollection, &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::UseModel(crate::sim::ModelChoice::Collection)]), "{:?}", out.commands);
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportModel("x.model".into()), &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::ImportModel(p)] if p.ends_with("x.model")), "{:?}", out.commands);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::UseCollection), Some("use-collection"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ImportModel("x.model".into())), Some("import-model"));
+    // M8a Task 7: "Save a specialised model…" — the scene's species preselected by the drawn tab,
+    // the action sends the picker's species, nothing ticked is an error; a loaded one says so
+    assert_eq!(st.specialise.0, vec![1], "H₂'s species preselected");
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::SaveSpecialised("hc.model".into()), &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::SaveSpecialised { path, species }] if path.ends_with("hc.model") && species == &vec![1]), "{:?}", out.commands);
+    st.specialise.0.clear();
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::SaveSpecialised("hc.model".into()), &mut out);
+    assert!(out.commands.is_empty() && out.error.is_some());
+    assert_eq!(crate::replay::unreplayable_kind(&Action::SaveSpecialised("x.model".into())), Some("specialised"));
+    let spec = ModelStatus { source: sim::ModelSource::File("C:/m/hc.model".into()), specialised: vec![1, 6], ..model() };
+    assert_eq!(source_line(&spec), "file: hc.model (specialised)");
+}
+
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the
 /// cloud refresh, Physics ▸ draft mode (estimated solver).
 #[test]
@@ -1303,6 +1375,41 @@ fn empty_snapshot(backend: Backend, model: Option<ModelStatus>) -> Snapshot {
     s.dynamics.drift_per_ps = None;
     s.dynamics.temperature = 0.0;
     s
+}
+
+/// Final review 4: while Train this segment is deferred, File ▸ Load (and a replay's `scene` line,
+/// the same action) loads a scene file's `train_mask` line as nothing — the scene sent has no mask
+/// — and the status line says so.
+#[test]
+fn a_scene_files_train_mask_is_ignored_while_segments_are_deferred() {
+    let dir = std::env::temp_dir().join(format!("atomic-ui-mask-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("seg.scene").display().to_string();
+    std::fs::write(&path, "grid 49 0.25
+train_mask 1 0 1
+nucleus 6 0 0 0
+nucleus 1 2 0 0
+nucleus 1 -2 0 0
+").unwrap();
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.scene_path = path.clone();
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: false });
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let sent = match out.commands.first() {
+        Some(Command::SetScene(s)) => s.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sent.nuclei.len(), 3, "the scene loads");
+    if crate::segment::SEGMENT_TRAINING {
+        assert_eq!(sent.train_mask, Some(vec![true, false, true]));
+    } else {
+        assert_eq!(sent.train_mask, None, "the mask is not loaded");
+        assert!(st.status.contains("train_mask ignored: Train this segment is deferred"), "{}", st.status);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A scene loaded from a file is the chip's source (final review app I1/I3): the chip names the
@@ -3434,6 +3541,8 @@ mod activity_words {
         assert!(outcome_sentence(K::KeptByVote).starts_with(&format!("kept: {FENCE_VOTES} fresh answers agree with each other")));
         assert_eq!(outcome_label(K::NotOffered), "not kept: other settings");
         assert_eq!(outcome_sentence(K::NotOffered), "used for this step, not kept for this model: its settings differ");
+        assert_eq!(outcome_label(K::HeldOut), "not kept: held-out check");
+        assert_eq!(outcome_sentence(K::HeldOut), "a DFT solve held out on purpose to test the teaching — never trained on");
         assert_eq!(outcome_label(K::Discarded), "discarded");
     }
 
@@ -3802,11 +3911,45 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: refusal.is_none(), refusal };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, species: Vec::new() };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
-        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
+        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 of 40 samples needed)");
+        // M8a Task 2 (fix round 2, review I3): each number named by what measured it — the DFT
+        // checks' measured error, the fit's leave-one-out floor, the measured energy
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
+        assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
+        assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window] {
+            for cal in [1.0, f64::INFINITY] {
+                let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
+                assert!(!t.contains("less") && !t.contains("inf"), "{t}");
+            }
+        }
+    }
+
+    /// M8a Task 2 (the Task 1 physics review's I4): audits near the cell faces that could not
+    /// judge the model are said on the checklist's audit line, never worded as a pass.
+    #[test]
+    fn box_affected_audits_are_said_on_the_audit_line() {
+        use activity::trust::lines;
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let mut m = model();
+        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 }];
+        let plain = lines(&m, &scene, &st);
+        assert!(!plain.iter().any(|l| l.text.contains("near the cell faces")), "{plain:?}");
+        m.audits_box_unjudged = 3;
+        m.last_audit.as_mut().unwrap().verdict = sim::AuditVerdict::BoxAffected;
+        let said = lines(&m, &scene, &st);
+        let line = said.iter().find(|l| l.text.starts_with("Last check against DFT")).expect("the audit line");
+        assert!(!line.met && !line.why, "unverified: no tick, and not the refusal's reason either (review M5)");
+        assert!(line.text.contains("box-affected, not judged") && line.text.ends_with("— unverified: 3 audits near the cell faces could not judge the model"), "{}", line.text);
     }
 
     /// Review Focus 4 on the diag-3h fixture: the box line is first and "this is why"; the fit's own
@@ -4361,7 +4504,7 @@ fn carbon_at_fast_shows_the_egg_box_line() {
         let a = 2.06 / 3f64.sqrt();
         let nuclei = [[0.0; 3], [a, a, a], [-a, -a, a], [-a, a, -a], [a, -a, -a]].iter().enumerate()
             .map(|(i, &pos)| crate::scene::SceneNucleus { z: if i == 0 { 6 } else { 1 }, a: None, pos, vel: [0.0; 3] }).collect();
-        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly }
+        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly, train_mask: None }
     };
     let fast = at(crate::quality::parse("fast").expect("Fast has an h"));
     let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
@@ -4462,14 +4605,14 @@ fn auto_audit_cadence_follows_the_play_speed() {
     assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
 }
 
-/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Orbitals,
-/// Selection and Log on the right; each side has its own open flag and selected tab, a strip button
+/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Knowledge
+/// (M8a Task 9), Orbitals, Selection and Log on the right; each side has its own open flag and selected tab, a strip button
 /// opens (or collapses) its own side only, and the search opens a control's own dock.
 #[test]
 fn the_two_docks_hold_their_own_tabs() {
     use super::DockSide;
     assert_eq!(DockTab::LEFT, [DockTab::Activity, DockTab::Readouts, DockTab::Graph], "the left dock's order");
-    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
+    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
     assert!(DockTab::LEFT.iter().all(|t| t.side() == DockSide::Left) && DockTab::RIGHT.iter().all(|t| t.side() == DockSide::Right));
     assert_eq!(DockTab::ALL.len(), DockTab::LEFT.len() + DockTab::RIGHT.len());
     assert!(DockTab::ALL.iter().all(|t| t.side().tabs().contains(t)));
@@ -4655,4 +4798,348 @@ fn rewind_and_reverse_velocities_have_their_homes() {
     let rev = search::ENTRIES.iter().find(|e| e.name == "Reverse velocities").expect("searchable");
     assert_eq!(rev.place, search::Place::Menu(menus::MenuId::Physics));
     assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
+}
+
+/// The Model tab's amber lone-atom note (`ModelStatus::lone_note`) is drawn by Start sampling and
+/// sends nothing; without a note none is drawn.
+#[test]
+fn the_model_tab_warns_of_atoms_without_a_neighbour() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let note = "1 of 3 atoms has no neighbour within 6 Bohr — it won't be learned; move it within 6 Bohr (≈ 3.2 Å) of another atom";
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    let without = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&without), &cam);
+    PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    assert!(PROBES.with(|p| p.borrow().get("lone-note").is_none()), "no note without lone atoms");
+    let with = snapshot(&scene, Backend::Estimated, Some(ModelStatus { lone_note: Some(note.into()), ..model() }));
+    let inp = input(&scene, Some(&with), &cam);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    assert!(probed_rect("lone-note").width() > 0.0, "the note is drawn by Start sampling");
+}
+
+/// M8a user-fix 3, the controller's ruling on concern 1: a class refused for one short key names
+/// that key and its floor, in the Activity tab and the Model tab alike, even when the class holds
+/// only that key (rows per key used to appear only for classes of two or more keys).
+#[test]
+fn a_refused_class_names_its_short_key() {
+    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29 };
+    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![nn.clone()] };
+    let m = ModelStatus { class_loo: vec![pair.clone()], ..model() };
+    let scene = Scene::preset("h2").unwrap();
+    let st = UiState::new("h2", &scene);
+    let lines = activity::trust::lines(&m, &scene, &st);
+    assert!(
+        lines.iter().any(|l| l.text.contains("around N, with N") && l.text.contains("5 of 29 samples needed")),
+        "{:?}",
+        lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    assert_eq!(dock::model::species_line("pair", &nn), "  pair around N, with N: not learned yet (DFT) · 5 of 29 samples needed");
+    // a trusted single-key class keeps its one line
+    let ok = sim::SpeciesVerdict { trusted: true, refusal: None, samples: 40, ..nn };
+    let m = ModelStatus { class_loo: vec![sim::ClassLoo { trusted: true, refusal: None, samples: 40, species: vec![ok], ..pair }], ..model() };
+    assert!(!activity::trust::lines(&m, &scene, &st).iter().any(|l| l.text.contains("around N, with N")));
+}
+
+/// M8a Task 9: the knowledge map — the tab draws a map, a click picks a pair or an element, the pair
+/// detail names the environment keys behind its verdict, and the overlay is display state kept in
+/// the profile.
+mod knowledge_map {
+    use super::*;
+    use knowledge::Pick;
+    use std::sync::Arc;
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                let o = show(root, st, inp);
+                assert!(o.commands.is_empty() && o.actions.is_empty(), "the map is display only");
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Three carbons in a chain with two hydrogens (C–C 2.89 Bohr, C–H 2.06 Bohr): a C–C the
+    /// fixture map has never seen.
+    fn chain() -> Scene {
+        let n = |z: u8, pos: [f64; 3]| crate::scene::SceneNucleus { z, a: None, pos, vel: [0.0; 3] };
+        Scene {
+            nuclei: vec![n(6, [-2.89, 0.0, 0.0]), n(6, [0.0, 0.0, 0.0]), n(6, [2.89, 0.0, 0.0]), n(1, [0.0, 2.06, 0.0]), n(1, [-2.89, -2.06, 0.0])],
+            ..Scene::preset("h2o").unwrap()
+        }
+    }
+
+    fn with_map(scene: &Scene, m: ModelStatus) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(m));
+        snap.activity.knowledge = Some(Arc::new(knowledge::fixture_map()));
+        snap
+    }
+
+    #[test]
+    fn the_knowledge_tab_draws_the_map_and_picks_by_click() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        assert!(st.activity.knowledge.is_some(), "the map is kept from the snapshot");
+        st.open_tab(DockTab::Knowledge);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a", "2140 samples · H C O", "3 trusted", "2 thin", "1 never seen", "C–C · never", "C–H · trusted", "H–H · thin", "2140 atoms", "THIS SCENE ASKS"] {
+            assert!(t.contains(want), "{want:?} in the tab:\n{t}");
+        }
+        // nothing picked: the weakest pair the scene asks (C–C, never seen) and its empty histogram
+        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("never taught"), "{t}");
+        // a click on a line's label picks the pair: its histogram with the scene's distances
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 6));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("the pair you picked · 610 samples") && t.contains("asked now (the open scene):") && t.contains("2 at 2.06 taught"), "{t}");
+        // a node picks its element: neighbour counts and bond angles, the scene's atoms marked
+        click_widget(&ctx, &mut st, &inp, "knowledge-element-6");
+        assert_eq!(st.knowledge.pick, Pick::Element(6));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("element · 610 atoms in the fitted samples") && t.contains("asked: #0") && t.contains("BOND ANGLES AT C"), "{t}");
+        // the pop-out window draws the same map
+        click_widget(&ctx, &mut st, &inp, "knowledge-popout");
+        assert!(st.knowledge.window);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Knowledge map") && t.matches("element · 610 atoms").count() == 2, "tab and window share the pick:\n{t}");
+        // another solver: the empty state
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        st.backend = Backend::Gpu;
+        let t = texts(&ctx, &mut st, &input(&scene, Some(&gpu), &cam));
+        assert!(t.contains("Pick Estimated to see it"), "{t}");
+    }
+
+    #[test]
+    fn the_pair_detail_lists_the_keys_behind_its_verdict() {
+        let scene = chain();
+        let cam = camera();
+        let key = |z: u8, neighbours: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize| sim::SpeciesVerdict {
+            z,
+            neighbours,
+            trusted: refusal.is_none(),
+            refusal,
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 0,
+            trusted_since: None,
+            inflation: 1.0,
+            samples,
+            columns,
+        };
+        let mut m = model();
+        let pair = m.class_loo[0].clone();
+        m.class_loo = vec![
+            sim::ClassLoo { species: vec![key(1, vec![1], None, 120, 12), key(6, vec![1], None, 600, 30)], ..pair.clone() },
+            sim::ClassLoo { class: "many-body", trusted: false, species: vec![key(1, vec![1, 7], Some((sim::ClassKey::Samples, 3.0, 92.0)), 3, 92), key(7, vec![1], None, 120, 20)], ..pair },
+        ];
+        let snap = with_map(&scene, m.clone());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        st.open_tab(DockTab::Knowledge);
+        st.knowledge.pick = Pick::Pair(1, 1);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("thin: taught, but not everywhere it was met"), "{t}");
+        assert!(t.contains("Three-or-more-atom arrangements around H, with H and N — not yet (3 of 92 samples needed)"), "the short key, in the Activity tab's words:\n{t}");
+        // only the keys where H sees H: not C's or N's (the Activity tab lists those elsewhere)
+        assert!(t.contains("learned: pair around H, with H\n"), "{t}");
+        assert!(!t.contains("the model as a whole is not trusted"), "{t}");
+        // an untrusted model: rule 4 is said first
+        let untrusted = ModelStatus { trusted: false, untrusted_reason: Some("max training energy residual 2.2e-3 > 1.0e-3 Ha/atom".into()), ..m };
+        let snap = with_map(&scene, untrusted);
+        let t = texts(&ctx, &mut st, &input(&scene, Some(&snap), &cam));
+        assert!(t.contains("the model as a whole is not trusted yet (max training energy residual"), "{t}");
+    }
+
+    #[test]
+    fn the_knowledge_overlay_is_display_only_and_kept_in_the_profile() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        assert!(!st.show_knowledge, "off by default");
+        assert!(knowledge::overlay_coverage(&st, &scene.nuclei).is_empty(), "off: no tint");
+        // View ▸ Display aids ▸ knowledge overlay: no command, no recorded action
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+        let outs = click_widget(&ctx, &mut st, &inp, "show-knowledge");
+        egui::Popup::close_all(&ctx);
+        assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
+        assert!(st.show_knowledge);
+        // the tint: the carbons see C–C, never seen
+        let cov = knowledge::overlay_coverage(&st, &scene.nuclei);
+        assert_eq!(cov.len(), 5);
+        assert_eq!(&cov[..3], &[0.0, 0.0, 0.0], "{cov:?}");
+        assert_eq!(knowledge::tint_srgb(0.0), [122, 118, 144]);
+        assert_eq!(knowledge::tint_srgb(0.5), [228, 192, 68]);
+        assert_eq!(knowledge::tint_srgb(1.0), [110, 210, 120]);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("knowledge overlay") && t.contains("1 well known") && t.contains("per atom: its least-known neighbour within 6.0 Bohr"), "the legend:\n{t}");
+        // Ctrl K finds it in the View menu, and the map in the dock
+        assert!(matches!(search::results("knowledge overlay", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
+        assert_eq!(search::results("knowledge map", 1)[0].place, search::Place::Dock(DockTab::Knowledge));
+        // the profile keeps it
+        let text = profile::capture(&st);
+        assert!(text.contains("show_knowledge = true"), "{text}");
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.show_knowledge);
+        // a profile saved before the Knowledge tab keeps its layout and gains the tab
+        let mut old = UiState::new("h2o", &scene);
+        profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\n");
+        assert_eq!(old.left_tabs, vec![DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Log], "the moved Log stays left");
+        assert_eq!(old.right_tabs, vec![DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection]);
+        assert_eq!(old.dock_tab, DockTab::Selection);
+        // a layout naming a tab twice is still ignored
+        let mut dup = UiState::new("h2o", &scene);
+        profile::apply(&mut dup, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Log\n");
+        assert_eq!(dup.right_tabs, DockTab::RIGHT.to_vec());
+    }
+}
+
+/// Train this segment (M8a Task 10): the Selection tab's button sends `Action::TrainSegment` with the
+/// selection and opens the preview (the run untouched otherwise: no scene change); the card's Open
+/// saves the scene, switches to the estimated solver on the segment with the Standard plan ready and
+/// shows the "back to" chip, whose click brings the saved scene back on the solver it had. The
+/// Model tab has the same button; an empty selection disables it. While the feature is deferred
+/// (`segment::SEGMENT_TRAINING` off) neither tab draws the button, and the same flow is driven by
+/// the action itself — the preview card, Open and the chip are unchanged.
+#[test]
+fn the_train_segment_button_opens_the_segment_and_the_chip_goes_back() {
+    let scene = crate::segment::alkane(10);
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.adopt_file("decane.scene", &scene);
+    st.backend = Backend::Gpu;
+    st.plan.seed = 7;
+    st.plan.perturbations = 3; // a custom plan: the segment opens with Standard instead
+    st.open_tab(DockTab::Selection);
+    let inp = PanelInput { selected: Some(0), ..input(&scene, None, &cam) };
+    let outs = if crate::segment::SEGMENT_TRAINING {
+        let outs = click_widget(&ctx, &mut st, &inp, "train-segment");
+        let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+        assert_eq!(acts, vec![&Action::TrainSegment(vec![0])]);
+        outs
+    } else {
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("train-segment")), "deferred: no button in the Selection tab");
+        vec![act(&mut st, &inp, Action::TrainSegment(vec![0]))]
+    };
+    assert!(outs.iter().all(|o| o.error.is_none() && o.switch_scene.is_none() && o.commands.is_empty()), "a preview changes nothing");
+    let seg = st.segment_preview.clone().expect("the preview");
+    assert!(seg.interior[0] && !seg.caps.is_empty());
+    // Open: the scene saved, the segment in the estimated solver, Standard ready, the chip
+    let outs = click_widget(&ctx, &mut st, &inp, "segment-open");
+    let opened = outs.iter().find_map(|o| o.switch_scene.clone()).expect("the segment opens");
+    assert_eq!(opened, seg.scene);
+    assert!(st.segment_preview.is_none());
+    assert_eq!(st.backend, Backend::Estimated);
+    assert_eq!(st.source, SceneSource::Segment("decane.scene".into()));
+    assert_eq!(st.source.label(), "decane.scene · segment");
+    assert_eq!(st.plan, sim::SamplingPlan { seed: 7, ..sim::SamplingPlan::default() }, "Standard, the seed kept");
+    assert_eq!((st.grid_n, st.grid_h), (seg.scene.grid_n, seg.scene.grid_h));
+    let back = st.segment_back.clone().expect("the way back");
+    assert_eq!((back.backend, back.label.as_str(), back.caps.clone()), (Backend::Gpu, "decane.scene", seg.caps.clone()));
+    let saved = Scene::parse(&std::fs::read_to_string(&back.path).unwrap()).unwrap();
+    assert_eq!(saved.nuclei.len(), scene.nuclei.len());
+    // the segment's view: the chip goes back
+    let inp2 = input(&opened, None, &cam);
+    let outs = click_widget(&ctx, &mut st, &inp2, "segment-back");
+    assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::BackToScene));
+    let again = outs.iter().find_map(|o| o.switch_scene.clone()).expect("the scene comes back");
+    assert_eq!(again, saved);
+    assert_eq!(again.nuclei.iter().map(|n| n.z).collect::<Vec<_>>(), scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>());
+    assert!(again.nuclei.iter().zip(&scene.nuclei).all(|(a, b)| (0..3).all(|k| (a.pos[k] - b.pos[k]).abs() < 1e-3)));
+    assert_eq!((st.backend, st.source.clone(), st.scene_path.as_str()), (Backend::Gpu, SceneSource::File("decane.scene".into()), "decane.scene"));
+    assert!(st.segment_back.is_none());
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let _ = std::fs::remove_file(&back.path);
+    // the Model tab has it too; nothing selected: disabled (no action)
+    st.open_tab(DockTab::Model);
+    if crate::segment::SEGMENT_TRAINING {
+        let outs = click_widget(&ctx, &mut st, &inp, "train-segment-model");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), vec![&Action::TrainSegment(vec![0])]);
+        st.segment_preview = None;
+        let none = input(&scene, None, &cam);
+        let outs = click_widget(&ctx, &mut st, &none, "train-segment-model");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled without a selection");
+    } else {
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("train-segment-model")), "deferred: no button in the Model tab");
+    }
+    // the actions are recorded, never replayed
+    for a in [Action::TrainSegment(vec![0]), Action::OpenSegment, Action::CancelSegment, Action::BackToScene] {
+        assert_eq!((a.describe(), crate::replay::unreplayable_kind(&a)), (None, Some("segment")));
+    }
+}
+
+/// A refused segment says why and changes nothing: an empty selection, a lone atom, the whole
+/// molecule (butane-sized: twice the cutoff reaches every atom).
+#[test]
+fn a_refused_segment_names_the_reason_and_changes_nothing() {
+    let cam = camera();
+    let h2 = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &h2);
+    let inp = input(&h2, None, &cam);
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![]));
+    assert_eq!(out.error.as_deref(), Some(format!("Train this segment: {}", crate::segment::NOTHING_SELECTED).as_str()));
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![0]));
+    assert!(out.error.as_deref().unwrap().contains("the whole molecule — train the scene itself"), "{:?}", out.error);
+    let mut far = h2.clone();
+    far.nuclei.push(crate::scene::SceneNucleus { z: 2, a: None, pos: [0.0, 9.0, 0.0], vel: [0.0; 3] });
+    let inp = input(&far, None, &cam);
+    let out = act(&mut st, &inp, Action::TrainSegment(vec![2]));
+    assert!(out.error.as_deref().unwrap().contains("He #2 has no neighbour within 6.0 Bohr"), "{:?}", out.error);
+    assert!(out.commands.is_empty() && out.switch_scene.is_none() && st.segment_preview.is_none() && st.segment_back.is_none());
 }

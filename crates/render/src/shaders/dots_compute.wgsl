@@ -28,6 +28,8 @@ struct Params {
     // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
     // re-drawn fresh each frame, glow (additive soft sprites) on/off
     walk: f32, refresh: f32, glow: u32, cut: f32,
+    // the blur: 0 crisp … 1 soft, 0.5 = the look before the slider
+    blur: f32, _b0: f32, _b1: f32, _b2: f32,
 };
 @group(0) @binding(0) var<uniform> prm: Params;
 @group(0) @binding(1) var scal: texture_3d<f32>;

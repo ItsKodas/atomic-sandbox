@@ -22,7 +22,7 @@
 //!    `gpu_oxygen_reference_multiplicity`) Hund's rule emerges: the triplet −16.106125 Ha below the
 //!    singlet −16.050056 (56.07 mHa; radial KB 56.06) and the quintet −15.756806. A multiplicity whose solve fails is
 //!    noted and left out; only if none succeeds does the pass end. The energy is set with
-//!    `SurrogateKs::set_reference_energy` — never a table — and cached with its multiplicity
+//!    `SurrogateKs::set_reference_solved` (with its box: a shared collection keeps it by the box rule, odd n) — never a table — and cached with its multiplicity
 //!    in a [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a
 //!    later pass at the same settings skips the scan. The sidecar records the rule
 //!    ([`surrogate::sidecar::REFERENCE_RULE`]); references from a file without it are not
@@ -125,7 +125,7 @@
 //! numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
-//! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
+//! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_answer`, with the solved multiplicity), so
 //! the box rule (`crate::surrogate::box_affected_face_density`) applies to the pass as it does to
 //! live answers: on a small box a scan to 1.8 r₀ or a 2000 K burst reaches geometries whose
 //! labels carry the box's confinement; they are kept (the model is still being built), never
@@ -183,7 +183,7 @@ use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
 use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
-use crate::surrogate::{box_affected_face_density, SurrogateKs, MIN_RESIDUAL_DOF};
+use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::VecDeque;
@@ -234,7 +234,26 @@ pub trait PlanSolves: Sized {
     /// shorter pass could not earn trust: then the plan that just reaches it). Unchanged when it
     /// already fits. Used to keep the viewer's automatic first pass near its time target (Task
     /// 9); σ, T, the scan range and the seed are kept.
-    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan;
+    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan {
+        self.scaled_to_for(scene, max_solves, false)
+    }
+
+    /// [`scaled_to`](Self::scaled_to) with the trust floor of a basis with (`body4`: a shared
+    /// collection's, M8a Task 5 fix round 1) or without the body-4 block
+    /// ([`min_samples_for_trust_basis`]).
+    fn scaled_to_for(&self, scene: &Scene, max_solves: usize, body4: bool) -> SamplingPlan;
+}
+
+/// [`PlanSolves::min_samples_for_trust`] for the basis a fit of `scene`'s species would use: with
+/// the body-4 block exactly when the pass learns into a shared collection (its Q′: 284 instead of
+/// 176 at two species; `surrogate::descriptor` "Body-4 features").
+pub fn min_samples_for_trust_basis(scene: &Scene, body4: bool) -> usize {
+    let mut species: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+    species.sort_unstable();
+    species.dedup();
+    let mut b = Basis::new(&species);
+    b.body4 = body4;
+    b.column_classes().len() + MIN_RESIDUAL_DOF as usize
 }
 
 impl PlanSolves for SamplingPlan {
@@ -243,13 +262,10 @@ impl PlanSolves for SamplingPlan {
     }
 
     fn min_samples_for_trust(scene: &Scene) -> usize {
-        let mut species: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        species.sort_unstable();
-        species.dedup();
-        Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize
+        min_samples_for_trust_basis(scene, false)
     }
 
-    fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan {
+    fn scaled_to_for(&self, scene: &Scene, max_solves: usize, body4: bool) -> SamplingPlan {
         let Ok(full) = self.solves(scene) else { return self.clone() };
         if full <= max_solves {
             return self.clone();
@@ -261,7 +277,7 @@ impl PlanSolves for SamplingPlan {
             ..self.clone()
         };
         let refs = at(0.0).solves(scene).unwrap_or(0);
-        let floor = Self::min_samples_for_trust(scene);
+        let floor = min_samples_for_trust_basis(scene, body4);
         let ok = |p: &SamplingPlan| p.solves(scene).unwrap_or(usize::MAX);
         // the largest factor that fits, by bisection (the count is monotone in f)
         let (mut lo, mut hi) = (0.0f64, 1.0f64);
@@ -356,6 +372,8 @@ pub struct Holdout {
     pub energy: f64,
     pub forces: Vec<[f64; 3]>,
     pub face: Option<f64>,
+    /// The multiplicity the teacher solved at (`EvalStats::multiplicity`).
+    pub multiplicity: Option<u32>,
     /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
     pub unfit: bool,
 }
@@ -393,6 +411,8 @@ pub const GHOST_TRAIL: usize = 6;
 
 /// The resumable pass (module doc).
 pub struct Sampler {
+    /// The pass learns into a shared collection (its trust floor counts the body-4 basis).
+    body4: bool,
     scene: Scene,
     /// The plan's counts as they stand: the plan the pass was built with until a
     /// [`rescale`](Self::rescale) lowers them.
@@ -414,6 +434,9 @@ pub struct Sampler {
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
     tail_skipped: usize,
+    /// Jobs whose geometry the attached shared collection already held, bit for bit: not solved
+    /// again (M8a Task 4a fix round 1; [`Sampler::collection_skipped`]).
+    collection_skipped: usize,
     /// Scan points not solved for [`SCAN_CUTOFF_FRACTION`].
     limit_skipped: usize,
     /// How the last failed sample solve's SCF ended (`SolverError::scf_end`), for the scan's tail.
@@ -537,7 +560,10 @@ impl Sampler {
                     .collect();
                 let pair = scans.len();
                 let r_limit = SCAN_CUTOFF_FRACTION * r_cut;
-                let mut shell_planned = false;
+                // a capped segment (`Scene::train_mask`, M8a Task 10) plans no shell check: a check
+                // is judged on every atom, caps included, and could fence a band of the source's
+                // pair for an answer the caps distort — the segment teaches, it does not judge
+                let mut shell_planned = base.train_mask().is_some();
                 for (k, &rk) in r.iter().enumerate() {
                     if rk > r_limit && !shell_planned {
                         // the pair's shell check: its first point beyond the limit, never fitted
@@ -591,6 +617,7 @@ impl Sampler {
         }
         let stage = Self::stage_of(queue.front(), burst.left);
         Ok(Sampler {
+            body4: false,
             scene: base,
             plan: plan.clone(),
             refs_total,
@@ -615,6 +642,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            collection_skipped: 0,
             limit_skipped: 0,
             last_failure: None,
             last_n: None,
@@ -651,6 +679,7 @@ impl Sampler {
         let queue: VecDeque<Job> = jobs.into_iter().map(|j| if inside_cell(&j.scene) { Job::Target(j) } else { Job::Skip("teaching", None, None) }).collect();
         let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
         Sampler {
+            body4: false,
             scene: base.clone(),
             plan,
             refs_total: 0,
@@ -665,6 +694,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            collection_skipped: 0,
             limit_skipped: 0,
             last_failure: None,
             last_n: None,
@@ -763,6 +793,13 @@ impl Sampler {
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).
+    /// The pass learns into a shared collection: its trust floor counts the body-4 basis
+    /// (M8a Task 5 fix round 1; [`min_samples_for_trust_basis`]).
+    pub fn with_body4(mut self, body4: bool) -> Sampler {
+        self.body4 = body4;
+        self
+    }
+
     pub fn with_references(mut self, cache: ReferenceCache) -> Sampler {
         self.refs = cache;
         self
@@ -787,6 +824,38 @@ impl Sampler {
     /// subset of each one's points is solved).
     pub fn scans(&self) -> &[PairScan] {
         &self.scans
+    }
+
+    /// How far the pass's **planned** fitted geometries move the scene (Bohr): the largest change,
+    /// over the queued perturbations and scan points, of a nucleus's position or of an interatomic
+    /// distance (a perturbation moves every nucleus, so a distance can change by up to twice a
+    /// displacement; a scan point moves one nucleus, by |r_k − r₀|). Not counted: the hot burst (a
+    /// trajectory, not planned up front), shell checks (never fitted; a capped segment plans none),
+    /// references and skipped geometries. What M8a ruling P24 reads: a capped segment's interior
+    /// test uses r_cut + this, so no planned move brings a cap within r_cut of an interior atom
+    /// (the app's `segment` cut). Informational for the pass itself: decides nothing here.
+    pub fn largest_planned_displacement(&self) -> f64 {
+        let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        let dist = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+        let mut worst = 0.0f64;
+        for job in &self.queue {
+            let sc = match job {
+                Job::Perturbation(sc) | Job::Scan(sc, _, _) => sc,
+                _ => continue,
+            };
+            let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+            let moved: Vec<usize> = (0..pos.len()).filter(|&i| pos[i] != base[i]).collect();
+            for &i in &moved {
+                worst = worst.max(dist(pos[i], base[i]));
+                // every pair with a moved end (a pair of two moved ends is seen from both)
+                for j in 0..pos.len() {
+                    if j != i {
+                        worst = worst.max((dist(pos[i], pos[j]) - dist(base[i], base[j])).abs());
+                    }
+                }
+            }
+        }
+        worst
     }
 
     /// Samples handed to the surrogate so far.
@@ -834,7 +903,7 @@ impl Sampler {
         let planned = self.scan_planned.clone();
         let nonref = |(p, m, b): (usize, usize, usize)| p + planned.iter().map(|&n| n.min(m)).sum::<usize>() + b;
         let mut want = (plan.perturbations.min(cur.0), plan.scan_points_per_pair.min(cur.1), plan.hot_burst_steps.min(cur.2));
-        let floor = <SamplingPlan as PlanSolves>::min_samples_for_trust(&self.scene).min(nonref(cur));
+        let floor = min_samples_for_trust_basis(&self.scene, self.body4).min(nonref(cur));
         // the exact count to end at: the plan's, or the floor (before the raise below rounds up)
         let target = nonref(want).max(floor);
         if nonref(want) < floor {
@@ -1109,7 +1178,8 @@ impl Sampler {
                         // surface's energy
                         if let Some(r) = self.refs.get(&key) {
                             let (e, m) = (r.energy, r.multiplicity);
-                            surrogate.set_reference_energy(z, e);
+                            // with its box: a shared collection takes it only by the box rule (`surrogate::shared`)
+                            surrogate.set_reference_solved(z, e, self.scene.cell.n, r.face_density);
                             self.progress.done += scan.remaining().len();
                             let m = m.map_or("from a loaded model".to_string(), |m| format!("multiplicity {m}"));
                             self.notes.push(format!("sampling: reference {} (Z = {z}) from the cache: E = {e:.6} Ha, {m}", symbol(z)));
@@ -1200,9 +1270,9 @@ impl Sampler {
                         self.finish();
                         return Err(failure.expect("no success means the last solve failed"));
                     };
-                    let (m_best, e_best) = (r.multiplicity.expect("a solved scan has its multiplicity"), r.energy);
+                    let (m_best, e_best, face) = (r.multiplicity.expect("a solved scan has its multiplicity"), r.energy, r.face_density);
                     self.refs.insert(key, r);
-                    surrogate.set_reference_energy(z, e_best);
+                    surrogate.set_reference_solved(z, e_best, self.scene.cell.n, face);
                     let others: Vec<String> = tried.iter().filter(|t| t.0 != m_best).map(|(m, e)| format!("{m} ({e:.6})")).collect();
                     let c = &self.scene.cell;
                     self.notes.push(format!(
@@ -1217,6 +1287,9 @@ impl Sampler {
                 }
                 Job::Target(job) => {
                     self.progress.target = Some(job.blocker);
+                    if !job.holdout && self.held_by_collection(surrogate, &job.scene, PassJob::Teach { blocker: job.blocker, holdout: false }) {
+                        return Ok(Some(self.progress()));
+                    }
                     let started = Instant::now();
                     match self.solve(&mut teacher, surrogate, &job.scene, true, true, should_abort) {
                         Err(ProviderError::Cancelled) => {
@@ -1237,7 +1310,7 @@ impl Sampler {
                         }
                         Ok(r) if job.holdout => {
                             self.progress.done += 1;
-                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::NotOffered);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::HeldOut);
                             ev.detail = format!("teaching: a held-out check near #{} — solved, never fitted (it tests the result after the refit)", job.blocker);
                             ev.face_density = r.stats.face_density;
                             ev.n_atoms = job.scene.nuclei.len();
@@ -1245,12 +1318,13 @@ impl Sampler {
                             ev.scf_steps = Some(r.stats.scf_steps);
                             ev.scf_end = converged(r.stats.scf_steps);
                             surrogate.push_event(ev);
-                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, energy: r.energy, forces: r.forces, scene: job.scene });
+                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, multiplicity: r.stats.multiplicity, energy: r.energy, forces: r.forces, scene: job.scene });
                         }
                         Ok(r) => self.record(surrogate, &job.scene, r, SampleTag::Targeted, None),
                     }
                     return Ok(Some(self.progress()));
                 }
+                Job::Perturbation(sc) if self.held_by_collection(surrogate, &sc, PassJob::Perturbation) => return Ok(Some(self.progress())),
                 Job::Perturbation(sc) => match self.sample(&mut teacher, surrogate, &sc, SampleTag::Perturbation, true, should_abort) {
                     Err(e) => {
                         self.queue.push_front(Job::Perturbation(sc));
@@ -1285,7 +1359,7 @@ impl Sampler {
                         Ok(res) => {
                             self.progress.done += 1;
                             self.last_scan = Some((pair, k));
-                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotOffered);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::HeldOut);
                             ev.detail = format!("sampling: the shell check of scan {i}–{j} at r = {r:.2} Bohr (beyond 5/6 {SCAN_LIMIT_MARK}) — solved, never fitted; judged after the refit");
                             ev.face_density = res.stats.face_density;
                             ev.n_atoms = sc.nuclei.len();
@@ -1296,6 +1370,11 @@ impl Sampler {
                             self.shell_checks.push(ShellCheck { pair: pair_z, r, r_cut: self.r_cut, unfit: res.stats.untrainable().is_some(), face: res.stats.face_density, energy: res.energy, forces: res.forces, scene: sc });
                         }
                     }
+                    return Ok(Some(self.progress()));
+                }
+                Job::Scan(sc, _, _) if self.held_by_collection(surrogate, &sc, PassJob::Scan) => {
+                    // the next point is solved cold-adjacent: its predecessor was not solved here
+                    self.last_scan = None;
                     return Ok(Some(self.progress()));
                 }
                 Job::Scan(sc, pair, k) => {
@@ -1319,6 +1398,34 @@ impl Sampler {
                 }
             }
         }
+    }
+
+    /// A job whose geometry the attached shared collection already holds — the same atoms at the
+    /// same positions, bit for bit (a pass on the same scene replays its seeded perturbations and
+    /// its scan points exactly) — is not solved again: a second answer there would be a twin of
+    /// the stored one, doubling its weight and its leave-one-out (M8a Task 4a fix round 1, review
+    /// I1). Counted, an event left, the ghost marked skipped; `true` when skipped. The hot burst is
+    /// a trajectory and is never skipped (an exact repeat of its answers is refused as a duplicate
+    /// by the store instead), nor are a shell check or a held-out check (measurements, not fitted).
+    fn held_by_collection(&mut self, surrogate: &mut SurrogateKs, sc: &Scene, job: PassJob) -> bool {
+        if !surrogate.collection_holds_geometry(sc) {
+            return false;
+        }
+        self.progress.done += 1;
+        self.progress.skipped += 1;
+        self.collection_skipped += 1;
+        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(job), TeachOutcome::NotSolved);
+        ev.detail = "sampling: this geometry is already in the shared collection (the same atoms at the same positions, bit for bit) — not solved again".to_string();
+        ev.n_atoms = sc.nuclei.len();
+        surrogate.push_event(ev);
+        self.mark(GhostOutcome::Skipped, ghost_atoms(sc));
+        true
+    }
+
+    /// Jobs not solved because the attached shared collection already held their geometry
+    /// ([`held_by_collection`](Self::held_by_collection)).
+    pub fn collection_skipped(&self) -> usize {
+        self.collection_skipped
     }
 
     /// The pass's per-sample time limit now (s; module doc, "The time limit"): `None` before
@@ -1478,13 +1585,33 @@ impl Sampler {
     /// density (module doc, "Box-affected samples"), and leaves its activity event (`burst_t`: a
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
-        let face = r.stats.face_density;
+        let (face, multiplicity) = (r.stats.face_density, r.stats.multiplicity);
         // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
         if let Some(why) = r.stats.untrainable() {
             let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
             self.progress.done += 1;
             self.progress.skipped += 1;
             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::UnfitNotKept);
+            ev.face_density = face;
+            ev.n_atoms = scene.nuclei.len();
+            ev.solve_ms = r.stats.solve_ms as f64;
+            ev.scf_steps = Some(r.stats.scf_steps);
+            ev.scf_end = converged(r.stats.scf_steps);
+            ev.burst_t = burst_t;
+            ev.detail = note.clone();
+            surrogate.push_event(ev);
+            self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
+            return;
+        }
+        // a geometry in which no atom has a neighbour within r_cut (a hot burst that flew apart)
+        // teaches nothing and is never kept (`surrogate::no_neighbours`)
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        if no_neighbours(&pos, surrogate.cutoff()) {
+            let note = format!("sampling: a {} geometry was not kept (no atom has a neighbour within the model's cutoff — lone atoms, nothing to learn)", self.progress.stage);
+            self.progress.done += 1;
+            self.progress.skipped += 1;
+            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::LoneNotKept);
             ev.face_density = face;
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
@@ -1506,9 +1633,10 @@ impl Sampler {
             forces: r.forces,
             tag,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         };
         let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
-        let outcome = match surrogate.add_sample_with_face(sample, scene, face) {
+        let outcome = match surrogate.add_sample_answer(sample, scene, face, multiplicity) {
             Ok(()) => {
                 self.added += 1;
                 if boxed {
@@ -1733,7 +1861,11 @@ pub fn run_sampling(
     progress: &mut dyn FnMut(SamplingProgress),
     should_abort: &mut dyn FnMut() -> bool,
 ) -> Result<usize, ProviderError> {
-    let r_cut = surrogate.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
+    let r_cut = surrogate.cutoff();
+    let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    if !pos.is_empty() && no_neighbours(&pos, r_cut) {
+        return Err(ProviderError::Invalid(lone_pass_refusal(r_cut)));
+    }
     let mut s = Sampler::with_cutoff(scene, plan, r_cut).map_err(ProviderError::Invalid)?;
     loop {
         if should_abort() {

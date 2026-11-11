@@ -69,6 +69,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_SUPERSEDED) => "superseded",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
+        Some(Q_LONE) => "held out (lone atoms)",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }
@@ -139,11 +140,11 @@ impl SurrogateKs {
             }
         }
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
+        if let Some((r, _)) = self.class_untrusted(&env_keys(pos, z, rc2)) {
             return Some(r);
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, &pred, e, f);
+            let v = self.variance_check(model, &pred, e, f, pos, z);
             if !v.accept {
                 return v.reason;
             }
@@ -296,11 +297,11 @@ impl SurrogateKs {
         let counts = neighbour_counts(&pos, rc2);
         let classes: Vec<&str> = counts.iter().map(|&k| atom_class(k).map_or("isolated", |c| ENV_CLASSES[c])).collect();
         let _ = writeln!(o, "    neighbour counts within r_cut {:?} → atom classes {:?}", counts, classes);
-        if let Some((r, short)) = self.class_untrusted(&counts) {
+        if let Some((r, short)) = self.class_untrusted(&env_keys(&pos, &z, rc2)) {
             refusals.push(format!("{:?}{}: {}", r.rule, if short { " (short of samples)" } else { "" }, r.text));
         }
         if let (Some(e), Some(f)) = (pred.energy_std, pred.force_std_epistemic.as_ref()) {
-            let v = self.variance_check(model, &pred, e, f);
+            let v = self.variance_check(model, &pred, e, f, &pos, &z);
             let _ = writeln!(o, "    variance: per-atom epistemic force std / bound [{}]", v.atoms.iter().map(|a| format!("{a:.2e}")).collect::<Vec<_>>().join(", "));
             if let Some(r) = v.reason.filter(|_| !v.accept) {
                 refusals.push(format!("{:?}: {}", r.rule, r.text));
@@ -359,13 +360,14 @@ impl SurrogateKs {
         if let Some(r) = self.report.as_ref() {
             let _ = writeln!(
                 o,
-                "  fit: n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e} s_F {:.2e}, λ {:.2e}, dof_E {:.1} dof_F {:.1}, κ {:.1e}, converged {}",
+                "  fit: n {} (Q′ {}, {} rows), rmse E/atom {} F {:.2e}, s_E {} s_F {:.2e}, λ {:.2e}, dof_E {:.1} dof_F {:.1}, κ {:.1e}, converged {}",
                 r.n_samples,
                 r.q_prime,
                 r.n_rows,
-                r.rmse_energy_per_atom,
+                // a fit without energy rows measured neither (s_E is its pin: Task 10a review, finding 5)
+                if r.has_energy_rows() { format!("{:.2e}", r.rmse_energy_per_atom) } else { surrogate::fit::NO_ENERGY_ROWS.to_string() },
                 r.rmse_force,
-                r.sigma_e,
+                r.sigma_e_text(),
                 r.sigma_f,
                 r.lambda,
                 r.residual_dof_e,
@@ -408,17 +410,20 @@ impl SurrogateKs {
             if self.excluded(i) {
                 continue;
             }
-            // the sample's largest atom class (a readout; the rule classes each atom: `class_loo`)
-            let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().filter_map(atom_class).max() else { continue };
+            // the sample's largest atom class over its fitted atoms (a readout; the rule classes
+            // each atom: `class_loo`)
+            let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, c)| atom_class(c)).max() else { continue };
             let n = s.pos.len().max(1) as f64;
             match surrogate::loo::leave_one_out(model, s) {
                 None => loo.push((i, c, f64::INFINITY, f64::INFINITY)),
                 Some(l) => {
-                    let e = if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n } / p.energy_std_per_atom;
+                    // the fitted rows only (M8a Task 10): no energy ratio without a fitted energy
+                    let e = l.energy.map_or(0.0, |e| if model.energy_per_atom { e.abs() } else { e.abs() / n } / p.energy_std_per_atom);
                     let f = l
                         .forces
                         .iter()
                         .zip(&s.forces)
+                        .filter_map(|(r, f)| r.map(|r| (r, f)))
                         .map(|(r, f)| {
                             let (d, bd) = p.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                             d / bd
@@ -510,7 +515,7 @@ impl SurrogateKs {
                 c.f_ratio
             );
         }
-        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.unfitted());
+        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.lone_held_out(), self.unfitted());
         // references and atomisation energies (an outlier flags a reference mix-up)
         let _ = writeln!(
             o,

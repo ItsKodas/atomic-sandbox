@@ -10,7 +10,7 @@ use std::sync::Arc;
 const DT_FS: f64 = 0.25;
 
 fn scene(nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
+    Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None, train_mask: None }
 }
 
 fn never() -> impl FnMut() -> bool {
@@ -2886,4 +2886,23 @@ fn partial_charges_follow_the_graph_and_side_densities() {
     d.apply(DynCommand::Pause);
     d.apply(DynCommand::RemoveNucleus(1));
     assert!(d.snapshot().charges.is_none());
+}
+
+/// M8a Task 10 (ruling P10): a capped segment's training mask rides with the scene through moves
+/// and steps (the same nuclei) and is dropped when a nucleus is added or removed (the segment it
+/// described is gone).
+#[test]
+fn adding_or_removing_a_nucleus_drops_the_train_mask() {
+    let mut s = scene(vec![Nucleus::new(1, [0.0; 3]), Nucleus::new(1, [1.4, 0.0, 0.0]), Nucleus::new(8, [0.0, 2.0, 0.0])]);
+    s.train_mask = Some(vec![true, false, true]);
+    let mut d = Dynamics::new(s.clone(), Box::new(Zero), DT_FS, 1);
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
+    let a = step_n(&mut d, 2);
+    assert_eq!(a.scene.train_mask, s.train_mask, "moves and steps keep it");
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [4.0, 0.0, 0.0])));
+    assert_eq!(d.snapshot().scene.train_mask, None, "an added nucleus drops it");
+    d.apply(DynCommand::ReplaceScene(s.clone()));
+    assert_eq!(d.snapshot().scene.train_mask, s.train_mask, "a replaced scene brings its own");
+    d.apply(DynCommand::RemoveNucleus(1));
+    assert_eq!(d.snapshot().scene.train_mask, None, "a removed nucleus drops it");
 }

@@ -451,7 +451,9 @@ impl OccupationWatch {
 /// The `EvalStats` fields that come straight from `ScfStats`, plus the M7 ones: the pseudised species' summaries
 /// (from `setup`), the core overlaps, the shared shells and whether their pattern changed since the previous
 /// evaluation (`watch`).
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, setup: Option<&qm::IonicSetup>, watch: &mut OccupationWatch) -> EvalStats {
+#[allow(clippy::too_many_arguments)]
+fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, system: &System, watch: &mut OccupationWatch) -> EvalStats {
+    let setup = system.ionic.as_deref();
     let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, mut warnings, core_overlaps, fractional, .. } = stats;
     let occupation_changed = watch.changed(&fractional);
     if occupation_changed {
@@ -473,6 +475,8 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         warnings,
         notes,
         face_density: Some(boundary_density),
+        // n↑ ≥ n↓ by construction (`qm::scf::spin_split`): 2S + 1 of the state solved
+        multiplicity: Some((system.n_up - system.n_dn + 1) as u32),
         eig_tol_used: Some(eig_tol_used),
         scf_tol_used: Some(scf_tol_used),
         energy: EnergyBreakdown { kinetic: energy.kinetic, external: energy.external, hartree: energy.hartree, xc: energy.xc, nuclear: energy.nuclear, total: energy.total },
@@ -663,7 +667,7 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, &system, &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 
@@ -1162,7 +1166,7 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, &system, &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 }
@@ -1300,7 +1304,7 @@ mod tests {
     }
 
     fn scene(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
+        Scene { nuclei, cell: Cell { n, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None }
     }
 
     /// H₂ along x at bond length `r` (nucleus 0 at +r/2), grid n³ at h = 0.25.
@@ -2715,7 +2719,7 @@ mod tests {
     /// A lone O at the origin (triplet) in a cell of 6 Bohr half-width at spacing h.
     fn o_scene(h: f64, policy: sim::IonicPolicy) -> Scene {
         let n = 2 * (6.0 / h).round() as usize + 1;
-        Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(3), sigma: None, external_field: [0.0; 3], ionic: policy }
+        Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: Some(3), sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None }
     }
 
     /// Spec §8 row 9 (§5.5, §4.8 T8): a scene coarser than a species' h_req is refused with
@@ -2759,7 +2763,7 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (radial Li atom); cargo test -p providers --release")]
     fn refused_species_falls_back_under_cores_only_and_is_invalid_under_all() {
-        let li = |policy| Scene { nuclei: vec![Nucleus::new(3, [0.0; 3])], cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy };
+        let li = |policy| Scene { nuclei: vec![Nucleus::new(3, [0.0; 3])], cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None };
         let mut notes = Vec::new();
         let (_, sys, settings) = super::problem(&li(sim::IonicPolicy::CoresOnly), 1e-6, &mut notes).expect("posed");
         assert!(sys.ionic.is_none(), "nothing pseudised: Li runs on today's all-electron path");

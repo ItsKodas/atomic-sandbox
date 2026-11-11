@@ -1,2 +1,5 @@
 # cmd.exe misparses LF-only batch files (labels, long lines)
 *.bat text eol=crlf
+
+# test fixtures read byte for byte (a collection folder: binary records, LF text)
+crates/providers/testdata/** -text

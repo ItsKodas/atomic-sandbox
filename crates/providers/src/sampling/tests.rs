@@ -131,6 +131,7 @@ fn pair(z0: u8, z1: u8, r: f64, c: Cell) -> Scene {
         sigma: None,
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 
@@ -289,6 +290,34 @@ fn scan_ranges_come_from_the_scene_not_a_table() {
     // a pair beyond the model's cutoff is not scanned (no neighbour inside r_cut to learn)
     let far = Sampler::new(&pair(1, 1, 6.5, cell(49)), &plan).unwrap();
     assert!(far.scans().is_empty());
+}
+
+/// M8a ruling P24: the largest planned move of a pass is read off its queue — a scan point moves
+/// one nucleus by |r_k − r₀| (H–H at 2.8 Bohr: its last fitted point 1.7 r₀ = 4.76 Bohr, 1.96 Bohr
+/// out; 1.8 r₀ is the shell check, never fitted), a perturbation every nucleus; the hot burst (not
+/// planned up front) counts nothing.
+#[test]
+fn the_largest_planned_displacement_is_read_off_the_queue() {
+    let scans = SamplingPlan { perturbations: 0, hot_burst_steps: 50, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let d = Sampler::new(&pair(1, 1, 2.8, cell(49)), &scans).unwrap().largest_planned_displacement();
+    assert!((d - 2.8 * 0.7).abs() < 1e-12, "{d}");
+    // a capped segment plans no shell check: the same fitted points, the same move
+    let masked = Scene { train_mask: Some(vec![true, false]), ..pair(1, 1, 2.8, cell(49)) };
+    assert!((Sampler::new(&masked, &scans).unwrap().largest_planned_displacement() - d).abs() < 1e-12);
+    let burst = SamplingPlan { perturbations: 0, hot_burst_steps: 50, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    assert_eq!(Sampler::new(&pair(1, 1, 2.8, cell(49)), &burst).unwrap().largest_planned_displacement(), 0.0);
+    // perturbations: every nucleus moves, a distance by up to the two displacements
+    let kicks = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let s = Sampler::new(&pair(1, 1, 2.8, cell(49)), &kicks).unwrap();
+    let d = s.largest_planned_displacement();
+    let mut want = 0.0f64;
+    for job in &s.queue {
+        if let Job::Perturbation(sc) = job {
+            let disp = |i: usize| dist(&Scene { nuclei: vec![sc.nuclei[i].clone(), s.scene.nuclei[i].clone()], ..sc.clone() }, 0, 1);
+            want = want.max(disp(0)).max(disp(1)).max((dist(sc, 0, 1) - 2.8).abs());
+        }
+    }
+    assert!(d > 0.0 && (d - want).abs() < 1e-12, "{d} vs {want}");
 }
 
 /// Ruling: a generated geometry closer than 3h to a face is counted and never sent to the
@@ -480,7 +509,7 @@ fn sampling_commands_flow_through_dynamics() {
     let p = snap.sampling.clone().unwrap();
     println!("cancelled: {p:?}; notes {:?}", snap.notes);
     assert!(p.cancelled && p.finished);
-    assert!(snap.notes.iter().any(|n| n.contains("samples kept — not enough to fit (Q′ = ")), "{:?}", snap.notes);
+    assert!(snap.notes.iter().any(|n| n.contains("samples kept — not enough to fit (")), "{:?}", snap.notes);
     assert_eq!(p.stage, "cancelled");
     assert!(h.lock().unwrap().discontinuities > disc0, "the live run must not extrapolate from the last sample geometry");
     {
@@ -1000,7 +1029,7 @@ fn gpu_oxygen_reference_multiplicity() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let teacher = Recording { inner, seen: seen.clone() };
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
-    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly };
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly, train_mask: None };
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
@@ -1337,7 +1366,7 @@ fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
 /// An empty scene has no species: a pass over it is refused with the message the app shows.
 #[test]
 fn a_pass_over_an_empty_scene_is_refused() {
-    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
     let plan = SamplingPlan::default();
     assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
     assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
@@ -1351,7 +1380,7 @@ fn a_pass_over_an_empty_scene_is_refused() {
 fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let teacher = Shared::new(PairMorse::h2());
     let h = teacher.handle();
-    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
     let (p, sh) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(empty.clone(), p, 0.25, 1);
     let s0 = d.snapshot();
@@ -1618,6 +1647,7 @@ fn scf_stall_measurement() {
         sigma: None,
         external_field: [0.0; 3],
         ionic,
+        train_mask: None,
     };
 
     // 1. the all-electron presets at h = 0.25 (cold)
@@ -2314,6 +2344,7 @@ fn a_checkpointed_pass_resumes_with_the_same_remaining_jobs() {
         sigma: None,
         external_field: [0.0; 3],
         ionic: sim::IonicPolicy::None,
+        train_mask: None,
     };
     let plan = SamplingPlan { perturbations: 5, hot_burst_steps: 8, scan_points_per_pair: 6, seed: 11, ..SamplingPlan::default() };
     let new_surrogate = || SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);

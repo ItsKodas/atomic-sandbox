@@ -796,6 +796,7 @@ impl crate::viewer::Viewer {
         // no editor geometry (cell box, walls, floor, axes, placement grid); the angle arcs with the labels
         let lines = self.scene_lines(&shown, false, show_labels);
         let risk = self.atom_risk();
+        let knowledge = self.atom_knowledge(self.drawn_nuclei(&shown));
         let blur = if self.ui.camera_view || at.is_some() { Vec::new() } else { self.blur_ghosts(&shown) };
         let frames = match (self.ui.camera_view, at) {
             (false, _) => Vec::new(),
@@ -812,6 +813,7 @@ impl crate::viewer::Viewer {
             lines: &lines,
             viewport: render::camera::Viewport::full(w as f32, h as f32),
             risk: &risk,
+            knowledge: &knowledge,
             blur: &blur,
             glow: self.ui.camera_view.then_some((&frames[..], self.ui.exposure_ev, self.ui.camera_solidity, self.ui.camera_size, self.ui.camera_smooth)),
             warp_from: warp_from.as_deref(),

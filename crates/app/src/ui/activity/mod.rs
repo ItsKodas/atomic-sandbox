@@ -87,6 +87,9 @@ pub struct ActivityState {
     pub views: Option<Arc<sim::TrainingViews>>,
     /// When `views` arrived (the age line).
     pub views_at: Option<Instant>,
+    /// The knowledge map (M8a Task 9, `ui::knowledge`), kept like `views`: the worker ships it
+    /// only when it was rebuilt (`ActivityDelta::knowledge`), and no fitted model means no map.
+    pub knowledge: Option<Arc<sim::KnowledgeMap>>,
     pub timeline: Vec<Mark>,
     pub filter: LogFilter,
     /// The Training section is open: the worker builds the views only then (`views_sent` is what
@@ -132,6 +135,7 @@ impl ActivityState {
             fit_points: Vec::new(),
             views: None,
             views_at: None,
+            knowledge: None,
             timeline: Vec::new(),
             filter: LogFilter { pass: true, fallback: true, audit: true, check: true, kept: true, not_kept: true, orbitals: true },
             training_open: false,
@@ -206,9 +210,15 @@ impl ActivityState {
         if s.model.as_ref().is_none_or(|m| !m.fitted) {
             self.views = None;
             self.views_at = None;
-        } else if let Some(v) = &a.views {
-            self.views = Some(v.clone());
-            self.views_at = Some(Instant::now());
+            self.knowledge = None;
+        } else {
+            if let Some(v) = &a.views {
+                self.views = Some(v.clone());
+                self.views_at = Some(Instant::now());
+            }
+            if let Some(k) = &a.knowledge {
+                self.knowledge = Some(k.clone());
+            }
         }
         self.provenance_mismatch = s.model.as_ref().is_some_and(|m| m.provenance_mismatch.is_some());
         self.overhead = (a.activity_ms, a.teacher_ms);

@@ -9,6 +9,7 @@ pub mod bonds;
 pub mod charges;
 pub mod dynamics;
 pub mod integrator;
+pub mod knowledge;
 pub mod provider;
 pub mod references;
 pub mod relax;
@@ -20,9 +21,10 @@ pub mod thermostat;
 pub use activity::{ActivityProbe, DisplaySolve, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
+pub use knowledge::{atom_coverage, Confidence, ElementKnowledge, KnowledgeMap, PairKnowledge};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, ClassKey, ClassLoo, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
+    AuditRecord, AuditVerdict, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, ModelSource, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
     ColourLook, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
     SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };

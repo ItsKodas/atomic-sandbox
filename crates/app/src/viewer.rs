@@ -471,6 +471,10 @@ pub struct Viewer {
     /// window's `%LOCALAPPDATA%\atomic-sandbox\training`; `None` headless (screenshots, replays,
     /// tests never write or offer one).
     pub training_dir: Option<PathBuf>,
+    /// The shared collections' folder (M8a Task 4b; ruling P6): the window's `models/collections`
+    /// (`scene::collections_dir`); `None` headless (screenshots, replays, tests keep per-scene
+    /// models). Sent to every estimated worker before its `EnsureModel` (`Command::Collections`).
+    pub collections_dir: Option<PathBuf>,
     /// The next estimated worker resumes the interrupted pass in this folder instead of its
     /// `EnsureModel` ([`Viewer::resume_training`]).
     resume_next: Option<PathBuf>,
@@ -532,6 +536,7 @@ impl Viewer {
             ghost: Default::default(),
             capture: Default::default(),
             training_dir: None,
+            collections_dir: None,
             resume_next: None,
         })
     }
@@ -581,6 +586,7 @@ impl Viewer {
         self.ui.activity.views_sent = false;
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
+        self.ui.activity.knowledge = None; // the new worker ships its own model's map
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
@@ -606,6 +612,9 @@ impl Viewer {
         }
         if estimated {
             let mut teach: Vec<Command> = self.training_dir.iter().map(|d| Command::TrainingCheckpoints(Some(d.clone()))).collect();
+            if let Some(d) = &self.collections_dir {
+                teach.push(Command::Collections(Some(d.clone())));
+            }
             teach.push(match resume {
                 Some(dir) => Command::ResumeTraining(dir),
                 None => Command::EnsureModel {
@@ -1235,6 +1244,24 @@ impl Viewer {
             }
             self.ui.capture_view = self.capture.view().clone();
         }
+        // a segment's preview describes the scene it was cut from: a new scene or a nucleus more or
+        // less ends it
+        if out.commands.iter().any(|c| matches!(c, Command::SetScene(_) | Command::AddNucleus { .. } | Command::RemoveNucleus(_))) {
+            self.ui.segment_preview = None;
+        }
+        if let Some(s) = out.switch_scene {
+            // Train this segment's Open and "back to the scene": on a new worker when the solver
+            // changes (the old one never starts on it), else as an ordinary SetScene
+            self.ui.segment_preview = None;
+            if self.ui.backend != self.backend {
+                self.tool = ToolState::default();
+                self.drag_target = None;
+                self.scene = s;
+                self.start(self.ui.backend, self.gpu.clone());
+            } else {
+                self.send(Command::SetScene(s));
+            }
+        }
         for cmd in out.commands {
             self.send(cmd);
         }
@@ -1696,6 +1723,13 @@ impl Viewer {
             .collect()
     }
 
+    /// The knowledge overlay's per-nucleus coverage (`sim::atom_coverage`, 0 never seen … 1 well
+    /// known; `gfx::World::knowledge`) of the nuclei drawn: empty (no tint) while View ▸ Display
+    /// aids ▸ knowledge overlay is off or no knowledge map has arrived. O(N²) per frame, display only.
+    pub fn atom_knowledge(&self, nuclei: &[crate::scene::SceneNucleus]) -> Vec<f32> {
+        crate::ui::knowledge::overlay_coverage(&self.ui, nuclei)
+    }
+
     /// Draft mode's red banner (`providers::surrogate`, "Draft mode"): while the model answers
     /// beyond what it has learned.
     pub fn draft_banner(&self) -> Option<String> {
@@ -1965,6 +1999,7 @@ impl Viewer {
         mode: ui::ToolMode,
         drag_target: Option<[f64; 3]>,
         pins: &[bool],
+        marks: &[([f64; 3], crate::segment::Mark)],
         vp: Viewport,
         pull: Option<String>,
     ) {
@@ -1990,6 +2025,24 @@ impl Viewer {
             {
                 let r = egui::Rect::from_center_size(to_pos(px), egui::vec2(14.0, 14.0));
                 painter.rect_stroke(r, 0.0, pin, egui::StrokeKind::Middle);
+            }
+        }
+        // Train this segment (mockup (d)): green rings on the atoms it teaches, faint ones on its edge
+        // atoms, teal on the caps (a dot where a preview's cap would go: no atom is there yet)
+        for &(p, mark) in marks {
+            let Some(px) = tools::project(camera, tools::v3(p), vp).map(to_pos) else { continue };
+            match mark {
+                crate::segment::Mark::Taught => {
+                    painter.circle_stroke(px, 11.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(0x6e, 0xd2, 0x78)));
+                }
+                crate::segment::Mark::Edge => {
+                    painter.circle_stroke(px, 10.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110)));
+                }
+                crate::segment::Mark::Cap => {
+                    let teal = egui::Color32::from_rgb(0x5f, 0xd4, 0xd0);
+                    painter.circle_stroke(px, 10.0, egui::Stroke::new(1.5, teal));
+                    painter.circle_filled(px, 3.0, teal);
+                }
             }
         }
         // the drag spring: target ring and a line to its nucleus
@@ -2534,6 +2587,8 @@ impl Viewer {
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             // the guides, not over the File window (they share its foreground layer)
             let guide_vp = if self.ui.files.open || self.ui.builder.open { Viewport { size: [0.0, 0.0], ..viewport } } else { viewport };
+            let segment_caps = self.ui.segment_back.as_ref().filter(|_| matches!(self.ui.source, ui::SceneSource::Segment(_))).map(|b| &b.caps[..]);
+            let marks = crate::segment::marks(&shown, self.ui.segment_preview.as_ref(), segment_caps);
             Self::distance_overlay(
                 root,
                 &self.camera,
@@ -2542,6 +2597,7 @@ impl Viewer {
                 self.ui.mode,
                 self.drag_target,
                 pins,
+                &marks,
                 guide_vp,
                 self.tool.dragging.then(|| {
                     let mut l = ui::pull_label(self.ui.drag_force);

@@ -231,7 +231,7 @@ mod tests {
     use std::f64::consts::PI;
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
+        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None, train_mask: None }
     }
 
     fn never() -> impl FnMut() -> bool { || false }

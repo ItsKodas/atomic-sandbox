@@ -79,6 +79,7 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::NearQuarantine => "fence".into(),
         R::Audit => "8 audit".into(),
         R::RelaxVerification => "relax check".into(),
+        R::Segment => "segment".into(),
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("reference {} m{multiplicity}", symbol(z)),
         R::Pass(PassJob::Perturbation) => "nudge".into(),
         R::Pass(PassJob::Scan) => "bond scan".into(),
@@ -148,6 +149,7 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
             }
         }
         R::NonFiniteAnswer => "the model's answer was not a finite number, so it was not used — this answer is the teacher's".into(),
+        R::Segment => "this scene is a cut-out segment — DFT answers every step and teaches the model the forces of its interior atoms; the model does not answer here".into(),
         R::NearQuarantine => "this geometry is next to one the model could not learn".into(),
         R::Audit => "a routine check of the model against DFT".into(),
         R::RelaxVerification => "checking the relaxed geometry with DFT".into(),
@@ -171,9 +173,11 @@ pub fn outcome_label(o: K) -> String {
         K::BoxNotKept => "not kept: box".into(),
         K::UnfitNotKept => "not kept: cores / occupations".into(),
         K::ShellNotKept => "not kept: cutoff shell".into(),
+        K::LoneNotKept => "not kept: lone atoms".into(),
         K::FenceDisagrees => "not kept: fence".into(),
         K::WaitingForPass => "not kept: waiting for a pass".into(),
         K::NotOffered => "not kept: other settings".into(),
+        K::HeldOut => "not kept: held-out check".into(),
         K::Discarded => "discarded".into(),
         K::StoreRefused => "refused by store".into(),
         K::Reference => "reference".into(),
@@ -193,9 +197,11 @@ pub fn outcome_sentence(o: K) -> String {
         K::BoxNotKept => "not kept: it touches the box walls — the box's squeeze, not the molecule".into(),
         K::UnfitNotKept => "used for this step, not kept: two atoms' cores overlap (the frozen-core approximation fails there) or the shared-shell occupation changed since the last step (the energy jumps)".into(),
         K::ShellNotKept => "used for this step, not kept and not judged: a pair lies in the cutoff shell a shell check measured — the model's cutoff cannot represent it (a shell fence)".into(),
+        K::LoneNotKept => "used for this step, not kept: no atom has a neighbour within the model's cutoff — a lone atom has nothing to learn (the isolated atom is the reference energy)".into(),
         K::FenceDisagrees => "not kept: next to a geometry the model could not learn, and the teacher still disagrees with the model there".into(),
         K::WaitingForPass => "not kept: many answers are held without a model — run a sampling pass".into(),
         K::NotOffered => "used for this step, not kept for this model: its settings differ".into(),
+        K::HeldOut => "a DFT solve held out on purpose to test the teaching — never trained on".into(),
         K::Discarded => "not judged and not kept: the model changed settings or species before the background answer arrived".into(),
         K::StoreRefused => "the store refused it (shape or settings)".into(),
         K::Reference => "a reference energy, not a sample".into(),
@@ -275,15 +281,46 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
 }
 
 /// The class line from the class's own verdict (`ClassLoo::refusal`, plan review M3): an
-/// energy-only failure is an energy error.
+/// energy-only failure is an energy error, and each number is named by what measured it — "DFT
+/// checks measured" only for the error the teacher measured, "leave-one-out" only for the fit's own
+/// left-out error (M8a Task 2 review I3).
 pub fn class_line(l: &sim::ClassLoo) -> String {
+    verdict_line(class_name(l.class), l.refusal, l.evidence)
+}
+
+/// The plain name of an environment class.
+fn class_name(class: &str) -> &'static str {
+    if class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" }
+}
+
+/// One environment species' line under its class (M8a user-test fix 2: an atom answers by its own
+/// species' verdict): "Three-or-more-atom arrangements around O, with H — learned".
+pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
+    verdict_line(&format!("{} {}", class_name(class), s.words()), s.refusal, s.evidence)
+}
+
+fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence: usize) -> String {
     use sim::ClassKey;
-    let name = if l.class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" };
-    match l.refusal {
+    let checks = |n: usize| format!("{n} DFT check{}", if n == 1 { "" } else { "s" });
+    match refusal {
         None => format!("{name} — learned"),
-        Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
+        // the floor is the key's own column count (M8a user-fix 3)
+        Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} of {q:.0} samples needed)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
+        // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound
+        Some((ClassKey::WorstAtom, x, _)) if evidence < providers::surrogate::MIN_EVIDENCE => format!(
+            "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",
+            providers::surrogate::MIN_EVIDENCE
+        ),
+        Some((ClassKey::WorstAtom, x, lim)) => format!("{name} — not yet (a recent DFT check found an atom's force {x:.1}× its bound; it starts answering only without one beyond {lim:.0}×)"),
+        // the calibrated verdict: the error the DFT checks measured where the class answers …
+        Some((ClassKey::Calibrated, x, lim)) => format!("{name} — not yet (DFT checks measured its force error at {x:.2}× the bound over {}, limit {lim:.2}×)", checks(evidence)),
+        // … its floor, the fit's own left-out error …
+        Some((ClassKey::LooFloor, x, lim)) => format!("{name} — not yet (leave-one-out force error {x:.2}× the bound on average, limit {lim:.2}×)"),
+        // … and the energy the DFT checks measured
+        Some((ClassKey::Window, n, w)) => format!("{name} — not yet (within its bound over {n:.0} DFT checks; it starts answering before the next refit only after {w:.0})"),
+        Some((ClassKey::MeasuredEnergy, x, lim)) => format!("{name} — not yet (DFT checks measured its energy error at {x:.2}× the tier over {}, limit {lim:.2}×)", checks(evidence)),
     }
 }
 

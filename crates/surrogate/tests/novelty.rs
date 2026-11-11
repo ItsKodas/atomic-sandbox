@@ -26,7 +26,7 @@ fn dimer_fit() -> (Accumulator, surrogate::Model) {
         let e = -0.956 + 0.17 * ((1.0 - x) * (1.0 - x) - 1.0);
         let de = 0.34 * (1.0 - x) * x;
         let f1 = [-de * u[0], -de * u[1], -de * u[2]];
-        let s = Sample { pos: vec![[0.0; 3], [r * u[0], r * u[1], r * u[2]]], z: vec![1, 1], energy: e, forces: vec![[-f1[0], -f1[1], -f1[2]], f1], tag: SampleTag::Scan, weight: 1.0 };
+        let s = Sample { pos: vec![[0.0; 3], [r * u[0], r * u[1], r * u[2]]], z: vec![1, 1], energy: e, forces: vec![[-f1[0], -f1[1], -f1[2]], f1], tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
         acc.add(&s, &basis, &[-0.478], &opts).unwrap();
     }
     let (model, _) = acc.solve(&opts, &prov, &[-0.478]).unwrap();
@@ -85,7 +85,7 @@ fn dimer_store_fit(n: usize) -> (Accumulator, Result<surrogate::Model, surrogate
         let e = -0.956 + 0.17 * ((1.0 - x) * (1.0 - x) - 1.0);
         let de = 0.34 * (1.0 - x) * x;
         let f1 = [-de * u[0], -de * u[1], -de * u[2]];
-        let s = Sample { pos: vec![[0.0; 3], [r * u[0], r * u[1], r * u[2]]], z: vec![1, 1], energy: e, forces: vec![[-f1[0], -f1[1], -f1[2]], f1], tag: SampleTag::Scan, weight: 1.0 };
+        let s = Sample { pos: vec![[0.0; 3], [r * u[0], r * u[1], r * u[2]]], z: vec![1, 1], energy: e, forces: vec![[-f1[0], -f1[1], -f1[2]], f1], tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true };
         acc.add(&s, &basis, &[-0.478], &opts).unwrap();
     }
     let model = acc.solve(&opts, &prov, &[-0.478]).map(|(m, _)| m);

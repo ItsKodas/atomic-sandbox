@@ -1,0 +1,4 @@
+# Atomic Sandbox collection: isolated-atom references, one 'Z E n rho' per line —
+# E the energy (Hartree), n the grid points per side of its solve, rho that solve's face density (e/Bohr^3); '-' = not recorded
+1 -0.4777874365710969 81 1.7779646555027284e-7
+1 -0.4781178336652037 101 1.2940748028711369e-8

@@ -74,6 +74,10 @@ pub struct World<'a> {
     /// `viewer::Viewer::atom_risk`; empty = no tint): the sphere is mixed toward red by
     /// [`risk_tint`] of it.
     pub risk: &'a [f32],
+    /// Per nucleus, how well the model knows its surroundings (the knowledge overlay, M8a Task 9:
+    /// `viewer::Viewer::atom_knowledge`, 0 never seen … 1 well known; empty = no tint): the sphere
+    /// is mixed toward the overlay's grey / amber / green (`ui::knowledge::tint_srgb`).
+    pub knowledge: &'a [f32],
     /// Motion blur (`Viewer::blur_ghosts`): (nucleus, position, alpha) of each translucent copy.
     pub blur: &'a [(usize, [f64; 3], f32)],
     /// The positions the shown field was solved at (`Viewer::warp_source`): it is warped to
@@ -181,6 +185,7 @@ pub struct Painter {
     dots_size: f32,
     dots_brightness: f32,
     dots_feather: f32,
+    dots_blur: f32,
     /// Bloom (`render::bloom`): its strength (0 = off) and threshold, from View.
     bloom: render::bloom::Bloom,
     bloom_intensity: f32,
@@ -272,6 +277,7 @@ impl Painter {
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            dots_blur: 0.5,
             bloom: render::bloom::Bloom::new(ctx, format),
             bloom_intensity: 0.0,
             bloom_threshold: 0.7,
@@ -672,7 +678,7 @@ impl Painter {
         self.shimmer = ui.shimmer;
         // the dots' look (View ▸ Density ▸ dots)
         self.dots_float = if ui.dots_float { ui.dots_drift } else { 0.0 };
-        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather);
+        (self.dots_glow, self.dots_amount, self.dots_size, self.dots_brightness, self.dots_feather, self.dots_blur) = (ui.dots_glow, ui.dots_amount, ui.dots_size, ui.dots_brightness, ui.dots_feather, ui.dots_blur);
         (self.bloom_intensity, self.bloom_threshold) = (ui.bloom, ui.bloom_threshold);
         // View ▸ Display aids ▸ background (sRGB in the panel, linear here)
         self.clear = ui.background.map_or(CLEAR, |c| {
@@ -759,6 +765,7 @@ impl Painter {
             colour_by: look.colour_by, signed: u32::from(look.signed),
             // the fresh re-draws (which keep the walk honest) slow with the drift, so slow dots do not pop
             walk: self.dots_float, refresh: 0.01 * (self.dots_float / 0.35).clamp(0.02, 1.0), glow: u32::from(glow), cut: self.dots_feather,
+            blur: self.dots_blur, _pad: [0.0; 3],
         });
     }
 
@@ -789,7 +796,7 @@ impl Painter {
         }
         self.renderer
             .spheres
-            .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));
+            .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, world.knowledge, self.nucleus_scale));
         self.renderer.lines.set_lines(ctx, world.lines);
         let ghosts: Vec<SphereInstance> = world
             .blur
@@ -896,12 +903,22 @@ pub fn risk_tint(risk: f32) -> f32 {
 
 const RISK_RED: [f32; 3] = [1.0, 0.12, 0.08];
 
-fn instances(nuclei: &[SceneNucleus], selected: &[usize], risk: &[f32], scale: f32) -> Vec<SphereInstance> {
+/// How much of the knowledge overlay's colour replaces the element colour (the element still shows).
+const KNOWLEDGE_MIX: f32 = 0.65;
+
+fn instances(nuclei: &[SceneNucleus], selected: &[usize], risk: &[f32], knowledge: &[f32], scale: f32) -> Vec<SphereInstance> {
     nuclei
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let base = elements::colour(n.z);
+            let element = elements::colour(n.z);
+            let base: [f32; 3] = match knowledge.get(i) {
+                Some(&c) => {
+                    let k = crate::ui::knowledge::tint_srgb(c).map(|b| elements::srgb_to_linear(b as f32 / 255.0));
+                    std::array::from_fn(|j| element[j] + KNOWLEDGE_MIX * (k[j] - element[j]))
+                }
+                None => element,
+            };
             let t = risk.get(i).map_or(0.0, |&r| risk_tint(r));
             SphereInstance {
                 centre: n.pos.map(|x| x as f32),
@@ -954,9 +971,20 @@ mod tests {
         assert_eq!(risk_tint(2.0), 0.85);
         assert_eq!(risk_tint(50.0), 0.85);
         let n = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
-        assert_eq!(instances(&n, &[], &[], 1.0)[0].colour, elements::colour(1), "no risk: no tint");
-        let red = instances(&n, &[], &[10.0], 1.0)[0].colour;
+        assert_eq!(instances(&n, &[], &[], &[], 1.0)[0].colour, elements::colour(1), "no risk: no tint");
+        let red = instances(&n, &[], &[10.0], &[], 1.0)[0].colour;
         assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
+    }
+
+    /// The knowledge overlay (M8a Task 9): a well-known atom leans green, a never-seen one grey;
+    /// no coverage, no tint.
+    #[test]
+    fn the_knowledge_tint_mixes_toward_its_colour() {
+        let n = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
+        let known = instances(&n, &[], &[], &[1.0], 1.0)[0].colour;
+        assert!(known[1] > known[0] && known[1] > known[2], "green: {known:?}");
+        let unknown = instances(&n, &[], &[], &[0.0], 1.0)[0].colour;
+        assert!(unknown[0] < elements::colour(1)[0] && (unknown[0] - unknown[1]).abs() < 0.1, "grey: {unknown:?}");
     }
 
     /// The empty scene: after `clear_density` the frame is the one of a painter that never had a

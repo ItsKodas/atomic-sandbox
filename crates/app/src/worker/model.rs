@@ -3,6 +3,30 @@
 //! and its one re-sizing from the median of its first solves, [`pass_resize`]), the
 //! active-learning refits and the per-solve cost estimate. The provider is reached only through
 //! `sim::Trainable`. Split out of `app/src/sim.rs` in M6 Task 1.
+//!
+//! # The shared collection (M8a Task 4b; spec §4.2; controller rulings P6, P13)
+//! With a collections folder set ([`Command::Collections`]: the window's `models/collections`;
+//! headless runs and tests set none and keep per-scene models bit for bit) the shared collection is
+//! **the default and stays the default** (user request, M8a Task 4b fix round 1): `EnsureModel`
+//! attaches the collection of the scene's solver surface (`Trainable::attach_collection`: one
+//! folder per h, σ, ionic policy, teacher and tolerance — every box and every species of that
+//! surface learn into it), and while the user's choice is the collection ([`ModelChoice::Collection`])
+//! every scene replacement re-attaches ([`Worker::sync_collection`]): a change of h, σ or the ionic
+//! policy moves to that surface's collection; a charged scene or a forced multiplicity (collections
+//! are neutral until M9) **leaves** it — the model is forgotten for that scene (the collection stays
+//! on disk, nothing of it is lost) with a note, so the scene learns per-scene — and the collection
+//! comes back when the scene is neutral again (Task 4a review ⚠️ 2).
+//!
+//! **Only a model file the user picked** (Load model, the Model tab's "a model file…") ends that
+//! choice, until the switch picks the collection again. **Forget** in collection mode drops this
+//! session's own samples (the session-only ones) and keeps the collection attached: its samples are
+//! permanent ([`Worker::forget_keeps_collection`]). A **worker re-spawn** (a solver switch) attaches
+//! the collection again: the session autosave of collection mode holds only the session-only samples
+//! (`autosave` module doc; ruling P13), which are put back beside it (`Trainable::load_session_only`)
+//! — never a switch to a model file. An autosave that is a per-scene model on a neutral scene is
+//! the file the user had picked (File mode), restored as such; on a charged scene it is that
+//! scene's per-scene model. A pass's checkpoint in collection mode is the checkpoint alone
+//! (`checkpoint` module doc, "Collection mode").
 
 use super::*;
 
@@ -101,6 +125,9 @@ pub struct ModelStatus {
     /// `last_audit` judged the current fit (`sim::TrainableStatus::last_audit_this_fit`): with
     /// `last_audit`, never audited / audited only before the last refit / audited this fit.
     pub last_audit_this_fit: bool,
+    /// Consecutive audits near the cell faces that could not judge the model
+    /// (`sim::TrainableStatus::audits_box_unjudged`; the checklist's audit line says so).
+    pub audits_box_unjudged: usize,
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
@@ -137,7 +164,65 @@ pub struct ModelStatus {
     pub no_model: Option<String>,
     /// The Retry can help now (`sim::TrainableStatus::retry_fit`): the Model tab's Retry button.
     pub retry_fit: bool,
+    /// Where the model comes from (`sim::TrainableStatus::model_source`): the shared collection, a
+    /// file, or neither (the Model tab's source line, [`source_line`]).
+    pub source: sim::ModelSource,
+    /// Atoms with no neighbour within the model's cutoff (`sim::TrainableStatus::lone_note`): the
+    /// Model tab's amber note by Start sampling and the pass offer.
+    pub lone_note: Option<String>,
+    /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
+    pub collections: bool,
+    /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
+    pub last_import: Option<Result<sim::ImportSummary, String>>,
+    /// The user's choice is the shared collection (a folder is set, and no model file was picked
+    /// since): the Model tab's switch shows it, also while a charged scene learns per-scene.
+    pub use_collection: bool,
+    /// The model file in use is this session's autosave (restored after a solver switch): the
+    /// source line names the file the user picked instead (review Minor 2).
+    pub source_is_autosave: bool,
+    /// The model in use is a specialised model (M8a Task 7; `Trainable::specialised`): the species
+    /// it was cut for; empty otherwise. The source line adds "(specialised)".
+    pub specialised: Vec<u8>,
+    /// The species the model in use knows (`Trainable::model_species`): the specialised-model
+    /// picker offers them beside the scene's.
+    pub model_species: Vec<u8>,
 }
+
+/// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
+/// "read-only — open in another window" when another process holds the collection), "file:
+/// <name>", or a per-scene model's line.
+#[cfg(test)]
+pub fn source_line(m: &ModelStatus) -> String {
+    source_line_with(m, None)
+}
+
+/// [`source_line`], naming `user_file` (the file the user picked, the Model tab's memory) when the
+/// model in use is this session's autosave of it (review Minor 2).
+pub fn source_line_with(m: &ModelStatus, user_file: Option<&std::path::Path>) -> String {
+    let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let spec = if m.specialised.is_empty() { "" } else { " (specialised)" };
+    match &m.source {
+        sim::ModelSource::Collection { slug, samples, read_only } => {
+            let ro = if *read_only { " · read-only — open in another window" } else { "" };
+            format!("model: shared — {slug} · {samples} samples{ro}")
+        }
+        sim::ModelSource::File(_) if m.source_is_autosave => match user_file {
+            Some(u) => format!("file: {}{spec}", name(u)),
+            None => format!("file: the model file picked earlier in this session{spec}"),
+        },
+        sim::ModelSource::File(p) => format!("file: {}{spec}", name(p)),
+        sim::ModelSource::None if m.collections => "model: this scene only (not shared)".into(),
+        sim::ModelSource::None => "model: this session only".into(),
+    }
+}
+
+/// "H, C, O": element symbols of `species`, in order.
+pub fn species_names(species: &[u8]) -> String {
+    species.iter().map(|&z| units::elements::symbol(z)).collect::<Vec<_>>().join(", ")
+}
+
+/// The import's honest caveat (Task 4a review ⚠️ 3): a file carries no isolated-atom references.
+pub const IMPORT_REFERENCES_NOTE: &str = "imported species are fitted only after a sampling pass on a scene that contains them: their isolated-atom references come from passes, never from a file";
 
 /// The box keeps the model untrusted (diag-3h, a user's H₂ + H at the Accurate grid's 12 Bohr cell:
 /// 130 of 145 samples box-affected, refused as "max training energy residual 2.2e-3" — the same
@@ -170,13 +255,21 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
 }
 
 /// The hover text of the "fit vs held" line.
-pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; new ones arrived after the last refit";
+pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; lone atoms (no neighbour within the cutoff, kept before such answers were refused) teach nothing; new ones arrived after the last refit";
 
 /// "fit N of S held: B box-excluded, Q quarantined, X superseded, P newer than the fit" — every
 /// sample the store holds beyond the fit, by reason (exact right after a refit, M6 Task 11:
 /// the user's unexplained "230 vs 250").
-pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, held_out: usize, unfitted: usize) -> String {
-    let parts: Vec<String> = [(box_excluded, "box-excluded"), (quarantined, "quarantined"), (superseded, "superseded"), (held_out, "draft guesses held out"), (unfitted, "newer than the fit")]
+#[allow(clippy::too_many_arguments)]
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+    let parts: Vec<String> = [
+        (box_excluded, "box-excluded"),
+        (quarantined, "quarantined"),
+        (superseded, "superseded"),
+        (held_out, "draft guesses held out"),
+        (lone, "lone atoms held out"),
+        (unfitted, "newer than the fit"),
+    ]
         .into_iter()
         .filter(|&(k, _)| k > 0)
         .map(|(k, what)| format!("{k} {what}"))
@@ -263,9 +356,15 @@ pub enum FirstPass {
 /// scene whose trust floor costs 79–126 s at the cold rate now starts without asking, and a
 /// water-like scene then runs ≈ 1.7× that plus its references (references.md, "M6 Task 9").
 pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
+    first_pass_for(scene, plan, per_solve_s, false)
+}
+
+/// [`first_pass`] for a pass that learns into a shared collection (`body4`: its trust floor counts
+/// the collection's body-4 basis, M8a Task 5 fix round 1) or not.
+pub fn first_pass_for(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>, body4: bool) -> FirstPass {
     let Some(per) = per_solve_s.filter(|c| *c > 0.0) else { return FirstPass::Start(plan) };
     // the fewest solves that can earn trust within the target (the plan itself when it fits)
-    let floor = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
+    let floor = plan.scaled_to_for(scene, (PASS_TARGET_S / per).floor() as usize, body4);
     let n = floor.solves(scene).unwrap_or(0);
     if n as f64 * per <= PASS_TARGET_S * 1.05 {
         return FirstPass::Start(plan);
@@ -292,10 +391,15 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 /// longer — `PlanSolves::scaled_to`, so never below the solves trust needs — and `None` when it
 /// fits (or nothing was timed). The running pass is shrunk to it by `Trainable::rescale_pass`.
 pub fn pass_resize(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64]) -> Option<(SamplingPlan, f64)> {
+    pass_resize_for(scene, plan, per_solve_s, false)
+}
+
+/// [`pass_resize`] with the collection's body-4 trust floor when `body4` ([`first_pass_for`]).
+pub fn pass_resize_for(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64], body4: bool) -> Option<(SamplingPlan, f64)> {
     let per = median(per_solve_s).filter(|m| m.is_finite() && *m > 0.0)?;
     let max = (PASS_TARGET_S / per).floor() as usize;
     let full = plan.solves(scene).ok()?;
-    (full > max).then(|| (plan.scaled_to(scene, max), per))
+    (full > max).then(|| (plan.scaled_to_for(scene, max, body4), per))
 }
 
 /// The automatic first pass being timed for its re-sizing ([`pass_resize`]).
@@ -321,12 +425,34 @@ impl Worker {
         if trainable(&mut self.dy).is_none() {
             return;
         }
-        if let Some(path) = autoload.filter(|p| p.exists()) {
+        // a collection's session-only samples (`autosave` module doc): `grid_n` 0, "any box"
+        let session_only = autoload.as_ref().filter(|p| p.exists()).is_some_and(|p| surrogate::sidecar::read_provenance(p).is_ok_and(|pr| pr.grid_n == 0));
+        if let Some(path) = autoload.clone().filter(|p| p.exists() && !session_only) {
             self.dy.apply(DynCommand::LoadModel(path));
             if let Some(r) = self.dy.snapshot().last_rejection {
-                // not ours: the file stays for a later worker on the settings it fits
+                // not ours: the file stays for a later worker on the settings it fits; the scene's
+                // collection is attached all the same (review Minor 3)
                 self.autoload_refused = Some(r);
+                self.sync_collection();
                 return;
+            }
+            // the session's per-scene model is back: on a neutral scene it was the user's file (a
+            // collection's autosave is session-only samples), on a charged one the per-scene model
+            // it kept
+            let sc = self.dy.snapshot().scene;
+            if sc.charge == 0 && sc.multiplicity.is_none() {
+                self.use_collection = false;
+            }
+        } else {
+            self.sync_collection();
+            if let Some(path) = autoload.filter(|_| session_only) {
+                let Some(t) = trainable(&mut self.dy) else { return };
+                if let Err(e) = t.load_session_only(&path) {
+                    // kept on disk for a later worker that attaches its collection (a charged scene
+                    // has none): this worker does not own the autosave
+                    self.dy.add_note(format!("this session's session-only samples were not put back ({e}); they stay in {}", path.display()));
+                    return;
+                }
             }
         }
         self.owns_autosave = true;
@@ -340,6 +466,92 @@ impl Worker {
         }
     }
 
+    /// Keeps the provider on the shared collection of the current scene's surface while the user's
+    /// choice is the collection and a folder is set (module doc, "The shared collection"): attaches
+    /// it (a no-op when attached; another surface's after an h, σ or ionic change), or — for a
+    /// charged scene or a forced multiplicity — lets an attached one go with a note. A refusal is a
+    /// note, never an error.
+    pub(super) fn sync_collection(&mut self) {
+        let Some(root) = self.collections.clone().filter(|_| self.use_collection) else { return };
+        let snap = self.dy.snapshot();
+        let scene = snap.scene;
+        let Some(t) = trainable(&mut self.dy) else { return };
+        let attached = match t.status(&scene, &snap.forces).model_source {
+            sim::ModelSource::Collection { slug, .. } => Some(slug),
+            _ => None,
+        };
+        let note = if scene.charge != 0 || scene.multiplicity.is_some() {
+            attached.map(|slug| {
+                t.forget();
+                let why = if scene.charge != 0 { format!("charge {:+}", scene.charge) } else { format!("multiplicity {} forced", scene.multiplicity.unwrap_or(0)) };
+                format!("this scene ({why}) cannot learn into the shared collection {slug} — collections are neutral until M9 — so it learns per-scene; the collection stays on disk and comes back when the scene is neutral again")
+            })
+        } else {
+            t.attach_collection(&root, &scene).err().map(|e| format!("shared collection not attached: {e}"))
+        };
+        if let Some(n) = note {
+            self.dy.add_note(n);
+        }
+    }
+
+    /// After a Forget the driver accepted (module doc, "The shared collection"): in collection mode the
+    /// collection is attached again — what was forgotten is this session's own samples; the
+    /// collection's are permanent — and that is said.
+    pub(super) fn forget_keeps_collection(&mut self) {
+        if !self.use_collection || self.collections.is_none() {
+            return;
+        }
+        self.sync_collection();
+        let Some(t) = trainable(&mut self.dy) else { return };
+        if let sim::ModelSource::Collection { slug, samples, .. } = t.model_source() {
+            self.dy.add_note(format!("forgotten: this session's own samples; the shared collection {slug} keeps its {samples} samples (they are permanent) and stays attached"));
+        }
+    }
+
+    /// [`Command::UseModel`]: the Model tab's switch.
+    pub(super) fn use_model(&mut self, choice: ModelChoice) {
+        if trainable(&mut self.dy).is_none() {
+            return;
+        }
+        match choice {
+            ModelChoice::File(path) => self.apply(Command::Dyn(DynCommand::LoadModel(path))),
+            ModelChoice::Collection => {
+                if self.collections.is_none() {
+                    self.dy.add_note("no shared collections folder in this run (headless runs keep per-scene models)".into());
+                    return;
+                }
+                self.use_collection = true;
+                self.pass_offer = None;
+                self.autoload_refused = None;
+                self.sync_collection();
+                self.owns_autosave = true;
+            }
+        }
+    }
+
+    /// [`Command::ImportModel`]: a `.model` file's samples into the attached collection, the
+    /// outcome kept for the Model tab and noted.
+    pub(super) fn import_model(&mut self, path: &std::path::Path) {
+        let Some(t) = trainable(&mut self.dy) else { return };
+        let r = t.import_model(path);
+        let note = match &r {
+            Ok(s) => format!("imported {}: {} samples taken, {} refused — {IMPORT_REFERENCES_NOTE}", path.display(), s.imported, s.refused.len()),
+            Err(e) => format!("import {}: {e}", path.display()),
+        };
+        self.last_import = Some(r);
+        self.dy.add_note(note);
+    }
+
+    /// [`Command::SaveSpecialised`]: the attached collection's samples within `species` to `path`
+    /// (`Trainable::save_specialised`); a note when written, an error when refused.
+    pub(super) fn save_specialised(&mut self, path: &std::path::Path, species: &[u8]) {
+        let Some(t) = trainable(&mut self.dy) else { return };
+        match t.save_specialised(path, species) {
+            Ok(n) => self.dy.add_note(format!("specialised model saved to {}: {n} samples ({}) — load it with \"a model file…\"", path.display(), species_names(species))),
+            Err(e) => self.error(format!("save specialised model {}: {e}", path.display())),
+        }
+    }
+
     /// The automatic first pass (Task 9 item 4): the panel's plan, re-sized to [`PASS_TARGET_S`]
     /// after its first [`PASS_SIZING_SOLVES`] solves ([`size_pass`](Self::size_pass)); or —
     /// when even the fewest solves that can earn trust take longer at the scene's cold
@@ -347,7 +559,8 @@ impl Worker {
     /// `StartSampling`, never re-sized).
     pub(super) fn start_first_pass(&mut self, plan: SamplingPlan) {
         let scene = self.dy.snapshot().scene;
-        match first_pass(&scene, plan, self.solve_s) {
+        let body4 = self.use_collection && self.collections.is_some();
+        match first_pass_for(&scene, plan, self.solve_s, body4) {
             FirstPass::Start(plan) => {
                 self.dy.apply(DynCommand::StartSampling(plan.clone()));
                 if sampling_active(&self.dy.snapshot()) {
@@ -382,7 +595,8 @@ impl Worker {
         }
         let before = p.total;
         let Some(sizing) = self.sizing.take() else { return };
-        let Some((plan, per)) = pass_resize(&sizing.scene, &sizing.plan, &sizing.per_solve_s) else { return };
+        let body4 = self.use_collection && self.collections.is_some();
+        let Some((plan, per)) = pass_resize_for(&sizing.scene, &sizing.plan, &sizing.per_solve_s, body4) else { return };
         self.dy.rescale_sampling(&plan);
         let Some(now) = self.dy.snapshot().sampling.filter(|now| now.total != before) else { return };
         let full = sizing.plan.solves(&sizing.scene).unwrap_or(before);
@@ -451,8 +665,11 @@ impl Worker {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
+        let (collections, last_import, use_collection) = (self.collections.is_some(), self.last_import.clone(), self.use_collection && self.collections.is_some());
+        let autosave = self.autosave.clone();
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
+        let source_is_autosave = matches!((&st.model_source, &autosave), (sim::ModelSource::File(p), Some(a)) if p == a);
         // no record (never audited, forgotten, a model loaded): no step either
         if st.last_audit.is_none() {
             self.activity.last_audit_step = None;
@@ -486,11 +703,12 @@ impl Worker {
             unfitted: st.unfitted,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
-            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.held_out, st.unfitted)),
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.held_out, st.lone, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
             last_audit_this_fit: st.last_audit_this_fit,
+            audits_box_unjudged: st.audits_box_unjudged,
             stuck: st.stuck,
             class_loo: st.class_loo,
             solves: st.solves,
@@ -503,6 +721,14 @@ impl Worker {
             pass_offer,
             no_model: st.no_model,
             retry_fit: st.retry_fit,
+            source: st.model_source,
+            lone_note: st.lone_note,
+            collections,
+            last_import,
+            use_collection,
+            source_is_autosave,
+            specialised: s.specialised(),
+            model_species: s.model_species(),
         })
     }
 
@@ -547,9 +773,10 @@ mod fit_vs_held_tests {
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
     fn the_fit_vs_held_line_names_what_the_fit_left_out() {
-        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0), "250 of 250 held");
-        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
-        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
-        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 3, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 3, 0, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 5, 0), "40 of 45 held: 5 lone atoms held out");
     }
 }

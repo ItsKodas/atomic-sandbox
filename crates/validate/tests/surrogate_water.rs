@@ -50,7 +50,7 @@ fn cell() -> Cell {
 }
 
 fn scene_of(nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::CoresOnly }
+    Scene { nuclei, cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::CoresOnly, train_mask: None }
 }
 
 /// The h2o preset's geometry (O–H 1.81 Bohr, 104.5°), O at the origin.

@@ -35,12 +35,17 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
     let first = m.trust_checks.iter().position(|c| !c.met);
     let seen = AuditSeen::of(m);
     for (k, c) in m.trust_checks.iter().enumerate() {
-        v.push(Line {
-            met: c.met,
-            why: boxed.is_none() && Some(k) == first,
-            text: words::trust_line(c, seen, m.audit_every),
-            hover: format!("value {:.3e}, limit {:.3e}", c.value, c.limit),
-        });
+        let mut text = words::trust_line(c, seen, m.audit_every);
+        let mut met = c.met;
+        // M8a Task 2 (the Task 1 physics review's I4; fix round 1, review M5): audits whose teacher
+        // answer touched the box walls judged nothing — the line reads "unverified", never a tick
+        // (not the refusal's "this is why": the rule is met, the check could not be made); each is
+        // re-audited at the next answered step
+        if c.key == sim::activity::TrustKey::Audit && c.met && m.audits_box_unjudged > 0 {
+            text = format!("{text} — unverified: {} audits near the cell faces could not judge the model", m.audits_box_unjudged);
+            met = false;
+        }
+        v.push(Line { met, why: boxed.is_none() && Some(k) == first, text, hover: format!("value {:.3e}, limit {:.3e}", c.value, c.limit) });
     }
     if boxed.is_none() && first.is_none() && m.fitted {
         // box-affected samples below the trust floor are fitted, and a model can still pass with
@@ -81,10 +86,35 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
             why: false,
             text: words::class_line(l),
             hover: format!(
-                "{} samples, leave-one-out force RMS {:.2}× / max {:.2}× the bound, energy {:.2}× the tier; {CLASS_HELP}",
-                l.samples, l.force_rms, l.force_max, l.energy_max
+                "{} samples, leave-one-out force RMS {:.2}× / max {:.2}× the bound, energy {:.2}× the tier{}; {CLASS_HELP}",
+                l.samples,
+                l.force_rms,
+                l.force_max,
+                l.energy_max,
+                match (l.measured, l.measured_energy) {
+                    (Some(f), Some(e)) => format!("; DFT checks measured force {f:.2}× the bound, energy {e:.2}× the tier over {} comparisons", l.evidence),
+                    _ => "; no DFT comparisons yet".to_string(),
+                }
             ),
         });
+        // per environment species when the class holds more than one (an atom answers by its own),
+        // and always for a refused class: its key's row says which key is short and of what (M8a
+        // user-fix 3, the controller's ruling on concern 1 — the user learns what to train)
+        for s in l.species.iter().filter(|_| l.species.len() > 1 || !l.trusted) {
+            v.push(Line {
+                met: s.trusted,
+                why: false,
+                text: format!("    {}", words::species_line(l.class, s)),
+                hover: format!(
+                    "the verdict for atoms {} in this class: its own DFT checks{}; {CLASS_HELP}",
+                    s.words(),
+                    match (s.measured, s.worst_atom) {
+                        (Some(f), Some(a)) => format!(" measured force {f:.2}× the bound, worst atom {a:.1}×, over {} comparisons", s.evidence),
+                        _ => " — none yet".to_string(),
+                    }
+                ),
+            });
+        }
     }
     v
 }

@@ -272,7 +272,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
     if nuclei.is_empty() {
         return Err(need("nuclei"));
     }
-    let scene = Scene { nuclei, cell, charge, multiplicity, sigma, external_field: [0.0; 3], ionic };
+    let scene = Scene { nuclei, cell, charge, multiplicity, sigma, external_field: [0.0; 3], ionic, train_mask: None };
     let n = scene.nuclei.len();
     let plan = plan.ok_or_else(|| need("plan"))?;
     let c = counters.ok_or_else(|| need("counters"))?;
@@ -368,6 +368,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         pass_start,
     };
     let sampler = Sampler {
+        body4: false, // set by the resuming provider (`with_body4`)
         scene: scene.clone(),
         plan: plan.clone(),
         refs_total: c[0],
@@ -391,6 +392,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         boxed: c[2],
         cell_skipped: c[3],
         tail_skipped: c[4],
+        collection_skipped: 0,
         limit_skipped: c[5],
         last_failure: None,
         last_n: None,

@@ -1,6 +1,7 @@
 //! Invariant descriptors of an atom's neighbourhood: the body-2 (l = 0) atomic basis on species
-//! channels and the body-3 real-harmonic contractions under a total-degree cap, with analytic
-//! position gradients. Pure f64, CPU.
+//! channels, the body-3 real-harmonic contractions under a total-degree cap and — for a shared
+//! collection's basis — the body-4 Gaunt contractions, with analytic position gradients. Pure
+//! f64, CPU.
 //!
 //! # The atomic basis on species channels
 //!
@@ -114,7 +115,53 @@
 //!
 //! Layout: the body-2 block first (unchanged), then the terms of [`Basis::body3_terms`] in
 //! increasing (c₁, c₂, l) order: all l of one channel pair contiguous, pairs in increasing
-//! (c₁, c₂) with c₁ ≤ c₂. Feature index n_max·S + q for the q-th term.
+//! (c₁, c₂) with c₁ ≤ c₂. Feature index n_max·S + q for the q-th term; the body-4 block (below)
+//! follows at n_max·S + P₃.
+//!
+//! # Body-4 features: the Gaunt contraction (M8a Task 5; `Basis::body4`)
+//!
+//! Three factors, each transforming by its own real Wigner matrix (A_l → D^l A_l), contract to an
+//! invariant through the real Gaunt coefficients
+//!
+//!   G^{l₁l₂l₃}_{m₁m₂m₃} = (1/4π) ∫ S_{l₁m₁}(r̂) S_{l₂m₂}(r̂) S_{l₃m₃}(r̂) dΩ,
+//!   B_{i,(c₁l₁, c₂l₂, c₃l₃)} = Σ_{m₁m₂m₃} G^{l₁l₂l₃}_{m₁m₂m₃} A_{c₁,l₁m₁}(i) A_{c₂,l₂m₂}(i) A_{c₃,l₃m₃}(i):
+//!
+//! B = (1/4π) ∫ f₁ f₂ f₃ dΩ with f_k(r̂) = Σ_m A_{c_k,l_km}(i) S_{l_km}(r̂), and a rotation of the
+//! neighbourhood rotates every f_k by the same Q (S_l(Q⁻¹r̂) = D^l(Q)ᵀ S_l(r̂)), which the integral
+//! over the sphere does not see. The S here are the Racah-normalised real harmonics of the atomic
+//! basis on the unit sphere (one normalisation per l: a scale of the column, which the fit
+//! standardises away); G ≠ 0 needs l₁ + l₂ + l₃ even (S_l(−r̂) = (−1)^l S_l(r̂)) and the triangle
+//! |l₁ − l₂| ≤ l₃ ≤ l₁ + l₂, and is symmetric under a simultaneous permutation of the three (l, m).
+//! G is computed once ([`gaunt`]) by Gauss–Legendre (10 nodes in cos θ) × the trapezoid in φ (20
+//! points) — exact for the degree ≤ 12 integrand (l ≤ 4), so the table is exact to rounding; the
+//! (0,0,0) entry is 1 and (l,l,0) is δ_{m₁m₂}/(2l+1), pinned by a test.
+//!
+//! As a sum over neighbours, B is Σ_{j,k,m} φ(d_ij) φ(d_ik) φ(d_im) times a function of the three
+//! directions: the four-body (three neighbours and the centre) correlation the body-3 block lacks
+//! — the dihedral-like information of three bonds at one atom. Repeated neighbours (j = k, …) are
+//! included as in the body-3 block, and the terms with an l = 0 factor are products of a body-2
+//! and a body-3 sum (A_{c,00}·Σ_m A A): radial × angular, quadratic and cubic in the density —
+//! not in the span of the blocks before, kept.
+//!
+//! **Terms.** Items (t, n, l) in increasing (channel c = t·n_max + n, l) order, every unordered
+//! triple i₁ ≤ i₂ ≤ i₃ once (B is symmetric under permutations of its items), with the parity and
+//! triangle rules above and the total-degree cap
+//!
+//!   n₁ + n₂ + n₃ + (l₁ + l₂ + l₃)/2 ≤ D₄ = min(degree_cap, [`BODY4_DEGREE_CAP`] = 2)
+//!
+//! — the body-3 block's weight per l (its cap n₁ + n₂ + l counts the pair (l, l) as l), so a
+//! (1, 1, 2) triple at n = 0 is the first genuinely angular body-4 term. D₄ = 2 keeps the
+//! collection's Q′ at 38 / 284 / 1 032 / 2 688 for S = 1–4 (body-3 alone: 29 / 176 / 543 / 1 232);
+//! D₄ = 3 or 4 would give 5 344 or 10 592 at S = 4, a 0.2–0.9 GB Gram per matrix. The recovery
+//! degree cap (6) leaves D₄ at 2. P₄ = 9 / 54 / 163 / 364 per centre species.
+//!
+//! **Gradients** by the product rule through the three factors: ∂B/∂r_j = Σ_f δ_{s_j t_f}
+//! Σ_{m} G ∇φ_{n_f,l_fm_f}(d_ij) × (the other two A), and ∂B_i/∂r_i = −Σ_j ∂B_i/∂r_j (translation
+//! invariance). The hot path folds them into the same adjoint W_{c,lm} = ∂E_i/∂A_{c,lm} as the
+//! body-3 block: W_{c_f, l_fm_f} += c_q G × (the other two A). `body4_forces_match_finite_
+//! differences` checks both against central differences (step 1e-5 Bohr: 8e-11 and 9e-11 of the
+//! largest force), `body4_features_are_rotation_invariant` the invariance (5.6e-13 relative over
+//! five random rotations of a six-atom H/C/O cluster).
 //!
 //! # Gradients
 //!
@@ -177,8 +224,132 @@ pub struct Basis {
     pub degree_cap: usize,
     /// Whether the body-3 block is part of the feature vector.
     pub body3: bool,
+    /// Whether the body-4 block is part of the feature vector (module doc, "Body-4 features"; M8a
+    /// Task 5): on for a shared collection's basis, off for a per-scene model's (`Basis::new`), so
+    /// a per-scene sidecar keeps its basis bit for bit.
+    pub body4: bool,
     /// Sorted, unique nuclear charges.
     pub species: Vec<u8>,
+}
+
+/// The highest total degree of the body-4 block (module doc, "Body-4 features"): D₄ =
+/// min(`degree_cap`, 2). Two keeps Q′ at 38 / 284 / 1 032 / 2 688 for S = 1 / 2 / 3 / 4 species
+/// (D₄ = 3: 52 / 468 / 1 902 / 5 344; 4: 77 / 820 / 3 603 / 10 592 — a 10⁴-column Gram is 0.9 GB
+/// per matrix), and it is the first degree with a genuinely angular four-body term (l = 1, 1, 2).
+pub const BODY4_DEGREE_CAP: usize = 2;
+
+/// The cutoff (Bohr) of a shared collection's basis (M8a Task 6; spec §4.3 "Reach"): the one
+/// place a collection's reach is set (the provider's fit basis, its sampling passes' scan and
+/// shell limits, the collection README's pair list). Per-scene models keep [`Basis::new`]'s 6 Bohr
+/// bit for bit (their sidecars carry their basis). Chosen by the transfer test
+/// (`validate/tests/transfer.rs`, `references.md` "M8a transfer and reach", 2026-11-02): **6 Bohr
+/// kept** — on CH₄ + C₂H₆ → propane neither reach transferred (the collection refused every propane
+/// atom at both, rightly: its errors there were 3–14 Ha/Bohr), and the 9 Bohr re-fit of the same
+/// samples was 1.6–2× worse in-domain (leave-one-out RMSE) with ≈ (9/6)³ ≈ 3.4× the neighbours
+/// per atom in a dense scene; the water case is unmeasured. Revisable when a transfer is measured.
+pub const COLLECTION_R_CUT: f64 = 6.0;
+
+/// One body-4 feature: the Gaunt contraction Σ_{m₁m₂m₃} G^{l₁l₂l₃}_{m₁m₂m₃} A_{(t₁,n₁),l₁m₁}
+/// A_{(t₂,n₂),l₂m₂} A_{(t₃,n₃),l₃m₃} of three (channel, l) items in increasing order (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Body4Term {
+    pub t: [usize; 3],
+    pub n: [usize; 3],
+    pub l: [usize; 3],
+}
+
+/// One nonzero real Gaunt coefficient: the positions of the three factors in an lm row
+/// ([`crate::basis::lm_index`]) and G = (1/4π) ∫ S_{l₁m₁} S_{l₂m₂} S_{l₃m₃} dΩ over the unit sphere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Gaunt {
+    pub lm: [usize; 3],
+    pub g: f64,
+}
+
+/// The nonzero real Gaunt coefficients of (l₁, l₂, l₃), every l ≤ [`crate::basis::L_MAX_SUPPORTED`]
+/// (module doc, "Body-4 features": computed once by a quadrature exact for the integrand).
+pub(crate) fn gaunt(l: [usize; 3]) -> &'static [Gaunt] {
+    use crate::basis::L_MAX_SUPPORTED as LM;
+    static TABLE: std::sync::OnceLock<Vec<Vec<Gaunt>>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let nlm = (LM + 1) * (LM + 1);
+        // Gauss–Legendre in x = cos θ (10 nodes: exact to degree 19) × the trapezoid in φ (20
+        // points: exact for |m| < 20) — exact for the degree ≤ 3·LM = 12 polynomial integrand.
+        let (xs, ws) = gauss_legendre(10);
+        let n_phi = 20;
+        let mut pts: Vec<(f64, Vec<f64>)> = Vec::new();
+        let mut sh = vec![0.0; nlm];
+        let mut dsh = vec![[0.0; 3]; nlm];
+        for (x, w) in xs.iter().zip(&ws) {
+            let st = (1.0 - x * x).max(0.0).sqrt();
+            for k in 0..n_phi {
+                let phi = 2.0 * std::f64::consts::PI * k as f64 / n_phi as f64;
+                crate::basis::solid_harmonics(LM, [st * phi.cos(), st * phi.sin(), *x], &mut sh, &mut dsh);
+                // ∫dΩ ≈ Σ w·(2π/n_φ), then the 1/4π of the average
+                pts.push((w / (2.0 * n_phi as f64), sh.clone()));
+            }
+        }
+        let mut out = vec![Vec::new(); (LM + 1) * (LM + 1) * (LM + 1)];
+        for l1 in 0..=LM {
+            for l2 in 0..=LM {
+                for l3 in 0..=LM {
+                    let mut list = Vec::new();
+                    for a in AtomicBasisScratch::l_range(l1) {
+                        for b in AtomicBasisScratch::l_range(l2) {
+                            for c in AtomicBasisScratch::l_range(l3) {
+                                let g: f64 = pts.iter().map(|(w, s)| w * s[a] * s[b] * s[c]).sum();
+                                // the quadrature is exact: anything else is rounding (≤ 1e-16)
+                                if g.abs() > 1e-13 {
+                                    list.push(Gaunt { lm: [a, b, c], g });
+                                }
+                            }
+                        }
+                    }
+                    out[(l1 * (LM + 1) + l2) * (LM + 1) + l3] = list;
+                }
+            }
+        }
+        out
+    });
+    &table[(l[0] * (LM + 1) + l[1]) * (LM + 1) + l[2]]
+}
+
+/// Nodes and weights of the n-point Gauss–Legendre rule on [−1, 1] (Newton on P_n from the
+/// usual first guesses, to rounding).
+fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut xs = vec![0.0; n];
+    let mut ws = vec![0.0; n];
+    for i in 0..n {
+        let mut x = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+        let mut dp = 1.0;
+        for _ in 0..100 {
+            let (mut p0, mut p1) = (1.0, x);
+            for k in 2..=n {
+                let p2 = ((2 * k - 1) as f64 * x * p1 - (k - 1) as f64 * p0) / k as f64;
+                p0 = p1;
+                p1 = p2;
+            }
+            dp = n as f64 * (x * p1 - p0) / (x * x - 1.0);
+            let dx = p1 / dp;
+            x -= dx;
+            if dx.abs() < 1e-16 {
+                break;
+            }
+        }
+        xs[i] = x;
+        ws[i] = 2.0 / ((1.0 - x * x) * dp * dp);
+    }
+    (xs, ws)
+}
+
+/// One body-4 value from the three factors' lm rows (module doc).
+#[inline]
+pub(crate) fn body4_value(entries: &[Gaunt], a1: &[f64], a2: &[f64], a3: &[f64]) -> f64 {
+    let mut b = 0.0;
+    for e in entries {
+        b += e.g * a1[e.lm[0]] * a2[e.lm[1]] * a3[e.lm[2]];
+    }
+    b
 }
 
 /// One body-3 feature: the contraction Σ_m A_{(t₁,n₁),lm} A_{(t₂,n₂),lm} of two channels with
@@ -215,6 +386,7 @@ impl Basis {
             r_cut: 6.0,
             degree_cap: 4,
             body3: true,
+            body4: false,
             species,
         }
     }
@@ -330,16 +502,88 @@ impl Basis {
         classes
     }
 
-    /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]):
-    /// n_max·S(S+1)/2 body-2 classes plus S·P₃ body-3 columns.
-    pub fn n_independent_columns(&self) -> usize {
-        let s = self.n_species();
-        self.n_max * s * (s + 1) / 2 + s * self.n_body3()
+    /// The independent column (index into [`Basis::column_classes`]) of every full column
+    /// q = s·P + k: both orderings of a hetero body-2 pair map to their one class.
+    pub fn column_class_index(&self) -> Vec<usize> {
+        let mut of = vec![usize::MAX; self.n_species() * self.n_features()];
+        for (c, class) in self.column_classes().iter().enumerate() {
+            for &q in class {
+                of[q] = c;
+            }
+        }
+        of
     }
 
-    /// Length P of the per-atom descriptor vector: n_max·S + P₃.
+    /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]):
+    /// n_max·S(S+1)/2 body-2 classes plus S·(P₃ + P₄) body-3 and body-4 columns.
+    pub fn n_independent_columns(&self) -> usize {
+        let s = self.n_species();
+        self.n_max * s * (s + 1) / 2 + s * (self.n_body3() + self.n_body4())
+    }
+
+    /// Length P of the per-atom descriptor vector: n_max·S + P₃ + P₄.
     pub fn n_features(&self) -> usize {
-        self.n_body2() + self.n_body3()
+        self.n_body2() + self.n_body3() + self.n_body4()
+    }
+
+    /// The total-degree cap of the body-4 block, D₄ = min(`degree_cap`, [`BODY4_DEGREE_CAP`])
+    /// (module doc, "Body-4 features").
+    pub fn body4_cap(&self) -> usize {
+        self.degree_cap.min(BODY4_DEGREE_CAP)
+    }
+
+    /// Every body-4 term in feature order, handed to `f` (module doc, "Body-4 features"): items
+    /// (t, n, l) in increasing (channel t·n_max + n, l) order, unordered triples i₁ ≤ i₂ ≤ i₃ with
+    /// l₁ + l₂ + l₃ even, the triangle |l₁ − l₂| ≤ l₃ ≤ l₁ + l₂ and n₁ + n₂ + n₃ + (l₁+l₂+l₃)/2 ≤ D₄.
+    /// Nothing while `body4` is off.
+    fn for_each_body4(&self, mut f: impl FnMut(Body4Term)) {
+        if !self.body4 {
+            return;
+        }
+        let d = self.body4_cap();
+        let l_top = self.l_max.min(2 * d);
+        let mut items: Vec<(usize, usize, usize)> = Vec::new();
+        for t in 0..self.n_species() {
+            for n in 0..self.n_max.min(d + 1) {
+                for l in 0..=l_top {
+                    items.push((t, n, l));
+                }
+            }
+        }
+        let m = items.len();
+        for a in 0..m {
+            let (t1, n1, l1) = items[a];
+            for b in a..m {
+                let (t2, n2, l2) = items[b];
+                if n1 + n2 + (l1 + l2) / 2 > d {
+                    continue;
+                }
+                for &(t3, n3, l3) in &items[b..] {
+                    let sum_l = l1 + l2 + l3;
+                    if sum_l % 2 == 1 || l3 > l1 + l2 || l3 + l1.min(l2) < l1.max(l2) {
+                        continue;
+                    }
+                    if n1 + n2 + n3 + sum_l / 2 > d {
+                        continue;
+                    }
+                    f(Body4Term { t: [t1, t2, t3], n: [n1, n2, n3], l: [l1, l2, l3] });
+                }
+            }
+        }
+    }
+
+    /// Size of the body-4 block P₄ (module doc); 0 while `body4` is off.
+    pub fn n_body4(&self) -> usize {
+        let mut k = 0;
+        self.for_each_body4(|_| k += 1);
+        k
+    }
+
+    /// The body-4 terms in feature order (module doc, "Layout"); empty while `body4` is off.
+    pub fn body4_terms(&self) -> Vec<Body4Term> {
+        let mut terms = Vec::new();
+        self.for_each_body4(|t| terms.push(t));
+        terms
     }
 
     /// Human-readable name of every feature, in index order (for debugging and the sidecar
@@ -355,6 +599,12 @@ impl Basis {
             names.push(format!(
                 "b3[Z={},n={};Z={},n={};l={}]",
                 self.species[t.t1], t.n1, self.species[t.t2], t.n2, t.l
+            ));
+        }
+        for t in self.body4_terms() {
+            names.push(format!(
+                "b4[Z={},n={},l={};Z={},n={},l={};Z={},n={},l={}]",
+                self.species[t.t[0]], t.n[0], t.l[0], self.species[t.t[1]], t.n[1], t.l[1], self.species[t.t[2]], t.n[2], t.l[2]
             ));
         }
         debug_assert_eq!(names.len(), self.n_features());
@@ -504,7 +754,9 @@ pub fn describe(
         .collect();
     let mut rn = vec![0.0; n_max];
     let mut drn = vec![0.0; n_max];
-    let mut scratch = basis.body3.then(|| AtomicBasisScratch::new(basis, n));
+    let mut scratch = (basis.body3 || basis.body4).then(|| AtomicBasisScratch::new(basis, n));
+    let p4 = p2 + basis.n_body3();
+    let terms4: Vec<(Body4Term, &[Gaunt])> = basis.body4_terms().into_iter().map(|t| (t, gaunt(t.l))).collect();
     for i in 0..n {
         if let Some(sc) = scratch.as_mut() {
             sc.clear();
@@ -591,8 +843,100 @@ pub fn describe(
                 }
             }
         }
+        // Body-4 values and gradients (module doc): the product rule through the three factors.
+        for (q, (t, entries)) in terms4.iter().enumerate() {
+            let c = t4_channels(basis, t);
+            atom.b[p4 + q] = body4_value(entries, sc.a(c[0]), sc.a(c[1]), sc.a(c[2]));
+        }
+        for (slot, &j) in sc.neighbours.iter().enumerate() {
+            let tj = s[j];
+            let (self_entry, rest) = atom.grad.split_at_mut(1);
+            let gj = &mut rest[slot].1;
+            let self_g = &mut self_entry[0].1;
+            for (q, (t, entries)) in terms4.iter().enumerate() {
+                if !t.t.contains(&tj) {
+                    continue;
+                }
+                let c = t4_channels(basis, t);
+                let a = [sc.a(c[0]), sc.a(c[1]), sc.a(c[2])];
+                let mut g = [0.0; 3];
+                for f in 0..3 {
+                    if t.t[f] != tj {
+                        continue;
+                    }
+                    let dp = sc.dphi(slot, t.n[f]);
+                    let (o1, o2) = ((f + 1) % 3, (f + 2) % 3);
+                    for e in entries.iter() {
+                        let w = e.g * a[o1][e.lm[o1]] * a[o2][e.lm[o2]];
+                        let d = dp[e.lm[f]];
+                        g[0] += w * d[0];
+                        g[1] += w * d[1];
+                        g[2] += w * d[2];
+                    }
+                }
+                gj[p4 + q] = g;
+                for x in 0..3 {
+                    self_g[p4 + q][x] -= g[x];
+                }
+            }
+        }
     }
     Ok(out)
+}
+
+/// Per atom, the independent columns ([`Basis::column_classes`] indices, ascending) its energy
+/// term E_i = Σ_k c_{s_i,k} B_{i,k} depends on here: those whose descriptor value B_{i,k} is
+/// non-zero. A feature of a neighbour channel the atom does not have is a sum (or a product of
+/// sums) with no term, exactly 0.0, so this is the atom's environment's column support — the
+/// parameters its predictions can move with (M8a user-fix 3: a class key is held to the count
+/// of these, not to the whole basis's Q′). `class_of` is [`Basis::column_class_index`], computed
+/// once by a caller that walks many geometries. Same panics as [`describe_values`].
+pub fn touched_columns(
+    basis: &Basis,
+    class_of: &[usize],
+    pos: &[[f64; 3]],
+    z: &[u8],
+) -> Result<Vec<Vec<usize>>, DescribeError> {
+    let s = basis.species_indices(z)?;
+    let p = basis.n_features();
+    let of = class_of;
+    let values = describe_values(basis, pos, z)?;
+    Ok(values
+        .iter()
+        .zip(&s)
+        .map(|(b, &si)| {
+            let mut c: Vec<usize> = b
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v != 0.0)
+                .map(|(k, _)| of[si * p + k])
+                .collect();
+            c.sort_unstable();
+            c.dedup();
+            c
+        })
+        .collect())
+}
+
+/// The three channels t·n_max + n of a body-4 term's factors.
+#[inline]
+pub(crate) fn t4_channels(basis: &Basis, t: &Body4Term) -> [usize; 3] {
+    [basis.body2_index(t.t[0], t.n[0]), basis.body2_index(t.t[1], t.n[1]), basis.body2_index(t.t[2], t.n[2])]
+}
+
+/// No atom of `pos` has a neighbour within `r_cut` (Bohr; strictly inside, where f_c > 0): every
+/// descriptor is empty, so the model's energy there is Σ ref exactly (`crate::fit`, "Isolated-atom
+/// limit") and a teacher answer at such a geometry teaches it nothing — its label E − Σ ref is
+/// only the isolated atoms' grid/box artefact. The provider never keeps one, holds stored ones out
+/// of the fit, and a collection refuses one on import (`crate::collection`, "Admission").
+pub fn no_neighbours(pos: &[[f64; 3]], r_cut: f64) -> bool {
+    let r2 = r_cut * r_cut;
+    pos.iter().enumerate().all(|(i, a)| {
+        pos[i + 1..].iter().all(|b| {
+            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= r2
+        })
+    })
 }
 
 /// The descriptor values B_i alone — what [`describe`] puts in `AtomDescriptor::b`, bit for bit
@@ -610,7 +954,9 @@ pub fn describe_values(basis: &Basis, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<
     let mut out: Vec<Vec<f64>> = vec![vec![0.0; p]; n];
     let mut rn = vec![0.0; n_max];
     let mut drn = vec![0.0; n_max];
-    let mut scratch = basis.body3.then(|| AtomicBasisScratch::new(basis, n));
+    let mut scratch = (basis.body3 || basis.body4).then(|| AtomicBasisScratch::new(basis, n));
+    let p4 = p2 + basis.n_body3();
+    let terms4: Vec<(Body4Term, &[Gaunt])> = basis.body4_terms().into_iter().map(|t| (t, gaunt(t.l))).collect();
     for i in 0..n {
         if let Some(sc) = scratch.as_mut() {
             sc.clear();
@@ -641,6 +987,10 @@ pub fn describe_values(basis: &Basis, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<
                 b += a1[lm] * a2[lm];
             }
             out[i][p2 + q] = b;
+        }
+        for (q, (t, entries)) in terms4.iter().enumerate() {
+            let c = t4_channels(basis, t);
+            out[i][p4 + q] = body4_value(entries, sc.a(c[0]), sc.a(c[1]), sc.a(c[2]));
         }
     }
     Ok(out)
@@ -733,6 +1083,65 @@ mod tests {
         let mut one = Basis::new(&[1]);
         one.body3 = false;
         assert_eq!(one.column_classes(), (0..8).map(|q| vec![q]).collect::<Vec<_>>());
+    }
+
+    /// M8a user-fix 3: an atom touches only the columns of its own centre species and of the
+    /// neighbour species it has; adding a third species to the basis adds columns no H/O atom
+    /// touches, so an H/O environment's support does not grow with it.
+    #[test]
+    fn an_atom_touches_only_its_own_species_and_neighbour_channels() {
+        // water-like: O at the origin, two H at ~1.8 Bohr
+        let pos = [[0.0, 0.0, 0.0], [1.8, 0.0, 0.0], [-0.45, 1.74, 0.0]];
+        let z = [8, 1, 1];
+        for body4 in [false, true] {
+            let mut ho = Basis::new(&[1, 8]);
+            ho.body4 = body4;
+            let mut hno = Basis::new(&[1, 7, 8]);
+            hno.body4 = body4;
+            assert!(ho
+                .column_class_index()
+                .iter()
+                .all(|&c| c < ho.n_independent_columns()));
+            let a = touched_columns(&ho, &ho.column_class_index(), &pos, &z).unwrap();
+            let b = touched_columns(&hno, &hno.column_class_index(), &pos, &z).unwrap();
+            for (i, (ta, tb)) in a.iter().zip(&b).enumerate() {
+                assert!(!ta.is_empty());
+                assert_eq!(
+                    ta.len(),
+                    tb.len(),
+                    "body4 {body4}, atom {i}: the N channel adds no column an H/O atom touches"
+                );
+            }
+            assert!(hno.n_independent_columns() > ho.n_independent_columns());
+            // an N₂ atom touches no column an H/O atom does: disjoint
+            let n2 = touched_columns(
+                &hno,
+                &hno.column_class_index(),
+                &[[0.0; 3], [2.07, 0.0, 0.0]],
+                &[7, 7],
+            )
+            .unwrap();
+            for t in &b {
+                assert!(
+                    n2[0].iter().all(|c| !t.contains(c)),
+                    "N₂'s columns are not water's"
+                );
+            }
+            println!(
+                "body4 {body4}: Q′ H/O {} → H/N/O {}; water O touches {}, H {}; N₂'s N {}",
+                ho.n_independent_columns(),
+                hno.n_independent_columns(),
+                b[0].len(),
+                b[1].len(),
+                n2[0].len()
+            );
+        }
+        // a lone atom touches nothing
+        let one = Basis::new(&[1]);
+        assert!(
+            touched_columns(&one, &one.column_class_index(), &[[0.0; 3]], &[1]).unwrap()[0]
+                .is_empty()
+        );
     }
 
     #[test]
@@ -925,6 +1334,197 @@ mod tests {
         }
         assert!(d.iter().any(|a| a.b[p2..].iter().any(|v| *v != 0.0)));
         eprintln!("body-3 vs Legendre double sum: worst {worst:.2e}");
+    }
+
+    /// A random 6-atom H/C/O cluster within r_cut of each other, and a uniformly random rotation
+    /// (normalised Gaussian quaternion).
+    fn cluster_and_rotation(seed: u64) -> (Vec<[f64; 3]>, Vec<u8>, [[f64; 3]; 3]) {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let pos: Vec<[f64; 3]> = (0..6).map(|_| [rng.gen_range(-1.6..1.6), rng.gen_range(-1.6..1.6), rng.gen_range(-1.6..1.6)]).collect();
+        let z = vec![1, 6, 8, 1, 6, 1];
+        let mut q: [f64; 4] = std::array::from_fn(|_| rng.gen_range(-1.0..1.0));
+        let nq = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        q.iter_mut().for_each(|v| *v /= nq);
+        let [w, x, y, zz] = q;
+        let r = [
+            [1.0 - 2.0 * (y * y + zz * zz), 2.0 * (x * y - zz * w), 2.0 * (x * zz + y * w)],
+            [2.0 * (x * y + zz * w), 1.0 - 2.0 * (x * x + zz * zz), 2.0 * (y * zz - x * w)],
+            [2.0 * (x * zz - y * w), 2.0 * (y * zz + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ];
+        (pos, z, r)
+    }
+
+    fn body4_basis() -> Basis {
+        let mut b = Basis::new(&[1, 6, 8]);
+        b.body4 = true;
+        b
+    }
+
+    #[test]
+    fn gaunt_coefficients_are_the_sphere_averages_they_claim() {
+        // S₀₀ = 1: G(00,00,00) = 1; Racah: the average of S_lm S_lm' is δ_mm'/(2l+1). Each value
+        // is a 200-point quadrature sum: exact up to ≈ 200 roundings (2e-14)
+        let tol = 5e-14;
+        assert_eq!(gaunt([0, 0, 0]).len(), 1);
+        assert!((gaunt([0, 0, 0])[0].g - 1.0).abs() < tol, "{}", gaunt([0, 0, 0])[0].g);
+        for l in 1..=3 {
+            let g = gaunt([l, l, 0]);
+            assert_eq!(g.len(), 2 * l + 1, "l = {l}");
+            for e in g {
+                assert_eq!(e.lm[0], e.lm[1]);
+                assert!((e.g - 1.0 / (2 * l + 1) as f64).abs() < tol, "l {l}: {}", e.g);
+            }
+        }
+        // parity and the triangle: nothing for an odd sum or a broken triangle
+        assert!(gaunt([1, 1, 1]).is_empty());
+        assert!(gaunt([1, 0, 0]).is_empty());
+        assert!(gaunt([2, 0, 0]).is_empty());
+        assert!(!gaunt([1, 1, 2]).is_empty());
+        // symmetric under a simultaneous permutation of the three (l, m) slots
+        for e in gaunt([1, 1, 2]) {
+            let swapped = gaunt([2, 1, 1]).iter().find(|f| f.lm == [e.lm[2], e.lm[1], e.lm[0]]).expect("permuted entry");
+            assert!((swapped.g - e.g).abs() < tol);
+        }
+    }
+
+    #[test]
+    fn body4_counts_and_layout() {
+        let b = body4_basis();
+        let p4 = b.n_body4();
+        assert_eq!(b.body4_terms().len(), p4);
+        assert_eq!(b.n_features(), b.n_body2() + b.n_body3() + p4);
+        assert_eq!(b.column_classes().len(), b.n_independent_columns());
+        assert_eq!(b.feature_names().len(), b.n_features());
+        // the Q′ the D₄ doc quotes for S = 1, 2, 4 (S = 3 here: 1 032)
+        assert_eq!(b.n_independent_columns(), 1032);
+        let q = |sp: &[u8]| {
+            let mut b = Basis::new(sp);
+            b.body4 = true;
+            b.n_independent_columns()
+        };
+        assert_eq!((q(&[1]), q(&[1, 8]), q(&[1, 6, 7, 8])), (38, 284, 2688));
+        // every term obeys the parity, the triangle and the cap, in increasing item order
+        let terms = b.body4_terms();
+        for t in &terms {
+            let sl = t.l.iter().sum::<usize>();
+            assert_eq!(sl % 2, 0);
+            assert!(t.l[2] <= t.l[0] + t.l[1] && t.l[0].abs_diff(t.l[1]) <= t.l[2]);
+            assert!(t.n.iter().sum::<usize>() + sl / 2 <= b.body4_cap());
+            let key = |k: usize| (b.body2_index(t.t[k], t.n[k]), t.l[k]);
+            assert!(key(0) <= key(1) && key(1) <= key(2));
+        }
+        assert!(terms.iter().any(|t| t.l == [1, 1, 2]), "the genuinely angular term is in");
+        // off by default: a per-scene basis is unchanged
+        assert_eq!(Basis::new(&[1, 6, 8]).n_body4(), 0);
+    }
+
+    #[test]
+    fn body4_features_are_rotation_invariant() {
+        let b = body4_basis();
+        let p4 = b.n_body2() + b.n_body3();
+        let mut worst: f64 = 0.0;
+        for seed in 0..5 {
+            let (pos, z, r) = cluster_and_rotation(seed);
+            let rotated: Vec<[f64; 3]> = pos.iter().map(|p| std::array::from_fn(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f64>() + 0.37)).collect();
+            let a = describe_values(&b, &pos, &z).unwrap();
+            let c = describe_values(&b, &rotated, &z).unwrap();
+            // permuting the atoms permutes the descriptors
+            let perm = [3, 0, 5, 1, 4, 2];
+            let pp: Vec<[f64; 3]> = perm.iter().map(|&i| pos[i]).collect();
+            let pz: Vec<u8> = perm.iter().map(|&i| z[i]).collect();
+            let d = describe_values(&b, &pp, &pz).unwrap();
+            for i in 0..pos.len() {
+                let scale = a[i][p4..].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                assert!(scale > 0.0, "atom {i} has body-4 features");
+                for k in p4..b.n_features() {
+                    let rel = (a[i][k] - c[i][k]).abs() / a[i][k].abs().max(c[i][k].abs()).max(1e-300);
+                    let abs_ok = (a[i][k] - c[i][k]).abs() <= 1e-14 * scale;
+                    assert!(rel <= 1e-10 || abs_ok, "seed {seed} atom {i} feature {k}: {} vs {}", a[i][k], c[i][k]);
+                    if a[i][k].abs() > 1e-6 * scale {
+                        worst = worst.max(rel);
+                    }
+                }
+            }
+            for (slot, &i) in perm.iter().enumerate() {
+                for k in 0..b.n_features() {
+                    assert!((d[slot][k] - a[i][k]).abs() <= 1e-12 * a[i][k].abs().max(1.0));
+                }
+            }
+        }
+        eprintln!("body-4 rotation invariance: worst relative difference {worst:.2e}");
+    }
+
+    #[test]
+    fn body4_forces_match_finite_differences() {
+        use rand::{Rng, SeedableRng};
+        let b = body4_basis();
+        let (pos, z, _) = cluster_and_rotation(11);
+        let p = b.n_features();
+        let p4 = b.n_body2() + b.n_body3();
+        // (1) the descriptor's own gradient lists against central differences of its values
+        let desc = describe(&b, &pos, &z).unwrap();
+        let h = 1e-5;
+        let mut worst_g: f64 = 0.0;
+        for (i, atom) in desc.iter().enumerate() {
+            let gmax = atom.grad.iter().flat_map(|(_, g)| g[p4..].iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
+            for (j, g) in &atom.grad {
+                for a in 0..3 {
+                    let mut pp = pos.clone();
+                    pp[*j][a] += h;
+                    let up = describe_values(&b, &pp, &z).unwrap();
+                    pp[*j][a] -= 2.0 * h;
+                    let dn = describe_values(&b, &pp, &z).unwrap();
+                    for k in p4..p {
+                        let fd = (up[i][k] - dn[i][k]) / (2.0 * h);
+                        let err = (fd - g[k][a]).abs() / gmax;
+                        worst_g = worst_g.max(err);
+                        assert!(err < 1e-6, "atom {i} wrt {j}.{a} feature {k}: fd {fd} vs {}", g[k][a]);
+                    }
+                }
+            }
+        }
+        // (2) the hot path's forces (the adjoint) against central differences of its energy, with
+        // random coefficients on the body-4 block only and on everything
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for only4 in [true, false] {
+            let coeffs: Vec<Vec<f64>> = (0..b.n_species()).map(|_| (0..p).map(|k| if only4 && k < p4 { 0.0 } else { rng.gen_range(-1.0..1.0) }).collect()).collect();
+            let m = crate::model::Model {
+                basis: b.clone(),
+                coeffs,
+                mean: vec![0.0; p],
+                scale: vec![1.0; p],
+                ref_energy: vec![0.0; b.n_species()],
+                sigma_e: 0.0,
+                sigma_f: 0.0,
+                energy_per_atom: true,
+                lambda: 0.0,
+                sigma_inv_chol: None,
+                n_samples: 0,
+                provenance: crate::model::Provenance { grid_n: 1, h: 1.0, sigma: 1.0, tol: 1.0, charge: 0, multiplicity: None, teacher: String::new(), masses: Vec::new(), ionic: "none".into() },
+                representatives: std::sync::OnceLock::new(),
+            };
+            let (_, f) = crate::model::energy_and_forces(&m, &pos, &z).unwrap();
+            let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));
+            let sum: [f64; 3] = std::array::from_fn(|a| f.iter().map(|v| v[a]).sum::<f64>());
+            assert!(sum.iter().all(|v| v.abs() < 1e-12 * fmax), "ΣF = {sum:?}");
+            let mut worst: f64 = 0.0;
+            for j in 0..pos.len() {
+                for a in 0..3 {
+                    let mut pp = pos.clone();
+                    pp[j][a] += h;
+                    let up = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
+                    pp[j][a] -= 2.0 * h;
+                    let dn = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
+                    let fd = -(up - dn) / (2.0 * h);
+                    let err = (fd - f[j][a]).abs() / fmax;
+                    worst = worst.max(err);
+                    assert!(err < 1e-6, "only4 {only4} atom {j}.{a}: fd {fd} vs {}", f[j][a]);
+                }
+            }
+            eprintln!("body-4 forces vs central differences (only body-4: {only4}): worst {worst:.2e} of max |F| {fmax:.3e}");
+        }
+        eprintln!("body-4 descriptor gradients vs central differences: worst {worst_g:.2e}");
     }
 
     #[test]

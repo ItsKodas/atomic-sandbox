@@ -36,23 +36,43 @@ pub const FENCE_VOTES: usize = 3;
 /// not learn it from what it was given).
 pub const FENCE_VOTE_LIMIT: u32 = 3;
 
-/// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values).
-pub(super) const Q_NONE: u8 = 0;
+/// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values): aliases of the
+/// `surrogate` crate's [`surrogate::quarantine`] codes, their one source of truth since M8a Task 3
+/// (ruling P4; the meaning of each is documented there). Values unchanged.
+pub(super) const Q_NONE: u8 = surrogate::quarantine::Q_NONE;
 
-pub(super) const Q_HELD: u8 = 1;
+pub(super) const Q_HELD: u8 = surrogate::quarantine::Q_HELD;
 
-pub(super) const Q_SUPERSEDED: u8 = 2;
+pub(super) const Q_SUPERSEDED: u8 = surrogate::quarantine::Q_SUPERSEDED;
 
-/// A box-affected sample (its face density above the box rule) taken while the model was still
-/// being built, excluded from the fit once the trust floor is met without it (Task 9 fix round
-/// 1, S1): never a quarantine candidate, never fencing.
-pub(super) const Q_BOX: u8 = 3;
+/// A collection sample whose box has no isolated-atom reference yet (M8a Task 4a fix round 2,
+/// `shared` module doc, "References per box"): its fit target E − Σ ref of its own box cannot be
+/// formed, so it waits out of the fit like a pending sample until that reference arrives. A
+/// provider-only code: never written to a file or a collection (a collection's status is its
+/// quarantine, and this is not one).
+pub(super) const Q_REF_WAIT: u8 = 5;
 
-/// A draft-mode audit's answer at a geometry the strict policy refused (fix (b), 2026-10-18;
-/// `SampleTag::DraftAudit`): held out of the strict fit — not fitted, not in the envelope, the
-/// grade or the leave-one-out, never fencing. Not written to the sidecar's quarantine array (the
-/// tag carries it; `install_sidecar` restores the code from the tag).
-pub(super) const Q_DRAFT: u8 = 4;
+/// A stored sample of **lone atoms** — no atom has a neighbour within the model's cutoff
+/// ([`no_neighbours`]) — loaded from a collection or a file written before the keep rule refused
+/// such answers (`TeachOutcome::LoneNotKept`; user test M8a: 202 lone-H samples spread by 1.3 mHa
+/// failed rule 4's self-check and untrusted a whole collection). Every descriptor of such a
+/// sample is empty, so the model's answer there is Σ ref exactly (no intercept, `surrogate::fit`
+/// "Isolated-atom limit") and its label E − Σ ref(own box) is only the isolated atom's grid/box
+/// artefact: it teaches nothing. Set at load by [`SurrogateKs::hold_out_lone`] and **held out of
+/// the fit for good** — not fitted, not in the envelope, the grade, the leave-one-out or the
+/// thinning distance, never fencing, never released or superseded (only `Q_HELD` is), never
+/// promoted (only `Q_DRAFT` is), never moved by the box or reference rules (they touch only
+/// `Q_NONE` and `Q_REF_WAIT`). A provider-only code like [`Q_REF_WAIT`]: never written — a
+/// collection gets no status record for it (its own code stands), a saved file writes the code the
+/// sample was loaded with (`lone_codes`) — so nothing on disk changes and the samples stay for a
+/// model that may one day learn from them (long-range terms).
+pub(super) const Q_LONE: u8 = 6;
+
+/// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
+pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
+
+/// A draft-mode audit's answer held out of the strict fit ([`surrogate::quarantine::Q_DRAFT`]).
+pub(super) const Q_DRAFT: u8 = surrogate::quarantine::Q_DRAFT;
 
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
@@ -60,12 +80,41 @@ pub const QUARANTINE_ROUNDS: usize = 5;
 /// Never quarantine more than this fraction of the store.
 pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
-/// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting).
+/// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
+/// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
 pub(super) struct FenceVote {
     pub(super) near: Vec<usize>,
     pub(super) n: usize,
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
+    pub(super) residual: Option<(f64, Vec<[f64; 3]>)>,
+    /// The model generation the residual was taken against: votes combine only within one
+    /// (fix round 1, the review's I1 — a refit in between changes what "the model's error" is).
+    pub(super) gen: u64,
+}
+
+/// Two fence votes agree (`surrogate` module doc, "Fence voting"): their residuals teacher − model
+/// do — the per-atom energy residuals within `energy_std_per_atom` and, per atom, the force
+/// residuals' magnitudes within the policy's force bound of that atom's teacher force in the second
+/// vote (`force_bound(|F_teacher|)`, as everywhere else) — when both carry one; else the
+/// raw answers ([`SurrogateKs::agree`]). Residuals, not answers (M8a Task 5, the user's
+/// compressed-H₂ log): votes are fresh answers at *different* geometries along a trajectory
+/// (a vibration enters the fence once per period), whose raw energies and forces differ by the
+/// surface's own slope — on a steep inner wall more than the tiers — while the model's error
+/// there varies slowly; magnitudes, because the molecule turns between votes and a force
+/// residual turns with it. Magnitudes drop the direction: two residuals of equal size pointing
+/// differently relative to the molecule agree here (a direction-aware invariant — the residual
+/// projected on the interatomic unit vectors, or Kabsch-aligned frames — would not); the vote only
+/// keeps one sample for the next refit, whose `judge_votes` decides on the full vectors.
+pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) -> bool {
+    match (&va.residual, &vb.residual) {
+        (Some((ea, fa)), Some((eb, fb))) => {
+            let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            (ea - eb).abs() / va.n.max(1) as f64 <= p.energy_std_per_atom
+                && fa.iter().zip(fb).zip(&vb.forces).all(|((a, b), t)| (norm(a) - norm(b)).abs() / 3f64.sqrt() <= p.force_bound(norm(t)))
+        }
+        _ => SurrogateKs::agree(p, va.n, va.energy, &va.forces, vb.energy, &vb.forces),
+    }
 }
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
@@ -131,6 +180,58 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_DRAFT).count()
     }
 
+    /// Stored samples of lone atoms held out of the fit ([`Q_LONE`]).
+    pub fn lone_held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_LONE).count()
+    }
+
+    /// Holds every stored sample in which no atom has a neighbour within `r_cut` (Bohr) out of the
+    /// fit ([`Q_LONE`]), remembering the code it had (`lone_codes`: what a saved file writes back);
+    /// how many were newly held. Called where stored samples are installed (a collection's attach,
+    /// a model or samples file, a session-only file), never on a fresh teacher answer (the keep
+    /// rule refuses those).
+    pub(super) fn hold_out_lone(&mut self, r_cut: f64) -> usize {
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let lone: Vec<usize> = (0..store.len()).filter(|&i| self.quarantine.get(i) != Some(&Q_LONE) && no_neighbours(&store.samples[i].pos, r_cut)).collect();
+        if lone.is_empty() {
+            return 0;
+        }
+        let n = store.len();
+        self.quarantine.resize(n, Q_NONE);
+        for &i in &lone {
+            self.lone_codes.insert(i, self.quarantine[i]);
+            self.quarantine[i] = Q_LONE;
+        }
+        lone.len()
+    }
+
+    /// The code sample `i` is written to a file with: a lone sample's ([`Q_LONE`]) is the code it
+    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it) and `Q_REF_WAIT` (it
+    /// waits again at the reload) write as `Q_NONE`.
+    pub(super) fn persisted_code(&self, i: usize) -> u8 {
+        let q = match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
+            Q_LONE => self.lone_codes.get(&i).copied().unwrap_or(Q_NONE),
+            q => q,
+        };
+        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE {
+            Q_NONE
+        } else {
+            q
+        }
+    }
+
+    /// The user's note on [`hold_out_lone`](Self::hold_out_lone)'s count `k` of the samples from
+    /// `source` ("shared collection <slug>", "model file …").
+    pub(super) fn note_lone_held_out(&mut self, source: &str, k: usize, r_cut: f64) {
+        if k > 0 {
+            let r = format!("{r_cut}");
+            self.user_notes.push(format!(
+                "{source}: {k} sample{} of lone atoms (no neighbour within {r} Bohr) held out of the fit — they teach nothing (kept on disk, unchanged)",
+                if k == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     /// Stored samples kept since the last refit (not in the fit yet; M6 Task 11's reconciliation,
     /// `sim::TrainableStatus::unfitted`).
     pub fn unfitted(&self) -> usize {
@@ -150,14 +251,16 @@ impl SurrogateKs {
         self.face.get(i).is_some_and(|&rho| rho > box_affected_face_density(h))
     }
 
-    /// The trust floor of the stored species (Q′ + `MIN_RESIDUAL_DOF` of their default basis): the
-    /// clean sample count the box-affected samples' exclusion waits for. `None` without a store.
+    /// The trust floor of the stored samples (the columns their usable atoms touch in the default
+    /// basis, |∪ S_k| — `fit_floor`, since M8a user-fix 3's ruling on concern 2, before it the
+    /// basis's Q′ — plus `MIN_RESIDUAL_DOF`): the clean sample count the box-affected samples'
+    /// exclusion waits for. `None` without a store.
     pub fn trust_floor(&self) -> Option<usize> {
         let store = self.store.as_ref()?;
         let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         species.sort_unstable();
         species.dedup();
-        Some(Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize)
+        Some(self.fit_floor(&self.default_basis(&species)) + MIN_RESIDUAL_DOF as usize)
     }
 
     /// Once the store holds enough other samples for the trust floor (Q′ + 30), the box-affected
@@ -182,8 +285,8 @@ impl SurrogateKs {
         true
     }
 
-    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded or a
-    /// held-out draft guess).
+    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded, a
+    /// held-out draft guess, waiting for its box's reference, or lone atoms).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -194,9 +297,11 @@ impl SurrogateKs {
         self.recovery.as_deref()
     }
 
-    /// Ruling S15 (`surrogate` module doc, "Trust recovery"): the degree-cap retry, then quarantine rounds.
+    /// Ruling S15 (`surrogate` module doc, "Trust recovery"): the degree-cap retry, then quarantine rounds;
+    /// and (M8a user-test fix) a cap an earlier recovery set is re-judged against the default basis.
     /// Returns the report of the fit that stands; a failed attempt restores the previous fit.
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
+        let body3 = self.basis().is_some_and(|b| b.body3);
         // 1. the bent-molecule setting
         let cap = self.basis().map(|b| (b.body3, b.degree_cap));
         if let Some((true, d)) = cap.filter(|_| self.degree_cap.is_none()) {
@@ -217,10 +322,66 @@ impl SurrogateKs {
                 }
             }
         }
-        // 2. quarantine the worst offenders, round by round
+        // 1b. a cap set by an earlier recovery is not kept for good (M8a user-test fix, module doc
+        // "Trust recovery"): when the capped fit fails, the default basis is tried as step 1 tried
+        // the cap — kept if it alone restores the residuals with the trust rule's counts
+        let entry = self.degree_cap.filter(|_| body3).map(|_| (self.save_state(), self.quarantine.clone(), self.species_dirty));
+        if entry.is_some() {
+            let saved = self.save_state();
+            self.degree_cap = None;
+            self.species_dirty = true;
+            match self.fit_store() {
+                Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
+                    self.recovery = Some(format!(
+                        "refit with the default basis restored the training residuals (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set no longer did)"
+                    ));
+                    return r;
+                }
+                _ => self.restore_state(saved),
+            }
+        }
+        // 2. quarantine the worst offenders on the standing basis, round by round
+        let before = self.quarantined();
+        let report = self.quarantine_rounds(report);
+        // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
+        // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
+        // collection"): the same quarantine from the default basis, from the state on entry; it
+        // stands only if it recovers (the trust rule, its counts included), else step 2's result does
+        if let Some((saved, flags, dirty)) = entry.filter(|_| self.recoverable_fail()) {
+            let capped = (self.save_state(), self.quarantine.clone(), report.clone(), self.species_dirty, self.recovery.clone());
+            self.restore_state(saved);
+            self.quarantine = flags;
+            self.species_dirty = dirty;
+            let entry_held = self.quarantined();
+            self.degree_cap = None;
+            self.species_dirty = true;
+            if let Ok(r) = self.fit_store() {
+                let r = self.quarantine_rounds(r);
+                if !self.recoverable_fail() && !self.trust_needs_samples() {
+                    self.recovery = Some(format!(
+                        "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {} samples quarantined — the model cannot represent them ({} this refit; kept, excluded from the fit; geometries near them fall back)",
+                        self.quarantined(),
+                        self.quarantined() - entry_held
+                    ));
+                    return r;
+                }
+            }
+            let (state, q, rep, d, note) = capped;
+            self.restore_state(state);
+            self.quarantine = q;
+            self.species_dirty = d;
+            self.recovery = note;
+            return self.note_quarantined(before, rep);
+        }
+        self.note_quarantined(before, report)
+    }
+
+    /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits
+    /// without them, up to [`QUARANTINE_ROUNDS`] rounds, never past [`QUARANTINE_MAX_FRACTION`] of
+    /// the store; a failed fit restores the previous one and stops.
+    fn quarantine_rounds(&mut self, report: FitReport) -> FitReport {
         let mut report = report;
         let n_store = self.samples();
-        let before = self.quarantined();
         for _ in 0..QUARANTINE_ROUNDS {
             if !self.recoverable_fail() {
                 break;
@@ -246,7 +407,12 @@ impl SurrogateKs {
                 }
             }
         }
-        let added = self.quarantined() - before;
+        report
+    }
+
+    /// The recovery note of quarantine rounds that added samples since `before` held.
+    fn note_quarantined(&mut self, before: usize, report: FitReport) -> FitReport {
+        let added = self.quarantined().saturating_sub(before);
         if added > 0 {
             self.recovery = Some(format!(
                 "{} samples quarantined — the model cannot represent them ({added} this refit; kept, excluded from the fit; geometries near them fall back)",
@@ -261,6 +427,23 @@ impl SurrogateKs {
         let Some(model) = self.model.as_ref() else { return false };
         let Ok(pr) = model.predict(pos, z, false) else { return false };
         Self::agree(&self.policy, pos.len(), pr.energy, &pr.forces, energy, forces)
+    }
+
+    /// [`reproduces`](Self::reproduces) for a stored sample, on the rows it was fitted with (M8a Task
+    /// 10, a capped segment's: no energy when unused, the interior atoms' forces only — its caps
+    /// and edge atoms are no answer the model is held to).
+    pub(super) fn reproduces_sample(&self, s: &Sample) -> bool {
+        if s.is_whole() {
+            return self.reproduces(&s.pos, &s.z, s.energy, &s.forces);
+        }
+        let Some(model) = self.model.as_ref() else { return false };
+        let Ok(pr) = model.predict(&s.pos, &s.z, false) else { return false };
+        let p = &self.policy;
+        (!s.use_energy || (pr.energy - s.energy).abs() / s.pos.len().max(1) as f64 <= p.energy_std_per_atom)
+            && pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)).all(|(_, (a, b))| {
+                let (d, bound) = p.force_residual(a, b);
+                d <= bound
+            })
     }
 
     /// Two answers agree within the policy's thresholds (per-atom energy; every atom's force
@@ -282,7 +465,7 @@ impl SurrogateKs {
         let mut rejected = 0;
         for (k, origin) in pending {
             let Some(s) = self.store.as_ref().and_then(|st| st.samples.get(k)).cloned() else { continue };
-            if self.excluded(k) || self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
+            if self.excluded(k) || self.reproduces_sample(&s) {
                 continue;
             }
             self.quarantine.resize(self.samples(), Q_NONE);
@@ -301,10 +484,10 @@ impl SurrogateKs {
         let Some(store) = self.store.as_ref() else { return 0 };
         let back: Vec<usize> = held
             .into_iter()
-            .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces(&s.pos, &s.z, s.energy, &s.forces)))
+            .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces_sample(s)))
             .collect();
         for &i in &back {
-            self.quarantine[i] = Q_NONE;
+            self.quarantine[i] = self.released_code(i);
         }
         back.len()
     }
@@ -391,8 +574,9 @@ impl SurrogateKs {
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
                 let n = s.pos.len().max(1) as f64;
-                let mut r = (pr.energy - s.energy).abs() / n / p.energy_std_per_atom;
-                for (fm, fs) in pr.forces.iter().zip(&s.forces) {
+                // the fitted rows only (a capped segment's: no energy, its interior atoms)
+                let mut r = if s.use_energy { (pr.energy - s.energy).abs() / n / p.energy_std_per_atom } else { 0.0 };
+                for (_, (fm, fs)) in pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
                     let (d, bound) = p.force_residual(fm, fs);
                     r = r.max(d / if absolute { p.force_std_abs } else { bound });
                 }
@@ -415,7 +599,12 @@ impl SurrogateKs {
             return;
         };
         let n = self.accumulated.min(self.desc_cache.len());
-        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().map(|(s, b)| (*s, &b[..])));
+        // a capped segment's interior atoms only: the active set is what the model has learned,
+        // and a cap or an edge atom is not (M8a Task 10; the cache keeps every atom, for the
+        // fences' nearness — the conservative side there)
+        let store = self.store.as_ref();
+        let trains = |i: usize, j: usize| store.and_then(|st| st.samples.get(i)).is_none_or(|s| s.trains_atom(j));
+        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().enumerate().filter(move |(j, _)| trains(i, *j)).map(|(_, (s, b))| (*s, &b[..])));
         let set = ActiveSet::build(basis, &model.scale, atoms);
         if !set.converged() {
             // the γ ≤ 1 + δ guarantee is void: every query falls back on 5e until a refit converges
@@ -444,7 +633,8 @@ impl SurrogateKs {
     /// stored atom of its species) from the geometry to the nearest stored sample (thinning),
     /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
     /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
-    /// strict mode the region (round 1 re-review, R1-1). ∞ without a model, an envelope or a candidate.
+    /// strict mode the region (round 1 re-review, R1-1) — and so are lone atoms (`Q_LONE`: never
+    /// data). ∞ without a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -453,7 +643,7 @@ impl SurrogateKs {
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
             for (i, atoms) in self.desc_cache.iter().enumerate() {
-                if self.quarantine.get(i) == Some(&Q_DRAFT) {
+                if matches!(self.quarantine.get(i), Some(&Q_DRAFT) | Some(&Q_LONE)) {
                     continue;
                 }
                 for (s, b) in atoms {
@@ -488,6 +678,7 @@ impl SurrogateKs {
         dedup: bool,
         essential: bool,
         h: f64,
+        mask: Option<&[bool]>,
         notes: &mut Vec<String>,
     ) -> Admission {
         let no = |outcome| Admission { kept: false, outcome };
@@ -526,7 +717,8 @@ impl SurrogateKs {
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
                 // other but not with the model are evidence the model is wrong here
                 let n = pos.len();
-                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec() });
+                let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
+                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.fence_votes.len() > FENCE_VOTES {
                     self.fence_votes.remove(0);
                 }
@@ -534,9 +726,9 @@ impl SurrogateKs {
                 // within the per-atom energy threshold and every atom's force bound)
                 let votes = &self.fence_votes;
                 let consistent = votes.len() == FENCE_VOTES
-                    && votes.iter().all(|v| v.n == n && v.near.iter().any(|i| near.contains(i)))
+                    && votes.iter().all(|v| v.n == n && v.gen == self.model_gen && v.near.iter().any(|i| near.contains(i)))
                     && votes.iter().enumerate().all(|(a, va)| {
-                        votes[a + 1..].iter().all(|vb| Self::agree(&self.policy, n, va.energy, &va.forces, vb.energy, &vb.forces))
+                        votes[a + 1..].iter().all(|vb| votes_agree(&self.policy, va, vb))
                     });
                 // one vote per region until a refit has judged it; at most FENCE_VOTE_LIMIT per
                 // fenced sample
@@ -553,15 +745,21 @@ impl SurrogateKs {
                     ));
                     return yes(TeachOutcome::KeptByVote);
                 }
-                notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
+                // no model answered in a capped segment (`TeachRule::Segment`) or wherever a rule
+                // refused before consulting it: nothing disagreed (Task 10a review, finding 7)
+                notes.push(match (model, mask) {
+                    (Some(_), _) => "surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into(),
+                    (None, Some(_)) => format!("surrogate: sample not kept — a capped segment next to a quarantined geometry (the model does not answer in a segment); a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                    (None, None) => format!("surrogate: sample not kept — next to a quarantined geometry, and the model was not consulted here; a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                });
                 return no(TeachOutcome::FenceDisagrees);
             }
             self.fence_votes.clear();
             let (mut released, mut superseded) = (0, 0);
             for &i in near {
                 let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
-                if self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
-                    self.quarantine[i] = Q_NONE;
+                if self.reproduces_sample(&s) {
+                    self.quarantine[i] = self.released_code(i);
                     released += 1;
                 } else {
                     self.quarantine[i] = Q_SUPERSEDED;
@@ -581,7 +779,7 @@ impl SurrogateKs {
             let d = self.nearest_stored(pos, z);
             let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
             if dedup && d <= limit {
-                if let Some(i) = self.is_label_copy(pos, z, energy, forces) {
+                if let Some(i) = self.is_label_copy(pos, z, energy, forces, mask) {
                     notes.push(format!("surrogate: sample not kept — a copy of stored sample #{i} (its labels within the fit's own noise)"));
                     return no(TeachOutcome::Thinned);
                 }
@@ -612,17 +810,30 @@ impl SurrogateKs {
     /// vibrating one is not a copy: its labels move by k·Δr per step, far above s_F (the active
     /// learning run: 6e-4 against 4.5e-5 Ha/Bohr). No constant beyond the fit's own noise levels.
     /// `None` without a fit.
-    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<usize> {
+    ///
+    /// `mask` is the answer's training mask (a capped segment's, `Scene::train_mask`; `None` for a
+    /// whole answer). Only stored samples fitted with the same rows are candidates (M8a Task 10a
+    /// review, finding 4): the same atoms taught and the energy used or not alike — a whole answer
+    /// is never a copy of a segment, nor a segment of one cut with another mask. The labels are
+    /// compared on those fitted rows only: the masked-out atoms' forces are not compared, and with
+    /// no energy row the energy test is skipped (a segment's E includes its caps; the fit never
+    /// reads it).
+    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], mask: Option<&[bool]>) -> Option<usize> {
         let (model, env, store, report) = (self.model.as_ref()?, self.envelope.as_ref()?, self.store.as_ref()?, self.report.as_ref()?);
         let basis = &model.basis;
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
         let cached = self.desc_basis.as_ref() == Some(basis);
+        // the answer's fitted rows (as `store::keep_sample_masked` will store it)
+        let mask = mask.filter(|m| m.len() == z.len());
+        let use_energy = mask.is_none();
+        let taught = |j: usize| mask.is_none_or(|m| m[j]);
         let (mut best, mut best_d) = (None, f64::INFINITY);
         for (i, s) in store.samples.iter().enumerate() {
             // only a sample that is (or will be) fitted: the rationale — fitted copies shrink s_F,
             // copies meet the counts — concerns the fit (round 1 re-review, R1-1: a held-out guess
-            // compared against would refuse the very fallbacks that let strict mode reach it)
-            if s.z != z || self.excluded(i) {
+            // compared against would refuse the very fallbacks that let strict mode reach it);
+            // and only one fitted with the same rows (finding 4 above)
+            if s.z != z || self.excluded(i) || s.use_energy != use_energy || (0..z.len()).any(|j| s.trains_atom(j) != taught(j)) {
                 continue;
             }
             let owned;
@@ -648,7 +859,8 @@ impl SurrogateKs {
         let n = z.len().max(1) as f64;
         let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
         let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
-        let same = (energy - s.energy).abs() <= s_e && forces.iter().zip(&s.forces).all(|(a, b)| (mag(a) - mag(b)).abs() <= report.sigma_f);
+        let same = (!use_energy || (energy - s.energy).abs() <= s_e)
+            && forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| taught(*j)).all(|(_, (a, b))| (mag(a) - mag(b)).abs() <= report.sigma_f);
         same.then_some(i)
     }
 
@@ -661,6 +873,6 @@ impl SurrogateKs {
         }
         species.sort_unstable();
         species.dedup();
-        NO_MODEL_SAMPLE_FACTOR * Basis::new(&species).column_classes().len()
+        NO_MODEL_SAMPLE_FACTOR * self.default_basis(&species).column_classes().len()
     }
 }

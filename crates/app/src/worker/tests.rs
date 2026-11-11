@@ -988,7 +988,7 @@ fn cancel_below_q_prime_keeps_the_samples_without_a_refit() {
         cancel.as_secs_f64() * 1e3
     );
     assert!(cancel < Duration::from_millis(1500), "Cancel took {cancel:?}");
-    assert!(note.contains("samples kept — not enough to fit (Q′ = "), "{:?}", c.dynamics.notes);
+    assert!(note.contains("samples kept — not enough to fit ("), "{:?}", c.dynamics.notes);
     assert!(!model(&c).fitted, "no refit below Q′");
     assert!(model(&c).samples >= 3, "the samples are kept");
 }
@@ -1025,7 +1025,8 @@ fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
 /// throttle would matter only if step 1 fell back too, and a slower GPU would then need fewer
 /// steps, not more). Step 1's worst atom uncertainty is 0.015 of its bound (printed). The bound
 /// is the measured count × 2 (M6 spec §9); the R = 8 answer is still box-affected at 49³ (face
-/// density 6.3e-4 > 2e-5) and not trained on.
+/// density 6.3e-4 > 2e-5) and not trained on — and, since the M8a user test, refused before the box
+/// rule by the lone-atom rule (no atom has a neighbour within the 6 Bohr cutoff).
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -1040,7 +1041,9 @@ fn after_a_far_drag_the_surrogate_answers_again() {
     let m = model(&far);
     eprintln!("R = 8: {:?}, trusted {}, samples {n0} → {}, notes {:?}", far.dynamics.source, m.trusted, m.samples, far.dynamics.eval.notes);
     assert_eq!(far.dynamics.source, sim::Source::Fallback);
-    assert!(far.dynamics.eval.notes.iter().any(|n| n.contains("box-affected")), "{:?}", far.dynamics.eval.notes);
+    // since the M8a user test the lone-atom rule refuses it first: at R = 8 neither atom has a
+    // neighbour within the 6 Bohr cutoff, so it is never kept (before, the box rule refused it)
+    assert!(far.dynamics.eval.notes.iter().any(|n| n.contains("lone atoms")), "{:?}", far.dynamics.eval.notes);
     assert!(m.trusted && m.samples == n0, "the box-affected answer must not be trained on: {m:?}");
     let s = teleport_h2(&w, 3.3);
     let refits0 = model(&s).refits;
@@ -3119,4 +3122,349 @@ fn an_interrupted_pass_resumes_in_a_new_worker_and_its_files_go_when_it_ends() {
     // removed in the round that published the end
     assert!(interrupted_pass(&dir).is_none() && !dir.join(MODEL_FILE).exists(), "Cancel discards the interrupted pass");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the shared collection (M8a Task 4b) ----
+
+/// [`ScriptedMorse`] reporting what a Kohn-Sham solve reports for a collection to judge an answer:
+/// the face density (0: clear of the box) and the multiplicity solved (the forced one, else the
+/// automatic n mod 2 unpaired).
+struct CleanMorse(ScriptedMorse);
+
+impl ForceProvider for CleanMorse {
+    fn evaluate(&mut self, scene: &sim::Scene, abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let mut r = self.0.evaluate(scene, abort)?;
+        let n = scene.nuclei.iter().map(|n| n.z as i32).sum::<i32>() - scene.charge;
+        r.stats.face_density = Some(0.0);
+        r.stats.multiplicity = Some(scene.multiplicity.unwrap_or(1 + n.rem_euclid(2) as u32));
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "scripted morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// A [`CleanMorse`] surrogate (`rest_s` a solve).
+fn clean_morse(rest_s: f64) -> MakeProvider {
+    Box::new(move || {
+        let teacher = CleanMorse(ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s });
+        Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+    })
+}
+
+/// An estimated worker on [`CleanMorse`], its collections under `root`.
+fn collection_worker(scene: Scene, root: &std::path::Path, rest_s: f64) -> SimWorker {
+    let w = SimWorker::spawn_test(scene, clean_morse(rest_s));
+    w.send(Command::Collections(Some(root.to_path_buf())));
+    w
+}
+
+fn collection_root(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-coll-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn shared(s: &Snapshot) -> Option<(String, usize)> {
+    match &s.model.as_ref()?.source {
+        sim::ModelSource::Collection { slug, samples, .. } => Some((slug.clone(), *samples)),
+        _ => None,
+    }
+}
+
+fn ensure(w: &SimWorker) {
+    w.send(Command::EnsureModel { autoload: None, plan: test_plan(), auto_pass: false });
+}
+
+/// Plan Task 4 Step 1 (worker; ruling P6): with a collections folder set, `EnsureModel` attaches the
+/// collection of the scene's solver surface; a pass learns into it; a second worker on another
+/// scene (another box, another geometry) at the same h, σ and ionic policy attaches the **same**
+/// folder and finds the first one's samples there. Without a folder (headless) the model is
+/// per-scene as before. Analytic teacher, seconds.
+#[test]
+fn ensure_model_attaches_the_scene_surfaces_collection() {
+    let root = collection_root("ensure");
+    let plan = SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() };
+    let w = collection_worker(h2_33(), &root, 0.005);
+    ensure(&w);
+    let s = snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    let (slug, empty) = shared(&s).unwrap();
+    assert_eq!(empty, 0, "a new collection");
+    let line = crate::sim::source_line(model(&s));
+    assert!(line.starts_with(&format!("model: shared — {slug} · ")), "{line}");
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    let s = snapshot_until(&w, "the pass's end", pass_done);
+    let (_, n1) = shared(&s).unwrap();
+    assert!(n1 >= 8, "the pass learned into the collection: {n1} samples ({:?})", s.dynamics.notes);
+    assert!(w.retire(Duration::from_secs(10)));
+
+    // another scene at the same surface: a 41³ box (same h), H₂ stretched
+    let mut other = h2_33();
+    other.grid_n = 41;
+    other.nuclei[1].pos[0] -= 0.2;
+    let w = collection_worker(other, &root, 0.005);
+    ensure(&w);
+    let s = snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    assert_eq!(shared(&s), Some((slug.clone(), n1)), "the same collection, with the first worker's samples");
+    let folders: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name()).collect();
+    assert_eq!(folders.len(), 1, "one surface, one collection: {folders:?}");
+    drop(w);
+
+    // no collections folder: per-scene, as before (headless runs)
+    let w = SimWorker::spawn_test(h2_33(), clean_morse(0.005));
+    ensure(&w);
+    let s = idle(&w);
+    assert_eq!(model(&s).source, sim::ModelSource::None, "headless: per-scene");
+    assert_eq!(crate::sim::source_line(model(&s)), "model: this session only");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Task 4a review ⚠️ 2: a charged scene leaves the collection (with a note) and learns per-scene;
+/// neutral again, the collection comes back. A model file the provider refuses leaves it attached;
+/// the switch keeps it.
+#[test]
+fn a_charged_scene_leaves_the_collection_and_a_neutral_one_returns() {
+    let root = collection_root("charge");
+    let w = collection_worker(h2_33(), &root, 0.005);
+    ensure(&w);
+    let s = snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    let (slug, _) = shared(&s).unwrap();
+    w.send(Command::SetCharge(1));
+    let s = snapshot_until(&w, "per-scene", |s| s.dynamics.scene.charge == 1 && s.model.as_ref().is_some_and(|m| m.source == sim::ModelSource::None));
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("cannot learn into the shared collection") && n.contains("per-scene")), "{:?}", s.dynamics.notes);
+    assert_eq!(crate::sim::source_line(model(&s)), "model: this scene only (not shared)");
+    w.send(Command::SetCharge(0));
+    let s = snapshot_until(&w, "the collection back", |s| s.dynamics.scene.charge == 0 && shared(s).is_some());
+    assert_eq!(shared(&s).unwrap().0, slug);
+    // a missing model file is refused: the collection stays attached
+    w.send(Command::UseModel(ModelChoice::File(root.join("no-such.model"))));
+    let s = snapshot_until(&w, "the load refused", |s| s.dynamics.last_rejection.is_some());
+    assert_eq!(shared(&s).map(|x| x.0), Some(slug.clone()), "{:?}", s.dynamics.last_rejection);
+    w.send(Command::UseModel(ModelChoice::Collection));
+    let s = idle(&w);
+    assert_eq!(shared(&s).unwrap().0, slug);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Task 4a review concern 6 (the collection-mode resume rule): a pass learning into a collection
+/// keeps only its checkpoint (the collection holds its samples); against a collection that does
+/// not hold the checkpoint's samples (another, empty folder) the resume is refused with the
+/// reason; a new worker on its own collection resumes it, and every planned sample ends up in the
+/// collection once.
+#[test]
+fn an_interrupted_collection_pass_resumes_from_its_collection() {
+    use super::checkpoint::{is_collection_checkpoint, CHECKPOINT_FILE, MODEL_FILE};
+    let root = collection_root("resume");
+    let dir = collection_root("resume-ckpt");
+    let empty = collection_root("resume-empty");
+    let plan = SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let w = collection_worker(h2_33(), &root, 0.04);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    ensure(&w);
+    snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    w.send(Command::Dyn(DynCommand::StartSampling(plan.clone())));
+    snapshot_until(&w, "a pass 2.5 s in", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 60));
+    assert!(dir.join(CHECKPOINT_FILE).exists() && !dir.join(MODEL_FILE).exists(), "the checkpoint alone: the collection holds the samples");
+    assert!(w.retire(Duration::from_secs(10)), "shut down mid-pass");
+    let (_, info) = interrupted_pass(&dir).expect("offered without a samples file");
+    assert!(is_collection_checkpoint(&info), "{}", info.provenance);
+    eprintln!("interrupted at {}/{}, the collection held {} (pass start {})", info.done, info.total, info.samples, info.pass_start);
+    assert!(info.samples > 0);
+
+    // a collection that does not hold them: refused, with the reason
+    let w = collection_worker(h2_33(), &empty, 0.04);
+    idle(&w);
+    w.send(Command::ResumeTraining(dir.clone()));
+    let s = snapshot_until(&w, "the refusal", |s| s.dynamics.last_rejection.is_some() || s.dynamics.sampling.is_some());
+    let why = s.dynamics.last_rejection.clone().expect("refused");
+    assert!(why.contains("holds 0 samples"), "{why}");
+    drop(w);
+
+    // its own collection: resumed, every planned sample in it once
+    let w = collection_worker(h2_33(), &root, 0.04);
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::ResumeTraining(dir.clone()));
+    let s = snapshot_until(&w, "the resumed pass", |s| s.dynamics.sampling.is_some() || s.dynamics.last_rejection.is_some());
+    assert_eq!(s.dynamics.last_rejection, None, "{:?}", s.dynamics.notes);
+    let s = snapshot_until(&w, "the end of the resumed pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished) && !s.working);
+    let (_, held) = shared(&s).expect("still shared");
+    assert_eq!(held, plan.perturbations + plan.hot_burst_steps, "every planned sample once ({:?})", s.dynamics.notes);
+    assert!(interrupted_pass(&dir).is_none(), "a finished pass leaves nothing to resume");
+    drop(w);
+    for d in [root, dir, empty] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+// ---- the shared collection stays the default (M8a Task 4b fix round 1) ----
+
+/// A per-scene model file of `scene`, taught by a headless worker (no collections folder).
+fn per_scene_file(scene: Scene, path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let w = SimWorker::spawn_test(scene, clean_morse(0.005));
+    ensure(&w);
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() })));
+    snapshot_until(&w, "the pass's end", pass_done);
+    w.send(Command::Dyn(DynCommand::SaveModel(path.to_path_buf())));
+    snapshot_until(&w, "the model file", |_| path.exists());
+    drop(w);
+}
+
+/// The user's request (fix round 1) and review I2: Forget in collection mode drops only the
+/// session's own samples and keeps the collection attached; a model file the user picked survives a
+/// scene change (no re-attach) until the switch picks the collection again; an h or σ change
+/// re-attaches another surface's collection. (The ionic policy is the third key: changing it on H₂
+/// needs the H pseudopotential's dimer gate — ≈ 1 min on the GPU, ≈ 40 min on the CPU — so it is
+/// not exercised here; `sync_collection` treats it like h and σ, through the same `replace`.)
+#[test]
+fn forget_keeps_the_collection_and_only_a_picked_file_leaves_it() {
+    let root = collection_root("file");
+    let file = std::env::temp_dir().join(format!("atomic-sandbox-coll-file-{}.model", std::process::id()));
+    per_scene_file(h2_33(), &file);
+    let plan = SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() };
+    let w = collection_worker(h2_33(), &root, 0.005);
+    ensure(&w);
+    let s = snapshot_until(&w, "the collection attached", |s| shared(s).is_some());
+    let (slug, _) = shared(&s).unwrap();
+    assert!(model(&s).use_collection, "the default");
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    let s = snapshot_until(&w, "the pass's end", pass_done);
+    let (_, n1) = shared(&s).unwrap();
+    assert!(n1 >= 8, "{n1}");
+
+    // Forget: the collection stays, with its samples (they are permanent)
+    w.send(Command::Dyn(DynCommand::ForgetModel));
+    let s = snapshot_until(&w, "the forget's note", |s| !s.working && s.dynamics.notes.iter().any(|n| n.contains("stays attached")));
+    assert_eq!(shared(&s), Some((slug.clone(), n1)), "{:?}", s.dynamics.notes);
+    assert_eq!(model(&s).samples, n1, "only the collection's samples are held");
+    assert!(model(&s).use_collection);
+
+    // a picked file leaves the collection, and a new scene does not bring it back
+    w.send(Command::UseModel(ModelChoice::File(file.clone())));
+    let s = snapshot_until(&w, "the file in use", |s| !s.working && model(s).source == sim::ModelSource::File(file.clone()));
+    assert!(!model(&s).use_collection, "the switch shows the file");
+    let mut moved = h2_33();
+    moved.nuclei[1].pos[0] += 0.1;
+    w.send(Command::SetScene(moved));
+    let s = idle(&w);
+    assert_eq!(model(&s).source, sim::ModelSource::File(file.clone()), "a picked file survives SetScene");
+    assert!(!model(&s).use_collection);
+    // the switch picks the collection again
+    w.send(Command::UseModel(ModelChoice::Collection));
+    let s = snapshot_until(&w, "the collection back", |s| !s.working && shared(s).is_some());
+    assert_eq!(shared(&s).unwrap().0, slug);
+    assert!(model(&s).use_collection);
+
+    // another h, another σ: another surface's collection each
+    w.send(Command::SetGrid { n: 33, h: 0.3 });
+    let s = snapshot_until(&w, "the h change", |s| !s.working && shared(s).is_some_and(|(x, _)| x != slug));
+    let slug_h = shared(&s).unwrap().0;
+    w.send(Command::SetSigma(Some(0.4)));
+    let s = snapshot_until(&w, "the σ change", |s| !s.working && shared(s).is_some_and(|(x, _)| x != slug_h && x != slug));
+    let slug_s = shared(&s).unwrap().0;
+    eprintln!("slugs: {slug} → {slug_h} → {slug_s}");
+    let folders = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).count();
+    assert_eq!(folders, 3, "three surfaces, three collections");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&file);
+}
+
+/// Review I1 (ruling P13) and the user's request: in collection mode the session autosave holds
+/// only the session-only samples (here every answer of a read-only collection: another worker of
+/// this process holds the writable handle) and the next worker — a solver switch — attaches the
+/// collection again and puts them back beside it (no switch to a file); a Forget then drops them,
+/// and the autosave is removed. In File mode the autosave is the full per-scene model and a solver
+/// switch keeps the file, named by the user's pick on the Model tab.
+#[test]
+fn a_solver_switch_reattaches_the_collection_and_the_autosave_follows_the_mode() {
+    let root = collection_root("switch");
+    let auto = std::env::temp_dir().join(format!("atomic-sandbox-coll-switch-{}.model", std::process::id()));
+    let _ = std::fs::remove_file(&auto);
+    let restore = |path: &std::path::Path| {
+        let w = SimWorker::spawn_test_saving(h2_33(), clean_morse(0.005), path.to_path_buf());
+        w.send(Command::Collections(Some(root.clone())));
+        w.send(Command::EnsureModel { autoload: Some(path.to_path_buf()), plan: test_plan(), auto_pass: false });
+        w
+    };
+    // the writable handle elsewhere: this worker's collection is read-only
+    let owner = collection_worker(h2_33(), &root, 0.005);
+    ensure(&owner);
+    snapshot_until(&owner, "the owner attached", |s| shared(s).is_some());
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the read-only collection", |s| matches!(model(s).source, sim::ModelSource::Collection { read_only: true, .. }));
+    let (slug, _) = shared(&s).unwrap();
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 8, hot_burst_steps: 0, scan_points_per_pair: 2, ..SamplingPlan::default() })));
+    let s = snapshot_until(&w, "the pass's end", pass_done);
+    let k = model(&s).samples;
+    assert!(k >= 8 && shared(&s) == Some((slug.clone(), 0)), "session-only: {k} held, the collection {:?}", shared(&s));
+    assert!(w.retire(Duration::from_secs(10)));
+    let prov = surrogate::sidecar::read_provenance(&auto).expect("the session-only samples were autosaved");
+    assert_eq!(prov.grid_n, 0, "a collection's session-only samples (any box)");
+    drop(owner);
+
+    // the solver switch: the collection again (writable now), the session-only samples beside it
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the samples back", |s| !s.working && shared(s).is_some() && model(s).samples == k);
+    assert_eq!(shared(&s).map(|x| x.0), Some(slug.clone()), "re-attached, not a file");
+    assert!(model(&s).use_collection && model(&s).autoload_refused.is_none());
+    // Forget drops them, the collection stays; the autosave goes (nothing session-only)
+    w.send(Command::Dyn(DynCommand::ForgetModel));
+    let s = snapshot_until(&w, "the forget", |s| !s.working && s.dynamics.notes.iter().any(|n| n.contains("stays attached")));
+    assert_eq!((shared(&s).map(|x| x.0), model(&s).samples), (Some(slug.clone()), 0));
+    assert!(w.retire(Duration::from_secs(10)));
+    assert!(!auto.exists(), "collection mode with nothing session-only: the autosave is removed");
+
+    // File mode: the full per-scene model is autosaved, and a solver switch keeps the file
+    let file = std::env::temp_dir().join(format!("atomic-sandbox-coll-switch-file-{}.model", std::process::id()));
+    per_scene_file(h2_33(), &file);
+    let w = restore(&auto);
+    snapshot_until(&w, "attached", |s| shared(s).is_some());
+    w.send(Command::UseModel(ModelChoice::File(file.clone())));
+    snapshot_until(&w, "the file in use", |s| !s.working && model(s).source == sim::ModelSource::File(file.clone()));
+    assert!(w.retire(Duration::from_secs(10)));
+    assert_eq!(surrogate::sidecar::read_provenance(&auto).expect("the per-scene model was autosaved").grid_n, 33);
+    let w = restore(&auto);
+    let s = snapshot_until(&w, "the file restored", |s| !s.working && matches!(model(s).source, sim::ModelSource::File(_)));
+    assert!(!model(&s).use_collection && model(&s).source_is_autosave, "File mode survives the solver switch");
+    assert_eq!(crate::sim::source_line_with(model(&s), Some(&file)), format!("file: {}", file.file_name().unwrap().to_string_lossy()));
+    drop(w);
+    for p in [&auto, &file] {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// M8a Task 9: the knowledge map ships with the fit that made it, the training views closed, and
+/// is not rebuilt while nothing it shows changed; a policy change (a new model generation) ships
+/// it again.
+#[test]
+fn the_knowledge_map_ships_when_the_fit_changes() {
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let mut map = None;
+    snapshots_until(
+        &w,
+        "a fitted model",
+        |s| {
+            if let Some(k) = &s.activity.knowledge {
+                map = Some(k.clone());
+            }
+        },
+        |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working,
+    );
+    let map = map.expect("built with the first fit, the views closed");
+    assert_eq!(map.elements.iter().map(|e| e.z).collect::<Vec<_>>(), vec![1]);
+    assert!(map.pairs.len() == 1 && map.pairs[0].samples > 0, "{:?}", map.pairs);
+    w.send(Command::Dyn(DynCommand::SetSpeed(3)));
+    assert!(idle(&w).activity.knowledge.is_none(), "nothing changed: no rebuild");
+    w.send(Command::SetAudit(7));
+    snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
 }

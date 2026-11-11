@@ -12,6 +12,7 @@ use render::elements;
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let Some((i, n)) = input.selection() else {
         theme::note(ui, "no selection (Inspect or Edit: click a nucleus)");
+        segment_row(ui, st, input, "d-segment", acts);
         molecules(ui, st, input);
         charges(ui, st, input, None);
         card_toggle(ui, st);
@@ -80,6 +81,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         });
         theme::note(ui, "Del removes it · Esc deselects");
     });
+    segment_row(ui, st, input, "d-segment", acts);
     super::group(ui, st, "d-guides", |ui, _| {
         theme::section(ui, "Distance guides");
         let guides = tools::distance_guides(n.pos, &input.scene.nuclei, Some(i));
@@ -101,6 +103,46 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     molecules(ui, st, input);
     charges(ui, st, input, Some(i));
     card_toggle(ui, st);
+}
+
+/// The atoms "Train this segment" cuts out: the Edit tool's group, else the selected nucleus.
+pub fn segment_atoms(st: &UiState, input: &PanelInput<'_>) -> Vec<usize> {
+    if st.edit_group.is_empty() {
+        input.selection().map(|(i, _)| vec![i]).unwrap_or_default()
+    } else {
+        st.edit_group.clone()
+    }
+}
+
+/// What the button does, on hover.
+pub const TRAIN_SEGMENT_TIP: &str = "teach the shared model the selected atoms' surroundings without solving the whole scene: the selection and every atom within twice the model's cutoff (plus the sampling pass's largest planned move) are cut out, each cut bond capped with an H (placed with the molecule builder's tables), and opened as a scene of its own in the estimated solver with the Standard plan ready. Only atoms whose whole neighbourhood is this scene's are taught; the caps and the edge atoms are not. The current scene is saved, and a chip by the scene chip brings you back. A preview with the counts, the box and the GPU memory comes first.";
+
+/// "Train this segment" (M8a Task 10; Dock ▸ Selection and the Model tab): `Action::TrainSegment`
+/// with [`segment_atoms`]; disabled, with the reason, with nothing selected or during a pass.
+/// Not drawn while the feature is deferred ([`crate::segment::SEGMENT_TRAINING`]).
+pub fn segment_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, anchor: &str, acts: &mut Vec<Action>) {
+    if !crate::segment::SEGMENT_TRAINING {
+        return;
+    }
+    let atoms = segment_atoms(st, input);
+    let sampling = input.snapshot.is_some_and(|s| crate::sim::sampling_active(&s.dynamics));
+    super::group(ui, st, anchor, |ui, _| {
+        ui.horizontal_wrapped(|ui| {
+            let b = ui
+                .add_enabled(!atoms.is_empty() && !sampling, egui::Button::new("Train this segment"))
+                .on_disabled_hover_text(if sampling { "a sampling pass is running: let it finish (or Cancel it) first" } else { crate::segment::NOTHING_SELECTED })
+                .on_hover_text(TRAIN_SEGMENT_TIP);
+            if super::super::probed(if anchor == "d-segment" { "train-segment" } else { "train-segment-model" }, b).clicked() {
+                acts.push(Action::TrainSegment(atoms.clone()));
+            }
+            let what = match atoms.len() {
+                0 => "no selection".to_string(),
+                1 => "1 atom selected".to_string(),
+                n => format!("{n} atoms selected"),
+            };
+            ui.label(RichText::new(what).size(11.0).color(theme::INK_FAINT));
+        });
+    });
 }
 
 /// Every atom's partial charge (`sim::charges`, Hirshfeld; the selected one marked), their sum

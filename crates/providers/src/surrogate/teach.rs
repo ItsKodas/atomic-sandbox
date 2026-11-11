@@ -171,7 +171,10 @@ pub(super) fn teach_verdict(classes: &[sim::ClassLoo], still_blocking: bool, out
     }
     let present: Vec<&sim::ClassLoo> = classes.iter().filter(|c| c.samples > 0).collect();
     let loo_fails = |c: &sim::ClassLoo| !(c.force_max <= 1.0 && c.force_rms <= 1.0 && c.energy_max <= 1.0);
-    if still_blocking || out_of_fit || failed > 0 || unjudged > 0 || present.iter().any(|c| loo_fails(c)) {
+    // a class the calibrated verdict refuses (M8a Task 2: its audits found the model off where it
+    // answers) is not accepted either — only a class short of samples is "needs samples"
+    let refused_by_verdict = |c: &sim::ClassLoo| !c.trusted && !matches!(c.refusal, Some((sim::ClassKey::Samples, ..)));
+    if still_blocking || out_of_fit || failed > 0 || unjudged > 0 || present.iter().any(|c| loo_fails(c) || refused_by_verdict(c)) {
         return TeachVerdict::NotAccepted;
     }
     if present.iter().any(|c| !c.trusted) {
@@ -439,8 +442,9 @@ impl SurrogateKs {
     }
 
     /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
-    /// may still take it, the sample floor the richer basis would set and the classes it would
-    /// leave short — the same `Basis` count the refit uses, no estimate.
+    /// may still take it, the sample floor the richer basis would set and the environment keys it
+    /// would leave short — each key's own floor in that basis (M8a user-fix 3,
+    /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
     fn richer_basis_floor(&self) -> Option<String> {
         let model = self.model.as_ref()?;
         let b = &model.basis;
@@ -452,11 +456,19 @@ impl SurrogateKs {
         species.dedup();
         let mut rich = Basis::new(&species);
         rich.degree_cap = RECOVERY_DEGREE_CAP;
-        let q = rich.column_classes().len();
-        let short: Vec<String> = self.class_loo.iter().enumerate().filter(|(_, c)| c.samples > 0 && c.samples < q).map(|(k, c)| format!("{} have {}", CLASS_WORDS[k], c.samples)).collect();
+        rich.body4 = b.body4;
+        rich.r_cut = b.r_cut;
+        let store = self.store.as_ref()?;
+        let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
+            .per_key
+            .into_iter()
+            .filter(|(_, (n, q))| n < q)
+            .map(|(k, (n, q))| format!("{} {} has {n} of {q}", ENV_CLASSES[(k.class - 1) as usize], sim::key_words(k.z, &k.neighbours)))
+            .collect();
         (!short.is_empty()).then(|| {
             format!(
-                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), every kind of environment needs ≥ {q} samples: {} — a sampling pass would then be needed as well",
+                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
                 b.degree_cap,
                 short.join(", ")
             )
@@ -749,7 +761,7 @@ impl SurrogateKs {
         };
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
-        let prov = self.store.as_ref().map(|s| s.provenance.clone());
+        let has_store = self.store.is_some();
         let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
         // R3-2: the checks judged near each blocker
@@ -761,12 +773,19 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = h.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = h.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some(prov) = prov.as_ref() else { continue };
+            if !has_store {
+                continue;
+            }
+            // the settings of the scene the check was solved on (its box included: a shared
+            // collection records it; per scene this equals the store's provenance)
+            let prov = &self.scene_provenance(&h.scene);
+            // judged on the canonical surface (collection mode; the identity per scene)
+            let e_c = self.to_canonical(&z, prov.grid_n, h.energy);
             let mut sink = Vec::new();
             // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
             // mode reaches it (`judge_held_out`)
             if self.geometry_refusal(&pos, &z).is_some() {
-                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::DraftAudit, &mut sink) {
+                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, SampleTag::DraftAudit, &mut sink) {
                     deferred += 1;
                     *deferred_near.entry(h.blocker).or_insert(0) += 1;
                 }
@@ -779,7 +798,7 @@ impl SurrogateKs {
                 match model.predict(&pos, &z, false) {
                     Ok(p) => {
                         let n = pos.len().max(1) as f64;
-                        let e = (h.energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
+                        let e = (e_c - p.energy).abs() / n / self.policy.energy_std_per_atom;
                         let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
                         Some(e.max(f))
                     }
@@ -787,7 +806,7 @@ impl SurrogateKs {
                 }
             };
             // judged, then kept (SHOULD-T4): validate, then train on all
-            if !self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::Targeted, &mut sink) {
+            if !self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, SampleTag::Targeted, &mut sink) {
                 continue;
             }
             let index = self.samples() - 1;
@@ -798,7 +817,7 @@ impl SurrogateKs {
                 if r <= 1.0 {
                     passed += 1;
                 } else {
-                    failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
+                    failed.push(FailedAudit { pos, z, energy: e_c, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
                 }
             }
         }
@@ -836,7 +855,7 @@ impl SurrogateKs {
             _ => None,
         });
         if let Some((a, b, q0)) = grew {
-            lines.push(format!("– the taught region needed the richer basis (degree {a} → {b}): the sample floor of every kind of environment rose {q0} → {q_now}"));
+            lines.push(format!("– the taught region needed the richer basis (degree {a} → {b}): the model's columns rose {q0} → {q_now}, and with them the sample floor of every kind of environment whose columns grew"));
         }
         let samples_before = start.as_ref().map_or(usize::MAX, |st| st.samples_before);
         for (c, l) in self.class_loo.iter().enumerate() {
@@ -969,7 +988,9 @@ impl SurrogateKs {
             }
             let pos: Vec<[f64; 3]> = c.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = c.scene.nuclei.iter().map(|n| n.z).collect();
-            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else {
+            // judged on the canonical surface (collection mode; the identity per scene)
+            let c_energy = self.to_canonical(&z, c.scene.cell.n, c.energy);
+            let Some((e, f)) = self.check_ratios(&pos, &z, c_energy, &c.forces) else {
                 self.leave_shell_checks_unjudged(std::slice::from_ref(&c), "the model cannot predict this geometry");
                 continue;
             };
@@ -979,7 +1000,7 @@ impl SurrogateKs {
                     c.r
                 ));
             } else {
-                let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c.energy - p.energy);
+                let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c_energy - p.energy);
                 self.user_notes.push(format!(
                     "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — a structural limitation: geometries with {name} in the cutoff shell ({:.2}–{:.2} Bohr) fall back to DFT (a shell fence); everywhere else the model answers as before{tail}",
                     c.r,
@@ -988,7 +1009,7 @@ impl SurrogateKs {
                     c.r_cut
                 ));
                 let pair = (c.pair.0.min(c.pair.1), c.pair.0.max(c.pair.1));
-                self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
+                self.audit_fences.push(FailedAudit { pos, z, energy: c_energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
             }
         }
     }

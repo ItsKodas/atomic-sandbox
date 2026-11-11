@@ -27,6 +27,7 @@ mod dock;
 mod files;
 pub mod profile;
 mod icons;
+pub mod knowledge;
 pub mod logbook;
 mod menus;
 pub mod model_offer;
@@ -172,12 +173,15 @@ const SPARK_WINDOW: usize = 400;
 /// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
 /// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
 /// line — all through [`UiState::adopt_file`]), or the molecule builder's Replace (its formula;
-/// Reset sends the built geometry again, `builder::Builder::last_replace`).
+/// Reset sends the built geometry again, `builder::Builder::last_replace`), or a capped segment cut
+/// out of a scene by Train this segment (`crate::segment`; the label of the scene it came from — the
+/// "back to the scene" chip returns there, `UiState::segment_back`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneSource {
     Preset(String),
     File(String),
     Built(String),
+    Segment(String),
 }
 
 impl SceneSource {
@@ -185,7 +189,7 @@ impl SceneSource {
     pub fn preset(&self) -> Option<&str> {
         match self {
             SceneSource::Preset(p) => Some(p),
-            SceneSource::File(_) | SceneSource::Built(_) => None,
+            SceneSource::File(_) | SceneSource::Built(_) | SceneSource::Segment(_) => None,
         }
     }
 
@@ -195,6 +199,7 @@ impl SceneSource {
             SceneSource::Preset(p) => p.clone(),
             SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
             SceneSource::Built(formula) => format!("built {formula}"),
+            SceneSource::Segment(of) => format!("{of} · segment"),
         }
     }
 }
@@ -230,22 +235,24 @@ pub enum DockTab {
     Orbitals,
     Selection,
     Log,
+    /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
+    Knowledge,
 }
 
 impl DockTab {
     /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser).
-    pub const ALL: [DockTab; 7] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const ALL: [DockTab; 8] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
     /// The left dock's tabs, in strip order: stats and what is going on.
     pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
     /// The right dock's tabs, in strip order: configuring things.
-    pub const RIGHT: [DockTab; 4] = [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const RIGHT: [DockTab; 5] = [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
     /// The dock this tab starts in (the tests; the layout can move it: `UiState::side_of`).
     #[cfg(test)]
     pub fn side(self) -> DockSide {
         match self {
             DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
-            DockTab::Model | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
         }
     }
 
@@ -258,6 +265,7 @@ impl DockTab {
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
+            DockTab::Knowledge => "Knowledge · what the model knows",
         }
     }
 }
@@ -583,6 +591,10 @@ pub struct UiState {
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
     pub model_file: Option<std::path::PathBuf>,
+    /// The Model tab's "Save a specialised model…" species picker (M8a Task 7): the species ticked,
+    /// and the scene species they were preselected from (re-preselected when the scene's species
+    /// change). Display state; the save is `Action::SaveSpecialised`.
+    pub specialise: (Vec<u8>, Vec<u8>),
     /// A picked model file whose settings differ from the scene's (`model_offer`): the card over the 3D view offers to
     /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
     /// the user presses Apply.
@@ -612,6 +624,13 @@ pub struct UiState {
     /// default; how long a point stays, in simulated fs ([`trails::LENGTH_MIN_FS`]…
     /// [`trails::LENGTH_MAX_FS`], logarithmic slider), and the alpha of the newest end (0–1).
     pub show_trails: bool,
+    /// View ▸ Display aids ▸ knowledge overlay (M8a Task 9, `knowledge`): each atom tinted by how
+    /// well the model knows its surroundings (`sim::atom_coverage`), with a legend. Off by
+    /// default; display only, not recorded; kept in the profile.
+    pub show_knowledge: bool,
+    /// The knowledge map's own view state (`knowledge::KnowledgeView`: the picked pair or element,
+    /// the pop-out window). Display only.
+    pub knowledge: knowledge::KnowledgeView,
     /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
     pub motion_blur: f32,
     /// View ▸ Density ▸ show ▸ None: no electron cloud, only the atoms (display only).
@@ -645,6 +664,8 @@ pub struct UiState {
     pub dots_brightness: f32,
     /// The dots' feather: the faint outskirts fade out (0 = every dot; up to 0.8 of √(field / max)).
     pub dots_feather: f32,
+    /// The dots' blur (user request 2026-10-22): 0 crisp … 1 soft; 0.5 = the look before the slider.
+    pub dots_blur: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
@@ -761,6 +782,28 @@ pub struct UiState {
     pub play_snapshots: std::collections::VecDeque<rewind::PlaySnapshot>,
     /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
     pub compare: crate::reference::Compare,
+    /// Train this segment (M8a Task 10, `crate::segment`): the cut waiting for its confirmation
+    /// (the card over the view, the rings on the scene), and the way back from an opened segment.
+    pub segment_preview: Option<crate::segment::Segment>,
+    pub segment_back: Option<SegmentBack>,
+}
+
+/// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
+/// panel had for it: "back to the scene" (`Action::BackToScene`) restores them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentBack {
+    pub path: std::path::PathBuf,
+    /// The scene chip's label for it ("butane.scene").
+    pub label: String,
+    pub source: SceneSource,
+    pub scene_path: String,
+    pub backend: Backend,
+    pub ionic: sim::IonicPolicy,
+    pub quality_h: f64,
+    /// The segment's caps (indices in the segment scene) and how many atoms it teaches (the rings
+    /// and the status line).
+    pub caps: Vec<usize>,
+    pub taught: usize,
 }
 
 impl UiState {
@@ -906,6 +949,7 @@ right {}
             files: Default::default(),
             builder: Default::default(),
             model_file: None,
+            specialise: Default::default(),
             model_offer: None,
             resume: None,
             status: String::new(),
@@ -916,6 +960,8 @@ right {}
             show_place_grid: true,
             grid_in_angstrom: false,
             show_trails: false,
+            show_knowledge: false,
+            knowledge: Default::default(),
             motion_blur: 0.5,
             hide_cloud: false,
             camera_view: false,
@@ -937,6 +983,7 @@ right {}
             dots_size: 1.0,
             dots_brightness: 1.0,
             dots_feather: 0.0,
+            dots_blur: 0.5,
             bonds_refresh: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
@@ -994,6 +1041,8 @@ right {}
             activity: activity::ActivityState::new(),
             play_snapshots: std::collections::VecDeque::new(),
             compare: Default::default(),
+            segment_preview: None,
+            segment_back: None,
         }
     }
 
@@ -1256,6 +1305,10 @@ pub struct PanelOutput {
     /// The interrupted training's offer was answered: resume it (true) or discard it (false)
     /// (`Viewer::resume_training`).
     pub training: Option<bool>,
+    /// A whole new scene, maybe on another solver (`UiState::backend`): Train this segment's Open
+    /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
+    /// changes, so the old one never starts solving it.
+    pub switch_scene: Option<Scene>,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
@@ -1302,6 +1355,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         out.commands.push(Command::SetActivityViews(want));
     }
     overlays::show(root.ctx(), view, st, input, &mut acts);
+    knowledge::legend(root.ctx(), view, st, input);
+    knowledge::window(root.ctx(), st, input);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);

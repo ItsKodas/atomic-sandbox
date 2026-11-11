@@ -464,6 +464,9 @@ pub enum TeachRule {
     Audit,
     RelaxVerification,
     Pass(PassJob),
+    /// The scene is a capped segment (`Scene::train_mask`, M8a Task 10): it teaches its interior
+    /// atoms; the model never answers there (its caps and edge atoms are not the source's).
+    Segment,
 }
 
 /// What happened to the teacher's answer (`providers::surrogate::admit` and the pass).
@@ -485,9 +488,18 @@ pub enum TeachOutcome {
     /// fitted or judged (the model's cutoff cannot represent it; an audit landing there is not a
     /// judgement of the model, which strict mode refuses there).
     ShellNotKept,
+    /// A teacher answer in which no atom has a neighbour within the model's cutoff: used for its
+    /// step, never trained on — every descriptor is empty, so it teaches nothing and carries only the
+    /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
+    LoneNotKept,
     FenceDisagrees,
     WaitingForPass,
+    /// Used for its step, not kept for this model: its settings differ.
     NotOffered,
+    /// A DFT solve held out on purpose to test the teaching — a teach-around pass's held-out check
+    /// or a sampling pass's shell check: solved, never trained on, judged after the refit (M8a
+    /// user-test fix 2; these were worded "other settings" before).
+    HeldOut,
     /// A background audit's answer arrived after the model changed settings or species: not
     /// judged, not kept (plan review S11).
     Discarded,
@@ -717,6 +729,9 @@ pub enum SampleState {
     BoxExcluded,
     /// A draft-mode audit's answer held out of the strict fit.
     HeldOut,
+    /// Lone atoms (no atom with a neighbour within the cutoff) loaded from before the keep rule
+    /// refused them: held out of the fit — they teach nothing.
+    Lone,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).

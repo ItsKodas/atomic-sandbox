@@ -9,7 +9,7 @@ use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
 use crate::scene::model_path;
-use crate::sim::{Backend, ModelStatus, FIT_VS_HELD_HELP};
+use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
 use egui::{Color32, RichText, Ui};
 use sim::SamplingPlan;
 
@@ -20,6 +20,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
     });
     resume_row(ui, st, input, acts);
+    super::selection::segment_row(ui, st, input, "d-model-segment", acts);
     if st.backend != Backend::Estimated {
         theme::note(ui, "The estimated solver is not running: pick Estimated in the toolbar's Solver group. Its model, sampling pass and audits show here.");
         return;
@@ -28,6 +29,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let d = snap.map(|s| &s.dynamics);
     let m: Option<&ModelStatus> = input.model();
     let sampling = input.sampling();
+    let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+    super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, &scene_z, acts));
     super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
             readouts(ui, d, m, input.scene, st);
@@ -77,6 +80,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
         offer(ui, o, acts);
+        lone_note(ui, input, "lone-note-offer");
     }
     super::group(ui, st, "d-audits", |ui, st| {
         theme::section(ui, "Audits");
@@ -153,6 +157,112 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
 }
 
+/// Where the model learns (M8a Task 4b): the source line ([`source_line`]), the switch between the
+/// shared collection and a model file (offered when a collections folder is set), and "Import a
+/// model file…" with the last import's outcome.
+fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, scene_z: &[u8], acts: &mut Vec<Action>) {
+    let Some(m) = m else { return };
+    // the switch shows the user's choice (a charged scene learns per-scene under it); Import needs
+    // the collection attached
+    let shared = m.use_collection;
+    let attached = matches!(m.source, sim::ModelSource::Collection { .. });
+    let read_only = matches!(m.source, sim::ModelSource::Collection { read_only: true, .. });
+    let line = RichText::new(source_line_with(m, st.model_file.as_deref())).size(12.5).color(if read_only { AMBER } else { theme::INK });
+    super::super::probed("model-source", ui.label(line)).on_hover_text(SOURCE_LINE_TIP);
+    if !m.collections {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(!sampling, egui::RadioButton::new(shared, "shared collection")).on_hover_text("learn into the one model of this solver surface (h, σ, ionic potential, teacher): every scene and box at these settings adds to it, and it saves itself as it learns (models/collections)").clicked() && !shared {
+            acts.push(Action::UseCollection);
+        }
+        if ui.add_enabled(!sampling, egui::RadioButton::new(!shared, "a model file…")).on_hover_text("switch to a model file as a specialised model for this scene (per-scene; Save model writes it)").clicked() {
+            let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+            if let Some(p) = model_dialog(&last).pick_file() {
+                st.model_file = Some(p);
+                acts.push(Action::LoadModel);
+            }
+        }
+    });
+    if attached {
+        specialise_row(ui, st, m, scene_z, acts);
+    }
+    let can_import = attached && !read_only && !sampling;
+    if super::super::probed("import-model", ui.add_enabled(can_import, egui::Button::new("Import a model file…")))
+        .on_disabled_hover_text("needs the shared collection attached and writable, and no pass running")
+        .on_hover_text(format!("add a .model file's samples to the shared collection — each one checked (the same solver surface, box status known, not a duplicate); what is refused is listed with the reason. {IMPORT_REFERENCES_NOTE}"))
+        .clicked()
+    {
+        let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+        if let Some(p) = model_dialog(&last).pick_file() {
+            acts.push(Action::ImportModel(p));
+        }
+    }
+    match &m.last_import {
+        Some(Ok(r)) => {
+            ui.label(RichText::new(import_line(r)).size(11.5));
+            for (i, why) in r.refused.iter().take(5) {
+                ui.weak(format!("  {}: {why}", i.map_or("the file".to_string(), |i| format!("sample #{i}"))));
+            }
+            if r.refused.len() > 5 {
+                ui.weak(format!("  … and {} more refused", r.refused.len() - 5));
+            }
+            for n in r.notes.iter().take(3) {
+                ui.weak(n);
+            }
+            ui.label(RichText::new(IMPORT_REFERENCES_NOTE).size(11.0).color(theme::INK_DIM));
+        }
+        Some(Err(e)) => warnbox(ui, &format!("import refused: {e}")),
+        None => {}
+    }
+}
+
+/// "Save a specialised model…" (M8a Task 7; spec §4.2): a species picker — the scene's species
+/// preselected, plus every species the shared model knows — and the file dialog; the save is
+/// `Action::SaveSpecialised`. The file loads through "a model file…" (any neutral scene of this
+/// solver surface, whatever its box).
+fn specialise_row(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, scene_z: &[u8], acts: &mut Vec<Action>) {
+    let mut scene: Vec<u8> = scene_z.to_vec();
+    scene.sort_unstable();
+    scene.dedup();
+    if st.specialise.1 != scene {
+        st.specialise = (scene.clone(), scene.clone());
+    }
+    let mut offered: Vec<u8> = scene.iter().copied().chain(m.model_species.iter().copied()).collect();
+    offered.sort_unstable();
+    offered.dedup();
+    egui::CollapsingHeader::new(RichText::new("Save a specialised model…").size(12.5)).id_salt("specialise").show(ui, |ui| {
+        ui.weak("a model fitted only on the shared samples made of these species: smaller and faster; it loads as a model file in any scene of this solver surface");
+        ui.horizontal_wrapped(|ui| {
+            for z in &offered {
+                let mut on = st.specialise.0.contains(z);
+                if ui.checkbox(&mut on, units::elements::symbol(*z)).changed() {
+                    st.specialise.0.retain(|x| x != z);
+                    if on {
+                        st.specialise.0.push(*z);
+                        st.specialise.0.sort_unstable();
+                    }
+                }
+            }
+        });
+        let can = !st.specialise.0.is_empty();
+        if super::super::probed("save-specialised", ui.add_enabled(can, egui::Button::new("Save…"))).on_disabled_hover_text("tick at least one species").clicked() {
+            let last = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
+            if let Some(p) = model_dialog(&last).save_file() {
+                acts.push(Action::SaveSpecialised(p));
+            }
+        }
+    });
+}
+
+/// "imported N, refused M" of an import (the Model tab).
+pub fn import_line(r: &sim::ImportSummary) -> String {
+    format!("last import: imported {}, refused {}", r.imported, r.refused.len())
+}
+
+/// The source line's hover text.
+const SOURCE_LINE_TIP: &str = "where the estimated solver's model comes from: the shared collection of this solver surface (one folder in models/collections per h, σ, ionic potential, teacher and tolerance — every scene at those settings learns into it), a model file (a specialised per-scene model), or this scene only (a charged scene or a forced multiplicity keeps a per-scene model: collections are neutral until M9)";
+
 fn warnbox(ui: &mut Ui, text: &str) {
     egui::Frame::new()
         .fill(AMBER.gamma_multiply(0.07))
@@ -228,6 +338,19 @@ pub fn teach_label(m: &ModelStatus) -> Option<String> {
 /// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
 pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
     let Some(o) = &m.teach_offer else { return };
+    // nothing to say and nothing to teach (every blocker already refused, e.g. after two rounds):
+    // no box — an empty pulsing outline read as a missing button (user report 2026-10-22); the
+    // refusals below still say why
+    let label = teach_label(m);
+    if o.prompt.is_none() && label.is_none() {
+        for (i, c, ins, why) in &o.refused {
+            ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
+        }
+        if o.refused_total > o.refused.len() {
+            ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
+        }
+        return;
+    }
     // the warning and its fix in one amber box whose outline pulses (user request 2026-10-19:
     // the button was easy to miss); still while a pass runs
     let pulse = if sampling {
@@ -246,7 +369,7 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
             if let Some(p) = &o.prompt {
                 ui.colored_label(AMBER, p);
             }
-            if let Some(label) = teach_label(m) {
+            if let Some(label) = &label {
                 let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
                 ui.add_space(4.0);
                 let button = egui::Button::new(RichText::new(format!("Fix it: {label}")).strong().size(14.0).color(egui::Color32::from_rgb(0x1c, 0x14, 0x05)))
@@ -279,6 +402,14 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
     }
 }
 
+/// The amber note on atoms with no neighbour within the model's cutoff (`ModelStatus::lone_note`):
+/// they are not learned — every one of them, and the pass is refused. Decides nothing.
+fn lone_note(ui: &mut Ui, input: &PanelInput<'_>, probe: &str) {
+    if let Some(n) = input.model().and_then(|m| m.lone_note.as_deref()) {
+        super::super::probed(probe, ui.label(RichText::new(n).color(AMBER)));
+    }
+}
+
 /// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
@@ -300,6 +431,7 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         } else if let Some(c) = cost {
             ui.weak(c);
         }
+        lone_note(ui, input, "lone-note");
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
             .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")
@@ -369,13 +501,23 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         }
         let armed = forget_armed(st);
         let samples = m.map_or(0, |m| m.samples);
-        let forget = if armed {
-            egui::Button::new(RichText::new(format!("Click again to forget {samples} samples")).color(RED))
+        // in collection mode only this session's own samples go: the collection's are permanent
+        let in_collection = m.and_then(|m| match m.source {
+            sim::ModelSource::Collection { samples: k, .. } => Some(k),
+            _ => None,
+        });
+        let forget = match (armed, in_collection) {
+            (true, Some(k)) => egui::Button::new(RichText::new(format!("Click again to forget {} session-only samples", samples.saturating_sub(k))).color(RED)),
+            (true, None) => egui::Button::new(RichText::new(format!("Click again to forget {samples} samples")).color(RED)),
+            (false, _) => egui::Button::new(RichText::new("Forget model…").color(theme::DANGER_INK)),
+        };
+        let tip = if in_collection.is_some() {
+            "drop this session's own samples — the ones the shared collection did not take (two clicks within 4 s); the shared collection stays attached and keeps its samples: they are permanent, nothing forgets them"
         } else {
-            egui::Button::new(RichText::new("Forget model…").color(theme::DANGER_INK))
+            "drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass"
         };
         if super::super::probed("forget", ui.add_enabled(estimated && (m.is_some_and(|m| m.samples > 0 || m.fitted) || sampling), forget))
-            .on_hover_text("drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass")
+            .on_hover_text(tip)
             .clicked()
         {
             acts.push(Action::Forget);
@@ -446,9 +588,21 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
 }
 
 /// The hover text of the "learned classes" rows.
-pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. One badly predicted sample is enough to keep its whole class on DFT until the region around it is learned.";
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model directions its atoms can move along (per kind of atom and neighbours: the columns those environments touch, not the whole model's), is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at three or more geometries of a class, one badly predicted sample is enough to keep the whole class on DFT; from then on the class is judged by the error those DFT checks measured (on average, with a margin to start answering), with the left-out average as a floor.";
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
+/// One environment species' row under its class ("  many-body around O, with H: learned · 967
+/// samples for 38 columns"): its samples against the columns its atoms touch (M8a user-fix 3), read
+/// "12 of 146 samples needed" only when that count is what refuses it (the review's Minor 3).
+pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
+    let count = if matches!(s.refusal, Some((sim::ClassKey::Samples, ..))) {
+        format!("{} of {} samples needed", s.samples, s.columns)
+    } else {
+        format!("{} samples for {} columns", s.samples, s.columns)
+    };
+    format!("  {class} {}: {} · {count}", s.words(), if s.trusted { "learned" } else { "not learned yet (DFT)" })
+}
+
 pub fn class_line(c: &sim::ClassLoo) -> String {
     format!(
         "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
@@ -464,8 +618,12 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)) };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
+        let s = |z, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples, columns| sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns };
+        assert_eq!(super::species_line("many-body", &s(8, vec![1], None, 967, 38)), "  many-body around O, with H: learned · 967 samples for 38 columns");
+        assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], Some((sim::ClassKey::Samples, 12.0, 146.0)), 12, 146)), "  many-body around H, with H and O: not learned yet (DFT) · 12 of 146 samples needed");
+        assert_eq!(super::species_line("pair", &s(1, vec![7], Some((sim::ClassKey::Force, 2.5, 1.0)), 300, 29)), "  pair around H, with N: not learned yet (DFT) · 300 samples for 29 columns");
     }
 }
 
@@ -542,6 +700,11 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
             ui.vertical(|ui| {
                 for c in &m.class_loo {
                     ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
+                    // per environment species (M8a user-test fix 2): an atom answers by its own
+                    // … and always under a refused class, so the short key is named (M8a user-fix 3)
+                    for s in c.species.iter().filter(|_| c.species.len() > 1 || !c.trusted) {
+                        ui.colored_label(if s.trusted { GREEN } else { AMBER }, RichText::new(species_line(c.class, s)).monospace());
+                    }
                 }
             })
             .response

@@ -12,6 +12,8 @@ struct Params {
     // the floating dots: Metropolis step (grid cells; 0 = a fresh sample every time), the share
     // re-drawn fresh each frame, glow (additive soft sprites) on/off
     walk: f32, refresh: f32, glow: u32, cut: f32,
+    // the blur: 0 crisp … 1 soft, 0.5 = the look before the slider
+    blur: f32, _b0: f32, _b1: f32, _b2: f32,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
@@ -63,9 +65,12 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @lo
     if (d2 > 1.0) { discard; }
     let z = textureLoad(scene_depth, vec2<i32>(in.pos.xy), 0);
     if (in.pos.z > z) { discard; }
-    var w = (1.0 - d2 * d2) * prm.intensity;
+    // the blur scales the falloff by 4^(1 − 2·blur): 1 at 0.5 (the look before the slider), ×4
+    // sharper at 0, ×4 softer at 1
+    let s = pow(4.0, 1.0 - 2.0 * clamp(prm.blur, 0.0, 1.0));
+    var w = (1.0 - pow(d2, 2.0 * s)) * prm.intensity;
     // glow: a soft Gaussian sprite, added (dense regions burn toward white)
-    if (prm.glow != 0u) { w = exp(-4.0 * d2) * prm.intensity; }
+    if (prm.glow != 0u) { w = exp(-4.0 * s * d2) * prm.intensity; }
     w = w * in.colour.a;
     return vec4(in.colour.rgb * w, w);
 }

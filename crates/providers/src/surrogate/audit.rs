@@ -5,8 +5,105 @@
 //! stays in the parent module doc.
 
 use super::*;
+use surrogate::history::PointKind;
 
 pub use sim::{AuditRecord, AuditVerdict};
+
+/// The `u8` code a fallback point of the audit history carries for its refusing rule
+/// (`surrogate::history::PointKind::Fallback`; M8a Task 1 fix round 1). The table is the
+/// provider's: the `surrogate` crate never reads it. Appended only — a code, once given, keeps
+/// its meaning in every history file.
+///
+/// | code | rule |
+/// |---|---|
+/// | 0 | `Cell` (the cell check) |
+/// | 1 | `NoModel` (rule 1) |
+/// | 2 | `NewSpecies` (rule 2) |
+/// | 3 | `OtherSettings` (rule 3) |
+/// | 4 | `Untrusted` (rule 4, the trust rule) |
+/// | 5 | `Class(Pair)` (rule 4b) |
+/// | 6 | `Class(ManyBody)` (rule 4b) |
+/// | 7 | `IsolatedAtom` (rule 5a) |
+/// | 8 | `Coordination` (rule 5b) |
+/// | 9 | `Spread` (rule 5, the envelope) |
+/// | 10 | `NoGrade` (rule 5e, no active set) |
+/// | 11 | `NewEnvironment` (rule 5d) |
+/// | 12 | `UnspannedAtom` (rule 5e at γ = ∞) |
+/// | 13 | `Grade` (rule 5e) |
+/// | 14 | `ForceUncertainty` (rule 6) |
+/// | 15 | `EnergyUncertainty` (rule 7) |
+/// | 16 | `NonFiniteAnswer` (never recorded: no finite prediction) |
+/// | 17 | `NearQuarantine` (the quarantine, audit and shell fences) |
+/// | 18 | `Audit` (an audit's own kind is `PointKind::Audit`; the code is for completeness) |
+/// | 19 | `RelaxVerification` |
+/// | 20 | `Pass` (a sampling-pass job; never a step) |
+/// | 22 | `Segment` (a capped segment's scene: teacher only, never recorded — no model answer; M8a Task 10) |
+/// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
+///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
+///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
+pub fn history_rule_code(rule: TeachRule) -> u8 {
+    use sim::activity::EnvClass;
+    match rule {
+        TeachRule::Cell => 0,
+        TeachRule::NoModel => 1,
+        TeachRule::NewSpecies(_) => 2,
+        TeachRule::OtherSettings => 3,
+        TeachRule::Untrusted(_) => 4,
+        TeachRule::Class(EnvClass::Pair) => 5,
+        TeachRule::Class(EnvClass::ManyBody) => 6,
+        TeachRule::IsolatedAtom => 7,
+        TeachRule::Coordination => 8,
+        TeachRule::Spread => 9,
+        TeachRule::NoGrade => 10,
+        TeachRule::NewEnvironment => 11,
+        TeachRule::UnspannedAtom => 12,
+        TeachRule::Grade => 13,
+        TeachRule::ForceUncertainty => 14,
+        TeachRule::EnergyUncertainty => 15,
+        TeachRule::NonFiniteAnswer => 16,
+        TeachRule::NearQuarantine => 17,
+        TeachRule::Audit => 18,
+        TeachRule::RelaxVerification => 19,
+        TeachRule::Pass(_) => 20,
+        TeachRule::Segment => 22,
+    }
+}
+
+/// The history code of a step the class rule (4b) refused while the variance verdict (rule 6/7)
+/// refused it as well (M8a Task 2): `evaluate` shows the class's note (rules 6–7 yield to the
+/// class's), but the model would not have answered the step had the class been trusted, so the
+/// comparison is not evidence for the class verdict — `calibrate::in_jurisdiction` leaves it out.
+pub const HISTORY_RULE_CLASS_AND_VARIANCE: u8 = 21;
+
+/// The rule a [`history_rule_code`] names, in the decision list's words ("?" for an unknown code).
+pub fn history_rule_name(code: u8) -> &'static str {
+    match code {
+        0 => "cell check",
+        1 => "rule 1 (no model)",
+        2 => "rule 2 (new species)",
+        3 => "rule 3 (other settings)",
+        4 => "rule 4 (untrusted)",
+        5 => "rule 4b (pair class)",
+        6 => "rule 4b (many-body class)",
+        7 => "rule 5a (isolated atom)",
+        8 => "rule 5b (coordination)",
+        9 => "rule 5 (envelope)",
+        10 => "rule 5e (no grade)",
+        11 => "rule 5d (new environment)",
+        12 => "rule 5e (unspanned atom)",
+        13 => "rule 5e (grade)",
+        14 => "rule 6 (force uncertainty)",
+        15 => "rule 7 (energy uncertainty)",
+        16 => "non-finite answer",
+        17 => "fence (quarantine, audit or shell)",
+        18 => "audit",
+        19 => "relax verification",
+        20 => "pass",
+        21 => "rule 4b with rule 6/7 failing too",
+        22 => "capped segment (teacher only)",
+        _ => "?",
+    }
+}
 
 /// What a background job is for (`surrogate` module doc, "Audit" and "Side densities").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +183,7 @@ pub(super) fn isolated_atom(z: u8, mass: Option<f64>, scene: &Scene) -> Scene {
     if let Some(m) = mass {
         nucleus.mass = m;
     }
-    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic }
+    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic, train_mask: None }
 }
 
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
@@ -116,6 +213,8 @@ pub(super) struct Solved {
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
     pub(super) face: Option<f64>,
+    /// The multiplicity the teacher solved at (`EvalStats::multiplicity`).
+    pub(super) multiplicity: Option<u32>,
     pub(super) display: Option<Display>,
     pub(super) orbitals: Option<OrbitalDisplay>,
     /// Why this answer must not be trained on (`EvalStats::untrainable`), if it must not.
@@ -204,7 +303,7 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     scf_steps = Some(r.stats.scf_steps);
-                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
+                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, multiplicity: r.stats.multiplicity, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
@@ -309,16 +408,29 @@ impl SurrogateKs {
     /// (a repeated request while one is queued or running is the same request). False without an
     /// auditor.
     pub fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+        self.request_atom_reference_job(z, mass, scene, true)
+    }
+
+    /// [`request_atom_reference`](Self::request_atom_reference)'s job, for the driver (`driver`:
+    /// its answer is handed on, always) or for the provider itself (`shared::request_box_references`).
+    /// One job per (Z, box n): a repeat — by either — joins the one queued or running (fix round 3:
+    /// a job of the same Z in another box is another job).
+    pub(super) fn request_atom_reference_job(&mut self, z: u8, mass: f64, scene: &Scene, driver: bool) -> bool {
         self.poll_side_jobs();
         if self.auditor.is_none() {
             return false;
         }
-        let pending = self.side_queue.iter().any(|j| j.2 == JobKind::Reference(z)) || self.auditor.as_ref().is_some_and(|a| a.busy == Some(JobKind::Reference(z)));
-        if pending {
+        let n = scene.cell.n;
+        if let Some(j) = self.ref_jobs.iter_mut().find(|j| j.z == z && j.n == n) {
+            j.driver |= driver;
             return true;
         }
+        // the collection the requesting scene shares, if any: only then may its answer become one
+        // of the collection's references (fix round 3, review 1)
+        let collection = self.shared.as_ref().filter(|sh| sh.coll.admit_provenance(&self.scene_provenance(scene)).is_ok()).map(|sh| sh.coll.key.slug());
         let atom = isolated_atom(z, Some(mass), scene);
         let prov = self.scene_provenance(&atom);
+        self.ref_jobs.push(super::shared::RefJob { z, n, driver, collection });
         self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
         self.pump_side_queue();
         true
@@ -338,14 +450,13 @@ impl SurrogateKs {
 
     /// Answers every reference request still queued — and `busy`'s, when it is one — with `why`
     /// (the auditor's thread is gone): each accepted request is answered exactly once.
-    pub(super) fn fail_references(&mut self, busy: Option<JobKind>, why: &str) {
-        let mut zs: Vec<u8> = self.side_queue.iter().filter_map(|j| if let JobKind::Reference(z) = j.2 { Some(z) } else { None }).collect();
-        if let Some(JobKind::Reference(z)) = busy {
-            zs.insert(0, z);
-        }
+    pub(super) fn fail_references(&mut self, _busy: Option<JobKind>, why: &str) {
+        // every job queued or running is in `ref_jobs`; the driver's are answered (fix round 3)
         self.side_queue.retain(|j| !matches!(j.2, JobKind::Reference(_)));
-        for z in zs {
-            self.atom_references.push((z, Err(ProviderError::Invalid(why.to_string()))));
+        for j in std::mem::take(&mut self.ref_jobs) {
+            if j.driver {
+                self.atom_references.push((j.z, Err(ProviderError::Invalid(why.to_string()))));
+            }
         }
     }
 
@@ -357,10 +468,8 @@ impl SurrogateKs {
         }
         if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
             if !self.send_job(scene, prov, kind, id) {
-                // the thread is gone: the references asked for are answered, the rest dropped
-                if let JobKind::Reference(z) = kind {
-                    self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher is gone".into()))));
-                }
+                // the thread is gone: the references asked for are answered (the popped one is still
+                // in `ref_jobs`), the rest dropped
                 self.fail_references(None, "the background teacher is gone");
                 self.side_queue.clear();
             }
@@ -424,6 +533,77 @@ impl SurrogateKs {
         self.last_audit.as_ref()
     }
 
+    /// Every judged comparison of the model's prediction with the teacher's answer — audits and
+    /// consulted-model fallbacks, by `PointKind` (M8a Task 1, `surrogate::history`): the newest
+    /// `surrogate::HISTORY_CAP` points, oldest first, and the counts of those that left none. A
+    /// record; nothing in the policy reads it.
+    pub fn audit_history(&self) -> &surrogate::AuditHistory {
+        &self.audit_history
+    }
+
+    /// Records a judged comparison in the history (`surrogate::history`, M8a Task 1) — an audit, or
+    /// (fix round 1, the physics review's I3) a step the teacher answered because a rule refused
+    /// the model's answer, `kind` saying which: the model's predictive stds at the geometry —
+    /// `stds` = (total-energy std, per-atom force std, its epistemic part) — against the teacher's
+    /// errors, ‖F_teacher − F_model‖ per atom and the signed gap E_teacher − E_model, with each
+    /// atom's class code (0 isolated, 1 pair, 2 many-body by its neighbour count within the model's
+    /// r_cut) and the model generation judged. No point, one count, for a box-affected answer (the
+    /// box's confinement is in the error), a draft-mode guess at a geometry strict mode refuses (no
+    /// verdict on the strict model), an unfit teacher answer (cores overlap, an occupation change:
+    /// not the surface the model learns), or a model without a variance factor (`stds` None).
+    ///
+    /// # Panics
+    /// If the shapes disagree with the geometry (a programming error at the call site: every
+    /// judged comparison leaves a point or a count, so nothing is dropped silently).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
+        if box_affected {
+            self.audit_history.unrecorded.box_affected += 1;
+            return;
+        }
+        if draft {
+            self.audit_history.unrecorded.draft += 1;
+            return;
+        }
+        if unfit {
+            self.audit_history.unrecorded.unfit += 1;
+            return;
+        }
+        let Some((energy_std, force_std, force_std_epistemic)) = stds else {
+            self.audit_history.unrecorded.no_variance += 1;
+            return;
+        };
+        let n = pos.len();
+        assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
+        let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
+        let classes = neighbour_counts(pos, rc2).into_iter().map(|c| atom_class(c).map_or(0, |k| k as u8 + 1)).collect();
+        // per atom (Z, its neighbours' species): the class verdict's key (user-test fix 2)
+        let species = if z.len() == n { neighbour_species(pos, z, rc2) } else { Vec::new() };
+        let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
+        // |F_teacher| per atom: the per-atom bound's input (M8a Task 2 fix round 1, review A.1)
+        let teacher_force = forces.iter().map(|t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()).collect();
+        // (`push` checks the per-atom lengths and the class codes and panics on a mismatch)
+        self.audit_history.push(surrogate::AuditPoint {
+            kind,
+            classes,
+            pred_force_std: force_std.to_vec(),
+            pred_force_std_epistemic: force_std_epistemic.to_vec(),
+            pred_energy_std: energy_std,
+            err_force,
+            teacher_force,
+            err_energy: energy - model_energy,
+            n_atoms: n,
+            model_gen: self.model_gen,
+            species,
+        });
+        // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
+        // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never
+        // refits, and its evidence would otherwise never be read)
+        if super::calibrate::in_jurisdiction(kind) {
+            self.rejudge_classes();
+        }
+    }
+
     /// The last audit judged the current fit: `false` when no audit ran since the last refit
     /// (`last_audit` is then an earlier fit's, or `None` when the model was never audited).
     /// Activity Task 3 review I1: the checklist's audit line must not read an earlier fit's
@@ -438,6 +618,7 @@ impl SurrogateKs {
             a.new_generation();
         }
         self.audit_due = false;
+        self.box_audits_unjudged = 0;
         self.audit_flip = false;
         self.last_audit = None;
         self.failed_audits.clear();
@@ -512,7 +693,25 @@ impl SurrogateKs {
         // a reference is answered whatever the generation (its requester waits for it); one
         // abandoned by a Forget or an installed model comes back `Cancelled`
         if let (JobKind::Reference(z), Some(r)) = (ans.job.kind, ans.reference.take()) {
-            return self.atom_references.push((z, r));
+            // the job's record: who asked and which collection its scene shared (fix round 3); an
+            // answer without one (it cannot happen) is handed on and offered nowhere
+            let n = ans.job.scene.cell.n;
+            let job = self.ref_jobs.iter().position(|j| j.z == z && j.n == n).map(|k| self.ref_jobs.remove(k));
+            let (driver, collection) = job.map_or((true, None), |j| (j.driver, j.collection));
+            // offered to the collection only when the requesting scene shared it — and it is still
+            // the one attached (`shared` module doc, "References per box"; review 1: never another
+            // surface's atom)
+            let ours = collection.is_some() && self.shared.as_ref().map(|s| s.coll.key.slug()) == collection;
+            if let (Ok(a), true) = (&r, ours) {
+                self.set_reference_solved(z, a.energy, n, a.face_density);
+            }
+            if driver {
+                return self.atom_references.push((z, r));
+            }
+            if let Err(e) = &r {
+                self.user_notes.push(format!("shared collection: the {} reference of the {n}³ box did not solve ({e}) — its answers keep waiting (a sampling pass solves it too)", symbol(z)));
+            }
+            return;
         }
         let Some(a) = self.auditor.as_ref() else { return };
         if ans.job.generation != a.generation() {
@@ -547,11 +746,11 @@ impl SurrogateKs {
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals, unfit })) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, unfit, ans.ms, ans.scf_steps);
+                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps);
             }
         }
     }
@@ -560,18 +759,24 @@ impl SurrogateKs {
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
     /// outcome) or discarded (plan review S11).
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, draft_guess, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        // the model current now is the one to judge (a refit since the dispatch is what counts)
+        // the canonical surface in collection mode (`shared` module doc; the identity per scene)
+        let raw_energy = energy;
+        let energy = self.to_canonical(&z, prov.grid_n, energy);
+        // the model current now is the one to judge (a refit since the dispatch is what counts);
+        // with the variance: the history's point needs the model's stds here (M8a Task 1 — one
+        // variance evaluation per audit, within what the cadence budgets)
         let pred = self
             .model
             .as_ref()
-            .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
-            .and_then(|m| m.predict(&pos, &z, false).ok());
+            .filter(|m| self.same_surface(&m.provenance, &prov) && m.basis.species_indices(&z).is_ok())
+            .and_then(|m| m.predict(&pos, &z, true).ok());
         let Some(pred) = pred else {
             let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
@@ -607,7 +812,8 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
+        // (never a capped segment's: a masked scene is teacher-only, nothing is audited there)
+        let outcome = self.admit_and_keep(&pos, &z, energy, raw_energy, &forces, face, multiplicity, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, None, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
@@ -623,7 +829,7 @@ impl SurrogateKs {
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
-                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error; the next answered step is audited again",
                 box_rho.unwrap_or(0.0)
             ),
             // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
@@ -654,6 +860,21 @@ impl SurrogateKs {
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         // the prediction judged above is the current model's, so the stamp is this fit's
         self.last_audit_fit = self.fits;
+        // a box-affected audit judged nothing (M8a Task 2, the Task 1 physics review's I4): it
+        // does not satisfy the cadence — the next answered step dispatches another — and the
+        // checklist counts it; the model's surface and trust are untouched (the gap is the box's)
+        if verdict == AuditVerdict::BoxAffected {
+            self.audit_due = true;
+            self.box_audits_unjudged += 1;
+        } else {
+            self.box_audits_unjudged = 0;
+        }
+        // the history's point (M8a Task 1)
+        let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
+            (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
+            _ => None,
+        };
+        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;
@@ -686,6 +907,7 @@ mod isolated_atom_tests {
             sigma: Some(0.3),
             external_field: [0.0; 3],
             ionic: sim::IonicPolicy::CoresOnly,
+            train_mask: None,
         };
         for p in sim::IonicPolicy::ALL {
             let atom = isolated_atom(8, None, &Scene { ionic: p, ..scene.clone() });

@@ -22,6 +22,7 @@ mod reference;
 mod replay;
 mod scene;
 mod screenshot;
+mod segment;
 mod sim;
 mod tools;
 mod trails;
@@ -192,12 +193,18 @@ impl StartFlags {
         }
         if let Some(path) = &self.scene {
             let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
-            let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
+            let mut s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
             s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
+            // final review 4: a segment's mask is not loaded while the feature is deferred
+            let ignored = s.drop_deferred_train_mask(crate::segment::SEGMENT_TRAINING);
             // the chip names the file, Reset and Save / Load point at it, and the Custom slider
             // shows the file's spacing (its grid beats any --quality) — as File ▸ Load does
             v.ui.adopt_file(path, &s);
             v.scene = s;
+            if let Some(note) = ignored {
+                eprintln!("--scene {path}: {note}");
+                v.ui.set_status(format!("--scene {path}: {note}"));
+            }
         }
         if let Some(h) = self.quality.filter(|_| self.scene.is_none()) {
             // the quality applies to the preset; an explicit grid (a scene file) beats it
@@ -485,6 +492,11 @@ fn main() {
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
     // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
     viewer.auto_pass = false;
+    // the estimated solver learns into the shared collection of the scene's solver surface (M8a Task 4b)
+    viewer.collections_dir = scene::collections_dir();
+    if viewer.collections_dir.is_none() {
+        eprintln!("note: no models folder beside the exe or in the working directory: the estimated solver keeps this session's model only (no shared collection)");
+    }
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));
@@ -871,6 +883,7 @@ impl App {
         let shown = v.shown_scene(Instant::now());
         let lines = v.overlay_lines(&shown);
         let risk = v.atom_risk();
+        let knowledge = v.atom_knowledge(v.drawn_nuclei(&shown));
         let blur = if v.ui.camera_view { Vec::new() } else { v.blur_ghosts(&shown) };
         let frames = if v.ui.camera_view { v.camera_frames(&shown) } else { Vec::new() };
         let selected = v.tool.set(shown.nuclei.len());
@@ -882,6 +895,7 @@ impl App {
             lines: &lines,
             viewport: v.viewport,
             risk: &risk,
+            knowledge: &knowledge,
             blur: &blur,
             glow: v.ui.camera_view.then_some((&frames[..], v.ui.exposure_ev, v.ui.camera_solidity, v.ui.camera_size, v.ui.camera_smooth)),
             warp_from: warp_from.as_deref(),

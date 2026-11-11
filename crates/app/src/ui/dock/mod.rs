@@ -1,5 +1,5 @@
 //! The two docks. The LEFT dock is what is going on (Activity, Readouts, Graph: stats), the RIGHT
-//! one is what you configure (Model, Orbitals, Selection, Log) — user request 2026-10-19. Both are
+//! one is what you configure (Model, Knowledge, Orbitals, Selection, Log) — user request 2026-10-19. Both are
 //! built the same way: an icon strip (one button per tab, with the status dots: drift and box
 //! health on Readouts, work running on Activity, trust on Model, the unread error / refusal count
 //! on Log; hovering a button peeks its key numbers) and, when open, the tab's panel (resizable).
@@ -86,6 +86,7 @@ fn icon(tab: DockTab) -> Icon {
         DockTab::Orbitals => Icon::Orbitals,
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
+        DockTab::Knowledge => Icon::Knowledge,
     }
 }
 
@@ -154,6 +155,7 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
             Some((i, n)) => format!("Selection\n{} #{i}", render::elements::symbol(n.z)),
             None => "Selection\nnothing selected".into(),
         },
+        DockTab::Knowledge => super::knowledge::peek(st),
         DockTab::Log => {
             let newest = st.log.entries.back().map_or(String::new(), |e| format!("\n{}: {}", e.kind.label(), e.text));
             format!("Log\n{} entries, {} unread errors or refusals{newest}", st.log.entries.len(), st.log.unread)
@@ -311,6 +313,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Orbitals => orbitals::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
+                DockTab::Knowledge => super::knowledge::tab(ui, st, input),
             }
         });
 }

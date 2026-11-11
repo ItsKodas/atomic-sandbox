@@ -403,6 +403,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().retry_fit(scene, refs)
     }
 
+    fn attach_collection(&mut self, root: &std::path::Path, scene: &Scene) -> Result<(), String> {
+        self.lock().attach_collection(root, scene)
+    }
+
+    fn import_model(&mut self, path: &std::path::Path) -> Result<crate::provider::ImportSummary, String> {
+        self.lock().import_model(path)
+    }
+
     fn fitted(&self) -> bool {
         Trainable::fitted(&*self.lock())
     }

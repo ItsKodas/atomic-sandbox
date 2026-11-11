@@ -473,6 +473,11 @@ pub struct EnergyBreakdown {
 ///   warning, which stays): how much the box confines this answer — the confinement energy per
 ///   unit of it scales as 1/h² (`providers::surrogate::box_affected_face_density`). `None` from a
 ///   provider without a grid (analytic, surrogate-answered steps).
+/// - `multiplicity`: the spin multiplicity 2S + 1 = n↑ − n↓ + 1 the solve ran at — the scene's
+///   forced one, or for an automatic scene the solver's own choice (`qm::System`: paired, one
+///   unpaired electron for an odd count). `None` from a provider without electrons (analytic,
+///   surrogate-answered steps). A record: the shared collection keeps it with each sample (M8a
+///   Task 4a; spec §4.2 "a sample keeps its own multiplicity as solved").
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `scf_tol_used`: the Δρ tolerance this solve actually stopped at (M7): the provider's `scf_tol`, except
@@ -498,6 +503,7 @@ pub struct EvalStats {
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
     pub face_density: Option<f64>,
+    pub multiplicity: Option<u32>,
     pub eig_tol_used: Option<f64>,
     pub scf_tol_used: Option<f64>,
     pub energy: EnergyBreakdown,
@@ -592,6 +598,7 @@ impl Default for EvalStats {
             warnings: Vec::new(),
             notes: Vec::new(),
             face_density: None,
+            multiplicity: None,
             eig_tol_used: None,
             scf_tol_used: None,
             energy: EnergyBreakdown::default(),
@@ -935,6 +942,64 @@ pub trait Trainable {
     fn retry_fit(&mut self, _scene: &Scene, _refs: &mut AtomReferences) -> Result<bool, String> {
         self.refit().map(|_| false)
     }
+    /// Learns into the **shared collection** of `scene`'s solver surface (M8a Task 4a; spec §4.2;
+    /// `providers::surrogate`, "The shared collection"): opens `root/<the surface's slug>` and
+    /// replaces what the provider held with the collection's samples, references and audit
+    /// history (a no-op when that collection is already attached). From then on every kept teacher
+    /// answer the collection admits is appended to it. `Err` with the reason, nothing changed, for a
+    /// scene that cannot share one (charged — collections are neutral until M9 —, a forced
+    /// multiplicity: such a scene keeps a per-scene model), an unusable folder or a running pass.
+    /// The provider holds the process's one writable handle (a second open is read-only). The
+    /// collection is a `surrogate` type, which `sim` cannot name (CLAUDE.md rule 5): the provider
+    /// opens it from the folder. The default refuses.
+    fn attach_collection(&mut self, _root: &std::path::Path, _scene: &Scene) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
+    /// Imports a `.model` file's samples into the attached collection (`surrogate::Collection::
+    /// import_sidecar` with the box rule of the collection's h), never silently: what was taken and
+    /// what was refused, with the reasons. `Err` without an attached, writable collection. The
+    /// default refuses.
+    fn import_model(&mut self, _path: &std::path::Path) -> Result<ImportSummary, String> {
+        Err("this provider does not learn".into())
+    }
+    /// Where the model comes from (`TrainableStatus::model_source`, without building the
+    /// readouts). The default: [`ModelSource::None`].
+    fn model_source(&self) -> ModelSource {
+        ModelSource::None
+    }
+    /// With a shared collection attached, writes the samples it does not hold — the
+    /// **session-only** ones (refused by it: box-affected, box status unknown, read-only; a held-out
+    /// draft guess) — to `path` as a samples-only file and returns how many (M8a Task 4b fix round
+    /// 1, ruling P13: the session autosave keeps them); `Ok(0)` writes nothing (none held, or no
+    /// collection attached). The default: `Ok(0)`.
+    fn save_session_only(&self, _path: &std::path::Path) -> std::io::Result<usize> {
+        Ok(0)
+    }
+    /// "Save a specialised model…" (M8a Task 7; spec §4.2): writes the attached collection's samples
+    /// made only of `species` (with their boxes and per-box references) to `path` as a model file
+    /// marked specialised, and returns how many. A loaded one is accepted for any neutral scene of
+    /// the same solver surface, whatever its box. `Err` without an attached collection or when no
+    /// sample lies within the species. The default refuses.
+    fn save_specialised(&self, _path: &std::path::Path, _species: &[u8]) -> Result<usize, String> {
+        Err("this provider does not learn".into())
+    }
+    /// The species of the specialised model in use (loaded from a file marked specialised; empty
+    /// otherwise — the Model tab's "(specialised)"). The default: empty.
+    fn specialised(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// The species the model in use is fitted on (its basis; empty without a fit). The default:
+    /// empty.
+    fn model_species(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// Puts the samples of a [`save_session_only`](Self::save_session_only) file back beside the
+    /// attached collection as session-only samples (never offered to it), the number taken; `Err`
+    /// without an attached collection of the file's surface, for another kind of file, or while a
+    /// pass runs. The default refuses.
+    fn load_session_only(&mut self, _path: &std::path::Path) -> Result<usize, String> {
+        Err("this provider does not learn".into())
+    }
     /// The teacher, for work the model must not see (the pass's solves, the reference atoms).
     fn teacher_mut(&mut self) -> &mut dyn ForceProvider;
     /// The readouts at `scene` (whose settings the model's provenance is compared with) and the
@@ -972,6 +1037,11 @@ pub trait Trainable {
     /// The training views' data built from what the provider holds, without a teacher solve
     /// (`crate::activity::TrainingViews`); `None` without a fitted model.
     fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
+        None
+    }
+    /// What the model's fitted samples cover (`crate::knowledge::KnowledgeMap`, M8a Task 9),
+    /// built from what the provider holds without a teacher solve; `None` without a fitted model.
+    fn knowledge_map(&self) -> Option<crate::knowledge::KnowledgeMap> {
         None
     }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
@@ -1062,6 +1132,10 @@ pub struct TrainableStatus {
     /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit
     /// (`providers::surrogate`, "Draft mode").
     pub held_out: usize,
+    /// Stored samples of lone atoms (no atom with a neighbour within the model's cutoff) loaded
+    /// from before the keep rule refused them, held out of the fit (`providers::surrogate`,
+    /// `Q_LONE`).
+    pub lone: usize,
     /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
     /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
     pub box_affected: usize,
@@ -1069,7 +1143,7 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `lone` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// What the last refit's trust recovery did.
@@ -1084,6 +1158,11 @@ pub struct TrainableStatus {
     /// (never audited), `Some` and `false` (no audit since the last refit: the record is an
     /// earlier fit's), `Some` and `true` (activity Task 3 review I1).
     pub last_audit_this_fit: bool,
+    /// Consecutive audits whose teacher answer was box-affected since the last judged one (M8a
+    /// Task 2, the Task 1 physics review's I4): each is "not judged", leaves no evidence and does
+    /// not satisfy the audit cadence — the next answered step is audited again. The checklist says
+    /// "k audits near the cell faces could not judge the model". 0 after a judged audit.
+    pub audits_box_unjudged: usize,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
     /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
@@ -1113,6 +1192,34 @@ pub struct TrainableStatus {
     /// [`Trainable::retry_fit`] can help now (a missing reference to re-solve, or enough samples
     /// for a fit that failed or is pending); false while a pass runs or when only more samples can.
     pub retry_fit: bool,
+    /// Where the model comes from (M8a Task 4a): a shared collection, a file, or neither.
+    pub model_source: ModelSource,
+    /// Atoms of the scene with no neighbour within the model's cutoff, in words for the Model tab
+    /// (`providers::surrogate::lone_atoms_note`): all of them — a pass is refused; some — they are
+    /// not learned. `None` when every atom has a neighbour. Informational.
+    pub lone_note: Option<String>,
+}
+
+/// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the
+/// shared collection of the scene's solver surface (its folder name, the samples it holds, and
+/// whether another process holds its lock), a model file it was loaded from, or neither (learned
+/// in this session only, or nothing yet).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ModelSource {
+    Collection { slug: String, samples: usize, read_only: bool },
+    File(std::path::PathBuf),
+    #[default]
+    None,
+}
+
+/// What [`Trainable::import_model`] did (plain data of `surrogate::ImportReport`): the samples
+/// taken, every refusal with its index in the file (`None` = the whole file) and reason, and the
+/// notes (references, duplicates and the like).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImportSummary {
+    pub imported: usize,
+    pub refused: Vec<(Option<usize>, String)>,
+    pub notes: Vec<String>,
 }
 
 /// A teach-around offer (`TrainableStatus::teach_offer`).
@@ -1162,14 +1269,18 @@ pub struct Readiness {
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
 /// ("pair": every atom has at most one neighbour within r_cut; "many-body": some atom has two or
 /// more), its samples, the LOO per-atom force error over its atoms as a ratio to each atom's
-/// force bound (RMS and max), the largest LOO per-atom energy error as a ratio to the energy
-/// tier, and whether the class is trusted.
+/// force bound (RMS and max), the LOO per-atom energy error as a ratio to the energy tier (RMS
+/// over the class's samples and max), the audit calibration the verdict used, and whether the
+/// class is trusted (`providers::surrogate::calibrate`, M8a Task 2: the calibrated, hysteretic
+/// verdict).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassLoo {
     pub class: &'static str,
     pub samples: usize,
     pub force_rms: f64,
     pub force_max: f64,
+    /// RMS over the class's samples of the LOO per-atom energy error over the tier (M8a Task 2).
+    pub energy_rms: f64,
     pub energy_max: f64,
     pub trusted: bool,
     /// The class rule's verdict in structured form: (the first failing condition, its value, its
@@ -1178,19 +1289,125 @@ pub struct ClassLoo {
     /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
     /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
+    /// κ_c, the audit calibration factor: the teacher's error over the model's predicted std,
+    /// rms over the evidence window's points of the class (≥ 1; 1 without any evidence, ∞ when a
+    /// comparison in the evidence was not a number). A readout (M8a Task 2): the verdict decides
+    /// on `measured`.
+    pub calibration: f64,
+    /// The teacher's force error at the geometries this class verdict decides, rms over the
+    /// evidence window's audits and rule-4b fallbacks of the class in units of the policy's
+    /// per-atom bound, inflated by one sigma of its own scatter (`providers::surrogate::calibrate`,
+    /// W_c); `None` without evidence. The calibrated verdict's force value is max(`force_rms`,
+    /// `measured`).
+    pub measured: Option<f64>,
+    /// The same for the energy: |E_teacher − E_model|/N over the tier, rms over those points,
+    /// inflated; `None` without evidence.
+    pub measured_energy: Option<f64>,
+    /// The largest single-atom measured force error over the evidence window, in bound units (the
+    /// worst-atom guard's input, `WORST_ATOM` = 3); `None` without evidence.
+    pub worst_atom: Option<f64>,
+    /// The evidence behind `measured`, in points: the window's audits plus the capped weight of
+    /// its rule-4b fallbacks of the class (an integer). Below
+    /// `providers::surrogate::calibrate::MIN_EVIDENCE` the verdict is the uncalibrated rule of
+    /// before.
+    pub evidence: usize,
+    /// The model generation (`TrainableStatus::model_gen`) since which the class has been trusted
+    /// without interruption — the hysteresis memory; `None` while untrusted.
+    pub trusted_since: Option<u64>,
+    /// The variance inflation rules 6 and 7 apply to the class's atoms (M8a Task 2 fix round 3,
+    /// `providers::surrogate::calibrate`, λ_c): the model's epistemic stds there are multiplied by
+    /// it before they are compared with their bounds. ≥ 1; 1 until the class has three
+    /// comparisons where the posterior decides.
+    pub inflation: f64,
+    /// The verdict per environment species of the class (M8a user-test fix 2,
+    /// `providers::surrogate::calibrate` "Per environment species"): an atom answers by its own
+    /// (central Z, neighbour species) key's verdict. The class's own `trusted` is all of them
+    /// trusted; its `refusal` and evidence numbers are the first refused key's. Empty before the
+    /// class has samples.
+    pub species: Vec<SpeciesVerdict>,
+}
+
+/// One environment key's verdict ([`ClassLoo::species`]): the atom's species and its neighbours'
+/// distinct species within r_cut (ascending), with the numbers of its own evidence window — the
+/// fields mean what [`ClassLoo`]'s do, for this key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeciesVerdict {
+    pub z: u8,
+    pub neighbours: Vec<u8>,
+    pub trusted: bool,
+    pub refusal: Option<(ClassKey, f64, f64)>,
+    pub calibration: f64,
+    pub measured: Option<f64>,
+    pub measured_energy: Option<f64>,
+    pub worst_atom: Option<f64>,
+    pub evidence: usize,
+    pub trusted_since: Option<u64>,
+    pub inflation: f64,
+    /// The fitted samples holding an atom of this key, and the count of the basis columns its atoms
+    /// touch — the sample floor it is held to (M8a user-fix 3 and its review: its own parameters, not the whole
+    /// basis's Q′, so a species added elsewhere does not raise it). For a key no fitted atom holds:
+    /// its class's sample count and the whole basis's Q′.
+    pub samples: usize,
+    pub columns: usize,
+}
+
+impl SpeciesVerdict {
+    /// "around O, with H" / "around H, with H and O" — the key in words (symbols only: Z is a key).
+    pub fn words(&self) -> String {
+        key_words(self.z, &self.neighbours)
+    }
+}
+
+/// An environment key (central Z, its neighbours' distinct species) in words: "around O, with H"
+/// / "around H, with H and O" (symbols only: Z is a key).
+pub fn key_words(z: u8, neighbours: &[u8]) -> String {
+    let sym = |z: u8| units::elements::symbol(z).to_string();
+    let nb: Vec<String> = neighbours.iter().map(|&z| sym(z)).collect();
+    let with = match nb.len() {
+        0 => String::new(),
+        1 => format!(", with {}", nb[0]),
+        n => format!(", with {} and {}", nb[..n - 1].join(", "), nb[n - 1]),
+    };
+    format!("around {}{with}", sym(z))
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
-/// the class rule tests them (`providers::surrogate`, "Class-wise trust").
+/// the class rule tests them (`providers::surrogate`, "Class-wise trust"; the calibrated verdict:
+/// `providers::surrogate::calibrate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassKey {
-    /// Fewer samples of the class than Q′: (samples, Q′).
+    /// Fewer samples than the parameters the verdict's atoms can move with: (samples, needed). Per
+    /// environment key (M8a user-fix 3 and its review) the fitted samples holding an atom of the key
+    /// against the count of the basis columns its atoms touch ([`SpeciesVerdict::columns`]);
+    /// class-wide, the class's
+    /// samples against the whole basis's Q′.
     Samples,
-    /// The leave-one-out force error over the class's atoms: the larger of max and RMS, as a
-    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN).
+    /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its
+    /// bound: (that ratio, 3). It keeps an untrusted class from entering at every evidence count,
+    /// and makes a trusted one leave while the class has fewer than three comparisons.
+    WorstAtom,
+    /// The uncalibrated rule (fewer than three comparisons): the leave-one-out force error over
+    /// the class's atoms — the larger of max and RMS, as a ratio to each atom's bound (limit 1;
+    /// NaN when either ratio is NaN).
     Force,
-    /// The largest leave-one-out per-atom energy error, as a ratio to the tier (limit 1).
+    /// The uncalibrated rule: the leave-one-out per-atom energy error's max as a ratio to the tier
+    /// (limit 1).
     Energy,
+    /// The calibrated verdict, decided by the DFT-measured force error (`ClassLoo::measured`, in
+    /// bound units) against its limit (`ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to stay).
+    Calibrated,
+    /// The calibrated verdict, decided by its floor: the leave-one-out force RMS beyond the limit
+    /// while the measured error is below it — the model is never trusted beyond its own
+    /// leave-one-out.
+    LooFloor,
+    /// The calibrated verdict, decided by the DFT-measured energy error (`ClassLoo::measured_energy`,
+    /// in tier units) against its limit.
+    MeasuredEnergy,
+    /// Between refits (M8a user-test fix 2: the verdict re-judged as evidence arrives) an untrusted
+    /// environment enters only on a full evidence window: (its comparisons, `WINDOW_POINTS` = 300)
+    /// — the count at which a window free of 3× atoms makes a 1 % tail unlikely. Until then entry
+    /// waits for the next refit's verdict.
+    Window,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

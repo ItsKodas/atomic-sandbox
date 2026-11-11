@@ -17,6 +17,9 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The surrogate helpers of the surrogate suite and the transfer test (M8a Task 6).
+pub mod surrogate;
+
 /// Serialises the GPU sections of concurrently running tests within one binary (poisoning is
 /// harmless here). Distinct test binaries never run at the same time under `cargo test`.
 pub static GPU: Mutex<()> = Mutex::new(());
@@ -89,7 +92,7 @@ pub fn never() -> impl FnMut() -> bool { || false }
 pub fn no_augment() -> impl FnMut(&Scene, &mut Vec<[f64; 3]>) { |_, _| {} }
 
 pub fn scene(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: Cell { n, h: H }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
+    Scene { nuclei, cell: Cell { n, h: H }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None }
 }
 
 /// H₂ along x at bond length `r`, nucleus 0 at +r/2, at rest.

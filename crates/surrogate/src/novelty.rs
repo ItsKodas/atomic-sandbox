@@ -71,7 +71,7 @@
 
 use crate::descriptor::{Basis, DescribeError};
 use crate::fit::Accumulator;
-use crate::linalg::symmetric_eigen;
+use crate::linalg::{symmetric_eigen, symmetric_eigen_householder};
 
 /// The unspanned directions of a fit and the rounding threshold (module doc).
 #[derive(Clone, Debug, PartialEq)]
@@ -111,7 +111,11 @@ impl NullSpace {
         }
         let trace: f64 = (0..q).map(|i| g[i * q + i]).sum();
         let tau = q as f64 * f64::EPSILON * trace;
-        let (ev, v) = symmetric_eigen(&g, q);
+        // a body-4 basis (a shared collection's, Q′ up to 2 688) takes Householder–QL: the same
+        // O(ε)‖G̃‖ backward error the threshold rests on (`linalg` tests: null eigenvalues at
+        // 8e-17·tr against τ/tr = Q′ε), minutes faster than Jacobi there; every other basis keeps
+        // Jacobi bit for bit
+        let (ev, v) = if basis.body4 { symmetric_eigen_householder(&g, q) } else { symmetric_eigen(&g, q) };
         let vectors = (0..q).filter(|&i| ev[i] <= tau).map(|i| (0..q).map(|k| v[k * q + i]).collect()).collect();
         NullSpace { basis, col_index, d, vectors, tau, energy_per_atom: acc.energy_per_atom.unwrap_or(true) }
     }
@@ -143,5 +147,20 @@ impl NullSpace {
             }
         }
         Ok(worst)
+    }
+
+    /// ν of the query's energy row and, per atom, the largest ν of its three force rows (the
+    /// split of [`novelty`](Self::novelty) a per-atom verdict reads; the same rows, the same ν):
+    /// `novelty` is (max of all of them, where). Zeros when nothing is unspanned.
+    pub fn novelty_per_atom(&self, pos: &[[f64; 3]], z: &[u8]) -> Result<(f64, Vec<f64>), DescribeError> {
+        if self.vectors.is_empty() || !(self.tau > 0.0) {
+            return Ok((0.0, vec![0.0; pos.len()]));
+        }
+        let (e_row, f_rows) = crate::loo::standardised_rows(&self.basis, &self.col_index, &self.d, self.energy_per_atom, pos, z)?;
+        let mut atoms = vec![0.0f64; pos.len()];
+        for (r, row) in f_rows.iter().enumerate() {
+            atoms[r / 3] = atoms[r / 3].max(self.nu(row));
+        }
+        Ok((self.nu(&e_row), atoms))
     }
 }

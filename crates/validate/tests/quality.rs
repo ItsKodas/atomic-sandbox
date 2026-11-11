@@ -31,6 +31,7 @@ fn h2(n: usize, h: f64, r: f64) -> Scene {
         sigma: None,
         external_field: [0.0; 3],
             ionic: sim::IonicPolicy::None,
+            train_mask: None,
     }
 }
 

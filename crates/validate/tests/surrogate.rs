@@ -162,6 +162,18 @@
 //!   be accepted under the **unchanged** class rule with the blocker kept in the fit: the pair
 //!   class trusted, the model trusted, both held-out checks within the audit criterion, the
 //!   blocker neither quarantined nor out of the fit. Solve count reported.
+//! - `trust_baseline_report` (M8a Task 1; `#[ignore]`d, a measurement never a gate): the two
+//!   scenarios above — the stuck-escape repro (NVE and hot) and the active-learning run — with an
+//!   in-step audit every 50 answered steps, observed through the provider's audit history
+//!   (`surrogate::history`: the model's predictive stds against the teacher's errors per judged
+//!   audit). Reported per environment class (rule 4b): audits touching the class, the share of
+//!   **missed large errors** (an audited atom whose ‖F_teacher − F_model‖ exceeds the fit's
+//!   in-domain 99th-percentile leave-one-out force error — nearest rank over the fitted atoms of the
+//!   class, `SurrogateKs::loo_force_errors` — while the class verdict was trusted), the calibration
+//!   ratio z = err/pred_std, and how often the class verdict flipped between consecutive steps.
+//!   The numbers of record: `references.md`, "M8a trust baseline"; what Task 2's calibrated,
+//!   hysteretic verdict is measured against. In this mode the repro's gated assertions become notes
+//!   in the report (audits every 50 are not the gated scenario).
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (the `Locked`
 //! teacher), one evaluation at a time, so the per-solve times in the timing rows are uncontended
@@ -169,18 +181,19 @@
 use gpu::GpuContext;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use providers::{FallbackPolicy, Sampler, SurrogateKs, TrainingResiduals};
+use providers::{FallbackPolicy, Sampler, SurrogateKs};
 use sim::{ForceProvider, ForceResult, Integrator, Nucleus, SamplingPlan, Scene, Source};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use surrogate::{Basis, FitReport, Prediction};
+use surrogate::Prediction;
 
 mod common;
 use common::{
     au_per_ps, bond, chrono_free_date, fit_line, h2, h3_plus, locate_surface, ms, never, no_augment, period_from_upward_crossings, relax, scene, solve,
     timing_row, triangle, EvalLog, Locked, DISPLACEMENT, DT_FS, H, H3_SIDE0, HARTREE_IN_CM, N_H2, TOL_H2,
 };
+use common::surrogate::{class_summary, fit_summary, model_vs_dft, residuals, sample_and_fit, student};
 
 /// Timing rows for `last-run-surrogate.md`, rewritten whenever a test finishes.
 static TIMING: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -285,63 +298,8 @@ const AL_T_ROT: f64 = 300.0;
 
 fn gpu() -> Option<GpuContext> { common::gpu("surrogate") }
 
-fn policy(audit_every: usize) -> FallbackPolicy {
-    FallbackPolicy { audit_every, ..FallbackPolicy::default() }
-}
-
-/// A `SurrogateKs` over the suite's locked, logged GPU teacher at tol 1e-6.
-fn student(ctx: &GpuContext, audit_every: usize) -> (SurrogateKs, Arc<Mutex<EvalLog>>) {
-    let (p, log) = Locked::new(ctx.clone(), TOL_H2);
-    (SurrogateKs::new(Box::new(p), policy(audit_every)).with_teacher_tol(TOL_H2), log)
-}
-
 fn h2_plan() -> SamplingPlan {
     SamplingPlan { hot_burst_t: H2_BURST_T, seed: seed(), ..SamplingPlan::default() }
-}
-
-fn residuals(t: Option<TrainingResiduals>) -> String {
-    t.map_or("—".into(), |t| format!("E/atom {:.2e}, F {:.2e} (bound {:.2e})", t.energy_per_atom, t.force, t.force_bound))
-}
-
-/// The per-class leave-one-out numbers (round 6): "pair n 273, LOO F rms 0.05× max 0.40×, E 0.10×, trusted".
-fn class_summary(s: &SurrogateKs) -> String {
-    s.class_loo()
-        .iter()
-        .map(|c| format!("{} n {}, LOO F rms {:.3}× max {:.3}×, E {:.3}×, {}", c.class, c.samples, c.force_rms, c.force_max, c.energy_max, if c.trusted { "trusted" } else { "untrusted" }))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn fit_summary(rep: &FitReport, s: &SurrogateKs) -> String {
-    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}; classes: {}",
-            rep.n_samples, rep.q_prime, rep.n_rows, rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.lambda, rep.dof_eff, rep.gamma_e, rep.gamma_f,
-            rep.residual_dof_e, rep.residual_dof_f, rep.condition_estimate, rep.hyper_iterations, if rep.converged { "" } else { " (not converged)" },
-            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")), class_summary(s))
-}
-
-/// One sampling pass with the surrogate's own teacher (`Sampler::step_own_teacher`, what
-/// `Dynamics` drives), then one refit. Appends the pass summary and the sampler's notes.
-fn sample_and_fit(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, out: &mut String) -> (FitReport, Duration) {
-    let t = Instant::now();
-    let r_cut = s.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
-    let mut sampler = Sampler::with_cutoff(sc, plan, r_cut).unwrap_or_else(|e| panic!("sampling plan: {e}"));
-    while sampler.step_own_teacher(s, &mut never()).unwrap_or_else(|e| panic!("sampling: {e}")).is_some() {}
-    let p = sampler.progress();
-    let notes = sampler.take_notes();
-    s.discontinuity();
-    let pass = t.elapsed();
-    let t = Instant::now();
-    let rep = s.refit().unwrap_or_else(|e| panic!("refit: {e}"));
-    let fit_ms = ms(t.elapsed());
-    let _ = writeln!(out, "  sampling pass ({} perturbations σ {}, {} scan points/pair over {:?} × r₀, {}-step burst at {} K, seed {}): {} samples of {} jobs ({} skipped, {} failed) in {:.1} s; E_ref(H) = {:+.6} Ha",
-                     plan.perturbations, plan.perturbation_sigma, plan.scan_points_per_pair, plan.scan_range, plan.hot_burst_steps, plan.hot_burst_t, plan.seed,
-                     sampler.samples_added(), p.total, p.skipped, p.failed, pass.as_secs_f64(), s.reference_energy(1).unwrap_or(f64::NAN));
-    for n in &notes { let _ = writeln!(out, "    note: {n}"); }
-    let b = s.basis().expect("fitted");
-    let _ = writeln!(out, "  basis: n_max {}, l_max {}, r_cut {}, degree cap {}, body3 {}, species {:?}, P {} features, Q′ {}; refit {fit_ms:.0} ms: {}",
-                     b.n_max, b.l_max, b.r_cut, b.degree_cap, b.body3, b.species, b.n_features(), b.n_independent_columns(), fit_summary(&rep, s));
-    assert_eq!((p.failed, p.skipped), (0, 0), "sampling pass: {p:?}");
-    (rep, pass)
 }
 
 /// rms and max of |ΔE| and of the per-component |ΔF| over a set of geometries.
@@ -368,16 +326,6 @@ impl ErrStats {
     }
     fn rmse_e(&self) -> f64 { (self.se2 / self.n.max(1) as f64).sqrt() }
     fn rmse_f(&self) -> f64 { (self.sf2 / self.nf.max(1) as f64).sqrt() }
-}
-
-/// The model's prediction (with its stds) and the teacher's answer at one geometry, the teacher
-/// called directly (a held-out comparison: nothing is kept as a sample).
-fn model_vs_dft(s: &mut SurrogateKs, sc: &Scene, what: &str) -> (Prediction, ForceResult) {
-    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
-    let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
-    let pred = s.model().expect("a fitted model").predict(&pos, &z, true).unwrap_or_else(|e| panic!("{what}: predict: {e}"));
-    let dft = solve(s.teacher_mut(), sc, what);
-    (pred, dft)
 }
 
 fn force_diffs<'a>(a: &'a [[f64; 3]], b: &'a [[f64; 3]]) -> impl Iterator<Item = f64> + 'a {
@@ -881,9 +829,30 @@ fn h3plus_tier() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
 fn active_learning_run_converges() {
+    active_learning_run(None, AUDIT_EVERY);
+}
+
+/// A gated assertion that the M8a baseline measurement turns into a note: `trust_baseline_report`
+/// measures today's rule at its own audit cadence and must not stop at a verdict the gated
+/// scenarios (the repro without audits, the active-learning run at every 50) are pinned to.
+macro_rules! check {
+    ($gate:expr, $soft:expr, $cond:expr, $($arg:tt)+) => {
+        if $gate {
+            assert!($cond, $($arg)+);
+        } else if !($cond) {
+            $soft.push(format!($($arg)+));
+        }
+    };
+}
+
+/// The active-learning scenario (the test's doc); with a `baseline` the M8a trust probe observes
+/// the provider after every step (`trust_baseline_report`, which may also set the audit cadence —
+/// `AUDIT_EVERY` in the gated run). The asserts stay: the probe only reads, and the gated run's
+/// cadence is the one the asserts were pinned at.
+fn active_learning_run(mut baseline: Option<&mut TrustBaseline>, audit_every: usize) {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, AUDIT_EVERY);
+    let (mut s, log) = student(&ctx, audit_every);
     let mut out = String::new();
     // the start: R_e + Δ along a generic axis, rotating with k_B·T_rot about its centre
     let u = [0.6, 0.64, 0.48];
@@ -893,7 +862,7 @@ fn active_learning_run_converges() {
     let v = (units::kelvin_to_hartree(AL_T_ROT) / sc.nuclei[0].mass).sqrt();
     sc.nuclei[0].vel = [v * w[0], v * w[1], v * w[2]];
     sc.nuclei[1].vel = [-v * w[0], -v * w[1], -v * w[2]];
-    let _ = writeln!(out, "H₂ active learning, {N_H2}³ teacher, no model: R₀ = {r0:.5} Bohr along {u:?}, rotating with K = k_B·{AL_T_ROT} K (v = {v:.2e} a.u., period {:.0} fs), dt = {DT_FS} fs, {AL_STEPS} steps, audit every {AUDIT_EVERY} answered steps, refit whenever a sample is pending",
+    let _ = writeln!(out, "H₂ active learning, {N_H2}³ teacher, no model: R₀ = {r0:.5} Bohr along {u:?}, rotating with K = k_B·{AL_T_ROT} K (v = {v:.2e} a.u., period {:.0} fs), dt = {DT_FS} fs, {AL_STEPS} steps, audit every {audit_every} answered steps, refit whenever a sample is pending",
                      units::au_time_to_fs(2.0 * std::f64::consts::PI * (0.5 * r0) / v));
     // the reference energy first (ruling S9, the sampling pass's rule): a references-only pass —
     // no model can be fitted without E_atom(H), and the worker's pass computes it the same way
@@ -933,8 +902,12 @@ fn active_learning_run_converges() {
                 let _ = writeln!(refit_log, "    refit {refits} before step {i}: n {} dof_E {:.0} dof_F {:.0} s_E {:.1e} s_F {:.1e}, residuals {}, trusted {}", rep.n_samples, rep.residual_dof_e, rep.residual_dof_f, rep.sigma_e, rep.sigma_f, residuals(s.training_residuals()), tr);
             }
         }
+        let trusted_before = s.trusted();
         let (f_new, st) = integ.step(&mut sc, &f, &mut s, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("step {i}: {e}"));
         f = f_new;
+        if let Some(b) = baseline.as_deref_mut() {
+            b.observe(&s, trusted_before);
+        }
         sources.push(st.eval.source);
         if st.eval.source == Source::Fallback {
             last_fallback = i;
@@ -970,14 +943,21 @@ fn active_learning_run_converges() {
     println!("{out}");
     let result = format!("{n_fb} fallbacks/{AL_STEPS} ({:.0} % in the last {AL_WINDOW}), last gap {:+.1e}, {} DFT calls", 100.0 * fraction, last_gap.map_or(f64::NAN, |g| g.1), l.calls);
     record(&ctx, timing_row("active_learning", "H₂", N_H2, TOL_H2, &l, t_test.elapsed(), &result));
-    assert!(l.warnings.iter().all(|w| !w.contains("box too small")), "{:?}", l.warnings);
-    assert!(s.trusted(), "not trusted at the end: {:?}", s.untrusted_reason());
-    assert!(fraction < AL_FALLBACK_BOUND, "fallback fraction over the last {AL_WINDOW} steps {fraction:.3} (bound {AL_FALLBACK_BOUND})");
+    // the gate (asserted), or the M8a measurement's notes (its cadence is not the pinned one)
+    let gate = baseline.is_none();
+    let mut soft: Vec<String> = Vec::new();
+    check!(gate, soft, l.warnings.iter().all(|w| !w.contains("box too small")), "{:?}", l.warnings);
+    check!(gate, soft, s.trusted(), "not trusted at the end: {:?}", s.untrusted_reason());
+    check!(gate, soft, fraction < AL_FALLBACK_BOUND, "fallback fraction over the last {AL_WINDOW} steps {fraction:.3} (bound {AL_FALLBACK_BOUND})");
     let (gap_step, gap) = last_gap.expect("a fallback with a trusted model happened");
-    assert_eq!(gap_step, last_fallback, "the last fallback (step {last_fallback}) carried no teacher gap: the model was untrusted there");
-    assert!(gap.abs() < AL_GAP_BOUND, "|teacher_gap| on the last fallback = {:.3e} (bound {AL_GAP_BOUND:.0e})", gap.abs());
+    check!(gate, soft, gap_step == last_fallback, "the last fallback (step {last_fallback}) carried no teacher gap: the model was untrusted there");
+    check!(gate, soft, gap.abs() < AL_GAP_BOUND, "|teacher_gap| on the last fallback = {:.3e} (bound {AL_GAP_BOUND:.0e})", gap.abs());
     for (i, g, failed) in &audits {
-        assert!(g.is_finite() && g.abs() < AUDIT_GAP_BOUND, "audit at step {i}: gap {g:+.3e} (failed {failed})");
+        check!(gate, soft, g.is_finite() && g.abs() < AUDIT_GAP_BOUND, "audit at step {i}: gap {g:+.3e} (failed {failed})");
+    }
+    if let Some(b) = baseline {
+        let _ = writeln!(b.runs, "  run: {n_fb} fallbacks over {AL_STEPS} steps ({refits} refits; first trusted before step {first_trusted:?}), {} audits, {} DFT calls", audits.len(), l.calls);
+        b.notes.extend(soft);
     }
 }
 
@@ -992,6 +972,26 @@ const REPRO_CHECK_EVERY: usize = 4;
 /// judged 1 of 87 — 21 of its ~22 checks were box-affected). It runs with the container walls on
 /// (the app's default) at `REPRO_WALL_HALF_WIDTH`, which keeps the nuclei ≥ 2 Bohr inside the
 /// faces' 3h margin region, so its answers are mostly not box-affected and can be judged.
+///
+/// **Two-sided since M8a Task 2 (fix round 1, the controller's ruling A on the physics review):**
+/// the calibrated class verdict refuses the hot run's many-body class when the teacher's error at
+/// the geometries it would answer is beyond the bound, so a hot run may answer nothing — the old
+/// max rule fluctuated open there (32 answers, worst judged 2.7× the bound, z up to 9.8). The floor
+/// is then met the other way round: at least this many **class-refused steps whose would-be model
+/// answers are judged against the teacher** (the refusing model's prediction at the step's geometry
+/// against the teacher's forces the step used) with the rms over them of the per-atom ‖ΔF‖/√3 /
+/// bound **beyond `ENTER`** — "the refusal was warranted". Never a bare "every step was refused":
+/// that would assert nothing about any force. The check fails both ways — a class refusing
+/// geometries the model knows (over-refusal), or a model answering badly.
+///
+/// **The refused population is the verdict's own jurisdiction** (fix round 2, the physics
+/// re-review's Important 1): only steps whose recorded history point is a rule-4b fallback (codes
+/// 5 and 6: every other rule passed, only the class verdict refused), judged over the atoms of the
+/// refusing class. A class refusal that rule 6/7 would have refused as well shows the same note but
+/// is coded apart (code 21) — the model would not have answered it had the class been trusted, and
+/// those are the steps the posterior itself flags, with the larger errors — and a box-affected
+/// step leaves no point (its teacher forces carry the confinement): both are excluded, and printed
+/// beside it as the wider population.
 const REPRO_MIN_JUDGED_HOT: usize = 10;
 /// The hot run's container walls (Bohr; the 49³ cell's half-extent is 6, its margin 5.25).
 const REPRO_WALL_HALF_WIDTH: f64 = 3.0;
@@ -1059,13 +1059,20 @@ fn the_stuck_escape_repro_is_answered_honestly() {
 
 /// The repro's setup and runs (`hot` per run: the thermostat stays on after the edit).
 fn stuck_escape_repro(runs: &[bool]) {
+    stuck_escape_repro_with(runs, 0, None);
+}
+
+/// The repro with an in-step audit every `audit_every` answered steps (0 = the gated scenario:
+/// none) and, for `trust_baseline_report`, the M8a trust probe observing the shared provider after
+/// every step; in that mode the runs' gated assertions become the report's notes.
+fn stuck_escape_repro_with(runs: &[bool], audit_every: usize, mut baseline: Option<&mut TrustBaseline>) {
     use sim::SharedTrainable;
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    let (mut s, log) = student(&ctx, audit_every);
     let mut out = String::new();
     let n_steps = repro_steps();
-    let _ = writeln!(out, "the stuck-then-escape repro (diagnosis 2026-10-15): H₂ default pass at {N_H2}³ + the r = {REPRO_TAIL_R} tail sample; per run: 4000 K for 400 fs, one H added 3 Bohr from the centre, {n_steps} steps (runs, hot: {runs:?})");
+    let _ = writeln!(out, "the stuck-then-escape repro (diagnosis 2026-10-15): H₂ default pass at {N_H2}³ + the r = {REPRO_TAIL_R} tail sample; per run: 4000 K for 400 fs, one H added 3 Bohr from the centre, {n_steps} steps (runs, hot: {runs:?}; audit every {audit_every} answered steps)");
     let plan = SamplingPlan { seed: seed(), ..SamplingPlan::default() };
     let (_rep, pass_wall) = sample_and_fit(&mut s, &h2(SCAN_R0), &plan, &mut out);
     assert!(s.trusted(), "the pass did not earn trust: {:?}", s.untrusted_reason());
@@ -1087,7 +1094,7 @@ fn stuck_escape_repro(runs: &[bool]) {
     let mut first = Some(p);
     for &hot in runs {
         let provider = first.take().unwrap_or_else(|| SharedTrainable::from_handle(hs.clone()));
-        repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out);
+        repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out, baseline.as_deref_mut());
     }
     let l = snapshot(&log);
     let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
@@ -1096,9 +1103,22 @@ fn stuck_escape_repro(runs: &[bool]) {
 }
 
 /// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
-/// (`hot`: the thermostat stays on), the checks.
-fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String) {
+/// (`hot`: the thermostat stays on), the checks — asserted, or with a `baseline` (the M8a trust
+/// probe, which observes the provider after every step) collected as its notes.
+#[allow(clippy::too_many_arguments)]
+fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String, mut baseline: Option<&mut TrustBaseline>) {
     use sim::{DynCommand, Dynamics, Surface, Walls};
+    let gate = baseline.is_none();
+    let mut soft: Vec<String> = Vec::new();
+    let what = if hot { "hot" } else { "NVE" };
+    // the probe reads the model's trust before the step and the history and verdicts after it
+    let trusted_now = |hs: &Arc<Mutex<SurrogateKs>>| hs.lock().unwrap_or_else(|e| e.into_inner()).trusted();
+    let observe = |baseline: &mut Option<&mut TrustBaseline>, trusted_before: bool| {
+        if let Some(b) = baseline.as_deref_mut() {
+            let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+            b.observe(&s, trusted_before);
+        }
+    };
     let check_every = if hot { 1 } else { REPRO_CHECK_EVERY };
     let (r_cut, tier) = {
         let s = hs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1118,16 +1138,17 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let mut heat_fb = 0;
     for i in 0..1600 {
         d.apply(DynCommand::Step(1));
+        let tb = !gate && trusted_now(hs);
         let snap = d.tick(f64::INFINITY, &mut never());
+        observe(&mut baseline, tb);
         heat_fb += (snap.source == Source::Fallback) as usize;
-        assert_eq!(snap.last_error, None, "heating, step {i}");
+        check!(gate, soft, snap.last_error.is_none(), "{what} heating, step {i}: {:?}", snap.last_error);
         if i % 25 == 24 { refit(hs); }
     }
     if !hot {
         d.apply(DynCommand::SetThermostat(None));
     }
     let pre = d.snapshot();
-    let what = if hot { "hot" } else { "NVE" };
     let _ = writeln!(out, "  {what} run — heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
     let c = centroid(&pre.scene);
     d.apply(DynCommand::AddNucleus(Nucleus::new(1, [c[0], c[1] + 3.0, c[2]])));
@@ -1144,14 +1165,52 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let mut refitted = false;
     let (mut max_same, mut max_switch, mut max_residual, mut switches) = (0.0f64, 0.0f64, 0.0f64, 0usize);
     let mut stopped = None;
+    // the class-refused steps' would-be answers against the teacher (M8a Task 2 fix rounds 1–2):
+    // the per-atom ‖ΔF‖/√3 / bound of the refusing model's prediction, rms per step — over the
+    // refusing class's atoms for the verdict's jurisdiction (the step's recorded point is a rule-4b
+    // fallback, codes 5/6), over every atom for the wider population of every step with the class's
+    // note (code 21 and box-affected steps included; printed beside it)
+    let mut refused_ratio: Vec<f64> = Vec::new();
+    let mut noted_ratio: Vec<f64> = Vec::new();
+    let code_pair = providers::surrogate::history_rule_code(sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
+    let code_mb = providers::surrogate::history_rule_code(sim::activity::TeachRule::Class(sim::activity::EnvClass::ManyBody));
     for i in 0..n_steps {
         d.apply(DynCommand::Step(1));
+        let tb = !gate && trusted_now(hs);
+        let recorded_before = hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
         let snap = d.tick(f64::INFINITY, &mut never());
+        observe(&mut baseline, tb);
+        if snap.source == Source::Fallback && which_rule(&snap.eval.notes) == "rule 4b (class LOO)" {
+            // before the refit below: the model that refused is the one judged
+            let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|x| x.pos).collect();
+            let z: Vec<u8> = snap.scene.nuclei.iter().map(|x| x.z).collect();
+            let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+            let pr = s.model().expect("a model refused").predict(&pos, &z, false).expect("predict");
+            let ratio2: Vec<f64> = pr.forces.iter().zip(&snap.forces).map(|(fm, ft)| { let (dd, b) = pol.force_residual(fm, ft); (dd / b).powi(2) }).collect();
+            noted_ratio.push((ratio2.iter().sum::<f64>() / ratio2.len() as f64).sqrt());
+            // the step's own point (one per step at most): its kind says whether the class verdict
+            // alone refused it, its classes which atoms the refusing class holds
+            let h = s.audit_history();
+            let point = if h.recorded() > recorded_before { h.iter().last().filter(|p| p.n_atoms == pos.len()) } else { None };
+            if let Some(p) = point {
+                let class_code = match p.kind {
+                    surrogate::history::PointKind::Fallback { rule } if rule == code_pair => Some(1u8),
+                    surrogate::history::PointKind::Fallback { rule } if rule == code_mb => Some(2u8),
+                    _ => None,
+                };
+                if let Some(code) = class_code {
+                    let mine: Vec<f64> = ratio2.iter().zip(&p.classes).filter(|(_, c)| **c == code).map(|(r, _)| *r).collect();
+                    if !mine.is_empty() {
+                        refused_ratio.push((mine.iter().sum::<f64>() / mine.len() as f64).sqrt());
+                    }
+                }
+            }
+        }
         let max = snap.scene.cell.max_coord();
         let worst = snap.scene.nuclei.iter().flat_map(|x| x.pos).fold(0.0f64, |m, x| m.max(x.abs()));
-        assert!(worst <= max, "{what} step {i}: a published scene is outside the margin ({worst} > {max})");
+        check!(gate, soft, worst <= max, "{what} step {i}: a published scene is outside the margin ({worst} > {max})");
         if let Some(e) = &snap.last_error {
-            assert!(e.contains("left the simulation cell"), "{what} step {i}: {e}");
+            check!(gate, soft, e.contains("left the simulation cell"), "{what} step {i}: {e}");
             stopped = Some(i);
             break;
         }
@@ -1182,7 +1241,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|x| x.pos).collect();
                 for (a, pa) in pos.iter().enumerate() {
                     let near = pos.iter().enumerate().any(|(b, pb)| b != a && (0..3).map(|k| (pa[k] - pb[k]).powi(2)).sum::<f64>() < r_cut * r_cut);
-                    assert!(near, "{what} step {i}: the model answered with atom {a} isolated: {pos:?}");
+                    check!(gate, soft, near, "{what} step {i}: the model answered with atom {a} isolated: {pos:?}");
                 }
                 if (answered - 1) % check_every != 0 { continue; }
                 let t = solve(&mut checker, &snap.scene, "on-demand check");
@@ -1214,13 +1273,13 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                     // the teacher's own total is in the breakdown (EvalStats doc)
                     Surface::Teacher => {
                         on_teacher += 1;
-                        assert_eq!(snap.energy_ks, snap.eval.energy.total, "{what} step {i}: a teacher-surface step reports the teacher's energy");
+                        check!(gate, soft, snap.energy_ks == snap.eval.energy.total, "{what} step {i}: a teacher-surface step reports the teacher's energy ({} vs {})", snap.energy_ks, snap.eval.energy.total);
                     }
                     Surface::Model => {
                         on_model_fb += 1;
                         let g = snap.teacher_gap.expect("a model-surface fallback carries its gap").abs() / n;
                         worst_fb_gap = worst_fb_gap.max(g);
-                        assert!(g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher");
+                        check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({})", which_rule(&snap.eval.notes));
                     }
                 }
             }
@@ -1236,6 +1295,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     // the grade against the outcome (the round-5 data: which γ the bad answers had)
     graded.sort_by(|a, b| a.0.total_cmp(&b.0));
     let beyond: Vec<String> = graded.iter().filter(|g| g.1 > REPRO_FORCE_RATIO || g.2 > tier).map(|g| format!("γ {:.2}: F×{:.1} ΔE/N {:.1e}", g.0, g.1, g.2)).collect();
+    let _ = writeln!(out, "    judged answers beyond 1× the force bound or the energy tier (the restated C1's scale): {} of {}", graded.iter().filter(|g| g.1 > 1.0 || g.2 > tier).count(), graded.len());
     let _ = writeln!(out, "    judged answers by grade: γ ∈ [{:.2}, {:.2}], median {:.2}; beyond the tier or 3× the force bound: {} — {}", graded.first().map_or(f64::NAN, |g| g.0), graded.last().map_or(f64::NAN, |g| g.0), graded.get(graded.len() / 2).map_or(f64::NAN, |g| g.0), beyond.len(), beyond.join("; "));
     for cut in [1.0, 1.1, 1.25, 1.5, 2.0] {
         let kept: Vec<&(f64, f64, f64)> = graded.iter().filter(|g| g.0 <= cut).collect();
@@ -1243,13 +1303,444 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         let _ = writeln!(out, "      γ ≤ {cut}: {} judged answers, worst force ratio {worst:.2}", kept.len());
     }
     for b in &bad { let _ = writeln!(out, "    BEYOND THE TIER {b}"); }
+    // the class-refused steps, judged the same way (fix rounds 1–2): was the refusal warranted?
+    let refused_rms = if refused_ratio.is_empty() { f64::NAN } else { (refused_ratio.iter().map(|x| x * x).sum::<f64>() / refused_ratio.len() as f64).sqrt() };
+    let noted_rms = if noted_ratio.is_empty() { f64::NAN } else { (noted_ratio.iter().map(|x| x * x).sum::<f64>() / noted_ratio.len() as f64).sqrt() };
+    let _ = writeln!(out, "    class-refused steps' would-be answers against the teacher — the verdict's jurisdiction (rule-4b points, codes 5/6, over the refusing class's atoms): {} steps, per-step rms ‖ΔF‖/√3 / bound {} — rms over them {refused_rms:.3} (ENTER {:.3}: the refusal is warranted beyond it)",
+                     refused_ratio.len(), quantiles(&refused_ratio), providers::surrogate::ENTER);
+    let _ = writeln!(out, "      every step with the class's note (code 21 and box-affected steps included, over every atom): {} steps, {} — rms {noted_rms:.3}", noted_ratio.len(), quantiles(&noted_ratio));
     println!("{out}");
     out.clear();
-    assert!(bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
+    check!(gate, soft, bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
     if hot {
-        assert!(checked >= REPRO_MIN_JUDGED_HOT, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected)");
+        // two-sided (the doc of `REPRO_MIN_JUDGED_HOT`): enough answers judged, or enough refusals
+        // judged and warranted — never a bare "everything was refused"
+        let warranted = refused_ratio.len() >= REPRO_MIN_JUDGED_HOT && refused_rms > providers::surrogate::ENTER;
+        check!(gate, soft, checked >= REPRO_MIN_JUDGED_HOT || warranted, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected), and the {} class-refused steps of the verdict's jurisdiction have would-be answers at rms error/bound {refused_rms:.3} (a warranted refusal needs ≥ {REPRO_MIN_JUDGED_HOT} of them beyond ENTER {:.3}; every class-noted step: {} at rms {noted_rms:.3})", refused_ratio.len(), providers::surrogate::ENTER, noted_ratio.len());
     }
-    assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
+    check!(gate, soft, max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
+    if let Some(b) = baseline {
+        let _ = writeln!(b.runs, "  {what} run: {answered} model answers, {checked} judged by the test's own checker (worst |ΔE|/N {worst_e:.2e}, worst force residual/bound {worst_f:.2}), {on_teacher} teacher-surface + {on_model_fb} model-surface fallbacks, stopped {stopped:?}; fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
+        b.notes.extend(soft);
+    }
+}
+
+// ---- M8a Task 1: the trust baseline (a measurement, never a gate) ----
+
+/// One environment class's baseline numbers for one kind of point (`TrustBaseline`): audits, or
+/// consulted-model fallbacks (fix round 1, I3).
+#[derive(Default)]
+struct ClassBaseline {
+    /// Points with at least one atom of the class, and their atoms of the class.
+    points: usize,
+    atoms: usize,
+    /// Atoms of the class whose class verdict was trusted after the step, and whose model was
+    /// untrusted before it (a sanity count for audits: an audit fires only when the model answers).
+    atoms_trusted: usize,
+    atoms_model_untrusted: usize,
+    /// Beyond the fit's in-domain LOO p99 of the class: points (any atom of the class) and atoms —
+    /// the atoms while the class verdict was trusted (the brief's "missed large error") and while
+    /// it was not. A point's atoms are not independent draws (the model's ΣF = 0: a dimer's two
+    /// atoms are one draw), so the point count is the honest one (physics review I1).
+    points_beyond: usize,
+    /// Points whose judging fit's p99 was known (a point recorded before a refit that preceded its
+    /// observation has none; `TrustBaseline::points_without_p99`).
+    points_with_p99: usize,
+    atoms_beyond_trusted: usize,
+    atoms_beyond_untrusted: usize,
+    /// Per point (the independent count) while the class verdict was trusted: the points with an
+    /// atom of the class whose judging fit's p99 was known, and those beyond it (fix round 2: the
+    /// controller's C1 acceptance, "beyond-p99-while-trusted counts per point").
+    points_trusted: usize,
+    points_beyond_trusted: usize,
+    /// The restated C1 (fix round 3, the controller's ruling): points while the class verdict was
+    /// trusted with an atom of the class judged beyond 1× its force bound (‖ΔF‖/√3 >
+    /// force_bound(|F_teacher|)) or |ΔE|/N beyond the energy tier — a missed large error when the
+    /// point is an audit (an answer the teacher judged).
+    points_beyond_bound_trusted: usize,
+    /// The in-domain LOO p99 force error of the fit that judged the newest point (finite LOO errors
+    /// only — physics review M6), the range over the fits seen, the fitted atoms of the class
+    /// behind the last one and how many of them had an undefined (∞) leave-one-out.
+    p99: f64,
+    p99_min: f64,
+    p99_max: f64,
+    p99_atoms: usize,
+    loo_undefined: usize,
+    /// Per audited atom and per point (the max over the point's atoms of the class): err/p99 and
+    /// the calibration ratio z = err/pred_force_std.
+    err_over_p99_atom: Vec<f64>,
+    err_over_p99_point: Vec<f64>,
+    z_atom: Vec<f64>,
+    z_point: Vec<f64>,
+    /// The absolute scale (physics review I2): ‖ΔF‖ per atom and per point (max), Ha/Bohr.
+    err_atom: Vec<f64>,
+    err_point: Vec<f64>,
+}
+
+/// The M8a Task 1 baseline of today's class-wise trust rule (rule 4b), measured through the
+/// provider's audit history after every step of a scenario; `report` words it. Reads only.
+struct TrustBaseline {
+    name: String,
+    /// Per class (0 pair, 1 many-body): the audit points and the fallback points.
+    audit: [ClassBaseline; 2],
+    fallback: [ClassBaseline; 2],
+    /// Fallback points by refusing rule code (`providers::surrogate::history_rule_code`).
+    fallback_rules: std::collections::BTreeMap<u8, usize>,
+    steps: usize,
+    points: usize,
+    isolated_atoms: usize,
+    /// Fits whose LOO p99 was computed (one per model generation a point named), and the points
+    /// whose judging fit was no longer current when observed (no p99 for them; z counted).
+    fits_seen: usize,
+    points_without_p99: usize,
+    p99_gen: Option<u64>,
+    /// `recorded()` of the history at the last observation (the new points since are the tail).
+    seen: u64,
+    prev_class: Option<[Option<bool>; 2]>,
+    prev_model: Option<bool>,
+    /// Consecutive-step changes of the class verdict (both steps with a verdict), per class, and
+    /// of the model-level `trusted()`; `class_entries` counts those that were untrusted → trusted
+    /// (a class earning trust, which every run must do once; the rest are losses).
+    class_flips: [usize; 2],
+    class_entries: [usize; 2],
+    model_flips: usize,
+    /// The calibrated verdict's inputs at the last observation (M8a Task 2): per class the
+    /// calibration factor κ, its evidence in points, the LOO force / energy rms ratios, the
+    /// measured force / energy errors (W, W_E; fix round 1) and the worst measured atom of the
+    /// evidence window (fix round 2) — NaN where there is no evidence.
+    calibration: [(f64, usize, f64, f64, f64, f64, f64, f64); 2],
+    /// The largest worst-atom value the class's evidence window showed over the run (fix round 2).
+    worst_atom_max: [f64; 2],
+    /// The largest rule-6/7 variance inflation λ of the class over the run (fix round 3).
+    inflation_max: [f64; 2],
+    /// Fallback points' z (max over the point's atoms of the class) by refusing rule code, per
+    /// class: the flagged tail the calibrated verdict is validated on (physics review I3).
+    z_by_rule: [std::collections::BTreeMap<u8, Vec<f64>>; 2],
+    /// Every class verdict flip, in words: the step, the class, the direction and the new verdict's
+    /// numbers (what moved it).
+    flip_log: Vec<String>,
+    /// z_E = err_energy / pred_energy_std per point, audits and fallbacks apart, and the absolute
+    /// |E_teacher − E_model|/N (Ha/atom) beside it.
+    z_energy_audit: Vec<f64>,
+    z_energy_fallback: Vec<f64>,
+    gap_audit: Vec<f64>,
+    gap_fallback: Vec<f64>,
+    unrecorded: surrogate::history::Unrecorded,
+    /// The gated assertions that did not hold in this mode, and the runs' summaries.
+    notes: Vec<String>,
+    runs: String,
+}
+
+/// Nearest-rank quantile of the finite values (sorted ascending; ∞ and NaN are dropped — physics
+/// review M6: one undefined LOO must not make the p99 ∞); NaN of an empty set.
+fn quantile(v: &[f64], q: f64) -> f64 {
+    let mut s: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+    if s.is_empty() {
+        return f64::NAN;
+    }
+    s.sort_by(|a, b| a.total_cmp(b));
+    let rank = ((q * s.len() as f64).ceil() as usize).clamp(1, s.len());
+    s[rank - 1]
+}
+
+fn rms(v: &[f64]) -> f64 {
+    let f: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+    if f.is_empty() { f64::NAN } else { (f.iter().map(|x| x * x).sum::<f64>() / f.len() as f64).sqrt() }
+}
+
+/// `quantiles` in scientific notation (absolute errors).
+fn sci(v: &[f64]) -> String {
+    let non_finite = v.iter().filter(|x| !x.is_finite()).count();
+    format!("median {:.1e}, p90 {:.1e}, max {:.1e} (n {}{})", quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1.0), v.len(), if non_finite > 0 { format!(", {non_finite} not finite") } else { String::new() })
+}
+
+fn quantiles(v: &[f64]) -> String {
+    let non_finite = v.iter().filter(|x| !x.is_finite()).count();
+    format!("median {:.2}, p90 {:.2}, max {:.2}, rms {:.2} (n {}{})", quantile(v, 0.5), quantile(v, 0.9), quantile(v, 1.0), rms(v), v.len(), if non_finite > 0 { format!(", {non_finite} not finite") } else { String::new() })
+}
+
+impl TrustBaseline {
+    fn new(name: &str) -> TrustBaseline {
+        TrustBaseline {
+            name: name.to_string(),
+            audit: Default::default(),
+            fallback: Default::default(),
+            fallback_rules: Default::default(),
+            steps: 0,
+            points: 0,
+            isolated_atoms: 0,
+            fits_seen: 0,
+            points_without_p99: 0,
+            p99_gen: None,
+            seen: 0,
+            prev_class: None,
+            prev_model: None,
+            class_flips: [0; 2],
+            class_entries: [0; 2],
+            model_flips: 0,
+            calibration: [(f64::NAN, 0, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, 1.0); 2],
+            worst_atom_max: [0.0; 2],
+            inflation_max: [1.0; 2],
+            z_by_rule: Default::default(),
+            flip_log: Vec::new(),
+            z_energy_audit: Vec::new(),
+            z_energy_fallback: Vec::new(),
+            gap_audit: Vec::new(),
+            gap_fallback: Vec::new(),
+            unrecorded: Default::default(),
+            notes: Vec::new(),
+            runs: String::new(),
+        }
+    }
+
+    /// The fit's in-domain LOO p99 force error per class (nearest rank over the fitted atoms of
+    /// the class with a finite leave-one-out; with fewer than 100 such atoms it is their maximum),
+    /// stored on both kinds' rows.
+    fn refresh_p99(&mut self, s: &SurrogateKs, gen: u64) {
+        let errs = s.loo_force_errors();
+        for c in 0..2 {
+            let v: Vec<f64> = errs.iter().filter(|(k, _)| *k as usize == c + 1).map(|(_, e)| *e).collect();
+            let undefined = v.iter().filter(|e| !e.is_finite()).count();
+            let p = quantile(&v, 0.99);
+            for b in [&mut self.audit[c], &mut self.fallback[c]] {
+                b.p99 = p;
+                b.p99_atoms = v.len();
+                b.loo_undefined = undefined;
+                if self.fits_seen == 0 {
+                    b.p99_min = p;
+                    b.p99_max = p;
+                } else if !p.is_nan() {
+                    b.p99_min = b.p99_min.min(p);
+                    b.p99_max = b.p99_max.max(p);
+                }
+            }
+        }
+        self.p99_gen = Some(gen);
+        self.fits_seen += 1;
+    }
+
+    /// After a step: the class verdicts (flips), the model's trust, and every point the step
+    /// added — each atom against the p99 of the fit that judged it (`model_gen`, asserted to be the
+    /// current one: no refit happens between a step and its observation in either scenario).
+    fn observe(&mut self, s: &SurrogateKs, trusted_before: bool) {
+        let loo = s.class_loo();
+        let verdict: [Option<bool>; 2] = [loo.first().map(|c| c.trusted), loo.get(1).map(|c| c.trusted)];
+        if let Some(prev) = self.prev_class {
+            for c in 0..2 {
+                if let (Some(a), Some(b)) = (prev[c], verdict[c]) {
+                    if a != b {
+                        self.class_flips[c] += 1;
+                        self.class_entries[c] += (!a && b) as usize;
+                        let l = &loo[c];
+                        self.flip_log.push(format!(
+                            "step {} {}: {} → {} — {:?}; measured F {:.4}× E {:.4}× worst atom {:.2}× from {} evidence (κ {:.3}, rule-6/7 inflation λ {:.3}), LOO F rms {:.4}× max {:.2}×, E rms {:.4}× max {:.2}×, {} samples, model gen {}",
+                            self.steps, l.class, if a { "trusted" } else { "untrusted" }, if b { "trusted" } else { "untrusted" }, l.refusal, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN), l.evidence, l.calibration, l.inflation, l.force_rms, l.force_max, l.energy_rms, l.energy_max, l.samples, s.model_generation()
+                        ));
+                    }
+                }
+            }
+        }
+        self.prev_class = Some(verdict);
+        for (c, l) in loo.iter().enumerate().take(2) {
+            self.calibration[c] = (l.calibration, l.evidence, l.force_rms, l.energy_rms, l.measured.unwrap_or(f64::NAN), l.measured_energy.unwrap_or(f64::NAN), l.worst_atom.unwrap_or(f64::NAN), l.inflation);
+            if l.inflation > self.inflation_max[c] || l.inflation.is_nan() {
+                self.inflation_max[c] = l.inflation;
+            }
+            if let Some(w) = l.worst_atom {
+                self.worst_atom_max[c] = if w.is_nan() || self.worst_atom_max[c].is_nan() { f64::NAN } else { self.worst_atom_max[c].max(w) };
+            }
+        }
+        let trusted = s.trusted();
+        if self.prev_model.is_some_and(|p| p != trusted) {
+            self.model_flips += 1;
+        }
+        self.prev_model = Some(trusted);
+        self.steps += 1;
+        let h = s.audit_history();
+        self.unrecorded = h.unrecorded;
+        let new = h.recorded().saturating_sub(self.seen) as usize;
+        self.seen = h.recorded();
+        let fresh: Vec<surrogate::AuditPoint> = h.iter().rev().take(new).rev().cloned().collect();
+        for p in fresh {
+            // the LOO p99 is the judging fit's (physics review M2): read only while that fit is
+            // the current one — a point recorded before a refit that preceded this observation
+            // (the repro's tail sample, recorded at generation 1 and observed after the refit to 2)
+            // has no p99 here and is counted as such; its z needs no fit
+            let p99_known = if self.p99_gen == Some(p.model_gen) {
+                true
+            } else if s.model_generation() == p.model_gen {
+                self.refresh_p99(s, p.model_gen);
+                true
+            } else {
+                self.points_without_p99 += 1;
+                false
+            };
+            self.points += 1;
+            let is_audit = p.kind.is_audit();
+            if let surrogate::history::PointKind::Fallback { rule } = p.kind {
+                *self.fallback_rules.entry(rule).or_default() += 1;
+            }
+            let rows = if is_audit { &mut self.audit } else { &mut self.fallback };
+            let mut seen_class = [false; 2];
+            let mut point_max: [(f64, f64); 2] = [(f64::NEG_INFINITY, f64::NEG_INFINITY); 2];
+            let mut point_err: [f64; 2] = [f64::NEG_INFINITY; 2];
+            let mut point_beyond = [false; 2];
+            let pol = FallbackPolicy::default();
+            let energy_beyond = p.err_energy.abs() / p.n_atoms.max(1) as f64 > pol.energy_std_per_atom || !p.err_energy.is_finite();
+            let mut point_beyond_bound = [energy_beyond; 2];
+            for j in 0..p.n_atoms {
+                let code = p.classes[j] as usize;
+                if code == 0 {
+                    self.isolated_atoms += 1;
+                    continue;
+                }
+                let c = code - 1;
+                seen_class[c] = true;
+                let b = &mut rows[c];
+                b.atoms += 1;
+                if verdict[c] == Some(true) {
+                    b.atoms_trusted += 1;
+                }
+                if !trusted_before {
+                    b.atoms_model_untrusted += 1;
+                }
+                let z = p.err_force[j] / p.pred_force_std[j];
+                point_beyond_bound[c] |= !(p.err_force[j] / 3f64.sqrt() <= pol.force_bound(p.teacher_force[j]));
+                b.z_atom.push(z);
+                b.err_atom.push(p.err_force[j]);
+                point_max[c].1 = point_max[c].1.max(z);
+                point_err[c] = point_err[c].max(p.err_force[j]);
+                if p99_known {
+                    let large = p.err_force[j] > b.p99;
+                    if verdict[c] == Some(true) {
+                        if large {
+                            b.atoms_beyond_trusted += 1;
+                        }
+                    } else if large {
+                        b.atoms_beyond_untrusted += 1;
+                    }
+                    point_beyond[c] |= large;
+                    let r = p.err_force[j] / b.p99;
+                    b.err_over_p99_atom.push(r);
+                    point_max[c].0 = point_max[c].0.max(r);
+                }
+            }
+            for c in 0..2 {
+                if seen_class[c] {
+                    if let surrogate::history::PointKind::Fallback { rule } = p.kind {
+                        self.z_by_rule[c].entry(rule).or_default().push(point_max[c].1);
+                    }
+                    let b = &mut rows[c];
+                    b.points += 1;
+                    b.z_point.push(point_max[c].1);
+                    b.err_point.push(point_err[c]);
+                    if p99_known {
+                        b.points_with_p99 += 1;
+                        b.points_beyond += point_beyond[c] as usize;
+                        b.err_over_p99_point.push(point_max[c].0);
+                        if verdict[c] == Some(true) {
+                            b.points_trusted += 1;
+                            b.points_beyond_trusted += point_beyond[c] as usize;
+                            b.points_beyond_bound_trusted += point_beyond_bound[c] as usize;
+                        }
+                    }
+                }
+            }
+            let z_e = p.err_energy / p.pred_energy_std;
+            let gap = p.err_energy.abs() / p.n_atoms.max(1) as f64;
+            if is_audit {
+                self.z_energy_audit.push(z_e);
+                self.gap_audit.push(gap);
+            } else {
+                self.z_energy_fallback.push(z_e);
+                self.gap_fallback.push(gap);
+            }
+        }
+    }
+
+    fn report(&self) -> String {
+        let mut o = String::new();
+        let u = self.unrecorded;
+        let pol = FallbackPolicy::default();
+        let _ = writeln!(o, "{}: {} steps observed, {} points recorded ({} audits, {} fallbacks; {} isolated atoms among them, no class), {} fits seen by the points ({} points recorded before a refit that preceded their observation: no p99 for them, z counted); model-level trusted() flips {}; comparisons without a point: no variance {}, box-affected {}, draft {}, unfit {}",
+                         self.name, self.steps, self.points, self.z_energy_audit.len(), self.z_energy_fallback.len(), self.isolated_atoms, self.fits_seen, self.points_without_p99, self.model_flips, u.no_variance, u.box_affected, u.draft, u.unfit);
+        o += &self.runs;
+        if !self.fallback_rules.is_empty() {
+            let _ = writeln!(o, "  fallback points by rule: {}", self.fallback_rules.iter().map(|(k, n)| format!("{n}× {}", providers::surrogate::history_rule_name(*k))).collect::<Vec<_>>().join("; "));
+        }
+        let share = |k: usize, n: usize| if n == 0 { f64::NAN } else { 100.0 * k as f64 / n as f64 };
+        for (c, name) in providers::surrogate::ENV_CLASSES.iter().enumerate() {
+            let b = &self.audit[c];
+            let _ = writeln!(o, "  {name}: in-domain LOO p99 force error {:.2e} Ha/Bohr at the last fit seen ({} fitted atoms, {} with an undefined LOO excluded; over the fits seen {:.2e}–{:.2e}); class verdict flips {} over {} consecutive-step pairs ({} of them entries untrusted → trusted, {} losses)",
+                             b.p99, b.p99_atoms, b.loo_undefined, b.p99_min, b.p99_max, self.class_flips[c], self.steps.saturating_sub(1), self.class_entries[c], self.class_flips[c] - self.class_entries[c]);
+            let (kappa, evidence, f_rms, e_rms, w_f, w_e, worst, lambda) = self.calibration[c];
+            let _ = writeln!(o, "    rule-6/7 variance inflation λ (fix round 3): {lambda:.3} at the last observation, max over the run {:.3}", self.inflation_max[c]);
+            let _ = writeln!(o, "    calibrated verdict at the last observation (M8a Task 2, fix round 2): measured F {w_f:.4}× the bound, E {w_e:.4}× the tier, worst atom {worst:.3}× from {evidence} evidence points of the window (κ {kappa:.3}); LOO F rms {f_rms:.4}× E rms {e_rms:.4}× → the verdict's force value max(LOO, measured) = {:.4}× (enter ≤ {:.3}, stay ≤ {:.1}; entry also needs worst atom ≤ {:.0}); the window's worst atom over the run: max {:.3}×",
+                             f_rms.max(w_f), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::WORST_ATOM, self.worst_atom_max[c]);
+            for (rule, zs) in &self.z_by_rule[c] {
+                let _ = writeln!(o, "    fallback z per point under {}: {}", providers::surrogate::history_rule_name(*rule), quantiles(zs));
+            }
+            for (what, b) in [("audits", &self.audit[c]), ("fallbacks", &self.fallback[c])] {
+                if b.points == 0 {
+                    let _ = writeln!(o, "    {what}: none touching the class");
+                    continue;
+                }
+                let _ = writeln!(o, "    {what}: {} points touching the class ({} atoms; {} atoms while the class verdict was trusted, {} while the model was untrusted before the step)", b.points, b.atoms, b.atoms_trusted, b.atoms_model_untrusted);
+                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (the brief's \"missed large error\"), {} while it was not",
+                                 b.points_beyond, b.points_with_p99, share(b.points_beyond, b.points_with_p99), b.points - b.points_with_p99, b.atoms_beyond_trusted, b.atoms_trusted, share(b.atoms_beyond_trusted, b.atoms_trusted), b.atoms_beyond_untrusted);
+                let _ = writeln!(o, "      per point while the class verdict was trusted: {} beyond the p99 (the generalisation-gap statistic), {} beyond 1× the force bound or the energy tier (the restated C1, fix round 3), of {} points", b.points_beyond_trusted, b.points_beyond_bound_trusted, b.points_trusted);
+                let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
+                let _ = writeln!(o, "      ‖ΔF‖ per point (max over its atoms), Ha/Bohr: {}; per atom: {} — the audit's force tolerance is max({:.0e}, 10 % |F|) ≤ {:.0e} Ha/Bohr", sci(&b.err_point), sci(&b.err_atom), pol.force_std_abs, providers::surrogate::FORCE_STD_BOUND_MAX);
+                let _ = writeln!(o, "      z = ‖ΔF‖/pred_force_std per point (max over its atoms): {}; per atom: {}", quantiles(&b.z_point), quantiles(&b.z_atom));
+            }
+        }
+        if !self.flip_log.is_empty() {
+            let _ = writeln!(o, "  class verdict flips, each with the new verdict's numbers:");
+            for f in &self.flip_log {
+                let _ = writeln!(o, "    {f}");
+            }
+        }
+        let _ = writeln!(o, "  energy z_E = (E_teacher − E_model)/pred_energy_std — audits: {}; fallbacks: {}", quantiles(&self.z_energy_audit), quantiles(&self.z_energy_fallback));
+        let _ = writeln!(o, "  energy |E_teacher − E_model|/N, Ha/atom — audits: {}; fallbacks: {} — the tier is {:.0e} Ha/atom", sci(&self.gap_audit), sci(&self.gap_fallback), pol.energy_std_per_atom);
+        if !self.notes.is_empty() {
+            let _ = writeln!(o, "  gated assertions that did not hold under these audits ({}):", self.notes.len());
+            for n in &self.notes {
+                let _ = writeln!(o, "    {n}");
+            }
+        }
+        o
+    }
+}
+
+/// The measurement's audit cadence: the brief's `AUDIT_EVERY` = 50 answered steps, or
+/// `BASELINE_AUDIT_EVERY` (a supplementary run at a denser cadence gives the calibration more
+/// points: the repro's model answers only 3–9 % of its steps after the edit).
+fn baseline_audit_every() -> usize {
+    std::env::var("BASELINE_AUDIT_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&k| k > 0).unwrap_or(AUDIT_EVERY)
+}
+
+/// M8a Task 1, Step 5 — the trust baseline (module doc; `references.md`, "M8a trust baseline"):
+/// `cargo test -p validate --release --test surrogate trust_baseline_report -- --ignored --nocapture`
+/// (`BASELINE_AUDIT_EVERY=10` for the supplementary dense-cadence run). Writes the report to the
+/// gitignored `last-run-trust-baseline-every<k>.md` as well (one file per cadence, physics review M4).
+#[test]
+#[ignore = "measurement (M8a Task 1): cargo test -p validate --release --test surrogate trust_baseline_report -- --ignored --nocapture"]
+fn trust_baseline_report() {
+    let Some(ctx) = gpu() else { return };
+    let t = Instant::now();
+    let every = baseline_audit_every();
+    let mut repro = TrustBaseline::new(&format!("stuck_escape_repro (NVE, then hot; {} steps each after the edit) with an in-step audit every {every} answered steps", repro_steps()));
+    stuck_escape_repro_with(&[false, true], every, Some(&mut repro));
+    let mut al = TrustBaseline::new(&format!("active_learning_run ({AL_STEPS} steps, audit every {every})"));
+    active_learning_run(Some(&mut al), every);
+    let mut out = String::new();
+    let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 3 — the measured error with the LOO floor over an evidence window of model generations, the worst-atom guard on entry, rules 6/7 inflated by the class's λ; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0}, WINDOW_POINTS {})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM, providers::surrogate::WINDOW_POINTS);
+    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
+    out += &repro.report();
+    out += &al.report();
+    println!("{out}");
+    let path = format!("{}/last-run-trust-baseline-every{every}.md", env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(&path, &out).unwrap_or_else(|e| panic!("writing {path}: {e}"));
 }
 
 /// M6 Task 11, requirement 6 — a measurement, not a pass/fail gate (run with `--ignored

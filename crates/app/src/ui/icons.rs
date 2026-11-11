@@ -34,6 +34,8 @@ pub enum Icon {
     Sliders,
     /// A window with an arrow leaving it (the capture's pop-out view).
     PopOut,
+    /// A folded map (the Knowledge tab).
+    Knowledge,
 }
 
 /// Paints `icon` into `rect` in `colour`.
@@ -170,6 +172,11 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(&[(10.5, 5.0), (5.0, 5.0), (5.0, 19.0), (19.0, 19.0), (19.0, 13.5)]);
             line(&[(11.0, 13.0), (19.5, 4.5)]);
             line(&[(13.5, 4.5), (19.5, 4.5), (19.5, 10.5)]);
+        }
+        Icon::Knowledge => {
+            closed(&[(3.0, 6.5), (9.0, 4.0), (15.0, 6.5), (21.0, 4.0), (21.0, 17.5), (15.0, 20.0), (9.0, 17.5), (3.0, 20.0)]);
+            line(&[(9.0, 4.0), (9.0, 17.5)]);
+            line(&[(15.0, 6.5), (15.0, 20.0)]);
         }
     }
 }

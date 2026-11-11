@@ -480,7 +480,7 @@ fn body3_columns_are_their_own_classes_lambda_zero_rank_test() {
     for _ in 0..60 {
         let pos = random_cluster(&mut rng, &z, 5.0, 0.9, basis.r_cut);
         let (e, f) = energy_and_forces(&teacher, &pos, &z).unwrap();
-        let s = Sample { pos, z: z.clone(), energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 };
+        let s = Sample { pos, z: z.clone(), energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true };
         acc.add(&s, &basis, &teacher.ref_energy, &opts).unwrap();
         store.push(s).unwrap();
     }
@@ -690,6 +690,7 @@ fn h3plus_fixture() -> Fixture {
             forces: vec![[c[10], c[11], c[12]], [c[13], c[14], c[15]], [c[16], c[17], c[18]]],
             tag: SampleTag::Perturbation,
             weight: 1.0,
+            force_mask: None, use_energy: true,
         })
         .collect();
     Fixture { reference_h, geometries }
@@ -1053,7 +1054,7 @@ fn n_max_short_bond_probe() {
             })
             .collect();
         let (e, f) = teacher(&pos);
-        geoms.push(Sample { pos, z: z.clone(), energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 });
+        geoms.push(Sample { pos, z: z.clone(), energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true });
     }
     let (train, held) = geoms.split_at(150);
     let mut store = SampleStore::new(provenance());

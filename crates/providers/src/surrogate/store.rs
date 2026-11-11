@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// `s` as the scene teaches it (M8a Task 10, ruling P10): a capped segment's scene
+/// (`Scene::train_mask`, one entry per nucleus — the sample's atoms) masks the sample's forces to
+/// its interior atoms and leaves its energy unfitted; any other scene leaves the sample as it is.
+pub(super) fn masked_by(mut s: Sample, scene: &Scene) -> Sample {
+    if let Some(m) = scene.train_mask().filter(|m| m.len() == s.pos.len()) {
+        s.force_mask = Some(m.to_vec());
+        s.use_energy = false;
+    }
+    s
+}
+
 impl SurrogateKs {
     /// Samples held (fallback steps and `add_sample`).
     pub fn samples(&self) -> usize {
@@ -15,13 +26,13 @@ impl SurrogateKs {
     /// settings the sample was produced at (its provenance); the first sample pins the store's.
     pub fn add_sample(&mut self, s: Sample, scene: &Scene) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
-        self.add_sample_with_provenance(s, &prov)
+        self.add_sample_with_provenance(masked_by(s, scene), &prov)
     }
 
     /// The primitive behind [`add_sample`](Self::add_sample): a sample with the provenance it
     /// was produced at (what a sidecar stores).
     pub fn add_sample_with_provenance(&mut self, s: Sample, prov: &Provenance) -> Result<(), StoreError> {
-        self.push_sample(s, prov, f64::NAN)
+        self.push_sample(s, prov, f64::NAN, None)
     }
 
     /// [`add_sample`](Self::add_sample) with the teacher's reported face density
@@ -31,15 +42,32 @@ impl SurrogateKs {
     /// density, never quarantine candidates, excluded from the fit once the trust floor is met
     /// without them.
     pub fn add_sample_with_face(&mut self, s: Sample, scene: &Scene, face: Option<f64>) -> Result<(), StoreError> {
+        self.add_sample_answer(s, scene, face, None)
+    }
+
+    /// [`add_sample_with_face`](Self::add_sample_with_face) with the multiplicity the teacher solved
+    /// at (`EvalStats::multiplicity`): what the sampling pass hands over. In collection mode both are
+    /// recorded with the sample (`shared` module doc).
+    pub fn add_sample_answer(&mut self, s: Sample, scene: &Scene, face: Option<f64>, multiplicity: Option<u32>) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
-        self.push_sample(s, &prov, face.unwrap_or(f64::NAN))
+        self.push_sample(masked_by(s, scene), &prov, face.unwrap_or(f64::NAN), multiplicity)
     }
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
     /// by the teacher, never a table). A change after a fit rebuilds the accumulator at the next
     /// refit. The caller vouches that `e` follows the reference rule (ruling S9: the atom's
     /// lowest-energy multiplicity — what `crate::sampling` computes); the sidecar records it.
+    /// In collection mode this is a session-only value (no box is recorded with it):
+    /// [`set_reference_solved`](Self::set_reference_solved) is the collection's setter.
     pub fn set_reference_energy(&mut self, z: u8, e: f64) {
+        if self.shared.is_some() {
+            // collection mode: a reference is per box (`shared` module doc, "References per box")
+            self.user_notes.push(format!(
+                "shared collection: a {} reference without its box ({e:.6} Ha) is not used — references are per box; a sampling pass solves them",
+                symbol(z)
+            ));
+            return;
+        }
         self.legacy_refs.remove(&z);
         self.failed_refs.remove(&z);
         if self.refs.insert(z, e) != Some(e) {
@@ -74,6 +102,13 @@ impl SurrogateKs {
     /// teacher surface without a jump and the driver restarts its conserved-energy history
     /// (the honest outcome: the surface the invariant lived on is gone).
     pub fn forget(&mut self) {
+        // a shared collection is let go (written and released), never cleared: it is on disk for
+        // every scene of its surface (`shared` module doc)
+        self.detach_collection();
+        self.source_file = None;
+        self.specialised.clear();
+        self.collection_note.clear();
+        self.offset_jump = 0.0;
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         if self.trusted() || was_model {
             self.epoch += 1;
@@ -96,6 +131,8 @@ impl SurrogateKs {
         self.audit_force = None;
         self.training_residuals = None;
         self.class_loo = Vec::new();
+        self.class_memory = BTreeMap::new();
+        self.class_judge = None;
         self.class_worst = Vec::new();
         self.class_blockers = Vec::new();
         self.teach_rounds.clear();
@@ -114,6 +151,7 @@ impl SurrogateKs {
         self.last_variance = None;
         self.answered = 0;
         self.quarantine.clear();
+        self.lone_codes.clear();
         self.face.clear();
         self.fence_votes.clear();
         self.fence_kept.clear();
@@ -128,6 +166,7 @@ impl SurrogateKs {
         self.reset_audits();
         // a new model's lifetime starts here (the queued events stay: they happened)
         self.ledger.counts = SolveCounts::default();
+        self.audit_history = surrogate::AuditHistory::default();
     }
 
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
@@ -137,12 +176,21 @@ impl SurrogateKs {
     /// formed (module doc, "No model yet") the samples alone, with the reference energies known
     /// (`surrogate::sidecar` version 6). `InvalidInput` with no samples at all.
     pub fn save_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(sh) = &self.shared {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("the shared collection {} saves itself as it learns ({}); a model file of it is a specialised model", sh.coll.key.slug(), sh.coll.folder().display()),
+            ));
+        }
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it)
-        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT).unwrap_or(Q_NONE)).collect();
-        // the face densities only when one matters (a file is otherwise unchanged)
-        let face: Vec<f64> = if (0..samples.len()).any(|i| self.is_box(i)) {
+        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it); a
+        // lone sample (`Q_LONE`, provider-only) writes the code it was loaded with
+        let flags: Vec<u8> = (0..samples.len()).map(|i| self.persisted_code(i)).collect();
+        // the face densities whenever one is known (M8a Task 4a: a collection imports a sample only
+        // when its box status can be judged — `surrogate::collection`, "Admission"; before, the
+        // array was written only when a sample was box-affected, so a clean file read as unknown)
+        let face: Vec<f64> = if (0..samples.len()).any(|i| self.is_box(i) || self.face.get(i).is_some_and(|f| f.is_finite())) {
             (0..samples.len()).map(|i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect()
         } else {
             Vec::new()
@@ -162,6 +210,9 @@ impl SurrogateKs {
                 reference_rule: rule.map(str::to_string),
                 quarantine: flags,
                 face_density: face,
+                sample_box: Vec::new(),
+                specialised: Vec::new(),
+                box_references: Vec::new(),
                 teacher_solves: Some(solves),
                 teacher_solves_note: None,
                 created_by: surrogate::sidecar::CREATED_BY.to_string(),
@@ -182,7 +233,9 @@ impl SurrogateKs {
             pair: c.pair,
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
-        surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
+        // and the audit history (version 7, M8a Task 1) with the class verdict's hysteresis memory
+        // (M8a Task 2 fix round 2: a reload keeps a verdict inside the band)
+        surrogate::sidecar::write_full_with_memory(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory.iter().map(|(k, &(t, g))| (k.clone(), t, g)).collect::<Vec<_>>())
     }
 
     /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
@@ -216,6 +269,10 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        // samples of lone atoms kept before the keep rule refused them: held out (`Q_LONE`)
+        let r_cut = self.cutoff();
+        let lone = self.hold_out_lone(r_cut);
+        self.note_lone_held_out("model file", lone, r_cut);
         // references of another rule are not fitted on (a new fit would bake them in — the model has
         // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
         let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
@@ -259,7 +316,10 @@ impl SurrogateKs {
     /// count starting at zero, with a note for the unreadable one), set only once the install
     /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, .. } = sc;
+        // a model file is a per-scene model: a shared collection is let go (`shared` module doc;
+        // `Trainable::load` keeps the handle to restore it when the install fails)
+        self.detach_collection();
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -281,6 +341,35 @@ impl SurrogateKs {
         }
         if model.ref_energy.len() != model.basis.n_species() {
             return Err("the file's reference energies do not match its species".into());
+        }
+        // samples of lone atoms kept before the keep rule refused them are held out (`Q_LONE`,
+        // below). A fit that cannot form without them leaves the file's samples installed with no
+        // model — the no-model case of a samples file (`install_samples`), which this set is
+        let lone_cut = model.basis.r_cut;
+        let lone_fallback = samples.iter().any(|s| no_neighbours(&s.pos, lone_cut)).then(|| surrogate::SampleSet {
+            provenance: model.provenance.clone(),
+            samples: samples.clone(),
+            references: model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect(),
+            reference_rule: reference_rule.clone(),
+            quarantine: quarantine.clone(),
+            face_density: face_density.clone(),
+            sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves,
+            teacher_solves_note: teacher_solves_note.clone(),
+            created_by: surrogate::sidecar::CREATED_BY.to_string(),
+        });
+        if let Some(set) = lone_fallback.as_ref() {
+            let usable = (0..set.samples.len())
+                .filter(|&i| !no_neighbours(&set.samples[i].pos, lone_cut) && set.samples[i].tag != SampleTag::DraftAudit && set.quarantine.get(i).is_none_or(|&q| q == Q_NONE))
+                .count();
+            if usable == 0 {
+                let set = lone_fallback.expect("checked");
+                self.install_samples(set)?;
+                self.user_notes.push("model file: besides its lone atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
+                return Ok(());
+            }
         }
         // a draft guess's audit is held out of the fit (`Q_DRAFT`): restored from its tag
         let mut quarantine = quarantine;
@@ -324,6 +413,10 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        self.lone_codes.clear();
+        // the lone samples the file's fit held (`Q_LONE`; the prefix above is the file's own)
+        let lone = self.hold_out_lone(lone_cut);
+        let lone_in_fit = self.lone_codes.iter().filter(|&(&i, &q)| i < self.accumulated && q == Q_NONE).count();
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
@@ -335,15 +428,29 @@ impl SurrogateKs {
         self.since_kept = THIN_EVERY;
         self.recovery = None;
         self.reset_audits();
+        // the file's audit history is the installed model's (M8a Task 1); its points' generations
+        // and the saved verdicts' `trusted_since` are the writer's, so this provider's generation
+        // moves past all of them — the calibrated verdict's evidence window compares generations
+        // as numbers (`calibrate`, "The evidence window"; M8a Task 2 fix round 2)
+        let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.2)).max().unwrap_or(0);
+        self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);
         self.fits += 1;
         // readouts (activity Task 4 review): the views' cache key and their `Fitted`
-        self.model_gen += 1;
+        self.model_gen = self.model_gen.max(newest) + 1;
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
+        // the hysteresis memory is the file's own, saved with the model (M8a Task 2 fix round 2,
+        // the task review's M4): a reload, the worker's re-spawn with its carried model and a
+        // resumed training keep a verdict that sat inside the band (ENTER, LEAVE]; a file without
+        // one (or of another shape) starts without a memory and a band verdict re-enters
+        self.class_loo = Vec::new();
+        self.class_memory = class_memory.into_iter().map(|(k, t, g)| (k, (t, g))).collect();
+        self.class_judge = None;
         self.refresh_class_loo();
+        self.commit_class_memory();
         self.rebuild_active_set();
         // round 1, SHOULD-4: the reconstructed fit membership must be the fit's own — a release
         // between a fit and a save (Q_HELD → Q_NONE) shifts the prefix and would give a non-member
@@ -381,12 +488,28 @@ impl SurrogateKs {
             (s.yy_e, s.yy_f)
         });
         let (want_n, want_rows) = self.report.as_ref().map_or((members, rows), |r| (r.n_samples, r.n_rows));
-        if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
+        if lone_in_fit > 0 {
+            // the file's fit used them: rebuilt from its stored samples without them (no DFT); a
+            // fit that cannot form leaves the samples with no model (the no-model case; its own
+            // install notes the lone samples)
+            self.species_dirty = true;
+            if let Err(e) = self.fit_store() {
+                self.install_samples(lone_fallback.expect("lone samples were found"))?;
+                self.user_notes.push(format!("model file: its fit cannot be rebuilt without its {lone_in_fit} lone-atom samples ({e}) — its samples are installed with no model yet"));
+                return Ok(());
+            }
+            self.note_lone_held_out("model file", lone, lone_cut);
+            self.user_notes.push(format!("model file: its fit used {lone_in_fit} of them — rebuilt from its stored samples without them (no DFT)"));
+        } else if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
             self.species_dirty = true;
             self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
             self.user_notes.push(format!(
                 "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums — the fit was rebuilt from its stored samples (no DFT)"
             ));
+        }
+        if lone_in_fit == 0 {
+            // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
+            self.note_lone_held_out("model file", lone, lone_cut);
         }
         // round 1, SHOULD-2: the failed audits it still held, re-judged on this fit (not counted
         // as a refit's re-judgement)
@@ -447,9 +570,20 @@ impl SurrogateKs {
         }
     }
 
-    /// Into the store (created with `prov` if absent); marks the basis dirty for a new species.
-    pub(super) fn push_sample(&mut self, s: Sample, prov: &Provenance, face: f64) -> Result<(), StoreError> {
+    /// Into the store (created with `prov` if absent); marks the basis dirty for a new species. In
+    /// collection mode the check is the collection's surface-key check and the sample is offered
+    /// to the collection with the solved `multiplicity` (`shared` module doc).
+    pub(super) fn push_sample(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>) -> Result<(), StoreError> {
         let z = s.z.clone();
+        if self.shared.is_some() {
+            self.push_shared(s, prov, face, multiplicity)?;
+            if let Some(acc) = &self.accumulator {
+                if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
+                    self.species_dirty = true;
+                }
+            }
+            return Ok(());
+        }
         let n = self.store.as_ref().map_or(0, |st| st.len());
         if !self.quarantine.is_empty() {
             self.quarantine.resize(n, Q_NONE);
@@ -479,11 +613,24 @@ impl SurrogateKs {
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
     /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
+    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, multiplicity: Option<u32>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
+        self.keep_sample_masked(pos, z, energy, forces, face, multiplicity, prov, tag, None, notes)
+    }
+
+    /// [`keep_sample`](Self::keep_sample) for a capped segment's answer (M8a Task 10, ruling P10;
+    /// module doc "Masked scenes"): with `mask` the sample's force mask is the scene's training
+    /// mask and its energy is not fitted (it holds the caps).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn keep_sample_masked(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, multiplicity: Option<u32>, prov: &Provenance, tag: SampleTag, mask: Option<&[bool]>, notes: &mut Vec<String>) -> bool {
+        if no_neighbours(pos, self.cutoff()) {
+            notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
+            return false;
+        }
         self.since_kept = 0;
-        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
-        match self.push_sample(sample, prov, face.unwrap_or(f64::NAN)) {
+        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0, force_mask: mask.map(<[bool]>::to_vec), use_energy: mask.is_none() };
+        match self.push_sample(sample, prov, face.unwrap_or(f64::NAN), multiplicity) {
             Ok(()) => {
+                notes.extend(std::mem::take(&mut self.collection_note));
                 if tag == SampleTag::DraftAudit {
                     // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
                     let n = self.samples();
@@ -495,7 +642,10 @@ impl SurrogateKs {
                 true
             }
             Err(e) => {
-                notes.push(format!("surrogate: sample not kept ({e})"));
+                notes.push(match self.collection_refuses(prov) {
+                    Some(why) => format!("surrogate: sample not kept — {why}"),
+                    None => format!("surrogate: sample not kept ({e})"),
+                });
                 false
             }
         }
@@ -512,8 +662,10 @@ impl SurrogateKs {
         pos: &[[f64; 3]],
         z: &[u8],
         energy: f64,
+        raw_energy: f64,
         forces: &[[f64; 3]],
         face: Option<f64>,
+        multiplicity: Option<u32>,
         model: Option<(f64, &[[f64; 3]])>,
         near: &[usize],
         keep: bool,
@@ -523,6 +675,7 @@ impl SurrogateKs {
         prov: &Provenance,
         unfit: Option<&str>,
         tag: SampleTag,
+        mask: Option<&[bool]>,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
         // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
@@ -531,8 +684,20 @@ impl SurrogateKs {
             notes.push(format!("surrogate: sample not kept ({why} — spec §5.6)"));
             return TeachOutcome::UnfitNotKept;
         }
-        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
-        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, tag, notes) {
+        // no atom with a neighbour within r_cut: nothing to learn, only an isolated atom's grid/box
+        // artefacts (`no_neighbours`) — used for its step, never kept, before `admit` touches anything
+        if no_neighbours(pos, self.cutoff()) {
+            notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
+            return TeachOutcome::LoneNotKept;
+        }
+        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, mask, notes);
+        // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
+        // the canonical surface for the comparisons; `raw_energy` exactly as solved — fix round 3,
+        // no round trip, so the duplicate check sees the teacher's bits)
+        let refused = a.kept && !self.keep_sample_masked(pos, z, raw_energy, forces, face, multiplicity, prov, tag, mask, notes);
+        // admit may have released or superseded fenced samples: their statuses go to the collection
+        self.sync_collection_status();
+        if refused {
             return TeachOutcome::StoreRefused;
         }
         a.outcome

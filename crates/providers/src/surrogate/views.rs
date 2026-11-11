@@ -187,11 +187,11 @@ impl SurrogateKs {
             }
         }
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
+        if let Some((r, _)) = self.class_untrusted(&env_keys(pos, z, rc2)) {
             return Err(code(r));
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, pred, e, f);
+            let v = self.variance_check(model, pred, e, f, pos, z);
             if !v.accept {
                 return Err(code(v.reason.expect("a refusing variance verdict names its rule")));
             }
@@ -277,7 +277,7 @@ impl SurrogateKs {
                         // `max_nan`: a NaN variance stays NaN (Task 3b), never a zero band
                         c.sigma.push(max_nan(e * e - floor2 * floor2, 0.0).sqrt());
                         // rule 6's ratio: max over the atoms of σ_F,epi/(√3 · bound) (plan review M5)
-                        c.force_ratio.push(self.variance_check(model, &p, e, f).atoms.iter().copied().fold(0.0, max_nan));
+                        c.force_ratio.push(self.variance_check(model, &p, e, f, &pos, &zs).atoms.iter().copied().fold(0.0, max_nan));
                     }
                     c.middle.push(self.verdict_middle(model, &pos, &zs, &p).err().map(|e| e.0));
                     c.r.push(x);
@@ -297,6 +297,10 @@ impl SurrogateKs {
                 Q_SUPERSEDED => SampleState::Superseded,
                 Q_BOX => SampleState::BoxExcluded,
                 Q_DRAFT => SampleState::HeldOut,
+                // lone atoms loaded from before the keep rule: held out for good
+                Q_LONE => SampleState::Lone,
+                // waiting for its box's reference (collection mode): not in the fit yet
+                Q_REF_WAIT => SampleState::Unfitted,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`
@@ -331,9 +335,13 @@ impl SurrogateKs {
             }
             let n = smp.pos.len() as f64;
             let st = state(i);
-            parity_energy.push(ParityPoint { dft: (smp.energy - eref) / n, model: (pred.energy - eref) / n, kind: kind(smp.tag), state: st, index: i });
+            // a capped segment (M8a Task 10): no energy point (its energy is not fitted: it holds
+            // the caps), the interior atoms' forces only
+            if smp.use_energy {
+                parity_energy.push(ParityPoint { dft: (smp.energy - eref) / n, model: (pred.energy - eref) / n, kind: kind(smp.tag), state: st, index: i });
+            }
             if st == SampleState::Fitted {
-                for (ft, fm) in smp.forces.iter().zip(&pred.forces) {
+                for (_, (ft, fm)) in smp.forces.iter().zip(&pred.forces).enumerate().filter(|(j, _)| smp.trains_atom(*j)) {
                     force_atoms.push([0, 1, 2].map(|a| [ft[a] as f32, fm[a] as f32]));
                 }
             }

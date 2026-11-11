@@ -30,7 +30,14 @@
 //!
 //! The hyperparameters are not re-estimated without the sample (the evidence's λ and σ move by
 //! O(1/n)); that is the standard closed-form LOO, and what "how well would this fit predict a
-//! sample it has not seen" needs. Cost per sample: m triangular solve pairs of size Q′ (A⁻¹Φ_sᵀ,
+//! sample it has not seen" needs.
+//!
+//! **Masked samples** (M8a Task 10; `fit` module doc, "Masked samples"): the left-out block is the
+//! rows the sample put into the fit — its energy row only when `use_energy`, the force rows only
+//! of its masked-in (interior) atoms — so m = [use_energy] + 3·n_interior. [`SampleLoo`] then has
+//! no energy residual (`None`) for a sample whose energy was not fitted and none for a masked-out
+//! atom (a cap or an edge atom is not a training point: every consumer — the class and key
+//! statistics, the LOO RMS, an audit's re-judgement — skips it). Cost per sample: m triangular solve pairs of size Q′ (A⁻¹Φ_sᵀ,
 //! O(m Q′²)), the m × m block and its solve O(m²Q′ + m³) — for H₂ (m = 7, Q′ = 29) ≈ 2·10⁴
 //! flops, for an S = 2 sample of 3 atoms (m = 10, Q′ = 176) ≈ 6·10⁵: a store of a few hundred
 //! samples costs milliseconds per refit.
@@ -41,11 +48,13 @@ use crate::linalg::cholesky_solve;
 use crate::model::Model;
 
 /// A sample's leave-one-out residuals (y − prediction of the fit without it): the energy per
-/// atom (Hartree per atom when the fit is per atom, else Hartree) and the forces (Hartree/Bohr).
+/// atom (Hartree per atom when the fit is per atom, else Hartree) and the forces (Hartree/Bohr) —
+/// of the rows the sample was fitted with: `energy` is `None` when its energy was not fitted,
+/// `forces[j]` `None` for an atom its force mask leaves out (module doc, "Masked samples").
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleLoo {
-    pub energy: f64,
-    pub forces: Vec<[f64; 3]>,
+    pub energy: Option<f64>,
+    pub forces: Vec<Option<[f64; 3]>>,
 }
 
 /// The standardised reduced design rows of a geometry exactly as `fit::Accumulator::add` builds
@@ -152,21 +161,32 @@ pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
     let (e_row, f_rows) = design_rows(model, &sample.pos, &sample.z).ok()?;
     let q = e_row.len();
     let n = sample.pos.len();
-    let m = 1 + 3 * n;
+    // the rows the sample was fitted with (module doc, "Masked samples")
+    let taught: Vec<usize> = (0..n).filter(|&j| sample.trains_atom(j)).collect();
+    let ne = usize::from(sample.use_energy);
+    let m = ne + 3 * taught.len();
+    if m == 0 {
+        return None;
+    }
     // in-sample residuals y − Φθ, from the model's own predictions (the same rows, expanded)
     let pred = model.predict(&sample.pos, &sample.z, false).ok()?;
     let per = if model.energy_per_atom { 1.0 / n as f64 } else { 1.0 };
     let mut e = Vec::with_capacity(m);
-    e.push((sample.energy - pred.energy) * per);
-    for j in 0..n {
+    if sample.use_energy {
+        e.push((sample.energy - pred.energy) * per);
+    }
+    for &j in &taught {
         for a in 0..3 {
             e.push(sample.forces[j][a] - pred.forces[j][a]);
         }
     }
     let w_e = sample.weight / (model.sigma_e * model.sigma_e);
     let w_f = sample.weight / (model.sigma_f * model.sigma_f);
-    let rows: Vec<&[f64]> = std::iter::once(&e_row[..]).chain(f_rows.iter().map(|r| &r[..])).collect();
-    let w: Vec<f64> = std::iter::once(w_e).chain(std::iter::repeat_n(w_f, 3 * n)).collect();
+    let rows: Vec<&[f64]> = std::iter::once(&e_row[..])
+        .take(ne)
+        .chain(taught.iter().flat_map(|&j| (0..3).map(move |a| 3 * j + a)).map(|r| &f_rows[r][..]))
+        .collect();
+    let w: Vec<f64> = std::iter::once(w_e).take(ne).chain(std::iter::repeat_n(w_f, 3 * taught.len())).collect();
     // Z = A⁻¹Φᵀ, column by column
     let z: Vec<Vec<f64>> = rows
         .iter()
@@ -185,7 +205,12 @@ pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
         }
     }
     let r = solve_small(ih, e, m)?;
-    Some(SampleLoo { energy: r[0], forces: (0..n).map(|j| [r[1 + 3 * j], r[2 + 3 * j], r[3 + 3 * j]]).collect() })
+    let mut forces = vec![None; n];
+    for (t, &j) in taught.iter().enumerate() {
+        let b = ne + 3 * t;
+        forces[j] = Some([r[b], r[b + 1], r[b + 2]]);
+    }
+    Some(SampleLoo { energy: sample.use_energy.then(|| r[0]), forces })
 }
 
 #[cfg(test)]
@@ -233,7 +258,15 @@ mod tests {
                     *x += 1e-3 * (rnd() - 0.5);
                 }
             }
-            samples.push(Sample { pos, z: vec![1; n], energy: e, forces: f, tag: SampleTag::Scan, weight: 0.5 + rnd() });
+            // M8a Task 10: every fourth sample is masked as a segment would be (atom 1 not taught,
+            // no energy), every fifth keeps its energy with atom 0 masked out
+            let force_mask = match i {
+                _ if i % 4 == 1 => Some((0..n).map(|k| k != 1).collect()),
+                _ if i % 5 == 2 => Some((0..n).map(|k| k != 0).collect()),
+                _ => None,
+            };
+            let use_energy = i % 4 != 1;
+            samples.push(Sample { pos, z: vec![1; n], energy: e, forces: f, tag: SampleTag::Scan, weight: 0.5 + rnd(), force_mask, use_energy });
         }
         // pinned hyperparameters with a moderate ridge: the brute-force side (an explicit A₋ and a
         // dense solve) is only as good as A₋'s conditioning, so the comparison runs where that is
@@ -254,7 +287,9 @@ mod tests {
     /// independent refit: the weights come from the same model on both sides): A₋ = L Lᵀ −
     /// Φ_sᵀW_sΦ_s, b = A θ (θ the model's standardised coefficients, S = 1: no ties), θ₋ =
     /// A₋⁻¹(b − Φ_sᵀW_s y_s), r = y_s − Φ_sθ₋, for every sample of a small mixed dimer/trimer
-    /// store (noisy, weighted rows, so H_ss is far from 0).
+    /// store (noisy, weighted rows, so H_ss is far from 0). Masked samples (M8a Task 10) are left
+    /// out by their fitted rows only, and report no energy residual without an energy row and no
+    /// force residual for a masked-out atom.
     #[test]
     fn loo_matches_a_downdate_of_the_fit() {
         let (basis, prov, samples, opts) = fixture();
@@ -271,15 +306,26 @@ mod tests {
         let theta: Vec<f64> = model.coeffs[0].clone();
         let b: Vec<f64> = (0..q).map(|i| (0..q).map(|j| a[i * q + j] * theta[j]).sum()).collect();
         let (mut worst, mut max_h) = (0.0f64, 0.0f64);
+        let mut masked = 0;
         for s in &samples {
             let loo = leave_one_out(&model, s).expect("loo");
             let ins = model.predict(&s.pos, &s.z, false).unwrap();
-            max_h = max_h.max((loo.forces[0][0] - (s.forces[0][0] - ins.forces[0][0])).abs());
+            let j0 = (0..s.pos.len()).find(|&j| s.trains_atom(j)).unwrap();
+            max_h = max_h.max((loo.forces[j0].unwrap()[0] - (s.forces[j0][0] - ins.forces[j0][0])).abs());
+            assert_eq!(loo.energy.is_some(), s.use_energy, "an energy residual exactly when the energy was fitted");
+            for (j, f) in loo.forces.iter().enumerate() {
+                assert_eq!(f.is_some(), s.trains_atom(j), "a force residual exactly for a fitted atom");
+            }
+            masked += usize::from(!s.is_whole());
             let (er, fr) = design_rows(&model, &s.pos, &s.z).unwrap();
             let n = s.pos.len();
-            let rows: Vec<Vec<f64>> = std::iter::once(er).chain(fr).collect();
-            let y: Vec<f64> = std::iter::once((s.energy + 0.5 * n as f64) / n as f64).chain(s.forces.iter().flat_map(|f| f.iter().copied())).collect();
-            let w: Vec<f64> = std::iter::once(s.weight / model.sigma_e.powi(2)).chain(std::iter::repeat_n(s.weight / model.sigma_f.powi(2), 3 * n)).collect();
+            // the rows the sample was fitted with
+            let rows: Vec<Vec<f64>> = std::iter::once(er).filter(|_| s.use_energy).chain(fr.into_iter().enumerate().filter(|(r, _)| s.trains_atom(r / 3)).map(|(_, row)| row)).collect();
+            let y: Vec<f64> = std::iter::once((s.energy + 0.5 * n as f64) / n as f64)
+                .filter(|_| s.use_energy)
+                .chain(s.forces.iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).flat_map(|(_, f)| f.iter().copied()))
+                .collect();
+            let w: Vec<f64> = std::iter::once(s.weight / model.sigma_e.powi(2)).filter(|_| s.use_energy).chain(std::iter::repeat_n(s.weight / model.sigma_f.powi(2), 3 * s.trained_atoms())).collect();
             let mut am = a.clone();
             let mut bm = b.clone();
             for (r, (row, (&wr, &yr))) in rows.iter().zip(w.iter().zip(&y)).enumerate() {
@@ -293,14 +339,16 @@ mod tests {
             }
             let th = solve_small(am, bm, q).expect("A₋ invertible");
             let brute: Vec<f64> = rows.iter().zip(&y).map(|(row, &yr)| yr - row.iter().zip(&th).map(|(x, t)| x * t).sum::<f64>()).collect();
-            let closed: Vec<f64> = std::iter::once(loo.energy).chain(loo.forces.iter().flat_map(|f| f.iter().copied())).collect();
+            let closed: Vec<f64> = loo.energy.into_iter().chain(loo.forces.iter().flatten().flat_map(|f| f.iter().copied())).collect();
+            assert_eq!(closed.len(), brute.len());
             // relative to the sample's largest residual component
             let scale = brute.iter().fold(0.0f64, |m, x| m.max(x.abs()));
             for (c, bf) in closed.iter().zip(&brute) {
                 worst = worst.max((c - bf).abs() / scale);
             }
         }
-        println!("closed-form LOO vs the explicit downdate: worst relative difference {worst:.2e}; largest LOO − in-sample force residual {max_h:.2e} (the hat block matters)");
+        println!("closed-form LOO vs the explicit downdate ({masked} of {} samples masked): worst relative difference {worst:.2e}; largest LOO − in-sample force residual {max_h:.2e} (the hat block matters)", samples.len());
+        assert!(masked >= 10);
         assert!(max_h > 1e-4, "test premise: leaving a sample out changes its residual");
         assert!(worst < 1e-10, "{worst:e}");
     }
@@ -321,9 +369,16 @@ mod tests {
         let mut worst = 0.0f64;
         for (s0, s1) in samples.iter().zip(&rotated) {
             let (l0, l1) = (leave_one_out(&m0, s0).unwrap(), leave_one_out(&m1, s1).unwrap());
-            let scale = std::iter::once(l0.energy.abs()).chain(l0.forces.iter().flatten().map(|x| x.abs())).fold(0.0f64, f64::max);
-            worst = worst.max((l0.energy - l1.energy).abs() / scale);
+            let scale = l0.energy.iter().map(|e| e.abs()).chain(l0.forces.iter().flatten().flatten().map(|x| x.abs())).fold(0.0f64, f64::max);
+            assert_eq!(l0.energy.is_some(), l1.energy.is_some());
+            if let (Some(e0), Some(e1)) = (l0.energy, l1.energy) {
+                worst = worst.max((e0 - e1).abs() / scale);
+            }
             for (f0, f1) in l0.forces.iter().zip(&l1.forces) {
+                let (Some(f0), Some(f1)) = (f0, f1) else {
+                    assert_eq!(f0.is_some(), f1.is_some());
+                    continue;
+                };
                 let rf0 = rot(f0);
                 for a in 0..3 {
                     worst = worst.max((rf0[a] - f1[a]).abs() / scale);

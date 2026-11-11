@@ -3,10 +3,12 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1 to 5)
+//! # Format (versions 1 to 8; this build writes a fitted model as version 7 — for a body-2 or a
+//! body-3 basis alike — or as version 8 for a body-4 basis, samples without a fit as version 6,
+//! and reads every version)
 //!
 //! ```text
-//! "ASMODEL1" … "ASMODEL5"          8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL8"          8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -20,7 +22,10 @@
 //! not a gate, `Provenance` doc; from version 4 also `ionic`, the ionic-surface tag, a gate}, `basis`
 //! {n_max, l_max, r_cut, degree_cap, body3, species}, `species` (the basis's, repeated for
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
-//! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
+//! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null; its
+//! `sigma_e` is the string "no energy rows" for a fit without energy rows, read as the pin
+//! `fit::SIGMA_E_WITHOUT_ENERGY_ROWS` — only such a fit's file, which holds masked samples and so
+//! is refused by builds before them, carries it),
 //! `accumulator` {q_prime, yy_e, n_e, sum_log_w_e, yy_f, n_f, sum_log_w_f, n_samples,
 //! energy_per_atom (bool or null), envelope_count [per species]}, `reference_rule` (how the
 //! reference energies were made — [`REFERENCE_RULE`] for references solved under ruling S9, or
@@ -49,8 +54,8 @@
 //!
 //! Tag codes: LiveStep 0, Perturbation 1, HotBurst 2, Scan 3, Fallback 4, Reference 5.
 //!
-//! **Version 2** (written whenever the basis has `body3: true`; version 1 is still written for a
-//! body-2 basis and still read): identical, with P = n_max·S + P₃ and Q′ as
+//! **Version 2** (was written for a basis with `body3: true` while version 1 was written for a
+//! body-2 basis; both still read): identical, with P = n_max·S + P₃ and Q′ as
 //! `Basis::{n_features, n_independent_columns}` give them for the body-3 basis, and ONE array
 //! appended after `sample_forces`:
 //!
@@ -77,6 +82,23 @@
 //! | sample_face_density | M | the teacher's density on the outermost grid plane, e/Bohr³ (NaN = not known) |
 //!
 //! A file without it reads as "not known" for every sample.
+//!
+//! **Optional, every version** (M8a Task 10, masked samples — `crate::fit` module doc, "Masked
+//! samples"): when any stored sample is masked (a capped segment's: `Sample::force_mask` set or
+//! `use_energy` false), two more arrays follow the face densities (after `sample_face_density`
+//! when present, else after `sample_quarantine` when present, else after the sample arrays):
+//!
+//! | name | length | content |
+//! |---|---|---|
+//! | sample_mask_kind | M | per sample, bit 0: it has a force mask; bit 1: its energy is not fitted (0 to 3, exact integral f64) |
+//! | sample_force_mask | Σ atoms of the samples with bit 0 | per atom of those samples in order: 1 its forces are fitted, 0 not |
+//!
+//! A file without them reads as "every sample whole" (no mask, energy fitted), so every earlier
+//! file still reads, and a file with no masked sample is written exactly as before. A build that
+//! predates them refuses such a file (its declared arrays are not that build's list) — it never
+//! reads a capped segment's caps as training data. With a masked sample whose energy is unused the
+//! accumulator object carries one more key, `n_scale` (`Accumulator::n_scale`, the scale rows;
+//! written only when it differs from `n_e`, read as `n_e` when absent).
 //!
 //! **Optional, every version** (activity spec A2; plan review M4, S17): the header key
 //! `teacher_solves` {pass, fallback, audit, verification, kept (JSON integers), complete (bool)}
@@ -106,7 +128,7 @@
 //! `body3: true` is refused (it has no terms array); a version-2 file always has the terms
 //! array; every file's `format` string must equal its magic.
 //!
-//! **Version 3** (M6 isotopes; the only version this build writes, for a body-2 or a body-3
+//! **Version 3** (M6 isotopes; from here on one version is written for a body-2 or a body-3
 //! basis alike): identical to version 2 except that the `body3_terms` array is present exactly
 //! when the basis header says `body3: true`, and `provenance` carries the required `masses`
 //! array ([[Z, A], …] as JSON integers; Z in 1..=255, A in 1..=65535, strictly ascending pairs;
@@ -119,8 +141,8 @@
 //! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
 //! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
 //!
-//! **Version 5** (the shell fence's species pair, final review I2; the only version this build
-//! writes): identical to version 4 except that a `failed_audits` record of origin "shell-check"
+//! **Version 5** (the shell fence's species pair, final review I2): identical to version 4
+//! except that a `failed_audits` record of origin "shell-check"
 //! carries the required `pair` key (above). The bump marks the files whose shell fences are
 //! complete; versions 1 to 4 are still read as before, and a version-4 file that holds a
 //! shell-check case is refused by the `pair` rule (it cannot have one).
@@ -128,7 +150,7 @@
 //! **Version 6** (samples without a fit, 2026-10-20: a PH₃ session whose first fit never formed —
 //! its P reference did not solve — could not be saved, and the session autosave deleted the
 //! minutes of DFT it had taught): written only by [`write_samples`], only when there is no fitted
-//! model; a fitted model is still written as version 5, byte for byte as before. The header keeps
+//! model; a fitted model was still written as version 5, byte for byte as before. The header keeps
 //! `format`, `created_by`, `provenance` (as version 5), `reference_rule`, `samples`, `arrays` and the
 //! optional `teacher_solves`, and adds `references` — [[Z, E], …], the isolated-atom energies the
 //! writer had (Hartree, strictly ascending Z; a species without one is absent: what a failed
@@ -136,9 +158,57 @@
 //! (nothing was fitted, so nothing was audited). The arrays are the sample ones only, in the same
 //! order and with the same optional tail:
 //! `sample_atoms, sample_tag, sample_weight, sample_energy, sample_z, sample_pos, sample_forces`
-//! [, `sample_quarantine`] [, `sample_face_density`]. [`read`] refuses a version-6 file (it has no
-//! model); [`read_any`] reads every version; [`read_provenance`] reads its header like any other.
+//! [, `sample_quarantine`] [, `sample_face_density`]. An optional header key `sample_box` (M8a
+//! Task 4b fix round 1: a JSON array of one box size per sample, grid points per side) records the
+//! box of each sample when they differ — a shared collection's session-only samples, whose
+//! `provenance.grid_n` is 0 (any box); a reader that predates it ignores the key. [`read`] refuses a
+//! version-6 file (it has no model); [`read_any`] reads every version; [`read_provenance`] reads its
+//! header like any other. Two more optional keys (M8a Task 7, ruling P8) mark a **specialised
+//! model** cut from a shared collection (`Collection::specialise`): `specialised`, the species it
+//! was cut for (strictly ascending Z; [`read_specialised`]), and `box_references`, [[Z, n, E], …]
+//! — the isolated-atom energy of each species per box (grid points per side, strictly ascending
+//! (Z, n)) — so each sample (whose box `sample_box` records; required with `specialised`) is
+//! fitted against its own box's references, as in the collection. Its `provenance.grid_n` is 0
+//! (any box): the loader accepts it for any neutral scene of the same surface key. Older readers
+//! ignore both keys (and then refuse the any-box provenance as another surface).
 //! A build older than version 6 refuses it as "newer than this build" — never misreads it.
+//!
+//! **Version 7** (M8a Task 1, the audit history; what this build writes for a fitted model):
+//! version 5 plus the provider's [`AuditHistory`] (`crate::history`: per judged audit the model's
+//! predictive stds against the teacher's errors, the evidence of a calibration). When the writer's
+//! history is not blank (a point recorded or an `Unrecorded` counter set) the header carries the
+//! key `audit_history` {points, recorded, no_variance, box_affected, draft, unfit (JSON integers)}
+//! right after `arrays`, and the ten history arrays follow the sample tail, last, in the order of
+//! [`HistoryArrays::NAMES`](crate::history::HistoryArrays::NAMES) — `audit_atoms`,
+//! `audit_model_gen`, `audit_kind`, `audit_energy_std`, `audit_err_energy` (`points` each) and
+//! `audit_classes`, `audit_force_std`, `audit_force_std_epistemic`, `audit_err_force`,
+//! `audit_teacher_force` (Σ atoms each; module doc of `crate::history` for the contents and the
+//! validation; `audit_kind` and the `unfit` counter were added in Task 1's fix round and
+//! `audit_teacher_force` in Task 2's, while version 7 was unreleased — no earlier form of
+//! version 7 exists in a file). With a blank history nothing is added:
+//! the file is version 5's bytes under the version-7 magic. A fitted provider also writes the key
+//! `class_memory` (M8a Task 2 fix round 2, while version 7 was unreleased): the calibrated class
+//! verdict's hysteresis memory, one object per environment key (M8a user-test fix 2: {class (1
+//! pair, 2 many-body), z, neighbours (the sorted neighbour species), trusted (JSON bool), since (the
+//! model generation it was entered at, a JSON integer, or null)}; the per-class form written before
+//! the keys reads as empty, a band verdict then re-entering under ENTER), and after the ten history
+//! arrays the optional `audit_species` array (`crate::history` "Species") — so a reload
+//! keeps a verdict that sat inside the hysteresis band (`providers::surrogate::calibrate`); absent,
+//! the loader starts without a memory (a band verdict re-enters). Optional and strict like
+//! `audit_history` when present. The keys and the arrays are read for
+//! version 7 only; versions 1 to 5 read with an empty history, version 6 has none (nothing was
+//! fitted, so nothing was audited). The bump keeps an older build from misreading the arrays:
+//! it refuses the file as "newer than this build".
+//!
+//! **Version 8** (M8a Task 5): version 7 with a body-4 basis (`Basis::body4`, a shared
+//! collection's). The basis object carries two more keys, `body4` (true) and `body4_cap` (the
+//! body-4 degree cap D₄ the layout was built with, `Basis::body4_cap`); the reader regenerates the
+//! body-4 terms from the basis and refuses a file whose `body4_cap` is not its own D₄ (the layout
+//! would differ) or whose `body4` is not true. Everything else, the arrays included, is version
+//! 7's; every array length follows from the larger P and Q′. A basis without body-4 is still
+//! written as version 7, bit for bit — so every per-scene sidecar is unchanged — and a build
+//! before this one refuses a version-8 file as "newer than this build" instead of misreading its
+//! arrays.
 //!
 //! # Validation
 //!
@@ -153,7 +223,13 @@
 //! viewer can compare a picked file with the scene before loading it.
 
 use crate::descriptor::Basis;
-use crate::fit::{Accumulator, FitReport, Sample, SampleTag};
+use crate::fit::{Accumulator, FitReport, Sample, SampleTag, NO_ENERGY_ROWS, SIGMA_E_WITHOUT_ENERGY_ROWS};
+use crate::history::{AuditHistory, EnvKey, HistoryArrays, Unrecorded};
+
+/// The calibrated class verdict's hysteresis memory (header key `class_memory`): per environment
+/// key (class, Z, neighbour species — `crate::history::EnvKey`, M8a user-test fix 2) the standing
+/// verdict and the generation it was entered at.
+pub type ClassMemory = Vec<(EnvKey, bool, Option<u64>)>;
 use crate::model::{Model, Provenance};
 use std::io;
 use std::path::Path;
@@ -167,11 +243,17 @@ pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
 pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
 /// The first eight bytes of a version-4 file (the ionic tag; still read).
 pub const MAGIC_V4: &[u8; 8] = b"ASMODEL4";
-/// The first eight bytes of a version-5 file (the shell fence's species pair; what this build writes).
+/// The first eight bytes of a version-5 file (the shell fence's species pair; still read).
 pub const MAGIC_V5: &[u8; 8] = b"ASMODEL5";
 /// The first eight bytes of a version-6 file: training samples without a fit ([`write_samples`];
 /// module doc, "Version 6").
 pub const MAGIC_V6: &[u8; 8] = b"ASMODEL6";
+/// The first eight bytes of a version-7 file (the audit history; what this build writes for a
+/// fitted model — module doc, "Version 7").
+pub const MAGIC_V7: &[u8; 8] = b"ASMODEL7";
+/// The first eight bytes of a version-8 file: version 7 with a body-4 basis (module doc, "Version
+/// 8"; M8a Task 5). A basis without body-4 is still written as version 7, bit for bit.
+pub const MAGIC_V8: &[u8; 8] = b"ASMODEL8";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -206,6 +288,13 @@ pub struct Sidecar {
     pub teacher_solves_note: Option<String>,
     /// The failed audits the writer still held (header key "failed_audits"; empty when absent).
     pub failed_audits: Vec<AuditCase>,
+    /// The writer's audit history (version 7; module doc). Empty for a file of an earlier version
+    /// or one written with a blank history.
+    pub audit_history: AuditHistory,
+    /// The calibrated class verdict's hysteresis memory per environment class (pair, many-body):
+    /// (trusted, the model generation it was entered at) — header key `class_memory` (version 7;
+    /// module doc). Empty when absent.
+    pub class_memory: ClassMemory,
 }
 
 /// What a version-6 file holds: training samples taught before any fit formed (module doc,
@@ -224,12 +313,25 @@ pub struct SampleSet {
     pub quarantine: Vec<u8>,
     /// As [`Sidecar::face_density`].
     pub face_density: Vec<f64>,
+    /// The box (grid points per side) each sample was solved in, when the samples come from more
+    /// than one box (a shared collection's session-only samples, M8a Task 4b fix round 1: the
+    /// provider's `save_session_only`); empty = every sample at `provenance.grid_n`. Header key
+    /// `sample_box` (module doc, "Version 6").
+    pub sample_box: Vec<usize>,
+    /// A **specialised model** (M8a Task 7, ruling P8; module doc, "Version 6"): the species it was
+    /// cut for from a shared collection (`Collection::specialise`), sorted unique; empty = not
+    /// specialised. Header key `specialised`.
+    pub specialised: Vec<u8>,
+    /// Isolated-atom energies per (species, box) — (Z, grid points per side, Hartree), sorted by
+    /// (Z, n) — so the samples of several boxes are fitted each against its own box (as in the
+    /// collection); empty = none. Header key `box_references`.
+    pub box_references: Vec<(u8, usize, f64)>,
     pub teacher_solves: Option<TeacherSolves>,
     pub teacher_solves_note: Option<String>,
     pub created_by: String,
 }
 
-/// Any sidecar: a fitted model (versions 1 to 5) or samples without a fit (version 6).
+/// Any sidecar: a fitted model (versions 1 to 5 and 7) or samples without a fit (version 6).
 #[derive(Clone, Debug)]
 pub enum Contents {
     Fitted(Box<Sidecar>),
@@ -318,13 +420,27 @@ pub fn write_full(path: &Path, model: &Model, acc: &Accumulator, report: Option<
 /// `audits` is not empty; module doc).
 #[allow(clippy::too_many_arguments)]
 pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<()> {
+    write_full_with_history(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, &AuditHistory::default())
+}
+
+/// [`write_full_with_audits`] with the provider's audit history (version 7; the key and arrays are
+/// written only when `history` is not blank — module doc, "Version 7").
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_history(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory) -> io::Result<()> {
+    write_full_with_memory(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, &[])
+}
+
+/// [`write_full_with_history`] with the calibrated class verdict's hysteresis memory (header key
+/// `class_memory`, written only when `memory` is not empty — module doc, "Version 7").
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits)?;
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory)?;
     write_atomic(path, &bytes)
 }
 
@@ -369,6 +485,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// here and is refused by [`read`]. Used by the viewer to compare a model with the scene before
 /// loading it (user request 2026-10-18).
 pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let (version, h) = read_header(path)?;
+    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
+}
+
+/// The species a **specialised model** was cut for (M8a Task 7; header key `specialised`, module
+/// doc "Version 6"), from the header alone like [`read_provenance`]; empty = not specialised (any
+/// other file, of any version).
+pub fn read_specialised(path: &Path) -> io::Result<Vec<u8>> {
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let (version, h) = read_header(path)?;
+    if version != 6 {
+        return Ok(Vec::new());
+    }
+    decode_specialised(&h).map_err(invalid)
+}
+
+/// The magic's version and the parsed header, reading only `16 + header_len` bytes ([`read_provenance`]).
+fn read_header(path: &Path) -> io::Result<(u8, Json)> {
     use std::io::Read;
     let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
     let mut f = std::fs::File::open(path)?;
@@ -385,8 +520,7 @@ pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
     bytes.extend_from_slice(&head);
     bytes.resize(16 + len, 0);
     f.read_exact(&mut bytes[16..]).map_err(|e| invalid(format!("header unreadable: {e}")))?;
-    let (version, h) = parse_header(&bytes).map_err(invalid)?;
-    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
+    parse_header(&bytes).map_err(invalid)
 }
 
 /// Reads and validates a sidecar (module doc).
@@ -412,7 +546,17 @@ const TAGS: [SampleTag; 9] = [
 ];
 
 fn tag_code(t: SampleTag) -> f64 {
-    TAGS.iter().position(|&x| x == t).expect("every tag is listed") as f64
+    tag_index(t) as f64
+}
+
+/// A tag's code (the sidecar's `sample_tag` value; `crate::collection` writes the same code).
+pub(crate) fn tag_index(t: SampleTag) -> u8 {
+    TAGS.iter().position(|&x| x == t).expect("every tag is listed") as u8
+}
+
+/// The tag of a code, `None` for a code this build does not know.
+pub(crate) fn tag_from_index(code: u8) -> Option<SampleTag> {
+    TAGS.get(code as usize).copied()
 }
 
 /// Largest n_max a file may declare (the default is 8; the bound only keeps a hostile header
@@ -430,12 +574,11 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = MAGIC_V5;
-    if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
+    let magic: &[u8; 8] = if basis.body4 { MAGIC_V8 } else { MAGIC_V7 };
+    if (body3 || basis.body4) && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
     if acc.basis != *basis {
@@ -507,18 +650,34 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         arrays.push(("body3_terms", &terms));
     }
     let q_flags = quarantine_values(quarantine)?;
-    push_sample_tail(&mut arrays, &q_flags, face_density);
+    let masks = mask_arrays(samples);
+    push_sample_tail(&mut arrays, &q_flags, face_density, masks.as_ref());
+    // the audit history (version 7), last: nothing when blank, so such a file is version 5's bytes
+    let with_history = *history != AuditHistory::default();
+    let hist_arrays = with_history.then(|| history.to_arrays());
+    if let Some(a) = &hist_arrays {
+        arrays.extend(a.as_slices());
+        // the species array (`crate::history` "Species", M8a user-test fix 2), after the ten
+        arrays.push((HistoryArrays::SPECIES, &a.species));
+    }
 
     let provenance = provenance_json(&model.provenance);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
-    let basis_json = obj(&[
+    let mut basis_pairs = vec![
         ("n_max", basis.n_max.to_string()),
         ("l_max", basis.l_max.to_string()),
         ("r_cut", num(basis.r_cut)),
         ("degree_cap", basis.degree_cap.to_string()),
         ("body3", basis.body3.to_string()),
         ("species", species.clone()),
-    ]);
+    ];
+    // version 8 only (module doc): the body-4 flag and its degree cap, which the reader checks
+    // against its own layout
+    if basis.body4 {
+        basis_pairs.push(("body4", "true".into()));
+        basis_pairs.push(("body4_cap", basis.body4_cap().to_string()));
+    }
+    let basis_json = obj(&basis_pairs);
     let model_json = obj(&[
         ("sigma_e", num(model.sigma_e)),
         ("sigma_f", num(model.sigma_f)),
@@ -531,7 +690,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         Some(r) => obj(&[
             ("rmse_energy_per_atom", num(r.rmse_energy_per_atom)),
             ("rmse_force", num(r.rmse_force)),
-            ("sigma_e", num(r.sigma_e)),
+            // a fit without energy rows has no measured s_E (its value is the pin): the readout
+            // says so (Task 10a review, finding 5); read back as the pin
+            ("sigma_e", if r.has_energy_rows() { num(r.sigma_e) } else { string(NO_ENERGY_ROWS) }),
             ("sigma_f", num(r.sigma_f)),
             ("lambda", num(r.lambda)),
             ("log_evidence", num(r.log_evidence)),
@@ -560,6 +721,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("energy_per_atom", acc.energy_per_atom.map_or("null".into(), |b| b.to_string())),
         ("envelope_count", format!("[{}]", env.count.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","))),
     ]);
+    // the scale rows (M8a Task 10, module doc): only when a sample without an energy row made
+    // them differ from the energy rows, so every other file is byte-identical
+    let acc_json = if acc.n_scale != acc.n_e { format!("{},\"n_scale\":{}}}", &acc_json[..acc_json.len() - 1], acc.n_scale) } else { acc_json };
     let arrays_json = arrays_json(&arrays);
     let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
@@ -575,6 +739,30 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("samples", samples.len().to_string()),
         ("arrays", arrays_json),
     ];
+    if with_history {
+        let u = history.unrecorded;
+        pairs.push((
+            "audit_history",
+            obj(&[
+                ("points", history.len().to_string()),
+                ("recorded", history.recorded().to_string()),
+                ("no_variance", u.no_variance.to_string()),
+                ("box_affected", u.box_affected.to_string()),
+                ("draft", u.draft.to_string()),
+                ("unfit", u.unfit.to_string()),
+            ]),
+        ));
+    }
+    if !memory.is_empty() {
+        let list: Vec<String> = memory
+            .iter()
+            .map(|(k, t, since)| {
+                let nb = format!("[{}]", k.neighbours.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
+                obj(&[("class", k.class.to_string()), ("z", k.z.to_string()), ("neighbours", nb), ("trusted", t.to_string()), ("since", since.map_or("null".to_string(), |g| g.to_string()))])
+            })
+            .collect();
+        pairs.push(("class_memory", format!("[{}]", list.join(","))));
+    }
     // optional (module doc): absent, the header is byte-identical to the older writer's
     if let Some(t) = solves {
         pairs.push(("teacher_solves", solves_json(t)));
@@ -666,14 +854,59 @@ fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
 }
 
 /// The optional sample tail (module doc): the quarantine flags when one is set, then the face
-/// densities when given.
-fn push_sample_tail<'a>(arrays: &mut Vec<(&'a str, &'a [f64])>, q_flags: &'a [f64], face_density: &'a [f64]) {
+/// densities when given, then the masks when a sample is masked.
+fn push_sample_tail<'a>(arrays: &mut Vec<(&'a str, &'a [f64])>, q_flags: &'a [f64], face_density: &'a [f64], masks: Option<&'a (Vec<f64>, Vec<f64>)>) {
     if q_flags.iter().any(|&q| q != 0.0) {
         arrays.push(("sample_quarantine", q_flags));
     }
     if !face_density.is_empty() {
         arrays.push(("sample_face_density", face_density));
     }
+    if let Some((kind, mask)) = masks {
+        arrays.push(("sample_mask_kind", kind));
+        arrays.push(("sample_force_mask", mask));
+    }
+}
+
+/// The two mask arrays (module doc, M8a Task 10) when any sample is masked, else `None`.
+fn mask_arrays(samples: &[Sample]) -> Option<(Vec<f64>, Vec<f64>)> {
+    if samples.iter().all(Sample::is_whole) {
+        return None;
+    }
+    let kind = samples.iter().map(|s| (u8::from(s.force_mask.is_some()) | (u8::from(!s.use_energy) << 1)) as f64).collect();
+    let mask = samples.iter().flat_map(|s| s.force_mask.iter().flatten().map(|&b| if b { 1.0 } else { 0.0 })).collect();
+    Some((kind, mask))
+}
+
+/// Applies the two mask arrays to `samples` (module doc, M8a Task 10): every kind 0 to 3, the
+/// mask entries 0 or 1 and exactly as many as the masked samples' atoms, and no sample that
+/// teaches nothing (no energy and no masked-in atom).
+fn decode_masks(samples: &mut [Sample], kind: &[f64], mask: &[f64]) -> Result<(), String> {
+    let mut at = 0usize;
+    for (i, (s, &k)) in samples.iter_mut().zip(kind).enumerate() {
+        if !(k == 0.0 || k == 1.0 || k == 2.0 || k == 3.0) {
+            return Err(format!("sample_mask_kind[{i}] = {k} is not 0, 1, 2 or 3"));
+        }
+        let k = k as u8;
+        s.use_energy = k & 2 == 0;
+        s.force_mask = None;
+        if k & 1 != 0 {
+            let n = s.pos.len();
+            let m = mask.get(at..at + n).ok_or_else(|| format!("sample_force_mask ends inside sample {i}"))?;
+            if let Some(j) = m.iter().position(|&x| x != 0.0 && x != 1.0) {
+                return Err(format!("sample_force_mask: sample {i} atom {j} is {} (0 or 1)", m[j]));
+            }
+            s.force_mask = Some(m.iter().map(|&x| x == 1.0).collect());
+            at += n;
+        }
+        if !s.use_energy && s.trained_atoms() == 0 {
+            return Err(format!("sample {i} teaches nothing (no energy and no masked-in atom)"));
+        }
+    }
+    if at != mask.len() {
+        return Err(format!("sample_force_mask has {} entries, the masked samples {at} atoms", mask.len()));
+    }
+    Ok(())
 }
 
 /// The header's `provenance` object.
@@ -718,6 +951,18 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     if set.references.windows(2).any(|w| w[0].0 >= w[1].0) || set.references.iter().any(|&(z, e)| z == 0 || !e.is_finite()) {
         return Err(invalid_input("sidecar: references must be finite energies in strictly ascending Z ≥ 1".into()));
     }
+    if !set.sample_box.is_empty() && set.sample_box.len() != n {
+        return Err(invalid_input(format!("sidecar: {} sample boxes for {n} samples", set.sample_box.len())));
+    }
+    if set.specialised.windows(2).any(|w| w[0] >= w[1]) || set.specialised.contains(&0) {
+        return Err(invalid_input("sidecar: a specialised model's species must be strictly ascending Z ≥ 1".into()));
+    }
+    if !set.specialised.is_empty() && set.sample_box.len() != n {
+        return Err(invalid_input("sidecar: a specialised model records every sample's box".into()));
+    }
+    if set.box_references.windows(2).any(|w| (w[0].0, w[0].1) >= (w[1].0, w[1].1)) || set.box_references.iter().any(|&(z, n, e)| z == 0 || n == 0 || !e.is_finite()) {
+        return Err(invalid_input("sidecar: box references must be finite energies in strictly ascending (Z ≥ 1, n ≥ 1)".into()));
+    }
     let [s_atoms, s_tag, s_weight, s_energy, s_z, s_pos, s_forces] = sample_arrays(&set.samples)?;
     let mut arrays: Vec<(&str, &[f64])> = vec![
         ("sample_atoms", &s_atoms),
@@ -729,7 +974,8 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
         ("sample_forces", &s_forces),
     ];
     let q_flags = quarantine_values(&set.quarantine)?;
-    push_sample_tail(&mut arrays, &q_flags, &set.face_density);
+    let masks = mask_arrays(&set.samples);
+    push_sample_tail(&mut arrays, &q_flags, &set.face_density, masks.as_ref());
     let references = format!("[{}]", set.references.iter().map(|&(z, e)| format!("[{z},{}]", num(e))).collect::<Vec<_>>().join(","));
     let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(MAGIC_V6).expect("ASCII"))),
@@ -742,6 +988,15 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     ];
     if let Some(t) = &set.teacher_solves {
         pairs.push(("teacher_solves", solves_json(t)));
+    }
+    if !set.sample_box.is_empty() {
+        pairs.push(("sample_box", format!("[{}]", set.sample_box.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))));
+    }
+    if !set.specialised.is_empty() {
+        pairs.push(("specialised", format!("[{}]", set.specialised.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","))));
+    }
+    if !set.box_references.is_empty() {
+        pairs.push(("box_references", format!("[{}]", set.box_references.iter().map(|&(z, n, e)| format!("[{z},{n},{}]", num(e))).collect::<Vec<_>>().join(","))));
     }
     Ok(assemble(MAGIC_V6, &obj(&pairs), &arrays))
 }
@@ -801,10 +1056,12 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         m if m == MAGIC_V4 => 4,
         m if m == MAGIC_V5 => 5,
         m if m == MAGIC_V6 => 6,
+        m if m == MAGIC_V7 => 7,
+        m if m == MAGIC_V8 => 8,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to 6)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 8)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL6)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL8)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -822,7 +1079,9 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         3 => MAGIC_V3,
         4 => MAGIC_V4,
         5 => MAGIC_V5,
-        _ => MAGIC_V6,
+        6 => MAGIC_V6,
+        7 => MAGIC_V7,
+        _ => MAGIC_V8,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
@@ -873,14 +1132,32 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if body3 && species.len() > MAX_SPECIES_V2 {
         return Err(format!("body-3 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
     }
+    // version 8 (module doc): the body-4 flag, present exactly then
+    let body4 = version >= 8 && b.get("body4")?.bool()?;
+    if version >= 8 && !body4 {
+        return Err("a version-8 file has a body-4 basis (body4 is false)".into());
+    }
+    if body4 && l_max > crate::basis::L_MAX_SUPPORTED {
+        return Err(format!("basis l_max {l_max} exceeds the supported {}", crate::basis::L_MAX_SUPPORTED));
+    }
+    if body4 && species.len() > MAX_SPECIES_V2 {
+        return Err(format!("body-4 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
+    }
     let basis = Basis {
         n_max,
         l_max,
         r_cut,
         degree_cap: b.get("degree_cap")?.usize()?,
         body3,
+        body4,
         species,
     };
+    if body4 {
+        let cap = b.get("body4_cap")?.usize()?;
+        if cap != basis.body4_cap() {
+            return Err(format!("body4_cap {cap} differs from this build's layout for the basis ({})", basis.body4_cap()));
+        }
+    }
     let s = basis.n_species();
     let p = basis.n_features();
     let q = basis.n_independent_columns();
@@ -898,7 +1175,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         r => Some(FitReport {
             rmse_energy_per_atom: r.get("rmse_energy_per_atom")?.f64()?,
             rmse_force: r.get("rmse_force")?.f64()?,
-            sigma_e: r.get("sigma_e")?.f64()?,
+            sigma_e: match r.get("sigma_e")? {
+                Json::Str(t) if t == NO_ENERGY_ROWS => SIGMA_E_WITHOUT_ENERGY_ROWS,
+                v => v.f64()?,
+            },
             sigma_f: r.get("sigma_f")?.f64()?,
             lambda: r.get("lambda")?.f64()?,
             log_evidence: r.get("log_evidence")?.f64()?,
@@ -956,7 +1236,20 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
     // the optional quarantine flags and face densities, in that order (module doc)
-    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let (has_quarantine, has_face, has_masks) = sample_tail(&declared, &mut fixed, n_stored);
+    // the audit history (version 7, module doc): the key announces the ten arrays, last
+    let history_counts = if version >= 7 { decode_history_key(&h)? } else { None };
+    let class_memory = if version >= 7 { decode_class_memory(&h)? } else { Vec::new() };
+    if let Some((points, _, _)) = &history_counts {
+        for (i, name) in HistoryArrays::NAMES.iter().enumerate() {
+            fixed.push((*name, (i < HistoryArrays::PER_POINT).then_some(*points)));
+        }
+    }
+    // the optional species array after the ten (absent in files written before it)
+    let has_species = history_counts.is_some() && declared.get(fixed.len()).is_some_and(|(n, _)| n == HistoryArrays::SPECIES);
+    if has_species {
+        fixed.push((HistoryArrays::SPECIES, None));
+    }
     let arrays = read_arrays(bytes, &declared, &fixed, version)?;
     let mut it = arrays.into_iter();
     let mut next = || it.next().expect("every declared array read");
@@ -1010,6 +1303,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     acc.n_f = a.get("n_f")?.usize()?;
     acc.sum_log_w_f = a.get("sum_log_w_f")?.f64()?;
     acc.n_samples = a.get("n_samples")?.usize()?;
+    // the scale rows (M8a Task 10): absent = the energy rows
+    acc.n_scale = match a.get("n_scale") {
+        Err(_) | Ok(Json::Null) => acc.n_e,
+        Ok(v) => v.usize()?,
+    };
     acc.energy_per_atom = match a.get("energy_per_atom")? {
         Json::Null => None,
         v => Some(v.bool()?),
@@ -1027,7 +1325,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
 
     let (atoms, tags, weights, energies) = (next(), next(), next(), next());
     let (zs, pos, forces) = (next(), next(), next());
-    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    let mut samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
     if has_terms {
         let stored = next();
         let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
@@ -1038,7 +1336,67 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     }
     let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits })
+    if has_masks {
+        let (kind, mask) = (next(), next());
+        decode_masks(&mut samples, &kind, &mask)?;
+    }
+    let audit_history = match history_counts {
+        None => AuditHistory::default(),
+        Some((_, recorded, unrecorded)) => {
+            let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next(), next()]);
+            let a = HistoryArrays { species: if has_species { next() } else { Vec::new() }, ..a };
+            AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
+        }
+    };
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory })
+}
+
+/// The version-7 header key `class_memory` (module doc): per environment key (class, z,
+/// neighbours, trusted, since), empty when absent or null; strict when present (every field
+/// typed). The per-class form written before the keys (M8a user-test fix 2: entries without `z`)
+/// reads as empty — the memory is dropped and a band verdict re-enters under the stricter ENTER,
+/// the conservative side.
+fn decode_class_memory(h: &Json) -> Result<ClassMemory, String> {
+    let list = match h.get("class_memory") {
+        Err(_) | Ok(Json::Null) => return Ok(Vec::new()),
+        Ok(k) => k.arr().map_err(|e| format!("class_memory: {e}"))?,
+    };
+    if list.iter().any(|e| e.get("z").is_err()) {
+        return Ok(Vec::new());
+    }
+    let byte = |e: &Json, name: &str| -> Result<u8, String> {
+        let v = e.get(name)?.usize().map_err(|x| format!("class_memory.{name}: {x}"))?;
+        u8::try_from(v).map_err(|_| format!("class_memory.{name} {v} is beyond 255"))
+    };
+    list.iter()
+        .map(|e| {
+            let trusted = e.get("trusted")?.bool().map_err(|x| format!("class_memory.trusted: {x}"))?;
+            let since = match e.get("since")? {
+                Json::Null => None,
+                g => Some(g.usize().map_err(|x| format!("class_memory.since: {x}"))? as u64),
+            };
+            let neighbours = e.get("neighbours")?.arr().map_err(|x| format!("class_memory.neighbours: {x}"))?.iter().map(|n| n.usize().map_err(|x| format!("class_memory.neighbours: {x}")).and_then(|v| u8::try_from(v).map_err(|_| format!("class_memory.neighbours: {v} is beyond 255")))).collect::<Result<Vec<u8>, String>>()?;
+            Ok((EnvKey { class: byte(e, "class")?, z: byte(e, "z")?, neighbours }, trusted, since))
+        })
+        .collect()
+}
+
+/// The version-7 header key `audit_history` (module doc): (points, recorded, the unrecorded
+/// counters), `None` when absent or null. Every field is required inside it, and a present key is
+/// strict — a history dropped silently would hide what a calibration has to see.
+fn decode_history_key(h: &Json) -> Result<Option<(usize, u64, Unrecorded)>, String> {
+    let k = match h.get("audit_history") {
+        Err(_) | Ok(Json::Null) => return Ok(None),
+        Ok(k) => k,
+    };
+    let count = |name: &str| -> Result<u64, String> { k.get(name)?.usize().map(|v| v as u64).map_err(|e| format!("audit_history.{name}: {e}")) };
+    let points = k.get("points")?.usize().map_err(|e| format!("audit_history.points: {e}"))?;
+    if points > crate::history::HISTORY_CAP {
+        return Err(format!("audit_history.points {points} exceeds the ring's {}", crate::history::HISTORY_CAP));
+    }
+    let recorded = count("recorded")?;
+    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")? };
+    Ok(Some((points, recorded, unrecorded)))
 }
 
 /// A version-6 file (module doc, "Version 6").
@@ -1077,15 +1435,66 @@ fn decode_samples_file(bytes: &[u8]) -> Result<SampleSet, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
-    let (has_quarantine, has_face) = sample_tail(&declared, &mut fixed, n_stored);
+    let (has_quarantine, has_face, has_masks) = sample_tail(&declared, &mut fixed, n_stored);
     let mut it = read_arrays(bytes, &declared, &fixed, version)?.into_iter();
     let mut next = || it.next().expect("every declared array read");
     let (atoms, tags, weights, energies) = (next(), next(), next(), next());
     let (zs, pos, forces) = (next(), next(), next());
-    let samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
+    let mut samples = decode_sample_list(&atoms, &tags, &weights, &energies, &zs, &pos, &forces)?;
     let quarantine = if has_quarantine { decode_quarantine(&next())? } else { Vec::new() };
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, created_by })
+    if has_masks {
+        let (kind, mask) = (next(), next());
+        decode_masks(&mut samples, &kind, &mask)?;
+    }
+    let sample_box = match h.get("sample_box") {
+        Err(_) | Ok(Json::Null) => Vec::new(),
+        Ok(b) => b.arr()?.iter().map(Json::usize).collect::<Result<Vec<_>, _>>()?,
+    };
+    if !sample_box.is_empty() && sample_box.len() != samples.len() {
+        return Err(format!("{} sample boxes for {} samples", sample_box.len(), samples.len()));
+    }
+    let specialised = decode_specialised(&h)?;
+    let mut box_references: Vec<(u8, usize, f64)> = Vec::new();
+    match h.get("box_references") {
+        Err(_) | Ok(Json::Null) => {}
+        Ok(list) => {
+            for r in list.arr()? {
+                let (z, n, e) = match r.arr()? {
+                    [z, n, e] => (z.u64()?, n.usize()?, e.f64()?),
+                    _ => return Err("box_references entries are [Z, n, E]".into()),
+                };
+                let z = u8::try_from(z).ok().filter(|&z| z >= 1).ok_or_else(|| format!("box reference Z {z} outside 1..=255"))?;
+                if n == 0 || !e.is_finite() || box_references.last().is_some_and(|&(pz, pn, _)| (pz, pn) >= (z, n)) {
+                    return Err(format!("box reference of Z = {z}, n = {n}: energies must be finite, in strictly ascending (Z, n ≥ 1)"));
+                }
+                box_references.push((z, n, e));
+            }
+        }
+    }
+    if !specialised.is_empty() && sample_box.len() != samples.len() {
+        return Err("a specialised model records every sample's box".into());
+    }
+    Ok(SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, sample_box, specialised, box_references, teacher_solves, teacher_solves_note, created_by })
+}
+
+/// The header key `specialised` (module doc, "Version 6"): strictly ascending Z ≥ 1; absent or
+/// null = not specialised.
+fn decode_specialised(h: &Json) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    match h.get("specialised") {
+        Err(_) | Ok(Json::Null) => {}
+        Ok(list) => {
+            for z in list.arr()? {
+                let z = u8::try_from(z.u64()?).ok().filter(|&z| z >= 1).ok_or("specialised species outside 1..=255")?;
+                if out.last().is_some_and(|&p| p >= z) {
+                    return Err("specialised species must be strictly ascending".into());
+                }
+                out.push(z);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The header's `reference_rule` (a missing key reads as null).
@@ -1120,19 +1529,25 @@ fn declared_arrays(h: &Json) -> Result<Vec<(String, usize)>, String> {
         .collect()
 }
 
-/// The optional quarantine flags and face densities after the `fixed` arrays, in that order
-/// (module doc): appended to `fixed` when declared; (quarantine present, face densities present).
-fn sample_tail(declared: &[(String, usize)], fixed: &mut Vec<(&str, Option<usize>)>, n_stored: usize) -> (bool, bool) {
+/// The optional quarantine flags, face densities and masks after the `fixed` arrays, in that
+/// order (module doc): appended to `fixed` when declared; (quarantine present, face densities
+/// present, masks present).
+fn sample_tail(declared: &[(String, usize)], fixed: &mut Vec<(&str, Option<usize>)>, n_stored: usize) -> (bool, bool, bool) {
     let extra: Vec<&str> = declared.iter().skip(fixed.len()).map(|(n, _)| n.as_str()).collect();
     let has_quarantine = extra.first() == Some(&"sample_quarantine");
     let has_face = extra.get(usize::from(has_quarantine)) == Some(&"sample_face_density");
+    let has_masks = extra.get(usize::from(has_quarantine) + usize::from(has_face)) == Some(&"sample_mask_kind");
     if has_quarantine {
         fixed.push(("sample_quarantine", Some(n_stored)));
     }
     if has_face {
         fixed.push(("sample_face_density", Some(n_stored)));
     }
-    (has_quarantine, has_face)
+    if has_masks {
+        fixed.push(("sample_mask_kind", Some(n_stored)));
+        fixed.push(("sample_force_mask", None));
+    }
+    (has_quarantine, has_face, has_masks)
 }
 
 /// The arrays after the header: the declared list must be `fixed` (names in order, lengths where
@@ -1230,7 +1645,7 @@ fn decode_sample_list(atoms: &[f64], tags: &[f64], weights: &[f64], energies: &[
             z.push(zz as u8);
         }
         let triples = |v: &[f64]| -> Vec<[f64; 3]> { v[3 * k..3 * (k + n)].chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() };
-        samples.push(Sample { pos: triples(pos), z, energy: energies[i], forces: triples(forces), tag: TAGS[tag as usize], weight: w });
+        samples.push(Sample { pos: triples(pos), z, energy: energies[i], forces: triples(forces), tag: TAGS[tag as usize], weight: w, force_mask: None, use_energy: true });
         k += n;
     }
     Ok(samples)
@@ -1612,7 +2027,7 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::envelope::Envelope;
     use rand::rngs::StdRng;
@@ -1630,11 +2045,16 @@ mod tests {
 
     /// A random model, accumulator, report and samples with awkward values (subnormal-free but
     /// spread over 16 decades, −0.0, a non-finite condition estimate).
-    fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
+    pub(crate) fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
+        random_sidecar_with(seed, body3, false)
+    }
+
+    pub(crate) fn random_sidecar_with(seed: u64, body3: bool, body4: bool) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;
-        if body3 {
+        basis.body4 = body4;
+        if body3 || body4 {
             // C = 9 channels, 45 unordered pairs × 3 l (D = 10 never binds at n_max 3, l_max 2):
             // P = 9 + 135, Q′ = 18 + 3·135
             basis.n_max = 3;
@@ -1649,6 +2069,7 @@ mod tests {
         acc.rhs_e = random_vec(&mut rng, q);
         acc.yy_e = 0.123_456_789_012_345_6;
         acc.n_e = 41;
+        acc.n_scale = 41;
         acc.sum_log_w_e = -0.0;
         acc.gram_f = random_vec(&mut rng, q * q);
         acc.rhs_f = random_vec(&mut rng, q);
@@ -1725,10 +2146,11 @@ mod tests {
                     forces: (0..n).map(|_| [rng.gen_range(-0.1..0.1), -0.0, rng.gen_range(-0.1..0.1)]).collect(),
                     tag: tags[i % tags.len()],
                     weight: if i % 5 == 0 { 2.5 } else { 1.0 },
+                    force_mask: None, use_energy: true,
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new() }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.
@@ -1780,7 +2202,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
         assert_ne!(bad, header);
-        let mut v = MAGIC_V5.to_vec();
+        let mut v = MAGIC_V7.to_vec();
         v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
         v.extend_from_slice(bad.as_bytes());
         v.extend_from_slice(&bytes[16 + hl..]);
@@ -1794,6 +2216,168 @@ mod tests {
 
     fn bits(v: &[f64]) -> Vec<u64> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A deterministic audit point of `n` atoms for the history tests (M8a Task 1).
+    fn history_point(i: u64, n: usize) -> crate::history::AuditPoint {
+        let k = i as f64;
+        crate::history::AuditPoint {
+            kind: if i % 3 == 0 { crate::history::PointKind::Audit } else { crate::history::PointKind::Fallback { rule: (i % 23) as u8 } },
+            classes: (0..n).map(|j| ((i as usize + j) % 3) as u8).collect(),
+            pred_force_std: (0..n).map(|j| 1e-3 * (1.0 + k + j as f64)).collect(),
+            pred_force_std_epistemic: (0..n).map(|j| 5e-4 * (1.0 + k + j as f64)).collect(),
+            pred_energy_std: 2e-5 * (1.0 + k),
+            err_force: (0..n).map(|j| 7e-4 * (1.0 + j as f64) * if i % 2 == 0 { 1.0 } else { 1.5 }).collect(),
+            teacher_force: (0..n).map(|j| 2e-2 * (1.0 + k) + 1e-3 * j as f64).collect(),
+            err_energy: if i % 3 == 0 { -1.3e-5 * (1.0 + k) } else { 2.1e-6 * k },
+            n_atoms: n,
+            model_gen: 3 + i / 7,
+            species: if i % 2 == 0 { Vec::new() } else { (0..n).map(|j| (1 + (j % 2) as u8 * 7, vec![1])).collect() },
+        }
+    }
+
+    /// M8a Task 1, Step 1: the ring keeps the newest `HISTORY_CAP` points — after HISTORY_CAP + 10
+    /// pushes `len()` is the cap and the oldest ten are gone; `recorded` counts every push.
+    #[test]
+    fn history_ring_keeps_the_newest() {
+        use crate::history::{AuditHistory, HISTORY_CAP};
+        let mut h = AuditHistory::default();
+        assert!(h.is_empty() && h.len() == 0 && h.recorded() == 0);
+        let extra = 10u64;
+        for i in 0..HISTORY_CAP as u64 + extra {
+            h.push(history_point(i, 1 + (i % 3) as usize));
+        }
+        assert_eq!(h.len(), HISTORY_CAP);
+        assert_eq!(h.recorded(), HISTORY_CAP as u64 + extra);
+        let first = h.iter().next().expect("not empty");
+        assert_eq!(first, &history_point(extra, 1 + (extra % 3) as usize), "the oldest ten were evicted");
+        let last = h.iter().last().expect("not empty");
+        let i_last = HISTORY_CAP as u64 + extra - 1;
+        assert_eq!(last, &history_point(i_last, 1 + (i_last % 3) as usize));
+        assert_eq!(h.iter().count(), HISTORY_CAP);
+    }
+
+    /// M8a Task 1, Step 1: a fitted model is written as version 7 with its audit history and reads
+    /// back equal (the unrecorded counters included); a version-5 file reads with an empty history;
+    /// the standalone `encode`/`decode` pair (Task 3's `history.bin`) round-trips the same ring,
+    /// bit for bit; a history with a class code beyond 2 or misshapen arrays is refused.
+    /// Version 7's `class_memory` key (M8a Task 2 fix round 2): the calibrated class verdict's
+    /// hysteresis memory round-trips; absent, it reads empty; a malformed key is refused.
+    #[test]
+    fn sidecar_round_trips_the_class_memory() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(48, false);
+        let path = tmp("memory-v7.model");
+        let k = |class, z, nb: &[u8]| EnvKey { class, z, neighbours: nb.to_vec() };
+        let memory = vec![(k(2, 8, &[1]), true, Some(41u64)), (k(2, 1, &[1, 8]), false, None)];
+        write_full_with_memory(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &memory).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string();
+        assert!(header.contains("\"class_memory\":[{\"class\":2,\"z\":8,\"neighbours\":[1],\"trusted\":true,\"since\":41},{\"class\":2,\"z\":1,\"neighbours\":[1,8],\"trusted\":false,\"since\":null}]"), "{header}");
+        assert_eq!(read(&path).unwrap().class_memory, memory);
+        // absent: empty
+        let plain = tmp("memory-none.model");
+        write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        assert!(read(&plain).unwrap().class_memory.is_empty());
+        // malformed: refused, naming the key
+        let bad = header.replacen("\"trusted\":true", "\"trusted\":1", 1);
+        let mut b = bytes[..8].to_vec();
+        b.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+        b.extend_from_slice(bad.as_bytes());
+        b.extend_from_slice(&bytes[16 + hl..]);
+        let pb = tmp("memory-bad.model");
+        std::fs::write(&pb, b).unwrap();
+        let e = read(&pb).unwrap_err().to_string();
+        assert!(e.contains("class_memory"), "{e}");
+    }
+
+    #[test]
+    fn sidecar_round_trips_the_history() {
+        use crate::history::{AuditHistory, HISTORY_CAP};
+        let orig = random_sidecar(47, false);
+        let mut hist = AuditHistory::default();
+        for i in 0..57u64 {
+            hist.push(history_point(i, 1 + (i % 4) as usize));
+        }
+        hist.unrecorded.no_variance = 3;
+        hist.unrecorded.box_affected = 2;
+        hist.unrecorded.draft = 1;
+        hist.unrecorded.unfit = 4;
+        let path = tmp("history-v7.model");
+        write_full_with_history(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V7);
+        let back = read(&path).unwrap();
+        assert_eq!(back.audit_history, hist);
+        assert_eq!(back.audit_history.recorded(), 57);
+        assert_eq!(back.model, orig.model);
+        // a file without a history: the same header and arrays as version 5 under the new magic
+        let plain = tmp("history-none.model");
+        write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let plain_bytes = std::fs::read(&plain).unwrap();
+        assert_eq!(&plain_bytes[..8], MAGIC_V7);
+        assert_eq!(read(&plain).unwrap().audit_history, AuditHistory::default());
+        let hl = u64::from_le_bytes(plain_bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&plain_bytes[16..16 + hl]).unwrap();
+        assert!(!header.contains("audit_history"), "{header}");
+        // the same bytes as a version-5 file: an empty history
+        let h5 = header.replacen("ASMODEL7", "ASMODEL5", 1);
+        let mut v5 = MAGIC_V5.to_vec();
+        v5.extend_from_slice(&(h5.len() as u64).to_le_bytes());
+        v5.extend_from_slice(h5.as_bytes());
+        v5.extend_from_slice(&plain_bytes[16 + hl..]);
+        let p5 = tmp("history-v5.model");
+        std::fs::write(&p5, v5).unwrap();
+        let old = read(&p5).unwrap();
+        assert_eq!(old.audit_history, AuditHistory::default());
+        assert_eq!(old.model, orig.model);
+        // the standalone encoding
+        let enc = hist.encode();
+        assert_eq!(&enc[..8], crate::history::MAGIC);
+        let dec = AuditHistory::decode(&enc).unwrap();
+        assert_eq!(dec, hist);
+        for (a, b) in dec.iter().zip(hist.iter()) {
+            assert_eq!(bits(&a.err_force), bits(&b.err_force));
+            assert_eq!(bits(&a.pred_force_std), bits(&b.pred_force_std));
+            assert_eq!(a.err_energy.to_bits(), b.err_energy.to_bits());
+        }
+        assert!(AuditHistory::decode(&enc[..enc.len() - 1]).is_err(), "truncated");
+        assert!(AuditHistory::decode(&[enc.as_slice(), &[0u8]].concat()).is_err(), "trailing byte");
+        assert!(AuditHistory::decode(b"ASAUDIT9").is_err(), "bad magic");
+        // a full ring round-trips through the encoding at exactly the cap
+        let mut full = AuditHistory::default();
+        for i in 0..HISTORY_CAP as u64 + 5 {
+            full.push(history_point(i, 2));
+        }
+        assert_eq!(AuditHistory::decode(&full.encode()).unwrap(), full);
+        // refused: a class code of 3, an atom count that no longer matches the per-atom arrays
+        let hl7 = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header7 = std::str::from_utf8(&bytes[16..16 + hl7]).unwrap();
+        assert!(header7.contains("\"audit_history\":{\"points\":57,\"recorded\":57,\"no_variance\":3,\"box_affected\":2,\"draft\":1,\"unfit\":4}"), "{header7}");
+        let n_pts = 57usize;
+        let a_sum = hist.to_arrays().classes.len();
+        // the body walk: the history arrays are the ten (five of `points`, five of Σ atoms) before
+        // the species array, which is last (M8a user-test fix 2)
+        let per_point = crate::history::HistoryArrays::PER_POINT;
+        let hist_bytes = 10 * 8 + 8 * (per_point * n_pts + 5 * a_sum);
+        let species_bytes = 8 + 8 * hist.to_arrays().species.len();
+        let hist_at = bytes.len() - species_bytes - hist_bytes;
+        let classes_at = hist_at + per_point * (8 + 8 * n_pts) + 8;
+        let mut bad_class = bytes.clone();
+        bad_class[classes_at..classes_at + 8].copy_from_slice(&3.0f64.to_le_bytes());
+        let p = tmp("history-bad-class.model");
+        std::fs::write(&p, &bad_class).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("audit_classes"), "{e}");
+        let mut bad_atoms = bytes.clone();
+        bad_atoms[hist_at + 8..hist_at + 16].copy_from_slice(&(history_point(0, 1).n_atoms as f64 + 1.0).to_le_bytes());
+        std::fs::write(&p, &bad_atoms).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("audit_atoms"), "{e}");
+        for f in [path, plain, p5, p] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     fn assert_accumulators_bit_equal(a: &Accumulator, b: &Accumulator) {
@@ -1818,6 +2402,7 @@ mod tests {
             assert_eq!(x.to_bits(), y.to_bits(), "{name}");
         }
         assert_eq!((a.n_e, a.n_f, a.n_samples, a.energy_per_atom), (b.n_e, b.n_f, b.n_samples, b.energy_per_atom));
+        assert_eq!(a.n_scale, b.n_scale);
         assert_eq!(a.envelope.count, b.envelope.count);
         assert_eq!(a.envelope.species, b.envelope.species);
         assert_eq!(a.envelope.n_features, b.envelope.n_features);
@@ -1825,7 +2410,115 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V5);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V7);
+    }
+
+    /// Masks the fixture's samples as capped segments would be (M8a Task 10): every third sample
+    /// with a force mask (its first atom out when it has more than one), every fourth without its
+    /// energy (then its first atom always in).
+    fn masked_samples(samples: &[Sample]) -> Vec<Sample> {
+        samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n = s.pos.len();
+                let force_mask = (i % 3 == 0).then(|| (0..n).map(|j| j > 0 || n == 1 || i % 4 == 0).collect());
+                Sample { force_mask, use_energy: i % 4 != 0, ..s.clone() }
+            })
+            .collect()
+    }
+
+    /// M8a Task 10 (module doc, "masked samples"): the force masks and the unused-energy flags
+    /// round-trip through a fitted file (version 7) and a samples-only file (version 6), with the
+    /// accumulator's scale-row count; a file with no masked sample is byte-identical to the
+    /// earlier writer's (no mask arrays, no `n_scale` key) and reads as "every sample whole"; a
+    /// malformed mask is refused.
+    #[test]
+    fn masked_samples_round_trip_and_old_files_read_whole() {
+        let orig = random_sidecar(12, false);
+        // an old file: the writer before Task 10 wrote exactly these bytes (no new key, no array)
+        let old = tmp("masks-old.model");
+        write(&old, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&old).unwrap()).to_string();
+        assert!(!text.contains("sample_mask_kind") && !text.contains("n_scale"));
+        let back = read(&old).unwrap();
+        assert!(back.samples.iter().all(Sample::is_whole), "an old file's samples read whole");
+        assert_eq!(back.accumulator.n_scale, back.accumulator.n_e);
+        // masked samples, and an accumulator whose scale rows exceed its energy rows
+        let samples = masked_samples(&orig.samples);
+        assert!(samples.iter().any(|s| s.force_mask.is_some() && s.use_energy) && samples.iter().any(|s| s.force_mask.is_some() && !s.use_energy) && samples.iter().any(|s| s.force_mask.is_none() && !s.use_energy));
+        let mut acc = orig.accumulator.clone();
+        acc.n_scale = 52;
+        let p = tmp("masks.model");
+        write(&p, &orig.model, &acc, orig.report.as_ref(), &samples, orig.reference_rule.as_deref()).unwrap();
+        let back = read(&p).unwrap();
+        assert_eq!(back.samples, samples);
+        assert_eq!(back.accumulator.n_scale, 52);
+        assert_accumulators_bit_equal(&back.accumulator, &acc);
+        // with the history after the tail (version 7's last arrays) and quarantine + densities before it
+        let n = samples.len();
+        let q: Vec<u8> = (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect();
+        let face: Vec<f64> = (0..n).map(|i| 1e-6 * i as f64).collect();
+        let mut history = AuditHistory::default();
+        history.push(history_point(1, 3));
+        write_full_with_history(&p, &orig.model, &acc, orig.report.as_ref(), &samples, None, &q, &face, None, &[], &history).unwrap();
+        let back = read(&p).unwrap();
+        assert_eq!((back.samples.clone(), back.quarantine.clone(), bits(&back.face_density)), (samples.clone(), q.clone(), bits(&face)));
+        assert_eq!(back.audit_history, history);
+        // a samples-only file (version 6)
+        let set = SampleSet {
+            provenance: orig.model.provenance.clone(),
+            samples: samples.clone(),
+            references: vec![(1, -0.45)],
+            reference_rule: None,
+            quarantine: Vec::new(),
+            face_density: face.clone(),
+            sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: CREATED_BY.into(),
+        };
+        let p6 = tmp("masks-v6.model");
+        write_samples(&p6, &set).unwrap();
+        let Contents::Samples(back) = read_any(&p6).unwrap() else { panic!("a samples-only file") };
+        assert_eq!(back.samples, samples);
+        // malformed masks are refused, never misread: a sample that teaches nothing, a kind beyond
+        // 3, a mask entry not 0/1, a mask array of the wrong length
+        let mut s_bad = samples.clone();
+        s_bad[0].force_mask = Some(vec![false; s_bad[0].pos.len()]);
+        s_bad[0].use_energy = false;
+        assert!(decode_masks(&mut s_bad.clone(), &[3.0], &vec![0.0; s_bad[0].pos.len()]).unwrap_err().contains("teaches nothing"));
+        assert!(decode_masks(&mut s_bad.clone(), &[4.0], &[]).unwrap_err().contains("not 0, 1, 2 or 3"));
+        assert!(decode_masks(&mut s_bad.clone(), &[1.0], &vec![0.5; s_bad[0].pos.len()]).unwrap_err().contains("(0 or 1)"));
+        assert!(decode_masks(&mut s_bad[..1].to_vec(), &[1.0], &vec![1.0; s_bad[0].pos.len() + 1]).unwrap_err().contains("entries"));
+        for f in [old, p, p6] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// Task 10a review, finding 5: a fit without energy rows (s_E pinned, γ_E = residual dof_E = 0)
+    /// writes its report's s_E as "no energy rows", not as a measured number, and reads back the
+    /// pin; a fit with energy rows writes the number as before.
+    #[test]
+    fn a_fit_without_energy_rows_writes_no_measured_sigma_e() {
+        let orig = random_sidecar(12, false);
+        let samples = masked_samples(&orig.samples);
+        let mut report = orig.report.clone().unwrap();
+        assert!(report.has_energy_rows());
+        let p = tmp("no-energy-rows.model");
+        write(&p, &orig.model, &orig.accumulator, Some(&report), &samples, None).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).to_string();
+        assert!(!text.contains("no energy rows"));
+        (report.sigma_e, report.gamma_e, report.residual_dof_e) = (crate::fit::SIGMA_E_WITHOUT_ENERGY_ROWS, 0.0, 0.0);
+        write(&p, &orig.model, &orig.accumulator, Some(&report), &samples, None).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).to_string();
+        assert!(text.contains("\"sigma_e\":\"no energy rows\""), "the fit's s_E reads as no measurement");
+        let back = read(&p).unwrap();
+        assert_eq!(back.report.as_ref(), Some(&report), "read back as the pin");
+        assert!(!back.report.unwrap().has_energy_rows());
+        let _ = std::fs::remove_file(p);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
@@ -1835,7 +2528,7 @@ mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V5);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V7);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -1912,6 +2605,9 @@ mod tests {
             reference_rule: Some(REFERENCE_RULE.into()),
             quarantine: (0..n).map(|i| [0, 1, 0, 3][i % 4]).collect(),
             face_density: (0..n).map(|i| if i % 3 == 0 { f64::NAN } else { 1e-6 * i as f64 }).collect(),
+            sample_box: Vec::new(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
             teacher_solves: Some(TeacherSolves { pass: 40, fallback: 3, audit: 0, verification: 0, kept: 43, complete: true }),
             teacher_solves_note: None,
             created_by: CREATED_BY.into(),
@@ -1941,6 +2637,23 @@ mod tests {
         write_samples(&p, &bare).unwrap();
         let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
         assert!(back.quarantine.is_empty() && back.face_density.is_empty() && back.references.is_empty() && back.teacher_solves.is_none());
+        assert!(back.sample_box.is_empty());
+        // the boxes of a collection's session-only samples (M8a Task 4b fix round 1) round-trip
+        let boxes = SampleSet { sample_box: (0..n).map(|i| 41 + 2 * (i % 3)).collect(), ..set.clone() };
+        write_samples(&p, &boxes).unwrap();
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
+        assert_eq!(back.sample_box, boxes.sample_box);
+        assert!(write_samples(&p, &SampleSet { sample_box: vec![41; n + 1], ..set.clone() }).is_err());
+        assert!(read_specialised(&p).unwrap().is_empty(), "not specialised");
+        // a specialised model's keys (M8a Task 7) round-trip; it needs every sample's box
+        let spec = SampleSet { specialised: vec![1, 15], box_references: vec![(1, 41, -0.47), (1, 43, -0.471), (15, 41, -6.4)], ..boxes.clone() };
+        write_samples(&p, &spec).unwrap();
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!() };
+        assert_eq!((back.specialised.clone(), back.box_references.clone()), (spec.specialised.clone(), spec.box_references.clone()));
+        assert_eq!(read_specialised(&p).unwrap(), vec![1, 15]);
+        assert!(write_samples(&p, &SampleSet { sample_box: Vec::new(), ..spec.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { box_references: vec![(15, 41, -6.4), (1, 41, -0.47)], ..spec.clone() }).is_err());
+        assert!(write_samples(&p, &SampleSet { specialised: vec![15, 1], ..spec }).is_err());
         // refused on write: no samples, misshapen flags, unsorted references
         assert!(write_samples(&p, &SampleSet { samples: Vec::new(), quarantine: Vec::new(), face_density: Vec::new(), ..set.clone() }).is_err());
         assert!(write_samples(&p, &SampleSet { quarantine: vec![0; n - 1], ..set.clone() }).is_err());
@@ -1954,6 +2667,34 @@ mod tests {
         let q = tmp("fitted-any.model");
         write(&q, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
         assert!(matches!(read_any(&q).unwrap(), Contents::Fitted(_)));
+    }
+
+    /// A body-4 basis (M8a Task 5) is written as version 8 and reads back bit for bit; a body-4-free
+    /// basis is still version 7; a version-8 header whose body-4 cap is not this build's layout,
+    /// or that says body4 false, is refused.
+    #[test]
+    fn a_body4_basis_round_trips_as_version_8() {
+        let orig = random_sidecar_with(37, true, true);
+        assert!(orig.model.basis.n_body4() > 0);
+        round_trip(orig.clone(), "round-trip-v8.model", "bare-v8.model", MAGIC_V8);
+        round_trip(random_sidecar_with(37, true, false), "round-trip-v7b3.model", "bare-v7b3.model", MAGIC_V7);
+        let path = tmp("body4-cap.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap().to_string();
+        assert!(header.contains("\"body4\":true,\"body4_cap\":2"), "{header}");
+        for (what, from, to) in [("cap", "\"body4_cap\":2", "\"body4_cap\":3"), ("flag", "\"body4\":true", "\"body4\":false")] {
+            let h2 = header.replacen(from, to, 1);
+            let mut b2 = bytes[..8].to_vec();
+            b2.extend_from_slice(&(h2.len() as u64).to_le_bytes());
+            b2.extend_from_slice(h2.as_bytes());
+            b2.extend_from_slice(&bytes[16 + header_len..]);
+            let p2 = tmp(&format!("body4-{what}.model"));
+            std::fs::write(&p2, b2).unwrap();
+            let e = read(&p2).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}");
+        }
     }
 
     fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
@@ -2026,7 +2767,7 @@ mod tests {
         let path = tmp("masses-v3.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V5);
+        assert_eq!(&bytes[..8], MAGIC_V7);
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
@@ -2051,7 +2792,7 @@ mod tests {
         let masses_key = ",\"masses\":[[1,1],[1,2]]";
         assert!(header.contains(masses_key), "{header}");
         let as_version = |magic: &[u8; 8]| {
-            let h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
+            let h = header.replacen("ASMODEL7", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
             let mut v = magic.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
@@ -2070,9 +2811,9 @@ mod tests {
         let p3 = tmp("masses-v3-body2.model");
         write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
         let bytes2 = std::fs::read(&p3).unwrap();
-        assert_eq!(&bytes2[..8], MAGIC_V5, "version 5 is written for a body-2 basis too");
+        assert_eq!(&bytes2[..8], MAGIC_V7, "version 7 is written for a body-2 basis too");
         let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
-        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL5", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
+        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL7","ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
         let mut v1 = MAGIC.to_vec();
         v1.extend_from_slice(&(h1.len() as u64).to_le_bytes());
         v1.extend_from_slice(h1.as_bytes());
@@ -2091,7 +2832,7 @@ mod tests {
             ("A out of range", header.replacen(masses_key, ",\"masses\":[[1,70000]]", 1)),
             ("not a pair", header.replacen(masses_key, ",\"masses\":[[1,1,1]]", 1)),
         ] {
-            let mut v = MAGIC_V5.to_vec();
+            let mut v = MAGIC_V7.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + header_len..]);
@@ -2115,7 +2856,7 @@ mod tests {
         let path = tmp("ionic-v4.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], b"ASMODEL5");
+        assert_eq!(&bytes[..8], b"ASMODEL7");
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.ionic, "cores/0123456789abcdef");
         assert_eq!(back.model, orig.model);
@@ -2135,7 +2876,7 @@ mod tests {
             ("not a string", header.replacen(key, ",\"ionic\":7", 1)),
             ("too long", header.replacen(key, &format!(",\"ionic\":\"{}\"", "x".repeat(MAX_IONIC_TAG + 1)), 1)),
         ] {
-            let mut v = MAGIC_V5.to_vec();
+            let mut v = MAGIC_V7.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + hl..]);
@@ -2171,7 +2912,7 @@ mod tests {
         assert_eq!(read(&cut).unwrap_err().kind(), io::ErrorKind::InvalidData);
         // an older version: header surgery as in `old_versions_read_as_all_electron` gives no mass record and "none"
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
-        let v2 = header.replacen("ASMODEL5", "ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
+        let v2 = header.replacen("ASMODEL7","ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
         let v2 = v2.replacen(&masses, "", 1);
         let mut v = MAGIC_V2.to_vec();
@@ -2223,7 +2964,7 @@ mod tests {
         let path = tmp("shell-pair-v5.model");
         write_full_with_audits(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &audits).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V5);
+        assert_eq!(&bytes[..8], MAGIC_V7);
         let back = read(&path).unwrap();
         assert_eq!(back.failed_audits, audits.to_vec());
         let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
@@ -2235,7 +2976,7 @@ mod tests {
             ("an unsorted pair", header.replacen(",\"pair\":[1,1]", ",\"pair\":[2,1]", 1), "Z_a ≤ Z_b"),
         ] {
             assert_ne!(bad, header, "{what}");
-            let mut v = MAGIC_V5.to_vec();
+            let mut v = MAGIC_V7.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + hl..]);
@@ -2267,7 +3008,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
         for (name, magic, strip_masses) in [("v4", MAGIC_V4, false), ("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
-            let mut h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1);
+            let mut h = header.replacen("ASMODEL7", std::str::from_utf8(magic).unwrap(), 1);
             if magic != MAGIC_V4 {
                 h = h.replacen(",\"ionic\":\"none\"", "", 1);
             }
@@ -2298,7 +3039,7 @@ mod tests {
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
         let with_header = |h: &str| {
-            let mut v = MAGIC_V5.to_vec();
+            let mut v = MAGIC_V7.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(body);
@@ -2347,9 +3088,9 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL7".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL9".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 7 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 9 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)
@@ -2361,14 +3102,14 @@ mod tests {
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();
         let with_header2 = |h: &str| {
-            let mut v = MAGIC_V5.to_vec();
+            let mut v = MAGIC_V7.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(&body2);
             v
         };
-        assert!(header2.contains("\"format\":\"ASMODEL5\"") && header2.contains("\"body3\":true"));
-        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL5", "ASMODEL1", 1))));
+        assert!(header2.contains("\"format\":\"ASMODEL7\"") && header2.contains("\"body3\":true"));
+        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL7","ASMODEL1", 1))));
         cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
         cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
         let mut swapped = good2.clone();

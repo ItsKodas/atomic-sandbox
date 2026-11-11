@@ -14,7 +14,7 @@ use sim::{Cell, DynCommand, Dynamics, IonicPolicy, Nucleus, PartialCharges, Scen
 use std::time::{Duration, Instant};
 
 fn scene(nuclei: Vec<Nucleus>, n: usize, charge: i32) -> Scene {
-    Scene { nuclei, cell: Cell { n, h: 0.25 }, charge, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::None }
+    Scene { nuclei, cell: Cell { n, h: 0.25 }, charge, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: IonicPolicy::None, train_mask: None }
 }
 
 /// The driver's charges at the scene's geometry: paused ticks until the references are in and the
