@@ -3295,6 +3295,299 @@ mod orbital_viewer {
         assert!(orbitals::unoccupied_lines(4, Some(&u), true)[0].starts_with("computing unoccupied orbitals…"));
         assert!(orbitals::unoccupied_lines(4, Some(&u), false).is_empty());
     }
+
+    // ---- orbitals by atom (orbital-atom-shares plan Task 4; user request 2026-11-12) ----
+
+    /// `r` with the Hirshfeld shares `s` (one per nucleus, as the provider ships them).
+    fn on(mut r: OrbitalInfo, s: &[f64]) -> OrbitalInfo {
+        r.shares = Some(s.to_vec());
+        r
+    }
+
+    fn heads(g: &[orbitals::Group], z: &[u8]) -> Vec<String> {
+        g.iter().map(|g| orbitals::heading(&g.owner, z)).collect()
+    }
+
+    /// An H₂O-like list: two rows mostly on O (0.92, 0.60 — the 0.55 line), one spread over all
+    /// three atoms (O 0.5, H 0.25, H 0.25), one on H #1. Atoms first by number, then the shared
+    /// group; rows keep their order; each row's share names its largest atom, the hover every atom
+    /// ≥ 1 % and the Hirshfeld caveat.
+    #[test]
+    fn groups_h2o_like() {
+        let z = [8, 1, 1];
+        let rows = vec![
+            on(row(Spin::Up, 0, 1, 0, -0.9, 1.0, idx(1)), &[0.92, 0.04, 0.04]),
+            on(row(Spin::Up, 1, 2, 1, -0.6, 1.0, idx(2)), &[0.60, 0.20, 0.20]),
+            on(row(Spin::Up, 2, 3, 2, -0.5, 1.0, idx(3)), &[0.5, 0.25, 0.25]),
+            on(row(Spin::Up, 3, 4, 3, -0.4, 1.0, idx(4)), &[0.05, 0.90, 0.05]),
+        ];
+        let refs: Vec<&OrbitalInfo> = rows.iter().collect();
+        let g = orbitals::groups(&refs, &z, true);
+        assert_eq!(heads(&g, &z), ["O #0", "H #1", "shared · O #0–H #1–H #2"]);
+        assert_eq!(g[0].rows, [0, 1], "O #0 holds two rows, in their order");
+        assert_eq!((g[1].rows.as_slice(), g[2].rows.as_slice()), (&[3][..], &[2][..]));
+        assert_eq!(g[2].owner, orbitals::Owner::Shared(vec![0, 1, 2]));
+        assert_eq!(orbitals::share_text(&[0.92, 0.04, 0.04], &z), "O #0 92 %");
+        assert_eq!(orbitals::share_text(&[0.5, 0.25, 0.25], &z), "O #0 50 %");
+        let hover = orbitals::share_hover(&[0.5, 0.25, 0.25], &z);
+        assert!(hover.starts_with("O #0 50 % · H #1 25 % · H #2 25 %"), "{hover}");
+        assert!(hover.contains("a split of space between the atoms (Hirshfeld, like the partial charges), not something measured"), "{hover}");
+        // below 1 % is left out of the hover
+        assert!(orbitals::share_hover(&[0.995, 0.004, 0.001], &z).starts_with("O #0 100 %\n"));
+    }
+
+    /// Near and exact 50/50 read `shared`, never one atom (the 0.55 margin); equal at the whole
+    /// percent shown goes by atom number, so the order does not flip with the noise.
+    #[test]
+    fn an_exact_tie_reads_shared() {
+        use orbitals::Owner;
+        assert_eq!(orbitals::owner_of(&[0.5000001, 0.4999999]), Owner::Shared(vec![0, 1]));
+        assert_eq!(orbitals::owner_of(&[0.4999999, 0.5000001]), Owner::Shared(vec![0, 1]), "a tie at the percent shown: by atom number");
+        assert_eq!(orbitals::owner_of(&[0.54, 0.46]), Owner::Shared(vec![0, 1]));
+        assert_eq!(orbitals::owner_of(&[0.46, 0.54]), Owner::Shared(vec![1, 0]), "largest first");
+        assert_eq!(orbitals::owner_of(&[0.56, 0.44]), Owner::Atom(0));
+        assert_eq!(orbitals::owner_of(&[0.44, 0.56]), Owner::Atom(1));
+        assert_eq!(orbitals::owner_of(&[0.55, 0.45]), Owner::Atom(0), "at least 0.55");
+        assert_eq!(orbitals::share_text(&[0.4999999, 0.5000001], &[1, 1]), "H #0 50 %");
+    }
+
+    /// A degenerate set (the provider has already given each member the set's mean) lands in one
+    /// group, whatever sits between its members.
+    #[test]
+    fn degenerate_rows_stay_together() {
+        let z = [6, 1, 1, 1, 1];
+        let t2 = [0.40, 0.15, 0.15, 0.15, 0.15];
+        let set = |mut r: OrbitalInfo| {
+            r.cluster = Some((3, 2e-5));
+            on(r, &t2)
+        };
+        let rows = vec![
+            on(row(Spin::Up, 0, 1, 0, -9.8, 1.0, idx(1)), &[0.99, 0.0025, 0.0025, 0.0025, 0.0025]),
+            set(row(Spin::Up, 1, 2, 1, -0.35, 1.0, idx(2))),
+            on(row(Spin::Up, 2, 3, 2, -0.34, 1.0, idx(3)), &[0.05, 0.80, 0.05, 0.05, 0.05]),
+            set(row(Spin::Up, 3, 4, 3, -0.35, 1.0, idx(4))),
+            set(row(Spin::Up, 4, 5, 4, -0.35, 1.0, idx(5))),
+        ];
+        let refs: Vec<&OrbitalInfo> = rows.iter().collect();
+        let g = orbitals::groups(&refs, &z, true);
+        let t2_groups: Vec<&orbitals::Group> = g.iter().filter(|g| g.rows.contains(&1)).collect();
+        assert_eq!(t2_groups.len(), 1);
+        assert_eq!(t2_groups[0].rows, [1, 3, 4], "{g:?}");
+        assert_eq!(heads(&g, &z), ["C #0", "H #1", "shared · C #0"]);
+    }
+
+    /// Text shapes with their colour (a `RichText` colour, else the fallback), drawn in a window
+    /// tall enough for the whole list.
+    fn coloured_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> Vec<(String, egui::Color32)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    let c = t.galley.job.sections.first().map_or(t.fallback_color, |s| s.format.color);
+                    out.push((t.galley.text().to_string(), c));
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 2400.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            last.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut last));
+        }
+        last
+    }
+
+    /// A water-like open-shell payload with shares on the scene's three atoms: ↑ #1 O, ↑ #2 O,
+    /// ↑ #3 H #1, ↓ #1 O, ↓ #2 H #1 (tracks 1–5).
+    fn water_by_atom() -> OrbitalDisplay {
+        let rows = vec![
+            on(row(Spin::Up, 0, 1, 0, -0.9, 1.0, idx(1)), &[0.98, 0.01, 0.01]),
+            on(row(Spin::Up, 1, 2, 1, -0.5, 1.0, idx(2)), &[0.60, 0.20, 0.20]),
+            on(row(Spin::Up, 2, 3, 2, -0.4, 1.0, idx(3)), &[0.15, 0.80, 0.05]),
+            on(row(Spin::Down, 0, 4, 0, -0.85, 1.0, idx(1)), &[0.98, 0.01, 0.01]),
+            on(row(Spin::Down, 1, 5, 2, -0.35, 1.0, idx(2)), &[0.15, 0.80, 0.05]),
+        ];
+        let mut o = payload(rows, OrbitalRequest::List);
+        o.positions = vec![[0.0; 3]; 3];
+        o.share_z = Some(vec![8, 1, 1]);
+        o
+    }
+
+    /// Goal 3 (user decision 2026-11-12): selecting H #1 keeps its rows at full strength and draws
+    /// the O rows faint, still in the list (the same rows, the same order) and still clickable;
+    /// the Edit tool's group counts as selected; deselecting leaves nothing faint.
+    #[test]
+    fn selection_dims_but_keeps_rows() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, water_by_atom());
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        let names = ["#1 ↑", "#2 ↑", "#3 ↑", "#1 ↓", "#2 ↓"];
+        // the row labels on screen, in order, each with whether it is drawn faint
+        let rows_drawn = |st: &mut UiState, inp: &PanelInput<'_>| -> Vec<(String, bool)> {
+            PROBES.with(|p| p.borrow_mut().clear());
+            let t = coloured_texts(&ctx, st, inp);
+            let probed = PROBES.with(|p| p.borrow().keys().filter(|k| k.starts_with("orbital-↑-") || k.starts_with("orbital-↓-")).count());
+            assert_eq!(probed, 5, "every row is drawn");
+            t.into_iter().filter(|(s, _)| names.contains(&s.as_str())).map(|(s, c)| (s, c == theme::INK_FAINT)).collect()
+        };
+        let none = input(&scene, Some(&snap), &cam);
+        let before = rows_drawn(&mut st, &none);
+        assert_eq!(before.len(), 5, "{before:?}");
+        assert!(before.iter().all(|(_, faint)| !faint), "nothing selected: nothing faint ({before:?})");
+        let h1 = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
+        let sel = rows_drawn(&mut st, &h1);
+        let order = |v: &[(String, bool)]| v.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&sel), order(&before), "the list does not re-sort on a selection");
+        let faint: Vec<&str> = sel.iter().filter(|(_, f)| *f).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(faint, ["#1 ↑", "#2 ↑", "#1 ↓"], "the O rows are faint, the H #1 rows lit");
+        // a faint row is still a picker
+        let outs = click_widget(&ctx, &mut st, &h1, "orbital-↑-1");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::PickOrbital { spin: Spin::Up, track: 1 }));
+        assert_eq!(st.orbital_pick, Some((Spin::Up, 1)));
+        // the Edit tool's group selects too: O #0 and H #1 together light every row here
+        st.edit_group = vec![0, 1];
+        assert!(rows_drawn(&mut st, &none).iter().all(|(_, f)| !f));
+        st.edit_group = vec![2];
+        assert_eq!(rows_drawn(&mut st, &none).iter().filter(|(_, f)| *f).count(), 5, "nothing is mostly on H #2");
+        st.edit_group.clear();
+        assert!(rows_drawn(&mut st, &none).iter().all(|(_, f)| !f), "deselected: nothing faint");
+        assert_eq!(orbitals::selected_atoms(Some(1), &[1, 2, 7], 3), [1, 2], "each once, within the scene");
+        assert!(orbitals::lit(&[0.3, 0.3, 0.4], &[]) && orbitals::lit(&[0.3, 0.3, 0.4], &[0, 1]) && !orbitals::lit(&[0.3, 0.3, 0.4], &[2]));
+    }
+
+    /// A state of the box and an unoccupied row of an earlier geometry are listed under their own
+    /// headings and show no share; the occupied rows keep theirs.
+    #[test]
+    fn box_and_earlier_rows_have_no_share() {
+        use orbitals::Owner;
+        let z = [8, 1, 1];
+        let mut boxed = on(row(Spin::Up, 3, 6, 3, 0.03, 0.0, idx(4)), &[0.4, 0.3, 0.3]); // shares ignored
+        boxed.box_state = true;
+        let unocc = row(Spin::Up, 4, 7, 4, 0.05, 0.0, idx(5));
+        let occ = on(row(Spin::Up, 0, 1, 0, -0.9, 1.0, idx(1)), &[0.98, 0.01, 0.01]);
+        let rows = [&occ, &boxed, &unocc];
+        let g = orbitals::groups(&rows, &z, false);
+        assert_eq!(g.iter().map(|g| g.owner.clone()).collect::<Vec<_>>(), [Owner::Atom(0), Owner::Box, Owner::Earlier]);
+        assert_eq!(heads(&g, &z), ["O #0", "box states", "from an earlier geometry"]);
+        let current = orbitals::groups(&rows, &z, true);
+        assert_eq!(current[2].owner, Owner::Unknown, "of this geometry without shares: unknown, not earlier");
+        // on screen: the headings, and a share on the occupied row only
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let mut o = water_by_atom();
+        o.rows.push(boxed.clone());
+        o.rows.push(unocc.clone());
+        o.unoccupied = Some(UnoccupiedStatus { requested: 4, current: false, ..Default::default() });
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        PROBES.with(|p| p.borrow_mut().clear());
+        let texts: Vec<String> = coloured_texts(&ctx, &mut st, &inp).into_iter().map(|(t, _)| t).collect();
+        for h in ["O #0", "H #1", "box states", "from an earlier geometry"] {
+            assert!(texts.iter().any(|t| t == h), "{h}: {texts:?}");
+        }
+        let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
+        assert!(probed("share-↑-1") && probed("orbital-↑-6") && probed("orbital-↑-7"));
+        assert!(!probed("share-↑-6") && !probed("share-↑-7"), "no share for a box state or an earlier geometry's row");
+        assert!(texts.iter().any(|t| t == "O #0 98 %"), "{texts:?}");
+    }
+
+    /// Review Focus 5: H₂ in play — the σ_g's shares 0.5 ± 1e-6 of grid noise on every step —
+    /// reads `shared` with the same heading and the same share every time.
+    #[test]
+    fn play_keeps_h2_shared() {
+        let z = [1, 1];
+        let mut seed = 0x9e37_79b9_u32;
+        for step in 0..20 {
+            // a small LCG: a deterministic ± noise of up to 1e-6
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed as f64 / u32::MAX as f64 - 0.5) * 2e-6;
+            let mut o = h2_closed();
+            o.rows[0].shares = Some(vec![0.5 + e, 0.5 - e]);
+            o.rows[2].shares = Some(vec![0.5 + e, 0.5 - e]);
+            let [up, dn] = [Spin::Up, Spin::Down].map(|s| o.rows.iter().filter(|r| r.spin == s && r.occupation > 0.0).collect::<Vec<_>>());
+            for rows in [up, dn] {
+                let g = orbitals::groups(&rows, &z, true);
+                assert_eq!(g.len(), 1);
+                assert_eq!(g[0].owner, orbitals::Owner::Shared(vec![0, 1]), "step {step}: e {e:e}");
+                assert_eq!(heads(&g, &z), ["shared · H #0–H #1"], "step {step}");
+            }
+            assert_eq!(orbitals::share_text(o.rows[0].shares.as_ref().unwrap(), &z), "H #0 50 %", "step {step}");
+        }
+    }
+
+    /// Spec goal 4: a lone atom lists exactly as without shares — no group heading, no share.
+    #[test]
+    fn one_nucleus_lists_as_today() {
+        let scene = Scene::preset("he").unwrap();
+        let cam = camera();
+        let he_rows = || vec![row(Spin::Up, 0, 1, 0, -0.57, 1.0, idx(1)), row(Spin::Down, 0, 2, 0, -0.57, 1.0, idx(1))];
+        let mut with = payload(he_rows().into_iter().map(|r| on(r, &[1.0])).collect(), OrbitalRequest::List);
+        with.share_z = Some(vec![2]);
+        with.spin = closed_spin();
+        let mut without = payload(he_rows(), OrbitalRequest::List);
+        without.spin = closed_spin();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("he", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        let mut draw = |o: OrbitalDisplay, sel: Option<usize>| {
+            let snap = with_payload(&scene, Backend::Gpu, o);
+            let inp = PanelInput { selected: sel, ..input(&scene, Some(&snap), &cam) };
+            PROBES.with(|p| p.borrow_mut().clear());
+            let t = coloured_texts(&ctx, &mut st, &inp);
+            assert!(PROBES.with(|p| !p.borrow().keys().any(|k| k.starts_with("share-"))), "no share column");
+            t
+        };
+        let a = draw(with.clone(), None);
+        assert!(!a.iter().any(|(t, _)| t.contains("He #0") || t.contains("shared ·")), "{a:?}");
+        assert_eq!(a, draw(without, None), "the same list as without shares");
+        // the list (from its heading to the view's status chip): the rest of the chrome shows the selection
+        let list = |t: &[(String, egui::Color32)]| {
+            let from = t.iter().position(|(s, _)| s == "ORBITALS").expect("the list's heading");
+            let to = from + t[from..].iter().position(|(s, _)| s.starts_with("paused")).expect("the status chip");
+            t[from..to].to_vec()
+        };
+        assert!(list(&a).iter().any(|(s, _)| s == "#1 ↑↓"));
+        assert_eq!(list(&draw(with, Some(0))), list(&a), "selecting the atom changes nothing in the list");
+    }
+
+    /// Controller ruling (Task 4): shares are used only when their Z list is the scene's — a late
+    /// payload from before an edit lists as without shares and says why; so does a payload whose
+    /// shares failed their check, or one waiting for the free-atom references.
+    #[test]
+    fn shares_need_the_scenes_atoms() {
+        let scene_z = [8, 1, 1];
+        let o = water_by_atom();
+        assert!(orbitals::grouped(&o, &scene_z) && orbitals::shares_note(&o, &scene_z, false).is_none());
+        // an H added since: the payload's shares index [8, 1, 1], the scene is [8, 1, 1, 1]
+        let edited = [8, 1, 1, 1];
+        assert!(!orbitals::grouped(&o, &edited));
+        assert!(orbitals::shares_note(&o, &edited, false).unwrap().contains("before the last edit"));
+        let mut bare = water_by_atom();
+        bare.share_z = None;
+        bare.rows.iter_mut().for_each(|r| r.shares = None);
+        assert_eq!(orbitals::shares_note(&bare, &scene_z, true).as_deref(), Some(orbitals::SHARES_PENDING));
+        assert!(orbitals::shares_note(&bare, &scene_z, false).unwrap().starts_with("atom shares need the atom references"));
+        bare.notes.push("orbital shares off: Σ = 1.002500 outside 1 ± 1e-3".into());
+        assert!(orbitals::shares_note(&bare, &scene_z, true).unwrap().contains("orbital shares off: Σ = 1.002500"), "the payload's own reason");
+        assert!(orbitals::shares_note(&bare, &[2], true).is_none(), "a lone atom: no note");
+    }
 }
 
 /// The Activity tab (activity spec §3.3): state, job rows, the solve log, the views contract.

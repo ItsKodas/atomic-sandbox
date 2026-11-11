@@ -15,7 +15,19 @@
 //! orbital is arbitrary ([`SIGN_TIP`]). The list is built by pure functions of the payload
 //! ([`RowView`], [`Levels`], [`unoccupied_lines`], [`spin_lines`]) so the tests read them without a
 //! window. Energies are converted at this edge through `units` (rule 3); the payload speaks Hartree.
+//!
+//! **Orbitals by atom** (orbital-atom-shares spec; user request 2026-11-12: "I want to see which
+//! orbitals are mostly on that atom"). With the payload's Hirshfeld shares (`OrbitalInfo::shares`,
+//! indexed by `OrbitalDisplay::share_z`, used only when that is the scene's own Z list) the list is
+//! grouped by atom ([`groups`]: under an atom holding ≥ [`MAJORITY`], else under `shared · …`;
+//! box states and rows of an earlier geometry under their own headings, with no share), each row
+//! shows its largest share ([`share_text`]; the tooltip [`SHARE_TIP`] says it is a split of space,
+//! not measured), and the atoms selected in the view light their rows ([`lit`]) while every other
+//! row is drawn faint — never hidden, never re-sorted (the grouping reads the shares only). A
+//! one-nucleus scene and a payload without usable shares list as before ([`grouped`]; the latter
+//! with [`shares_note`]). Display only: nothing here is an `Action`.
 use super::super::{theme, Action, PanelInput, ShowMode, UiState, UNOCCUPIED_MAX};
+use super::selection::atom_name;
 use egui::{Color32, RichText, Ui};
 use sim::{LoneAtomLabels, OrbitalDisplay, OrbitalInfo, OrbitalRequest, Spin, SpinSummary, UnoccupiedStatus};
 
@@ -546,6 +558,219 @@ fn merged<'a>(up: &[&'a OrbitalInfo], dn: &[&'a OrbitalInfo]) -> Vec<(&'a Orbita
     out
 }
 
+// ---- where an orbital lives (orbital-atom-shares spec, goals 1–4; user request 2026-11-12) ----
+
+/// An orbital is listed under an atom when that atom holds at least this share of it, and a
+/// selection lights a row when the selected atoms together hold at least this much ([`lit`]) — spec,
+/// "Calls made after the builder check": H₂'s σ_g (50/50 to the grid's noise) reads `shared` on
+/// every step instead of flickering between its atoms. A display margin, not physics.
+pub const MAJORITY: f64 = 0.55;
+/// A `shared · …` heading names the atoms holding at least this share, largest first.
+pub const SHARED_MIN: f64 = 0.25;
+/// A row's tooltip lists the atoms holding at least this share.
+pub const HOVER_MIN: f64 = 0.01;
+/// The share's tooltip (rule 7: the share is a choice of split, not a measurement).
+pub const SHARE_TIP: &str = "the share of this orbital on each atom, s_A = ∫ w_A |ψ|²: a split of space between the atoms (Hirshfeld, like the partial charges), not something measured — another split (Mulliken, Bader) gives other numbers. An orbital is listed under an atom holding at least 55 % of it, else under shared (naming the atoms holding at least 25 %); the 55 % line is a display margin, not physics. A degenerate set shows its average (a single member's share depends on the display's rotation of the set); a paired ↑↓ row shows the ↑ orbital's";
+/// The list's note while the free-atom references the shares are weighted by are being solved.
+pub const SHARES_PENDING: &str = "atom shares need the atom references: being solved";
+/// The prefix of the producer's note when the shares failed their Σ_A s = 1 check
+/// (`providers::orbitals::settle_shares`).
+const SHARES_OFF: &str = "orbital shares off";
+
+/// Under whose heading a row is listed (spec, goal 2 and "Calls made after the builder check").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// One atom (scene index) holds at least [`MAJORITY`] of it.
+    Atom(usize),
+    /// No atom does: the atoms holding at least [`SHARED_MIN`], largest first (equal at the whole
+    /// percent shown: by atom number). Empty when the orbital is spread thinner than that.
+    Shared(Vec<usize>),
+    /// A state of the box (`OrbitalInfo::box_state`): no share (its far tails' split is the box's).
+    Box,
+    /// An unoccupied row solved at an earlier geometry (`UnoccupiedStatus::current` false).
+    Earlier,
+    /// A row without shares.
+    Unknown,
+}
+
+/// One heading of the grouped list and its rows (indices into the rows given to [`groups`], in
+/// their given order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub owner: Owner,
+    pub rows: Vec<usize>,
+}
+
+/// A share as the list prints it: whole percent.
+fn percent(s: f64) -> i64 {
+    (100.0 * s).round() as i64
+}
+
+/// The atoms by share, largest first; shares equal at the whole percent shown go by atom number,
+/// so H₂'s 0.5000001 / 0.4999999 orders (and names) the same on every step.
+fn ranked(shares: &[f64]) -> Vec<usize> {
+    let mut k: Vec<usize> = (0..shares.len()).collect();
+    k.sort_by_key(|&a| (std::cmp::Reverse(percent(shares[a])), a));
+    k
+}
+
+/// The owner of a row with shares (no memory: the current shares only).
+pub fn owner_of(shares: &[f64]) -> Owner {
+    let order = ranked(shares);
+    match order.first() {
+        Some(&best) if shares[best] >= MAJORITY => Owner::Atom(best),
+        _ => Owner::Shared(order.into_iter().filter(|&k| shares[k] >= SHARED_MIN).collect()),
+    }
+}
+
+/// The list's groups (spec, goal 2): `rows` in the order they are drawn, `z` the species the
+/// shares index (the scene's), `unocc_current` whether the unoccupied rows are of this geometry.
+/// A row goes under [`Owner::Box`] if it is a state of the box, under [`Owner::Earlier`] if it is an
+/// unoccupied row while those are an earlier geometry's, under [`Owner::Unknown`] without shares (or
+/// shares not one per atom of `z`), else under [`owner_of`]. A degenerate set carries one averaged
+/// share (the provider's), so it stays together. Groups go atoms by number, then shared groups by
+/// their first atom (a group naming none last), then box states, earlier, unknown; rows keep their
+/// order. Selection plays no part: the list never re-sorts as atoms are selected (anti-goal).
+pub fn groups(rows: &[&OrbitalInfo], z: &[u8], unocc_current: bool) -> Vec<Group> {
+    let mut out: Vec<Group> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let owner = if r.box_state {
+            Owner::Box
+        } else if !unocc_current && r.occupation == 0.0 {
+            Owner::Earlier
+        } else {
+            match r.shares.as_deref() {
+                Some(s) if !z.is_empty() && s.len() == z.len() => owner_of(s),
+                _ => Owner::Unknown,
+            }
+        };
+        match out.iter_mut().find(|g| g.owner == owner) {
+            Some(g) => g.rows.push(i),
+            None => out.push(Group { owner, rows: vec![i] }),
+        }
+    }
+    let rank = |o: &Owner| match o {
+        Owner::Atom(k) => (0, *k, Vec::new()),
+        Owner::Shared(v) => (1, v.first().copied().unwrap_or(usize::MAX), v.clone()),
+        Owner::Box => (2, 0, Vec::new()),
+        Owner::Earlier => (3, 0, Vec::new()),
+        Owner::Unknown => (4, 0, Vec::new()),
+    };
+    out.sort_by_key(|g| rank(&g.owner));
+    out
+}
+
+/// A group's heading: `O #0`, `shared · O #0–H #1–H #2`, `box states`, … (atom names as the
+/// Selection tab gives them).
+pub fn heading(owner: &Owner, z: &[u8]) -> String {
+    let name = |k: usize| atom_name(z.get(k).copied().unwrap_or(0), k);
+    match owner {
+        Owner::Atom(k) => name(*k),
+        Owner::Shared(v) if v.is_empty() => format!("shared · spread over many atoms (none holds {:.0} %)", 100.0 * SHARED_MIN),
+        Owner::Shared(v) => format!("shared · {}", v.iter().map(|&k| name(k)).collect::<Vec<_>>().join("–")),
+        Owner::Box => "box states".into(),
+        Owner::Earlier => "from an earlier geometry".into(),
+        Owner::Unknown => "no atom shares".into(),
+    }
+}
+
+/// A heading's tooltip.
+fn heading_tip(owner: &Owner) -> String {
+    match owner {
+        Owner::Atom(_) => format!("orbitals with at least {:.0} % of their share on this atom. {SHARE_TIP}", 100.0 * MAJORITY),
+        Owner::Shared(_) => format!("orbitals no single atom holds {:.0} % of — bonds and delocalised orbitals — naming the atoms holding at least {:.0} %, largest first. {SHARE_TIP}", 100.0 * MAJORITY, 100.0 * SHARED_MIN),
+        Owner::Box => format!("no atom share: splitting a box state's far tails between the atoms would present an artefact as a fact. {BOX_STATE_TIP}"),
+        Owner::Earlier => "unoccupied orbitals solved at an earlier geometry (the display eigensolve reruns when idle): shares belong to the orbitals they were computed with, so these get none".into(),
+        Owner::Unknown => "no share was computed for these orbitals".into(),
+    }
+}
+
+/// Whether a row stays at full strength under the selection (spec, goal 3): the selected atoms
+/// together hold at least [`MAJORITY`] of it — a bond's shared orbital lights when both its atoms
+/// are selected. Nothing selected: every row is lit.
+pub fn lit(shares: &[f64], selected: &[usize]) -> bool {
+    selected.is_empty() || selected.iter().filter_map(|&k| shares.get(k)).sum::<f64>() >= MAJORITY
+}
+
+/// The selected atoms: the view's selection and the Edit tool's group (`UiState::edit_group`),
+/// each once, in scene order, within the scene's `n` nuclei.
+pub fn selected_atoms(selected: Option<usize>, edit_group: &[usize], n: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = selected.into_iter().chain(edit_group.iter().copied()).filter(|&k| k < n).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// A row's share as the list prints it: its largest, `H #0 50 %` (spec, goal 1).
+pub fn share_text(shares: &[f64], z: &[u8]) -> String {
+    let k = ranked(shares).first().copied().unwrap_or(0);
+    format!("{} {} %", atom_name(z.get(k).copied().unwrap_or(0), k), percent(shares.get(k).copied().unwrap_or(0.0)))
+}
+
+/// The share's hover: every atom holding at least [`HOVER_MIN`], largest first, then [`SHARE_TIP`].
+pub fn share_hover(shares: &[f64], z: &[u8]) -> String {
+    let atoms: Vec<String> = ranked(shares)
+        .into_iter()
+        .filter(|&k| shares[k] >= HOVER_MIN)
+        .map(|k| format!("{} {} %", atom_name(z.get(k).copied().unwrap_or(0), k), percent(shares[k])))
+        .collect();
+    format!("{}\n{SHARE_TIP}", atoms.join(" · "))
+}
+
+/// Whether the list is grouped by atom: more than one nucleus (spec, goal 4: a lone atom lists as
+/// before) and shares indexing exactly the scene's species — a payload solved before an edit
+/// (`share_z` another Z list) never pairs its shares with the wrong atoms (controller ruling, Task 4).
+pub fn grouped(o: &OrbitalDisplay, scene_z: &[u8]) -> bool {
+    scene_z.len() > 1 && o.share_z.as_deref() == Some(scene_z)
+}
+
+/// The list's one-line note when a molecule's payload has no usable shares (the list is then as
+/// before): why — the payload is from before an edit, its shares failed their own check (the
+/// producer's reason), the free-atom references are being solved (`refs_pending`), or they are
+/// not in yet. `None` when grouped, for a lone atom, and without rows.
+pub fn shares_note(o: &OrbitalDisplay, scene_z: &[u8], refs_pending: bool) -> Option<String> {
+    if scene_z.len() <= 1 || o.rows.is_empty() || grouped(o, scene_z) {
+        return None;
+    }
+    if o.share_z.is_some() {
+        return Some("atom shares not shown: these orbitals were solved before the last edit, for other atoms".into());
+    }
+    if let Some(n) = o.notes.iter().find(|n| n.starts_with(SHARES_OFF)) {
+        return Some(format!("atom shares not shown — {n}"));
+    }
+    Some(if refs_pending { SHARES_PENDING.into() } else { "atom shares need the atom references: not in for these orbitals yet".into() })
+}
+
+/// What the list needs besides the payload: the scene's species, the selected atoms, whether the
+/// free-atom references are being solved, and the smeared-core note's Zσ.
+struct ListInput<'a> {
+    z_sigma: f64,
+    scene_z: &'a [u8],
+    selected: &'a [usize],
+    refs_pending: bool,
+}
+
+/// How one row is drawn besides its orbital: its share (text and hover; `None` = no share column)
+/// and whether the selection dims it.
+#[derive(Default)]
+struct Place {
+    share: Option<(String, String)>,
+    faint: bool,
+}
+
+impl Place {
+    /// For a row of `owner` with `shares` (the ↑ member's, for a pair) when the list is grouped.
+    fn of(owner: &Owner, shares: Option<&[f64]>, z: &[u8], selected: &[usize]) -> Place {
+        let shares = shares.filter(|_| matches!(owner, Owner::Atom(_) | Owner::Shared(_)));
+        Place {
+            share: shares.map(|s| (share_text(s, z), share_hover(s, z))),
+            // a row without a share (box, earlier, unknown) is not on the selected atoms as far as
+            // anything here knows: dimmed under a selection like any other row that is not
+            faint: !shares.map_or(selected.is_empty(), |s| lit(s, selected)),
+        }
+    }
+}
+
 // ---- the tab ----
 
 /// The `show` selector: one button per mode, probed as `{prefix}-{word}`; returns the picked mode.
@@ -626,7 +851,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     // the largest Zσ of the scene's all-electron nuclei: the molecule's smeared-core note
     let pseudised = super::super::pseudo::pseudised(input);
     let z_sigma = input.snapshot.map_or(0.0, |s| largest_smeared_z_sigma(&s.dynamics.scene, &pseudised));
-    list(ui, st, payload, z_sigma, acts);
+    // the groups name and the selection lights the scene's atoms (orbital-atom-shares spec)
+    let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+    let selected = selected_atoms(input.selected, &st.edit_group, scene_z.len());
+    let refs_pending = input.snapshot.is_some_and(|s| !s.dynamics.bonds_pending.is_empty());
+    list(ui, st, payload, &ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending }, acts);
 }
 
 /// The per-mode controls, always drawn (a search result can reveal them) and enabled for the modes
@@ -772,12 +1001,14 @@ pub fn preset_tip(p: super::super::ColourPreset) -> String {
     }
 }
 
-/// The list: a heading per channel, a line per orbital and its tags, then the notes.
-fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma: f64, acts: &mut Vec<Action>) {
+/// The list: a heading per channel, a line per orbital and its tags, then the notes. With usable
+/// shares ([`grouped`]) the rows go under a heading per [`Group`], each group keeping the channel
+/// structure (one ↑↓ list for a closed shell, else ↑ then ↓) and the occupied / unoccupied split.
+fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, li: &ListInput<'_>, acts: &mut Vec<Action>) {
     super::group(ui, st, "d-orb-list", |ui, st| {
         ui.horizontal_wrapped(|ui| {
             theme::section(ui, "Orbitals");
-            theme::info(ui, format!("label · spin · ε (Ha) · ε (eV) · occupation · tags. {KS_NOTE} {HOMO_TIP}"));
+            theme::info(ui, format!("label · spin · ε (Ha) · ε (eV) · occupation · largest atom share (in a molecule) · tags. {KS_NOTE} {HOMO_TIP}"));
         });
         let Some(o) = payload else {
             theme::note(ui, "needs a DFT step");
@@ -794,16 +1025,18 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
                 r.on_hover_text(HOMO_INVERTED_TIP);
             }
         }
-        if let Some(l) = smeared_molecule_line(o.lone_atom, z_sigma) {
+        if let Some(l) = smeared_molecule_line(o.lone_atom, li.z_sigma) {
             ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap()).on_hover_text(SMEARED_MOLECULE_TIP);
         }
         if o.rows.is_empty() {
             theme::note(ui, "no electrons — nothing to show");
         }
+        let by_atom = grouped(o, li.scene_z);
         let picked = match &o.what {
             OrbitalRequest::Orbital { spin, track, .. } => Some((*spin, *track)),
             _ => None,
         };
+        let unocc_current = o.unoccupied.as_ref().is_none_or(|u| u.current);
         let [up, dn] = channels(&o.rows);
         if paired(&o.rows, &o.spin) {
             // a closed shell: one row per ↑↓ pair instead of two identical blocks (user request
@@ -813,39 +1046,85 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
                 ui.label(RichText::new(format!("↑↓ paired · {n_occ} occupied")).strong());
                 theme::info(ui, PAIRED_TIP);
             });
-            let mut shown_unocc = false;
-            for (u, d) in merged(&up, &dn) {
-                if u.occupation == 0.0 && !shown_unocc {
-                    shown_unocc = true;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("↑↓ unoccupied").color(theme::INK_DIM));
-                        theme::info(ui, UNOCCUPIED_TIP);
-                    });
+            let pairs = merged(&up, &dn);
+            // by atom (user request 2026-11-12), a pair placed by its ↑ member's shares
+            let ups: Vec<&OrbitalInfo> = pairs.iter().map(|(u, _)| *u).collect();
+            let blocks: Vec<(Option<Owner>, Vec<usize>)> = if by_atom {
+                groups(&ups, li.scene_z, unocc_current).into_iter().map(|g| (Some(g.owner), g.rows)).collect()
+            } else {
+                vec![(None, (0..pairs.len()).collect())]
+            };
+            for (owner, members) in blocks {
+                if let Some(owner) = &owner {
+                    group_heading(ui, owner, li.scene_z);
                 }
-                // either member picked shows the pair as selected
-                let on = picked == Some((u.spin, u.track)) || d.is_some_and(|d| picked == Some((d.spin, d.track)));
-                row(ui, st, u, d, &levels, on, acts);
+                let mut shown_unocc = false;
+                for i in members {
+                    let (u, d) = pairs[i];
+                    if u.occupation == 0.0 && !shown_unocc {
+                        shown_unocc = true;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("↑↓ unoccupied").color(theme::INK_DIM));
+                            theme::info(ui, UNOCCUPIED_TIP);
+                        });
+                    }
+                    // either member picked shows the pair as selected
+                    let on = picked == Some((u.spin, u.track)) || d.is_some_and(|d| picked == Some((d.spin, d.track)));
+                    let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, u.shares.as_deref(), li.scene_z, li.selected));
+                    row(ui, st, u, d, &levels, on, &place, acts);
+                }
             }
         } else {
-            for (spin, rows) in [(Spin::Up, up), (Spin::Down, dn)] {
+            let channel_line = |ui: &mut Ui, spin: Spin, rows: &[&OrbitalInfo]| {
                 let n_occ = rows.iter().filter(|r| r.occupation > 0.0).count();
                 if n_occ == 0 {
                     ui.label(RichText::new(format!("{}: none occupied", arrow(spin))).color(theme::INK_DIM));
                 } else {
                     ui.label(RichText::new(format!("{} spin · {n_occ} occupied", arrow(spin))).strong());
                 }
-                let mut shown_unocc = false;
-                for r in rows {
-                    if r.occupation == 0.0 && !shown_unocc {
-                        shown_unocc = true;
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(format!("{} unoccupied", arrow(spin))).color(theme::INK_DIM));
-                            theme::info(ui, UNOCCUPIED_TIP);
-                        });
+            };
+            // one block per channel as before; by atom (user request 2026-11-12), the channels'
+            // counts first, then each group with its ↑ rows then its ↓ rows
+            let all: Vec<&OrbitalInfo> = up.iter().chain(dn.iter()).copied().collect();
+            let blocks: Vec<(Option<Owner>, Vec<usize>)> = if by_atom {
+                channel_line(ui, Spin::Up, &up);
+                channel_line(ui, Spin::Down, &dn);
+                groups(&all, li.scene_z, unocc_current).into_iter().map(|g| (Some(g.owner), g.rows)).collect()
+            } else {
+                vec![(None, (0..all.len()).collect())]
+            };
+            for (owner, members) in blocks {
+                if let Some(owner) = &owner {
+                    group_heading(ui, owner, li.scene_z);
+                }
+                for spin in [Spin::Up, Spin::Down] {
+                    let rows: Vec<&OrbitalInfo> = members.iter().map(|&i| all[i]).filter(|r| r.spin == spin).collect();
+                    match &owner {
+                        None => channel_line(ui, spin, &rows),
+                        Some(_) if rows.is_empty() => continue,
+                        Some(_) => {
+                            ui.label(RichText::new(format!("{} spin", arrow(spin))).size(11.0).color(theme::INK_DIM));
+                        }
                     }
-                    row(ui, st, r, None, &levels, picked == Some((r.spin, r.track)), acts);
+                    let mut shown_unocc = false;
+                    for r in rows {
+                        if r.occupation == 0.0 && !shown_unocc {
+                            shown_unocc = true;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("{} unoccupied", arrow(spin))).color(theme::INK_DIM));
+                                theme::info(ui, UNOCCUPIED_TIP);
+                            });
+                        }
+                        let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, r.shares.as_deref(), li.scene_z, li.selected));
+                        row(ui, st, r, None, &levels, picked == Some((r.spin, r.track)), &place, acts);
+                    }
                 }
             }
+        }
+        // why a molecule's list is not by atom, under the rows: the rows do not move when the
+        // shares arrive and the note goes
+        if let Some(n) = shares_note(o, li.scene_z, li.refs_pending) {
+            theme::note(ui, n);
         }
         if o.rows.iter().any(|r| r.occupation == 0.0) {
             ui.add(egui::Label::new(RichText::new(GAP_TIP).size(11.0).color(theme::INK_FAINT)).wrap());
@@ -853,21 +1132,33 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
     });
 }
 
+/// A group's heading in the grouped list, its tooltip saying what puts a row under it.
+fn group_heading(ui: &mut Ui, owner: &Owner, z: &[u8]) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(heading(owner, z)).strong().color(theme::INK)).on_hover_text(heading_tip(owner));
+}
+
 /// One orbital: swatch, include box (all-coloured mode), the label as the picker, ε, occupation,
-/// then its tags. With `partner` (the ↓ member of a closed shell's pair, [`paired`]; user request
-/// 2026-11-11) `r` is the ↑ member and the row stands for both: labelled `↑↓`, probed
-/// `orbital-↑↓-{↑ track}`, the occupations summed; a click picks the ↑ orbital and the include
-/// box toggles both tracks.
-fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalInfo>, levels: &Levels, picked: bool, acts: &mut Vec<Action>) {
+/// its largest atom share (`place`, in a molecule with shares), then its tags. With `partner` (the
+/// ↓ member of a closed shell's pair, [`paired`]; user request 2026-11-11) `r` is the ↑ member and
+/// the row stands for both: labelled `↑↓`, probed `orbital-↑↓-{↑ track}`, the occupations summed;
+/// a click picks the ↑ orbital and the include box toggles both tracks. A row the selection does
+/// not light (`place.faint`; user request 2026-11-12) is drawn in faint ink and stays clickable;
+/// its warning tags keep their amber (a caveat is never hidden).
+#[allow(clippy::too_many_arguments)]
+fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalInfo>, levels: &Levels, picked: bool, place: &Place, acts: &mut Vec<Action>) {
     let v = match partner {
         Some(d) => RowView::pair(r, d, levels),
         None => RowView::of(r, levels),
     };
     let arrows = if partner.is_some() { "↑↓" } else { arrow(r.spin) };
     let colour = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
+    // the secondary ink: dim, or faint with the rest of a row the selection does not light
+    let dim = if place.faint { theme::INK_FAINT } else { theme::INK_DIM };
     ui.horizontal(|ui| {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 3.0, swatch(colour));
+        let sw = swatch(colour);
+        ui.painter().rect_filled(rect, 3.0, if place.faint { sw.gamma_multiply(0.35) } else { sw });
         resp.on_hover_text(if st.show == ShowMode::Coloured { "this orbital's colour in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)" } else { "this orbital's colour in All orbitals coloured" });
         if st.show == ShowMode::Coloured {
             // a pair's box is on while either member is drawn, and switches both
@@ -887,26 +1178,32 @@ fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalI
             }
         }
         let name = RichText::new(format!("{} {arrows}", v.label)).monospace();
+        let name = if place.faint { name.color(theme::INK_FAINT) } else { name };
         let b = ui.add(egui::Button::selectable(picked, name));
         let b = b.on_hover_text(v.label_tip());
         super::super::probe(&format!("orbital-{arrows}-{}", r.track), &b);
         if b.clicked() {
             acts.push(Action::PickOrbital { spin: r.spin, track: r.track });
         }
-        ui.label(RichText::new(&v.ha).monospace()).on_hover_text("ε in Hartree: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow");
-        ui.label(RichText::new(&v.ev).monospace().color(theme::INK_DIM)).on_hover_text("ε in eV (1 Ha = 27.2114 eV; converted for display only)");
+        let ha = RichText::new(&v.ha).monospace();
+        ui.label(if place.faint { ha.color(theme::INK_FAINT) } else { ha }).on_hover_text("ε in Hartree: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow");
+        ui.label(RichText::new(&v.ev).monospace().color(dim)).on_hover_text("ε in eV (1 Ha = 27.2114 eV; converted for display only)");
         let occ_tip = if partner.is_some() {
             "occupation of the pair: the sum of its ↑ and its ↓ orbital's (1 + 1 = 2 for a closed shell; a fraction is a degenerate shell shared equally, summed over both spins — pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
         } else {
             "occupation: 1 or 0 (integer aufbau); a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
         };
-        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(theme::INK_DIM)).on_hover_text(occ_tip);
+        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(dim)).on_hover_text(occ_tip);
+        if let Some((text, hover)) = &place.share {
+            let s = ui.label(RichText::new(text).monospace().color(dim)).on_hover_text(hover);
+            super::super::probe(&format!("share-{arrows}-{}", r.track), &s);
+        }
     });
     if !v.tags.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.add_space(18.0);
             for t in &v.tags {
-                let c = if t.warn { super::super::AMBER } else { theme::INK_DIM };
+                let c = if t.warn { super::super::AMBER } else { dim };
                 ui.label(RichText::new(&t.text).size(11.0).color(c)).on_hover_text(&t.tip);
             }
         });
