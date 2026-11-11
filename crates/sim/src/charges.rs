@@ -272,6 +272,15 @@ impl<'a> Weights<'a> {
         self.pos.len()
     }
 
+    /// The free-atom lookups as plain data, for another evaluator of these same weights (the GPU
+    /// share kernel, `qm_gpu::orbitals::ShareTablesGpu`): `(1/dr, ρ⁰(k·dr) for k = 0.. of each
+    /// distinct table, which[a] = nucleus a's table)`. Evaluated as `Lookup::at` does: x = r/dr,
+    /// i = ⌊x⌋, linear in ρ between entries i and i + 1, the last entry where i + 1 ≥ the length.
+    pub fn lookups(&self) -> (f64, Vec<&[f64]>, &[usize]) {
+        let inv_dr = self.lookups.first().map_or(0.0, |l| l.inv_dr);
+        (inv_dr, self.lookups.iter().map(|l| l.rho.as_slice()).collect(), &self.which)
+    }
+
     /// ρ_A⁰(|r − R_A|) for every A into `out`; returns `Ok(Σ_A ρ_A⁰)` when the sum is > 0, else
     /// `Err(nearest nucleus)` (every table has underflowed or ended at r). The callers' node loops
     /// scale by v / Σ themselves (one division per node, `hirshfeld`'s arithmetic unchanged).

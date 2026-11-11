@@ -44,6 +44,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("forces", include_str!("shaders/forces.wgsl")),
     ("multigrid", include_str!("shaders/multigrid.wgsl")),
     ("orbital_moments", include_str!("shaders/orbital_moments.wgsl")),
+    ("orbital_shares", include_str!("shaders/orbital_shares.wgsl")),
     ("colour_accumulate", include_str!("shaders/colour_accumulate.wgsl")),
     ("enclosure", include_str!("shaders/enclosure.wgsl")),
     ("sample", include_str!("shaders/sample.wgsl")),
@@ -97,6 +98,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "mg_restrict", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "mg_prolong_add", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "orbital_moments", shader: "orbital_moments", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
+    Spec { entry: "orbital_shares", shader: "orbital_shares", bindings: &[(0, U), (1, R), (2, R), (3, RW), (4, R), (5, R), (6, R), (7, R)] },
     Spec {
         entry: "colour_accumulate",
         shader: "colour_accumulate",
