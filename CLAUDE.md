@@ -44,14 +44,14 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 
 | Change | Command | Time |
 |---|---|---|
-| any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~75 s + ~70 s |
+| any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~75 s + ~6 min |
 | solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~31 min, ~3.5 min |
 | dynamics | `cargo test -p validate --release --test dynamics` | ~6 min |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~12–17 min |
 | bonds / relax / isotopes | `cargo test -p validate --release --test tools` | ~3–10 min |
 | charges | `cargo test -p validate --release --test charges` (CPU) | ~11 min |
 | pseudopotentials | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | ~1 h, ~9 min, ~1.5–2 h |
-| orbital display | `cargo test -p validate --release --test orbitals` | ~1 min |
+| orbital display | `cargo test -p validate --release --test orbitals` | ~4 min |
 | viewer / UI / worker | `cargo test -p app --release` (incl. the replay scripts) | ~10 min |
 | molecule builder | `cargo test -p app --release --bin app -- builder::` | seconds |
 

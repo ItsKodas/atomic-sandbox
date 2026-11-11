@@ -909,10 +909,10 @@ fn h2_sigma_g_is_shared_evenly() {
 /// (experiment), 57³ × 0.25, `ionic none`, the tables this solver's own all-electron Li and H
 /// atoms. The lowest occupied row of each channel is the Li 1s core: its share on Li ≥ 0.95.
 /// Measured (2026-11-12, tol 1e-5): 0.971454 on Li, 0.028545 on H, both channels; the bond
-/// row 0.330 / 0.670. The 2.9 % on H is the part of this row the H's weight takes. A likely
-/// contributor, not isolated: the σ = h = 0.25 nucleus (Zσ = 0.75) lifts this 1s to
-/// ε = −1.085 Ha (NIST LSD Li atom, point nucleus: −1.875 Ha), so the core is wider than a
-/// point-nucleus core (rule 7; `references.md` "Orbital shares").
+/// row 0.330 / 0.670. The 2.9 % on H is the part of this row the H's weight takes: ≈ 0.8 % is
+/// expected even for a point-nucleus core (a Slater model), and the σ = h = 0.25 nucleus
+/// (Zσ = 0.75), which lifts this 1s to ε = −1.085 Ha (NIST LSD Li atom, point nucleus:
+/// −1.875 Ha), plausibly doubles it; not isolated (rule 7; `references.md` "Orbital shares").
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn lih_li_core_sits_on_li() {
@@ -981,6 +981,8 @@ fn ch4_t2_members_share_one_answer() {
             let eps: Vec<f64> = t2.iter().map(|r| r.energy).collect();
             println!("  {site} {spin:?}: t₂ ε split {:.2e} Ha; members' max|Δs| = {set:.1e}; averaged shares C {:.6}, H {:.6?}, H spread {h_spread:.2e}; Σ − 1 = {:+.2e}",
                      spread(&eps), first[0], on_h, sim::share_sum(first) - 1.0);
+            // equal by construction (`set_average` writes one mean to each member): this proves a
+            // whole three-member set was found and averaged; the H spread below carries the content
             assert!(set <= 1e-12, "{site} {spin:?}: the t₂ members' shares differ by {set:.2e}");
             assert!(h_spread <= 1e-3, "{site} {spin:?}: the four H's t₂ shares spread {h_spread:.2e}");
         }
@@ -995,10 +997,11 @@ fn ch4_t2_members_share_one_answer() {
 /// 3a₁ and 1b₁, the two highest occupied rows (2a₁ < 1b₂ < 3a₁ < 1b₁; 1b₁ the out-of-plane p),
 /// and both must be listed under O: share ≥ `MAJORITY` (the spec's "an O lone pair mostly on
 /// O"). Measured (2026-11-12, tol 1e-5; pseudo-O Z_v = 6, multiplicity 3; pseudo-H): worst
-/// |Σ − 1| = 8.7e-8; O shares 2a₁ 0.793, 1b₂ 0.666, 3a₁ 0.828, 1b₁ 0.862. These are shares of
-/// valence-only orbitals against pseudo-atom valence tables, which are nodeless and smaller
-/// than the all-electron ones inside r_c, so they need not equal an all-electron split (rule 7;
-/// `references.md` "Orbital shares").
+/// |Σ − 1| = 8.7e-8; O shares 2a₁ 0.793, 1b₂ 0.666, 3a₁ 0.828, 1b₁ 0.862 (q_O = −0.298, the
+/// literature Hirshfeld magnitude). These are shares of valence-only, norm-conserving
+/// pseudo-orbitals (the all-electron charge inside r_c, a different shape there) against
+/// pseudo-atom tables without the core density, so they need not equal an all-electron split;
+/// the difference is confined to the r_c spheres (rule 7; `references.md` "Orbital shares").
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn h2o_accepted_shares_sum_to_one() {

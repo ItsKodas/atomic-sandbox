@@ -2957,7 +2957,7 @@ mod tests {
     /// 2): the display eigensolve's vectors are rows n_σ.. of the view's shown fields, and the
     /// payload's unoccupied rows must carry the shares of exactly those fields — the same-ψ̃
     /// comparison over every shown row, each payload row of its own (no set average) holding the
-    /// raw GPU shares of its (channel, index) bit for bit, and a box state holding none. A cation,
+    /// raw GPU shares of its (channel, index) bit for bit, and a box state, if the payload has any, holding none. A cation,
     /// because its lowest unoccupied orbitals are bound: H₂'s at 49³ are all box states (measured),
     /// which carry no shares, so they cannot show the mapping. That case has no provider
     /// comparison: the two providers' unoccupied vectors are separate eigensolves.
