@@ -452,6 +452,41 @@ The last items before M8: the four minors the M7 final review parked, and the pl
   a run. The merge of main met main's resumable passes in the same function (`finish_pass`); a cancelled pass
   deletes its checkpoint, so "the pass ended before its shell check" stays true.
 
+### Docking UI and orbitals by atom (Nov 3 and Nov 11–12; branch `docking`, cut from M8a's tip)
+
+The View menu had become "such a mess" (user, Oct 21), and the two fixed side docks could only hold tabs on the
+left or right. The user picked a full docking workspace from a brainstorm with mockups: `egui_dock` for the
+tree, the View menu regrouped into one View panel, duotone icons, pins that auto-hide (Visual Studio style),
+layouts stored in the profile, and four presets (One monitor, Two monitors, Training, Presenting). Spec and
+plan landed Nov 3 12:25. That afternoon one Opus implementer per task built D1 and D2: the layout grammar, the
+dock tree, the icons, the View panel, auto-hide and the presets. D3 (detaching panels into their own OS
+windows) was committed at 17:14 when the user asked to stop, unreviewed. Eight days later the user resumed:
+- **Detach:** the review found two bugs that bite on the user's three monitors. A window saved maximised on the
+  right-hand monitor overlaps the primary by 8 px, so the "on no monitor" check let it open off-screen when that
+  monitor was unplugged (now: 64 × 8 px of its title bar must be on a monitor). "Reset layout" from a tab's menu
+  closed Activity and Graph, because it mixed deferred and immediate changes while the tree was lent.
+- **Drag tabs between windows (user decision Nov 12):** floating panels inside the window went. A tab dragged
+  out of every window now opens a new one there, and a drag over another window shows the same drop targets. The
+  review caught one invisible bug: when windows overlapped, a drop on nothing still let the covered window apply
+  its own drop underneath. The source tree is now snapshotted during a drag and restored. The user's hand-test:
+  "Works nicely".
+- **A press the UI takes never moves the camera** (user report: resizing a panel near its edge also orbited).
+  egui-winit's `consumed` is last frame's `wants_pointer_input`, which misses the few-pixel grab margin outside a
+  widget's edge; the fix asks egui's own hit test.
+- **Small user requests on the way:** the Activity job list stopped jumping between iterations and steps; a
+  closed shell's identical ↑ and ↓ orbital lists fold into one ↑↓ list (and, after the user found He still
+  showing two, also when one spin shows an extra unoccupied row).
+- **Orbitals by atom (spec and plan Nov 12, five tasks, about 4 h).** The user wanted to see "which orbitals are
+  mostly on that atom". A molecular orbital belongs to no atom, so the design uses the split the partial charges
+  already use (Hirshfeld weights from this solver's own free atoms) and says so in the tooltip. The rows group
+  under atoms at ≥ 55 % (or "shared · …"), and selecting atoms dims the rest. `sim` hands each nucleus's radial
+  table to the provider as data (rule 5); the CPU path sums over `CpuView`'s ψ̃, a new WGSL kernel does the same
+  on the GPU (agreement 5e-7; 0.5 ms at H₂O 95³). Degenerate sets show their average share, since a single
+  rotated member's share depends on the display's arbitrary rotation. The oracles cross-check against the
+  literature: water's q_O from the orbital shares is −0.298 (Hirshfeld ≈ −0.3), LiH's q_Li +0.397 against the
+  charges suite's +0.4025.
+- **Gate (Nov 12, 8f54423):** core 480, providers 308, validate orbitals 12, app 536 passed, nothing failed.
+
 ---
 
 ## Failures and dead ends
@@ -615,6 +650,13 @@ M6 (a cell-aware refusal message); the second is queued for "lowest of several s
 - **Weekly usage.** The user asked on Oct 15 for a stop at 60 % of the weekly plan and a cost cut: cheaper
   models for engineering-only tasks, Opus or Fable only for physics. The ledgers record readings from 35 %
   on Oct 15 up to 53 %; on Oct 16 at 49 % the user raised the cap to 75 %.
+- **Docking (Nov 11–12): tests and agents that tripped over each other.** On Windows a running test exe can't
+  be relinked: a focused test run failed with LNK1104 while the full suite still held the binary, and cargo
+  does not hold its lock while tests run. Every app test also links the app binary (an integration test needs
+  it), so a fix round waited about 48 minutes for the user to close the app. A lag report sent a debugging
+  agent to build two versions side by side; the user then found every window on the PC lagged, so the agent
+  was stopped before measuring anything, and its 1.2 GB build folder deleted. A controller probe also added a
+  blank tab to the user's open Notepad (Windows 11 Notepad is single-process); nothing was lost.
 
 ### M7: four things that were tried and turned out wrong
 
