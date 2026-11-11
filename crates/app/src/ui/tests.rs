@@ -6569,7 +6569,7 @@ mod detached_windows {
             None => inner,
             Some(_) => WinRect { x: x - 8, y: y - 31, w: inner.w + 16, h: inner.h + 39 },
         };
-        Place { win, inner, outer }
+        Place { win, inner, outer, targets: true }
     }
 
     /// [`window_frame`] at `ppp` pixels per point (its 600 × 800 points then `600 ppp × 800 ppp`
@@ -6673,8 +6673,16 @@ mod detached_windows {
         let (outs, _) = drag_tab(&mut st, DockTab::Orbitals, &[egui::pos2(4400.0, 50.0)], false, &mut main, &mut |_| vec![]);
         let r = opened(&outs)[0].2.unwrap();
         assert!(r.x + r.w as i32 == 2560 + 1920 && r.y == 50, "{r:?}");
-        // Esc on the way: the release does nothing
+        // Esc on the way: the release does nothing, and the Esc is the drag's alone — it does not
+        // also deselect (Task 11 review M4)
         let (outs, _) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1700.0, 500.0)], true, &mut main, &mut |_| vec![]);
+        assert!(opened(&outs).is_empty() && st.workspace.window_of(DockTab::Log).is_none());
+        assert!(outs.iter().all(|o| !o.deselect && o.actions.is_empty()), "Esc was not also a Deselect");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
+        // released over the capture pop-out view (one of the app's windows, no drop targets):
+        // nothing opens, the tab stays (review M2)
+        st.workspace.set_places(vec![popout_place(1600, 1000, 800, 400), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        let (outs, _) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1700.0, 1100.0)], false, &mut main, &mut |_| vec![]);
         assert!(opened(&outs).is_empty() && st.workspace.window_of(DockTab::Log).is_none());
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
     }
@@ -6816,5 +6824,184 @@ mod detached_windows {
         assert!(opened(&outs).is_empty());
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Graph*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
+    }
+
+    /// The capture pop-out view on the desktop: one of the app's windows, with no drop targets.
+    fn popout_place(x: i32, y: i32, w: u32, h: u32) -> Place {
+        let r = WinRect { x, y, w, h };
+        Place { win: None, inner: r, outer: r, targets: false }
+    }
+
+    /// Task 11 review I1: with app windows overlapping, the window behind never takes a drop its
+    /// `egui_dock` resolved under the one in front. Window B covers the main window's Log leaf; a
+    /// tab released on B off its targets, right over the main window's Log centre button, changes
+    /// neither tree (no target: the tab stays, spec D-15). The reverse — the source window behind
+    /// the main one, released on the main window off its targets over its own other leaf's centre
+    /// — changes neither. A release on B's target over the main window's Log centre moves the tab
+    /// once, into B.
+    #[test]
+    fn a_release_over_a_covering_window_never_drops_into_the_window_behind() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, wctx) = (egui::Context::default(), egui::Context::default());
+        apply_theme(&ctx);
+        apply_theme(&wctx);
+        let mut st = UiState::new("h2", &scene);
+        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Activity]))").unwrap());
+        let b = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
+        st.workspace.take_requests();
+        assert_eq!(layout::encode(&st.workspace.to_node()), tree);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let log = st.workspace.leaf_rect(DockTab::Log).unwrap().center();
+        // B's point (40, 760), the corner of its body, over the main window's Log centre
+        let cover = |st: &mut UiState, bx: f32, by: f32| {
+            st.workspace.set_places(vec![place(Some(b), (log.x - bx) as i32, (log.y - by) as i32, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        };
+        cover(&mut st, 40.0, 760.0);
+        let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
+        let mut win = |st: &mut UiState| vec![window_frame_at(&wctx, st, &inp, b, 1.0, vec![])];
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        assert_eq!(drawn, None, "B's corner is no target");
+        assert!(opened(&outs).is_empty());
+        assert_eq!(layout::encode(&st.workspace.to_node()), tree, "the main window's hidden drop was undone");
+        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity*]");
+        // B's centre over the main window's Log centre: into B, once
+        cover(&mut st, 300.0, 400.0);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        assert!(drawn.is_some());
+        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity,Graph*]");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
+        assert_eq!(st.workspace.floats_for_test(), 0);
+
+        // the reverse: window C (two leaves) behind the main window, its Model leaf's centre under
+        // the main window's Log leaf, off that leaf's buttons
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse(tree).unwrap());
+        st.workspace.set_windows(vec![(None, false, layout::parse_window("V(0.50,[Activity*],[Model*])").unwrap())]);
+        let c = st.workspace.windows()[0];
+        st.workspace.take_requests();
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let spot = st.workspace.leaf_rect(DockTab::Log).unwrap().left_bottom() + egui::vec2(12.0, -12.0);
+        let (cx, cy) = ((spot.x - 300.0) as i32, (spot.y - 600.0) as i32);
+        st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0), place(Some(c), cx, cy, 600.0, 800.0, 1.0)]);
+        let cctx = egui::Context::default();
+        apply_theme(&cctx);
+        let mut src = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&cctx, st, &inp, c, 1.0, ev);
+        let mut others = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Activity, &[egui::pos2(300.0, 600.0)], false, &mut src, &mut others);
+        assert_eq!(drawn, None, "the main window's Log corner is no target");
+        assert!(opened(&outs).is_empty());
+        assert_eq!(layout::encode(&st.workspace.window_node(c).unwrap()), "V(0.50,[Activity*],[Model*])", "C's hidden drop was undone");
+        assert_eq!(layout::encode(&st.workspace.to_node()), tree);
+    }
+
+    /// Task 11 review M7: tearing out a detached window's only tab closes that window and opens a
+    /// new one holding the tab where it was released (its leaf's size, kept on the second
+    /// monitor).
+    #[test]
+    fn tearing_out_a_detached_windows_only_tab_reopens_it_where_released() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, wctx) = (egui::Context::default(), egui::Context::default());
+        apply_theme(&ctx);
+        apply_theme(&wctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.take_requests();
+        st.workspace.set_monitors(vec![PRIMARY, SECOND]);
+        st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
+        let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
+        // desktop (3000, 300), on the second monitor, from the window's points
+        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(3000.0 - 1500.0, 300.0 - 100.0)], false, &mut win, &mut main);
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        let new = st.workspace.window_of(DockTab::Graph).expect("in a new window");
+        assert_ne!(new, id);
+        assert_eq!(st.workspace.windows(), vec![new]);
+        let r = requests(&outs);
+        assert_eq!(r.iter().filter(|r| **r == WindowRequest::Close { id }).count(), 1, "{r:?}");
+        assert_eq!(opened(&outs), vec![(new, vec![DockTab::Graph], Some(WinRect { x: 3000, y: 1080 - 800, w: 600, h: 800 }))]);
+    }
+
+    /// Task 11 review M3: a drag whose source window closes under it is forgotten — the window
+    /// it was over stops drawing its targets.
+    #[test]
+    fn a_drag_whose_window_closes_is_forgotten() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let (ctx, wctx) = (egui::Context::default(), egui::Context::default());
+        apply_theme(&ctx);
+        apply_theme(&wctx);
+        let mut st = UiState::new("h2", &scene);
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.take_requests();
+        st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
+        for _ in 0..3 {
+            window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![]);
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let log = st.workspace.leaf_rect(DockTab::Log).unwrap().center();
+        let c = probed_rect("dock-tab-Graph").center();
+        window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(c), pointer(c, true)]);
+        for p in [c + egui::vec2(12.0, 0.0), c + egui::vec2(50.0, 0.0), egui::pos2(log.x - 1500.0, log.y - 100.0)] {
+            window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(p)]);
+        }
+        PROBES.with(|m| m.borrow_mut().remove("drop-target"));
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert_eq!(st.workspace.dragging(), Some(DockTab::Graph));
+        assert!(PROBES.with(|m| m.borrow().contains_key("drop-target")), "the main window draws the Log leaf's targets");
+        // the window closes under the drag (Alt+F4 with the button held)
+        st.workspace.window_closed(id);
+        assert_eq!(st.workspace.dragging(), None);
+        PROBES.with(|m| m.borrow_mut().remove("drop-target"));
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(PROBES.with(|m| !m.borrow().contains_key("drop-target")), "no stale targets");
+    }
+
+    /// Docking spec D-16 for a resize grip (the brief's "separator's / grip's"; the app has none
+    /// left since floats went — every `egui::Window` of the chrome is fixed-size — so a plain
+    /// resizable egui window stands in): a press 2 pt outside its drawn right edge, inside egui's
+    /// resize grab, is the window's (it widens) though egui-winit's `consumed` says no;
+    /// `ui::takes_press`, which gates the 3D view's presses (`Viewer::ui_takes_press`), says yes.
+    #[test]
+    fn a_press_in_a_resize_grips_margin_is_the_uis() {
+        let ctx = egui::Context::default();
+        let run = |events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))), events, ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                egui::Window::new("grip").id(egui::Id::new("grip-window")).default_pos([100.0, 100.0]).default_size([300.0, 200.0]).resizable(true).show(root.ctx(), |ui| {
+                    ui.label("a resizable window");
+                });
+            });
+            full.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            run(vec![]);
+        }
+        let rect = || ctx.memory(|m| m.area_rect(egui::Id::new("grip-window"))).expect("the window");
+        let before = rect();
+        let p = egui::pos2(before.right() + 2.0, before.center().y);
+        run(vec![egui::Event::PointerMoved(p)]);
+        assert!(!ctx.egui_wants_pointer_input(), "egui-winit's `consumed` misses the grip's margin");
+        assert!(takes_press(&ctx, p), "the hit test does not");
+        run(vec![pointer(p, true)]);
+        for k in 1..=4 {
+            run(vec![egui::Event::PointerMoved(p + egui::vec2(10.0 * k as f32, 0.0))]);
+        }
+        run(vec![pointer(p + egui::vec2(40.0, 0.0), false)]);
+        run(vec![]);
+        assert!(rect().width() > before.width() + 20.0, "egui took the press: the window widened {before:?} → {:?}", rect());
+        // well away from it, the press is the 3D view's
+        assert!(!takes_press(&ctx, egui::pos2(800.0, 700.0)));
     }
 }

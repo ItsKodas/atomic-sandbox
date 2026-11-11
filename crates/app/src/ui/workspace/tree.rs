@@ -949,6 +949,8 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         (None, latched) => latched.and_then(|(_, split)| split),
     };
     let windows = st.workspace.windows();
+    // a drag from here: the tree as it was, for a release over another window (`super::drag`)
+    let kept = st.workspace.drag_from(None).then(|| dock.clone());
     let (mut asked, bars, dragged_tab) = {
         let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: None, windows, window_tabs: 0, bars: Vec::new(), dragged: None };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt("workspace"));
@@ -973,7 +975,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         }
         (asked, tiles.bars, tiles.dragged)
     };
-    asked.extend(st.workspace.drag_frame(root.ctx(), None, &dock, &bars, dragged_tab, &overlay));
+    asked.extend(st.workspace.drag_frame(root.ctx(), None, &mut dock, kept, &bars, dragged_tab, &overlay));
     st.workspace.drag = origin.map(|o| (o, dragged));
     if st.workspace.give_back(dock, asked) {
         root.ctx().request_discard("a panel dropped into the 3D view's leaf went beside it");
@@ -996,6 +998,7 @@ pub fn show_window(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts
     let area = root.available_rect_before_wrap();
     let style = style(root.style());
     let overlay = style.overlay.clone();
+    let kept = st.workspace.drag_from(Some(id)).then(|| dock.clone());
     let (mut asked, bars, dragged) = {
         let mut tiles = Tiles { st, input, acts, asked: Vec::new(), layers: HashMap::new(), pins: Vec::new(), window: Some(id), windows, window_tabs: tabs, bars: Vec::new(), dragged: None };
         let mut ui = root.new_child(UiBuilder::new().max_rect(area).layout(Layout::top_down(Align::Min)).id_salt(("detached", id)));
@@ -1013,7 +1016,7 @@ pub fn show_window(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts
         asked.extend(buttons);
         (asked, tiles.bars, tiles.dragged)
     };
-    asked.extend(st.workspace.drag_frame(root.ctx(), Some(id), &dock, &bars, dragged, &overlay));
+    asked.extend(st.workspace.drag_frame(root.ctx(), Some(id), &mut dock, kept, &bars, dragged, &overlay));
     st.workspace.give_back_window(id, dock, asked);
     true
 }

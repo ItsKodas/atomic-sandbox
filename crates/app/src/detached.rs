@@ -19,7 +19,7 @@
 //!   window has a size (minimised: skipped, its texture uploads still applied). Its present mode is
 //!   Mailbox when the GPU has it, so its vsync never holds the main window's frames (as the
 //!   pop-out's).
-use crate::ui::{theme, Place, WinRect};
+use crate::ui::{theme, Place, WinRect, MIN_WINDOW};
 use gpu::{GpuContext, SurfaceState};
 use std::sync::Arc;
 use winit::event::WindowEvent;
@@ -50,7 +50,7 @@ impl DetachedWindow {
     pub fn open(el: &ActiveEventLoop, ctx: &GpuContext, id: u32, title: &str, rect: Option<WinRect>, size: Option<[f32; 2]>, fill: bool) -> Result<DetachedWindow, String> {
         let mut attrs = Window::default_attributes()
             .with_title(title)
-            .with_min_inner_size(winit::dpi::LogicalSize::new(240.0, 160.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(MIN_WINDOW[0] as f64, MIN_WINDOW[1] as f64))
             .with_window_icon(winit::window::Icon::from_rgba(crate::icon::rgba(64), 64, 64).ok());
         attrs = match (rect, fill) {
             (Some(m), true) => attrs
@@ -59,7 +59,7 @@ impl DetachedWindow {
                 .with_maximized(true),
             (Some(r), false) => attrs.with_position(winit::dpi::PhysicalPosition::new(r.x, r.y)).with_inner_size(winit::dpi::PhysicalSize::new(r.w, r.h)),
             (None, _) => {
-                let [w, h] = size.map_or(DEFAULT_SIZE, |[w, h]| [w.max(240.0), h.max(160.0)]);
+                let [w, h] = size.map_or(DEFAULT_SIZE, |[w, h]| [w.max(MIN_WINDOW[0]), h.max(MIN_WINDOW[1])]);
                 attrs.with_inner_size(winit::dpi::LogicalSize::new(w as f64, h as f64))
             }
         };
@@ -229,13 +229,15 @@ fn work_area(_: &winit::monitor::MonitorHandle) -> Option<WinRect> {
 }
 
 /// Where window `w` is on the desktop (spec D-15): its client area (inner position and size) and
-/// its outer frame, physical pixels; `None` while minimised or when the OS cannot say.
-pub fn place(win: Option<u32>, w: &Window) -> Option<Place> {
+/// its outer frame, physical pixels; `None` while minimised or when the OS cannot say. `targets`:
+/// a window with a tree to drop a tab into (false for the capture pop-out view).
+pub fn place(win: Option<u32>, w: &Window, targets: bool) -> Option<Place> {
     let (i, s) = (w.inner_position().ok()?, w.inner_size());
     let (o, os) = (w.outer_position().ok()?, w.outer_size());
     (s.width > 0 && s.height > 0 && w.is_minimized() != Some(true)).then_some(Place {
         win,
         inner: WinRect { x: i.x, y: i.y, w: s.width, h: s.height },
         outer: WinRect { x: o.x, y: o.y, w: os.width, h: os.height },
+        targets,
     })
 }

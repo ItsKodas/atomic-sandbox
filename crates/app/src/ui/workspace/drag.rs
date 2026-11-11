@@ -27,8 +27,16 @@
 //!   detached window holding the tab, its top-left at the release point, the panel's current size,
 //!   clamped into the work area of the monitor under the cursor ([`Change::TearOut`]); over its own
 //!   window — `egui_dock`'s (a drop, or nothing: with `allowed_in_windows` false it never floats).
-//!   Esc cancels. A detached window whose last tab leaves closes.
-use super::detached::WinRect;
+//!   Esc cancels (and is the drag's alone that frame: [`Workspace::drag_escape`]). A detached
+//!   window whose last tab leaves closes, and a drag whose source window closes is forgotten.
+//! - **Overlapping windows** (Task 11 review I1): the source's `egui_dock` knows nothing of a
+//!   window covering it, and resolves a drop for whatever of its own leaves lies under the
+//!   pointer. While a drag from it is on, its tree is kept as it was before its dock area drew,
+//!   and a release over another window (or over none) puts that back first — so a release on no
+//!   target there changes nothing, and one on a target moves the tab once, ours.
+//! - **The capture pop-out view** is one of the app's windows too, with no drop targets
+//!   ([`Place::targets`] false): a release over it cancels.
+use super::detached::{panels_of, WinRect, MIN_WINDOW};
 use super::layout::Node;
 use super::tree::{Change, Tile, Workspace, TAB_BAR};
 use crate::ui::DockTab;
@@ -38,12 +46,14 @@ use std::collections::HashMap;
 
 /// Where one of the app's windows is on the desktop (physical pixels, winit's units): its client
 /// area (inner position and size) and its outer frame (title bar and borders included). `win`:
-/// detached window N, `None` for the main window.
+/// detached window N, `None` for the main window; `targets`: it has a tree to drop a tab into
+/// (false for the capture pop-out view, whose `win` means nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub win: Option<u32>,
     pub inner: WinRect,
     pub outer: WinRect,
+    pub targets: bool,
 }
 
 /// A drop target in a window's tree.
@@ -83,7 +93,7 @@ pub(super) struct Drags {
 }
 
 /// A new window's least size (points; the window side's `with_min_inner_size`).
-const MIN_SIZE: Vec2 = vec2(240.0, 160.0);
+const MIN_SIZE: Vec2 = vec2(MIN_WINDOW[0], MIN_WINDOW[1]);
 
 impl Workspace {
     /// Where the app's windows are (physical desktop pixels), top-most first: the window side
@@ -92,10 +102,35 @@ impl Workspace {
         self.xd.places = places;
     }
 
-    /// Test hook: the panel whose tab is being dragged, if any.
-    #[cfg(test)]
+    /// The panel whose tab is being dragged between windows, if any (the 3D view takes no keys
+    /// meanwhile: Esc is the drag's).
     pub fn dragging(&self) -> Option<DockTab> {
         self.xd.drag.as_ref().map(|d| d.tab)
+    }
+
+    /// Whether a drag from window `win` is on (its tree is then kept from before its dock area
+    /// draws, for a release over another window: see the module doc).
+    pub(super) fn drag_from(&self, win: Option<u32>) -> bool {
+        self.xd.drag.as_ref().is_some_and(|d| d.from == win)
+    }
+
+    /// Esc during a drag from window `win`, before anything else in its frame reads the keys: it
+    /// cancels the drag (and `egui_dock`'s own drop with it) and is consumed, so it neither
+    /// deselects nor hides a flyout (Task 11 review M4).
+    pub fn drag_escape(&mut self, ctx: &Context, win: Option<u32>) {
+        let Some(d) = self.xd.drag.as_mut().filter(|d| d.from == win && !d.cancelled) else { return };
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            d.cancelled = true;
+            ctx.stop_dragging();
+        }
+    }
+
+    /// Forgets a drag from detached window `id` (it closed under the drag: the other windows stop
+    /// drawing its targets).
+    pub(super) fn forget_drag_from(&mut self, id: u32) {
+        if self.drag_from(Some(id)) {
+            self.xd.drag = None;
+        }
     }
 
     fn ppp(&self, win: Option<u32>) -> f32 {
@@ -105,7 +140,7 @@ impl Workspace {
     /// Where window `win` is: as reported, else — headless, nothing reported — its own screen at
     /// the desktop origin.
     fn place(&self, win: Option<u32>) -> Option<Place> {
-        if let Some(p) = self.xd.places.iter().find(|p| p.win == win) {
+        if let Some(p) = self.xd.places.iter().find(|p| p.win == win && p.targets) {
             return Some(*p);
         }
         if !self.xd.places.is_empty() {
@@ -113,7 +148,7 @@ impl Workspace {
         }
         let (r, k) = (self.xd.screens.get(&win)?, self.ppp(win));
         let px = WinRect { x: 0, y: 0, w: (r.right() * k).round().max(0.0) as u32, h: (r.bottom() * k).round().max(0.0) as u32 };
-        Some(Place { win, inner: px, outer: px })
+        Some(Place { win, inner: px, outer: px, targets: true })
     }
 
     /// A point of window `win` (points) in desktop pixels.
@@ -125,11 +160,16 @@ impl Workspace {
 
     /// The app's window at desktop point `d`, the top-most first (`None`: none of them), its
     /// outer frame counting; `from` is the drag's source (headless, the only one known).
-    fn window_at(&self, d: [f64; 2], from: Option<u32>) -> Option<Option<u32>> {
+    fn window_at(&self, d: [f64; 2], from: Option<u32>) -> Option<Place> {
         if self.xd.places.is_empty() {
-            return self.place(from).filter(|p| contains(&p.outer, d)).map(|_| from);
+            return self.place(from).filter(|p| contains(&p.outer, d));
         }
-        self.xd.places.iter().find(|p| contains(&p.outer, d)).map(|p| p.win)
+        self.xd.places.iter().find(|p| contains(&p.outer, d)).copied()
+    }
+
+    /// The window with drop targets at desktop point `d` (`None` for none, or the pop-out view).
+    fn target_window_at(&self, d: [f64; 2], from: Option<u32>) -> Option<Option<u32>> {
+        self.window_at(d, from).filter(|p| p.targets).map(|p| p.win)
     }
 
     /// Desktop point `d` in window `win`'s client area, points (`None`: not in it).
@@ -155,10 +195,14 @@ impl Workspace {
     }
 
     /// One window's part of a cross-window drag, after its dock area drew (its tree still lent:
-    /// `dock`, with its tab buttons `bars` and the tab being dragged in it, `dragged`): follows a
+    /// `dock`, with its tab buttons `bars` and the tab being dragged in it, `dragged`; `before`:
+    /// the tree before the dock area drew, kept while a drag from this window is on): follows a
     /// drag from this window, acts on its release (the changes returned, done when the tree is
-    /// back), and draws the drop targets of another window's drag over this one.
-    pub(super) fn drag_frame(&mut self, ctx: &Context, win: Option<u32>, dock: &DockState<Tile>, bars: &[(Tile, Rect)], dragged: Option<Tile>, overlay: &OverlayStyle) -> Vec<Change> {
+    /// back; a release over another window, or none, first puts `before` back, undoing a drop
+    /// `egui_dock` made under the window covering it), and draws the drop targets of another
+    /// window's drag over this one.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn drag_frame(&mut self, ctx: &Context, win: Option<u32>, dock: &mut DockState<Tile>, before: Option<DockState<Tile>>, bars: &[(Tile, Rect)], dragged: Option<Tile>, overlay: &OverlayStyle) -> Vec<Change> {
         self.xd.ppp.insert(win, ctx.pixels_per_point());
         self.xd.screens.insert(win, ctx.content_rect());
         self.xd.bars.insert(win, bars.to_vec());
@@ -169,30 +213,35 @@ impl Workspace {
                 let k = ctx.pixels_per_point();
                 let leaf = dock.find_tab(&Tile::Panel(t)).and_then(|p| dock.leaf(p.node_path()).ok());
                 let size = leaf.map(|l| l.rect.size()).filter(|s| s.x > 0.0 && s.y > 0.0).unwrap_or(MIN_SIZE).max(MIN_SIZE);
-                let mates = win.is_none().then(|| leaf.map(|l| l.tabs.iter().filter_map(|x| if let Tile::Panel(p) = x { Some(*p) } else { None }).filter(|&p| p != t).collect()).unwrap_or_default());
+                let mates = win.is_none().then(|| leaf.map(|l| panels_of(&l.tabs).into_iter().filter(|&p| p != t).collect()).unwrap_or_default());
                 self.xd.drag = Some(TabDrag { tab: t, from: win, size: [(size.x * k).round() as u32, (size.y * k).round() as u32], mates, at: None, cancelled: false });
             }
             let at = pointer.map(|p| self.desk(win, p));
-            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if let Some(d) = self.xd.drag.as_mut() {
                 d.at = at.or(d.at);
-                if esc {
-                    // `egui_dock`'s own drop goes with the drag
-                    d.cancelled = true;
-                    ctx.stop_dragging();
-                }
             }
             ctx.request_repaint();
         } else if self.xd.drag.as_ref().is_some_and(|d| d.from == win) {
             // the drag ended in this frame: a release (anything else — Esc — does nothing)
             let d = self.xd.drag.take().expect("a drag");
             let released = ctx.input(|i| i.pointer.primary_released());
-            if let (true, false, Some(at)) = (released, d.cancelled, pointer.map(|p| self.desk(win, p)).or(d.at)) {
-                match self.window_at(at, win) {
-                    Some(w) if w == win => {} // egui_dock's own: a drop, or nothing
-                    Some(w) => {
-                        if let Some(target) = self.target_in(w, at, overlay) {
-                            out.push(Change::DropTab(d.tab, w, target, d.mates));
+            if let (true, Some(at)) = (released, pointer.map(|p| self.desk(win, p)).or(d.at)) {
+                let over = self.window_at(at, win);
+                let own = over.is_some_and(|p| p.targets && p.win == win);
+                // released over another window, or none: `egui_dock` here may have dropped the
+                // tab on a leaf of this window that lies under it — undone (review I1)
+                if let Some(b) = before.filter(|_| !own) {
+                    if shape(&b) != shape(dock) {
+                        ctx.request_discard("a drop under another window was undone");
+                    }
+                    *dock = b;
+                }
+                match over {
+                    _ if d.cancelled || own => {} // cancelled, or egui_dock's own: a drop, or nothing
+                    Some(p) if !p.targets => {}   // the pop-out view: nothing to drop into
+                    Some(p) => {
+                        if let Some(target) = self.target_in(p.win, at, overlay) {
+                            out.push(Change::DropTab(d.tab, p.win, target, d.mates));
                         }
                     }
                     None => out.push(Change::TearOut(d.tab, self.tear_rect(at, d.size), d.mates)),
@@ -201,7 +250,7 @@ impl Workspace {
         }
         // another window's drag over this one: its drop targets at the cursor
         let shown = match &self.xd.drag {
-            Some(d) if d.from != win && !d.cancelled => d.at.filter(|&at| self.window_at(at, d.from) == Some(win)).and_then(|at| self.local(win, at)),
+            Some(d) if d.from != win && !d.cancelled => d.at.filter(|&at| self.target_window_at(at, d.from) == Some(win)).and_then(|at| self.local(win, at)),
             _ => None,
         };
         if let Some(over) = shown.and_then(|p| over(dock, bars, p, win.is_none(), overlay)) {
@@ -295,6 +344,14 @@ impl Workspace {
         }
         self.new_window(Node::Leaf { tabs: vec![t], active: 0 }, Some(rect), false, None, false);
     }
+}
+
+/// Where every tab of a tree is (each leaf's index and tabs): whether `egui_dock` moved one.
+fn shape(d: &DockState<Tile>) -> Vec<(usize, Vec<Tile>)> {
+    d.iter_all_nodes().filter_map(|(p, n)| match n {
+        egui_dock::Node::Leaf(l) => Some((p.node.0, l.tabs.clone())),
+        _ => None,
+    }).collect()
 }
 
 /// Whether desktop point `d` is in `r`.

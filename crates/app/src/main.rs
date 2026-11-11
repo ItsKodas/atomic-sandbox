@@ -99,11 +99,21 @@ struct App {
     /// When the monitor list was last given to the UI (`detached::monitors`), and that list.
     monitors_at: Option<Instant>,
     monitors: Vec<ui::WinRect>,
-    /// The app's windows, the last focused first (`None`: the main one; detached window N): the
-    /// z-order a tab dragged between windows is hit-tested in (docking spec D-15).
-    z: Vec<Option<u32>>,
+    /// The app's windows, the last focused first: the z-order a tab dragged between windows is
+    /// hit-tested in (docking spec D-15).
+    z: Vec<Win>,
     /// `--layout <preset>`: applied once the monitors are known (Two monitors needs them).
     start_layout: Option<ui::LayoutPreset>,
+}
+
+/// One of the app's windows in the drag's z-order (`App::z`): the main one, detached window N, or
+/// the capture pop-out view (one of the app's windows with no drop targets: a tab released over it
+/// is not torn out, Task 11 review M2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Win {
+    Main,
+    Detached(u32),
+    Popout,
 }
 
 /// `--record`: the path until the window opens, then the recorder, and whether the worker was idle
@@ -588,7 +598,7 @@ fn main() {
         detached: Vec::new(),
         monitors_at: None,
         monitors: Vec::new(),
-        z: vec![None],
+        z: vec![Win::Main],
         start_layout,
     };
     event_loop.run_app(&mut app).expect("run");
@@ -732,7 +742,7 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 if f {
-                    self.raise(None);
+                    self.raise(Win::Main);
                 }
                 window.request_redraw();
             }
@@ -814,6 +824,7 @@ impl App {
             Ok(p) => {
                 eprintln!("pop-out view opened ({} × {} frame)", frame.size.0, frame.size.1);
                 self.popout = Some(p);
+                self.raise(Win::Popout);
                 self.viewer.ui.set_status("pop-out view: the capture's frame in its own window (F11: full screen)".to_string());
             }
             Err(e) => {
@@ -872,8 +883,8 @@ impl App {
                             let i = self.detached.iter().position(|w| w.id > id).unwrap_or(self.detached.len());
                             self.detached.insert(i, d);
                             // a new window opens in front
-                            self.z.retain(|w| *w != Some(id));
-                            self.z.insert(0, Some(id));
+                            self.z.retain(|w| *w != Win::Detached(id));
+                            self.z.insert(0, Win::Detached(id));
                         }
                         Err(e) => {
                             self.viewer.ui.workspace.window_closed(id);
@@ -886,7 +897,7 @@ impl App {
                         eprintln!("detached window {id} closed");
                     }
                     self.detached.retain(|d| d.id != id);
-                    self.z.retain(|w| *w != Some(id));
+                    self.z.retain(|w| *w != Win::Detached(id));
                 }
                 ui::WindowRequest::Focus { id } => {
                     if let Some(d) = self.detached.iter().find(|d| d.id == id) {
@@ -909,7 +920,7 @@ impl App {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 let id = d.id;
                 self.detached.remove(i);
-                self.z.retain(|w| *w != Some(id));
+                self.z.retain(|w| *w != Win::Detached(id));
                 self.viewer.ui.workspace.window_closed(id);
                 eprintln!("detached window {id} closed by the user: its panels are back in the main window");
             }
@@ -921,27 +932,28 @@ impl App {
                 d.focused = f;
                 if f {
                     let id = d.id;
-                    self.raise(Some(id));
+                    self.raise(Win::Detached(id));
                 }
             }
             _ => {}
         }
     }
 
-    /// Window `w` (`None`: the main one) came to the front: first in the drag's z-order.
-    fn raise(&mut self, w: Option<u32>) {
+    /// Window `w` came to the front: first in the drag's z-order.
+    fn raise(&mut self, w: Win) {
         self.z.retain(|x| *x != w);
         self.z.insert(0, w);
     }
 
     /// Where every window is (`detached::place`), the last focused first, for the UI's drag
-    /// between windows (docking spec D-15).
+    /// between windows (docking spec D-15); the pop-out view with no drop targets.
     fn places(&self, main: &Window) -> Vec<ui::Place> {
         self.z
             .iter()
             .filter_map(|&w| match w {
-                None => detached::place(None, main),
-                Some(id) => self.detached.iter().find(|d| d.id == id).and_then(|d| detached::place(Some(id), &d.window)),
+                Win::Main => detached::place(None, main, true),
+                Win::Detached(id) => self.detached.iter().find(|d| d.id == id).and_then(|d| detached::place(Some(id), &d.window, true)),
+                Win::Popout => self.popout.as_ref().and_then(|p| detached::place(None, &p.window, false)),
             })
             .collect()
     }
@@ -955,7 +967,12 @@ impl App {
                 self.popout = None;
                 self.viewer.ui.capture.popout = false;
             }
-            WindowEvent::Focused(f) => p.focused = f,
+            WindowEvent::Focused(f) => {
+                p.focused = f;
+                if f {
+                    self.raise(Win::Popout);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() && !event.repeat => {
                 use winit::keyboard::{Key, NamedKey};
                 match event.logical_key {

@@ -138,7 +138,7 @@ fn on_popup(ctx: &egui::Context, p: Pos2) -> bool {
 }
 
 /// The flyout's area: in the foreground, over the 3D view's own overlays (the status chip, the
-/// capture buttons) and the panels floating in windows.
+/// capture buttons).
 fn flyout_layer() -> LayerId {
     LayerId::new(Order::Foreground, Id::new("autohide-flyout"))
 }
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(edge_of(pos2(100.0, 900.0), v), Edge::Left, "below-left, farther left than below");
         assert_eq!(edge_of(pos2(600.0, 10.0), v), Edge::Left, "above the view: the nearer side");
         assert_eq!(edge_of(pos2(900.0, 10.0), v), Edge::Right);
-        assert_eq!(edge_of(pos2(950.0, 400.0), v), Edge::Right, "over the view (a floating window): the nearest edge");
+        assert_eq!(edge_of(pos2(950.0, 400.0), v), Edge::Right, "over the view: the nearest edge");
         assert_eq!(edge_of(pos2(600.0, 780.0), v), Edge::Bottom);
     }
 

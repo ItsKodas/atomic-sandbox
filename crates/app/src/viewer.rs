@@ -834,8 +834,10 @@ impl Viewer {
     /// snapshot mirror `self.scene`, never the interpolated `shown_scene` (S5: display only).
     pub fn input(&mut self, e: &replay::Event, consumed: bool) {
         use replay::{Button, Event, KeyName};
-        // the molecule builder's window has the mouse and the keys (Space, Delete, Esc are its own)
-        let consumed = consumed || self.ui.builder.open;
+        // the molecule builder's window has the mouse and the keys (Space, Delete, Esc are its own);
+        // while a tab is dragged between windows the keys are the drag's (Esc cancels it, and must
+        // not also clear the selection: docking Task 11 review M4)
+        let consumed = consumed || self.ui.builder.open || (matches!(e, Event::Key { .. }) && self.ui.workspace.dragging().is_some());
         let vp = self.viewport;
         // the Edit tool's group is its own: another tool selects one nucleus
         if self.ui.mode != ui::ToolMode::Edit {
@@ -3328,6 +3330,34 @@ nucleus 1 {a} {} {}
         assert_eq!(press(&mut v, (vp.origin[0] + vp.size[0] / 2.0, mid)), (false, false), "the middle of the view is the view's");
         assert_ne!(v.camera, cam, "it orbits");
         assert_eq!(v.viewport, vp, "and moves no separator");
+    }
+
+    /// Docking Task 11 review M4: while a tab is dragged between windows the keys are the drag's —
+    /// the window's Esc reaches the 3D view as consumed (the selection stays) and the chrome's
+    /// frame cancels the drag with it; after the drag Esc deselects again.
+    #[test]
+    fn esc_during_a_tab_drag_is_the_drags() {
+        use crate::replay::{Event, KeyName};
+        let mut v = Viewer::new("h2").unwrap();
+        let run = |v: &mut Viewer, events: Vec<egui::Event>| discard(v.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), events, ..Default::default() }));
+        for _ in 0..3 {
+            run(&mut v, vec![]);
+        }
+        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Graph").copied()).expect("the Graph tab").center();
+        let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        run(&mut v, vec![egui::Event::PointerMoved(c), button(c, true)]);
+        for dx in [12.0, 50.0] {
+            run(&mut v, vec![egui::Event::PointerMoved(c + egui::vec2(dx, 0.0))]);
+        }
+        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Graph));
+        v.tool.selected = Some(0);
+        v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
+        assert_eq!(v.tool.selected, Some(0), "the drag's Esc does not deselect");
+        run(&mut v, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert_eq!(v.ui.workspace.dragging(), None, "it cancels the drag");
+        run(&mut v, vec![button(c + egui::vec2(50.0, 0.0), false)]);
+        v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
+        assert_eq!(v.tool.selected, None, "after the drag Esc deselects");
     }
 
     /// The wheel over the 3D view: without a drag it zooms; during a Select-drag it leaves the

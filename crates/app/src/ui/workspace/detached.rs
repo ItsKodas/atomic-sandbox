@@ -44,6 +44,10 @@ pub struct WinRect {
     pub h: u32,
 }
 
+/// A detached window's least inner size, points (the window side's `with_min_inner_size`; a tab
+/// torn out of every window opens at least this large, `super::drag`).
+pub const MIN_WINDOW: [f32; 2] = [240.0, 160.0];
+
 /// The title-bar strip [`WinRect::usable_on`] looks at: the window's top `STRIP_H` px, `STRIP_INSET`
 /// px in from each side (Windows reports a maximised window's outer position 8 px outside its
 /// monitor, so a window maximised on the monitor to the right overhangs its left neighbour by 8 px:
@@ -161,7 +165,7 @@ fn default_siblings(t: DockTab) -> Vec<DockTab> {
 }
 
 /// The panels among a leaf's tiles.
-fn panels_of(tabs: &[Tile]) -> Vec<DockTab> {
+pub(super) fn panels_of(tabs: &[Tile]) -> Vec<DockTab> {
     tabs.iter()
         .filter_map(|t| match t {
             Tile::Panel(p) => Some(*p),
@@ -364,6 +368,7 @@ impl Workspace {
             if w.asked {
                 self.det.requests.push(WindowRequest::Close { id: w.id });
             }
+            self.forget_drag_from(w.id);
         }
         self.det.origins.clear();
     }
@@ -479,6 +484,7 @@ impl Workspace {
     fn close_if_empty(&mut self, i: usize) {
         if self.det.list[i].dock.iter_all_tabs().next().is_none() {
             let w = self.det.list.remove(i);
+            self.forget_drag_from(w.id);
             if w.asked {
                 self.det.requests.push(WindowRequest::Close { id: w.id });
             }
@@ -503,6 +509,7 @@ impl Workspace {
         let Some(i) = self.det.list.iter().position(|w| w.id == id) else { return };
         let panels = self.window_panels(id);
         self.det.list.remove(i);
+        self.forget_drag_from(id);
         self.dock_back(panels);
     }
 

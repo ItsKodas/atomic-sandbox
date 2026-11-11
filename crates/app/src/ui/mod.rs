@@ -50,7 +50,7 @@ pub use theme::apply as apply_theme;
 /// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.
 pub use workspace::presets::Preset as LayoutPreset;
 /// Detached windows (docking spec D-12): what the UI asks of the window side, and where a window is.
-pub use workspace::detached::{WinRect, WindowRequest};
+pub use workspace::detached::{WinRect, WindowRequest, MIN_WINDOW};
 pub use workspace::drag::Place;
 
 use crate::scene::Scene;
@@ -1246,6 +1246,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.log.record(&st.status, st.status_seq, input);
     // the reference comparison's results (a helper process on its own thread; never blocks)
     st.compare.poll(input.snapshot);
+    // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
+    st.workspace.drag_escape(root.ctx(), None);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
@@ -1294,6 +1296,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
 pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>, id: u32) -> PanelOutput {
     let mut out = PanelOutput::default();
     let mut acts = Vec::new();
+    st.workspace.drag_escape(root.ctx(), Some(id));
     workspace::tree::show_window(root, st, input, &mut acts, id);
     out.actions = acts.clone();
     for a in acts {
