@@ -902,16 +902,21 @@
 //!   point, thinned or held out there — the caps and edge atoms are not the source's, so a model
 //!   answer there would be judged on atoms it is not meant to know. The pass plans no **shell check**
 //!   in a masked scene (judged on every atom, it could fence a source pair for an answer the caps
-//!   distort). Dedup (`is_label_copy`) and the quarantine fences apply as for any answer (the
-//!   fence's nearness counts every atom: the conservative side).
+//!   distort). The quarantine fences apply as for any answer (the fence's nearness counts every
+//!   atom: the conservative side; with no model answer the fence vote decides, and the note says
+//!   no model answered). Dedup (`is_label_copy`) compares an answer only with stored samples of
+//!   the same mask and energy use (a whole answer is never a copy of a segment), on the fitted
+//!   rows: no energy test without an energy row, no masked-out force (Task 10a review, finding 4).
 //! - **Leave-one-out, class and key verdicts** (`trust::compute_class_loo_full`): only the fitted
 //!   rows — a masked sample's energy LOO does not exist (`SampleLoo::energy` `None`), its masked-out
 //!   atoms have no force LOO and no class or key (`trust::trained_keys`). A class or key counts a
 //!   masked sample when it holds an interior atom of it; its energy statistics count the samples with
-//!   a fitted energy only, and a key with samples but **no** fitted energy reads as energy LOO ∞ —
-//!   refused for want of energy evidence (conservative; an item for the physics review: forces
-//!   determine the energy model, but no energy datum vouches for it). `loo_rms` and
-//!   `loo_force_errors` likewise.
+//!   a fitted energy only, and a key holding segments with fewer than `calibrate::MIN_EVIDENCE` (3)
+//!   fitted energies — none, or one or two whole samples among the segments — reads as energy
+//!   LOO ∞: refused for want of energy evidence (Task 10a review, finding 1; ruling P25: the
+//!   evidence comes from whole-scene fallbacks, never from a force-only energy calibration —
+//!   forces determine the energy model, but no energy datum vouches for it). A key of whole
+//!   samples only is judged as before. `loo_rms` and `loo_force_errors` likewise.
 //! - **Sample floors** (`trust::key_column_counts`, the whole-model union floor, `fit_floor`'s
 //!   cache key): only interior atoms touch a key's columns and count as its samples.
 //! - **Training residuals, recovery and release** (`compute_training_residuals`, `worst_offenders`,
@@ -2651,7 +2656,11 @@ impl Trainable for SurrogateKs {
                 self.last_fit_error = Some(e.to_string());
             }
         }
-        r.map(|r| format!("{} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_energy_per_atom, r.rmse_force))
+        // a fit without energy rows measured no energy rmse (Task 10a review, finding 5)
+        r.map(|r| {
+            let e = if r.has_energy_rows() { format!("rmse_E {:.1e} Ha/atom", r.rmse_energy_per_atom) } else { format!("rmse_E — ({})", surrogate::fit::NO_ENERGY_ROWS) };
+            format!("{} samples, {e}, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_force)
+        })
             .map_err(|e| e.to_string())
     }
 

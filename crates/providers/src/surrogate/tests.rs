@@ -10147,6 +10147,33 @@ fn a_masked_sample_never_contributes_its_energy_or_its_masked_out_forces() {
     assert_eq!(clean.knowledge_map().unwrap().elements[0].atoms_seen, atoms_before + 2 * k, "the interior atoms only");
     assert_eq!(clean.loo_rms().unwrap().samples, whole + k);
     println!("masked samples: loo {:?}; trusted {}", clean.loo_rms(), clean.trusted());
+    // (Task 10a review, finding 2) the sample-label consumers past the fit: dedup, release and
+    // supersede, fence votes — the same outcome with the garbage labels
+    let last = whole + k - 1;
+    let (gc, gg) = (clean.store().unwrap().samples[last].clone(), garbage.store().unwrap().samples[last].clone());
+    assert_ne!((gc.energy, gc.forces[2]), (gg.energy, gg.forces[2]), "the garbage labels are stored");
+    // dedup against the garbage-labelled segment: the teacher's answer is a copy in both
+    let mask = gc.force_mask.clone().unwrap();
+    let copy = |s: &SurrogateKs| s.is_label_copy(&gc.pos, &gc.z, gc.energy, &gc.forces, Some(&mask));
+    assert_eq!(copy(&clean), Some(last));
+    assert_eq!(copy(&garbage), copy(&clean), "dedup never reads a masked-out label");
+    // release / supersede (`reproduces_sample`) of a quarantined segment
+    let (rc, rg) = (clean.reproduces_sample(&gc), garbage.reproduces_sample(&gg));
+    println!("the segment reproduced (its fitted rows): clean {rc}, garbage {rg}");
+    assert!(rc, "the model fitted with the segment reproduces its fitted rows");
+    assert_eq!(rg, rc);
+    for s in [&mut clean, &mut garbage] {
+        s.quarantine.resize(s.samples(), Q_NONE);
+        s.quarantine[last] = Q_HELD;
+    }
+    assert_eq!((clean.release_reproduced(), garbage.release_reproduced()), (1, 1), "released in both");
+    assert_eq!(clean.quarantine, garbage.quarantine);
+    // fence votes: a refit's judgement of a vote-kept segment (`judge_votes`)
+    for s in [&mut clean, &mut garbage] {
+        s.vote_pending = vec![(last, vec![last - 1])];
+    }
+    assert_eq!((clean.judge_votes(), garbage.judge_votes()), (0, 0), "kept by both");
+    assert_eq!((&clean.quarantine, &clean.fence_kept), (&garbage.quarantine, &garbage.fence_kept));
 }
 
 /// A provider whose samples are all capped segments (the capping gate's collection B): the refit
@@ -10166,6 +10193,12 @@ fn a_store_of_masked_samples_alone_fits_its_forces_and_is_not_trusted() {
     assert_eq!((rep.sigma_e, rep.residual_dof_e), (surrogate::fit::SIGMA_E_WITHOUT_ENERGY_ROWS, 0.0));
     assert_eq!(s.accumulator().unwrap().n_e, 0);
     assert!(!s.trusted(), "no energy evidence: not trusted");
+    // the pinned s_E is no measurement: the inspect view and the refit's line say so (Task 10a
+    // review, finding 5)
+    let fit_line = s.inspect(&[]).lines().find(|l| l.trim_start().starts_with("fit:")).unwrap().to_string();
+    assert!(fit_line.contains("rmse E/atom no energy rows") && fit_line.contains("s_E no energy rows"), "{fit_line}");
+    let refit_line = Trainable::refit(&mut s).unwrap();
+    assert!(refit_line.contains("rmse_E — (no energy rows)"), "{refit_line}");
     // the interior atoms' forces are learned: held-out H₃ forces on atoms 0 and 1
     let model = s.model().unwrap().clone();
     let mut worst: f64 = 0.0;
@@ -10179,6 +10212,95 @@ fn a_store_of_masked_samples_alone_fits_its_forces_and_is_not_trusted() {
     println!("masked-only store: s_F {:.2e}, held-out worst |ΔF| on the taught atoms {worst:.2e}; untrusted: {:?}", rep.sigma_f, s.untrusted_reason());
     // within the policy's absolute force tier (what a trusted answer is held to)
     assert!(worst < FallbackPolicy::default().force_std_abs, "{worst:e}");
+}
+
+/// Task 10a review, finding 1: a key holding capped segments has its uncalibrated energy evidence
+/// from its whole samples only, and fewer than `calibrate::MIN_EVIDENCE` of them is no evidence —
+/// the key's LOO energy reads ∞ (refused on the energy), as with none. A key of whole samples only
+/// (the dimers' pair key here) is judged as before. With three whole samples the rule of before
+/// applies again.
+#[test]
+fn a_key_mixing_segments_needs_three_energy_samples_for_energy_evidence() {
+    for whole in 0..=3usize {
+        let mut s = dimer_model_three_atom_teacher();
+        let mut rng = StdRng::seed_from_u64(1013);
+        for _ in 0..120 {
+            let sc = masked_h3_random(&mut rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+        }
+        for _ in 0..whole {
+            let sc = random_h3(&mut rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+        }
+        s.refit().unwrap();
+        let j = s.class_judge.as_ref().expect("a judgement after the refit");
+        let many: Vec<(&surrogate::EnvKey, &super::calibrate::ClassStats)> = j.key_stats.iter().filter(|(k, _)| k.class == 2).collect();
+        assert!(!many.is_empty(), "the segments' interior atoms hold a many-body key");
+        for (k, st) in &many {
+            let verdict = s.class_loo()[1].species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).map(|v| v.refusal);
+            println!("whole H₃ {whole}: key {k:?} samples {} energy rms {:.3e} max {:.3e}; verdict {verdict:?}", st.samples, st.energy_rms, st.energy_max);
+            if whole < super::calibrate::MIN_EVIDENCE {
+                assert_eq!((st.energy_rms, st.energy_max), (f64::INFINITY, f64::INFINITY), "{whole} energy samples are no energy evidence");
+            } else {
+                assert!(st.energy_rms.is_finite() && st.energy_max.is_finite(), "{whole} energy samples are evidence: {st:?}");
+            }
+        }
+        // the dimers' pair key (whole samples only) keeps its finite energy statistics
+        let pair: Vec<_> = j.key_stats.iter().filter(|(k, _)| k.class == 1).collect();
+        assert!(!pair.is_empty() && pair.iter().all(|(_, st)| st.energy_max.is_finite()), "{pair:?}");
+    }
+}
+
+/// Task 10a review, finding 7: a capped segment next to a quarantined geometry goes to the fence
+/// vote with no model answer (the model does not answer in a segment), and its note says so — not
+/// that the teacher "disagrees with the model".
+#[test]
+fn a_masked_scene_by_a_fence_is_not_said_to_disagree_with_the_model() {
+    let mut s = dimer_model_three_atom_teacher();
+    let sc = masked_h3(2.0);
+    s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    let k = s.samples() - 1;
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[k] = Q_HELD;
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    println!("{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("a capped segment next to a quarantined geometry")), "{:?}", r.stats.notes);
+    assert!(!r.stats.notes.iter().any(|n| n.contains("disagrees with the model")), "{:?}", r.stats.notes);
+}
+
+/// Task 10a review, finding 4: dedup (`is_label_copy`) compares an answer only with stored
+/// samples of its own mask (a whole answer is never a copy of a capped segment, nor a segment of
+/// one with another mask), and in an energy-free comparison it skips the energy and the
+/// masked-out forces (the labels the fit never reads) rather than comparing them.
+#[test]
+fn dedup_compares_a_masked_answer_only_with_samples_of_its_own_mask() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(1012);
+    for _ in 0..12 {
+        let sc = masked_h3_random(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    let sc = masked_h3_random(&mut rng);
+    let good = pair_morse_sample(&sc);
+    s.add_sample(good.clone(), &sc).unwrap();
+    s.refit().unwrap();
+    let i = s.samples() - 1;
+    let mask = [true, true, false];
+    let (pos, z) = (&good.pos, &good.z);
+    assert_eq!(s.is_label_copy(pos, z, good.energy, &good.forces, Some(&mask)), Some(i), "the same answer of the same segment");
+    let mut cap = good.forces.clone();
+    cap[2] = [50.0, -50.0, 50.0];
+    assert_eq!(s.is_label_copy(pos, z, good.energy + 100.0, &cap, Some(&mask)), Some(i), "neither the energy nor the cap's force is compared");
+    let sf = s.report().unwrap().sigma_f;
+    let mut moved = good.forces.clone();
+    let m = (moved[0][0].powi(2) + moved[0][1].powi(2) + moved[0][2].powi(2)).sqrt();
+    assert!(m > 0.0);
+    moved[0] = std::array::from_fn(|a| moved[0][a] * (m + 10.0 * sf) / m);
+    assert_eq!(s.is_label_copy(pos, z, good.energy, &moved, Some(&mask)), None, "an interior force 10 s_F away is no copy");
+    assert_eq!(s.is_label_copy(pos, z, good.energy, &good.forces, None), None, "a whole answer is never a copy of a segment");
+    assert_eq!(s.is_label_copy(pos, z, good.energy, &good.forces, Some(&[false, true, true])), None, "nor one of another mask");
 }
 
 /// A random H₃ (`random_h3`) as a segment: atoms 0 and 1 interior.

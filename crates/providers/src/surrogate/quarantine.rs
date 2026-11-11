@@ -678,6 +678,7 @@ impl SurrogateKs {
         dedup: bool,
         essential: bool,
         h: f64,
+        mask: Option<&[bool]>,
         notes: &mut Vec<String>,
     ) -> Admission {
         let no = |outcome| Admission { kept: false, outcome };
@@ -744,7 +745,13 @@ impl SurrogateKs {
                     ));
                     return yes(TeachOutcome::KeptByVote);
                 }
-                notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
+                // no model answered in a capped segment (`TeachRule::Segment`) or wherever a rule
+                // refused before consulting it: nothing disagreed (Task 10a review, finding 7)
+                notes.push(match (model, mask) {
+                    (Some(_), _) => "surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into(),
+                    (None, Some(_)) => format!("surrogate: sample not kept — a capped segment next to a quarantined geometry (the model does not answer in a segment); a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                    (None, None) => format!("surrogate: sample not kept — next to a quarantined geometry, and the model was not consulted here; a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                });
                 return no(TeachOutcome::FenceDisagrees);
             }
             self.fence_votes.clear();
@@ -772,7 +779,7 @@ impl SurrogateKs {
             let d = self.nearest_stored(pos, z);
             let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
             if dedup && d <= limit {
-                if let Some(i) = self.is_label_copy(pos, z, energy, forces) {
+                if let Some(i) = self.is_label_copy(pos, z, energy, forces, mask) {
                     notes.push(format!("surrogate: sample not kept — a copy of stored sample #{i} (its labels within the fit's own noise)"));
                     return no(TeachOutcome::Thinned);
                 }
@@ -803,17 +810,30 @@ impl SurrogateKs {
     /// vibrating one is not a copy: its labels move by k·Δr per step, far above s_F (the active
     /// learning run: 6e-4 against 4.5e-5 Ha/Bohr). No constant beyond the fit's own noise levels.
     /// `None` without a fit.
-    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<usize> {
+    ///
+    /// `mask` is the answer's training mask (a capped segment's, `Scene::train_mask`; `None` for a
+    /// whole answer). Only stored samples fitted with the same rows are candidates (M8a Task 10a
+    /// review, finding 4): the same atoms taught and the energy used or not alike — a whole answer
+    /// is never a copy of a segment, nor a segment of one cut with another mask. The labels are
+    /// compared on those fitted rows only: the masked-out atoms' forces are not compared, and with
+    /// no energy row the energy test is skipped (a segment's E includes its caps; the fit never
+    /// reads it).
+    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], mask: Option<&[bool]>) -> Option<usize> {
         let (model, env, store, report) = (self.model.as_ref()?, self.envelope.as_ref()?, self.store.as_ref()?, self.report.as_ref()?);
         let basis = &model.basis;
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
         let cached = self.desc_basis.as_ref() == Some(basis);
+        // the answer's fitted rows (as `store::keep_sample_masked` will store it)
+        let mask = mask.filter(|m| m.len() == z.len());
+        let use_energy = mask.is_none();
+        let taught = |j: usize| mask.is_none_or(|m| m[j]);
         let (mut best, mut best_d) = (None, f64::INFINITY);
         for (i, s) in store.samples.iter().enumerate() {
             // only a sample that is (or will be) fitted: the rationale — fitted copies shrink s_F,
             // copies meet the counts — concerns the fit (round 1 re-review, R1-1: a held-out guess
-            // compared against would refuse the very fallbacks that let strict mode reach it)
-            if s.z != z || self.excluded(i) {
+            // compared against would refuse the very fallbacks that let strict mode reach it);
+            // and only one fitted with the same rows (finding 4 above)
+            if s.z != z || self.excluded(i) || s.use_energy != use_energy || (0..z.len()).any(|j| s.trains_atom(j) != taught(j)) {
                 continue;
             }
             let owned;
@@ -839,7 +859,8 @@ impl SurrogateKs {
         let n = z.len().max(1) as f64;
         let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
         let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
-        let same = (energy - s.energy).abs() <= s_e && forces.iter().zip(&s.forces).all(|(a, b)| (mag(a) - mag(b)).abs() <= report.sigma_f);
+        let same = (!use_energy || (energy - s.energy).abs() <= s_e)
+            && forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| taught(*j)).all(|(_, (a, b))| (mag(a) - mag(b)).abs() <= report.sigma_f);
         same.then_some(i)
     }
 

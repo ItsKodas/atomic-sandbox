@@ -271,8 +271,10 @@
 //! * a **scale row** (`sumsq`, `n_scale`): the standardisation D is a property of the features,
 //!   not of the targets, so a sample without an energy row still contributes the per-atom mean of
 //!   its interior atoms' descriptors (Σ_{i interior} B_i / n_interior) — the same quantity an
-//!   energy row holds for a whole sample (÷ N). For every unmasked sample the scale row IS its
-//!   energy row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
+//!   energy row holds for a whole sample (÷ N). Without `energy_per_atom` the whole sample's row
+//!   is extensive (Σ over all N atoms), and the masked one is scaled to match:
+//!   (N / n_interior) Σ_{i interior} B_i. For every unmasked sample the scale row IS its energy
+//!   row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
 //! * the **envelope** (`Envelope::add_atom`) of the interior atoms only: a cap or an edge atom
 //!   describes no knowledge of the source (the conservative ruling — the provider's active set
 //!   and key counts follow it).
@@ -562,7 +564,30 @@ impl FitReport {
     pub fn residual_dof(&self) -> f64 {
         self.residual_dof_e + self.residual_dof_f
     }
+
+    /// Whether the fit had an energy row (module doc, "Masked samples"). Without one G_E = 0, so
+    /// γ_E = 0 and the residual dof n_E − γ_E = 0 exactly; with n_E ≥ 1 rows γ_E < n_E strictly
+    /// (a finite prior), so the residual dof is > 0.
+    pub fn has_energy_rows(&self) -> bool {
+        self.residual_dof_e != 0.0 || self.gamma_e != 0.0
+    }
+
+    /// s_E as the fit measured it; `None` for a fit without energy rows, whose s_E is the pin
+    /// [`SIGMA_E_WITHOUT_ENERGY_ROWS`] (no residual to estimate it from) — what a readout shows
+    /// instead of a number (Task 10a review, finding 5).
+    pub fn measured_sigma_e(&self) -> Option<f64> {
+        self.has_energy_rows().then_some(self.sigma_e)
+    }
+
+    /// The readout of s_E: the number (`{:.2e}`), or "no energy rows" for the pin.
+    pub fn sigma_e_text(&self) -> String {
+        self.measured_sigma_e().map_or_else(|| NO_ENERGY_ROWS.to_string(), |s| format!("{s:.2e}"))
+    }
 }
+
+/// What a readout shows for the energy numbers of a fit without energy rows (s_E, the energy
+/// rmse): no number is measured.
+pub const NO_ENERGY_ROWS: &str = "no energy rows";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FitError {
@@ -799,7 +824,10 @@ impl Accumulator {
             self.n_e += 1;
             self.sum_log_w_e += w.ln();
         } else {
-            let inv = 1.0 / n_taught as f64; // n_taught ≥ 1: `shape_ok`
+            // the interior mean (per atom), or the interior sum scaled to N atoms (extensive, as a
+            // whole sample's Σ over all N): the quantity a whole sample's energy row holds.
+            // n_taught ≥ 1: `shape_ok`
+            let inv = if per_atom { 1.0 / n_taught as f64 } else { n as f64 / n_taught as f64 };
             phi.iter_mut().for_each(|v| *v *= inv);
         }
         for (c, class) in self.classes.iter().enumerate() {
@@ -2424,6 +2452,7 @@ mod tests {
             report.rmse_force
         );
         assert!(report.sigma_e < 1e-7 && report.sigma_f < 1e-7, "noise-free data: s_E {:e}, s_F {:e}", report.sigma_e, report.sigma_f);
+        assert!(report.has_energy_rows() && report.measured_sigma_e() == Some(report.sigma_e));
         let s0 = &store.samples[0];
         let pred = model.predict(&s0.pos, &s0.z, true).unwrap();
         let e_std = pred.energy_std.expect("variance requested");
@@ -2879,6 +2908,9 @@ mod tests {
         assert_eq!(report.sigma_e, SIGMA_E_WITHOUT_ENERGY_ROWS);
         assert_eq!(report.residual_dof_e, 0.0);
         assert_eq!(report.rmse_energy_per_atom, 0.0);
+        // the pin is not a measurement (Task 10a review, finding 5): readouts say so
+        assert!(!report.has_energy_rows());
+        assert_eq!((report.measured_sigma_e(), report.sigma_e_text()), (None, "no energy rows".to_string()));
         assert_eq!(report.n_rows, 120 * 6);
         assert!(report.rmse_force < 1e-10, "{:e}", report.rmse_force);
         let mut worst: f64 = 0.0;
@@ -2946,6 +2978,33 @@ mod tests {
         eprintln!("warm refit with masked samples: |ΔF|/σ_F {worst_f:.1e} (bound 10κε {bound:.1e}), std rel {worst_std:.1e}, γ_E {:.6} vs {:.6}, γ_F {:.6} vs {:.6}", r_w.gamma_e, sol.gamma_e, r_w.gamma_f, sol.gamma_f);
         assert!(worst_f < bound && worst_std < 1e-5, "{worst_f:e} {worst_std:e}");
         assert!(rel_change(r_w.gamma_e, sol.gamma_e) < 1e-5 && rel_change(r_w.gamma_f, sol.gamma_f) < 1e-5);
+    }
+
+    /// A masked sample's scale row is the quantity a whole sample's energy row holds (module doc,
+    /// "Masked samples"): the interior mean of the descriptors with `energy_per_atom` (÷ N for a
+    /// whole sample), the interior sum × N / n_interior without it (extensive, like Σ over all N).
+    /// On an equilateral H₃ every atom's descriptor is the same B, so the whole sample's scale row
+    /// (B per atom, 3B extensive) and the masked one's (2 of the 3 atoms interior) must agree.
+    #[test]
+    fn a_masked_scale_row_is_intensive_or_extensive_as_a_whole_samples() {
+        let basis = Basis::new(&[H, O]);
+        let refs = [-0.478, -74.8];
+        let a = 1.5;
+        let pos = vec![[0.0, 0.0, 0.0], [a, 0.0, 0.0], [0.5 * a, 0.5 * 3f64.sqrt() * a, 0.0]];
+        let whole = Sample::new(pos, vec![1, 1, 1], -1.6, vec![[0.0; 3]; 3], SampleTag::Perturbation, 1.0);
+        let seg = Sample { force_mask: Some(vec![true, true, false]), use_energy: false, ..whole.clone() };
+        for per_atom in [true, false] {
+            let opts = FitOptions { energy_per_atom: per_atom, ..Default::default() };
+            let (mut aw, mut am) = (Accumulator::new(&basis), Accumulator::new(&basis));
+            aw.add(&whole, &basis, &refs, &opts).unwrap();
+            am.add(&seg, &basis, &refs, &opts).unwrap();
+            assert_eq!((aw.n_scale, am.n_scale, am.n_e), (1, 1, 0));
+            let scale = aw.sumsq.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            assert!(scale > 0.0);
+            for (k, (w, m)) in aw.sumsq.iter().zip(&am.sumsq).enumerate() {
+                assert!((w - m).abs() <= 1e-12 * scale, "energy_per_atom {per_atom}: sumsq[{k}] whole {w:e} masked {m:e}");
+            }
+        }
     }
 
     fn morse_bend_samples(rng: &mut StdRng, n: usize) -> Vec<Sample> {

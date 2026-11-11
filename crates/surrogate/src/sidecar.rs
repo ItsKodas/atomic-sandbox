@@ -22,7 +22,10 @@
 //! not a gate, `Provenance` doc; from version 4 also `ionic`, the ionic-surface tag, a gate}, `basis`
 //! {n_max, l_max, r_cut, degree_cap, body3, species}, `species` (the basis's, repeated for
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
-//! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
+//! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null; its
+//! `sigma_e` is the string "no energy rows" for a fit without energy rows, read as the pin
+//! `fit::SIGMA_E_WITHOUT_ENERGY_ROWS` — only such a fit's file, which holds masked samples and so
+//! is refused by builds before them, carries it),
 //! `accumulator` {q_prime, yy_e, n_e, sum_log_w_e, yy_f, n_f, sum_log_w_f, n_samples,
 //! energy_per_atom (bool or null), envelope_count [per species]}, `reference_rule` (how the
 //! reference energies were made — [`REFERENCE_RULE`] for references solved under ruling S9, or
@@ -220,7 +223,7 @@
 //! viewer can compare a picked file with the scene before loading it.
 
 use crate::descriptor::Basis;
-use crate::fit::{Accumulator, FitReport, Sample, SampleTag};
+use crate::fit::{Accumulator, FitReport, Sample, SampleTag, NO_ENERGY_ROWS, SIGMA_E_WITHOUT_ENERGY_ROWS};
 use crate::history::{AuditHistory, EnvKey, HistoryArrays, Unrecorded};
 
 /// The calibrated class verdict's hysteresis memory (header key `class_memory`): per environment
@@ -687,7 +690,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         Some(r) => obj(&[
             ("rmse_energy_per_atom", num(r.rmse_energy_per_atom)),
             ("rmse_force", num(r.rmse_force)),
-            ("sigma_e", num(r.sigma_e)),
+            // a fit without energy rows has no measured s_E (its value is the pin): the readout
+            // says so (Task 10a review, finding 5); read back as the pin
+            ("sigma_e", if r.has_energy_rows() { num(r.sigma_e) } else { string(NO_ENERGY_ROWS) }),
             ("sigma_f", num(r.sigma_f)),
             ("lambda", num(r.lambda)),
             ("log_evidence", num(r.log_evidence)),
@@ -1170,7 +1175,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         r => Some(FitReport {
             rmse_energy_per_atom: r.get("rmse_energy_per_atom")?.f64()?,
             rmse_force: r.get("rmse_force")?.f64()?,
-            sigma_e: r.get("sigma_e")?.f64()?,
+            sigma_e: match r.get("sigma_e")? {
+                Json::Str(t) if t == NO_ENERGY_ROWS => SIGMA_E_WITHOUT_ENERGY_ROWS,
+                v => v.f64()?,
+            },
             sigma_f: r.get("sigma_f")?.f64()?,
             lambda: r.get("lambda")?.f64()?,
             log_evidence: r.get("log_evidence")?.f64()?,
@@ -2488,6 +2496,29 @@ pub(crate) mod tests {
         for f in [old, p, p6] {
             let _ = std::fs::remove_file(f);
         }
+    }
+
+    /// Task 10a review, finding 5: a fit without energy rows (s_E pinned, γ_E = residual dof_E = 0)
+    /// writes its report's s_E as "no energy rows", not as a measured number, and reads back the
+    /// pin; a fit with energy rows writes the number as before.
+    #[test]
+    fn a_fit_without_energy_rows_writes_no_measured_sigma_e() {
+        let orig = random_sidecar(12, false);
+        let samples = masked_samples(&orig.samples);
+        let mut report = orig.report.clone().unwrap();
+        assert!(report.has_energy_rows());
+        let p = tmp("no-energy-rows.model");
+        write(&p, &orig.model, &orig.accumulator, Some(&report), &samples, None).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).to_string();
+        assert!(!text.contains("no energy rows"));
+        (report.sigma_e, report.gamma_e, report.residual_dof_e) = (crate::fit::SIGMA_E_WITHOUT_ENERGY_ROWS, 0.0, 0.0);
+        write(&p, &orig.model, &orig.accumulator, Some(&report), &samples, None).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).to_string();
+        assert!(text.contains("\"sigma_e\":\"no energy rows\""), "the fit's s_E reads as no measurement");
+        let back = read(&p).unwrap();
+        assert_eq!(back.report.as_ref(), Some(&report), "read back as the pin");
+        assert!(!back.report.unwrap().has_energy_rows());
+        let _ = std::fs::remove_file(p);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the

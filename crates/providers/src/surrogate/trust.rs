@@ -721,10 +721,14 @@ impl SurrogateKs {
             let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
             let energy_rms = if e_samples > 0 { (se / e_samples as f64).sqrt() } else { 0.0 };
             let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
-            // samples but none with a fitted energy (a key taught only by capped segments): no
-            // energy evidence, which the energy rule reads as failed — the conservative side
-            // (`surrogate` module doc, "Masked samples"; an item for the physics review)
-            let (energy_rms, energy_max) = if samples > 0 && e_samples == 0 { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, energy_max) };
+            // a class or key holding capped segments (fewer energy-bearing samples than samples)
+            // takes its energy evidence from its whole samples only (ruling P25: no force-only
+            // energy calibration), and fewer than MIN_EVIDENCE of them is no evidence — the energy
+            // must not rest on one or two whole samples among many segments (Task 10a review,
+            // finding 1): energy LOO ∞, which the energy rule reads as failed. One of whole
+            // samples only (e_samples = samples) is judged as before.
+            let segments = e_samples < samples;
+            let (energy_rms, energy_max) = if segments && e_samples < super::calibrate::MIN_EVIDENCE { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, energy_max) };
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));

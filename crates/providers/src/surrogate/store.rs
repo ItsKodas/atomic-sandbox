@@ -690,7 +690,7 @@ impl SurrogateKs {
             notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
             return TeachOutcome::LoneNotKept;
         }
-        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, notes);
+        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, mask, notes);
         // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
         // the canonical surface for the comparisons; `raw_energy` exactly as solved — fix round 3,
         // no round trip, so the duplicate check sees the teacher's bits)
