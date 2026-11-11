@@ -58,7 +58,7 @@
 //! the solvers, which handle empty spin channels: `qm::scf` module doc.) The driver itself never
 //! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
 //! the other callers.
-use crate::references::{AtomReference, AtomReferences};
+use crate::references::{AtomReference, AtomReferences, RadialDensity};
 use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
@@ -237,6 +237,23 @@ pub struct OrbitalInfo {
     /// walls bend it ("boundary touches the box: enlarge the box").
     /// `false` in every other view.
     pub touches_box: bool,
+    /// The row's Hirshfeld share on each nucleus in scene order (`crate::charges::orbital_shares`;
+    /// a degenerate set's members carry the set's mean, `crate::charges::set_average`):
+    /// s_A = ∫ w_A |ψ|², a split of space, not a measured quantity. `None` = not computed (no
+    /// free-atom tables, a failed Σ_A s = 1 check, or a producer that does not compute them).
+    pub shares: Option<Vec<f64>>,
+}
+
+/// The free-atom tables the orbital shares are weighted by (orbital-atom-shares spec, "The physics,
+/// stated plainly"): `tables[i]` is nucleus i's isolated-atom density (`crate::references`, the
+/// same entries the partial charges use; one `Arc` per species may be shared by its nuclei), and
+/// `z` the scene's species in order when they were taken — a producer whose scene's Z list
+/// differs computes no shares (never shares indexed to the wrong atoms). Plain data: the provider
+/// needs no `AtomReferences`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShareTables {
+    pub tables: Vec<Arc<RadialDensity>>,
+    pub z: Vec<u8>,
 }
 
 /// The spin readout (spec §5.5; `qm::orbitals::SpinSummary` with its display scale): occupied

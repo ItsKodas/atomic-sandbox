@@ -549,6 +549,7 @@ impl ViewState {
             not_converged: r.not_converged,
             l: r.l,
             touches_box: false,
+            shares: None,
         }).collect();
         if let Some(m) = rows.iter().map(|r| r.track + 1).max() {
             self.next = self.next.max(m);

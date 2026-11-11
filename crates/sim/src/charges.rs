@@ -68,8 +68,43 @@
 //! relative error is ≤ dr²|ρ''|/(8ρ): (h/16)²κ²/2 for an e^{−2κr} tail, 1.2e-4 for H at h = 0.25;
 //! ≲ 2e-3 in a smeared core (κ ≲ 1/σ), where w_A ≈ 1 (physics review NIT-2). One table per
 //! distinct reference (pointer identity: `Promolecule::from_refs` borrows one cache entry per
-//! species; a copy per nucleus would only cost time).
-use crate::provider::SideKind;
+//! species; a copy per nucleus would only cost time). The weights are [`Weights`], shared with the
+//! orbital shares below.
+//!
+//! # Orbital shares (orbital-atom-shares spec, "The physics, stated plainly")
+//!
+//! The same weights split an orbital's probability between the atoms — display only (the
+//! Orbitals tab's grouping and dimming; nothing feeds a solve, a force or the surrogate):
+//!
+//! ```text
+//! s_iA = ∫ w_A(r) |ψ_i(r)|² d³r ≈ h³ Σ_nodes w_A(r_n) |ψ_i(r_n)|²,
+//! Σ_A s_iA = h³ Σ_nodes |ψ_i|² = 1         (Σ_A w_A = 1 at every node; ψ_i normalised, Σ ψ² h³ = 1),
+//! s̄_A = (1/d) Σ_{i∈set} s_iA                (a degenerate set of d rows: [`set_average`]).
+//! ```
+//!
+//! - **Normalisation.** [`orbital_shares`] does not renormalise: Σ_A s_iA is h³ Σ |ψ_i|², the
+//!   orbital's own norm, so a mis-scaled or wrong ψ shows as a sum off 1, and the caller shows the
+//!   shares only when |Σ_A s_iA − 1| ≤ [`SUM_TOL`] (the charges' bound). Σ_A w_A = 1 holds to a
+//!   few ulps per node whatever the lookup's interpolation error, so the sum is rounding only.
+//! - **Every node counts.** The charges skip ρ = 0 nodes (they hold no electron); here the
+//!   weight multiplies |ψ|², so a node is skipped only where ψ = 0 exactly (adding 0 changes no
+//!   sum). An unoccupied orbital is not confined to where ρ ≠ 0.
+//! - **The underflow rule** is the charges': a node where every table is 0 (an e^{−2κr} tail
+//!   below f64's range, or a table whose last segment does not decay, cut to 0) goes whole to the
+//!   nearest nucleus (the lower index on a tie), so Σ_A w_A = 1 there too and no probability is
+//!   dropped.
+//! - **Degenerate sets.** A member's share depends on the rotation the display picked inside its
+//!   set; the mean over the set is (1/d) ∫ w_A Σ_{i∈set} |ψ_i|², and Σ_{i∈set} |ψ_i|² is invariant
+//!   under any orthogonal rotation within the set, so every member shows that mean.
+//! - **Pseudised atoms.** Their tables are the pseudo-atoms' valence densities and the orbitals
+//!   the pseudo-valence orbitals (also normalised, Σ = 1 holds); inside r_c both are nodeless and
+//!   smaller than the all-electron ones, so pseudo and all-electron shares of the same molecule
+//!   need not agree (as for the charges, SHOULD-4a). A pseudo-atom's core orbitals are not
+//!   orbitals of the solve and have no row.
+//! - **What it is not.** A split of space, not a measured quantity (rule 7): Hirshfeld's
+//!   free-atom weights pull a bond's density toward the atoms by their free densities, and another
+//!   scheme (Mulliken, Bader) gives other numbers.
+use crate::provider::{OrbitalInfo, SideKind, Spin};
 use crate::references::RadialDensity;
 use crate::scene::{neumaier, Cell, Scene};
 
@@ -195,6 +230,121 @@ impl Acc {
     }
 }
 
+/// The stockholder weights w_A(r) of free atoms at fixed nuclei (module doc): one lookup per
+/// distinct table, reaching every node of `cell` from every nucleus inside it. Shared by the
+/// charges ([`hirshfeld`]) and the orbital shares ([`orbital_shares`]).
+pub struct Weights<'a> {
+    pos: &'a [[f64; 3]],
+    lookups: Vec<Lookup>,
+    /// `lookups[which[a]]` is nucleus a's table.
+    which: Vec<usize>,
+}
+
+impl<'a> Weights<'a> {
+    /// Free atom `tables[a]` at `pos[a]`, tabulated for the nodes of `cell` (dr = h/16 out to the
+    /// cell's diagonal + h: module doc, "The free-atom lookup"). Tables are shared by pointer
+    /// identity (one lookup per species when the caller passes one reference per species).
+    pub fn new(tables: &[&RadialDensity], pos: &'a [[f64; 3]], cell: &Cell) -> Self {
+        assert_eq!(tables.len(), pos.len(), "Weights: {} free atoms for {} nuclei", tables.len(), pos.len());
+        let (h, half) = (cell.h, cell.half_extent());
+        let dr = h / LOOKUP_PER_H;
+        let r_max = 2.0 * 3f64.sqrt() * half + h;
+        let mut keys: Vec<*const RadialDensity> = Vec::new();
+        let mut lookups = Vec::new();
+        let mut which = Vec::with_capacity(pos.len());
+        for &t in tables {
+            let key = t as *const RadialDensity;
+            let k = match keys.iter().position(|&p| p == key) {
+                Some(k) => k,
+                None => {
+                    keys.push(key);
+                    lookups.push(Lookup::new(t, dr, r_max));
+                    lookups.len() - 1
+                }
+            };
+            which.push(k);
+        }
+        Weights { pos, lookups, which }
+    }
+
+    /// The number of nuclei.
+    pub fn atoms(&self) -> usize {
+        self.pos.len()
+    }
+
+    /// ρ_A⁰(|r − R_A|) for every A into `out`; returns `Ok(Σ_A ρ_A⁰)` when the sum is > 0, else
+    /// `Err(nearest nucleus)` (every table has underflowed or ended at r). The callers' node loops
+    /// scale by v / Σ themselves (one division per node, `hirshfeld`'s arithmetic unchanged).
+    #[inline]
+    fn raw(&self, r: [f64; 3], out: &mut [f64]) -> Result<f64, usize> {
+        let mut sum = 0.0;
+        let (mut nearest, mut best) = (0usize, f64::INFINITY);
+        for (a, p) in self.pos.iter().enumerate() {
+            let d = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+            let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if r2 < best {
+                (nearest, best) = (a, r2);
+            }
+            out[a] = self.lookups[self.which[a]].at(r2.sqrt());
+            sum += out[a];
+        }
+        if sum > 0.0 { Ok(sum) } else { Err(nearest) }
+    }
+
+    /// w_A(r) for every nucleus A into `out` (length [`Weights::atoms`]): Σ_A w_A = 1 to rounding,
+    /// each in [0, 1]; where every free atom's density is 0 at r (underflow, or a table that ends)
+    /// the nearest nucleus takes 1 and the others 0 (ties: the lower index).
+    pub fn at(&self, r: [f64; 3], out: &mut [f64]) {
+        assert_eq!(out.len(), self.atoms(), "Weights::at: {} slots for {} nuclei", out.len(), self.atoms());
+        if self.pos.is_empty() {
+            return;
+        }
+        match self.raw(r, out) {
+            Ok(sum) => out.iter_mut().for_each(|w| *w /= sum),
+            Err(nearest) => {
+                out.iter_mut().for_each(|w| *w = 0.0);
+                out[nearest] = 1.0;
+            }
+        }
+    }
+
+    /// Σ_nodes v_n w_A(r_n) per nucleus (compensated), the value at a node with every table at 0
+    /// given to its nearest nucleus; nodes with v = 0 are skipped (they add nothing). Also Σ v.
+    fn partition(&self, cell: &Cell, values: &[f64]) -> (Vec<f64>, f64) {
+        let atoms = self.atoms();
+        let n = cell.n;
+        let (h, half) = (cell.h, cell.half_extent());
+        let mut own = vec![Acc::default(); atoms];
+        let mut total = Acc::default();
+        let mut w = vec![0.0f64; atoms];
+        let coord = |i: usize| -half + i as f64 * h;
+        for kz in 0..n {
+            let z = coord(kz);
+            for jy in 0..n {
+                let y = coord(jy);
+                let row = n * (jy + n * kz);
+                for ix in 0..n {
+                    let v = values[row + ix];
+                    if v == 0.0 {
+                        continue;
+                    }
+                    total.add(v);
+                    match self.raw([coord(ix), y, z], &mut w) {
+                        Ok(sum) => {
+                            let s = v / sum;
+                            for a in 0..atoms {
+                                own[a].add(w[a] * s);
+                            }
+                        }
+                        Err(nearest) => own[nearest].add(v),
+                    }
+                }
+            }
+        }
+        (own.iter().map(Acc::value).collect(), total.value())
+    }
+}
+
 /// The Hirshfeld charges (module doc) of the density `rho` — ρ↑ + ρ↓ at `cell`'s n³ nodes in
 /// `qm::Grid` order (x fastest; node (i, j, k) at −half + (i, j, k)·h) — with free atom
 /// `free[a]` at `pos[a]` and counted charge `counted[a]` per nucleus. Returns (q per nucleus,
@@ -208,64 +358,71 @@ pub fn hirshfeld(free: &[&RadialDensity], pos: &[[f64; 3]], counted: &[f64], cel
     if atoms == 0 {
         return (Vec::new(), cell.h.powi(3) * neumaier(rho.iter().copied()));
     }
-    let (h, half) = (cell.h, cell.half_extent());
-    // one lookup per distinct table (species), reaching every node from every nucleus inside the cell
-    let dr = h / LOOKUP_PER_H;
-    let r_max = 2.0 * 3f64.sqrt() * half + h;
-    let mut tables: Vec<(*const RadialDensity, Lookup)> = Vec::new();
-    let mut which = Vec::with_capacity(atoms);
-    for t in free {
-        let key = *t as *const RadialDensity;
-        let k = match tables.iter().position(|(p, _)| *p == key) {
-            Some(k) => k,
-            None => {
-                tables.push((key, Lookup::new(t, dr, r_max)));
-                tables.len() - 1
-            }
-        };
-        which.push(k);
+    // ρ = 0 nodes are skipped (a quadrature shortcut: they hold no electron)
+    let (own, total) = Weights::new(free, pos, cell).partition(cell, rho);
+    let h3 = cell.h * cell.h * cell.h;
+    let q = (0..atoms).map(|a| counted[a] - h3 * own[a]).collect();
+    (q, h3 * total)
+}
+
+/// The orbital's shares (module doc, "Orbital shares"): s_A = h³ Σ_nodes w_A(r_n) |ψ(r_n)|² per
+/// nucleus of `w`, for ψ at `cell`'s n³ nodes in `qm::Grid` order (as [`hirshfeld`]), compensated.
+/// **Not renormalised**: Σ_A s_A = h³ Σ |ψ|², which is 1 for the solver's normalised orbitals —
+/// the caller checks it against [`SUM_TOL`] (a wrong or mis-scaled ψ shows there).
+pub fn orbital_shares(w: &Weights, cell: &Cell, psi: &[f64]) -> Vec<f64> {
+    let n = cell.n;
+    assert_eq!(psi.len(), n * n * n, "orbital_shares: {} values for {n}³ nodes", psi.len());
+    if w.atoms() == 0 {
+        return Vec::new();
     }
-    let mut own = vec![Acc::default(); atoms];
-    let mut total = Acc::default();
-    let mut w = vec![0.0f64; atoms];
-    let coord = |i: usize| -half + i as f64 * h;
-    for kz in 0..n {
-        let z = coord(kz);
-        for jy in 0..n {
-            let y = coord(jy);
-            let row = n * (jy + n * kz);
-            for ix in 0..n {
-                let v = rho[row + ix];
-                if v == 0.0 {
+    // |ψ|² = 0 exactly adds nothing, so skipping it is exact (ψ ≠ 0 where ρ = 0 is still counted)
+    let p: Vec<f64> = psi.iter().map(|x| x * x).collect();
+    let h3 = cell.h * cell.h * cell.h;
+    w.partition(cell, &p).0.into_iter().map(|s| h3 * s).collect()
+}
+
+/// Every member of a degenerate set gets the set's mean share (module doc, "Orbital shares"):
+/// within each channel, rows by index; a row with `cluster == Some((d, _))` starts a set of the d
+/// rows with consecutive indices from it (`qm::orbitals` shows whole sets only, and a set's members
+/// are consecutive rows of one channel). `shares[k]` belongs to `rows[k]`. A set whose members
+/// are not all present with shares of one length gets `None` for every member present: a part of
+/// a set has no rotation-invariant answer. Rows of their own are untouched.
+pub fn set_average(rows: &[OrbitalInfo], shares: &mut [Option<Vec<f64>>]) {
+    assert_eq!(rows.len(), shares.len(), "set_average: {} share lists for {} rows", shares.len(), rows.len());
+    for spin in [Spin::Up, Spin::Down] {
+        let mut order: Vec<usize> = (0..rows.len()).filter(|&k| rows[k].spin == spin).collect();
+        order.sort_by_key(|&k| rows[k].index);
+        let mut i = 0;
+        while i < order.len() {
+            let first = &rows[order[i]];
+            let d = match first.cluster {
+                Some((d, _)) if d > 1 => d,
+                _ => {
+                    i += 1;
                     continue;
                 }
-                total.add(v);
-                let x = coord(ix);
-                let mut sum = 0.0;
-                let (mut nearest, mut best) = (0usize, f64::INFINITY);
-                for a in 0..atoms {
-                    let d = [x - pos[a][0], y - pos[a][1], z - pos[a][2]];
-                    let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if r2 < best {
-                        (nearest, best) = (a, r2);
-                    }
-                    w[a] = tables[which[a]].1.at(r2.sqrt());
-                    sum += w[a];
-                }
-                if sum > 0.0 {
-                    let s = v / sum;
-                    for a in 0..atoms {
-                        own[a].add(w[a] * s);
-                    }
-                } else {
-                    own[nearest].add(v);
-                }
+            };
+            // the members present: consecutive indices from `first`, the same set size
+            let mut members = vec![order[i]];
+            while members.len() < d
+                && i + members.len() < order.len()
+                && rows[order[i + members.len()]].index == first.index + members.len()
+                && rows[order[i + members.len()]].cluster.is_some_and(|(e, _)| e == d)
+            {
+                members.push(order[i + members.len()]);
+            }
+            i += members.len();
+            let len = shares[members[0]].as_ref().map(Vec::len);
+            let whole = members.len() == d && len.is_some() && members.iter().all(|&k| shares[k].as_ref().map(Vec::len) == len);
+            let mean = whole.then(|| {
+                let len = len.unwrap_or(0);
+                (0..len).map(|a| neumaier(members.iter().map(|&k| shares[k].as_ref().map_or(0.0, |s| s[a]))) / d as f64).collect::<Vec<f64>>()
+            });
+            for &k in &members {
+                shares[k] = mean.clone();
             }
         }
     }
-    let h3 = h * h * h;
-    let q = (0..atoms).map(|a| counted[a] - h3 * own[a].value()).collect();
-    (q, h3 * total.value())
 }
 
 /// The electric dipole (e·Bohr, about the cell centre — the coordinates' origin) of point charges
@@ -425,6 +582,219 @@ mod tests {
             let (q, _) = hirshfeld(&free, &pos, &vec![1.0; atoms], &cell, &rho);
             println!("{n}³, {atoms} atoms: {:.1} ms (Σq = {:+.2e})", t.elapsed().as_secs_f64() * 1e3, q.iter().sum::<f64>());
         }
+    }
+
+    /// An H-like free atom e^{−2r}/π (one electron) and an He-like one 2ζ³/π e^{−2ζr} (ζ = 27/16,
+    /// two electrons), as tables; `cut` ends the table at 5 Bohr with a rising last segment, so the
+    /// table is 0 beyond it (the underflow rule's case).
+    fn h_like(r: f64) -> f64 {
+        (-2.0 * r).exp() / std::f64::consts::PI
+    }
+    fn he_like(r: f64) -> f64 {
+        let zeta: f64 = 27.0 / 16.0;
+        2.0 * zeta.powi(3) / std::f64::consts::PI * (-2.0 * zeta * r).exp()
+    }
+    fn table(f: fn(f64) -> f64, cut: bool) -> RadialDensity {
+        let mut t = RadialDensity::from_fn(f, if cut { 5.0 } else { 8.0 }, 0.125);
+        if cut {
+            let last = *t.log_rho.last().unwrap();
+            t.r.push(5.125);
+            t.log_rho.push(last + 1.0);
+        }
+        t
+    }
+
+    /// The two characterisation fixtures (H₂ with a bond bump and a zeroed outer slab, the ρ = 0
+    /// skip; HeH⁺ with tables cut at 5 Bohr, the underflow rule at the cell's corners): (q, N).
+    fn characterisation_fixtures() -> [(Vec<f64>, f64); 2] {
+        let cell = Cell { n: 49, h: 0.25 };
+        let h_t = table(h_like, false);
+        let pos = [[-0.7, 0.1, 0.0], [0.72, 0.0, -0.05]];
+        let bump = gauss(0.4);
+        let mut rho = on_nodes(&cell, &[(0.85, pos[0], &h_like), (0.85, pos[1], &h_like), (0.3, [0.0; 3], &bump)]);
+        let half = cell.half_extent();
+        for (k, v) in rho.iter_mut().enumerate() {
+            if -half + (k % cell.n) as f64 * cell.h > 5.0 {
+                *v = 0.0;
+            }
+        }
+        let h2 = hirshfeld(&[&h_t, &h_t], &pos, &[1.0, 1.0], &cell, &rho);
+        let (he_c, h_c) = (table(he_like, true), table(h_like, true));
+        let pos = [[-0.5, 0.0, 0.0], [0.95, 0.1, 0.0]];
+        let rho = on_nodes(&cell, &[(0.9, pos[0], &he_like), (0.2, pos[1], &h_like)]);
+        let heh = hirshfeld(&[&he_c, &h_c], &pos, &[2.0, 1.0], &cell, &rho);
+        [h2, heh]
+    }
+
+    /// `hirshfeld`'s output before the weights were factored into [`Weights`] (pinned from the
+    /// code at eb2a309): the refactor changes no charge.
+    #[test]
+    fn hirshfeld_is_unchanged_by_the_weights_refactor() {
+        let [h2, heh] = characterisation_fixtures();
+        println!("H2: q = {:?}, N = {:?}", h2.0, h2.1);
+        println!("HeH+: q = {:?}, N = {:?}", heh.0, heh.1);
+        let pinned: [([f64; 2], f64); 2] = [
+            ([-0.001135540014018277, 0.0014898000509727671], 1.9996457399630454),
+            ([0.3724588331628429, 0.618070202646799], 2.009470964190358),
+        ];
+        for ((q, n), (pq, pn)) in [h2, heh].iter().zip(pinned) {
+            assert!((n - pn).abs() <= 1e-12, "N {n:?} vs {pn:?}");
+            for (a, b) in q.iter().zip(pq) {
+                assert!((a - b).abs() <= 1e-12, "q {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// `values` scaled so that h³ Σ v² = 1 (the solver's L² norm on the grid).
+    fn normalised(cell: &Cell, mut v: Vec<f64>) -> Vec<f64> {
+        let norm = (cell.h.powi(3) * neumaier(v.iter().map(|x| x * x))).sqrt();
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    /// Σ_A s_A = h³ Σ |ψ|² = 1 for a normalised ψ (Σ_A w_A = 1 at every node, also where the tables
+    /// have underflowed), and a ψ mirror-symmetric between two equal atoms splits evenly.
+    #[test]
+    fn orbital_shares_sum_to_the_norm() {
+        let cell = Cell { n: 33, h: 0.3 };
+        let h_t = table(h_like, false);
+        let pos = [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]];
+        let slater = |r: f64| (-r).exp();
+        let slater_15 = |r: f64| (-1.5 * r).exp();
+        // an asymmetric bonding-like ψ, on full and on cut (underflowing at the corners) tables
+        let psi = normalised(&cell, on_nodes(&cell, &[(1.0, pos[0], &slater), (0.3, pos[1], &slater_15)]));
+        let cut = table(h_like, true);
+        for tables in [[&h_t, &h_t], [&cut, &cut]] {
+            let s = orbital_shares(&Weights::new(&tables, &pos, &cell), &cell, &psi);
+            let sum = neumaier(s.iter().copied());
+            println!("asymmetric ψ: s = {s:?}, Σ s − 1 = {:+.3e}", sum - 1.0);
+            assert!((sum - 1.0).abs() <= 1e-10, "{s:?}");
+            assert!(s[0] > s[1], "{s:?}");
+        }
+        // σ_g-like: ψ(x, y, z) = ψ(−x, y, z) and the two atoms are the mirror images
+        let psi = normalised(&cell, on_nodes(&cell, &[(1.0, pos[0], &slater), (1.0, pos[1], &slater)]));
+        let s = orbital_shares(&Weights::new(&[&h_t, &h_t], &pos, &cell), &cell, &psi);
+        println!("symmetric ψ: s = {s:?}, s₀ − s₁ = {:+.3e}", s[0] - s[1]);
+        assert!((neumaier(s.iter().copied()) - 1.0).abs() <= 1e-10, "{s:?}");
+        assert!((s[0] - s[1]).abs() <= 1e-12, "{s:?}");
+    }
+
+    /// An orbital on one of two atoms 12 Bohr apart is that atom's.
+    #[test]
+    fn a_far_atom_owns_its_orbital() {
+        let cell = Cell { n: 49, h: 0.4 };
+        let h_t = table(h_like, false);
+        let pos = [[-6.0, 0.0, 0.0], [6.0, 0.0, 0.0]];
+        let g = |r: f64| (-0.5 * r * r).exp();
+        let psi = normalised(&cell, on_nodes(&cell, &[(1.0, pos[0], &g)]));
+        let s = orbital_shares(&Weights::new(&[&h_t, &h_t], &pos, &cell), &cell, &psi);
+        println!("far atoms: s = {s:?}");
+        assert!(s[0] >= 0.999, "{s:?}");
+        assert!((s[0] + s[1] - 1.0).abs() <= 1e-10, "{s:?}");
+    }
+
+    /// The weights themselves: they sum to 1 with every atom's share in [0, 1], and a node beyond
+    /// every table's reach goes whole to the nearest nucleus.
+    #[test]
+    fn the_weights_sum_to_one_and_the_nearest_takes_an_empty_node() {
+        let cell = Cell { n: 49, h: 0.25 };
+        let (he_c, h_c) = (table(he_like, true), table(h_like, true));
+        let pos = [[-0.5, 0.0, 0.0], [0.95, 0.1, 0.0]];
+        let w = Weights::new(&[&he_c, &h_c], &pos, &cell);
+        let mut out = [0.0; 2];
+        for r in [[0.0, 0.0, 0.0], [-0.5, 0.0, 0.0], [2.0, -1.0, 0.5], [-3.0, 2.0, 1.0]] {
+            w.at(r, &mut out);
+            assert!((out[0] + out[1] - 1.0).abs() <= 1e-15 && out.iter().all(|&x| (0.0..=1.0).contains(&x)), "{r:?}: {out:?}");
+        }
+        w.at([0.0, 0.0, 0.0], &mut out);
+        assert!(out[0] > out[1], "He's denser table dominates between them: {out:?}");
+        // beyond 5.125 Bohr of both: the tables are 0; the corner nodes are nearest the H at +x
+        for (r, nearest) in [([6.0, 6.0, 6.0], 1usize), ([-6.0, -6.0, 6.0], 0)] {
+            w.at(r, &mut out);
+            assert_eq!(out[nearest], 1.0, "{r:?}: {out:?}");
+            assert_eq!(out[1 - nearest], 0.0, "{r:?}: {out:?}");
+        }
+    }
+
+    fn row(spin: Spin, index: usize, cluster: Option<(usize, f64)>) -> OrbitalInfo {
+        OrbitalInfo {
+            spin,
+            index,
+            track: index as u32,
+            slot: 0,
+            energy: -0.5 + 0.01 * index as f64,
+            eps_range: (-0.5, -0.5),
+            occupation: 1.0,
+            label: crate::provider::OrbitalLabel::Index(index + 1),
+            cluster,
+            rotated: cluster.is_some(),
+            grid_split: None,
+            box_state: false,
+            smeared_1s: false,
+            residual: None,
+            not_converged: false,
+            l: None,
+            touches_box: false,
+            shares: None,
+        }
+    }
+
+    /// A degenerate set's members all show the set's mean share (the rotation-invariant one),
+    /// per channel; a row of its own keeps its share; two adjacent sets of the same size stay two;
+    /// a set with a member's shares missing gets none.
+    #[test]
+    fn set_average_shares_one_answer() {
+        let t = Some((3, 1e-6));
+        let p = Some((2, 1e-6));
+        // ↓ listed first and interleaved with ↑ (the order of the slice must not matter)
+        let rows = vec![
+            row(Spin::Down, 1, t),
+            row(Spin::Up, 0, None),
+            row(Spin::Up, 1, t),
+            row(Spin::Down, 2, t),
+            row(Spin::Up, 2, t),
+            row(Spin::Up, 3, t),
+            row(Spin::Down, 3, t),
+            row(Spin::Down, 4, p),
+            row(Spin::Down, 5, p),
+            row(Spin::Down, 6, p),
+            row(Spin::Down, 7, p),
+            row(Spin::Up, 4, p),
+            row(Spin::Up, 5, p),
+        ];
+        let v = |a: f64, b: f64, c: f64| Some(vec![a, b, c]);
+        let mut shares = vec![
+            v(0.6, 0.3, 0.1),
+            v(0.2, 0.7, 0.1),
+            v(0.9, 0.05, 0.05),
+            v(0.6, 0.1, 0.3),
+            v(0.05, 0.9, 0.05),
+            v(0.05, 0.05, 0.9),
+            v(0.9, 0.05, 0.05),
+            v(1.0, 0.0, 0.0),
+            v(0.0, 1.0, 0.0),
+            v(0.0, 0.0, 1.0),
+            v(0.0, 0.5, 0.5),
+            v(0.3, 0.3, 0.4),
+            None,
+        ];
+        set_average(&rows, &mut shares);
+        let close = |s: &Option<Vec<f64>>, want: [f64; 3]| s.as_ref().is_some_and(|s| s.iter().zip(want).all(|(a, b)| (a - b).abs() <= 1e-15));
+        let third = 1.0 / 3.0;
+        for k in [2, 4, 5] {
+            assert!(close(&shares[k], [third; 3]), "↑ t₂ member {k}: {:?}", shares[k]);
+        }
+        assert!(close(&shares[1], [0.2, 0.7, 0.1]), "a row of its own is untouched: {:?}", shares[1]);
+        for k in [0, 3, 6] {
+            assert!(close(&shares[k], [0.7, 0.15, 0.15]), "↓ set averaged on its own: {:?}", shares[k]);
+        }
+        for k in [7, 8] {
+            assert!(close(&shares[k], [0.5, 0.5, 0.0]), "the first ↓ pair: {:?}", shares[k]);
+        }
+        for k in [9, 10] {
+            assert!(close(&shares[k], [0.0, 0.25, 0.75]), "the second ↓ pair: {:?}", shares[k]);
+        }
+        assert!(shares[11].is_none() && shares[12].is_none(), "a set missing a member's shares has none: {:?}", &shares[11..]);
     }
 
     /// A density that does not integrate to the electrons the counted charges imply (a partial core
