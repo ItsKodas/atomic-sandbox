@@ -45,9 +45,10 @@ another monitor, with saved layouts and one consistent icon set.
   box health; Activity: work running; Model: trust; Log: unread count — today's strip dots).
   Hovering a tab shows today's peek. A leaf's tab bar ends with its controls: pin (auto-hide, D2),
   pop out (D3), close.
-- **D-5 Floating inside the window:** `egui_dock`'s own undock-to-floating-window is allowed for
-  panels in D1 (drag a tab out of the tree). The Knowledge tab's hand-made in-app window
-  (`knowledge::window`) is removed; its job is done by floating (D1) and detaching (D3) the panel.
+- **D-5 No floating inside the window** (user decision 2026-11-12, replacing D1's floating): `egui_dock`'s
+  undock-to-floating-window is off (`allowed_in_windows` false). Dragging a tab out of the main window
+  detaches it instead (D-15); dropping it on an empty spot inside a window cancels the drag. The
+  Knowledge tab's hand-made in-app window (`knowledge::window`) stays removed; detaching does its job.
 - **D-6 The View panel** (`ui/dock/view.rs`) holds every control of today's View menu, regrouped:
   - *What you see:* Density / Orbitals / All orbitals coloured / Spin density / None; the
     estimated solver's cloud (draft) controls.
@@ -111,6 +112,19 @@ another monitor, with saved layouts and one consistent icon set.
   usable on any connected monitor (less than 64 × 8 px of its title-bar strip, the top 32 px
   inset 8 px each side, on one) docks back instead. Ctrl K revealing a panel in a detached window
   focuses that window.
+- **D-15 Dragging tabs between windows** (user request 2026-11-12): a tab dragged and released
+  outside every one of the app's windows opens a new detached window (D-12) holding that tab, its
+  top-left at the release point, at the panel's current size, kept on the monitor under the cursor.
+  While a tab is dragged over another of the app's windows (main or detached), that window shows the
+  same drop targets as a drag inside it: over a leaf, its centre tabs the panel in and its four edges
+  split; over a tab bar, the tab is inserted. In the main window the 3D view's tile takes edge splits
+  only (D-3). Releasing on a target moves the tab; releasing on no target, or Esc, cancels (the tab
+  stays). This works main → detached, detached → main and detached → detached; a detached window
+  whose last tab leaves closes. Inside one window the drag is `egui_dock`'s own, as before.
+- **D-16 The 3D view never shares a drag with the UI** (user report 2026-11-12: resizing a panel near
+  its edge also orbited the camera): a press that the UI takes — a widget, a resize grip or a
+  separator, including the grab margin just outside their drawn edge — never moves the camera or
+  starts a tool, and a drag the UI holds never reaches the 3D view.
 - **D-13 Recording:** all of this is display state — nothing becomes an `Action`, nothing reaches
   the worker. The screenshot harness gains `--ui layout=<preset>` and keeps `tab=` (shows that
   panel) and `dock=closed` (Presenting).
@@ -119,11 +133,13 @@ another monitor, with saved layouts and one consistent icon set.
 
 ## Out of scope
 
-Dragging tabs between OS windows; theming beyond the icon fill; touch input; per-scene layouts.
+Theming beyond the icon fill; touch input; per-scene layouts.
 
 ## Hand-testing (user)
 
-D1: drag tabs between leaves, split by dropping on an edge, resize, float a tab, close and reopen
+D1: drag tabs between leaves, split by dropping on an edge, resize, close and reopen
 via Window, every View setting still works and is found by Ctrl K, old profile opens sensibly.
 D2: unpin / hover / pin back, each preset, layout survives restart. D3: pop out Activity + Graph to
-the second monitor, restart (it comes back there), unplug the monitor (panels dock back).
+the second monitor, restart (it comes back there), unplug the monitor (panels dock back); drag a
+tab out of the main window (a new window opens there), drag tabs into it and back, onto an edge
+(split) and its tab bar; resize panels right at their edges (the camera never moves).

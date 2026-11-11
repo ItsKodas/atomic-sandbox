@@ -135,4 +135,19 @@ Tab names are `DockTab::title()` (case-insensitive on read). `from_sides`: the l
 - [ ] Hand-test checklist for the user in the report (two monitors).
 - [ ] Commit `feat(workspace): detach panels to their own windows (other monitors)`.
 
+### Task 11: Drag tabs between windows; no in-window floating; the 3D view never shares a drag (Opus)
+
+User decision 2026-11-12 (spec D-5, D-15, D-16); runs after Task 9, before Task 10.
+
+**Files:** modify `crates/app/src/ui/workspace/tree.rs` (tab drag latch from `TabViewer::on_tab_button`'s `Response`, `allowed_in_windows` false, drop-target overlay and the move), `ui/workspace/detached.rs` (window rects in desktop pixels for hit-testing, the move into/out of a detached tree, a window whose last tab leaves closes), `crates/app/src/main.rs` and `crates/app/src/detached.rs` (desktop cursor position during a drag — winit on Windows keeps sending the pressed window `CursorMoved` outside itself; convert with each window's inner position and scale factor; redraw the target window while a drag is over it), `crates/app/src/viewer.rs` / `main.rs` (D-16 input gate), `ui/tests.rs`, README, dev-reference.
+
+- [ ] No floating: `allowed_in_windows` false everywhere; any code and docs for floats (incl. `present()` for a floating panel, the "floats are lost on restart" minor) go.
+- [ ] Drag out: a tab dragged with the pointer released outside every app window → `WindowRequest::Open` with that tab, rect at the release point (desktop px), the panel's current size, clamped into the work area of the monitor under the cursor; the tab leaves its tree (a detached window left empty closes).
+- [ ] Drag over another app window → that window draws drop targets (leaf centre = tab in, four edges = split, tab bar = insert; the main 3D tile: edges only) at the cursor; release on a target applies the move through the existing `Change`s; no target / Esc cancels. Main ↔ detached and detached ↔ detached.
+- [ ] D-16: a press the UI takes (widgets, resize grips, separators and their grab margins just outside the drawn edge) never moves the camera or starts a tool; a drag the UI holds never reaches the 3D view. Find why `consumed` misses these presses (egui-winit's `wants_pointer_input` is last frame's and excludes grab margins) and fix it at the source; test with a press in a separator's / grip's margin over the 3D view.
+- [ ] Display state only (D-13): nothing becomes an `Action`.
+- [ ] Tests (headless, monitors and window rects injected): release outside → one `Open` with the tab and the release rect; drop on a detached window's leaf centre / edge / tab bar moves the tab there; drop on the 3D tile's centre is refused, its edge splits; detached → main; last tab out closes the window; no float is ever created by a drag-release inside the window; D-16 margin press leaves the camera unchanged.
+- [ ] Hand-test checklist in the report (three monitors, mixed DPI if available).
+- [ ] Commit `feat(workspace): drag tabs between windows (out of the main window opens a new one)`.
+
 ### Task 10: D3 docs and final gate (Opus) — README (detaching, the Two monitors layout), dev-reference, DEVLOG entry, full `cargo test -p app --release`; commit `docs: detached windows (D3)`.
