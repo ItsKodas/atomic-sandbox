@@ -29,12 +29,12 @@ solve, a force, the surrogate or a sample.
 
 ## Goals
 
-1. **Every orbital row shows where it lives:** the largest share and its atom (e.g. `O₁ 92 %`);
+1. **Every orbital row shows where it lives:** the largest share and its atom (e.g. `O #0 92 %`);
    hover shows every atom with a share ≥ 1 %, largest first, and the Hirshfeld note.
 2. **The list is grouped by atom:** an orbital whose largest share is a clear majority
-   (s ≥ 0.55, see the calls below) is listed under that atom's heading (`O₁`, `H₂`, …, the same atom names the Selection
+   (s ≥ 0.55, see the calls below) is listed under that atom's heading (`O #0`, `H #1`, …, the same atom names the Selection
    panel uses). Orbitals with no majority go under a **shared** heading naming the atoms that carry
-   them (e.g. `shared · H₁–H₂`).
+   them (e.g. `shared · H #0–H #1`).
    Within a group, rows keep today's order (by energy) and today's ↑ / ↓ / ↑↓ channel structure
    and occupied / unoccupied split.
 3. **Selection lights up the selected atoms' orbitals:** with one or more atoms selected in the 3D
