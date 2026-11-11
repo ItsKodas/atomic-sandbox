@@ -231,6 +231,10 @@ pub struct AtomReference {
 #[derive(Clone, Debug, Default)]
 pub struct AtomReferences {
     entries: Vec<(ReferenceKey, AtomReference)>,
+    /// Bumped by every [`insert`](Self::insert) (a seeded energy included): a cheap "changed since"
+    /// for readers that cache what they derived from the entries (`crate::dynamics`, "Orbital share
+    /// tables").
+    generation: u64,
 }
 
 impl AtomReferences {
@@ -241,6 +245,7 @@ impl AtomReferences {
 
     /// Stores `r` under `key`, replacing an entry with the same key.
     pub fn insert(&mut self, key: ReferenceKey, r: AtomReference) {
+        self.generation += 1;
         match self.entries.iter_mut().find(|(k, _)| *k == key) {
             Some(entry) => entry.1 = r,
             None => self.entries.push((key, r)),
@@ -270,6 +275,11 @@ impl AtomReferences {
             }
         }
         out
+    }
+
+    /// The count of [`insert`](Self::insert)s so far: unchanged means the entries are unchanged.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Every entry, in insertion order.

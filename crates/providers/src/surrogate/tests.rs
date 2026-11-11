@@ -5576,7 +5576,7 @@ impl ForceProvider for Producer {
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
                 field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-                lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
             });
         }
         Ok(r)
@@ -5637,20 +5637,40 @@ fn the_auditor_teacher_polls_the_drivers_display_interrupt() {
 
 /// Orbital-atom-shares plan Task 2 (Review Focus 4): the share tables reach the background
 /// auditor's teacher with every job, and it weights them at the positions it solved — the job's,
-/// not the driver's scene. Two refreshes on a CPU auditor: the scene's H₂ (R = 1.4, centred 0.5
-/// Bohr off the origin: the box makes it lopsided), then a job at R = 1.6 centred at the origin.
-/// Each payload carries its own job's positions and Σ = 1 within 1e-9; the centred job's σ_g
-/// splits 0.5/0.5 within 1e-6 (weights at the scene's off-centre positions would not split it
-/// evenly).
+/// not another one's. Two refreshes on a CPU auditor, each checked against an independent cold
+/// `CpuKs` solve of the same scene with the same tables (fix round 1, I2 — the bounds are derived,
+/// not fitted to a run):
+/// - **First, H₂ at R = 1.6 centred at the origin.** It is the auditor's first solve, so it is
+///   cold, and the CPU solver is deterministic (a fixed pseudo-random start, single-threaded): its
+///   shares must equal the independent cold solve's **bit for bit**. Its σ_g must also split evenly
+///   within 1e-9. This bound is empirical, not derived: the pseudo-random start breaks the mirror
+///   symmetry at the SCF and eigensolver tolerances, and a cold solve of this kind measures
+///   |s₀ − s₁| ≤ 2e-10 (`ks::tests::cpu_payload_carries_shares`, and this test's output). Being
+///   deterministic, it moves only when the solver's code does. The bit-for-bit check is the exact one.
+/// - **Then the scene's H₂: R = 1.4, centred 0.5 Bohr off the origin** (the box makes it lopsided,
+///   0.505 / 0.495). The auditor warm-starts it from the first job (`discontinuity`), so it differs
+///   from the cold solve by SCF convergence only. The bound comes from the tolerance:
+///   - H₂ is a closed shell with one orbital per channel, so |ψ_σ|² = ρ_σ = ρ/2, and
+///     |s_A − s′_A| = |∫ w_A (ρ_σ − ρ′_σ)| ≤ ½ ‖ρ − ρ′‖₁ (0 ≤ w_A ≤ 1).
+///   - Each solve stopped at ∫|ρ_out − ρ_in| ≤ tol = 1e-6 within `max_iter` = 200 steps, from
+///     ∫|ρ_out − ρ_in| ≤ 2N = 4. Read as a geometric contraction, that is q ≤ (tol/4)^(1/200) =
+///     0.927 per step. Each output then lies within q/(1 − q)·tol ≤ 13 tol of the fixed point, so
+///     |Δs| ≤ ½ · 2 · 13 tol = 1.3e-5.
+///   - The assertion is at 1e-4: 8× headroom over that estimate, because DIIS is not a uniform
+///     contraction. That is still 50× below the 0.005 a split at the other job's (centred)
+///     positions would be off by.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn side_solve_shares_use_the_job_geometry() {
     use crate::ks::CpuKs;
     use sim::{OrbitalRequest, OrbitalViewRequest, RadialDensity, ShareTables};
-    let mut s = SurrogateKs::new(Box::new(CpuKs::new(1e-6)), FallbackPolicy::default()).with_auditor(Box::new(CpuKs::new(1e-6)));
-    s.set_orbital_view(OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+    let tol = 1e-6;
+    let view = OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) };
     let t = Arc::new(RadialDensity::from_fn(|r: f64| (-2.0 * r).exp() / std::f64::consts::PI, 12.0, 0.05));
-    s.set_share_tables(Some(Arc::new(ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] })));
+    let tables = Arc::new(ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] });
+    let mut s = SurrogateKs::new(Box::new(CpuKs::new(tol)), FallbackPolicy::default()).with_auditor(Box::new(CpuKs::new(tol)));
+    s.set_orbital_view(view.clone());
+    s.set_share_tables(Some(tables.clone()));
     let refresh = |s: &mut SurrogateKs, sc: &Scene| -> sim::OrbitalDisplay {
         assert!(s.request_display(sc));
         let t0 = std::time::Instant::now();
@@ -5662,20 +5682,36 @@ fn side_solve_shares_use_the_job_geometry() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     };
-    let scene_now = dimer(1.4, [1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 1, 1);
+    // the same scene solved cold on an independent CpuKs with the same view and tables
+    let cold = |sc: &Scene| -> sim::OrbitalDisplay {
+        let mut c = CpuKs::new(tol);
+        c.set_orbital_view(view.clone());
+        c.set_share_tables(Some(tables.clone()));
+        c.evaluate(sc, &mut || false).expect("the cold solve").orbitals.expect("its payload")
+    };
+    let shares = |o: &sim::OrbitalDisplay| -> Vec<(sim::Spin, Vec<f64>)> {
+        o.rows.iter().map(|r| (r.spin, r.shares.clone().expect("shares on every row"))).collect()
+    };
     let job = h2(1.6);
-    for sc in [&scene_now, &job] {
+    let scene_now = dimer(1.4, [1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 1, 1);
+    for (k, sc) in [&job, &scene_now].into_iter().enumerate() {
         let o = refresh(&mut s, sc);
         let want: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         assert_eq!(o.positions, want, "the payload is the job's geometry");
-        assert!(!o.rows.is_empty());
-        for r in &o.rows {
-            let sh = r.shares.as_ref().expect("shares from the auditor's teacher");
+        assert_eq!(o.share_z, Some(vec![1, 1]));
+        let (side, reference) = (shares(&o), shares(&cold(sc)));
+        assert_eq!(side.len(), reference.len());
+        for ((spin, sh), (rspin, rsh)) in side.iter().zip(&reference) {
+            assert_eq!(spin, rspin);
             let sum = sim::share_sum(sh);
-            println!("job at {:?}: {} {:?} shares {sh:?}, Σ − 1 = {:+.2e}", want, r.label, r.spin, sum - 1.0);
+            let dev = sh.iter().zip(rsh).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            println!("job {k} at {want:?}: {spin:?} shares {sh:?}, Σ − 1 = {:+.2e}, s₀ − s₁ = {:+.2e}, |side − cold| = {dev:.2e}", sum - 1.0, sh[0] - sh[1]);
             assert!((sum - 1.0).abs() <= 1e-9, "Σ = {sum}");
-            if std::ptr::eq(sc, &job) {
-                assert!((sh[0] - sh[1]).abs() <= 1e-6, "symmetric about the job's own centre: {sh:?}");
+            if k == 0 {
+                assert_eq!(sh, rsh, "a cold, deterministic solve: bit for bit the independent one's");
+                assert!((sh[0] - sh[1]).abs() <= 1e-9, "symmetric about the job's own centre: {sh:?}");
+            } else {
+                assert!(dev <= 1e-4, "within the SCF-tolerance bound of the cold solve: {sh:?} vs {rsh:?}");
             }
         }
     }

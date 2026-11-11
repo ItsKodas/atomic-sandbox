@@ -376,6 +376,10 @@ impl std::fmt::Debug for OrbitalField {
 /// draw — `notes` says why), the spin readout, the unoccupied state, and notes for the tab. `what`
 /// is the request this payload answers *as resolved* — the orbital actually shown after a
 /// selection fallback, the tracks actually included — and `lone_atom` the labelling verdict.
+/// `share_z` is the species list the rows' `OrbitalInfo::shares` index (the evaluated nuclei's Z
+/// in scene order, the free-atom tables' `ShareTables::z`), set together with the shares and
+/// `None` when no row has any: a consumer names the atoms from it and refuses shares whose
+/// species are not the scene's it shows them on (a side job's payload can outlive an edit).
 #[derive(Clone, Debug)]
 pub struct OrbitalDisplay {
     pub cell: Cell,
@@ -388,6 +392,7 @@ pub struct OrbitalDisplay {
     pub notes: Vec<String>,
     pub what: OrbitalRequest,
     pub lone_atom: LoneAtomLabels,
+    pub share_z: Option<Vec<u8>>,
 }
 
 /// The converged total density ρ↑ + ρ↓ (e/Bohr³) on the evaluation's grid, for display only.
@@ -850,7 +855,7 @@ pub trait ForceProvider: Send {
     }
     /// The free-atom tables the orbital shares are weighted by ([`ShareTables`]; orbital-atom-
     /// shares spec), or `None` (a reference still missing, the scene's species changed). The
-    /// driver sends them whenever they change (`crate::dynamics`, "Bonds and references"); the
+    /// driver sends them whenever they change (`crate::dynamics`, "Orbital share tables"); the
     /// producer computes shares only for a payload whose evaluated species equal `z`, at that
     /// payload's own positions (never a scene edited since). Display only: they reach no solve,
     /// force or sample. No-op by default: a provider without orbitals (a surrogate forwards them

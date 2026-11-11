@@ -2361,6 +2361,7 @@ mod orbital_viewer {
             notes: Vec::new(),
             what,
             lone_atom: LoneAtomLabels::NotLoneAtom,
+            share_z: None,
         }
     }
 

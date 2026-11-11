@@ -75,8 +75,9 @@
 //!   were computed with).
 //! - **The check** ([`settle_shares`]): every row with shares must have |Σ_A s − 1| ≤
 //!   `sim::charges::SUM_TOL`; if any misses, no row of the payload carries shares and the
-//!   payload says so once ("orbital shares off: Σ = …"). Then every member of a degenerate set
-//!   gets the set's mean (`sim::charges::set_average`).
+//!   payload says so once ("orbital shares off: Σ = … outside 1 ± 1e-3": the check knows the sum,
+//!   not its cause). Then every member of a degenerate set gets the set's mean
+//!   (`sim::charges::set_average`), and the payload's `share_z` names the species the shares index.
 //!
 //! The CPU producer computes the numbers from [`CpuView::shown`]'s f64 ψ̃ in one pass over the
 //! nodes ([`attach_shares`], `sim::charges::orbital_shares_many`); the GPU producer brings its own
@@ -604,6 +605,7 @@ impl ViewState {
             notes,
             what: pick.what,
             lone_atom: lone_atom_out(out.lone_atom),
+            share_z: None,
         }
     }
 
@@ -623,6 +625,7 @@ impl ViewState {
             notes: vec![note],
             what: self.req.what.clone(),
             lone_atom: LoneAtomLabels::NotLoneAtom,
+            share_z: None,
         }
     }
 }
@@ -649,14 +652,19 @@ pub fn share_eligible(display: &OrbitalDisplay, k: usize) -> bool {
 }
 
 /// The shares' own check and the set average onto the payload's rows (module doc, "Orbital
-/// shares"): `raw[k]` is `display.rows[k]`'s shares per nucleus (`None`: not computed). A row that
-/// is not [`share_eligible`] gets none whatever `raw` says; if any other row's Σ_A s misses 1 by
-/// more than `SUM_TOL` (or is not finite), no row gets shares and one note says so. The GPU
-/// producer brings its own `raw` here.
-pub fn settle_shares(display: &mut OrbitalDisplay, mut raw: Vec<Option<Vec<f64>>>) {
+/// shares"): `raw[k]` is `display.rows[k]`'s shares per nucleus of the species list `z` (`None`:
+/// not computed). A row that is not [`share_eligible`] gets none whatever `raw` says; if any other
+/// row's Σ_A s misses 1 by more than `SUM_TOL` (or is not finite), no row gets shares and one note
+/// says so. `display.share_z` is `z` when some row ends with shares, else `None`. The GPU producer
+/// brings its own `raw` here.
+pub fn settle_shares(display: &mut OrbitalDisplay, z: &[u8], mut raw: Vec<Option<Vec<f64>>>) {
     assert_eq!(raw.len(), display.rows.len(), "settle_shares: {} share lists for {} rows", raw.len(), display.rows.len());
     let atoms = display.positions.len();
+    display.share_z = None;
     for (k, s) in raw.iter_mut().enumerate() {
+        if z.len() != atoms {
+            *s = None;
+        }
         if !share_eligible(display, k) || s.as_ref().is_some_and(|s| s.len() != atoms) {
             *s = None;
         }
@@ -668,13 +676,15 @@ pub fn settle_shares(display: &mut OrbitalDisplay, mut raw: Vec<Option<Vec<f64>>
     });
     if let Some(sum) = worst.filter(|x| !((x - 1.0).abs() <= SUM_TOL)) {
         display.rows.iter_mut().for_each(|r| r.shares = None);
-        display.notes.push(format!("orbital shares off: Σ = {sum:.6} on a row (|Σ − 1| > {SUM_TOL:.0e}: not this solve's normalised orbitals) — no shares shown"));
+        display.notes.push(format!("orbital shares off: Σ = {sum:.6} outside 1 ± {SUM_TOL:.0e}"));
         return;
     }
     set_average(&display.rows, &mut raw);
+    let any = raw.iter().any(Option::is_some);
     for (r, s) in display.rows.iter_mut().zip(raw) {
         r.shares = s;
     }
+    display.share_z = any.then(|| z.to_vec());
 }
 
 /// The CPU producer's shares (module doc, "Orbital shares"): with `tables` fitting the evaluated
@@ -698,7 +708,7 @@ pub fn attach_shares<'p>(display: &mut OrbitalDisplay, tables: Option<&ShareTabl
             raw[k] = Some(s);
         }
     }
-    settle_shares(display, raw);
+    settle_shares(display, z, raw);
 }
 
 /// A display texture type of a [`Pool`].
@@ -964,6 +974,7 @@ mod tests {
             notes: Vec::new(),
             what: OrbitalRequest::List,
             lone_atom: LoneAtomLabels::NotLoneAtom,
+            share_z: None,
         }
     }
 
@@ -976,7 +987,7 @@ mod tests {
         let pair = Some((2, 1e-7));
         let mut d = two_atom_payload(vec![(None, false), (pair, false), (pair, false), (None, true)]);
         let raw = vec![Some(vec![0.5, 0.5 + 4e-4]), Some(vec![0.9, 0.1]), Some(vec![0.2, 0.8]), Some(vec![0.3, 0.7])];
-        settle_shares(&mut d, raw.clone());
+        settle_shares(&mut d, &[1, 1], raw.clone());
         let got: Vec<Option<Vec<f64>>> = d.rows.iter().map(|r| r.shares.clone()).collect();
         assert_eq!(got[0], raw[0], "within SUM_TOL: kept as computed");
         for k in [1, 2] {
@@ -985,19 +996,24 @@ mod tests {
         }
         assert_eq!(got[3], None, "a box state gets no share");
         assert!(d.notes.is_empty(), "{:?}", d.notes);
+        assert_eq!(d.share_z, Some(vec![1, 1]), "the species the shares index");
         // one row's Σ off by 2e-3 (or NaN): no shares anywhere, one note
         for bad in [vec![0.5, 0.502], vec![f64::NAN, 0.5]] {
             let mut d = two_atom_payload(vec![(None, false), (None, false), (None, false)]);
-            settle_shares(&mut d, vec![Some(vec![0.5, 0.5]), Some(bad.clone()), Some(vec![0.6, 0.4 + 2.5e-3])]);
-            assert!(d.rows.iter().all(|r| r.shares.is_none()), "{bad:?}");
+            settle_shares(&mut d, &[1, 1], vec![Some(vec![0.5, 0.5]), Some(bad.clone()), Some(vec![0.6, 0.4 + 2.5e-3])]);
+            assert!(d.rows.iter().all(|r| r.shares.is_none()) && d.share_z.is_none(), "{bad:?}");
             assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
             println!("{}", d.notes[0]);
             assert!(d.notes[0].starts_with("orbital shares off: Σ = "), "{:?}", d.notes);
         }
         // the worst row is named: 1.0025 rather than 1.002
         let mut d = two_atom_payload(vec![(None, false), (None, false)]);
-        settle_shares(&mut d, vec![Some(vec![0.5, 0.502]), Some(vec![0.6, 0.4025])]);
-        assert!(d.notes[0].contains("1.002500"), "{:?}", d.notes);
+        settle_shares(&mut d, &[1, 1], vec![Some(vec![0.5, 0.502]), Some(vec![0.6, 0.4025])]);
+        assert_eq!(d.notes, vec!["orbital shares off: Σ = 1.002500 outside 1 ± 1e-3".to_string()]);
+        // nothing computed (every row a box state): no shares, no species list
+        let mut d = two_atom_payload(vec![(None, true)]);
+        settle_shares(&mut d, &[1, 1], vec![Some(vec![0.5, 0.5])]);
+        assert!(d.rows[0].shares.is_none() && d.share_z.is_none() && d.notes.is_empty());
     }
 
     /// Tables for another species list (a scene edited since they were sent) or for a nucleus
@@ -1010,11 +1026,12 @@ mod tests {
             let mut d = two_atom_payload(vec![(None, false)]);
             let st = ShareTables { tables, z: z.clone() };
             attach_shares(&mut d, Some(&st), &[1, 1], |_, _| Some(psi.as_slice()));
-            assert!(d.rows[0].shares.is_none() && d.notes.is_empty(), "tables for {z:?}");
+            assert!(d.rows[0].shares.is_none() && d.share_z.is_none() && d.notes.is_empty(), "tables for {z:?}");
         }
         let mut d = two_atom_payload(vec![(None, false)]);
         attach_shares(&mut d, Some(&ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] }), &[1, 1], |_, _| Some(psi.as_slice()));
         let s = d.rows[0].shares.clone().expect("fitting tables: shares");
+        assert_eq!(d.share_z, Some(vec![1, 1]));
         assert!((s[0] + s[1] - 1.0).abs() < 1e-12 && (s[0] - s[1]).abs() < 1e-12, "a uniform ψ between mirror atoms: {s:?}");
     }
 

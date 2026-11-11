@@ -2778,7 +2778,7 @@ impl ForceProvider for Viewing {
         Some(sim::OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [-4.0; 3], positions: Vec::new(), rows: vec![row], field: None,
             spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-            lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
         })
     }
 }
@@ -2876,7 +2876,7 @@ fn an_interrupted_estimated_refresh_is_re_requested_once_when_idle() {
         unoccupied: Some(UnoccupiedStatus { requested: 4, interrupted, ..Default::default() }),
         notes: Vec::new(),
         what: OrbitalRequest::List,
-        lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+        lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
     };
     let mut snap = DynSnapshot::default();
     snap.paused = true;

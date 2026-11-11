@@ -2800,6 +2800,56 @@ mod tests {
         }
     }
 
+    /// Fix round 1 (M3): `share_eligible` through `CpuKs` with unoccupied rows. H₂⁺ (49³, R = 2.0;
+    /// a cation's potential keeps bound virtuals, unlike LSDA H₂'s box states). The rows are checked
+    /// in two states:
+    /// - **Paused** (forced: the eigensolve runs, the rows are current): every non-box row,
+    ///   occupied and unoccupied, carries shares with Σ = 1, and a box state carries none.
+    /// - **In play, after a move** (the eigensolve's play budget keeps the held vectors: stamped
+    ///   not current): the unoccupied rows carry none, the occupied rows keep theirs.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn cpu_unoccupied_rows_get_shares_only_when_current() {
+        let mut c = CpuKs::new(1e-6);
+        c.set_orbital_view(with_unoccupied(OrbitalRequest::List, 2, true));
+        c.set_share_tables(Some(h_like_tables(&[1, 1])));
+        let mut s = h2(49, 2.0);
+        s.charge = 1;
+        let o = c.evaluate(&s, &mut never()).expect("CpuKs").orbitals.expect("a payload");
+        let u = o.unoccupied.clone().expect("m = 2 asked for");
+        assert!(u.current, "paused: the eigensolve ran at this geometry");
+        let mut unocc_with_shares = 0;
+        for r in &o.rows {
+            println!("current: {} {:?} ε {:+.4} occ {} box {} shares {:?}", r.label, r.spin, r.energy, r.occupation, r.box_state, r.shares);
+            if r.box_state {
+                assert!(r.shares.is_none(), "a box state gets no share");
+            } else {
+                let sh = r.shares.as_ref().expect("a current row's shares");
+                assert!((sim::share_sum(sh) - 1.0).abs() <= 1e-9, "{sh:?}");
+                if r.residual.is_some() {
+                    unocc_with_shares += 1;
+                }
+            }
+        }
+        assert!(unocc_with_shares > 0, "the test needs a bound (non-box) unoccupied row");
+        assert_eq!(o.share_z, Some(vec![1, 1]));
+        // play: a moved geometry, the held unoccupied vectors stamped not current
+        c.set_orbital_view(with_unoccupied(OrbitalRequest::List, 2, false));
+        s.nuclei[0].pos[0] += 0.02;
+        c.evaluate(&s, &mut never()).expect("a play step");
+        let o = c.orbital_display_now(&mut || false).expect("a re-display");
+        let u = o.unoccupied.clone().expect("m = 2");
+        assert!(!u.current, "the play budget kept the earlier geometry's vectors: {u:?}");
+        for r in &o.rows {
+            println!("stale: {} {:?} occ {} residual {:?} shares {:?}", r.label, r.spin, r.occupation, r.residual, r.shares);
+            if r.residual.is_some() {
+                assert!(r.shares.is_none(), "an unoccupied row of an earlier geometry gets no share");
+            } else {
+                assert!(r.shares.as_ref().is_some_and(|sh| (sim::share_sum(sh) - 1.0).abs() <= 1e-9), "an occupied row keeps its shares");
+            }
+        }
+    }
+
     // ---- pseudopotentials (M7 Task 9) ----
 
     /// A lone O at the origin (triplet) in a cell of 6 Bohr half-width at spacing h.

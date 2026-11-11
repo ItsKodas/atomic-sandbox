@@ -444,9 +444,20 @@
 //! `sync_share_tables` compares what the scene needs with what was last sent and sends only a
 //! change: at the start of every tick (after the commands, so an edit's re-evaluation and any
 //! `orbital_display_now` see the edited scene's tables), after every edit (`after_edit`), and when
-//! a reference lands (`poll_references`, before the density refresh it may run). The provider
+//! a reference lands (`poll_references`, before the density refresh it may run). It first compares
+//! its inputs — the scene's species, cell, σ and ionic policy and the cache's
+//! `AtomReferences::generation` — with the last call's and returns when they are unchanged, so an
+//! idle tick builds no key and never asks `ionic_tag` (whose pseudopotential cache lock a
+//! generation holds for minutes: a display path must not wait on it). The provider
 //! still checks the species of each payload against the tables' `z`, so a payload of a scene edited
 //! between the two (Review Focus 1) carries no shares rather than shares indexed to the wrong atoms.
+//! A provider starts with none, so nothing is sent until the first tables exist; after that every
+//! change is sent, `None` included. **Paused** (fix round 1, I1), the payload already shown was
+//! made before the tables came — the default session's first one, before its references are
+//! solved — and no evaluation follows; so when new tables are sent while paused with fresh forces and the shown payload is the stepping
+//! provider's own at the current positions, the driver re-reads it once (`orbital_display_now`,
+//! no SCF solve) and the shares appear. A side job's payload (estimated mode) waits for the next
+//! refresh, whose job carries the tables.
 //! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
 //! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
 //! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
@@ -1120,9 +1131,12 @@ pub struct Dynamics {
     /// charges"; the nodes rebuilt on a grid change).
     charges: Option<Arc<PartialCharges>>,
     charge_nodes: Option<(Cell, Arc<Vec<[f64; 3]>>)>,
-    /// The orbital share tables last sent to the provider (module doc, "Orbital share tables"):
-    /// `None` before the first sync, `Some(None)` when it was told there are none.
-    share_tables: Option<Option<Arc<ShareTables>>>,
+    /// The orbital share tables the provider holds (module doc, "Orbital share tables"): `None`
+    /// as every provider starts, else the last ones sent.
+    share_tables: Option<Arc<ShareTables>>,
+    /// The inputs of the last `sync_share_tables`: species, cell, σ, ionic policy and the
+    /// references' generation (unchanged: nothing to rebuild).
+    share_inputs: Option<(Vec<u8>, Cell, Option<f64>, crate::scene::IonicPolicy, u64)>,
     /// The provider's teaching events since the worker's last drain, stamped with their step
     /// (`crate::activity::TeachBuffer`, plan review M6).
     teach: crate::activity::TeachBuffer,
@@ -1213,6 +1227,7 @@ impl Dynamics {
             charges: None,
             charge_nodes: None,
             share_tables: None,
+            share_inputs: None,
             teach: Default::default(),
         };
         d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
@@ -2892,6 +2907,11 @@ impl Dynamics {
     /// charges' key, or `None` when a nucleus has no tabled reference (or the scene is empty).
     fn sync_share_tables(&mut self) {
         let z: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
+        let inputs = (z.clone(), self.scene.cell.clone(), self.scene.sigma, self.scene.ionic, self.refs.generation());
+        if self.share_inputs.as_ref() == Some(&inputs) {
+            return;
+        }
+        self.share_inputs = Some(inputs);
         let want: Option<Vec<&RadialDensity>> = if z.is_empty() {
             None
         } else {
@@ -2901,8 +2921,8 @@ impl Dynamics {
             z.iter().map(|&zz| self.refs.get(&ReferenceKey::new(cell, sigma, tol, name, zz, &ionic)).filter(|r| !r.radial.is_empty()).map(|r| &r.radial)).collect()
         };
         let unchanged = match (&self.share_tables, &want) {
-            (Some(None), None) => true,
-            (Some(Some(held)), Some(t)) => held.z == z && held.tables.len() == t.len() && held.tables.iter().zip(t).all(|(a, b)| **a == **b),
+            (None, None) => true,
+            (Some(held), Some(t)) => held.z == z && held.tables.len() == t.len() && held.tables.iter().zip(t).all(|(a, b)| **a == **b),
             _ => false,
         };
         if unchanged {
@@ -2925,8 +2945,38 @@ impl Dynamics {
             }).collect();
             Arc::new(ShareTables { tables, z })
         });
+        let gained = sent.is_some();
         self.provider.set_share_tables(sent.clone());
-        self.share_tables = Some(sent);
+        self.share_tables = sent;
+        if gained {
+            self.reread_orbitals_for_shares();
+        }
+    }
+
+    /// New share tables while paused (module doc, "Orbital share tables", I1): the payload shown is
+    /// the stepping provider's own at the current positions, made before them, and no evaluation
+    /// follows — re-read it once (`orbital_display_now`, no SCF solve) so its rows carry the shares.
+    /// Not while stepping, relaxing or sampling (their next payload comes with them), with stale
+    /// forces (the re-evaluation's payload does), for a side job's payload (its next refresh), or
+    /// while the display interrupt is raised (a command is waiting: the re-read would yield, and
+    /// the payload that command brings carries the tables).
+    fn reread_orbitals_for_shares(&mut self) {
+        if !self.paused || self.pending_steps > 0 || self.fire.is_some() || self.forces.is_none() || self.scene.nuclei.is_empty() {
+            return;
+        }
+        if self.display_interrupt.as_ref().is_some_and(|f| f()) {
+            return;
+        }
+        if self.orbital_view.what.is_off() || self.orbitals_side.is_some() || self.pass_active() {
+            return;
+        }
+        let here: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        if !self.orbitals.as_ref().is_some_and(|o| o.positions == here) {
+            return;
+        }
+        if let Some(o) = self.display_now() {
+            self.set_orbitals(o, self.sim_time, None);
+        }
     }
 
     /// The detector after an evaluation (module doc): the graph at the current positions, or

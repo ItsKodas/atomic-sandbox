@@ -2895,7 +2895,7 @@ mod tests {
         use sim::{OrbitalDisplay, OrbitalRequest, Spin};
         let payload = |what| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows: Vec::new(), field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
         };
         let empty = sim::BondGraph { bonds: Vec::new(), components: Vec::new(), step: 0, sim_time: 0.0, n_nuclei: 0 };
         let mut v = Viewer::new("h2").unwrap();
@@ -3809,7 +3809,7 @@ nucleus 1 {a} {} {}
         };
         let payload = |what, rows| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
         };
         let mut v = pinned("h2");
         let mut d = sim::DynSnapshot::default();
