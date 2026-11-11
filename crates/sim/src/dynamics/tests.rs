@@ -2888,6 +2888,74 @@ fn partial_charges_follow_the_graph_and_side_densities() {
     assert!(d.snapshot().charges.is_none());
 }
 
+/// Records every `set_share_tables` the driver sends to the wrapped provider (the orbital share
+/// tables, module doc "Orbital share tables").
+struct ShareRecorder {
+    inner: crate::test_providers::Gaussians,
+    sent: Arc<std::sync::Mutex<Vec<Option<Arc<crate::provider::ShareTables>>>>>,
+}
+
+impl ForceProvider for ShareRecorder {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.inner.evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "share recorder"
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+    fn set_share_tables(&mut self, tables: Option<Arc<crate::provider::ShareTables>>) {
+        self.sent.lock().unwrap().push(tables);
+    }
+}
+
+/// Orbital-atom-shares Task 2: the driver sends the share tables as data — `None` before the
+/// references exist, `Some` with the scene's Z list (one table per nucleus, one `Arc` per
+/// species) once they do, `None` again right after an edit adds a species without a reference,
+/// `Some` for the new Z list once it lands; nothing is resent while nothing changes.
+#[test]
+fn dynamics_sends_tables_when_references_exist() {
+    use crate::test_providers::Gaussians;
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let p = ShareRecorder { inner: Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), sent: sent.clone() };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let last = |sent: &Arc<std::sync::Mutex<Vec<Option<Arc<crate::provider::ShareTables>>>>>| sent.lock().unwrap().last().cloned();
+    assert_eq!(d.snapshot().bonds_pending, vec![1], "the H reference is queued");
+    d.tick(f64::INFINITY, &mut never());
+    assert_eq!(last(&sent), Some(None), "before the references: None");
+    settle_references(&mut d);
+    let t = last(&sent).flatten().expect("Some once the H reference landed");
+    assert_eq!(t.z, vec![1, 1]);
+    assert_eq!(t.tables.len(), 2);
+    assert!(Arc::ptr_eq(&t.tables[0], &t.tables[1]), "one table per species");
+    let h_table = d.references().iter().find(|(k, _)| k.z == 1).map(|(_, r)| r.radial.clone()).expect("the H entry");
+    assert_eq!(*t.tables[0], h_table, "the charges' reference table");
+    let calls = sent.lock().unwrap().len();
+    d.tick(f64::INFINITY, &mut never());
+    step_n(&mut d, 2);
+    assert_eq!(sent.lock().unwrap().len(), calls, "nothing changed: nothing resent");
+    // an O added (a species without a reference): None at once, before the re-evaluation
+    d.apply(DynCommand::AddNucleus(Nucleus::new(8, [0.0, 2.0, 0.0])));
+    assert_eq!(last(&sent), Some(None), "the edit: None until O's reference exists");
+    assert_eq!(d.snapshot().bonds_pending, vec![8]);
+    settle_references(&mut d);
+    let t = last(&sent).flatten().expect("Some once the O reference landed");
+    assert_eq!(t.z, vec![1, 1, 8]);
+    assert!(Arc::ptr_eq(&t.tables[0], &t.tables[1]) && !Arc::ptr_eq(&t.tables[0], &t.tables[2]));
+    // a removed H: the same species' tables for the new Z list
+    d.apply(DynCommand::RemoveNucleus(0));
+    let t = last(&sent).flatten().expect("both references exist");
+    assert_eq!(t.z, vec![1, 8]);
+}
+
 /// M8a Task 10 (ruling P10): a capped segment's training mask rides with the scene through moves
 /// and steps (the same nuclei) and is dropped when a nucleus is added or removed (the segment it
 /// described is gone).

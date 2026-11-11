@@ -368,7 +368,11 @@ pub fn hirshfeld(free: &[&RadialDensity], pos: &[[f64; 3]], counted: &[f64], cel
 /// The orbital's shares (module doc, "Orbital shares"): s_A = h³ Σ_nodes w_A(r_n) |ψ(r_n)|² per
 /// nucleus of `w`, for ψ at `cell`'s n³ nodes in `qm::Grid` order (as [`hirshfeld`]), compensated.
 /// **Not renormalised**: Σ_A s_A = h³ Σ |ψ|², which is 1 for the solver's normalised orbitals —
-/// the caller checks it against [`SUM_TOL`] (a wrong or mis-scaled ψ shows there).
+/// the caller checks it against [`SUM_TOL`] (a wrong or mis-scaled ψ shows there). Callers leave
+/// out `OrbitalInfo::box_state` rows (spec, "Box states and stale rows get no share"): a state of
+/// the box is normalised too, so the Σ check passes it, but how its far tails split between the
+/// atoms is the Dirichlet box's artefact, not the molecule's. Several orbitals of one geometry:
+/// [`orbital_shares_many`] (the weights once per node).
 pub fn orbital_shares(w: &Weights, cell: &Cell, psi: &[f64]) -> Vec<f64> {
     let n = cell.n;
     assert_eq!(psi.len(), n * n * n, "orbital_shares: {} values for {n}³ nodes", psi.len());
@@ -381,12 +385,76 @@ pub fn orbital_shares(w: &Weights, cell: &Cell, psi: &[f64]) -> Vec<f64> {
     w.partition(cell, &p).0.into_iter().map(|s| h3 * s).collect()
 }
 
+/// [`orbital_shares`] of every ψ in `psis` (each n³ values in `qm::Grid` order), the free-atom
+/// densities ρ_A⁰(r_n) and their sum read once per node and applied to every ψ — one pass over
+/// the nodes instead of one per orbital (an 81³ grid with 3 atoms: ≈ 9 ms per [`orbital_shares`]
+/// call; 95³ with 21 atoms ≈ 80 ms). Each ψ's result is **bit-identical** to
+/// `orbital_shares(w, cell, psi)`: the same products in the same order into its own compensated
+/// sums (a node is skipped for that ψ alone where its |ψ|² = 0, the underflow rule's node goes
+/// whole to the nearest nucleus as there).
+pub fn orbital_shares_many(w: &Weights, cell: &Cell, psis: &[&[f64]]) -> Vec<Vec<f64>> {
+    let n = cell.n;
+    for psi in psis {
+        assert_eq!(psi.len(), n * n * n, "orbital_shares_many: {} values for {n}³ nodes", psi.len());
+    }
+    let atoms = w.atoms();
+    if atoms == 0 {
+        return vec![Vec::new(); psis.len()];
+    }
+    let (h, half) = (cell.h, cell.half_extent());
+    let coord = |i: usize| -half + i as f64 * h;
+    // own[k * atoms + a]: ψ_k's sum on nucleus a
+    let mut own = vec![Acc::default(); psis.len() * atoms];
+    let mut rho0 = vec![0.0f64; atoms];
+    for kz in 0..n {
+        let z = coord(kz);
+        for jy in 0..n {
+            let y = coord(jy);
+            let row = n * (jy + n * kz);
+            for ix in 0..n {
+                let node = row + ix;
+                // the weights only where some ψ is non-zero (none of its sums changes otherwise)
+                if psis.iter().all(|p| p[node] == 0.0) {
+                    continue;
+                }
+                let raw = w.raw([coord(ix), y, z], &mut rho0);
+                for (k, psi) in psis.iter().enumerate() {
+                    let v = psi[node] * psi[node];
+                    if v == 0.0 {
+                        continue;
+                    }
+                    let acc = &mut own[k * atoms..(k + 1) * atoms];
+                    match raw {
+                        Ok(sum) => {
+                            let s = v / sum;
+                            for a in 0..atoms {
+                                acc[a].add(rho0[a] * s);
+                            }
+                        }
+                        Err(nearest) => acc[nearest].add(v),
+                    }
+                }
+            }
+        }
+    }
+    let h3 = h * h * h;
+    own.chunks(atoms).map(|acc| acc.iter().map(|s| h3 * s.value()).collect()).collect()
+}
+
+/// Σ_A s_A of one row's shares (compensated): the check against 1 ± [`SUM_TOL`] (module doc,
+/// "Orbital shares").
+pub fn share_sum(shares: &[f64]) -> f64 {
+    neumaier(shares.iter().copied())
+}
+
 /// Every member of a degenerate set gets the set's mean share (module doc, "Orbital shares"):
 /// within each channel, rows by index; a row with `cluster == Some((d, _))` starts a set of the d
 /// rows with consecutive indices from it (`qm::orbitals` shows whole sets only, and a set's members
-/// are consecutive rows of one channel). `shares[k]` belongs to `rows[k]`. A set whose members
-/// are not all present with shares of one length gets `None` for every member present: a part of
-/// a set has no rotation-invariant answer. Rows of their own are untouched.
+/// are consecutive rows of one channel) and the same `eps_range` (`qm::orbitals` writes one range
+/// per set: without it, a missing row would let two adjacent sets of the same d merge). `shares[k]`
+/// belongs to `rows[k]`. A set whose members are not all present with shares of one length gets
+/// `None` for every member present: a part of a set has no rotation-invariant answer. Rows of
+/// their own are untouched.
 pub fn set_average(rows: &[OrbitalInfo], shares: &mut [Option<Vec<f64>>]) {
     assert_eq!(rows.len(), shares.len(), "set_average: {} share lists for {} rows", shares.len(), rows.len());
     for spin in [Spin::Up, Spin::Down] {
@@ -402,12 +470,13 @@ pub fn set_average(rows: &[OrbitalInfo], shares: &mut [Option<Vec<f64>>]) {
                     continue;
                 }
             };
-            // the members present: consecutive indices from `first`, the same set size
+            // the members present: consecutive indices from `first`, the same set size and range
             let mut members = vec![order[i]];
             while members.len() < d
                 && i + members.len() < order.len()
                 && rows[order[i + members.len()]].index == first.index + members.len()
                 && rows[order[i + members.len()]].cluster.is_some_and(|(e, _)| e == d)
+                && rows[order[i + members.len()]].eps_range == first.eps_range
             {
                 members.push(order[i + members.len()]);
             }
@@ -795,6 +864,94 @@ mod tests {
             assert!(close(&shares[k], [0.0, 0.25, 0.75]), "the second ↓ pair: {:?}", shares[k]);
         }
         assert!(shares[11].is_none() && shares[12].is_none(), "a set missing a member's shares has none: {:?}", &shares[11..]);
+    }
+
+    /// Task 1 review Minor 1: two adjacent ↑ sets of the same size, {3, 4, 5} and {6, 7, 8} (d = 3,
+    /// each with its own `eps_range`, as `qm::orbitals` writes them), with row 4 missing: rows 3
+    /// and 5 are an incomplete set and get none — row 5 must not borrow 6 and 7 as its members —
+    /// and {6, 7, 8} is averaged on its own.
+    #[test]
+    fn a_missing_row_does_not_merge_adjacent_sets() {
+        let t = Some((3, 1e-6));
+        let in_set = |index: usize, eps: (f64, f64)| OrbitalInfo { eps_range: eps, ..row(Spin::Up, index, t) };
+        let (lo, hi) = ((-0.6, -0.6 + 1e-7), (-0.4, -0.4 + 1e-7));
+        let rows = vec![in_set(3, lo), in_set(5, lo), in_set(6, hi), in_set(7, hi), in_set(8, hi)];
+        let v = |a: f64, b: f64, c: f64| Some(vec![a, b, c]);
+        let mut shares = vec![v(0.9, 0.05, 0.05), v(0.05, 0.05, 0.9), v(0.6, 0.3, 0.1), v(0.3, 0.6, 0.1), v(0.0, 0.0, 1.0)];
+        set_average(&rows, &mut shares);
+        assert!(shares[0].is_none() && shares[1].is_none(), "the set with row 4 missing has none: {shares:?}");
+        for k in 2..5 {
+            let s = shares[k].as_ref().expect("the whole set is averaged");
+            for (a, want) in s.iter().zip([0.3, 0.3, 0.4]) {
+                assert!((a - want).abs() <= 1e-15, "{k}: {s:?}");
+            }
+        }
+    }
+
+    /// The many-ψ pass gives every ψ exactly (bit for bit) what [`orbital_shares`] gives it alone:
+    /// on full and on cut tables (the underflow rule at the corners), for ψ with exact zeros (a
+    /// zeroed slab; one ψ zero everywhere) and ψ that are zero where another is not.
+    #[test]
+    fn orbital_shares_many_is_bit_identical_to_one_at_a_time() {
+        let cell = Cell { n: 33, h: 0.3 };
+        let (h_t, cut, he_t) = (table(h_like, false), table(h_like, true), table(he_like, true));
+        let pos = [[-0.7, 0.0, 0.0], [0.7, 0.1, 0.0], [0.0, 1.2, -0.4]];
+        let slater = |r: f64| (-r).exp();
+        let slater_15 = |r: f64| (-1.5 * r).exp();
+        let p_like = |r: f64| r * (-0.8 * r).exp();
+        let a = normalised(&cell, on_nodes(&cell, &[(1.0, pos[0], &slater), (0.3, pos[1], &slater_15)]));
+        let b = normalised(&cell, on_nodes(&cell, &[(1.0, pos[0], &slater), (-1.0, pos[1], &slater)]));
+        let mut c = normalised(&cell, on_nodes(&cell, &[(1.0, pos[2], &p_like)]));
+        let half = cell.half_extent();
+        for (k, x) in c.iter_mut().enumerate() {
+            if -half + (k % cell.n) as f64 * cell.h > 1.0 {
+                *x = 0.0;
+            }
+        }
+        let zero = vec![0.0; a.len()];
+        let psis: Vec<&[f64]> = vec![&a, &zero, &b, &c];
+        for tables in [[&h_t, &h_t, &he_t], [&cut, &cut, &cut]] {
+            let w = Weights::new(&tables, &pos, &cell);
+            let many = orbital_shares_many(&w, &cell, &psis);
+            assert_eq!(many.len(), psis.len());
+            for (k, psi) in psis.iter().enumerate() {
+                let one = orbital_shares(&w, &cell, psi);
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+                assert_eq!(bits(&many[k]), bits(&one), "ψ {k}: {:?} vs {one:?}", many[k]);
+            }
+            assert!(many[1].iter().all(|&s| s == 0.0), "a zero ψ has no share: {:?}", many[1]);
+        }
+        assert!(orbital_shares_many(&Weights::new(&[&h_t], &pos[..1], &cell), &cell, &[]).is_empty());
+    }
+
+    /// The many-ψ pass's cost at the Accurate grid (81³) for 3 atoms (water) with 13 rows (5 + 8
+    /// unoccupied, one channel) and at 95³ for 21 atoms with 40 rows, against one
+    /// [`orbital_shares`] call per row: reported, never asserted (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn orbital_shares_many_cost_is_reported() {
+        let g = gauss(0.6);
+        let atom = RadialDensity::from_fn(&g, 6.0, 0.075);
+        for (n, atoms, rows) in [(81usize, 3usize, 13usize), (95, 21, 40)] {
+            let cell = Cell { n, h: 0.15 };
+            let pos: Vec<[f64; 3]> = (0..atoms).map(|k| { let a = k as f64 * 2.4; [2.5 * a.cos(), 2.5 * a.sin(), 0.3 * k as f64 - 3.0] }).collect();
+            let psis: Vec<Vec<f64>> = (0..rows).map(|r| {
+                let terms: Vec<(f64, [f64; 3], &dyn Fn(f64) -> f64)> = pos.iter().enumerate().map(|(a, &p)| (((r + 1) * (a + 2)) as f64 % 3.0 - 1.0, p, &g as &dyn Fn(f64) -> f64)).collect();
+                normalised(&cell, on_nodes(&cell, &terms))
+            }).collect();
+            let refs: Vec<&[f64]> = psis.iter().map(|p| p.as_slice()).collect();
+            let free = vec![&atom; atoms];
+            let w = Weights::new(&free, &pos, &cell);
+            let t = std::time::Instant::now();
+            let many = orbital_shares_many(&w, &cell, &refs);
+            let t_many = t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            let one = orbital_shares(&w, &cell, refs[0]);
+            let t_one = t.elapsed().as_secs_f64() * 1e3;
+            println!("{n}³, {atoms} atoms, {rows} rows: many {t_many:.1} ms ({:.2} ms/row); one at a time {t_one:.1} ms/row (×{rows} = {:.0} ms); Σ s − 1 of row 0 {:+.1e}",
+                     t_many / rows as f64, t_one * rows as f64, neumaier(many[0].iter().copied()) - 1.0);
+            assert_eq!(many[0], one);
+        }
     }
 
     /// A density that does not integrate to the electrons the counted charges imply (a partial core

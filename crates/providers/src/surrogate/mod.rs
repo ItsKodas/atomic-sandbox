@@ -381,6 +381,11 @@
 //! `orbital_display_now` is `None` here; the caller asks for a display refresh instead
 //! (`request_display`, which is also how "refresh every N s" updates the orbitals). Without an
 //! auditor (the CPU teacher) there is no producer and the estimated solver shows no orbitals.
+//! The orbital shares' free-atom tables (`set_share_tables`, orbital-atom-shares spec) travel the
+//! same way: kept here, sent with every job and handed to the auditor's teacher before it solves
+//! (and to the stepping teacher, which shows no orbitals). The teacher weights them at the
+//! positions it evaluated — the job's scene, not the driver's newer one (Review Focus 4) — and a
+//! job whose species are not the tables' gets no shares (`crate::orbitals`, "Orbital shares").
 //!
 //! The same job slot solves the bond detector's **isolated-atom references** (M6 Task 3 review
 //! I2; [`request_atom_reference`](SurrogateKs::request_atom_reference), taken with
@@ -964,7 +969,7 @@ use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
     ClassLoo, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, OrbitalDisplay, OrbitalViewRequest, ProviderError, Scene,
-    SideDisplay, SideKind, Source, Trainable, TrainableStatus,
+    ShareTables, SideDisplay, SideKind, Source, Trainable, TrainableStatus,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1253,6 +1258,9 @@ pub struct SurrogateKs {
     /// background job so the auditor's teacher's unoccupied eigensolve yields to the user too
     /// (module doc, "Orbitals"; Task 4 re-review N1).
     display_interrupt: Option<sim::DisplayInterrupt>,
+    /// The orbital shares' free-atom tables (`set_share_tables`), sent with every background job
+    /// like the orbital view (module doc, "Orbitals").
+    share_tables: Option<Arc<ShareTables>>,
     /// The running sampling pass (`Trainable::start_pass`; `crate::sampling`), and the last one's
     /// final progress.
     pass: Option<Sampler>,
@@ -1414,6 +1422,7 @@ impl SurrogateKs {
             display_core: false,
             last_pseudised: None,
             display_interrupt: None,
+            share_tables: None,
             pass: None,
             last_pass: None,
             ref_cache: AtomReferences::default(),
@@ -2194,6 +2203,14 @@ impl ForceProvider for SurrogateKs {
     /// never shows orbitals, so it needs none.
     fn set_display_interrupt(&mut self, interrupt: sim::DisplayInterrupt) {
         self.display_interrupt = Some(interrupt);
+    }
+
+    /// Kept and sent with every background job (the auditor's teacher, the one orbital producer,
+    /// weights them at its job's positions); forwarded to the stepping teacher too, which shows no
+    /// orbitals (module doc, "Orbitals").
+    fn set_share_tables(&mut self, tables: Option<Arc<ShareTables>>) {
+        self.teacher.set_share_tables(tables.clone());
+        self.share_tables = tables;
     }
 }
 

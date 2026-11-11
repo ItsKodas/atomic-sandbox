@@ -848,6 +848,14 @@ pub trait ForceProvider: Send {
     fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
         Some(scene.nuclei.iter().map(|n| n.z as f64).collect())
     }
+    /// The free-atom tables the orbital shares are weighted by ([`ShareTables`]; orbital-atom-
+    /// shares spec), or `None` (a reference still missing, the scene's species changed). The
+    /// driver sends them whenever they change (`crate::dynamics`, "Bonds and references"); the
+    /// producer computes shares only for a payload whose evaluated species equal `z`, at that
+    /// payload's own positions (never a scene edited since). Display only: they reach no solve,
+    /// force or sample. No-op by default: a provider without orbitals (a surrogate forwards them
+    /// to its teachers).
+    fn set_share_tables(&mut self, _tables: Option<Arc<ShareTables>>) {}
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task

@@ -60,14 +60,36 @@
 //! solved yet shows none. The rows carry the residuals, the not-converged tag, the box-state tag
 //! (with the face-density rule — the surrogate's [`box_affected_face_density`]`(h)`, `qm::orbitals`
 //! §8) and occupation 0; the status the block edge's hidden count, the tolerance and the notes.
+//!
+//! # Orbital shares (orbital-atom-shares spec; `sim::charges`, "Orbital shares")
+//! Each row may carry its Hirshfeld shares s_iA = ∫ w_A |ψ̃_i|² per nucleus (`OrbitalInfo::shares`),
+//! weighted by the free-atom tables the driver sends (`ForceProvider::set_share_tables`). The
+//! steps are shared by both producers:
+//! - **Which tables.** Only tables whose species list `z` equals the payload's evaluated nuclei
+//!   ([`tables_fit`]): a scene edited after the tables were sent gets no shares, never shares
+//!   indexed to the wrong atoms (Review Focus 1). The weights sit at the payload's own positions —
+//!   the geometry the orbitals were solved at, which in estimated mode is the side job's.
+//! - **Which rows** ([`share_eligible`]): not a state of the box (its far tails' split is the
+//!   box's artefact; the Σ check cannot reject it, being normalised), and not an unoccupied row of
+//!   an earlier geometry (`UnoccupiedStatus::current` false: shares belong to the orbitals they
+//!   were computed with).
+//! - **The check** ([`settle_shares`]): every row with shares must have |Σ_A s − 1| ≤
+//!   `sim::charges::SUM_TOL`; if any misses, no row of the payload carries shares and the
+//!   payload says so once ("orbital shares off: Σ = …"). Then every member of a degenerate set
+//!   gets the set's mean (`sim::charges::set_average`).
+//!
+//! The CPU producer computes the numbers from [`CpuView::shown`]'s f64 ψ̃ in one pass over the
+//! nodes ([`attach_shares`], `sim::charges::orbital_shares_many`); the GPU producer brings its own
+//! numbers to [`settle_shares`]. Display only: nothing here reaches a solve, a force or a sample.
 use crate::surrogate::box_affected_face_density;
 use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use nalgebra::DMatrix;
 use qm::orbitals as qo;
 use qm::{Grid, KsState};
+use sim::charges::SUM_TOL;
 use sim::{
-    Cell, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, Spin, SpinSummary,
-    UnoccupiedStatus, ORBITAL_MIN_INTERVAL,
+    orbital_shares_many, set_average, share_sum, Cell, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest,
+    OrbitalViewRequest, RadialDensity, ShareTables, Spin, SpinSummary, UnoccupiedStatus, Weights, ORBITAL_MIN_INTERVAL,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -610,6 +632,75 @@ impl ViewState {
 /// pseudo-orbital's node count, which has no core nodes — the valence 2s would be named 1s — so the rows read #k.
 pub const PSEUDO_LABELS_NOTE: &str = "pseudised atom: the orbitals are numbered #k — a pseudo-orbital has no core nodes, so its 2s would read 1s; the atomic names wait for the core reconstruction (planned)";
 
+// ---- orbital shares (module doc, "Orbital shares") ----
+
+/// `tables` when they are this payload's: one table per nucleus, for the species `z` of the
+/// evaluated nuclei in order (module doc, "Orbital shares").
+pub fn tables_fit<'t>(tables: Option<&'t ShareTables>, z: &[u8]) -> Option<&'t ShareTables> {
+    tables.filter(|t| t.z == z && t.tables.len() == z.len())
+}
+
+/// Whether `display.rows[k]` may carry shares (module doc, "Orbital shares"): not a state of the
+/// box, not an unoccupied row held from an earlier geometry.
+pub fn share_eligible(display: &OrbitalDisplay, k: usize) -> bool {
+    let r = &display.rows[k];
+    let stale = display.unoccupied.as_ref().is_some_and(|u| !u.current) && r.residual.is_some();
+    !r.box_state && !stale
+}
+
+/// The shares' own check and the set average onto the payload's rows (module doc, "Orbital
+/// shares"): `raw[k]` is `display.rows[k]`'s shares per nucleus (`None`: not computed). A row that
+/// is not [`share_eligible`] gets none whatever `raw` says; if any other row's Σ_A s misses 1 by
+/// more than `SUM_TOL` (or is not finite), no row gets shares and one note says so. The GPU
+/// producer brings its own `raw` here.
+pub fn settle_shares(display: &mut OrbitalDisplay, mut raw: Vec<Option<Vec<f64>>>) {
+    assert_eq!(raw.len(), display.rows.len(), "settle_shares: {} share lists for {} rows", raw.len(), display.rows.len());
+    let atoms = display.positions.len();
+    for (k, s) in raw.iter_mut().enumerate() {
+        if !share_eligible(display, k) || s.as_ref().is_some_and(|s| s.len() != atoms) {
+            *s = None;
+        }
+    }
+    // the row farthest from Σ = 1 (a NaN counts as the farthest)
+    let worst = raw.iter().flatten().map(|s| share_sum(s)).fold(None, |w: Option<f64>, x| match w {
+        Some(w) if (w - 1.0).abs() >= (x - 1.0).abs() || w.is_nan() => Some(w),
+        _ => Some(x),
+    });
+    if let Some(sum) = worst.filter(|x| !((x - 1.0).abs() <= SUM_TOL)) {
+        display.rows.iter_mut().for_each(|r| r.shares = None);
+        display.notes.push(format!("orbital shares off: Σ = {sum:.6} on a row (|Σ − 1| > {SUM_TOL:.0e}: not this solve's normalised orbitals) — no shares shown"));
+        return;
+    }
+    set_average(&display.rows, &mut raw);
+    for (r, s) in display.rows.iter_mut().zip(raw) {
+        r.shares = s;
+    }
+}
+
+/// The CPU producer's shares (module doc, "Orbital shares"): with `tables` fitting the evaluated
+/// species `z`, s_iA of every [`share_eligible`] row from its ψ̃ (`psi_of(spin, index)`, n³ f64
+/// in `qm::Grid` order on the payload's cell), at the payload's positions, in one pass over the
+/// nodes; then [`settle_shares`]. Tables that do not fit leave every row without shares and add
+/// nothing to the payload (a provider without tables behaves as before).
+pub fn attach_shares<'p>(display: &mut OrbitalDisplay, tables: Option<&ShareTables>, z: &[u8], psi_of: impl Fn(Spin, usize) -> Option<&'p [f64]>) {
+    let Some(t) = tables_fit(tables, z).filter(|_| z.len() == display.positions.len()) else { return };
+    let n = display.cell.n;
+    let picked: Vec<(usize, &[f64])> = (0..display.rows.len())
+        .filter(|&k| share_eligible(display, k))
+        .filter_map(|k| psi_of(display.rows[k].spin, display.rows[k].index).filter(|p| p.len() == n * n * n).map(|p| (k, p)))
+        .collect();
+    let mut raw: Vec<Option<Vec<f64>>> = vec![None; display.rows.len()];
+    {
+        let free: Vec<&RadialDensity> = t.tables.iter().map(|a| a.as_ref()).collect();
+        let w = Weights::new(&free, &display.positions, &display.cell);
+        let psis: Vec<&[f64]> = picked.iter().map(|&(_, p)| p).collect();
+        for (&(k, _), s) in picked.iter().zip(orbital_shares_many(&w, &display.cell, &psis)) {
+            raw[k] = Some(s);
+        }
+    }
+    settle_shares(display, raw);
+}
+
 /// A display texture type of a [`Pool`].
 pub trait PoolTexture {
     fn create(ctx: &GpuContext, dims: [u32; 3]) -> Self;
@@ -723,6 +814,13 @@ impl CpuView {
         self.unocc_info.as_ref()
     }
 
+    /// The displayed ψ̃ of the last update's row `index` of channel `spin` (f64, n³ in `qm::Grid`
+    /// order, ‖ψ̃‖ = 1: the rotation within a set is orthogonal), if the update had one — what
+    /// the orbital shares are computed from ([`attach_shares`]).
+    pub fn shown(&self, spin: Spin, index: usize) -> Option<&[f64]> {
+        self.prev[spin_in(spin).index()].get(index).map(Vec::as_slice)
+    }
+
     /// One update on `state` (solved at `nuclei`, SCF tolerance `tol_scf`): the scalars, the
     /// tracker, the displayed orbitals (kept as the next update's previous set) and the product
     /// `view` picks from the rows. Returns the tracker's output, the spin readout, the pick and
@@ -832,6 +930,93 @@ impl CpuView {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A payload of `rows` (↑ channel, index = position) over two nuclei, for the share steps.
+    fn two_atom_payload(rows: Vec<(Option<(usize, f64)>, bool)>) -> OrbitalDisplay {
+        let rows = rows.into_iter().enumerate().map(|(i, (cluster, box_state))| OrbitalInfo {
+            spin: Spin::Up,
+            index: i,
+            track: i as u32,
+            slot: 0,
+            energy: -0.5 + 0.1 * i as f64,
+            eps_range: (-0.5, -0.5),
+            occupation: if box_state { 0.0 } else { 1.0 },
+            label: OrbitalLabel::Index(i + 1),
+            cluster,
+            rotated: false,
+            grid_split: None,
+            box_state,
+            smeared_1s: false,
+            residual: box_state.then_some(1e-7),
+            not_converged: false,
+            l: None,
+            touches_box: false,
+            shares: None,
+        }).collect();
+        OrbitalDisplay {
+            cell: Cell { n: 9, h: 0.5 },
+            origin: [-2.0; 3],
+            positions: vec![[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]],
+            rows,
+            field: None,
+            spin: SpinSummary::default(),
+            unoccupied: None,
+            notes: Vec::new(),
+            what: OrbitalRequest::List,
+            lone_atom: LoneAtomLabels::NotLoneAtom,
+        }
+    }
+
+    /// The shares' own check (module doc, "Orbital shares"): rows summing to 1 within `SUM_TOL`
+    /// keep their shares, a degenerate set gets its mean, a box state gets none whatever it was
+    /// given; one row off by more than `SUM_TOL` (or NaN) takes every row's shares away and leaves
+    /// one note.
+    #[test]
+    fn settle_shares_checks_the_sum_and_averages_sets() {
+        let pair = Some((2, 1e-7));
+        let mut d = two_atom_payload(vec![(None, false), (pair, false), (pair, false), (None, true)]);
+        let raw = vec![Some(vec![0.5, 0.5 + 4e-4]), Some(vec![0.9, 0.1]), Some(vec![0.2, 0.8]), Some(vec![0.3, 0.7])];
+        settle_shares(&mut d, raw.clone());
+        let got: Vec<Option<Vec<f64>>> = d.rows.iter().map(|r| r.shares.clone()).collect();
+        assert_eq!(got[0], raw[0], "within SUM_TOL: kept as computed");
+        for k in [1, 2] {
+            let s = got[k].as_ref().expect("the pair's mean");
+            assert!((s[0] - 0.55).abs() < 1e-15 && (s[1] - 0.45).abs() < 1e-15, "{s:?}");
+        }
+        assert_eq!(got[3], None, "a box state gets no share");
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+        // one row's Σ off by 2e-3 (or NaN): no shares anywhere, one note
+        for bad in [vec![0.5, 0.502], vec![f64::NAN, 0.5]] {
+            let mut d = two_atom_payload(vec![(None, false), (None, false), (None, false)]);
+            settle_shares(&mut d, vec![Some(vec![0.5, 0.5]), Some(bad.clone()), Some(vec![0.6, 0.4 + 2.5e-3])]);
+            assert!(d.rows.iter().all(|r| r.shares.is_none()), "{bad:?}");
+            assert_eq!(d.notes.len(), 1, "{:?}", d.notes);
+            println!("{}", d.notes[0]);
+            assert!(d.notes[0].starts_with("orbital shares off: Σ = "), "{:?}", d.notes);
+        }
+        // the worst row is named: 1.0025 rather than 1.002
+        let mut d = two_atom_payload(vec![(None, false), (None, false)]);
+        settle_shares(&mut d, vec![Some(vec![0.5, 0.502]), Some(vec![0.6, 0.4025])]);
+        assert!(d.notes[0].contains("1.002500"), "{:?}", d.notes);
+    }
+
+    /// Tables for another species list (a scene edited since they were sent) or for a nucleus
+    /// count the payload does not have: no shares and no note — the payload is as without tables.
+    #[test]
+    fn tables_that_do_not_fit_add_nothing() {
+        let t = Arc::new(sim::RadialDensity::from_fn(|r: f64| (-2.0 * r).exp() / std::f64::consts::PI, 8.0, 0.1));
+        let psi = vec![1.0 / (9f64.powi(3) * 0.125).sqrt(); 9 * 9 * 9];
+        for (tables, z) in [(vec![t.clone(), t.clone()], vec![1u8, 8]), (vec![t.clone(), t.clone(), t.clone()], vec![1, 1, 1])] {
+            let mut d = two_atom_payload(vec![(None, false)]);
+            let st = ShareTables { tables, z: z.clone() };
+            attach_shares(&mut d, Some(&st), &[1, 1], |_, _| Some(psi.as_slice()));
+            assert!(d.rows[0].shares.is_none() && d.notes.is_empty(), "tables for {z:?}");
+        }
+        let mut d = two_atom_payload(vec![(None, false)]);
+        attach_shares(&mut d, Some(&ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] }), &[1, 1], |_, _| Some(psi.as_slice()));
+        let s = d.rows[0].shares.clone().expect("fitting tables: shares");
+        assert!((s[0] + s[1] - 1.0).abs() < 1e-12 && (s[0] - s[1]).abs() < 1e-12, "a uniform ψ between mirror atoms: {s:?}");
+    }
 
     /// The rate bound (spec §4.4), on synthetic instants: the first payload, then one per
     /// `ORBITAL_MIN_INTERVAL`; forced ones always (and they restart the interval); an armed

@@ -433,6 +433,20 @@
 //! they arrived (the side job's own step is not tracked). Costs, measured
 //! (`charges::tests::partition_cost_is_reported`): the partition is 12 ms for water at 81³ and
 //! 97 ms for 21 atoms at 95³ — against a DFT step of 0.3 s and seconds.
+//! # Orbital share tables (orbital-atom-shares spec; display only)
+//! The orbital shares (`crate::charges`, "Orbital shares") are computed by the provider that
+//! makes the orbitals, against the same free-atom references as the charges. The provider never
+//! sees the cache (rule 5): the driver hands it the tables as data
+//! (`ForceProvider::set_share_tables`, a [`ShareTables`](crate::provider::ShareTables): one table
+//! per nucleus in scene order, one `Arc` per species, under the charges' `ReferenceKey`) —
+//! `Some` when every nucleus of the current scene has a tabled reference, `None` when any is
+//! missing (a new species before its reference lands; another grid, σ or ionic surface).
+//! `sync_share_tables` compares what the scene needs with what was last sent and sends only a
+//! change: at the start of every tick (after the commands, so an edit's re-evaluation and any
+//! `orbital_display_now` see the edited scene's tables), after every edit (`after_edit`), and when
+//! a reference lands (`poll_references`, before the density refresh it may run). The provider
+//! still checks the species of each payload against the tables' `z`, so a payload of a scene edited
+//! between the two (Review Focus 1) carries no shares rather than shares indexed to the wrong atoms.
 //! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
 //! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
 //! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
@@ -494,8 +508,8 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::charges::{ChargeSource, PartialCharges};
 use crate::integrator::Integrator;
-use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideKind, Source};
-use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
+use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, ShareTables, SideKind, Source};
+use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, RadialDensity, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
 use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
@@ -1106,6 +1120,9 @@ pub struct Dynamics {
     /// charges"; the nodes rebuilt on a grid change).
     charges: Option<Arc<PartialCharges>>,
     charge_nodes: Option<(Cell, Arc<Vec<[f64; 3]>>)>,
+    /// The orbital share tables last sent to the provider (module doc, "Orbital share tables"):
+    /// `None` before the first sync, `Some(None)` when it was told there are none.
+    share_tables: Option<Option<Arc<ShareTables>>>,
     /// The provider's teaching events since the worker's last drain, stamped with their step
     /// (`crate::activity::TeachBuffer`, plan review M6).
     teach: crate::activity::TeachBuffer,
@@ -1195,6 +1212,7 @@ impl Dynamics {
             pair_reports: Vec::new(),
             charges: None,
             charge_nodes: None,
+            share_tables: None,
             teach: Default::default(),
         };
         d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
@@ -1608,6 +1626,8 @@ impl Dynamics {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
+        // the commands just applied may have changed the species (module doc, "Orbital share tables")
+        self.sync_share_tables();
         // the orbital view's rate flag follows the play state (module doc, "Orbital display");
         // pausing into a state whose newest payload is an earlier step's re-reads it (M1)
         if self.forward_orbital_view() {
@@ -2606,6 +2626,7 @@ impl Dynamics {
         self.stale_eval_failed = false;
         self.surface_refresh = false;
         self.side_display = None;
+        self.sync_share_tables();
         self.restart_history();
         self.last_error = None;
         // not while relaxing: FIRE bypasses the thermostat, and a draw would hand the relax
@@ -2708,6 +2729,8 @@ impl Dynamics {
                 }
             }
             self.seq += 1;
+            // a landed reference may complete the scene's tables (module doc, "Orbital share tables")
+            self.sync_share_tables();
             let was_pending = !self.ref_queue.is_empty();
             self.queue_missing_references();
             if self.ref_queue.is_empty() {
@@ -2862,6 +2885,48 @@ impl Dynamics {
                 self.seq += 1;
             }
         }
+    }
+
+    /// Sends the provider the orbital share tables the current scene needs, if they differ from
+    /// those last sent (module doc, "Orbital share tables"): one table per nucleus under the
+    /// charges' key, or `None` when a nucleus has no tabled reference (or the scene is empty).
+    fn sync_share_tables(&mut self) {
+        let z: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
+        let want: Option<Vec<&RadialDensity>> = if z.is_empty() {
+            None
+        } else {
+            let (cell, sigma) = (&self.scene.cell, self.scene.sigma);
+            let (tol, name) = self.reference_solver();
+            let ionic = self.provider.ionic_tag(&self.scene);
+            z.iter().map(|&zz| self.refs.get(&ReferenceKey::new(cell, sigma, tol, name, zz, &ionic)).filter(|r| !r.radial.is_empty()).map(|r| &r.radial)).collect()
+        };
+        let unchanged = match (&self.share_tables, &want) {
+            (Some(None), None) => true,
+            (Some(Some(held)), Some(t)) => held.z == z && held.tables.len() == t.len() && held.tables.iter().zip(t).all(|(a, b)| **a == **b),
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        let sent = want.map(|t| {
+            // one `Arc` per distinct table (a species' nuclei share it: `charges::Weights` keys its
+            // lookups by the table's address)
+            let mut made: Vec<(*const RadialDensity, Arc<RadialDensity>)> = Vec::new();
+            let tables = t.iter().map(|&r| {
+                let key = r as *const RadialDensity;
+                match made.iter().find(|(k, _)| *k == key) {
+                    Some((_, a)) => a.clone(),
+                    None => {
+                        let a = Arc::new(r.clone());
+                        made.push((key, a.clone()));
+                        a
+                    }
+                }
+            }).collect();
+            Arc::new(ShareTables { tables, z })
+        });
+        self.provider.set_share_tables(sent.clone());
+        self.share_tables = Some(sent);
     }
 
     /// The detector after an evaluation (module doc): the graph at the current positions, or

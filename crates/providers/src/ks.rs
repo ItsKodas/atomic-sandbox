@@ -53,6 +53,12 @@
 //! each such eigensolve to it (`ActivityProbe::display_solve`: the Activity tab's job line and
 //! log row; display only, not a teaching solve).
 //!
+//! Each payload's rows may carry their Hirshfeld shares on the atoms (orbital-atom-shares spec;
+//! `crate::orbitals`, "Orbital shares"), against the free-atom tables the driver sends
+//! (`ForceProvider::set_share_tables`, kept across `reset`: they are the scene's data, checked
+//! against each payload's evaluated species). [`CpuKs`] computes them from its f64 ψ̃ at the
+//! evaluated positions; [`GpuKs`] keeps the tables and sends none yet (plan Task 3: its kernel).
+//!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
 //! `discontinuity` was called since — the density is always the geometry last evaluated; a
@@ -167,7 +173,7 @@ use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product};
 use sim::{
     nothing_to_solve, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
-    OrbitalField, OrbitalViewRequest, ProviderError, Scene, Slot, SolverError, Source,
+    OrbitalField, OrbitalViewRequest, ProviderError, Scene, ShareTables, Slot, SolverError, Source,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -518,6 +524,8 @@ pub struct CpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
+    /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
+    share_tables: Option<Arc<ShareTables>>,
 }
 
 impl CpuKs {
@@ -530,6 +538,7 @@ impl CpuKs {
             interrupt: None,
             show_core: false,
             watch: OccupationWatch::default(),
+            share_tables: None,
         }
     }
 
@@ -585,6 +594,9 @@ impl CpuKs {
         if state.ionic.is_some() && nuclei.len() == 1 {
             payload.notes.push(crate::orbitals::PSEUDO_LABELS_NOTE.into());
         }
+        // the rows' shares at the evaluated nuclei, from the ψ̃ just shown (`crate::orbitals`, "Orbital shares")
+        let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
+        crate::orbitals::attach_shares(&mut payload, self.share_tables.as_deref(), &z, |s, i| view.shown(s, i));
         Some(payload)
     }
 
@@ -743,6 +755,10 @@ impl ForceProvider for CpuKs {
     fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
         self.interrupt = Some(interrupt);
     }
+
+    fn set_share_tables(&mut self, tables: Option<Arc<ShareTables>>) {
+        self.share_tables = tables;
+    }
 }
 
 /// The GPU adapter's density textures (`crate::orbitals::Pool`: a texture leaves the pool inside
@@ -789,6 +805,10 @@ pub struct GpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
+    /// The orbital shares' free-atom tables (`set_share_tables`), kept for the GPU share kernel
+    /// (orbital-atom-shares plan Task 3); until then the GPU payload's rows carry no shares.
+    #[allow(dead_code)]
+    share_tables: Option<Arc<ShareTables>>,
 }
 
 impl GpuKs {
@@ -816,6 +836,7 @@ impl GpuKs {
             interrupt: None,
             show_core: false,
             watch: OccupationWatch::default(),
+            share_tables: None,
         }
     }
 
@@ -1283,6 +1304,10 @@ impl ForceProvider for GpuKs {
 
     fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
         self.interrupt = Some(interrupt);
+    }
+
+    fn set_share_tables(&mut self, tables: Option<Arc<ShareTables>>) {
+        self.share_tables = tables;
     }
 }
 
@@ -2712,6 +2737,67 @@ mod tests {
         c.set_orbital_view(with_unoccupied(OrbitalRequest::SpinDensity, 2, true));
         let again = c.orbital_display_now(&mut || false).expect("a re-display").unoccupied.expect("m = 2");
         assert_eq!((again.solves, again.current), (1, true), "the same state: no new eigensolve");
+    }
+
+    // ---- orbital shares (orbital-atom-shares plan Task 2) ----
+
+    /// Share tables for species `z`: one H-like free atom e^{−2r}/π shared by every nucleus (an
+    /// analytic stand-in for the solved reference — a mirror-symmetric molecule's split is even for
+    /// any one table, and the sum rule holds for any weights).
+    fn h_like_tables(z: &[u8]) -> Arc<sim::ShareTables> {
+        let t = Arc::new(sim::RadialDensity::from_fn(|r: f64| (-2.0 * r).exp() / std::f64::consts::PI, 12.0, 0.05));
+        Arc::new(sim::ShareTables { tables: z.iter().map(|_| t.clone()).collect(), z: z.to_vec() })
+    }
+
+    /// Plan Task 2: `CpuKs` H₂ (33³, R = 1.4) with tables for both H → σ_g (↑ and ↓) splits
+    /// 0.5/0.5 within 1e-6 and its shares sum to 1 within 1e-9 (h³ Σ ψ̃² = 1); no note added. A
+    /// re-display without a solve carries the same shares.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn cpu_payload_carries_shares() {
+        let mut c = CpuKs::new(1e-6);
+        c.set_orbital_view(view(OrbitalRequest::List));
+        c.set_share_tables(Some(h_like_tables(&[1, 1])));
+        let o = c.evaluate(&h2(33, 1.4), &mut never()).expect("CpuKs").orbitals.expect("a payload");
+        assert_eq!(o.rows.len(), 2, "σ_g ↑ and ↓");
+        for r in &o.rows {
+            let s = r.shares.as_ref().expect("shares on every row");
+            let sum = sim::share_sum(s);
+            println!("{} {:?}: shares {s:?}, Σ − 1 = {:+.2e}, s₀ − s₁ = {:+.2e}", r.label, r.spin, sum - 1.0, s[0] - s[1]);
+            assert_eq!(s.len(), 2);
+            assert!((sum - 1.0).abs() <= 1e-9, "Σ = {sum}");
+            assert!(s.iter().all(|x| (x - 0.5).abs() <= 1e-6), "{s:?}");
+        }
+        assert!(!o.notes.iter().any(|n| n.contains("orbital shares")), "{:?}", o.notes);
+        let again = c.orbital_display_now(&mut || false).expect("a re-display");
+        assert_eq!(again.rows.iter().map(|r| r.shares.clone()).collect::<Vec<_>>(), o.rows.iter().map(|r| r.shares.clone()).collect::<Vec<_>>());
+        // the tables withdrawn: as before them
+        c.set_share_tables(None);
+        let none = c.orbital_display_now(&mut || false).expect("a re-display");
+        assert!(none.rows.iter().all(|r| r.shares.is_none()));
+    }
+
+    /// Plan Task 2 / Review Focus 1: tables for [1, 1] and a scene changed to three H before the
+    /// payload → every row's `shares` is `None` (never shares indexed to the wrong atoms) and the
+    /// payload carries no note about it; the tables for the new species list give shares again.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn stale_tables_give_no_shares() {
+        let mut c = CpuKs::new(1e-6);
+        c.set_orbital_view(view(OrbitalRequest::List));
+        c.set_share_tables(Some(h_like_tables(&[1, 1])));
+        let h3 = scene(33, vec![Nucleus::new(1, [0.7, 0.0, 0.0]), Nucleus::new(1, [-0.7, 0.0, 0.0]), Nucleus::new(1, [0.0, 1.6, 0.0])]);
+        let o = c.evaluate(&h3, &mut never()).expect("CpuKs").orbitals.expect("a payload");
+        assert!(!o.rows.is_empty());
+        assert!(o.rows.iter().all(|r| r.shares.is_none()), "{:?}", o.rows.iter().map(|r| &r.shares).collect::<Vec<_>>());
+        assert!(!o.notes.iter().any(|n| n.contains("orbital shares")), "{:?}", o.notes);
+        c.set_share_tables(Some(h_like_tables(&[1, 1, 1])));
+        let o = c.orbital_display_now(&mut || false).expect("a re-display");
+        for r in &o.rows {
+            let s = r.shares.as_ref().expect("the new tables fit");
+            println!("H₃ {} {:?}: {s:?}", r.label, r.spin);
+            assert!(s.len() == 3 && (sim::share_sum(s) - 1.0).abs() <= 1e-9, "{s:?}");
+        }
     }
 
     // ---- pseudopotentials (M7 Task 9) ----

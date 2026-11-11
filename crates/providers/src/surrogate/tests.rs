@@ -3691,7 +3691,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -4097,7 +4097,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -5633,6 +5633,52 @@ fn the_auditor_teacher_polls_the_drivers_display_interrupt() {
     refresh(&mut s);
     assert_eq!(side_log.lock().unwrap().polled, [true, false], "the same interrupt, read live");
     assert!(step_log.lock().unwrap().polled.is_empty(), "the stepping teacher shows no orbitals");
+}
+
+/// Orbital-atom-shares plan Task 2 (Review Focus 4): the share tables reach the background
+/// auditor's teacher with every job, and it weights them at the positions it solved — the job's,
+/// not the driver's scene. Two refreshes on a CPU auditor: the scene's H₂ (R = 1.4, centred 0.5
+/// Bohr off the origin: the box makes it lopsided), then a job at R = 1.6 centred at the origin.
+/// Each payload carries its own job's positions and Σ = 1 within 1e-9; the centred job's σ_g
+/// splits 0.5/0.5 within 1e-6 (weights at the scene's off-centre positions would not split it
+/// evenly).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn side_solve_shares_use_the_job_geometry() {
+    use crate::ks::CpuKs;
+    use sim::{OrbitalRequest, OrbitalViewRequest, RadialDensity, ShareTables};
+    let mut s = SurrogateKs::new(Box::new(CpuKs::new(1e-6)), FallbackPolicy::default()).with_auditor(Box::new(CpuKs::new(1e-6)));
+    s.set_orbital_view(OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+    let t = Arc::new(RadialDensity::from_fn(|r: f64| (-2.0 * r).exp() / std::f64::consts::PI, 12.0, 0.05));
+    s.set_share_tables(Some(Arc::new(ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] })));
+    let refresh = |s: &mut SurrogateKs, sc: &Scene| -> sim::OrbitalDisplay {
+        assert!(s.request_display(sc));
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(d) = s.take_side_display() {
+                return d.orbitals.expect("the refresh carries the orbitals");
+            }
+            assert!(t0.elapsed().as_secs_f64() < 120.0, "no refresh within 120 s");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let scene_now = dimer(1.4, [1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 1, 1);
+    let job = h2(1.6);
+    for sc in [&scene_now, &job] {
+        let o = refresh(&mut s, sc);
+        let want: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(o.positions, want, "the payload is the job's geometry");
+        assert!(!o.rows.is_empty());
+        for r in &o.rows {
+            let sh = r.shares.as_ref().expect("shares from the auditor's teacher");
+            let sum = sim::share_sum(sh);
+            println!("job at {:?}: {} {:?} shares {sh:?}, Σ − 1 = {:+.2e}", want, r.label, r.spin, sum - 1.0);
+            assert!((sum - 1.0).abs() <= 1e-9, "Σ = {sum}");
+            if std::ptr::eq(sc, &job) {
+                assert!((sh[0] - sh[1]).abs() <= 1e-6, "symmetric about the job's own centre: {sh:?}");
+            }
+        }
+    }
 }
 
 /// Review SHOULD 12 (spec §4.3): estimated mode has exactly one orbital producer, the background
@@ -7381,7 +7427,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -7407,7 +7453,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
