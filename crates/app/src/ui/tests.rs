@@ -1325,6 +1325,137 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     assert!(st.draft);
 }
 
+// ---- ⚠ Model only (user request 2026-11-12) ----
+
+/// The commands a run of frames sent for draft mode and the audit cadence, in order.
+fn draft_and_audit(outs: &[PanelOutput]) -> Vec<String> {
+    outs.iter()
+        .flat_map(|o| &o.commands)
+        .filter(|c| matches!(c, Command::SetDraft(_) | Command::SetAudit(_)))
+        .map(|c| format!("{c:?}"))
+        .collect()
+}
+
+/// `Action::ModelOnly`: on = draft on and audits 0 (the previous two kept), off = both restored
+/// exactly; refused off Estimated; leaving Estimated restores; a hand change of draft or the
+/// cadence turns it off and restores nothing over it (the other setting stays).
+#[test]
+fn model_only_saves_and_restores_draft_and_audits() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let fresh = || {
+        let mut st = UiState::new("h2", &scene);
+        st.gpu_available = true;
+        st.backend = Backend::Estimated;
+        st
+    };
+    let mut st = fresh();
+    assert!(st.model_only.is_none() && overlays::model_only_chip(&st).is_none(), "every session starts with it off");
+    act(&mut st, &inp, Action::SetAudit(500));
+    let out = act(&mut st, &inp, Action::ModelOnly(true));
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0)]), "{:?}", out.commands);
+    assert!(st.draft && st.audit_every == 0);
+    assert_eq!(st.model_only, Some(ModelOnlySaved { draft: false, audit_every: 500 }));
+    assert_eq!(st.audit_every_on, 500, "\"audits on\" would bring back the replaced cadence");
+    assert_eq!(overlays::model_only_chip(&st), Some("model only — no DFT checks"));
+    assert!(act(&mut st, &inp, Action::ModelOnly(true)).commands.is_empty(), "already on: nothing");
+    let out = act(&mut st, &inp, Action::ModelOnly(false));
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(!st.draft && st.audit_every == 500 && st.model_only.is_none() && overlays::model_only_chip(&st).is_none());
+    assert!(act(&mut st, &inp, Action::ModelOnly(false)).commands.is_empty(), "already off: nothing");
+    // draft already on before: it stays on after
+    act(&mut st, &inp, Action::Draft(true));
+    act(&mut st, &inp, Action::ModelOnly(true));
+    let out = act(&mut st, &inp, Action::ModelOnly(false));
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500)]), "{:?}", out.commands);
+    // the solver leaves Estimated: off, restored
+    let mut st = fresh();
+    act(&mut st, &inp, Action::SetAudit(700));
+    act(&mut st, &inp, Action::ModelOnly(true));
+    let out = act(&mut st, &inp, Action::Backend(Backend::Gpu));
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700)]), "{:?}", out.commands);
+    assert!(st.backend == Backend::Gpu && st.model_only.is_none() && !st.draft && st.audit_every == 700);
+    // not on another solver (the toggle is hidden there; a script could still ask)
+    let out = act(&mut st, &inp, Action::ModelOnly(true));
+    assert!(out.commands.is_empty() && out.error.is_some() && st.model_only.is_none());
+    // a hand change of draft: off, the user's draft kept, the audits left at 0 (nothing restored)
+    let mut st = fresh();
+    act(&mut st, &inp, Action::ModelOnly(true));
+    let out = act(&mut st, &inp, Action::Draft(false));
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false)]), "{:?}", out.commands);
+    assert!(st.model_only.is_none() && !st.draft && st.audit_every == 0);
+    assert!(st.status.contains("by hand"), "{}", st.status);
+    // a hand change of the cadence: off, the cadence kept, draft left on
+    let mut st = fresh();
+    act(&mut st, &inp, Action::ModelOnly(true));
+    let out = act(&mut st, &inp, Action::SetAudit(300));
+    assert!(matches!(out.commands.as_slice(), [Command::SetAudit(300)]), "{:?}", out.commands);
+    assert!(st.model_only.is_none() && st.draft && st.audit_every == 300);
+    // Ctrl K finds it by either name
+    for q in ["model only", "no DFT checks"] {
+        assert_eq!(search::results(q, 1)[0].anchor, "tb-model-only", "{q}");
+    }
+}
+
+/// The toolbar's ⚠ Model only, clicked: absent unless Estimated is the solver (and in the compact
+/// slot of a window too narrow for it, 1000 pt); on sends draft on
+/// and audits 0 (recorded as one `ModelOnly(true)`) and puts the pill in the status chip; off
+/// restores a non-default cadence; switching to GPU while on restores; the Model panel's "audits
+/// on" (a hand change) turns it off and keeps the user's choice.
+#[test]
+fn clicking_model_only_toggles_restores_and_hides_off_estimated() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let gpu = snapshot(&scene, Backend::Gpu, None);
+    let est = snapshot(&scene, Backend::Estimated, Some(model()));
+    let mut st = UiState::new("h2", &scene);
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let shown = |st: &mut UiState, inp: &PanelInput<'_>, w: f32| {
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(&ctx, st, inp, w, vec![]);
+        PROBES.with(|p| p.borrow().contains_key("model-only"))
+    };
+    for w in [1400.0, 1000.0] {
+        assert!(!shown(&mut st, &input(&scene, Some(&gpu), &cam), w), "{w}: hidden under GPU");
+    }
+    st.backend = Backend::Estimated;
+    let inp = input(&scene, Some(&est), &cam);
+    for w in [1400.0, 1240.0] {
+        assert!(shown(&mut st, &inp, w), "{w}: shown under Estimated");
+    }
+    // the compact slot at 1000 has no room for it: not drawn, Ctrl K's anchor is Estimated
+    assert!(!shown(&mut st, &inp, 1000.0), "1000: no room in the compact slot");
+    assert_eq!(probed_rect("anchor-tb-model-only"), probed_rect("solver-estimated"));
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert!(!PROBES.with(|p| p.borrow().contains_key("model-only-chip")), "no chip pill while off");
+    act(&mut st, &inp, Action::SetAudit(500));
+    let outs = click_widget(&ctx, &mut st, &inp, "model-only");
+    assert_eq!(draft_and_audit(&outs), ["SetDraft(true)", "SetAudit(0)"]);
+    let recorded: Vec<_> = outs.iter().flat_map(|o| &o.actions).filter(|a| matches!(a, Action::ModelOnly(_))).collect();
+    assert_eq!(recorded, [&Action::ModelOnly(true)], "recorded as one action");
+    assert!(st.draft && st.audit_every == 0 && st.model_only.is_some());
+    probed_rect("model-only-chip"); // the chip's pill is drawn
+    let outs = click_widget(&ctx, &mut st, &inp, "model-only");
+    assert_eq!(draft_and_audit(&outs), ["SetDraft(false)", "SetAudit(500)"]);
+    assert!(!st.draft && st.audit_every == 500 && st.model_only.is_none());
+    // on, then GPU: off and restored
+    click_widget(&ctx, &mut st, &inp, "model-only");
+    let outs = click_widget(&ctx, &mut st, &inp, "solver-gpu");
+    assert_eq!(draft_and_audit(&outs), ["SetDraft(false)", "SetAudit(500)"]);
+    assert!(st.backend == Backend::Gpu && st.model_only.is_none() && !st.draft && st.audit_every == 500);
+    // on, then the Model panel's "audits on" by hand: off, the replaced cadence back, draft still on
+    st.backend = Backend::Estimated;
+    click_widget(&ctx, &mut st, &inp, "model-only");
+    alone(&mut st, DockTab::Model);
+    let outs = click_widget(&ctx, &mut st, &inp, "audits-on");
+    assert_eq!(draft_and_audit(&outs), ["SetAudit(500)"]);
+    assert!(st.model_only.is_none() && st.draft && st.audit_every == 500);
+}
+
 // ---- the drag pull (user request 2026-10-14: the wheel while dragging) ----
 
 /// The wheel's action scales the pull geometrically (× 1.25 per line up, ÷ per line down),

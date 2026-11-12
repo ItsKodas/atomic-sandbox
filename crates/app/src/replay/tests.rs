@@ -188,6 +188,8 @@ fn actions_parse_and_describe_symmetrically() {
         Action::Walls { on: true, half_width: 3.5 },
         Action::Cloud { superposition: true, refresh: false, refresh_s: 2.0 },
         Action::Draft(true),
+        Action::ModelOnly(true),
+        Action::ModelOnly(false),
         Action::DragForce(0.16),
         Action::DragForceWheel(-2.0),
         Action::ShowBonds(false),

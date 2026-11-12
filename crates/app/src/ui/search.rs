@@ -63,6 +63,8 @@ pub const ENTRIES: &[Entry] = &[
     e("Delete selected", "remove nucleus atom", Toolbar, "tb-selection"),
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
+    // user request 2026-11-12: shown beside Estimated; with another solver the anchor is Estimated
+    e("⚠ Model only (no DFT checks)", "model only draft audits off hands-off unchecked surrogate estimated", Toolbar, "tb-model-only"),
     // the scene chip (since the File windows, 2026-10-19, the full layout's File menu holds only
     // Open… / Save… / Profiles…; the compact layout's File submenu keeps the inline rows too)
     e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", SceneChip, "m-presets"),

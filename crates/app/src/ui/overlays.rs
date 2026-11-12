@@ -212,6 +212,11 @@ pub fn bond_reference_line(r: &sim::ReferenceProgress) -> String {
     )
 }
 
+/// The status chip's ⚠ Model only pill (user request 2026-11-12), while it is on.
+pub fn model_only_chip(st: &UiState) -> Option<&'static str> {
+    st.model_only.is_some().then_some("model only — no DFT checks")
+}
+
 /// Draws the chip and returns its rect (the draft banner stacks under it).
 fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) -> Rect {
     let notes = chip_notes(st, input);
@@ -271,6 +276,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                             theme::pill(ui, source_label(d.source), source_colour(d.source)).on_hover_text(super::SOURCE_TIP);
                             if d.history_guess.last() == Some(&true) {
                                 theme::pill(ui, "draft guess", RED).on_hover_text("draft mode: this step is the model's guess, also where it would have fallen back to DFT");
+                            }
+                            if let Some(t) = model_only_chip(st) {
+                                super::probed("model-only-chip", theme::pill(ui, t, super::AMBER)).on_hover_text(super::toolbar::MODEL_ONLY_TIP);
                             }
                         } else {
                             theme::pill(ui, &format!("DFT · {}", s.engine.label()), SPARK_E);

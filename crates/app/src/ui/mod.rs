@@ -144,6 +144,14 @@ pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decima
     }
 }
 
+/// What ⚠ Model only replaced (`UiState::model_only`): the draft mode and the audit cadence it
+/// restores when it is turned off (user request 2026-11-12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelOnlySaved {
+    pub draft: bool,
+    pub audit_every: usize,
+}
+
 /// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
 pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
 /// The auto cadence's bounds (answered steps): never more often than every 2000 steps (user request 2026-10-19; was 200), never
@@ -727,6 +735,11 @@ pub struct UiState {
     pub audit_every: usize,
     /// Draft mode (`Command::SetDraft`): per session, off by default.
     pub draft: bool,
+    /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
+    /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored
+    /// exactly when it is turned off or the solver leaves Estimated; a hand change of either turns
+    /// it off without restoring. Per session, off at start (never in a profile).
+    pub model_only: Option<ModelOnlySaved>,
     /// The drag spring's force cap ("pull", Ha/Bohr; `DynCommand::SetDragForce`): the wheel while
     /// dragging scales it by [`DRAG_WHEEL_STEP`] per line within the driver's range. Per session;
     /// it outlives the drag (the next one uses it).
@@ -955,6 +968,7 @@ impl UiState {
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
+            model_only: None,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),
             edit_group: Vec::new(),
