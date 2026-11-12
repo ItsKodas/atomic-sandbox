@@ -489,7 +489,7 @@
 //! booked), the drift history is cleared once (W is kept: it is the drained energy),
 //! `relax.converged` is `Some(outcome == Converged)` with a note for anything else. On a
 //! provider that can be taught (the surrogate) a converged relax whose last evaluation was the
-//! model's own answer (`Source::Surrogate`; a fallback step's forces are already the teacher's,
+//! model's own answer (`Source::Surrogate`, or `Source::Reference` at lone atoms; a fallback step's forces are already the teacher's,
 //! so they are reported as verified without another solve) is checked by one teacher solve at the result
 //! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
 //! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
@@ -2311,7 +2311,9 @@ impl Dynamics {
         // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
         // last answer's forces were the teacher's already (a fallback step, review M5)
         if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
-            if self.eval.source == Source::Surrogate {
+            // a lone-atom reference answer (`Source::Reference`) is the model's own value, never a
+            // teacher's: checked the same way
+            if matches!(self.eval.source, Source::Surrogate | Source::Reference) {
                 self.provider.as_trainable().expect("checked").force_teacher_next();
                 let r = self.provider.evaluate(&self.scene, should_abort);
                 Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
@@ -2614,7 +2616,7 @@ impl Dynamics {
     /// of its kind (`DynSnapshot::ms_per_step_model` / `_dft`), by the latest evaluation's source.
     fn record_step_cost(&mut self, ts: Instant) {
         let ms = ts.elapsed().as_secs_f64() * 1e3;
-        let model = self.eval.source == Source::Surrogate;
+        let model = matches!(self.eval.source, Source::Surrogate | Source::Reference);
         let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
         *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
         self.last_step_model = model;

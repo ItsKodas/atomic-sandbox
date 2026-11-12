@@ -371,8 +371,8 @@ fn number<T: std::str::FromStr>(w: &str) -> Result<T, String> {
 
 fn source_word(s: &str) -> Result<String, String> {
     match s {
-        "dft" | "surrogate" | "fallback" => Ok(s.to_string()),
-        _ => Err(format!("source dft, surrogate or fallback, got '{s}'")),
+        "dft" | "surrogate" | "fallback" | "reference" => Ok(s.to_string()),
+        _ => Err(format!("source dft, surrogate, fallback or reference, got '{s}'")),
     }
 }
 
@@ -381,6 +381,7 @@ fn source_name(s: sim::Source) -> &'static str {
         sim::Source::Dft => "dft",
         sim::Source::Surrogate => "surrogate",
         sim::Source::Fallback => "fallback",
+        sim::Source::Reference => "reference",
     }
 }
 

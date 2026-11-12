@@ -430,6 +430,12 @@ pub enum Source {
     /// is the model's when a trusted model exists (`teacher_gap` is `Some`) and the teacher's
     /// otherwise (`teacher_gap` is `None`) — see [`EvalStats::energy_surface`].
     Fallback,
+    /// Lone atoms (no atom has a neighbour within the model's cutoff) answered from the
+    /// isolated-atom references (`providers::surrogate`, the lone-atom rule): E = Σ_i E_ref(Z_i),
+    /// every force zero — what the model itself answers there, by construction, so its energy is
+    /// on the model's surface. Neither a model answer (nothing was consulted or learned) nor a
+    /// fallback (no solve).
+    Reference,
 }
 
 /// Which potential-energy surface an evaluation's `energy` is on (the surrogate's one-surface
@@ -441,7 +447,8 @@ pub enum Surface {
     /// at a geometry the model may not answer (out of its envelope, M6 Task 11), on the first
     /// evaluation after an edit, or after a failed audit (no `teacher_gap`).
     Teacher,
-    /// The surrogate model's surface: `Source::Surrogate`, or a `Fallback` whose energy is the
+    /// The surrogate model's surface: `Source::Surrogate`, `Source::Reference` (the model's own
+    /// answer at lone atoms, Σ E_ref), or a `Fallback` whose energy is the
     /// model's (`teacher_gap` present).
     Model,
 }
@@ -655,7 +662,7 @@ impl EvalStats {
     pub fn energy_surface(&self) -> Surface {
         match self.source {
             Source::Dft => Surface::Teacher,
-            Source::Surrogate => Surface::Model,
+            Source::Surrogate | Source::Reference => Surface::Model,
             Source::Fallback => if self.teacher_gap.is_some() { Surface::Model } else { Surface::Teacher },
         }
     }

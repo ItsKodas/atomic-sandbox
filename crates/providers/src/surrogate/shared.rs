@@ -188,6 +188,11 @@ fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
     sh.coll.references.range(species.clone()).next_back().map(|(_, r)| r.energy).or_else(|| sh.box_refs.range(species).next_back().map(|(_, &e)| e))
 }
 
+/// [`canonical_ref`] for the lone-atom rule (`lone`): the energy a reference answer sums.
+pub(super) fn canonical_reference(sh: &SharedCollection, z: u8) -> Option<f64> {
+    canonical_ref(sh, z)
+}
+
 /// What changes when the audit history changes: its recorded points and its unrecorded counts.
 fn history_stamp(h: &surrogate::AuditHistory) -> (u64, u64) {
     let u = &h.unrecorded;
@@ -643,6 +648,9 @@ impl SurrogateKs {
         if self.shared.is_none() {
             return self.set_reference_energy(z, e);
         }
+        // the last report's offset before anything changes — the collection's stored references
+        // (the canonical ones) change in `offer_reference` already
+        let before = self.last_report_offset();
         let sh = self.shared.as_mut().expect("collection mode");
         let limit = box_affected_face_density(sh.coll.key.h);
         let slug = sh.coll.key.slug();
@@ -657,7 +665,6 @@ impl SurrogateKs {
             Ok(ReferenceOutcome::Refused(why)) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box is not stored ({why}) — used for this box in this session only"))),
             Err(w) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box could not be written ({w}) — used for this session only"))),
         };
-        let before = self.last_report_offset();
         let sh = self.shared.as_mut().expect("collection mode");
         let changed = sh.box_refs.insert((z, grid_n), value).is_none_or(|old| old.to_bits() != value.to_bits());
         self.user_notes.extend(note);
@@ -672,9 +679,18 @@ impl SurrogateKs {
     /// The canonical shift Σ(ref_own − ref_canonical) of the last report, when it was on the
     /// teacher's surface (0 for a box without its references: the report was the raw answer);
     /// `None` without a report or after a model-surface one (the model's answers do not move until
-    /// the refit, whose jump books them).
+    /// the refit, whose jump books them). A lone-atom reference answer (`lone`) reported
+    /// Σ ref_canonical, which moves with the canonical references at once: its "offset" is
+    /// −Σ ref_canonical, so an arrival books Σ Δref_canonical (`None` when one is missing).
     fn last_report_offset(&self) -> Option<f64> {
-        let l = self.last.as_ref().filter(|l| !l.on_model)?;
+        let l = self.last.as_ref()?;
+        if l.reference {
+            let sh = self.shared.as_ref()?;
+            return l.z.iter().try_fold(0.0, |acc, &z| canonical_ref(sh, z).map(|e| acc - e));
+        }
+        if l.on_model {
+            return None;
+        }
         Some(self.box_offset(&l.z, l.provenance.grid_n).unwrap_or(0.0))
     }
 

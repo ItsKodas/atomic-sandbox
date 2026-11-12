@@ -17,6 +17,38 @@
 //!    alone and would otherwise carry atoms out of the cell (the user's escape: |x| = 287 Bohr
 //!    with no edit, a dissociated H₂ at 8000 K); the store, the envelope and every audit are of
 //!    in-cell geometries, so the cell is part of what the model's answer means.
+//!
+//!    (A capped segment's scene — "Masked scenes" below — is the teacher's before any other rule.)
+//! 0b. **Lone atoms** (user request 2026-11-12; [`lone`] holds the derivation): in strict mode, a
+//!    scene in which no atom has a neighbour within r_cut (`no_neighbours`) is **answered from the
+//!    isolated-atom references** — E = Σ_i E_ref(Z_i), every force 0, `Source::Reference` — whether
+//!    or not a model exists, and without consulting the trust verdict. That is exactly the model's
+//!    own answer there (every descriptor is empty, the fit has no intercept: `surrogate::fit`,
+//!    "Isolated-atom limit"), so a DFT step buys nothing: its answer is never kept (the keep rule,
+//!    `no_neighbours`; the user's M8a test had 202 lone-H samples spread by 1.3 mHa break trust)
+//!    and differs from Σ E_ref only by the isolated atoms' grid and box artefacts, which no model
+//!    can learn: the egg-box ripple (≈ 1e-6 Ha) and the walls' confinement, growing toward the
+//!    faces (lone H, default 12-Bohr box: +1.8e-3 Ha 4 Bohr from the nearest face, +3.5e-2 Ha at
+//!    2 Bohr — measured, `validate/references.md`; the free atom is the more physical answer). Why: an untrusted shared model (the user's single H) fell back to DFT on
+//!    every step. The references are those of the model's energy accounting: per scene the
+//!    store's (its surface's grid, h, σ, tolerance, teacher and ionic tag must be the scene's), in
+//!    collection mode the canonical ones, the box's own references solved (so the answer is what a
+//!    teacher answer there is reported as, less the wobble). The answer is on the model's surface
+//!    (`Surface::Model`); a switch to or from a teacher-surface report is booked along the forces
+//!    (`transition_jump`), a canonical reference arriving under one is booked as Σ Δref. No teacher
+//!    call, no sample, no audit, no teaching event; `SolveCounts::reference` counts it apart (not a
+//!    solve, not a fallback, not a model answer). The step's note: "lone atoms: answered from the
+//!    atom references". **It stands aside** (today's path, the reason noted) in draft mode (kept as
+//!    it was), for the relax verification, for a charged scene (the references are neutral atoms),
+//!    for a missing or unsolved reference of this surface or box, for **mixed species** among two or
+//!    more lone atoms (LSDA's separated-atom charge transfer under the cell-wide aufbau), and for a
+//!    **multiplicity other than the parallel-spin product** of the atoms' reference states,
+//!    M* = 1 + Σ (m_i − 1) — two lone H at "automatic" (1) are the restricted singlet, 4.6e-2 Ha
+//!    above 2 E_ref at 6.4 Bohr (rule 5a's measurement), so they go to DFT; at 3 they are answered.
+//!    The reference multiplicity is the scan's recorded choice, or the only one the scan can solve
+//!    (hydrogen's 2); unknown → stands aside. **Audits are never scheduled at a lone geometry**
+//!    (this rule's, a draft-mode answer's, a stood-aside one's): the gap there is the wobble, not a
+//!    model error, and could untrust a good model.
 //! 1. **No model** (nothing fitted yet) → teacher; the sample is kept; `Source::Fallback`.
 //! 2. **Unknown species** (a Z the model's `Basis` has no channel for) → teacher,
 //!    unconditionally; the sample is kept and the model is marked for a rebuild with the
@@ -992,6 +1024,7 @@ pub mod calibrate;
 mod inspect;
 mod knowledge;
 mod ledger;
+mod lone;
 mod policy;
 mod quarantine;
 mod shared;
@@ -1005,6 +1038,7 @@ use audit::*;
 use inspect::StrictVerdict;
 use trust::ClassJudge;
 use ledger::*;
+use lone::Lone;
 use policy::*;
 use quarantine::*;
 pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
@@ -1034,6 +1068,9 @@ struct LastEval {
     /// model-surface fallback's `model_forces`), the reported forces otherwise — the m̃ of the
     /// transition booking (`transition_jump`).
     surface_forces: Vec<[f64; 3]>,
+    /// A lone-atom reference answer (`lone`, `Source::Reference`): on the model's surface, and a
+    /// teacher step after it books the transition (module doc, rule 0b).
+    reference: bool,
 }
 
 /// The model's answer at the geometry of a teacher step (rules 5–7 and audits).
@@ -1737,7 +1774,11 @@ impl SurrogateKs {
                     .as_ref()
                     .filter(|m| flip && self.same_surface(&m.provenance, &h.prov) && m.basis.species_indices(&h.z).is_ok())
                     .and_then(|m| m.predict(&h.pos, &h.z, false).ok());
+                // after a lone-atom reference answer (rule 0b, on the model's surface) the switch to
+                // the teacher's is booked along the forces, as rule 5's (`transition_jump`)
+                let after_reference = self.last.as_ref().is_some_and(|l| l.reference);
                 match at_model {
+                    _ if after_reference => stats.refit_jump = self.transition_jump(r.energy, false, &r.forces, &h.pos),
                     Some(p) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - p.energy),
                     None => self.pending_jump = None,
                 }
@@ -1765,7 +1806,7 @@ impl SurrogateKs {
         ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
         self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
-        self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces });
+        self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces, reference: false });
         self.last_fallback = true;
         Ok(ForceResult { energy, forces: r.forces, stats, display: r.display, orbitals: None })
     }
@@ -1888,6 +1929,17 @@ impl ForceProvider for SurrogateKs {
         }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
         let draft = self.policy.never_fallback;
+        // rule 0b, lone atoms (module doc; `lone`): in strict mode, no atom with a neighbour within
+        // r_cut is answered from the isolated-atom references — the model's own answer there,
+        // whatever its trust; not in draft mode, nor when the teacher was asked for (the relax
+        // verification). When it stands aside the step takes today's path with the reason noted
+        if !draft && !forced {
+            match self.lone_reference(scene, &prov) {
+                Lone::Answer { energy } => return Ok(self.reference_answer(energy, prov, pos, z, t0)),
+                Lone::StandAside(why) => self.pending_notes.push(format!("surrogate: lone atoms, not answered from the atom references — {why}")),
+                Lone::NotLone => {}
+            }
+        }
         let mut untrusted = None;
         // the strict policy's refusal here, before draft mode or the relax verification override
         // it: the readiness readout's (module doc, "Readiness")
@@ -2021,7 +2073,11 @@ impl ForceProvider for SurrogateKs {
             by_audit_fence = reason.is_some();
         }
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
-        let due = (reason.is_none() || draft) && self.policy.audit_every > 0 && {
+        // never at lone atoms (rule 0b; draft mode and a stood-aside lone scene included): the gap
+        // there is the isolated atoms' grid/box wobble, not a model error, and the answer is never
+        // kept — an audit could only untrust a good model on it
+        let lone = self.model.as_ref().is_some_and(|m| no_neighbours(&pos, m.basis.r_cut));
+        let due = (reason.is_none() || draft) && !lone && self.policy.audit_every > 0 && {
             self.answered += 1;
             self.answered % self.policy.audit_every == 0 || self.audit_due || self.audit_burst > 0
         };
@@ -2119,7 +2175,7 @@ impl ForceProvider for SurrogateKs {
         self.streak_box = 0;
         self.streak_box_face = 0.0;
         self.class_streak = 0;
-        self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov, flip_back: false, surface_forces: pred.forces.clone() });
+        self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov, flip_back: false, surface_forces: pred.forces.clone(), reference: false });
         Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None, orbitals: None })
     }
 

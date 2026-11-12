@@ -15,7 +15,7 @@
 use super::icons::{self, Icon};
 use super::menus::dt_field;
 use super::search;
-use super::{probe, probed, source_colour, source_label, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
+use super::{probe, probed, source_colour, source_label, source_tip, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
 use crate::sim::Backend;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Button, Color32, Direction, FontId, Frame, Label, Layout, Margin, RichText, Stroke, TextStyle, Ui, Vec2, WidgetText};
@@ -146,7 +146,7 @@ impl Widths {
         let rate = |f: &FontId, unit: &str| max(&[w(&format!("00.0k{unit}"), f), w(&format!("    —{unit}"), f)]);
         let line_w = |parts: &[&str]| parts.iter().enumerate().map(|(k, p)| w(p, if k % 2 == 1 { &sub_mono } else { &sub })).sum::<f32>();
         let kbd = w("Space", &FontId::monospace(10.0)) + 10.0;
-        let solver_sub = 10.0 + sp + w(source_label(sim::Source::Fallback), &sub) + sp + line_w(&["· trusted · ", "100", " % fallback · epoch ", "9999"]);
+        let solver_sub = 10.0 + sp + max(&[w(source_label(sim::Source::Fallback), &sub), w(source_label(sim::Source::Reference), &sub)]) + sp + line_w(&["· trusted · ", "100", " % fallback · epoch ", "9999"]);
 
         let speed_field = field(&MAX_SPEED.to_string());
         let rate_full = rate(&FontId::monospace(15.0), "");
@@ -736,12 +736,18 @@ the fit's own words: {d}"),
             None => tip.to_string(),
         });
     }
+    let src = d.source;
     if t.kind == TrustKind::NoModel {
+        // lone atoms are answered from the references without a model too (rule 0b)
+        if src == sim::Source::Reference {
+            sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(source_tip(src));
+            sub(ui, RichText::new(format!("· {}", t.kind.short())).size(SUB).color(theme::INK_DIM));
+            return;
+        }
         sub(ui, t.kind.short());
         return;
     }
-    let src = d.source;
-    sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(super::SOURCE_TIP);
+    sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(source_tip(src));
     let short = t.kind.short();
     let epoch = m.map_or(0, |m| m.epoch);
     let pct = format!("{:>3.0}", 100.0 * d.fallback_fraction_100);

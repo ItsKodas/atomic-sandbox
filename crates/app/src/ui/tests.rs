@@ -7744,3 +7744,22 @@ fn a_refused_segment_names_the_reason_and_changes_nothing() {
     assert!(out.error.as_deref().unwrap().contains("He #2 has no neighbour within 6.0 Bohr"), "{:?}", out.error);
     assert!(out.commands.is_empty() && out.switch_scene.is_none() && st.segment_preview.is_none() && st.segment_back.is_none());
 }
+
+/// Rule 0b (lone atoms answered from the atom references): its own label, colour and hover — the
+/// honesty words the brief asks for (the DFT wobble, nothing learned) — distinct from the
+/// surrogate's and the fallback's.
+#[test]
+fn a_reference_answer_has_its_own_label_colour_and_tip() {
+    let r = Source::Reference;
+    assert_eq!(source_label(r), "atom references");
+    for other in [Source::Surrogate, Source::Fallback, Source::Dft] {
+        assert_ne!(source_colour(r), source_colour(other), "{other:?}");
+        assert_ne!(source_label(r), source_label(other));
+        assert_eq!(source_tip(other), SOURCE_TIP);
+    }
+    let tip = source_tip(r);
+    for want in ["lone atoms: answered from the atom references", "grid and box artefacts", "egg-box ripple", "confinement", "2 mHa 4 Bohr from the nearest face", "Nothing is learned", "none is audited"] {
+        assert!(tip.contains(want), "the tip lacks '{want}': {tip}");
+    }
+    assert!(SOURCE_TIP.contains("atom references (teal)"));
+}

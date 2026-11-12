@@ -169,6 +169,10 @@ impl SurrogateKs {
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        // rule 0b: strict mode answers lone atoms from the references, whatever the trust
+        if let Lone::Answer { .. } = self.lone_reference(scene, &self.scene_provenance(scene)) {
+            return Some(Readiness { answers: true, rule: None, atom: None, text: "lone atoms: answered from the atom references".into(), unlearned: None });
+        }
         let key = self.verdict_key();
         let refusal = match &self.strict_verdict {
             Some(v) if v.key == key && v.pos == pos && v.z == z => v.refusal.clone(),
@@ -255,6 +259,7 @@ impl SurrogateKs {
             d.iter().map(|(i, j, r)| format!("{i}-{j} {r:.3}")).collect::<Vec<_>>().join(", ")
         );
         let _ = writeln!(o, "    would_answer: {:?}", self.would_answer(&pos, &z, &prov));
+        let _ = writeln!(o, "    lone-atom rule (0b, strict mode): {:?}", self.lone_reference(scene, &prov));
         if let Err(g) = self.gate(&z, &prov) {
             let _ = writeln!(o, "    REFUSED by the gate ({:?}): {}", g.reason.rule, g.reason.text);
             return o;

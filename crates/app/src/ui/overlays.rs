@@ -273,7 +273,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     if let Some(s) = input.snapshot {
                         let d = &s.dynamics;
                         if s.backend == Backend::Estimated {
-                            theme::pill(ui, source_label(d.source), source_colour(d.source)).on_hover_text(super::SOURCE_TIP);
+                            // lone atoms say so in the chip (rule 0b): the label alone could read as a model answer
+                            let text = if d.source == sim::Source::Reference { "lone atoms: atom references" } else { source_label(d.source) };
+                            theme::pill(ui, text, source_colour(d.source)).on_hover_text(super::source_tip(d.source));
                             if d.history_guess.last() == Some(&true) {
                                 theme::pill(ui, "draft guess", RED).on_hover_text("draft mode: this step is the model's guess, also where it would have fallen back to DFT");
                             }

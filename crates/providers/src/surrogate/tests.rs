@@ -2625,8 +2625,8 @@ fn a_surrogate_driven_dimer_heated_apart_pauses_at_the_face_and_walls_keep_it_in
 /// bulk's, so an atom with NO neighbour was "inside" the envelope (half a spread out) and was
 /// answered with Σ E_ref and zero force. Now: an atom with no neighbour within r_cut in a scene
 /// of more than one atom is refused (5a), and a coordination more than 3× below the training
-/// minimum is outside (5b); a one-atom scene is still the model's (its answer is the reference
-/// itself).
+/// minimum is outside (5b); a one-atom scene is still answered, with the reference itself (by
+/// rule 0b since 2026-11-12: the same E_ref the model gives there).
 #[test]
 fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     let teacher = Shared::new(MorseDimer::h2());
@@ -2680,12 +2680,15 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with H: LOO force error")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
-    // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
-    // the isolated class is exempt from the class rule)
+    // a one-atom scene: E_ref exactly (no neighbour is its training state; the isolated class is
+    // exempt from the class rule) — since rule 0b (2026-11-12) answered from the reference itself,
+    // the same number the model gives there, without consulting it
     let mut one = in_big_cell(h2(1.6));
     one.nuclei.truncate(1);
     let r = s.evaluate(&one, &mut never()).unwrap();
-    assert_eq!((r.stats.source, r.energy), (Source::Surrogate, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
+    assert_eq!((r.stats.source, r.energy), (Source::Reference, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
+    let p = s.model().unwrap().predict(&[one.nuclei[0].pos], &[1], false).unwrap();
+    assert_eq!(p.energy.to_bits(), r.energy.to_bits(), "the model's own answer there");
 }
 
 /// One excursion run of the Requirement-3 tests: a window-trained dimer (1.2–2.2) swinging from
@@ -2744,7 +2747,7 @@ fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f
                 assert_eq!(snap.energy_ks, e_t, "step {i}: the reported energy is the teacher's");
                 on_teacher += 1;
             }
-            Source::Dft => unreachable!(),
+            Source::Dft | Source::Reference => unreachable!(),
         }
         if surface != last_surface {
             assert!(snap.eval.refit_jump.is_some(), "step {i}: a surface change without a booked jump");
@@ -3571,7 +3574,13 @@ fn fnv1a(text: &str) -> u64 {
 /// reads "3 of 29 samples needed" instead of "3 samples < Q′ 29" (steps 92–94; one species, so the
 /// key's column floor is the whole Q′ and no decision moves). Diffed against HEAD 07e8315: those 3
 /// lines, nothing else; with the old wording substituted back the trace hashes to the old pin.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x49de_dced_28e4_5113;
+/// **Re-pinned for rule 0b, lone atoms answered from the references** (0x49de_dced_28e4_5113 → below;
+/// the traces of this tree with the rule switched off and on, diffed: with it off the trace hashes to
+/// the old pin exactly): one line differs, step 61's H₂ at R = 6.3 Bohr (both atoms lone, automatic
+/// multiplicity 1) — the rule stands aside (1 is not the parallel-spin product 3) and its note says
+/// so after the step's own notes. Every source, answer, sample, refit and the auditor's section are
+/// unchanged.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x5962_e7e3_cd31_1f35;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -10150,6 +10159,9 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
+
+/// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).
+mod lone;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 
