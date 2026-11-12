@@ -301,8 +301,17 @@ impl SurrogateKs {
     /// Ruling S15 (`surrogate` module doc, "Trust recovery"): the degree-cap retry, then quarantine rounds;
     /// and (M8a user-test fix) a cap an earlier recovery set is re-judged against the default basis.
     /// Returns the report of the fit that stands; a failed attempt restores the previous fit.
+    ///
+    /// No ratchet (spec 2026-11-13 §4.2): the recovery ends with `!recoverable_fail()` or with the
+    /// store's fit, quarantine codes, `degree_cap` and `species_dirty` exactly as on entry — a
+    /// recovery that cannot restore the training residuals holds nothing (before it, the samples
+    /// its rounds named stayed held and the next refit's rounds started from them, up to the 10 %
+    /// cap), so the collection gets no status record from it either (`sync_collection_status`
+    /// finds no code changed). The entry report is returned, the note says so.
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
         let body3 = self.basis().is_some_and(|b| b.body3);
+        // the state on entry: what a recovery that does not restore the residuals returns to
+        let (entry_state, entry_flags, entry_dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
         // 1. the bent-molecule setting
         let cap = self.basis().map(|b| (b.body3, b.degree_cap));
         if let Some((true, d)) = cap.filter(|_| self.degree_cap.is_none()) {
@@ -326,8 +335,8 @@ impl SurrogateKs {
         // 1b. a cap set by an earlier recovery is not kept for good (M8a user-test fix, module doc
         // "Trust recovery"): when the capped fit fails, the default basis is tried as step 1 tried
         // the cap — kept if it alone restores the residuals with the trust rule's counts
-        let entry = self.degree_cap.filter(|_| body3).map(|_| (self.save_state(), self.quarantine.clone(), self.species_dirty));
-        if entry.is_some() {
+        let recapped = body3 && self.degree_cap.is_some();
+        if recapped {
             let saved = self.save_state();
             self.degree_cap = None;
             self.species_dirty = true;
@@ -343,16 +352,20 @@ impl SurrogateKs {
         }
         // 2. quarantine the worst offenders on the standing basis, round by round
         let before = self.quarantined();
-        let report = self.quarantine_rounds(report);
+        let rounds = self.quarantine_rounds(report.clone());
+        if !self.recoverable_fail() {
+            return self.note_quarantined(before, rounds);
+        }
+        // step 2 did not restore the residuals: back to the state on entry (no ratchet)
+        self.restore_state(entry_state);
+        self.quarantine = entry_flags;
+        self.species_dirty = entry_dirty;
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
-        // stands only if it recovers (the trust rule, its counts included), else step 2's result does
-        if let Some((saved, flags, dirty)) = entry.filter(|_| self.recoverable_fail()) {
-            let capped = (self.save_state(), self.quarantine.clone(), report.clone(), self.species_dirty, self.recovery.clone());
-            self.restore_state(saved);
-            self.quarantine = flags;
-            self.species_dirty = dirty;
+        // stands only if it recovers (the trust rule, its counts included), else the entry state does
+        if recapped {
+            let entry = (self.save_state(), self.quarantine.clone());
             let entry_held = self.quarantined();
             self.degree_cap = None;
             self.species_dirty = true;
@@ -367,14 +380,13 @@ impl SurrogateKs {
                     return r;
                 }
             }
-            let (state, q, rep, d, note) = capped;
+            let (state, flags) = entry;
             self.restore_state(state);
-            self.quarantine = q;
-            self.species_dirty = d;
-            self.recovery = note;
-            return self.note_quarantined(before, rep);
+            self.quarantine = flags;
+            self.species_dirty = entry_dirty;
         }
-        self.note_quarantined(before, report)
+        self.recovery = Some("recovery did not restore trust; no samples held".into());
+        report
     }
 
     /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits

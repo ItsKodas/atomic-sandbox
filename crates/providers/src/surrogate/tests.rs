@@ -967,6 +967,104 @@ fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
     assert_eq!((s.quarantined(), s.superseded()), (0, 0));
 }
 
+/// Fourteen stray H₂ samples at distinct in-window bond lengths, the energy of the k-th off by
+/// `0.1 · 0.75^k` Ha (k = 0..13): each quarantine round names the few within a factor 2 of the
+/// worst, so the rounds reach the 10 % cap before they reach the last strays (measured on the
+/// 100-sample Morse store before the fix: 9 held, max residual still 3.7e-3 Ha/atom; at
+/// `0.2 · 0.75^k` the fit spreads the misfit over every sample and the rounds name none
+/// within the cap).
+fn graded_strays() -> Vec<(Scene, f64)> {
+    (0..14).map(|k| (dimer(1.25 + 0.9 * k as f64 / 13.0, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1), 0.1 * 0.75f64.powi(k))).collect()
+}
+
+/// Spec 2026-11-13 §4.2 (no ratchet): a trust recovery whose quarantine rounds cannot restore the
+/// training residuals within the 10 % cap holds nothing — before it, the samples the rounds named
+/// stayed held, and the next refit's rounds started from them (the collection's ratchet up to
+/// the cap). The fit that stands is the entry one, every sample in it; a second refit agrees.
+#[test]
+fn a_recovery_that_cannot_restore_trust_holds_nothing() {
+    let (mut s, _) = trained(1.2, 2.2, 100, FallbackPolicy::default());
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    for (sc, off) in graded_strays() {
+        let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+        bad.energy += off;
+        s.add_sample(bad, &sc).unwrap();
+    }
+    let rep = s.refit().unwrap();
+    // the entry fit's first round names these (the rounds' machinery engages on this store)
+    let named = s.worst_offenders().len();
+    println!(
+        "after the strays: {} samples fitted; holds the rounds left {}; the entry fit's first round names {named} (cap {:.1}); trusted {} {:?}; note {:?}",
+        rep.n_samples,
+        s.quarantined(),
+        QUARANTINE_MAX_FRACTION * s.samples() as f64,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    assert!(!s.trusted());
+    assert!(s.recoverable_fail(), "the fit still fails on its residuals");
+    assert!(named > 0, "the premise: the rounds have offenders to name");
+    assert_eq!(s.quarantined(), 0, "a failed recovery holds nothing");
+    assert!(s.recovery_note().unwrap().contains("recovery did not restore trust; no samples held"), "{:?}", s.recovery_note());
+    assert_eq!(rep.n_samples, 114, "the entry fit stands");
+    assert_eq!(s.refit().map(|r| r.n_samples).ok(), Some(114), "idempotent: every sample stays fitted");
+    assert_eq!(s.quarantined(), 0);
+}
+
+/// §4.2 in collection mode: a failed recovery writes no status record — the reopened
+/// collection's codes are those before the refit, its two pre-existing holds still held.
+#[test]
+fn a_failed_recovery_leaves_the_collection_codes_as_they_were() {
+    let dir = collection_root("no-ratchet");
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let prov = s.provenance_for(&h2(1.4));
+    let mut notes = Vec::new();
+    let mut keep = |s: &mut SurrogateKs, sc: &Scene, off: f64| {
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+        assert!(s.keep_sample(&pos, &[1, 1], e + off, &f, Some(0.0), Some(1), &prov, SampleTag::Scan, &mut notes), "{notes:?}");
+    };
+    let mut rng = StdRng::seed_from_u64(11);
+    for i in 0..100 {
+        keep(&mut s, &h2_at(1.2 + 1.0 * i as f64 / 99.0, &mut rng), 0.0);
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    // two strays held by an earlier refit, written to the collection
+    for (k, r) in [1.5, 1.9].into_iter().enumerate() {
+        keep(&mut s, &dimer(r, [0.0, 0.0, 1.0], [0.0; 3], 1, 1), 0.3);
+        s.quarantine.resize(s.samples(), Q_NONE);
+        s.quarantine[100 + k] = Q_HELD;
+    }
+    s.sync_collection_status();
+    assert_eq!(s.quarantined(), 2);
+    for (sc, off) in graded_strays() {
+        keep(&mut s, &sc, off);
+    }
+    let codes = s.collection().unwrap().quarantine.clone();
+    assert_eq!((codes.len(), codes.iter().filter(|&&q| q == Q_HELD).count()), (116, 2), "the premise");
+    let rep = s.refit().unwrap();
+    println!(
+        "after the strays: {} samples fitted; held {}; the entry fit's first round names {}; trusted {} {:?}; note {:?}",
+        rep.n_samples,
+        s.quarantined(),
+        s.worst_offenders().len(),
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    assert!(!s.trusted() && s.recoverable_fail(), "the premise: the recovery fails");
+    assert_eq!(s.quarantined(), 2, "the two earlier holds, nothing more");
+    assert!(s.recovery_note().unwrap().contains("recovery did not restore trust; no samples held"), "{:?}", s.recovery_note());
+    let key = prov.surface_key();
+    drop(s);
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert_eq!(c.quarantine, codes, "no status record written");
+}
+
 /// A long-range Morse teacher (a = 0.3: at R = 8 the pair still binds by 4.4e-2 Ha, while
 /// every feature of the 6 Bohr cutoff model has vanished and it can only say Σ E_ref) — a
 /// geometry genuinely unrepresentable. Task 8 fix round 4 (the re-review's Important): the
