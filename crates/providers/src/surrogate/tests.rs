@@ -10205,6 +10205,10 @@ mod recovery_loo;
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;
 
+/// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
+/// the stored scenes, a measurement only (`scope_measure.rs`).
+mod scope_measure;
+
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 
 /// H₂ + H with a training mask: atoms 0 and 1 interior, the third a "cap".

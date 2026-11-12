@@ -4374,3 +4374,72 @@ What the user waits for at 50 000 samples (Q′ 1 032, 2.7 atoms per sample), ex
 - Paused (or before the first fit), it is still a wait of that length.
 
 What is left: the active set's MaxVol scan on threads, and the recovery's repeated searches.
+
+## Scoped-trust measurement (step 3) (2026-11-13; the scoped-trust study's "Rule 3: measured counterfactual"; `providers` `surrogate::tests::scope_measure`; release, Ryzen 7 9800X3D, CPU, BelowNormal, other cargo jobs running) — a measurement, no behaviour changed
+
+**What is measured.** On a fit whose training residuals fail, Rule 3 would take a suspect set S, downdate the fit by S at fixed hyperparameters, and (i) require that downdated fit to pass both training-residual checks store-wide, (ii) answer a scene only if its prediction under Δc_S moves ≤ ε = 0.1 of each bound. This measures both gates on the user's collection; nothing is decided here.
+
+- **S**: the fit's members failing in-sample (|E_model − E|/N over `energy_std_per_atom` or any trained atom's ‖ΔF‖/√3 over `force_bound(|F|)` above 1, as `compute_training_residuals` reads them), plus the leave-one-out offenders by the recovery's own rule (own-bound ρ > 1 and ≥ ½ the worst; asserted equal to `worst_offenders()` while the residuals fail).
+- **Δc_S** = A⁻¹Φ_SᵀW_S(I − H_SS)⁻¹e_S, computed in the symmetric form A⁻¹Φ_SᵀW^½ G⁻¹ W^½ e_S with G = I − W^½Φ_SA⁻¹Φ_SᵀW^½ (derivation in the module doc); the fit without S is θ − Δc_S.
+- **Shift** at a stored geometry, in bound units: s_F = max_j ‖ΔF_j‖/√3 / `force_bound(|F_j teacher|)` (the trust checks' per-component reading; the raw ‖ΔF_j‖/b_j is √3 larger and its gate count is given too), s_E = |ΔE|/N / 1e-3 Ha/atom. Quantiles are nearest-rank, over every stored sample of the formula (fitted or held; S members included, counts outside S given).
+
+**The oracle** (`the_block_downdate_is_an_explicit_refit_without_the_block`, not ignored, < 0.1 s). A 48-sample H/O pair-potential store (H–O body-2 columns tied, a quarter masked, Q′ 156, κ 5.7e4, λ = 1e3 pinned), S = 7 samples (two masked, two without an energy row; m = 56 rows). Δc_S against an explicit refit without S at the same λ, σ_e, σ_f and standardisation (normal equations rebuilt row by row; L Lᵀ − A − λI = 5.8e-16 relative): **5.8e-12** relative in Δc, **3.4e-13** in θ₋; for S = {s}, e_s + Φ_sΔc_s against `surrogate::loo::leave_one_out`: **5.2e-16**. On the real fits (phase 4 of the measurement) L Lᵀ matches the rebuilt A + λ_eff I to 1.0–1.5e-15, and Δc agrees with the explicit refit to 3.3e-4–4.5e-3 relative. That is the conditioning limit (κ(A) 1.1–2.2e13: ε κ ≈ 2e-3–5e-3), not an error of the algebra. The H₂/H₃ shifts of the two agree to ≤ 9.7e-4 bound units, 100× below ε.
+
+Command (each snapshot a copy in a scratch folder, copied again into a temp root by the test; nothing else is written):
+`SURROGATE_SCOPE_SNAPSHOT=<copy>/lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5 cargo test -p providers --release -j 4 --lib scope_measurement -- --ignored --nocapture --test-threads 1`
+
+**The fits measured.** Q′ 1 032 throughout.
+
+| | `coll_now` (1 978 samples) | pre-1805, after the attach's refit | pre-1805, entry fit (file's codes) |
+|---|---|---|---|
+| state | the attach's refit (2 fits, 12.5–15.2 s) ran no recovery: 190 held + 13 offenders > the 197.8 cap; standing = entry fit | 13 fits, 35.8–40.1 s, 128 held | 105 held, no recovery |
+| worst training force / energy | **1.740×** (3.48e-3 > 2.0e-3) / 0.950× | **1.0185×** / 0.922× | **2.361×** / 0.923× |
+| κ(A), λ | 1.06e13, 1.046 | 1.38e13, 1.001 (at the ridge floor) | 2.23e13, 0.589 |
+| \|S\| (in-sample + LOO) | **16** (14 + 13): 15 H₃, H₃O #1411; worst ρ 2.36 (#382 H₃) | **3** (1 + 3): H₃O #1378, #1379, #1345; worst ρ 1.16 | **35** (34 + 1): #1804 HO (ρ 972.7, in-sample 0.18), 32 H₃O, H₂ #802, H₂O #1133 |
+| \|S\| + held vs cap | 206 > 197.8 | 131 / 180.5 | 140 / 180.5 |
+| rows m, min pivot of G | 163, 0.29 | 39, 0.87 | 440, 1.0e-5 |
+| **gate (i)**: worst force / energy outside S, downdated | **1.158×** (#1906 H₃) / **1.042×** (#1805 H₂) → **fails** | **1.068×** (#1381 H₃O) / 0.922× → **fails** | **1.096×** (#1378 H₃O) / 0.915× → **fails** |
+| members outside S failing, downdated | 5 (1 H₂, 4 H₃) | 2 (H₃O) | 1 (H₃O) |
+
+**Shifts under Δc_S** (s_F; s_E: min / median / p90 / max; gate (ii) at ε = 0.1, with the raw-norm count in brackets):
+
+| | `coll_now` | pre-1805, after the refit | pre-1805, entry |
+|---|---|---|---|
+| H₂ s_F | 3.8e-5 / 0.016 / 0.033 / 0.42 | 2.1e-6 / 3.4e-4 / 4.7e-4 / 0.023 | 1.4e-4 / 0.025 / 0.048 / 0.50 |
+| H₂ s_E | 3.2e-5 / 3.4e-3 / 8.3e-3 / 0.30 | 3.2e-6 / 1.3e-4 / 3.7e-4 / 0.039 | 1.6e-5 / 4.6e-3 / 0.014 / 0.65 |
+| **H₂ gate (ii)** | **481 / 495** (475) | **475 / 475** (475) | **465 / 475** (462) |
+| H₃ s_F | 4.5e-3 / **0.091** / **0.23** / **5.3** | 8.3e-5 / 3.6e-3 / 0.013 / 0.28 | 7.8e-3 / 0.044 / 0.10 / **2.5** |
+| H₃ s_E | 1.0e-4 / 0.016 / 0.059 / 6.5 | 1.4e-6 / 4.1e-4 / 2.2e-3 / 0.10 | 2.3e-5 / 5.5e-3 / 0.025 / 0.99 |
+| **H₃ gate (ii)** | **292 / 499** (119), 292 of the 484 outside S | **334 / 347** (329) | **311 / 347** (227) |
+| H₂O s_F (contrast) | 6.5e-4 / 8.7e-3 / 0.017 / 0.049 | 4.1e-5 / 5.6e-3 / 0.013 / 0.041 | 7.4e-3 / 0.057 / 0.22 / 1.2 |
+| H₂O gate (ii) | 409 / 409 | 408 / 408 | 318 / 408 |
+| H₃O s_F (contrast) | 4.0e-3 / 0.039 / 0.19 / 0.95 | 2.5e-3 / 0.025 / 0.22 / 0.34 | 0.038 / 0.32 / 0.80 / 3.4 |
+| H₃O gate (ii) | 235 / 313 | 248 / 313 | 10 / 313 |
+| N₂ | 0 exactly (261 / 261) | 0 exactly | 0 exactly |
+
+**Contrast, not the study's S: the leave-one-out offenders alone.**
+- *Pre-1805 entry fit, S = {#1804}* (m 7, min pivot 1.4e-5): gate (i) **fails by 0.2 %** (1.0020×, #1237 H₃O; energy 0.925×).
+  - #1804's own leak into H₃: s_F median 0.044, p90 **0.0998**, max **4.75** (#1446; #485–487 at 3.8–4.1×), s_E max 2.8. **310 / 347 pass** gate (ii) (242 under the raw norm).
+  - H₂: 472 / 475. H₂O: 295 / 408. H₃O: 5 / 313.
+- *`coll_now`, S = the 13 offenders*: gate (i) fails (1.111× #1906 H₃, energy 1.039× #1805 H₂). H₂ 481 / 495, H₃ 292 / 487 outside S.
+
+**Wall time** (phases of the test):
+
+| phase | time |
+|---|---|
+| attach + refit, as the app | 12.5–15.2 s (`coll_now`, 2 fits); 35.8–40.1 s (pre-1805, 13 fits) |
+| entry fit (one deferred fit) | 2.2–2.5 s |
+| suspects | ≤ 0.01 s with the class pass's cached ratios; 1.0–1.3 s when the leave-one-out pass runs for a deferred fit |
+| block downdate (m 7–440) | ≤ 0.02 s |
+| shifts and downdated residuals over every stored sample (1 805–1 978) | 0.02–0.04 s |
+| explicit-refit oracle | 0.2 s |
+
+So the study's cost estimate (under 1 s per failing refit at Q′ 1 590) holds: the downdate is ≤ 0.02 s at Q′ 1 032, ≈ 0.05 s scaled by Q′² to 1 590.
+
+**Reading.**
+- **Gate (i) fails in every state measured.** That covers the three fits under the study's S, and the two contrasts. The miss ranges from 0.2 % to 16 %. Rule 3 as specified would answer nothing on either snapshot. Removing S does not leave a fit that passes: the misfit moves to the next samples along the chain (H₃O → H₃O, H₃ → H₃ and H₂), the same non-monotone pattern as the recovery rounds (1.007 → 1.131 → 1.0185). The margin is the one already documented: trusted fits here sit at 0.96–1.00×.
+- **On `coll_now` H₃ is the failing environment itself.** 15 of the 16 suspects are H₃, so scoping H₃ out of the refusal is not on the table. Its leak is large: median 0.09 of the bound, p90 0.23, max 5.3×. Only 292 of 484 H₃ samples outside S move ≤ 0.1.
+- **#1804 couples into H₃ measurably**, which confirms the study's chain (O–H bent, water compensates through H–H, H₃ reads H–H). Removing #1804 alone moves the median H₃ by 0.044 of its bound, and 37 of 347 H₃ by more than 0.1, up to 4.75×. H₃ was therefore not safe to scope by key or species in the #1804 state. Gate (ii) would have refused those 37 H₃ geometries and answered 310, but only if gate (i) had passed, and it misses by 0.2 %.
+- **H₂ is the weakly coupled one**: 94–100 % pass gate (ii), medians ≤ 0.025. The tail is the same few dimers each time: #1505 and #1499 in every state, then #146, #150, #889 or #1494.
+- **N₂ moves by exactly 0**: its columns share no sample with H or O (Rule 2's component argument, exact).
+- **Nothing here argues for a larger ε or a looser gate (i).** The H₃ tails (2.5–5.3× the bound) are where a looser rule would answer wrongly.
