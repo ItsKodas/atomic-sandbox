@@ -8170,29 +8170,34 @@ mod updates {
     }
 
     /// The recorded answers: the releases list (or a refusal), a manifest's formats, and the
-    /// installer from memory — held back while `gate` is set (a stalled connection).
+    /// installer from memory — held back while `gate` is set (a stalled connection). `stalled` is
+    /// set once a download's read is held at the gate, so a test can wait for that state instead
+    /// of racing the job's thread.
     pub(super) struct FixtureNet {
         pub list: Result<Vec<Release>, CheckError>,
         pub manifest: Result<Option<Formats>, String>,
         pub gate: Arc<AtomicBool>,
+        pub stalled: Arc<AtomicBool>,
         pub calls: Arc<AtomicUsize>,
     }
 
     impl FixtureNet {
         pub fn new() -> FixtureNet {
-            FixtureNet { list: Ok(releases()), manifest: Ok(None), gate: Arc::new(AtomicBool::new(false)), calls: Arc::new(AtomicUsize::new(0)) }
+            FixtureNet { list: Ok(releases()), manifest: Ok(None), gate: Arc::new(AtomicBool::new(false)), stalled: Arc::new(AtomicBool::new(false)), calls: Arc::new(AtomicUsize::new(0)) }
         }
     }
 
-    /// The installer's bytes, after the gate opens.
+    /// The installer's bytes, after the gate opens (`stalled` set while a read waits at it).
     struct Gated {
         gate: Arc<AtomicBool>,
+        stalled: Arc<AtomicBool>,
         bytes: &'static [u8],
     }
 
     impl Read for Gated {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             while self.gate.load(Ordering::Relaxed) {
+                self.stalled.store(true, Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             let n = self.bytes.len().min(buf.len()).min(16);
@@ -8211,13 +8216,13 @@ mod updates {
             self.manifest.clone()
         }
         fn download(&self, r: &Release, dir: std::path::PathBuf) -> Result<crate::update::Download, String> {
-            let gate = self.gate.clone();
+            let (gate, stalled) = (self.gate.clone(), self.stalled.clone());
             let setup = crate::update::release::installer_name(&r.version);
             let source = move |url: &str| -> Result<Box<dyn Read + Send>, String> {
                 match url.rsplit('/').next().unwrap() {
                     "SHA256SUMS.txt" => Ok(Box::new(SUMS)),
                     "SHA256SUMS.txt.minisig" => Ok(Box::new(SIG)),
-                    n if n == setup => Ok(Box::new(Gated { gate: gate.clone(), bytes: FIXTURE_SETUP })),
+                    n if n == setup => Ok(Box::new(Gated { gate: gate.clone(), stalled: stalled.clone(), bytes: FIXTURE_SETUP })),
                     n => Err(format!("no {n}")),
                 }
             };
@@ -8240,21 +8245,39 @@ mod updates {
     /// `st` as an installed build with `root`, the fixture list, this build at `current`, and the
     /// fixture network.
     pub(super) fn installed(st: &mut UiState, root: &std::path::Path, current: &str) -> Arc<AtomicBool> {
+        installed_gated(st, root, current).0
+    }
+
+    /// [`installed`], with the fixture network's `gate` and `stalled` flags ([`FixtureNet`]).
+    fn installed_gated(st: &mut UiState, root: &std::path::Path, current: &str) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         let net = FixtureNet::new();
-        let gate = net.gate.clone();
+        let flags = (net.gate.clone(), net.stalled.clone());
         (st.data_mode, st.data_root) = (crate::paths::DataMode::Installed, Some(root.to_path_buf()));
         st.update.net = Arc::new(net);
         st.update.releases = releases();
         st.update.current = ver(current);
-        gate
+        flags
     }
 
-    /// Runs frames until the download is no longer running (at most 10 s).
+    /// Polls `done` every 2 ms until it holds, for at most `secs` (a generous bound: a loaded
+    /// machine only makes it slower, never changes the outcome); whether it held.
+    fn wait_for(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !done() {
+            if t.elapsed().as_secs() >= secs {
+                return done();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
+
+    /// Runs frames until the download is no longer running (at most 60 s).
     fn wait_download(st: &mut UiState) -> DownloadState {
         let t = std::time::Instant::now();
         loop {
             let s = st.update.download.as_ref().expect("a download").poll();
-            if !matches!(s, DownloadState::Running(..)) || t.elapsed().as_secs() > 10 {
+            if !matches!(s, DownloadState::Running(..)) || t.elapsed().as_secs() > 60 {
                 return s;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -8969,6 +8992,12 @@ mod updates {
 
     /// Each of the panel's buttons sends its action: Check for updates now, Install and restart,
     /// the download's Cancel ("Cancelling…" until the stalled read lets go), Restart now.
+    ///
+    /// Deterministic under load: the cancel is clicked only once the job's read is held at the
+    /// gate (`stalled`), so the job can't report its cancel before the panel has drawn
+    /// "Cancelling…" (it used to, when a busy machine left the job thread short of the installer's
+    /// read at the click: it then saw the cancel between reads and ended at once); every wait
+    /// polls its condition with a generous bound.
     #[test]
     fn buttons_emit_actions() {
         let scene = Scene::preset("h2").unwrap();
@@ -8977,22 +9006,23 @@ mod updates {
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
         let root = temp_root("buttons");
-        let gate = installed(&mut st, &root, "0.1.0");
+        let (gate, stalled) = installed_gated(&mut st, &root, "0.1.0");
         st.update.releases.clear();
         st.update.open = true;
         assert!(has(&shown(&ctx, &mut st, &inp), "No list yet"));
         let outs = click_widget(&ctx, &mut st, &inp, "check-now");
         assert_eq!(actions(&outs), [Action::CheckUpdates]);
         let t = std::time::Instant::now();
-        while st.update.checking() && t.elapsed().as_secs() < 10 {
+        while st.update.checking() && t.elapsed().as_secs() < 60 {
             shown(&ctx, &mut st, &inp);
         }
         assert_eq!(st.update.releases, releases(), "the list arrived");
         assert!(st.update.error.is_none());
-        // a stalled download
+        // a stalled download: its read held at the gate before anything else
         gate.store(true, Ordering::Relaxed);
         let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
         assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        assert!(wait_for(60, || stalled.load(Ordering::Relaxed)), "the job reached the installer's read");
         assert!(matches!(st.update.download.as_ref().unwrap().poll(), DownloadState::Running(..)));
         assert!(has(&shown(&ctx, &mut st, &inp), "downloading:"));
         let outs = click_widget(&ctx, &mut st, &inp, "cancel-download");
@@ -9001,17 +9031,13 @@ mod updates {
         assert!(has(&shown(&ctx, &mut st, &inp), "Cancelling…"), "until the stalled read lets go");
         gate.store(false, Ordering::Relaxed);
         let t = std::time::Instant::now();
-        while st.update.cancelling() && t.elapsed().as_secs() < 10 {
+        while st.update.cancelling() && t.elapsed().as_secs() < 60 {
             shown(&ctx, &mut st, &inp);
         }
         assert!(!st.update.cancelling() && !has(&shown(&ctx, &mut st, &inp), "Cancelling…"));
         // (the job removes its .part as it ends, just after reporting)
         let parts = || root.join("updates").read_dir().unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".part"));
-        let t = std::time::Instant::now();
-        while parts() && t.elapsed().as_secs() < 5 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!parts(), "the cancelled .part is gone");
+        assert!(wait_for(60, || !parts()), "the cancelled .part is gone");
         // again, to the end: Restart now
         click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
         assert!(matches!(wait_download(&mut st), DownloadState::Ready(_)));
