@@ -483,6 +483,9 @@ pub struct Viewer {
     /// The next estimated worker resumes the interrupted pass in this folder instead of its
     /// `EnsureModel` ([`Viewer::resume_training`]).
     resume_next: Option<PathBuf>,
+    /// Bonds guessed from experience (`crate::bond_experience`; user request 2026-11-13): the
+    /// verdicts of the fresh graphs seen, and the drawing of the latest stale one.
+    pub bond_exp: crate::bond_experience::Experience,
 }
 
 impl Viewer {
@@ -544,6 +547,7 @@ impl Viewer {
             training_dir: None,
             collections_dir: None,
             resume_next: None,
+            bond_exp: Default::default(),
         })
     }
 
@@ -1235,6 +1239,7 @@ impl Viewer {
             pseudo_generating: providers::pseudo::generating(),
             draft_banner: None,
             bonds_label: None,
+            stale_bonds_line: None,
             probe: self.sim.as_ref().map(|w| w.probe().view()),
         };
         ui::actions::apply(&mut self.ui, &input, a, &mut out);
@@ -1547,6 +1552,12 @@ impl Viewer {
                 }
                 let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
                 self.ghost.follow(ghost, Instant::now());
+                // bonds from experience: a fresh graph is recorded, a stale one guessed over
+                let place = crate::bond_experience::place_for(self.collections_dir.as_deref(), &s);
+                self.bond_exp.on_snapshot(&s.dynamics, place);
+                if let Some(note) = self.bond_exp.note.take() {
+                    self.ui.log.push(ui::logbook::LogKind::Warning, note);
+                }
                 self.snapshot = Some(*s);
                 self.record_trails();
             }
@@ -2181,11 +2192,9 @@ impl Viewer {
         if self.ui.show_trails {
             lines.extend(self.trails.lines(&shown.nuclei, self.ui.trail_fs, self.ui.trail_opacity));
         }
-        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds && self.ui.loading.is_none()) {
-            if let Some(g) = &d.bonds {
-                let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
-                lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
-            }
+        if let Some((g, looks)) = self.drawn_bonds(shown.nuclei.len()).filter(|_| self.ui.show_bonds && self.ui.loading.is_none()) {
+            let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+            lines.extend(crate::overlay::bond_lines_drawn(&pos, g, &looks));
         }
         // M7: pairs whose frozen cores overlap (the latest solve's; drawn between the nuclei as shown now,
         // only while the counts agree) — always, not a bond display option: the approximation is failing there
@@ -2193,13 +2202,37 @@ impl Viewer {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
             lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
         }
-        if let Some((marks, stale)) = self.angle_marks(shown).filter(|_| arcs) {
+        if let Some(marks) = self.angle_marks(shown).filter(|_| arcs) {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
-            for m in &marks {
-                lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), stale));
+            for (m, stale) in &marks {
+                lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), *stale));
             }
         }
         lines
+    }
+
+    /// The drawing of experience over a stale graph (`crate::bond_experience`): only with View ▸
+    /// Bonds & labels ▸ guess bonds from experience on, the snapshot's graph stale, and the drawing
+    /// made for this very snapshot.
+    pub fn experience_shown(&self) -> Option<&crate::bond_experience::Shown> {
+        let d = &self.snapshot.as_ref()?.dynamics;
+        self.bond_exp.shown().filter(|x| self.ui.guess_bonds && d.bonds_stale && x.is_for(d))
+    }
+
+    /// The bonds drawn for `n` nuclei with each one's look: experience's drawing over a stale graph
+    /// ([`Viewer::experience_shown`]), else the snapshot's graph, every bond fresh or every bond
+    /// stale. `None` without a graph of `n` nuclei. Only the bond lines, the angle arcs and the
+    /// length labels follow it: the molecule names and labels, the charges' neighbours and the
+    /// Selection panel stay the DFT graph's (`DynSnapshot::bonds`) — a bond from experience never
+    /// renames a molecule.
+    pub fn drawn_bonds(&self, n: usize) -> Option<(&sim::BondGraph, Vec<crate::overlay::BondLook>)> {
+        if let Some(x) = self.experience_shown().filter(|x| x.graph.n_nuclei == n) {
+            return Some((&x.graph, x.looks.clone()));
+        }
+        let d = &self.snapshot.as_ref()?.dynamics;
+        let g = d.bonds.as_deref().filter(|g| g.n_nuclei == n)?;
+        let look = if d.bonds_stale { crate::overlay::BondLook::Stale } else { crate::overlay::BondLook::Fresh };
+        Some((g, vec![look; g.bonds.len()]))
     }
 
     /// What the running sampling pass is solving, to be drawn instead of the scene (View ▸ Display
@@ -2237,34 +2270,35 @@ impl Viewer {
         }
     }
 
-    /// The bond angles to draw between the nuclei as drawn now (M7 Task 13), with the stale flag of
-    /// the graph (an earlier DFT step's: faded): every angle at an atom with at most
-    /// `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is selected or hovered
-    /// (any tool but Place, [`Self::hovered_nucleus`]). `None` when View ▸ bonds or ▸ bond angles is off, there is no graph, or it
-    /// belongs to another nucleus count.
-    fn angle_marks(&self, shown: &Scene) -> Option<(Vec<crate::overlay::AngleMark>, bool)> {
+    /// The bond angles to draw between the nuclei as drawn now (M7 Task 13) between the drawn bonds
+    /// ([`Viewer::drawn_bonds`]), each with its stale flag (either of its two bonds an earlier DFT
+    /// step's, drawn stale: faded): every angle at an atom with at most `ANGLE_DECLUTTER_BONDS`
+    /// bonds, those of a busier atom only while it is selected or hovered (any tool but Place,
+    /// [`Self::hovered_nucleus`]). `None` when View ▸ bonds or ▸ bond angles is off, there is no
+    /// graph, or it belongs to another nucleus count.
+    fn angle_marks(&self, shown: &Scene) -> Option<Vec<(crate::overlay::AngleMark, bool)>> {
         if !(self.ui.show_bonds && self.ui.show_angles) {
             return None;
         }
-        let d = &self.snapshot.as_ref()?.dynamics;
-        let g = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len())?;
+        let (g, looks) = self.drawn_bonds(shown.nuclei.len())?;
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         let all = crate::overlay::bond_angles(&pos, g);
         let selected = self.tool.selected.filter(|&i| i < pos.len());
-        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().cloned().collect();
-        Some((marks, d.bonds_stale))
+        let stale = |v: usize, o: usize| g.bonds.iter().zip(&looks).any(|(b, &l)| ((b.i, b.j) == (v, o) || (b.i, b.j) == (o, v)) && l == crate::overlay::BondLook::Stale);
+        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().map(|m| (m.clone(), stale(m.vertex, m.a) || stale(m.vertex, m.b))).collect();
+        Some(marks)
     }
 
     /// The angle labels of this frame (M7 Task 13): the degree text, its anchor in the world and the
     /// pill's text and background alpha — those of the molecule labels, fading with the bonds when
-    /// the graph is an earlier step's. Empty whenever [`Viewer::angle_marks`] is `None`.
+    /// either bond is an earlier step's. Empty whenever [`Viewer::angle_marks`] is `None`.
     pub fn angle_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
-        let Some((marks, stale)) = self.angle_marks(shown) else { return Vec::new() };
-        let (alpha, bg) = if stale { (110, 70) } else { (235, 150) };
+        let Some(marks) = self.angle_marks(shown) else { return Vec::new() };
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         marks
             .iter()
-            .map(|m| AngleLabel {
+            .map(|(m, stale)| (m, if *stale { (110, 70) } else { (235, 150) }))
+            .map(|(m, (alpha, bg))| AngleLabel {
                 text: crate::overlay::angle_label(m),
                 anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)),
                 alpha,
@@ -2307,16 +2341,16 @@ impl Viewer {
         if !(self.ui.show_bonds && self.ui.show_bond_lengths) {
             return Vec::new();
         }
-        let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics) else { return Vec::new() };
-        let Some(g) = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()) else { return Vec::new() };
-        let (alpha, bg) = if d.bonds_stale { (110, 70) } else { (235, 150) };
+        let Some((g, looks)) = self.drawn_bonds(shown.nuclei.len()) else { return Vec::new() };
         let focus: Vec<usize> = self.tool.selected.filter(|&i| i < shown.nuclei.len()).into_iter().chain(self.hovered_nucleus(shown)).collect();
         let all = g.bonds.len() <= BOND_LENGTH_DECLUTTER;
         g.bonds
             .iter()
-            .filter(|b| all || focus.contains(&b.i) || focus.contains(&b.j))
-            .filter(|b| b.i < shown.nuclei.len() && b.j < shown.nuclei.len())
-            .map(|b| {
+            .zip(looks)
+            .filter(|(b, _)| all || focus.contains(&b.i) || focus.contains(&b.j))
+            .filter(|(b, _)| b.i < shown.nuclei.len() && b.j < shown.nuclei.len())
+            .map(|(b, look)| {
+                let (alpha, bg) = if look == crate::overlay::BondLook::Stale { (110, 70) } else { (235, 150) };
                 let (p, q) = (shown.nuclei[b.i].pos, shown.nuclei[b.j].pos);
                 let r = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
                 AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg, key: (1, b.i, b.j, 0), value: r, ends: Some((p, q)) }
@@ -2324,11 +2358,19 @@ impl Viewer {
             .collect()
     }
 
+    /// The stale bonds' line while experience draws over them ("bonds from experience (N pairs) ·
+    /// last DFT t = … fs", `bond_experience::Shown::label`); `None` when it decided nothing (the
+    /// plain `ui::bonds_label` stands).
+    pub fn stale_bonds_line(&self) -> Option<String> {
+        self.experience_shown()?.label()
+    }
+
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
-    /// step's), and under it the faded charges' ("charges from t = … fs", `ui::charges_label`).
+    /// step's — experience's line when it draws over them), and under it the faded charges'
+    /// ("charges from t = … fs", `ui::charges_label`).
     pub fn bonds_label(&self) -> Option<String> {
         let s = self.snapshot.as_ref()?;
-        let bonds = self.ui.show_bonds.then(|| ui::bonds_label(&s.dynamics)).flatten();
+        let bonds = self.ui.show_bonds.then(|| self.stale_bonds_line().or_else(|| ui::bonds_label(&s.dynamics))).flatten();
         // the faded charges' time (estimated mode between DFT densities), under the bonds'
         let charges = self.ui.show_charges.then(|| ui::charges_label(&s.dynamics)).flatten();
         match (bonds, charges) {
@@ -2459,6 +2501,8 @@ impl Viewer {
             return;
         }
         if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels && lv.names) {
+            // the molecules are the DFT graph's, never experience's (`crate::bond_experience`): a
+            // bond guessed from experience changes the lines drawn, not a molecule's name or label
             if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
                 // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
@@ -2600,7 +2644,8 @@ impl Viewer {
         }
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
-        self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
+        let stale_bonds_line = self.stale_bonds_line();
+        self.ui.edit_group =if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
         let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;
@@ -2625,6 +2670,7 @@ impl Viewer {
                     pseudo_generating: providers::pseudo::generating(),
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
+                    stale_bonds_line: stale_bonds_line.clone(),
                     probe,
                 },
             );
@@ -2677,6 +2723,7 @@ impl Viewer {
                 pseudo_generating: providers::pseudo::generating(),
                 draft_banner: draft_banner.clone(),
                 bonds_label: bonds_label.clone(),
+                stale_bonds_line: stale_bonds_line.clone(),
                 probe,
             };
             let ui_state = &mut self.ui;
@@ -2939,6 +2986,76 @@ mod tests {
             charge_note: None,
             activity: Default::default(),
         }
+    }
+
+    /// User request 2026-11-13 (bonds from experience), the wiring: fresh graphs are recorded as the
+    /// snapshots arrive; over a stale one, a pair experience calls broken is not drawn even though
+    /// the last DFT graph had it, a pair it does not know keeps the stale dashed style, a pair it
+    /// calls bonded is drawn from experience; the corner line says so, the molecules stay the DFT
+    /// graph's, and with the setting off the stale graph is drawn as before.
+    #[test]
+    fn experience_draws_over_a_stale_graph() {
+        use crate::overlay::{self, BondLook};
+        let mut v = Viewer::new("h2").unwrap();
+        let mut scene = v.scene.clone();
+        scene.nuclei.push(SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] });
+        let at = |p: [[f64; 3]; 3]| {
+            let mut s = scene.clone();
+            for (n, q) in s.nuclei.iter_mut().zip(p) {
+                n.pos = q;
+            }
+            s
+        };
+        let bond = |i, j| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.4, s: 0.5, route: sim::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 };
+        let graph = |pairs: &[(usize, usize)], t: f64| sim::BondGraph { bonds: pairs.iter().map(|&(i, j)| bond(i, j)).collect(), components: vec![vec![0, 1, 2]], step: 1, sim_time: t, n_nuclei: 3 };
+        let mut seq = 0;
+        let mut feed = |v: &mut Viewer, s: &Scene, g: sim::BondGraph, stale: bool| {
+            let mut snap = snapshot_with_bonds(s, g, stale);
+            snap.dynamics.scene = s.to_sim().unwrap();
+            snap.dynamics.forces_stale = false;
+            seq += 1;
+            snap.dynamics.seq = seq;
+            snap.backend = Backend::Estimated;
+            v.on_event_bare(SimEvent::Snapshot(Box::new(snap)));
+        };
+        // experience: an H–H pair at ≈ 1.5 Bohr bonded and at ≈ 4 Bohr not (each H with two neighbours)
+        for k in 0..3 {
+            let d = 0.02 * k as f64;
+            feed(&mut v, &at([[0.0; 3], [1.5 + d, 0.0, 0.0], [0.0, 4.0 + d, 0.0]]), graph(&[(0, 1)], 10.0), false);
+        }
+        assert_eq!(v.bond_exp.len(), 9, "three fresh graphs of three pairs");
+        // stale: 0–1 at 4.01 (the last DFT graph bonded it), 1–2 at 1.51 (it did not), 0–2 at 6 (unknown, bonded before)
+        let now = at([[0.0; 3], [4.01, 0.0, 0.0], [4.01 + 1.51, 0.0, 0.0]]);
+        feed(&mut v, &now, graph(&[(0, 1), (0, 2)], 10.0), true);
+        let (g, looks) = v.drawn_bonds(3).expect("a drawing");
+        let drawn: Vec<(usize, usize, BondLook)> = g.bonds.iter().zip(&looks).map(|(b, &l)| (b.i, b.j, l)).collect();
+        assert_eq!(drawn, vec![(0, 2, BondLook::Stale), (1, 2, BondLook::Experience)], "0–1 broken by experience, 0–2 unknown, 1–2 from experience");
+        let line = v.stale_bonds_line().expect("experience's line");
+        assert!(line.starts_with("bonds from experience (2 pairs) · last DFT t = ") && line.ends_with("· 1 unsure (dashed)"), "{line}");
+        assert_eq!(v.bonds_label().as_deref(), Some(line.as_str()));
+        // the lines: the experience bond solid (one segment per strand), the unknown one in stale pieces
+        let lines = v.overlay_lines(&now);
+        let alpha = |base: f32, rho: f64| base * (overlay::MIN_ALPHA + (1.0 - overlay::MIN_ALPHA) * overlay::strength_fraction(rho));
+        // 1–2 is new from experience: a plain bond at the weakest style
+        let exp = lines.iter().filter(|p| (p.colour[3] - alpha(overlay::EXPERIENCE_BOND_ALPHA, sim::bonds::RHO_FLOOR)).abs() < 1e-5).count();
+        assert_eq!(exp, 2 * overlay::BOND_STRANDS, "solid: one segment per strand");
+        let stale = lines.iter().filter(|p| (p.colour[3] - alpha(overlay::STALE_BOND_ALPHA, 0.2)).abs() < 1e-5).count();
+        assert!(stale > 2 * overlay::BOND_STRANDS, "the unknown bond dashed and faded ({stale})");
+        // the angle at 2 between a stale bond and one from experience: stale
+        assert!(v.angle_labels(&now).iter().all(|l| (l.alpha, l.bg) == (110, 70)) && !v.angle_labels(&now).is_empty());
+        // the molecules stay the DFT graph's
+        assert_eq!(v.snapshot.as_ref().unwrap().dynamics.bonds.as_ref().unwrap().bonds.len(), 2);
+        // the setting off: the stale graph as it was
+        v.ui.guess_bonds = false;
+        let (g, looks) = v.drawn_bonds(3).unwrap();
+        assert_eq!((g.bonds.len(), looks), (2, vec![BondLook::Stale; 2]));
+        assert!(v.stale_bonds_line().is_none());
+        // a fresh graph: drawn fresh, never guessed over
+        v.ui.guess_bonds = true;
+        feed(&mut v, &now, graph(&[(1, 2)], 20.0), false);
+        let (_, looks) = v.drawn_bonds(3).unwrap();
+        assert_eq!(looks, vec![BondLook::Fresh]);
+        assert!(v.stale_bonds_line().is_none());
     }
 
     /// Review R1: the spheres are drawn at the orbital scale only while the newest payload is the one

@@ -143,6 +143,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        stale_bonds_line: None,
         pseudo_generating: None,
         probe: None,
     }
@@ -2278,6 +2279,69 @@ fn the_refresh_after_a_drag_round_trips_through_the_profile() {
     assert!(back.auto_refresh_bonds);
     profile::apply(&mut back, "auto_refresh_bonds = nonsense\n");
     assert!(back.auto_refresh_bonds, "unreadable: the default");
+}
+
+/// User request 2026-11-13: View ▸ Bonds & labels ▸ guess bonds from experience is display state,
+/// on by default, in the profile as `guess_bonds` (an old profile without it, or an unreadable
+/// value, reads as on), put back by Reset view settings, and in Ctrl K.
+#[test]
+fn the_guess_from_experience_persists_in_the_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    assert!(st.guess_bonds, "on by default");
+    assert!(profile::capture(&st).contains("\nguess_bonds = true\n"));
+    st.guess_bonds = false;
+    let text = profile::capture(&st);
+    assert!(text.contains("\nguess_bonds = false\n"), "{text}");
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert!(!back.guess_bonds);
+    let old: String = text.lines().filter(|l| !l.starts_with("guess_bonds")).map(|l| format!("{l}\n")).collect();
+    profile::apply(&mut back, &old);
+    assert!(back.guess_bonds, "an old profile: on");
+    back.guess_bonds = false;
+    profile::apply(&mut back, "guess_bonds = maybe\n");
+    assert!(back.guess_bonds, "unreadable: the default");
+    assert!(search::ENTRIES.iter().any(|e| e.name == "Guess bonds from experience" && e.anchor == "m-bonds"), "a Ctrl K entry");
+}
+
+/// User request 2026-11-13: while experience draws over the stale bonds, the quiet line over Solve
+/// Bonds is experience's (the viewer's `stale_bonds_line`), not the plain "last DFT step" one.
+#[test]
+fn the_stale_line_is_experiences_when_it_draws() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let stale = bonds_snapshot(&scene, Backend::Estimated, true);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.auto_refresh_bonds = false;
+    let mut inp = input(&scene, Some(&stale), &cam);
+    inp.stale_bonds_line = Some("bonds from experience (1 pair) · last DFT t = 12.50 fs".into());
+    inp.bonds_label = inp.stale_bonds_line.clone();
+    fn walk(s: &egui::epaint::Shape, out: &mut String) {
+        match s {
+            egui::epaint::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let full = ctx.run_ui(raw, |root| {
+            show(root, &mut st, &inp);
+        });
+        text.clear();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut text));
+    }
+    assert!(PROBES.with(|p| p.borrow().get("bonds-stale-line").is_some()), "the line is drawn");
+    assert!(text.contains("bonds from experience (1 pair)") && !text.contains("bonds from the last DFT step"), "{text}");
 }
 
 /// User request 2026-11-13: with the bonds stale the 3D view says so in a small line just over the

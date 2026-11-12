@@ -124,17 +124,53 @@ pub fn dash_pieces(len: f32, kind: Option<(f32, f32)>, stale: bool) -> Vec<(f32,
     out
 }
 
+/// How a drawn bond is styled: from the current evaluation, an earlier DFT step's (faded and in
+/// the long stale dashes), or guessed from experience while the graph is stale
+/// (`crate::bond_experience`: solid, in [`EXPERIENCE_TINT`], at [`EXPERIENCE_BOND_ALPHA`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BondLook {
+    Fresh,
+    Stale,
+    Experience,
+}
+
+/// The "from experience" tint (user request 2026-11-13; display only): a bond experience calls
+/// bonded is drawn this much of the way from its own colour to a soft mint — enough to tell it
+/// from a fresh bond next to it, not so much that it reads as another kind (the 3D view's
+/// background is dark in both themes, and the mint stays light on a light custom background).
+pub const EXPERIENCE_TINT: [f32; 3] = [0.55, 0.92, 0.78];
+pub const EXPERIENCE_TINT_MIX: f32 = 0.6;
+/// Alpha of a bond from experience: between a stale bond's and a fresh one's — a guess, not this
+/// geometry's density.
+pub const EXPERIENCE_BOND_ALPHA: f32 = 0.7;
+
 /// The bonds of `graph` between the nuclei at `pos` (the positions drawn now — the topology of the
 /// last DFT graph between the CURRENT nuclei, spec §3.4), faded and broken into the long stale
 /// dashes ([`dash_pieces`], [`STALE_DASH`]) when `stale`. Nothing when the graph's nucleus count is
-/// not `pos.len()` (a graph with wrong indices is never drawn).
+/// not `pos.len()` (a graph with wrong indices is never drawn). The viewer draws through
+/// [`bond_lines_drawn`]; this uniform form is the tests'.
+#[cfg(test)]
 pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<LineVertex> {
+    let look = if stale { BondLook::Stale } else { BondLook::Fresh };
+    bond_lines_drawn(pos, graph, &vec![look; graph.bonds.len()])
+}
+
+/// [`bond_lines`] with each bond's own look (`looks[k]` for `graph.bonds[k]`; a missing one is
+/// stale): a bond from experience keeps its kind's pattern and its strength, solid (no stale
+/// dashes), tinted.
+pub fn bond_lines_drawn(pos: &[[f64; 3]], graph: &sim::BondGraph, looks: &[BondLook]) -> Vec<LineVertex> {
     let mut out = Vec::new();
     if graph.n_nuclei != pos.len() {
         return out;
     }
-    let base = if stale { STALE_BOND_ALPHA } else { BOND_ALPHA };
-    for b in &graph.bonds {
+    for (k, b) in graph.bonds.iter().enumerate() {
+        let look = looks.get(k).copied().unwrap_or(BondLook::Stale);
+        let stale = look == BondLook::Stale;
+        let base = match look {
+            BondLook::Fresh => BOND_ALPHA,
+            BondLook::Stale => STALE_BOND_ALPHA,
+            BondLook::Experience => EXPERIENCE_BOND_ALPHA,
+        };
         let (Some(&a), Some(&c)) = (pos.get(b.i), pos.get(b.j)) else { continue };
         let (a, c) = (Vec3::from_array(a.map(|x| x as f32)), Vec3::from_array(c.map(|x| x as f32)));
         let axis = c - a;
@@ -142,7 +178,10 @@ pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<
         if len < 1e-6 {
             continue;
         }
-        let rgb = if b.multi_centre { RING_BOND } else { BOND };
+        let mut rgb = if b.multi_centre { RING_BOND } else { BOND };
+        if look == BondLook::Experience {
+            rgb = std::array::from_fn(|i| rgb[i] + (EXPERIENCE_TINT[i] - rgb[i]) * EXPERIENCE_TINT_MIX);
+        }
         let f = strength_fraction(b.rho_bcp);
         let colour = [rgb[0], rgb[1], rgb[2], base * (MIN_ALPHA + (1.0 - MIN_ALPHA) * f)];
         let radius = BOND_RADIUS * (MIN_WIDTH + (1.0 - MIN_WIDTH) * f);
@@ -643,6 +682,35 @@ mod tests {
         assert!((widest(&fresh) - GAP).abs() < 1e-4, "fresh: only the contact's own gaps {fresh:?}");
         assert!(widest(&stale) > STALE_GAP - 1e-4, "stale: the long stale gaps between groups {stale:?}");
         assert!(stale.iter().all(|&(a, b)| !(a < 0.5 * len && 0.5 * len < b)), "the middle is a gap: {stale:?}");
+    }
+
+    /// User request 2026-11-13 (bonds from experience): in one drawing, a bond from experience is
+    /// solid — one piece per strand, no stale gap — in the mint tint at its own alpha, a closed-shell
+    /// one from experience keeps its kind's dashes, and a stale one keeps the long stale dashes; the
+    /// uniform form is the per-bond one with every bond alike.
+    #[test]
+    fn a_bond_from_experience_is_solid_and_tinted_beside_a_stale_one() {
+        let pos = [[-1.0, 0.0, 0.0], [1.06, 0.0, 0.0], [3.5, 0.0, 0.0]];
+        let g = graph(3, &[(0, 1, false), (1, 2, false)]);
+        let v = bond_lines_drawn(&pos, &g, &[BondLook::Experience, BondLook::Stale]);
+        let exp: Vec<&LineVertex> = v.iter().filter(|p| (p.colour[3] - EXPERIENCE_BOND_ALPHA).abs() < 1e-6).collect();
+        let stale: Vec<&LineVertex> = v.iter().filter(|p| (p.colour[3] - STALE_BOND_ALPHA).abs() < 1e-6).collect();
+        assert_eq!(exp.len() + stale.len(), v.len(), "every vertex is one or the other (full strength)");
+        assert_eq!(exp.len(), 2 * BOND_STRANDS, "from experience: solid, one segment per strand");
+        assert!(stale.len() > 2 * BOND_STRANDS, "stale: in pieces ({})", stale.len());
+        let tinted: [f32; 3] = std::array::from_fn(|i| BOND[i] + (EXPERIENCE_TINT[i] - BOND[i]) * EXPERIENCE_TINT_MIX);
+        assert!(exp.iter().all(|p| p.colour[..3] == tinted[..]), "the experience tint");
+        assert!(stale.iter().all(|p| p.colour[..3] == BOND[..]), "stale: the bond's own colour");
+        assert!(tinted.iter().zip(&BOND).any(|(a, b)| (a - b).abs() > 0.1), "a visible tint");
+        // a closed-shell bond from experience: its own dashes, not the stale ones
+        let contact = graph_with(2, &[(0, 1, false)], 0.02, 0.5);
+        let p = strand_pieces(&bond_lines_drawn(&pos[..2], &contact, &[BondLook::Experience]), pos[0], pos[1]);
+        let own = dash_pieces(2.06, Some((DASH, GAP)), false);
+        assert_eq!(p.len(), own.len(), "{p:?} vs {own:?}");
+        // uniform = per-bond with every look alike
+        assert_eq!(bond_lines(&pos, &g, true), bond_lines_drawn(&pos, &g, &[BondLook::Stale; 2]));
+        assert_eq!(bond_lines(&pos, &g, false), bond_lines_drawn(&pos, &g, &[BondLook::Fresh; 2]));
+        assert!(bond_lines_drawn(&pos[..2], &g, &[BondLook::Fresh; 2]).is_empty(), "another nucleus count: nothing");
     }
 
     /// User request 2026-11-13: a stale arc is the stale dash along the arc (faded); a fresh one keeps
