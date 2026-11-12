@@ -311,6 +311,8 @@ fn copy_tree_with(src: &Path, dst: &Path, copy: CopyFn) -> Result<CopyReport, St
 /// A folder that is a shared collection (`surrogate::collection`'s layout): `key.txt` and
 /// `samples.bin` in it.
 fn is_collection(d: &Path) -> bool {
+    // follows links on purpose: a collection whose files are links is still routed to
+    // `copy_collection`, which then refuses it whole rather than copying it in part
     d.join("key.txt").is_file() && d.join("samples.bin").is_file()
 }
 
@@ -328,9 +330,13 @@ fn copy_collection(from: &Path, to: &Path, key: &str, copy: CopyFn, report: &mut
         return;
     }
     let r = match copy_tree_with(from, &part, copy) {
-        Ok(r) if r.failed.is_empty() => r,
+        Ok(r) if r.failed.is_empty() && r.skipped_links.is_empty() => r,
+        // a skipped link inside a collection would leave it partly copied: whole or not at all
         Ok(r) => {
             let _ = std::fs::remove_dir_all(&part);
+            if r.failed.is_empty() {
+                report.failed.push((from.to_path_buf(), "a link inside the collection (links are not followed): not copied".to_string()));
+            }
             report.skipped_links.extend(r.skipped_links);
             report.failed.extend(r.failed);
             return;
@@ -1029,6 +1035,29 @@ mod tests {
         let r = copy_tree_new(&src, &dst).unwrap();
         assert_eq!((r.copied, r.skipped_existing, r.failed.len()), (3, 1, 0), "{r:?}");
         assert_eq!(t.read("dst/collections/h2o/history.bin"), "h");
+    }
+
+    /// Re-review N1: a link inside a collection is not followed, so the collection would arrive
+    /// part-copied; it is refused whole instead (reported as failed, no part folder left).
+    #[test]
+    fn a_collection_holding_a_link_is_refused_whole() {
+        let t = Tmp::new("colllink");
+        t.file("src/collections/h2o/key.txt", "k");
+        t.file("src/collections/h2o/samples.bin", "s");
+        t.file("elsewhere/extra.bin", "x");
+        let link = t.0.join("src/collections/h2o/extra");
+        if !dir_link(&t.0.join("elsewhere"), &link) {
+            eprintln!("a_collection_holding_a_link_is_refused_whole: no directory link could be made here; skipped");
+            return;
+        }
+        let dst = t.0.join("dst");
+        let r = copy_tree_new(&t.0.join("src"), &dst).unwrap();
+        assert!(!dst.join("collections/h2o").exists(), "{r:?}");
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert!(r.failed[0].1.contains("link"), "{r:?}");
+        assert_eq!(r.skipped_links, vec![link.clone()]);
+        assert!(parts(&dst).is_empty(), "{:?}", parts(&dst));
+        let _ = std::fs::remove_dir(&link);
     }
 
     #[test]
