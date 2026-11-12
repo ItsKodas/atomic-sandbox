@@ -88,6 +88,56 @@ fn a_forgotten_sample_is_not_fitted_and_never_released() {
     assert_eq!((s.quarantine[k], s.superseded(), s.samples()), (Q_FORGOTTEN, 0, before + 1));
 }
 
+/// Final review I1: a forgotten sample's fence is permanent (never released or superseded), so the
+/// model refuses next to it at every visit — and each agreeing teacher answer there is an ordinary
+/// one: the first is kept (as pinned above), a second at the same geometry is a copy of it and a
+/// third a hair away is thinned, as anywhere else; before, every visit added a sample.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn agreeing_answers_next_to_a_forgotten_sample_are_thinned() {
+    let mut s = window();
+    let k = 17;
+    forget(&mut s, k).unwrap();
+    s.refit().unwrap();
+    let at = |s: &SurrogateKs, stretch: f64| {
+        let smp = &s.store.as_ref().unwrap().samples[k];
+        let mut sc = dimer(1.0, [1.0, 0.0, 0.0], [0.0; 3], 1, 1);
+        for (n, p) in sc.nuclei.iter_mut().zip(&smp.pos) {
+            n.pos = *p;
+        }
+        // stretch the bond along itself, about its midpoint
+        let (a, b) = (sc.nuclei[0].pos, sc.nuclei[1].pos);
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        for c in 0..3 {
+            sc.nuclei[0].pos[c] -= 0.5 * stretch * d[c] / r;
+            sc.nuclei[1].pos[c] += 0.5 * stretch * d[c] / r;
+        }
+        sc
+    };
+    let visit = |s: &mut SurrogateKs, stretch: f64| {
+        let sc = at(s, stretch);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(s.near_quarantined(&pos, &[1, 1]), vec![k], "the forgotten sample fences (stretch {stretch})");
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+        assert!(r.stats.notes.iter().any(|n| n.contains("near forgotten samples agrees with the model") && n.contains("forgotten kept")), "{:?}", r.stats.notes);
+        assert_eq!((s.quarantine[k], s.superseded()), (Q_FORGOTTEN, 0), "never released or superseded");
+        r.stats.notes
+    };
+    let before = s.samples();
+    visit(&mut s, 0.0);
+    assert_eq!(s.samples(), before + 1, "the first agreeing answer is kept");
+    let notes = visit(&mut s, 0.0);
+    assert_eq!(s.samples(), before + 1, "the second, the same answer, is not: {notes:?}");
+    assert!(notes.iter().any(|n| n.contains("a copy of stored sample")), "{notes:?}");
+    let notes = visit(&mut s, 2e-3);
+    assert_eq!(s.samples(), before + 1, "a third a hair away is thinned: {notes:?}");
+    assert!(notes.iter().any(|n| n.contains("training spreads from a stored one")), "{notes:?}");
+    assert!(s.near_quarantined(&at(&s, 0.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]) == vec![k], "the fence stays");
+}
+
 /// Restore: back in the fit at the refit (code 0, what it had); a sample that is not forgotten is
 /// refused.
 #[test]

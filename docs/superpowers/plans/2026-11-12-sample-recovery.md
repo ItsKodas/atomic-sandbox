@@ -14,7 +14,7 @@
 - `sim::Trainable` gains forget, restore and list methods.
 - The app adds `Action::ForgetSample` / `Action::RestoreSample` and a Model-tab section.
 
-**Spec:** `docs/superpowers/specs/2026-11-12-sample-recovery-design.md` (read it first; it is the authority).
+**Spec:** `docs/superpowers/specs/2026-11-12-sample-recovery-design.md` (read it first; it is the authority). Its "Amendments (2026-11-12/13)" section records the rulings made during implementation; they override the plan where they differ.
 
 ## Global Constraints
 

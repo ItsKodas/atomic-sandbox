@@ -938,7 +938,7 @@ pub struct SampleSuspect {
 
 /// A stored sample's identity as the Model tab's Forget / Restore carry it (Task 2 fix round 1,
 /// M8): its index in the provider's store and a check value of the sample itself (the surrogate's
-/// hash of its Z and positions). The provider refuses an id whose index now holds another sample
+/// hash of its Z and the exact bits of its positions, energy and forces). The provider refuses an id whose index now holds another sample
 /// (a model switch, attach or load queued before the click) with "the sample list changed — pick
 /// it again".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

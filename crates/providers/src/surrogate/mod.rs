@@ -716,8 +716,9 @@
 //!    an analytic fixture (`tests/recovery_loo.rs`): one force-only compressed H₂ among H₃ and H₂ —
 //!    the training ranking holds 7 victims and ends untrusted, the leave-one-out ranking holds the
 //!    outlier alone and trusts. The recovery note names the worst ratio held ("3 samples
-//!    quarantined — the fit without each predicts it at up to 38× its bound, and keeping them
-//!    breaks the fit of their neighbours (…)"). **The fallback** (fix round 1, the coordinator's
+//!    quarantined — the fit without each predicts it at up to 38× its bound, and the fit without
+//!    them recovers (…)"; "…, and the fit without them passes" when its residuals and noise pass
+//!    short of the trust rule's counts). **The fallback** (fix round 1, the coordinator's
 //!    option A; `quarantine_rounds`): when the leave-one-out rounds do not recover the fit (the
 //!    residuals, the noise and the trust rule's counts), the state the rounds started from is
 //!    restored (the fit, the codes, `species_dirty`, the note) and the rounds run again ranked by the
@@ -739,7 +740,11 @@
 //!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). The holds of a
 //!    recovery that did not restore trust stay (and are written to a collection): a sample held by
 //!    the leave-one-out ranking is one the fit without it misses, so a later refit's release by
-//!    reproduction rarely takes it back — only supersede or (Task 2) the user's Restore. Not changed: the
+//!    reproduction rarely takes it back. A held sample leaves the hold only when a later fit
+//!    reproduces it (released into the fit) or a fresh agreeing teacher answer next to it
+//!    supersedes it — which ends its fence but keeps it out of the fit. The user's Restore does not
+//!    apply to it: Restore clears only a forgotten sample, and only a code-0 sample can be
+//!    forgotten. Not changed: the
 //!    rounds, the cap, the degree-cap steps, release and supersede, and the trust rule that judges
 //!    every fit;
 //! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
@@ -778,7 +783,10 @@
 //! sample in the fit (code 0) can be forgotten, so Restore returns it to exactly that; the buttons
 //! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
 //! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
-//! as before (rule 8, Task 2 fix round 1 I1).
+//! as before (rule 8, Task 2 fix round 1 I1). Its fence is therefore permanent while it stays
+//! forgotten, so an agreeing teacher answer next to it — where nothing is released or superseded —
+//! is an ordinary one: thinned and copy-checked like a variance fallback's (`admit`; final review
+//! I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`), not a new sample at every step.
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
@@ -2212,7 +2220,12 @@ impl ForceProvider for SurrogateKs {
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)
         let near = self.near_quarantined(&pos, &z);
-        if reason.is_none() && !near.is_empty() {
+        // refused by the fence alone (final review I1): its answer is thinned and copy-checked as a
+        // variance fallback's is — which reaches `admit`'s checks only where forgotten samples
+        // alone fence (a held one is released or superseded by an agreeing answer, and a
+        // disagreeing one is never kept but by a fence vote)
+        let by_fence = reason.is_none() && !near.is_empty();
+        if by_fence {
             reason = Some(Refusal::new(
                 format!(
                     "surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)",
@@ -2308,8 +2321,8 @@ impl ForceProvider for SurrogateKs {
                 // the variance rules' fallbacks are the answers active learning asks for, and so
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
                 // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
-                thin: (by_envelope || by_class) && !class_short && !forced,
-                dedup: (by_envelope || by_class || by_audit_fence) && !forced,
+                thin: (by_envelope || by_class || by_fence) && !class_short && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence || by_fence) && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
                 audit,

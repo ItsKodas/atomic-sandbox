@@ -1239,24 +1239,35 @@ impl SurrogateKs {
             // Restore clears it (spec R2)
             let movable: Vec<usize> = near.iter().copied().filter(|&i| !self.is_forgotten(i)).collect();
             let kept_forgotten = near.len() - movable.len();
-            for i in movable {
-                let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
-                if self.reproduces_sample(&s) {
-                    self.quarantine[i] = self.released_code(i);
-                    released += 1;
-                } else {
-                    self.quarantine[i] = Q_SUPERSEDED;
-                    superseded += 1;
+            // only forgotten samples fence here (final review I1): nothing is released or
+            // superseded, so the fence stays and the model goes on refusing here for as long as
+            // they stay forgotten — the answer is an ordinary agreeing one and goes to the
+            // thinning and copy checks below (the caller thins and deduplicates a fence's
+            // answers, `evaluate`'s `by_fence`), instead of a new sample at every step
+            if movable.is_empty() {
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); the answer is thinned and copy-checked like any other"
+                ));
+            } else {
+                for i in movable {
+                    let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
+                    if self.reproduces_sample(&s) {
+                        self.quarantine[i] = self.released_code(i);
+                        released += 1;
+                    } else {
+                        self.quarantine[i] = Q_SUPERSEDED;
+                        superseded += 1;
+                    }
                 }
+                if released + superseded > 0 {
+                    self.species_dirty = true; // the fit's sample set changed: rebuild
+                }
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near {samples} agrees with the model — {released} released, {superseded} superseded{}",
+                    if kept_forgotten > 0 { format!(", {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back)") } else { String::new() }
+                ));
+                return yes(TeachOutcome::KeptReleased { released, superseded });
             }
-            if released + superseded > 0 {
-                self.species_dirty = true; // the fit's sample set changed: rebuild
-            }
-            notes.push(format!(
-                "surrogate: a fresh teacher answer near {samples} agrees with the model — {released} released, {superseded} superseded{}",
-                if kept_forgotten > 0 { format!(", {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back)") } else { String::new() }
-            ));
-            return yes(TeachOutcome::KeptReleased { released, superseded });
         }
         // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are
         // kept — but never a copy where copies could satisfy the rule (`is_label_copy`; round 1 of
@@ -1351,7 +1362,8 @@ impl SurrogateKs {
     }
 
     /// The identity of stored sample `i` the Model tab's buttons carry ([`sim::SampleId`]; fix
-    /// round 1, M8): its index and [`sample_key`] of its Z and positions. `None` for no such sample.
+    /// round 1, M8): its index and [`sample_key`] of its Z and the bits of its positions, energy
+    /// and forces. `None` for no such sample.
     pub fn sample_id(&self, i: usize) -> Option<sim::SampleId> {
         let s = self.store.as_ref()?.samples.get(i)?;
         Some(sim::SampleId { index: i, key: sample_key(s) })

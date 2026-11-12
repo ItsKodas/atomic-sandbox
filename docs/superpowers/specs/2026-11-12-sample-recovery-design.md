@@ -100,3 +100,18 @@ No tolerance moves.
 - Persisting the recovery's `degree_cap`.
 - The margin display.
 - The re-solve duplicate check.
+
+## Amendments (2026-11-12/13)
+
+Rulings made during implementation and review (the ledger `.superpowers/sdd/2026-11-12-sample-recovery/progress.md` holds each with its reasoning). Where they differ from the text above, they win.
+
+- **R1, option A.** The leave-one-out rounds run first. When they do not recover the fit (residuals, noise and the trust rule's counts), the state the rounds started from is restored and the old training-residual rounds run from it. Their result stands only if it recovers; otherwise the leave-one-out result stands. The recovery is never worse than before R1, at up to 5 extra fits on a refit that is failing anyway. Options C and D were rejected (C changes release, outside R1; D changes the path state).
+- **Step 3 runs whenever the result is not recovered.** The default-basis retry is gated on "not recovered" (residuals, noise **or** the counts), not only on failing residuals or noise.
+- **The pre-1805 expectation was wrong.** "Fewer than 110 held, trusted" (Pinned behaviour above) came from a debug number that had no release step. The measured result: the first refit ends untrusted at 1.0185× with 128 held (the fallback 165 held at 1.46×), the next refit trusted at 0.9950× with 122 held. The numbers are pinned honestly in `crates/validate/references.md` "Leave-one-out recovery ranking".
+- **`SampleId` replaces the bare `usize`.** `Action::ForgetSample` / `RestoreSample` and the `Trainable` methods carry `sim::SampleId`: the store index plus a check value (`sample_key`, FNV-1a over Z and the bits of the positions, energy and forces). An id whose index now holds another sample is refused ("the sample list changed — pick it again").
+- **Forget only a code-0 sample.** A held, superseded, box-excluded, draft, waiting or lone sample is refused by name, so Restore (back to code 0) always restores exactly what it was.
+- **The final note wording.** The recovery note counts this refit's holds ("K samples quarantined this refit (N held in all) — …"), names the worst leave-one-out ratio held against each one's own bound (or "the 2e-3 Ha/Bohr force-noise tier" in the noise-only mode), and ends ", and the fit without them recovers" (residuals, noise and the counts pass) or ", and the fit without them passes" (residuals and noise pass, short of the counts). When the fallback stands it says "ranked by their own training residual (the leave-one-out ranking did not recover the fit)". The old clause "and keeping them breaks the fit of their neighbours" overclaimed and is gone. Notes next to a forgotten sample say "forgotten", not "quarantined".
+- **Rule 8 holds.** The failed-audit drop list excludes code 7: forgetting the sample of a failed audit does not lift the global untrust; the audit is re-judged at every refit as before.
+- **Holds made by a failed recovery persist** (and are written to a collection). A held sample leaves the hold only when a later fit reproduces it (released) or a fresh agreeing answer next to it supersedes it, which ends its fence but keeps it out of the fit. Restore does not apply to a held sample.
+- **Answers next to a forgotten sample are thinned** (final review I1). A forgotten sample's fence is permanent, so an agreeing teacher answer fenced by forgotten samples alone goes through the normal thinning and copy checks instead of being kept at every step.
+- **Not in this branch:** `box_blocks_trust` subtracting a forgotten box-affected sample twice (a diagnostic line only, below the trust floor) is a follow-up.
