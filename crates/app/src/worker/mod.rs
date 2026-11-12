@@ -878,7 +878,7 @@ fn worker(
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
         // round's pacing or the wait above was the round's, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && views_wake.is_none()) else {
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && views_wake.is_none()) else {
             w.retire();
             return;
         };
@@ -937,7 +937,8 @@ impl Worker {
         let pass_only = pre.paused && pre.pending_steps == 0 && !pre.forces_stale;
         let done_before = pre.sampling.as_ref().map(|p| (p.done, p.skipped));
         drop(fresh);
-        self.set_busy(will_work);
+        // a background refit in flight is work: the view shows it until the new model stands
+        self.set_busy(will_work || self.refit_started.is_some());
         let t0 = Instant::now();
         let mut snap = self
             .dy
@@ -963,7 +964,8 @@ impl Worker {
             // paused with a reference solving off the stepping path: poll it once a budget
             polls_references_only(&snap).then_some(t0 + budget)
         };
-        if self.refit_if_pending(&snap) {
+        let refitted = self.refit_if_pending(&snap);
+        if refitted {
             // the refit's note is in the driver now: publish it with this snapshot
             let d = self.dy.snapshot();
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
@@ -976,7 +978,9 @@ impl Worker {
         // the retry above): poll it once a budget, like a bond reference — else its answer waits in
         // the auditor's channel for the next command (final review I1)
         self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
-        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending);
+        // (a background refit in flight is polled once a budget too: paused, nothing else would
+        // wake the worker to install it)
+        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending || self.refit_started.is_some());
         if polling && self.pace_until.is_none() {
             self.pace_until = Some(t0 + budget);
         }
@@ -987,7 +991,7 @@ impl Worker {
         // change counter moves when a side payload lands)
         // (a training-view build that has come due is not nothing: it publishes, activity final review M7)
         let views_due = self.views_wake().is_some_and(|t| Instant::now() >= t);
-        let quiet = !applied && !events && !views_due && self.idle_polling && polling && reference_key(&snap) == reference_key(&self.last);
+        let quiet = !applied && !events && !views_due && !refitted && self.idle_polling && polling && reference_key(&snap) == reference_key(&self.last);
         self.idle_polling = polling;
         if !quiet {
             self.publish(snap);
@@ -1109,7 +1113,7 @@ impl Worker {
 
     fn publish(&mut self, snap: DynSnapshot) {
         self.track_cost(&snap);
-        let working = has_work(&snap);
+        let working = has_work(&snap) || self.refit_started.is_some();
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }
