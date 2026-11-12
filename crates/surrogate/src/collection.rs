@@ -212,7 +212,7 @@ const FLAG_NO_ENERGY: u16 = 2;
 const SAMPLE_FLAGS_KNOWN: u16 = FLAG_FORCE_MASK | FLAG_NO_ENERGY;
 /// The largest record accepted (a hostile or damaged length prefix is not followed past this):
 /// 64 MiB ≈ a 1.3-million-atom sample.
-const MAX_RECORD: usize = 1 << 26;
+pub const MAX_RECORD: usize = 1 << 26;
 
 /// One stored teacher answer and where it came from.
 #[derive(Clone, Debug, PartialEq)]

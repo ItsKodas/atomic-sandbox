@@ -28,7 +28,8 @@ pub fn hex(d: &[u8; 32]) -> String {
 }
 
 fn unhex(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 || !s.is_ascii() {
+    // hex digits only (`from_str_radix` alone would take a leading `+`)
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -160,24 +161,24 @@ mod tests {
     fn sums_entries_are_read_strictly() {
         let (a, b) = (sha256(b"a"), sha256(b"b"));
         let check = |sums: String, d: &[u8; 32]| verify(sums.as_bytes(), &signed(&sums), "x.exe", d, TEST_KEY);
-        // sha256sum's binary mode, upper-case hex and CRLF lines read
-        assert_eq!(check(format!("{}  y.exe
-{} *x.exe
-", hex(&b), hex(&a).to_uppercase()), &a), Ok(()));
+        // CRLF lines (a sums file written on Windows), sha256sum's binary mode and upper-case hex read
+        let crlf = format!("{}  y.exe\r\n{} *x.exe\r\n", hex(&b), hex(&a).to_uppercase());
+        assert!(crlf.contains("\r\n"));
+        assert_eq!(check(crlf, &a), Ok(()));
+        assert_eq!(check(format!("{}  x.exe\r\n", hex(&a)), &a), Ok(()), "a CRLF line's name is not `x.exe\\r`");
         // listed twice with the same sum is fine; with another sum it is refused
-        assert_eq!(check(format!("{0}  x.exe
-{0}  x.exe
-", hex(&a)), &a), Ok(()));
-        let e = check(format!("{}  x.exe
-{}  x.exe
-", hex(&a), hex(&b)), &a).unwrap_err();
+        assert_eq!(check(format!("{0}  x.exe\n{0}  x.exe\n", hex(&a)), &a), Ok(()));
+        let e = check(format!("{}  x.exe\n{}  x.exe\n", hex(&a), hex(&b)), &a).unwrap_err();
         assert!(e.contains("twice"), "{e}");
         // a name that only contains it, and a malformed sum, are not its entry
-        assert!(check(format!("{}  x.exe.part
-{}  old-x.exe
-", hex(&a), hex(&a)), &a).unwrap_err().contains("isn't listed"));
-        assert!(check(format!("{}  x.exe
-", &hex(&a)[..60]), &a).unwrap_err().contains("isn't a SHA-256"));
+        assert!(check(format!("{}  x.exe.part\n{}  old-x.exe\n", hex(&a), hex(&a)), &a).unwrap_err().contains("isn't listed"));
+        assert!(check(format!("{}  x.exe\n", &hex(&a)[..60]), &a).unwrap_err().contains("isn't a SHA-256"));
+        // hex digits only: a `+` sign (which `from_str_radix` would take) or a non-hex letter is refused
+        let plus = format!("+{}", &hex(&a)[1..]);
+        assert!(check(format!("{plus}  x.exe\n"), &a).unwrap_err().contains("isn't a SHA-256"));
+        assert_eq!(unhex(&format!("+a{}", &hex(&a)[2..])), None);
+        assert_eq!(unhex(&format!("g{}", &hex(&a)[1..])), None);
+        assert_eq!(unhex(&hex(&a)), Some(a));
         assert_eq!(unhex("zz"), None);
     }
 

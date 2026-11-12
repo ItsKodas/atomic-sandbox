@@ -2,8 +2,8 @@
 //! [`Release`]s, and the choices the Version panel makes from them (module doc of `update`).
 //!
 //! Tags follow semver with a leading `v`: `vX.Y.Z` is a release, `vX.Y.Z-beta.N` a pre-release
-//! (installer spec, "Versions"). A tag that is not a version is skipped, not an error: one odd
-//! release never hides the rest. Drafts are skipped (they are not public). A release counts as a
+//! (installer spec, "Versions"). A tag that is not a version, or an entry of another shape (no
+//! tag, an asset without its URL), is skipped, not an error: one odd release never hides the rest. Drafts are skipped (they are not public). A release counts as a
 //! pre-release when GitHub marks it so **or** its version has a pre-release part, so a mis-marked
 //! beta never reaches the Stable channel.
 
@@ -140,9 +140,14 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, CheckError> {
         }
         return Err(CheckError::Malformed(format!("GitHub said: {message}")));
     }
-    let raw: Vec<GhRelease> = serde_json::from_value(value).map_err(|e| CheckError::Malformed(e.to_string()))?;
-    let mut out: Vec<Release> = raw
+    let serde_json::Value::Array(entries) = value else {
+        return Err(CheckError::Malformed("not a list of releases".into()));
+    };
+    // entry by entry: one oddly shaped release (no tag, an asset without its URL) is skipped, not
+    // the whole list (module doc)
+    let mut out: Vec<Release> = entries
         .into_iter()
+        .filter_map(|e| serde_json::from_value::<GhRelease>(e).ok())
         .filter(|r| !r.draft)
         .filter_map(|r| {
             let version = tag_version(&r.tag_name)?;
@@ -220,6 +225,26 @@ mod tests {
         assert_eq!(setup.url, "https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/AtomicSandbox-Setup-0.2.0.exe");
         assert!(rs[1].prerelease);
         assert_eq!((rs[2].version.clone(), rs[2].prerelease, rs[2].notes.as_str()), (v("0.1.0"), false, ""), "a null body is empty notes");
+    }
+
+    /// Review M2: a tag that isn't `v<semver>` and an entry of another shape are skipped; the rest
+    /// of the list still reads.
+    #[test]
+    fn odd_tags_and_entries_are_skipped_not_fatal() {
+        let json = r#"[
+            {"tag_name":"nightly","draft":false,"prerelease":false,"assets":[]},
+            {"tag_name":"v1.2","draft":false,"prerelease":false,"assets":[]},
+            {"tag_name":"0.5.0","draft":false,"prerelease":false,"assets":[]},
+            {"name":"no tag at all","draft":false,"assets":[]},
+            {"tag_name":"v0.6.0","assets":[{"name":"x.exe","size":3}]},
+            {"tag_name":"v0.4.0","draft":false,"prerelease":false,"published_at":"2026-12-24T00:00:00Z","assets":[]},
+            42
+        ]"#;
+        let rs = parse_releases(json).unwrap();
+        assert_eq!(rs.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(), ["v0.4.0"]);
+        assert_eq!(rs[0].date, "2026-12-24");
+        assert_eq!(parse_releases("[]"), Ok(Vec::new()));
+        assert!(matches!(parse_releases("\"a string\""), Err(CheckError::Malformed(_))));
     }
 
     #[test]
