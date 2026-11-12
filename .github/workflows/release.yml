@@ -154,6 +154,9 @@ jobs:
           # version ("Inno Setup 6 Command-Line Compiler"): the installer's SHA-256 above is what pins
           # 6.6.1; this only confirms the copy installed is an Inno Setup 6 compiler
           $banner = (& $iscc '/?' 2>&1 | Out-String)
+          # `ISCC /?` exits non-zero after printing its usage; Actions' pwsh wrapper would end the
+          # step with that code, so it is cleared once the banner is read
+          $global:LASTEXITCODE = 0
           Write-Output "ISCC.exe: $iscc"
           if ($banner -notmatch 'Inno Setup 6') {
             Write-Output "::error::$iscc is not an Inno Setup 6 compiler. Its banner: $($banner.Trim() -split "`n" | Select-Object -First 3)"
