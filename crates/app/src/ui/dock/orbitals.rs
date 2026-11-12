@@ -306,10 +306,20 @@ impl RowView {
     }
 
     /// One row for a closed shell's pair ([`paired`]; user request 2026-11-11): the ↑ member's ε
-    /// and tags, the two occupations summed (H₂'s σ_g reads 2; a fractional shell sums its two
-    /// fractions).
+    /// and plain tags, the two occupations summed (H₂'s σ_g reads 2; a fractional shell sums its
+    /// two fractions), and the warning tags of both members (final review M1: a caveat is never
+    /// hidden — `not_converged` and the box tags come from each channel's own eigensolve, so the ↓
+    /// member's can differ). A warning both members carry is shown once; one only a member carries
+    /// is prefixed with its arrow ("↓ not converged (residual 3.0e-4)").
     pub fn pair(up: &OrbitalInfo, dn: &OrbitalInfo, levels: &Levels) -> RowView {
-        RowView { occupation: occupation_text(up.occupation + dn.occupation), ..RowView::of(up, levels) }
+        let u = RowView::of(up, levels);
+        let d = RowView::of(dn, levels);
+        let has = |v: &RowView, t: &Tag| v.tags.iter().any(|x| x.warn && x.text == t.text);
+        let marked = |t: &Tag, s: Spin| Tag { text: format!("{} {}", arrow(s), t.text), tip: format!("the {} orbital of this pair only: {}", arrow(s), t.tip), warn: true };
+        // the ↑ member's tags in their order, then the warnings only the ↓ member carries
+        let mut tags: Vec<Tag> = u.tags.iter().map(|t| if t.warn && !has(&d, t) { marked(t, Spin::Up) } else { t.clone() }).collect();
+        tags.extend(d.tags.iter().filter(|t| t.warn && !has(&u, t)).map(|t| marked(t, Spin::Down)));
+        RowView { occupation: occupation_text(up.occupation + dn.occupation), tags, ..u }
     }
 
     /// The label's tooltip: what is on screen when this orbital is picked.

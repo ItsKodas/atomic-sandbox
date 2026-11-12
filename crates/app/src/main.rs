@@ -819,7 +819,10 @@ impl App {
     fn sync_popout(&mut self, el: &ActiveEventLoop) {
         let want = self.viewer.ui.capture.popout;
         if !want {
-            self.popout = None;
+            if self.popout.take().is_some() {
+                // a closed window leaves the drag's z-order (final review M7)
+                self.z.retain(|w| *w != Win::Popout);
+            }
             return;
         }
         let (Some(g), None) = (&self.gfx, &self.popout) else { return };
@@ -972,6 +975,7 @@ impl App {
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 self.popout = None;
+                self.z.retain(|w| *w != Win::Popout);
                 self.viewer.ui.capture.popout = false;
             }
             WindowEvent::Focused(f) => {

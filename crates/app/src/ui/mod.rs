@@ -759,7 +759,7 @@ pub struct UiState {
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
     pub graph_series: GraphSeries,
     pub graph_all: bool,
-    /// The session log (Log tab, toasts, the strip's counter) and its filter.
+    /// The session log (the Log panel and its tab's unread count, toasts) and its filter.
     pub log: LogBook,
     pub log_filter: LogFilter,
     /// The Ctrl K control search, and the control it last revealed.
@@ -1285,7 +1285,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
     }
     keys(root.ctx(), st, &mut acts);
-    // the activity headline (the chip, the bar, the strip's peek): rebuilt at most every 100 ms
+    // the activity headline (the chip, the bar, the Activity tab's hover peek): rebuilt at most every 100 ms
     let reference = st.activity.current_reference();
     st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
     let compact = root.available_width() < COMPACT_WIDTH;

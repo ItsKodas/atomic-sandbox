@@ -2862,6 +2862,47 @@ mod orbital_viewer {
         assert!(has("↑ spin · 1 occupied") && has("↓: none occupied") && !has("↑↓ paired"), "{texts:?}");
     }
 
+    /// A folded ↑↓ row never hides a member's caveat (final review M1): a warning only the ↓
+    /// member carries (its own display eigensolve stopped at the cap) is drawn on the pair's row
+    /// with its arrow; one both carry is drawn once, unmarked; the ↑ member's plain tags stay.
+    #[test]
+    fn a_folded_pair_shows_the_down_members_warnings() {
+        let mut o = h2_closed();
+        o.rows[2].not_converged = true;
+        o.rows[2].residual = Some(3e-4);
+        let l = Levels::of(&o.rows);
+        let v = RowView::pair(&o.rows[0], &o.rows[2], &l);
+        let texts: Vec<&str> = v.tags.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.contains(&"HOMO"), "the ↑ member's plain tags stay: {texts:?}");
+        let nc: Vec<_> = v.tags.iter().filter(|t| t.text.contains("not converged")).collect();
+        assert_eq!(nc.len(), 1, "{texts:?}");
+        assert_eq!(nc[0].text, "↓ not converged (residual 3.0e-4)");
+        assert!(nc[0].warn && nc[0].tip.starts_with("the ↓ orbital of this pair only"), "{:?}", nc[0]);
+        // both members not converged: one tag, no arrow
+        let mut both = o.rows.clone();
+        both[0].not_converged = true;
+        both[0].residual = Some(3e-4);
+        let v = RowView::pair(&both[0], &both[2], &Levels::of(&both));
+        let nc: Vec<_> = v.tags.iter().filter(|t| t.text.contains("not converged")).map(|t| t.text.as_str()).collect();
+        assert_eq!(nc, ["not converged (residual 3.0e-4)"], "the same warning is shown once");
+        // on screen: the pair's row carries the ↓ member's warning
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+        assert!(has("#1 ↑↓") && has("↓ not converged (residual 3.0e-4)"), "{texts:?}");
+    }
+
     /// Every pinned honesty string is in the text its widget shows (tooltips are built by these
     /// functions and constants; the layout test draws them).
     #[test]
