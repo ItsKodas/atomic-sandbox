@@ -41,6 +41,7 @@ mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
+pub mod version;
 mod workspace;
 
 pub use actions::Action;
@@ -819,6 +820,10 @@ pub struct UiState {
     /// test can stand in an installed build with a temporary root.
     pub data_mode: crate::paths::DataMode,
     pub data_root: Option<std::path::PathBuf>,
+    /// Help ▸ Version… and the top bar's chip (`version`, installer Task 4): the releases list,
+    /// the check, the one download, the restart guard; the channel and Check automatically are
+    /// kept in the profile.
+    pub update: version::UpdateState,
 }
 
 /// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
@@ -1027,6 +1032,7 @@ impl UiState {
             import_data: None,
             data_mode: crate::paths::mode(),
             data_root: crate::paths::user_root(),
+            update: version::UpdateState::default(),
         }
     }
 
@@ -1296,6 +1302,9 @@ pub struct PanelOutput {
     /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
     /// changes, so the old one never starts solving it.
     pub switch_scene: Option<Scene>,
+    /// Restart now went past its guard (`version::restart`): the viewer saves the session, hands
+    /// the verified installer off and closes the app (`Viewer::restart_for_update`).
+    pub restart_for_update: bool,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
@@ -1356,11 +1365,14 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     files::show_save(root.ctx(), st, input, &mut acts);
     crate::builder::ui::show(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
+    version::show(root.ctx(), st, &mut acts);
     profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
+    // the updater's threads (the check, the download, a manifest) and a restart waiting on a job
+    version::tick(root.ctx(), st, input, &mut out);
     window_requests(st, &mut out);
     out
 }

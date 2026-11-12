@@ -487,6 +487,9 @@ pub struct Viewer {
     /// (`DynCommand::SetClock`): a session resumed after an update (`--resume-session`,
     /// `update::apply::Session`); `None` = time starts at 0, as for any new run.
     pub resume_clock: Option<f64>,
+    /// The installer is running ([`Viewer::restart_for_update`]): `main` closes the app through
+    /// its own clean-exit path (the profile flushed, the window gone), as for the close button.
+    pub close_for_update: Option<crate::update::CloseForUpdate>,
 }
 
 impl Viewer {
@@ -549,6 +552,7 @@ impl Viewer {
             collections_dir: None,
             resume_next: None,
             resume_clock: None,
+            close_for_update: None,
         })
     }
 
@@ -1296,6 +1300,9 @@ impl Viewer {
         for cmd in out.commands {
             self.send(cmd);
         }
+        if out.restart_for_update {
+            self.restart_for_update();
+        }
         if let Some(resume) = out.training {
             // it switches the solver itself (and says so)
             return self.resume_training(resume);
@@ -1307,6 +1314,31 @@ impl Viewer {
                 self.backend.label()
             ));
         }
+    }
+
+    /// Restart now, past its guard (`ui::version`; installer Task 4): the scene and its settings
+    /// saved as the session file (`update::save_session`, under the per-user root's `updates\`),
+    /// then the verified installer started (`update::hand_off`) and the app asked to close
+    /// ([`Viewer::close_for_update`]). Anything refused is the error line, and the app stays.
+    fn restart_for_update(&mut self) {
+        match self.hand_off_update() {
+            Ok(close) => {
+                self.close_for_update = Some(close);
+                self.ui.set_status("the installer is starting: the app closes and reopens updated, paused where you left it");
+            }
+            Err(e) => self.last_error = Some(format!("restart to update: {e}")),
+        }
+    }
+
+    fn hand_off_update(&self) -> Result<crate::update::CloseForUpdate, String> {
+        let verified = self.ui.update.verified().ok_or("nothing is downloaded and verified yet")?;
+        if self.ui.data_mode != crate::paths::DataMode::Installed {
+            return Err("only the installed build updates itself".into());
+        }
+        let root = self.ui.data_root.as_ref().ok_or("there is no per-user folder (LOCALAPPDATA isn't set)")?;
+        let session = root.join("updates").join(crate::update::apply::SESSION_FILE);
+        crate::update::save_session(self, &session)?;
+        crate::update::hand_off(&verified, &session)
     }
 
     /// Starts a Select-drag of nucleus `index` (the button went down on it). Nothing is sent

@@ -399,6 +399,10 @@ fn main() {
     // root, once (`paths`; dev and portable builds keep their folders beside the exe)
     if paths::mode() == paths::DataMode::Installed {
         paths::seed_installed();
+        // the updater's leftovers in `updates\` only: stale downloads, installers of other versions
+        if let (Some(dir), Ok(current)) = (update::apply::updates_dir(), semver::Version::parse(env!("CARGO_PKG_VERSION"))) {
+            update::clean_updates(&dir, &current);
+        }
     }
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
@@ -579,6 +583,9 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    // the window's automatic update checks (at launch, then every 6 hours; never in a build from
+    // source, nor headless: `ui::version`)
+    viewer.ui.update.background = true;
     // after the profile and the flags: the session's scene and settings win, paused
     let resumed = session.is_some();
     if let Some(s) = session {
@@ -1102,7 +1109,9 @@ impl App {
         // the detached windows' panels are drawn in the same frame, from the same state (spec D-12)
         let windows = self.detached.iter_mut().map(|d| (d.id, d.egui.clone(), d.take_input())).collect();
         let (mut out, detached_out) = self.viewer.run_ui_with(raw, windows);
-        match frame::take_cmd() {
+        // Restart now handed off to the installer (`Viewer::close_for_update`): the close button's path
+        let cmd = frame::take_cmd().or_else(|| self.viewer.close_for_update.take().map(|_installer_waits| frame::Cmd::Close));
+        match cmd {
             Some(frame::Cmd::Minimise) => window.set_minimized(true),
             Some(frame::Cmd::ToggleMaximise) => window.set_maximized(!window.is_maximized()),
             Some(frame::Cmd::Close) => {

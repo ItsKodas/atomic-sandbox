@@ -17,7 +17,9 @@
 //!   downloads — blocking, for worker threads only.
 //! - [`apply`] (Task 3): the background [`Download`] (to `.part`, verified, then renamed), the
 //!   [`Session`] saved before a restart and read back by `--resume-session`, and the hand-off to
-//!   the silent installer ([`hand_off`]).
+//!   the silent installer ([`hand_off`]); the startup cleanup of `updates\` ([`clean_updates`]).
+//! - The Version panel, the top bar's "vX available" chip, the background check and the restart
+//!   guard (Task 4) are the UI's: `ui::version`.
 //!
 //! Tests run offline against the recorded answers in `fixtures/` (that folder is `-text` in
 //! `.gitattributes`: the signed bytes must not change at checkout); `net`'s against a loopback
@@ -30,9 +32,9 @@ pub mod net;
 pub mod release;
 pub mod verify;
 
-pub use apply::{hand_off, installer_command, load_session, save_session, session_path, CloseForUpdate, Download, DownloadState, Session, Verified};
+pub use apply::{clean_updates, hand_off, installer_command, load_session, save_session, session_path, CloseForUpdate, Download, DownloadState, Session, Verified};
 pub use formats::{current_formats, downgrade_warnings, Formats};
-pub use net::fetch_releases;
+pub use net::{fetch_manifest, fetch_releases};
 pub use manifest::{Manifest, ManifestAsset};
 pub use release::{check_response, installable, newer, parse_releases, visible, Asset, Channel, CheckError, Release};
 pub use verify::verify;

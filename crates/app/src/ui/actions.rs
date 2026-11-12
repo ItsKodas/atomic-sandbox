@@ -238,6 +238,22 @@ pub enum Action {
     /// replayable: import-data` (a replay touches only its script); a replay skips it (it changes
     /// no run).
     ImportData(std::path::PathBuf),
+    /// Help ▸ Version…'s "Check for updates now" (installer Task 4, `ui::version`): GitHub's
+    /// releases list fetched on a thread of its own; a failure is one quiet line and the last list
+    /// stays. Any build (a build from source lists only). Recorded as `# not replayable: update`;
+    /// a replay skips it (it never touches the network).
+    CheckUpdates,
+    /// An entry's "Install and restart" (or an older one's "Install … anyway", after its downgrade
+    /// warnings): that release's installer downloaded and verified in the background, cancelling
+    /// another download. The installed build only. Recorded as `# not replayable: update`.
+    InstallVersion(String),
+    /// "Restart now" once the download is verified, through the restart guard (an unsaved model
+    /// first, then a running job: `ui::version`): the session saved, the installer handed off, the
+    /// app closed. Recorded as `# not replayable: update`.
+    RestartToUpdate,
+    /// The download's Cancel ("Cancelling…" until it has stopped; a waiting restart is called off).
+    /// Recorded as `# not replayable: update`.
+    CancelUpdateDownload,
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did. ⚠ Model only
@@ -605,6 +621,10 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
                 }
             }
         }
+        Action::CheckUpdates => super::version::check_now(st),
+        Action::InstallVersion(tag) => super::version::install(st, &tag, out),
+        Action::RestartToUpdate => super::version::restart(st, input, out),
+        Action::CancelUpdateDownload => super::version::cancel_download(st),
         Action::DiscardTraining => {
             if st.resume.take().is_some() {
                 out.training = Some(false);
@@ -1132,7 +1152,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 

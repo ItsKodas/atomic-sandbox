@@ -583,6 +583,27 @@ fn import_data_records_as_a_line_a_replay_skips() {
     assert!(p.play(&mut v, &text).is_ok());
 }
 
+/// The updater's four actions (installer Task 4) are recorded as `# not replayable: update` lines
+/// (the tag in the comment) and a replay skips them with a warning: it never touches the network,
+/// downloads or installs.
+#[test]
+fn update_actions_record_as_lines_a_replay_skips() {
+    let all = [Action::CheckUpdates, Action::InstallVersion("v0.2.0".into()), Action::RestartToUpdate, Action::CancelUpdateDownload];
+    for a in &all {
+        assert_eq!(a.describe(), None, "{a:?}: no script form");
+        assert_eq!(unreplayable_kind(a), Some("update"), "{a:?}");
+    }
+    let lines: Vec<Line> = all.iter().cloned().map(Line::Action).chain([Line::Expect(Expect::Nuclei(2))]).collect();
+    let text = write(&lines);
+    assert_eq!(text.matches("# not replayable: update ").count(), 4, "{text}");
+    assert!(text.contains("InstallVersion(\"v0.2.0\")"), "the tag is in the comment: {text}");
+    assert_eq!(parse(&text).unwrap(), [vec![Line::NotReplayable("update".into()); 4], vec![Line::Expect(Expect::Nuclei(2))]].concat());
+    assert!(harmless("update"));
+    let (mut v, mut host) = morse_h2();
+    let mut p = Player::new(&mut host, (1400, 900));
+    assert!(p.play(&mut v, &text).is_ok());
+}
+
 /// `mark` and what is counted from it: the largest distance seen, the fallbacks (none on an analytic
 /// provider), the model's samples (none); a `scene` line loads a file relative to the script.
 #[test]

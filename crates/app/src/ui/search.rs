@@ -140,6 +140,7 @@ pub const ENTRIES: &[Entry] = &[
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
+    e("Version and updates", "version update upgrade downgrade install release channel stable beta check restart", Menu(M::Help), "m-version"),
     // Window (docking spec D-7)
     e("Show a panel", "window panels open reopen closed tab Model Knowledge Selection Readouts View Orbitals Log Activity Graph", Menu(M::Window), "m-panels"),
     e("Layout: One monitor", "layouts workspace arrangement preset default single screen", Menu(M::Window), "m-layout"),

@@ -7852,3 +7852,682 @@ fn import_data_runs_in_the_installed_build() {
     assert!(st.import_data.is_none());
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---- the Version panel, the chip and the restart guard (installer Task 4) ----
+//
+// No test touches the network: `UpdateState`'s default network is `version::Offline` in a test
+// build, and the tests that need answers stand in `FixtureNet` (the recorded releases, the signed
+// fixture sums, a stand-in installer from memory).
+
+mod updates {
+    use super::*;
+    use crate::update::{Channel, CheckError, DownloadState, Formats, Release};
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use version::{Guard, UpdateNet, OTHER_WINDOW, PORTABLE_REFUSED, UPDATES_OFF};
+
+    const RELEASES: &str = include_str!("../update/fixtures/releases.json");
+    const SUMS: &[u8] = include_bytes!("../update/fixtures/SHA256SUMS.txt");
+    const SIG: &[u8] = include_bytes!("../update/fixtures/SHA256SUMS.txt.minisig");
+    const TEST_KEY: &str = include_str!("../update/fixtures/TEST-ONLY.pub");
+    /// The bytes the fixture `SHA256SUMS.txt` lists as the v0.2.0 installer (`update::apply`'s tests).
+    const FIXTURE_SETUP: &[u8] = b"AtomicSandbox-Setup-0.2.0.exe: a stand-in for the installer, test only\n";
+
+    pub(super) fn releases() -> Vec<Release> {
+        crate::update::parse_releases(RELEASES).unwrap()
+    }
+
+    pub(super) fn ver(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    /// The recorded answers: the releases list (or a refusal), a manifest's formats, and the
+    /// installer from memory — held back while `gate` is set (a stalled connection).
+    pub(super) struct FixtureNet {
+        pub list: Result<Vec<Release>, CheckError>,
+        pub manifest: Result<Option<Formats>, String>,
+        pub gate: Arc<AtomicBool>,
+        pub calls: Arc<AtomicUsize>,
+    }
+
+    impl FixtureNet {
+        pub fn new() -> FixtureNet {
+            FixtureNet { list: Ok(releases()), manifest: Ok(None), gate: Arc::new(AtomicBool::new(false)), calls: Arc::new(AtomicUsize::new(0)) }
+        }
+    }
+
+    /// The installer's bytes, after the gate opens.
+    struct Gated {
+        gate: Arc<AtomicBool>,
+        bytes: &'static [u8],
+    }
+
+    impl Read for Gated {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            while self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let n = self.bytes.len().min(buf.len()).min(16);
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    impl UpdateNet for FixtureNet {
+        fn releases(&self) -> Result<Vec<Release>, CheckError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.list.clone()
+        }
+        fn manifest(&self, _: &Release) -> Result<Option<Formats>, String> {
+            self.manifest.clone()
+        }
+        fn download(&self, r: &Release, dir: std::path::PathBuf) -> Result<crate::update::Download, String> {
+            let gate = self.gate.clone();
+            let setup = crate::update::release::installer_name(&r.version);
+            let source = move |url: &str| -> Result<Box<dyn Read + Send>, String> {
+                match url.rsplit('/').next().unwrap() {
+                    "SHA256SUMS.txt" => Ok(Box::new(SUMS)),
+                    "SHA256SUMS.txt.minisig" => Ok(Box::new(SIG)),
+                    n if n == setup => Ok(Box::new(Gated { gate: gate.clone(), bytes: FIXTURE_SETUP })),
+                    n => Err(format!("no {n}")),
+                }
+            };
+            // the stand-in's size, as listed
+            let mut r = r.clone();
+            let name = crate::update::release::installer_name(&r.version);
+            r.assets.iter_mut().filter(|a| a.name == name).for_each(|a| a.size = FIXTURE_SETUP.len() as u64);
+            crate::update::Download::start_with(&r, dir, Box::new(source), TEST_KEY)
+        }
+    }
+
+    /// A temporary per-user root for an installed build standing in (its `updates\` holds the
+    /// downloads).
+    pub(super) fn temp_root(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("atomic-version-ui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// `st` as an installed build with `root`, the fixture list, this build at `current`, and the
+    /// fixture network.
+    pub(super) fn installed(st: &mut UiState, root: &std::path::Path, current: &str) -> Arc<AtomicBool> {
+        let net = FixtureNet::new();
+        let gate = net.gate.clone();
+        (st.data_mode, st.data_root) = (crate::paths::DataMode::Installed, Some(root.to_path_buf()));
+        st.update.net = Arc::new(net);
+        st.update.releases = releases();
+        st.update.current = ver(current);
+        gate
+    }
+
+    /// Runs frames until the download is no longer running (at most 10 s).
+    fn wait_download(st: &mut UiState) -> DownloadState {
+        let t = std::time::Instant::now();
+        loop {
+            let s = st.update.download.as_ref().expect("a download").poll();
+            if !matches!(s, DownloadState::Running(..)) || t.elapsed().as_secs() > 10 {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Every text drawn in the third of three frames (a window sizes itself first).
+    pub(super) fn shown(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> Vec<String> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    fn has(lines: &[String], text: &str) -> bool {
+        lines.iter().any(|l| l.contains(text))
+    }
+
+    fn line_at(lines: &[String], text: &str) -> usize {
+        lines.iter().position(|l| l == text).unwrap_or_else(|| panic!("no line {text:?} in {lines:#?}"))
+    }
+
+    fn actions(outs: &[PanelOutput]) -> Vec<Action> {
+        outs.iter().flat_map(|o| o.actions.clone()).collect()
+    }
+
+    fn probed_now(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> bool {
+        PROBES.with(|p| p.borrow_mut().clear());
+        shown(ctx, st, inp);
+        PROBES.with(|p| p.borrow().contains_key(name))
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        ctx
+    }
+
+    /// The chip offers the newest release on the channel that is newer than this build — none
+    /// without a list, none when this build is the newest, a newer pre-release on Beta only — and a
+    /// click on it opens the Version panel.
+    #[test]
+    fn chip_shows_only_when_newer_on_channel() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(version::chip_text(&st.update), None, "no list yet");
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        assert_eq!(version::chip_text(&st.update).as_deref(), Some("v0.2.0 available"));
+        assert!(has(&shown(&ctx, &mut st, &inp), "v0.2.0 available"), "drawn in the top bar");
+        click_widget(&ctx, &mut st, &inp, "update-chip");
+        assert!(st.update.open, "the chip opens the Version panel");
+        st.update.open = false;
+        st.update.current = ver("0.2.0");
+        for ch in [Channel::Stable, Channel::Beta] {
+            st.update.channel = ch;
+            assert_eq!(version::chip_text(&st.update), None, "{ch:?}: v0.2.0 is the newest (its beta is older)");
+        }
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        // a pre-release newer than every release: Beta's chip only
+        let mut beta = releases().into_iter().find(|r| r.tag == "v0.2.0-beta.1").unwrap();
+        (beta.tag, beta.version) = ("v0.3.0-beta.1".into(), ver("0.3.0-beta.1"));
+        st.update.releases.insert(0, beta);
+        st.update.channel = Channel::Stable;
+        assert_eq!(version::chip_text(&st.update), None);
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        st.update.channel = Channel::Beta;
+        assert_eq!(version::chip_text(&st.update).as_deref(), Some("v0.3.0-beta.1 available"));
+        assert!(probed_now(&ctx, &mut st, &inp, "update-chip"));
+    }
+
+    /// Help ▸ Version… opens the panel: every release of the channel newest first (the draft not
+    /// listed), with its date, the running one marked "installed", the notes collapsed.
+    #[test]
+    fn version_panel_lists_newest_first_and_marks_installed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        st.update.channel = Channel::Beta;
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Help));
+        click_widget(&ctx, &mut st, &inp, "help-version");
+        egui::Popup::close_all(&ctx);
+        assert!(st.update.open, "Help ▸ Version… opens it");
+        let tags: Vec<&str> = st.update.listed().iter().map(|r| r.tag.as_str()).collect();
+        assert_eq!(tags, ["v0.2.0", "v0.2.0-beta.1", "v0.1.0"], "newest first; the draft v0.3.0 is not public");
+        let lines = shown(&ctx, &mut st, &inp);
+        let (a, b, c) = (line_at(&lines, "v0.2.0"), line_at(&lines, "v0.2.0-beta.1"), line_at(&lines, "v0.1.0"));
+        assert!(a < b && b < c, "on screen newest first: {a} {b} {c}");
+        assert_eq!(lines.iter().filter(|l| *l == "installed").count(), 1, "one entry is the running one");
+        let installed = line_at(&lines, "installed");
+        assert!(installed > c, "v0.1.0 is marked installed");
+        for date in ["2026-12-01", "2026-11-20", "2026-11-01"] {
+            assert!(lines.iter().any(|l| l == date), "{date}");
+        }
+        assert!(has(&lines, "release notes"), "the notes, collapsed");
+        assert!(!has(&lines, "Installer and in-app updates"), "collapsed: the body is not drawn");
+        assert!(has(&lines, "Atomic Sandbox v0.1.0"));
+        // the window's close button closes it
+        st.update.open = false;
+        assert!(!has(&shown(&ctx, &mut st, &inp), "v0.2.0-beta.1"));
+    }
+
+    /// Stable lists releases only; Beta (its button) lists the pre-release too, marked "beta".
+    #[test]
+    fn beta_channel_shows_prerelease() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.update.releases = releases();
+        st.update.open = true;
+        assert_eq!(st.update.channel, Channel::Stable, "Stable by default");
+        assert!(st.update.listed().iter().all(|r| !r.prerelease));
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(!has(&lines, "v0.2.0-beta.1") && !lines.iter().any(|l| l == "beta"), "{lines:#?}");
+        click_widget(&ctx, &mut st, &inp, "channel-beta");
+        assert_eq!(st.update.channel, Channel::Beta);
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(lines.iter().any(|l| l == "v0.2.0-beta.1") && lines.iter().any(|l| l == "beta"), "{lines:#?}");
+        click_widget(&ctx, &mut st, &inp, "channel-stable");
+        assert_eq!(st.update.channel, Channel::Stable);
+    }
+
+    /// An unsigned release (v0.1.0: a zip, no SHA256SUMS.txt) is listed with its Install button
+    /// disabled and the reason beside it; a click sends nothing, and the action itself refuses.
+    #[test]
+    fn unsigned_release_button_disabled_with_reason() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("unsigned");
+        installed(&mut st, &root, "0.2.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, crate::update::release::NO_SIGNATURE), "{lines:#?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.1.0");
+        assert!(actions(&outs).is_empty(), "disabled: nothing sent");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none());
+        let out = act(&mut st, &inp, Action::InstallVersion("v0.1.0".into()));
+        assert!(out.error.as_deref().is_some_and(|e| e.contains(crate::update::release::NO_SIGNATURE)), "{:?}", out.error);
+        assert!(st.update.download.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Install and restart on an older release shows its downgrade warnings first — from its
+    /// manifest when it has one (read on a thread), the generic line when it has none — and only
+    /// "Install … anyway" sends `InstallVersion`, which starts the download.
+    #[test]
+    fn install_older_shows_downgrade_warning_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("downgrade");
+        installed(&mut st, &root, "0.3.0");
+        // v0.2.0 carries a manifest: one whose scene format is older than this build's
+        let mut formats = crate::update::current_formats();
+        formats.insert(crate::update::formats::SCENE.into(), 0);
+        st.update.net = Arc::new(FixtureNet { manifest: Ok(Some(formats)), ..FixtureNet::new() });
+        st.update.open = true;
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert!(actions(&outs).is_empty(), "an older target asks first: {:?}", actions(&outs));
+        assert!(st.update.download.is_none(), "nothing started");
+        assert_eq!(st.update.confirm.as_ref().map(|c| c.tag.as_str()), Some("v0.2.0"));
+        let t = std::time::Instant::now();
+        while st.update.confirm.as_ref().is_some_and(|c| c.warnings.is_none()) && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        let w = st.update.confirm.as_ref().unwrap().warnings.clone().expect("the manifest was read");
+        assert_eq!(w, [format!("scenes saved by this version (v{}) may not open in v0.2.0", env!("CARGO_PKG_VERSION"))]);
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, "Before going back to the older v0.2.0") && has(&lines, "scenes saved by this version"), "{lines:#?}");
+        assert!(has(&lines, "Install v0.2.0 anyway"));
+        let outs = click_widget(&ctx, &mut st, &inp, "install-anyway");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        assert!(st.update.confirm.is_none() && st.update.download.is_some(), "the download started");
+        assert_eq!(wait_download(&mut st), DownloadState::Ready(root.join("updates").join("AtomicSandbox-Setup-0.2.0.exe")));
+        // no manifest: the generic warning, at once
+        st.update.download = None;
+        let mut no_manifest = releases();
+        no_manifest.iter_mut().for_each(|r| r.assets.retain(|a| a.name != "manifest.json"));
+        st.update.releases = no_manifest;
+        click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        let w = st.update.confirm.as_ref().unwrap().warnings.clone().expect("no manifest to read");
+        assert_eq!(w, ["v0.2.0 records no data formats: collections, models or profiles saved by this version may not open in it"]);
+        assert!(has(&shown(&ctx, &mut st, &inp), "v0.2.0 records no data formats"));
+        click_widget(&ctx, &mut st, &inp, "install-cancel");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none(), "Cancel: nothing starts");
+        // a newer target asks nothing
+        st.update.current = ver("0.1.0");
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A ready download in an installed build: `st` with v0.2.0 downloaded and verified.
+    fn ready(st: &mut UiState, inp: &PanelInput<'_>, root: &std::path::Path) {
+        installed(st, root, "0.1.0");
+        assert!(act(st, inp, Action::InstallVersion("v0.2.0".into())).error.is_none());
+        assert!(matches!(wait_download(st), DownloadState::Ready(_)));
+        assert!(st.update.verified().is_some());
+    }
+
+    /// Restart now while a refit runs waits ("Waiting for the refit to finish…", Cancel it and
+    /// restart / Keep waiting, the other-window note) and restarts by itself once it ends; Cancel it
+    /// and restart goes at once; a playing run is paused first; nothing restarts without a
+    /// verified download.
+    #[test]
+    fn restart_waits_for_running_refit() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let idle = input(&scene, None, &cam);
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("restart");
+        installed(&mut st, &root, "0.1.0");
+        let out = act(&mut st, &idle, Action::RestartToUpdate);
+        assert!(!out.restart_for_update && out.error.as_deref().is_some_and(|e| e.contains("nothing is downloaded")), "{:?}", out.error);
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        let out = act(&mut st, &refit, Action::RestartToUpdate);
+        assert!(!out.restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let lines = shown(&ctx, &mut st, &refit);
+        for t in ["Waiting for the refit to finish…", "Cancel it and restart", "Keep waiting", OTHER_WINDOW] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        click_widget(&ctx, &mut st, &refit, "guard-keep-waiting");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: false });
+        let lines = shown(&ctx, &mut st, &refit);
+        assert!(has(&lines, "Restarting when the refit finishes…") && has(&lines, OTHER_WINDOW));
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update, "still running: still waiting");
+        // the refit ends: the restart goes ahead by itself
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Cancel it and restart: at once, the refit still running
+        act(&mut st, &refit, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &refit, "guard-cancel-restart");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Idle);
+        // a playing run is paused first (the job in flight finishes; the restart opens paused anyway)
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let out = act(&mut st, &playing, Action::RestartToUpdate);
+        assert!(matches!(one_dyn(&out), DynCommand::Pause), "{:?}", out.commands);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        assert!(act(&mut st, &playing, Action::RestartToUpdate).commands.is_empty(), "paused once");
+        // a sampling pass is named (its model's samples asked about first: acknowledged here)
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
+        let sampling = input(&scene, Some(&snap), &cam);
+        assert_eq!(version::running(&sampling), Some("the sampling pass"));
+        st.update.guard = Guard::Idle;
+        st.update.model_ack = true;
+        act(&mut st, &sampling, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        // Cancel (the download) calls a waiting restart off
+        act(&mut st, &idle, Action::CancelUpdateDownload);
+        assert_eq!(st.update.guard, Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unsaved in-session model with no collection: Restart now first offers Save model… /
+    /// Restart anyway / Cancel (with the other-window note); Restart anyway goes on; Save model…
+    /// opens the Save window; a model in a shared collection is kept, so nothing is asked.
+    #[test]
+    fn unsaved_model_offers_save_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        assert!(version::unsaved_model(&inp), "273 samples, no collection");
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        let root = temp_root("unsaved");
+        ready(&mut st, &inp, &root);
+        st.update.open = true;
+        let out = act(&mut st, &inp, Action::RestartToUpdate);
+        assert!(!out.restart_for_update);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        let lines = shown(&ctx, &mut st, &inp);
+        for t in ["The restart won't keep this session's model", "Save model…", "Restart anyway", "Cancel", OTHER_WINDOW] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        click_widget(&ctx, &mut st, &inp, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &inp, "guard-save");
+        assert!(st.files.save_open, "the Save window, for the model");
+        assert_eq!(st.update.guard, Guard::Idle);
+        st.files.save_open = false;
+        act(&mut st, &inp, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-anyway");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update), "Restart anyway goes on");
+        // a shared collection keeps the model: no question
+        let mut m = model();
+        m.source = sim::ModelSource::Collection { slug: "h2".into(), samples: 273, read_only: false };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let kept = input(&scene, Some(&snap), &cam);
+        assert!(!version::unsaved_model(&kept));
+        assert!(act(&mut st, &kept, Action::RestartToUpdate).restart_for_update);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A portable copy offers each release's zip as a link (this repository's own asset), no
+    /// install button and no downgrade warnings; the actions refuse.
+    #[test]
+    fn portable_mode_shows_download_links() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.data_mode = crate::paths::DataMode::Portable;
+        st.update.releases = releases();
+        st.update.current = ver("0.3.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert_eq!(lines.iter().filter(|l| *l == "Download zip").count(), 2, "v0.2.0 and v0.1.0: {lines:#?}");
+        assert!(!has(&lines, "Install and restart") && !has(&lines, crate::update::release::NO_SIGNATURE));
+        assert!(PROBES.with(|p| p.borrow().contains_key("zip-v0.2.0") && p.borrow().contains_key("zip-v0.1.0")));
+        let r = st.update.releases.iter().find(|r| r.tag == "v0.2.0").unwrap();
+        assert_eq!(version::zip_link(r), Some("https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/AtomicSandbox-0.2.0-windows-x64.zip"));
+        // a zip whose address isn't its release's own is no link
+        let mut moved = r.clone();
+        moved.assets.iter_mut().filter(|a| a.name.ends_with(".zip")).for_each(|a| a.url = "https://example.com/a.zip".into());
+        assert_eq!(version::zip_link(&moved), None);
+        click_widget(&ctx, &mut st, &inp, "zip-v0.2.0");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none(), "a link only: no warnings, no download");
+        for a in [Action::InstallVersion("v0.2.0".into()), Action::RestartToUpdate] {
+            assert_eq!(act(&mut st, &inp, a).error.as_deref(), Some(PORTABLE_REFUSED));
+        }
+    }
+
+    /// A build from source lists only ("running from source: updates are off"), never checks by
+    /// itself — the window's automatic check included — and refuses the actions; Check now still
+    /// lists (here: the tests' offline network, its quiet line).
+    #[test]
+    fn dev_mode_says_updates_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(st.data_mode, crate::paths::DataMode::Dev);
+        st.update.background = true; // as the window sets it
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, UPDATES_OFF), "{lines:#?}");
+        assert!(!has(&lines, "Install and restart") && !has(&lines, "Download zip") && !has(&lines, "Restart now"));
+        assert!(lines.iter().any(|l| l == "v0.2.0"), "the list is shown");
+        assert!(!st.update.checking() && st.update.last_started.is_none(), "no automatic check from source");
+        for a in [Action::InstallVersion("v0.2.0".into()), Action::RestartToUpdate] {
+            assert_eq!(act(&mut st, &inp, a).error.as_deref(), Some(UPDATES_OFF));
+        }
+        act(&mut st, &inp, Action::CheckUpdates);
+        let t = std::time::Instant::now();
+        while st.update.checking() && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert_eq!(st.update.error.as_deref(), Some("couldn't check (offline)"));
+        assert_eq!(st.update.releases.len(), releases().len(), "the last list stays");
+    }
+
+    /// Each of the panel's buttons sends its action: Check for updates now, Install and restart,
+    /// the download's Cancel ("Cancelling…" until the stalled read lets go), Restart now.
+    #[test]
+    fn buttons_emit_actions() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("buttons");
+        let gate = installed(&mut st, &root, "0.1.0");
+        st.update.releases.clear();
+        st.update.open = true;
+        assert!(has(&shown(&ctx, &mut st, &inp), "No list yet"));
+        let outs = click_widget(&ctx, &mut st, &inp, "check-now");
+        assert_eq!(actions(&outs), [Action::CheckUpdates]);
+        let t = std::time::Instant::now();
+        while st.update.checking() && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert_eq!(st.update.releases, releases(), "the list arrived");
+        assert!(st.update.error.is_none());
+        // a stalled download
+        gate.store(true, Ordering::Relaxed);
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        assert!(matches!(st.update.download.as_ref().unwrap().poll(), DownloadState::Running(..)));
+        assert!(has(&shown(&ctx, &mut st, &inp), "downloading:"));
+        let outs = click_widget(&ctx, &mut st, &inp, "cancel-download");
+        assert_eq!(actions(&outs), [Action::CancelUpdateDownload]);
+        assert!(st.update.download.is_none() && st.update.cancelling());
+        assert!(has(&shown(&ctx, &mut st, &inp), "Cancelling…"), "until the stalled read lets go");
+        gate.store(false, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        while st.update.cancelling() && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert!(!st.update.cancelling() && !has(&shown(&ctx, &mut st, &inp), "Cancelling…"));
+        // (the job removes its .part as it ends, just after reporting)
+        let parts = || root.join("updates").read_dir().unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".part"));
+        let t = std::time::Instant::now();
+        while parts() && t.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!parts(), "the cancelled .part is gone");
+        // again, to the end: Restart now
+        click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert!(matches!(wait_download(&mut st), DownloadState::Ready(_)));
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, "Restart now") && has(&lines, OTHER_WINDOW), "{lines:#?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "restart-now");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update), "nothing running: it goes ahead");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One download at a time: starting another release's cancels the first ("Cancelling…" while
+    /// it finishes its read); the same release again is left as it is.
+    #[test]
+    fn starting_another_download_cancels_the_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("one-at-a-time");
+        let gate = installed(&mut st, &root, "0.1.0");
+        // a v0.2.1 like v0.2.0, its assets at its own addresses
+        let mut next = st.update.releases.iter().find(|r| r.tag == "v0.2.0").unwrap().clone();
+        (next.tag, next.version) = ("v0.2.1".into(), ver("0.2.1"));
+        for a in &mut next.assets {
+            a.name = a.name.replace("0.2.0", "0.2.1");
+            a.url = crate::update::net::asset_url("v0.2.1", &a.name);
+        }
+        st.update.releases.insert(0, next);
+        gate.store(true, Ordering::Relaxed);
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        assert!(!st.update.cancelling(), "the same release again: left running");
+        act(&mut st, &inp, Action::InstallVersion("v0.2.1".into()));
+        assert_eq!(st.update.download.as_ref().map(|d| d.tag()), Some("v0.2.1"));
+        assert!(st.update.cancelling(), "v0.2.0 is cancelled, finishing its read");
+        gate.store(false, Ordering::Relaxed);
+        // v0.2.1's stand-in isn't in the fixture sums: verification refuses it (nothing installed)
+        assert!(matches!(wait_download(&mut st), DownloadState::Failed(e) if e.contains("SHA256SUMS")), "fails closed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The window's automatic check (installed build, Check automatically on): at launch, then
+    /// not again until 6 hours have passed; off with the switch. A refused check keeps the last
+    /// list; a redirect the client refused is said as it is.
+    #[test]
+    fn the_automatic_check_runs_at_launch_then_every_six_hours() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("auto");
+        installed(&mut st, &root, "0.1.0");
+        let net = FixtureNet::new();
+        let calls = net.calls.clone();
+        st.update.net = Arc::new(net);
+        st.update.releases.clear();
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "headless (no window): no automatic check");
+        st.update.background = true;
+        let wait = |st: &mut UiState, ctx: &egui::Context| {
+            let t = std::time::Instant::now();
+            while st.update.checking() && t.elapsed().as_secs() < 10 {
+                shown(ctx, st, &inp);
+            }
+        };
+        shown(&ctx, &mut st, &inp);
+        wait(&mut st, &ctx);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "at launch");
+        assert_eq!(st.update.releases.len(), 3);
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "not again within 6 hours");
+        let Some(earlier) = std::time::Instant::now().checked_sub(version::CHECK_EVERY) else { return };
+        st.update.last_started = Some(earlier);
+        shown(&ctx, &mut st, &inp);
+        wait(&mut st, &ctx);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "6 hours on");
+        st.update.auto_check = false;
+        st.update.last_started = Some(earlier);
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "Check automatically off");
+        // refusals: one quiet line, the last list kept
+        st.update.open = true;
+        for (e, line) in [
+            (CheckError::RateLimited, "couldn't check (GitHub said: rate limited, try later)".to_string()),
+            (CheckError::Malformed("GitHub's releases list redirected to an unexpected host: evil.example".into()), "couldn't check: GitHub's releases list redirected to an unexpected host: evil.example".to_string()),
+            (CheckError::Malformed("not JSON (x)".into()), "couldn't check (GitHub's answer wasn't a releases list: not JSON (x))".to_string()),
+        ] {
+            assert_eq!(version::check_error_line(&e), line);
+            st.update.net = Arc::new(FixtureNet { list: Err(e), ..FixtureNet::new() });
+            act(&mut st, &inp, Action::CheckUpdates);
+            wait(&mut st, &ctx);
+            assert_eq!(st.update.error.as_deref(), Some(line.as_str()));
+            assert_eq!(st.update.releases.len(), 3, "the last list stays");
+            assert!(has(&shown(&ctx, &mut st, &inp), &line), "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The channel and Check automatically are kept in the profile (a profile without them gives
+    /// Stable and on).
+    #[test]
+    fn channel_and_auto_check_persist_in_profile() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!((st.update.channel, st.update.auto_check), (Channel::Stable, true), "the defaults");
+        let text = profile::capture(&st);
+        assert!(text.contains("update_channel = Stable\n") && text.contains("update_auto_check = true\n"), "{text}");
+        (st.update.channel, st.update.auto_check) = (Channel::Beta, false);
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!((fresh.update.channel, fresh.update.auto_check), (Channel::Beta, false));
+        // an older profile without the lines, and unreadable values: the defaults
+        let mut old = UiState::new("h2", &scene);
+        profile::apply(&mut old, "update_channel = Nightly\nupdate_auto_check = maybe\n");
+        assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
+        let defaults = profile::defaults(&old);
+        profile::apply(&mut old, &defaults);
+        assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
+    }
+}

@@ -69,6 +69,42 @@ pub fn session_path() -> Option<PathBuf> {
     updates_dir().map(|d| d.join(SESSION_FILE))
 }
 
+/// A `.part` this old is no live download's: a running job writes to its own at least every read
+/// timeout (30 s) or fails. Younger ones may be another window's download, and are left.
+pub const STALE_PART: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The startup cleanup of an installed build (plan Task 4 ruling): in `dir` (`<user root>\updates`)
+/// only, and only plain files directly in it, removes
+/// - every `*.part` older than [`STALE_PART`] (a download a killed or closed app left behind), and
+/// - every installer (`AtomicSandbox-Setup-*.exe`) but this version's own — the one that just
+///   installed it, which may still be running (it started this app) and goes at a later start.
+///
+/// The session file and anything else are left; links are never followed. Returns what was removed.
+pub fn clean_updates(dir: &Path, current: &semver::Version) -> Vec<PathBuf> {
+    clean_updates_at(dir, current, std::time::SystemTime::now())
+}
+
+fn clean_updates_at(dir: &Path, current: &semver::Version, now: std::time::SystemTime) -> Vec<PathBuf> {
+    let keep = super::release::installer_name(current);
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut removed = Vec::new();
+    for e in rd.flatten() {
+        // `DirEntry::file_type` does not follow links: a link is neither a file nor removed
+        if !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        let stale_part = name.ends_with(".part")
+            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age >= STALE_PART));
+        let old_installer = name.starts_with("AtomicSandbox-Setup-") && name.ends_with(".exe") && name != keep;
+        if (stale_part || old_installer) && std::fs::remove_file(e.path()).is_ok() {
+            removed.push(e.path());
+        }
+    }
+    removed.sort();
+    removed
+}
+
 // ---- the download ----
 
 /// Where a download's bytes come from: the reader for an asset URL, or why not. The app's is
@@ -991,5 +1027,38 @@ mod tests {
             assert!(text.contains(from), "{from}");
             assert!(Session::parse(&text.replace(from, to)).is_err(), "{from} → {to}");
         }
+    }
+
+    /// Task 4's startup cleanup: stale `.part`s and every installer but this version's go; a
+    /// fresh `.part` (another window's download), the session file, other files and a folder stay;
+    /// nothing outside the folder is touched; a missing folder is no error.
+    #[test]
+    fn startup_cleanup_removes_stale_parts_and_old_installers() {
+        let root = temp("cleanup");
+        let dir = root.join("updates");
+        std::fs::create_dir_all(dir.join("AtomicSandbox-Setup-0.0.9.exe")).unwrap(); // a folder of that name
+        for f in [
+            "AtomicSandbox-Setup-0.2.0.exe.4242-0.part",
+            "AtomicSandbox-Setup-0.1.0.exe",
+            "AtomicSandbox-Setup-0.2.0.exe",
+            "AtomicSandbox-Setup-0.3.0-beta.1.exe",
+            SESSION_FILE,
+            "notes.txt",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        std::fs::write(root.join("AtomicSandbox-Setup-0.1.0.exe"), b"outside").unwrap();
+        let now = std::time::SystemTime::now();
+        let current = semver::Version::parse("0.2.0").unwrap();
+        // the .part was just written: it may be a live download, so it stays this time
+        let removed = clean_updates_at(&dir, &current, now);
+        assert_eq!(removed, [dir.join("AtomicSandbox-Setup-0.1.0.exe"), dir.join("AtomicSandbox-Setup-0.3.0-beta.1.exe")]);
+        // two minutes on it is stale
+        let removed = clean_updates_at(&dir, &current, now + STALE_PART);
+        assert_eq!(removed, [dir.join("AtomicSandbox-Setup-0.2.0.exe.4242-0.part")]);
+        assert_eq!(files_in(&dir), ["AtomicSandbox-Setup-0.0.9.exe", "AtomicSandbox-Setup-0.2.0.exe", "notes.txt", SESSION_FILE]);
+        assert!(root.join("AtomicSandbox-Setup-0.1.0.exe").is_file(), "outside updates\\: untouched");
+        assert!(clean_updates(&root.join("nowhere"), &current).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

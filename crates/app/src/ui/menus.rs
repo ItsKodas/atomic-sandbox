@@ -95,6 +95,10 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                         ui.add_space(3.0 * CAPTION_BUTTON_W - 10.0 + 8.0);
                     }
                     hot.push(search_button(ui, st, compact).rect);
+                    // "v0.2.0 available" (installer Task 4): a newer version on the channel, beside the search
+                    if let Some(r) = super::version::chip(ui, st) {
+                        hot.push(r.rect);
+                    }
                 });
             });
             if framed {
@@ -999,6 +1003,15 @@ fn help_menu(ui: &mut Ui, st: &mut UiState) {
             }
         }
         theme::note(ui, "Each opens the long-form text (also README \"Physics, honestly\").");
+    });
+    ui.separator();
+    // the Version panel (installer Task 4): the releases, the channel, the checks, install and restart
+    anchored(ui, st, "m-version", |ui, st| {
+        let r = probed("help-version", ui.add(Button::new(format!("Version…  (v{})", st.update.current)).frame_when_inactive(false)));
+        if r.on_hover_text("the version running, the releases on GitHub, and installing another one").clicked() {
+            st.update.open = true;
+            ui.close();
+        }
     });
 }
 

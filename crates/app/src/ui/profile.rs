@@ -5,7 +5,9 @@
 //! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
 //! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
 //! `workspace::detached`), the view and density-look settings and which
-//! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
+//! of the View panel's sections are open (`view_sections = what,looks`), the units, the Version
+//! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
+//! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
 //!
@@ -54,6 +56,7 @@ pub const PROFILE_FORMAT: u32 = 1;
 const NAME_STYLES: [NameStyle; 4] = [NameStyle::Common, NameStyle::Stoichiometric, NameStyle::Hydride, NameStyle::FormulaOnly];
 const ENERGY_UNITS: [EnergyUnits; 3] = [EnergyUnits::Ha, EnergyUnits::Ev, EnergyUnits::Both];
 const TEMP_UNITS: [TempUnits; 3] = [TempUnits::K, TempUnits::C, TempUnits::F];
+const UPDATE_CHANNELS: [crate::update::Channel; 2] = [crate::update::Channel::Stable, crate::update::Channel::Beta];
 
 /// The profile of `st`, as text.
 pub fn capture(st: &UiState) -> String {
@@ -76,6 +79,9 @@ pub fn capture(st: &UiState) -> String {
         out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
     }
     out += &format!("view_sections = {}\n", st.view_sections.encode());
+    // the Version panel's display settings (installer Task 4)
+    out += &format!("update_channel = {:?}\n", st.update.channel);
+    out += &format!("update_auto_check = {}\n", st.update.auto_check);
     out
 }
 
@@ -121,6 +127,12 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
+    }
+    if let Some(v) = kv.get("update_channel").and_then(|w| pick(&UPDATE_CHANNELS, w)) {
+        st.update.channel = v;
+    }
+    if let Some(v) = kv.get("update_auto_check").and_then(|v| v.parse().ok()) {
+        st.update.auto_check = v;
     }
     // the View panel's open sections (docking Task 4); a profile from before it opens the default two
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));

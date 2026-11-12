@@ -9,6 +9,8 @@
 //!   network, DNS, TLS, a timeout — is [`CheckError::Offline`].
 //! - [`Http`]: the download job's byte [`Source`] (`apply`), refusing any URL that is not one of
 //!   this repository's release assets.
+//! - [`fetch_manifest`] (Task 4): a release's small `manifest.json`, in memory, through the same
+//!   asset rules — the Version panel's downgrade warnings.
 //!
 //! **Redirects** are never followed by the client (`redirects(0)`) but by hand ([`follow`]): at
 //! most [`MAX_REDIRECTS`] hops, each to an `https://` URL on one of [`ALLOWED_HOSTS`] exactly —
@@ -19,7 +21,8 @@
 //! 10 s to connect, 30 s for any one read — a slow download keeps going, a stalled one fails.
 
 use super::apply::Source;
-use super::release::{check_response, Asset, CheckError, Release};
+use super::manifest::Manifest;
+use super::release::{check_response, Asset, CheckError, Release, MANIFEST_NAME};
 use std::io::Read;
 use std::time::Duration;
 
@@ -173,6 +176,37 @@ pub fn check_asset(tag: &str, asset: &Asset) -> Result<(), String> {
 /// downloads the updater starts).
 pub fn is_release_asset(url: &str) -> bool {
     url.strip_prefix(ASSET_PREFIX).and_then(|rest| rest.split_once('/')).is_some_and(|(tag, name)| plain_segment(tag) && plain_segment(name))
+}
+
+/// The largest `manifest.json` taken (it is under a kilobyte).
+const MANIFEST_MAX: u64 = 1 << 20;
+
+/// A release's `manifest.json` (Task 4: the Version panel's downgrade warnings), small, in memory,
+/// through the same rules as every download (the asset's URL tied to its release, the redirects
+/// to GitHub's hosts only). `None` when the release carries none (`v0.1.0`). Blocking: call it from
+/// a worker thread.
+pub fn fetch_manifest(release: &Release) -> Result<Option<Manifest>, String> {
+    manifest_from(release, &mut Http::new())
+}
+
+/// [`fetch_manifest`] from `source` (the tests serve it from memory).
+pub(crate) fn manifest_from(release: &Release, source: &mut dyn Source) -> Result<Option<Manifest>, String> {
+    let Some(a) = release.asset(MANIFEST_NAME) else { return Ok(None) };
+    check_asset(&release.tag, a)?;
+    let r = source.open(&a.url).map_err(|e| format!("couldn't download {}: {e}", a.name))?;
+    let mut bytes = Vec::new();
+    r.take(MANIFEST_MAX + 1).read_to_end(&mut bytes).map_err(|e| format!("the download of {} stopped part-way: {e}", a.name))?;
+    if bytes.len() as u64 > MANIFEST_MAX {
+        return Err(format!("{} is larger than {MANIFEST_MAX} bytes: not a release manifest", a.name));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't text", a.name))?;
+    Manifest::parse(&text).map(Some).map_err(|e| format!("{}: {e}", a.name))
+}
+
+/// The release's page on GitHub (`…/releases/tag/<tag>`), built from the tag — never from an
+/// address in GitHub's answer — and only for a tag that is one plain path segment.
+pub fn release_page(tag: &str) -> Option<String> {
+    plain_segment(tag).then(|| format!("https://github.com/ItsKodas/atomic-sandbox/releases/tag/{tag}"))
 }
 
 /// The download job's source over HTTPS ([`super::apply::Download::start`]).
@@ -382,5 +416,39 @@ mod tests {
             let url = asset_url(tag, name);
             assert!(check_asset(tag, &asset(name, &url)).unwrap_err().contains("isn't a plain file name"), "{tag} {name}");
         }
+    }
+
+    /// Task 4: a release's `manifest.json` is read whole, in memory, from its own release's URL
+    /// only; a release without one asks for nothing; a manifest that isn't one is refused; the
+    /// release page is built from a plain tag only.
+    #[test]
+    fn a_release_manifest_is_read_through_the_asset_rules() {
+        use crate::update::parse_releases;
+        const MANIFEST: &str = include_str!("fixtures/manifest_v0.2.0.json");
+        let releases = parse_releases(include_str!("fixtures/releases.json")).unwrap();
+        let by = |t: &str| releases.iter().find(|r| r.tag == t).unwrap().clone();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let serve = |body: &'static str| {
+            let log = asked.clone();
+            move |url: &str| -> Result<Box<dyn Read + Send>, String> {
+                log.lock().unwrap().push(url.to_string());
+                Ok(Box::new(body.as_bytes()))
+            }
+        };
+        let m = manifest_from(&by("v0.2.0"), &mut serve(MANIFEST)).unwrap().expect("v0.2.0 carries one");
+        assert_eq!((m.version.as_str(), m.formats.get("sidecar")), ("0.2.0", Some(&8)));
+        assert_eq!(asked.lock().unwrap().as_slice(), ["https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/manifest.json"]);
+        asked.lock().unwrap().clear();
+        assert_eq!(manifest_from(&by("v0.1.0"), &mut serve(MANIFEST)), Ok(None));
+        assert!(asked.lock().unwrap().is_empty(), "no manifest asset: nothing asked");
+        assert!(manifest_from(&by("v0.2.0"), &mut serve("<html>not it</html>")).unwrap_err().starts_with("manifest.json: "));
+        // another address than its release's own: refused before any request
+        let mut moved = by("v0.2.0");
+        moved.assets.iter_mut().find(|a| a.name == MANIFEST_NAME).unwrap().url = "https://example.com/manifest.json".into();
+        asked.lock().unwrap().clear();
+        assert!(manifest_from(&moved, &mut serve(MANIFEST)).unwrap_err().contains("isn't this release's"));
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(release_page("v0.2.0").as_deref(), Some("https://github.com/ItsKodas/atomic-sandbox/releases/tag/v0.2.0"));
+        assert_eq!(release_page("../x"), None);
     }
 }

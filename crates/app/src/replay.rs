@@ -421,6 +421,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
         Action::Screenshot | Action::Record(_) => "capture",
         Action::ImportData(_) => "import-data",
+        Action::CheckUpdates | Action::InstallVersion(_) | Action::RestartToUpdate | Action::CancelUpdateDownload => "update",
         _ => "action",
     })
 }
@@ -430,8 +431,9 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
     // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
-    // nor an import of data folders (it copies files into the installed build's root; a replay never does)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data")
+    // nor an import of data folders (it copies files into the installed build's root; a replay never does),
+    // nor the updater's check, download and restart (a replay never touches the network or installs)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).
