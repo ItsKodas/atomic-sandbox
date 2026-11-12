@@ -375,7 +375,8 @@ pub fn profiles_dir() -> Option<std::path::PathBuf> {
 }
 
 /// The `timings` folder (completion times shipped with the repository), found like [`models_dir`]
-/// (an installed build: the root itself, which holds the user's `timings.txt`; it ships none).
+/// (an installed build: the install folder's read-only `bundled\timings`, absent while the
+/// repository commits none; the user's own `timings.txt` stays at the root).
 pub fn timings_dir() -> Option<std::path::PathBuf> {
     crate::paths::dir(crate::paths::DataDir::Timings)
 }
