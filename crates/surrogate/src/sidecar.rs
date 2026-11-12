@@ -202,9 +202,11 @@
 //!
 //! **Version 8** (M8a Task 5): version 7 with a body-4 basis (`Basis::body4`, a shared
 //! collection's). The basis object carries two more keys, `body4` (true) and `body4_cap` (the
-//! body-4 degree cap D₄ the layout was built with, `Basis::body4_cap`); the reader regenerates the
-//! body-4 terms from the basis and refuses a file whose `body4_cap` is not its own D₄ (the layout
-//! would differ) or whose `body4` is not true. Everything else, the arrays included, is version
+//! body-4 degree cap D₄ the layout was built with, `Basis::body4_cap`); the reader loads the file
+//! at its own degree (`Basis::body4_degree` = `body4_cap`, spec §4.1), regenerates the body-4 terms
+//! from the basis, and refuses a file whose `body4_cap` is outside [`BODY4_DEGREE_START`] ..=
+//! [`BODY4_DEGREE_CAP`], is not the D₄ its basis builds (a `degree_cap` below it), or whose `body4`
+//! is not true. Everything else, the arrays included, is version
 //! 7's; every array length follows from the larger P and Q′. A basis without body-4 is still
 //! written as version 7, bit for bit — so every per-scene sidecar is unchanged — and a build
 //! before this one refuses a version-8 file as "newer than this build" instead of misreading its
@@ -222,7 +224,7 @@
 //! reader's (`sim::Dynamics` refuses a mismatch). [`read_provenance`] reads the header alone (no arrays, no samples) so a
 //! viewer can compare a picked file with the scene before loading it.
 
-use crate::descriptor::Basis;
+use crate::descriptor::{Basis, BODY4_DEGREE_CAP, BODY4_DEGREE_START};
 use crate::fit::{Accumulator, FitReport, Sample, SampleTag, NO_ENERGY_ROWS, SIGMA_E_WITHOUT_ENERGY_ROWS};
 use crate::history::{AuditHistory, EnvKey, HistoryArrays, Unrecorded};
 
@@ -1143,6 +1145,17 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if body4 && species.len() > MAX_SPECIES_V2 {
         return Err(format!("body-4 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
     }
+    // the body-4 degree is the file's own (module doc, version 8): within [start, ceiling], and
+    // the layout it implies must be the one the basis builds (a `degree_cap` below it would not)
+    let body4_degree = if body4 {
+        let cap = b.get("body4_cap")?.usize()?;
+        if !(BODY4_DEGREE_START..=BODY4_DEGREE_CAP).contains(&cap) {
+            return Err(format!("body4_cap {cap} outside this build's body-4 degrees {BODY4_DEGREE_START}–{BODY4_DEGREE_CAP}"));
+        }
+        cap
+    } else {
+        BODY4_DEGREE_START
+    };
     let basis = Basis {
         n_max,
         l_max,
@@ -1150,13 +1163,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         degree_cap: b.get("degree_cap")?.usize()?,
         body3,
         body4,
+        body4_degree,
         species,
     };
-    if body4 {
-        let cap = b.get("body4_cap")?.usize()?;
-        if cap != basis.body4_cap() {
-            return Err(format!("body4_cap {cap} differs from this build's layout for the basis ({})", basis.body4_cap()));
-        }
+    if body4 && body4_degree != basis.body4_cap() {
+        return Err(format!("body4_cap {body4_degree} differs from this build's layout for the basis ({})", basis.body4_cap()));
     }
     let s = basis.n_species();
     let p = basis.n_features();
@@ -2050,10 +2061,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn random_sidecar_with(seed: u64, body3: bool, body4: bool) -> Sidecar {
+        random_sidecar_at(seed, body3, body4, BODY4_DEGREE_START)
+    }
+
+    /// [`random_sidecar_with`] at a chosen body-4 degree (`Basis::body4_degree`).
+    pub(crate) fn random_sidecar_at(seed: u64, body3: bool, body4: bool, body4_degree: usize) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;
         basis.body4 = body4;
+        basis.body4_degree = body4_degree;
         if body3 || body4 {
             // C = 9 channels, 45 unordered pairs × 3 l (D = 10 never binds at n_max 3, l_max 2):
             // P = 9 + 135, Q′ = 18 + 3·135
@@ -2670,8 +2687,8 @@ pub(crate) mod tests {
     }
 
     /// A body-4 basis (M8a Task 5) is written as version 8 and reads back bit for bit; a body-4-free
-    /// basis is still version 7; a version-8 header whose body-4 cap is not this build's layout,
-    /// or that says body4 false, is refused.
+    /// basis is still version 7; a version-8 header whose body-4 cap is outside
+    /// [`BODY4_DEGREE_START`] ..= [`BODY4_DEGREE_CAP`], or that says body4 false, is refused.
     #[test]
     fn a_body4_basis_round_trips_as_version_8() {
         let orig = random_sidecar_with(37, true, true);
@@ -2684,7 +2701,11 @@ pub(crate) mod tests {
         let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap().to_string();
         assert!(header.contains("\"body4\":true,\"body4_cap\":2"), "{header}");
-        for (what, from, to) in [("cap", "\"body4_cap\":2", "\"body4_cap\":3"), ("flag", "\"body4\":true", "\"body4\":false")] {
+        for (what, from, to) in [
+            ("cap-above", "\"body4_cap\":2", "\"body4_cap\":4"),
+            ("cap-below", "\"body4_cap\":2", "\"body4_cap\":1"),
+            ("flag", "\"body4\":true", "\"body4\":false"),
+        ] {
             let h2 = header.replacen(from, to, 1);
             let mut b2 = bytes[..8].to_vec();
             b2.extend_from_slice(&(h2.len() as u64).to_le_bytes());
@@ -2695,6 +2716,38 @@ pub(crate) mod tests {
             let e = read(&p2).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}");
         }
+    }
+
+    /// A file loads at its own body-4 degree (spec §4.1): a D₄ = 3 basis writes `body4_cap` 3 and
+    /// reads back as `body4_degree` 3 with bit-equal predictions, beside the D₄ = 2 one.
+    #[test]
+    fn a_body4_file_loads_at_its_own_degree() {
+        let probe: (Vec<[f64; 3]>, Vec<u8>) = (vec![[0.0, 0.0, 0.0], [1.8, 0.1, -0.2], [-0.4, 1.7, 0.3], [0.2, -0.3, 2.1]], vec![8, 1, 6, 1]);
+        for degree in [BODY4_DEGREE_START, BODY4_DEGREE_CAP] {
+            let orig = random_sidecar_at(37, true, true, degree);
+            assert_eq!(orig.model.basis.body4_cap(), degree);
+            let path = tmp(&format!("body4-degree-{degree}.model"));
+            write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(&bytes[..8], MAGIC_V8);
+            let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap();
+            assert!(header.contains(&format!("\"body4_cap\":{degree}")), "{header}");
+            let back = read(&path).unwrap();
+            assert_eq!(back.model.basis.body4_degree, degree);
+            assert_eq!(back.model.basis, orig.model.basis);
+            assert_eq!(back.model, orig.model);
+            let (e0, f0) = crate::model::energy_and_forces(&orig.model, &probe.0, &probe.1).unwrap();
+            let (e1, f1) = crate::model::energy_and_forces(&back.model, &probe.0, &probe.1).unwrap();
+            assert_eq!(e1.to_bits(), e0.to_bits(), "D₄ = {degree}: energy");
+            for (a, b) in f1.iter().zip(&f0) {
+                for k in 0..3 {
+                    assert_eq!(a[k].to_bits(), b[k].to_bits(), "D₄ = {degree}: forces");
+                }
+            }
+        }
+        // the two degrees are different layouts
+        assert!(random_sidecar_at(37, true, true, 3).model.basis.n_body4() > random_sidecar_at(37, true, true, 2).model.basis.n_body4());
     }
 
     fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
