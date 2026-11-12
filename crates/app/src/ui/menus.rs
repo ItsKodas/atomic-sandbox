@@ -83,7 +83,13 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                     }
                 }
                 ui.add_space(12.0);
-                hot.push(scene_chip(ui, st, input, compact, acts).rect);
+                // with the "back to" chip beside it the scene chip takes its short form (the search
+                // button is laid out from the right and would cover a long one)
+                let segment_open = st.segment_back.is_some() && matches!(st.source, super::SceneSource::Segment(_));
+                hot.push(scene_chip(ui, st, input, compact || segment_open, acts).rect);
+                if let Some(r) = back_chip(ui, st, acts) {
+                    hot.push(r.rect);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if framed {
                         ui.add_space(3.0 * CAPTION_BUTTON_W - 10.0 + 8.0);
@@ -256,6 +262,21 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     r
 }
 
+/// "← back to <scene>" next to the scene chip while a segment opened by Train this segment is the
+/// scene (mockup (d)): `Action::BackToScene` reloads the scene it was cut from, saved when it opened.
+fn back_chip(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) -> Option<egui::Response> {
+    let b = st.segment_back.as_ref().filter(|_| matches!(st.source, super::SceneSource::Segment(_)))?;
+    ui.add_space(6.0);
+    let r = ui
+        .add(Button::new(RichText::new(format!("← back to {}", b.label.trim_end_matches(".scene"))).color(theme::ACCENT_INK)).fill(theme::ACCENT_BG).stroke(Stroke::new(1.0, theme::ACCENT)).corner_radius(egui::CornerRadius::same(12)))
+        .on_hover_text(format!("reload the scene this segment was cut from, where you left it (saved as {}), on the solver it had; what the collection learned here stays learned", b.path.display()));
+    let r = probed("segment-back", r);
+    if r.clicked() {
+        acts.push(Action::BackToScene);
+    }
+    Some(r)
+}
+
 fn search_button(ui: &mut Ui, st: &mut UiState, compact: bool) -> egui::Response {
     let text = if compact { "      Ctrl K".to_string() } else { "      Find a control or setting…          Ctrl K".to_string() };
     let r = ui
@@ -318,6 +339,8 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                     acts.push(Action::LoadScene { sidecar: true });
                 }
             }
+            // a segment has no Reset: "back to the scene" (the chip by this one) is its way out
+            super::SceneSource::Segment(_) => {}
             super::SceneSource::Built(_) => {
                 if let Some(h) = st.builder.last_replace.clone() {
                     if probed("reset", ui.button("Reset")).on_hover_text("the molecule builder's geometry again, unrelaxed (pauses; time restarts)").clicked() {

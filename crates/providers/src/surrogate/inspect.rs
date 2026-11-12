@@ -360,13 +360,14 @@ impl SurrogateKs {
         if let Some(r) = self.report.as_ref() {
             let _ = writeln!(
                 o,
-                "  fit: n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e} s_F {:.2e}, λ {:.2e}, dof_E {:.1} dof_F {:.1}, κ {:.1e}, converged {}",
+                "  fit: n {} (Q′ {}, {} rows), rmse E/atom {} F {:.2e}, s_E {} s_F {:.2e}, λ {:.2e}, dof_E {:.1} dof_F {:.1}, κ {:.1e}, converged {}",
                 r.n_samples,
                 r.q_prime,
                 r.n_rows,
-                r.rmse_energy_per_atom,
+                // a fit without energy rows measured neither (s_E is its pin: Task 10a review, finding 5)
+                if r.has_energy_rows() { format!("{:.2e}", r.rmse_energy_per_atom) } else { surrogate::fit::NO_ENERGY_ROWS.to_string() },
                 r.rmse_force,
-                r.sigma_e,
+                r.sigma_e_text(),
                 r.sigma_f,
                 r.lambda,
                 r.residual_dof_e,

@@ -292,6 +292,34 @@ fn scan_ranges_come_from_the_scene_not_a_table() {
     assert!(far.scans().is_empty());
 }
 
+/// M8a ruling P24: the largest planned move of a pass is read off its queue — a scan point moves
+/// one nucleus by |r_k − r₀| (H–H at 2.8 Bohr: its last fitted point 1.7 r₀ = 4.76 Bohr, 1.96 Bohr
+/// out; 1.8 r₀ is the shell check, never fitted), a perturbation every nucleus; the hot burst (not
+/// planned up front) counts nothing.
+#[test]
+fn the_largest_planned_displacement_is_read_off_the_queue() {
+    let scans = SamplingPlan { perturbations: 0, hot_burst_steps: 50, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let d = Sampler::new(&pair(1, 1, 2.8, cell(49)), &scans).unwrap().largest_planned_displacement();
+    assert!((d - 2.8 * 0.7).abs() < 1e-12, "{d}");
+    // a capped segment plans no shell check: the same fitted points, the same move
+    let masked = Scene { train_mask: Some(vec![true, false]), ..pair(1, 1, 2.8, cell(49)) };
+    assert!((Sampler::new(&masked, &scans).unwrap().largest_planned_displacement() - d).abs() < 1e-12);
+    let burst = SamplingPlan { perturbations: 0, hot_burst_steps: 50, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    assert_eq!(Sampler::new(&pair(1, 1, 2.8, cell(49)), &burst).unwrap().largest_planned_displacement(), 0.0);
+    // perturbations: every nucleus moves, a distance by up to the two displacements
+    let kicks = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let s = Sampler::new(&pair(1, 1, 2.8, cell(49)), &kicks).unwrap();
+    let d = s.largest_planned_displacement();
+    let mut want = 0.0f64;
+    for job in &s.queue {
+        if let Job::Perturbation(sc) = job {
+            let disp = |i: usize| dist(&Scene { nuclei: vec![sc.nuclei[i].clone(), s.scene.nuclei[i].clone()], ..sc.clone() }, 0, 1);
+            want = want.max(disp(0)).max(disp(1)).max((dist(sc, 0, 1) - 2.8).abs());
+        }
+    }
+    assert!(d > 0.0 && (d - want).abs() < 1e-12, "{d} vs {want}");
+}
+
 /// Ruling: a generated geometry closer than 3h to a face is counted and never sent to the
 /// teacher (which here would refuse it and count a failure).
 #[test]

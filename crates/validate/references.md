@@ -3862,7 +3862,7 @@ Flips (ruling B): met — cadence 50: pair 11 (6 + 5; every loss the LOO floor a
 
 **Why it is not met, measured.** (1) Rule 6 with a calibrated std claims std ≤ bound, not error ≤ bound: for a calibrated Gaussian at std = bound an atom exceeds 1× its bound with P(χ²₃/3 > 1) = 0.39, so any gate that lets the class answer near its bound produces "beyond 1×" answers at a rate the baseline (which refused the many-body class nearly throughout) never shows; at cadence 50 the many-body class answered 442 hot steps (fix round 2: 105) and 35 of 243 judged ones were 1–2.9× the bound — none beyond 3×, none beyond the tier. (2) The tail beyond a ratio-of-sums λ: the cadence-10 failing audit came right after an entry at λ 12.4 and was z = 43 against the model's own std (≈ 3.5 inflated sigmas): λ calibrates the rms, not a heavy tail. (3) An interaction: steps the inflated rule 6 refuses are rule-6 points — the posterior's evidence, not the class verdict's — so a trusted class's verdict window stops receiving rule-4b points and holds its older evidence: at cadence 50 the many-body class stayed trusted from step 4275 on 3 points (W 0.28) while rule 6 and the audits (161 rule-8 fallbacks) did the refusing.
 
-**Documented gap (rule 7): the many-body class answers rare steps beyond 1× its force bound.** Rule 6 bounds the *predicted* std, not the error: for a calibrated Gaussian posterior at std = bound an atom's error exceeds 1× its bound with P(χ²₃/3 > 1) ≈ 39 %, so a class allowed to answer near its bound will be audited beyond 1× now and then however well its std is calibrated. Measured with the inflation (audits per point while the class was trusted): **cadence 50 — 1 of 11** many-body audits beyond 1× (‖ΔF‖ 6.6e-3 Ha/Bohr ≈ 1.9× its bound, energy inside the tier; the test's own checker: 35 of 243 judged hot answers between 1× and 2.87×, none beyond 3× or the tier); **cadence 10 — 1 of 3** (‖ΔF‖ 2.1e-2 Ha/Bohr at z 43 against the model's own std — ≈ 3.5 inflated sigmas: λ calibrates the rms, not a heavy tail — and |ΔE|/N 1.5e-3 Ha/atom, past the tier), caught by that rule-8 audit, which untrusted the model until re-earned (the following model-surface steps fell back). The gated repro (audits off) judged all 65 checked hot answers within 1× (worst 0.97×). **Why the b35166e baseline's 0 is not comparable**: its max rule refused the many-body class almost throughout the repro (26–32 hot answers, 1–4 many-body audits), so it had almost no audited many-body answers to count; a verdict that lets the class answer is measured on 11 and 3 audits and hundreds of checked answers.
+**Documented gap (rule 7): the many-body class answers rare steps beyond 1× its force bound.** Rule 6 bounds the *predicted* std, not the error: for a calibrated Gaussian posterior at std = bound an atom's error exceeds 1× its bound with P(χ²₃/3 > 1) ≈ 39 %, so a class allowed to answer near its bound will be audited beyond 1× now and then however well its std is calibrated. Measured with the inflation (audits per point while the class was trusted): **cadence 50 — 1 of 11** many-body audits beyond 1× (‖ΔF‖ 6.6e-3 Ha/Bohr ≈ 1.9× its bound, energy inside the tier; the test's own checker: 35 of 243 judged hot answers between 1× and 2.87×, none beyond 3× or the tier); **cadence 10 — 1 of 3** (‖ΔF‖ 2.1e-2 Ha/Bohr at z 43 against the model's own std — ≈ 3.5 inflated sigmas: λ calibrates the rms, not a heavy tail — and |ΔE|/N 1.5e-3 Ha/atom, past the tier), caught by that rule-8 audit, which untrusted the model until re-earned (the following model-surface steps fell back). **How long such an episode lasts is set by the audit cadence, and these numbers hold only for the synchronous audits of this measurement (every 10 or 50 answered steps, in the step).** At the app's default — background audits every 2000 answered steps, on a second GPU teacher while the model keeps stepping — a failed audit's answer has already been used by the dynamics when its verdict arrives, and an episode of answers beyond the bound can run ≈ 2000 answered steps (more at the top speed, where the background audits fall behind to one every ≈ 20 000–40 000 answered steps: README "audit lag") before an audit catches it. Not measured at that cadence. The gated repro (audits off) judged all 65 checked hot answers within 1× (worst 0.97×). **Why the b35166e baseline's 0 is not comparable**: its max rule refused the many-body class almost throughout the repro (26–32 hot answers, 1–4 many-body audits), so it had almost no audited many-body answers to count; a verdict that lets the class answer is measured on 11 and 3 audits and hundreds of checked answers.
 
 **Open item for the physics re-review (fix round 3, concern 3): the inflated rule 6 starves the verdict's evidence window.** Steps the inflated rule 6 refuses are rule-6 points (codes 14/15) — the posterior's evidence (λ), not the class verdict's (audits and rule-4b only). Once a class is trusted, the refusals that would have been its rule-4b evidence become rule-6 points, and its verdict window keeps its older comparisons: at cadence 50 the many-body class stayed trusted from step 4275 on 3 points (W 0.28) while rule 6 (24 hot fallbacks) and the audits (161 rule-8 fallbacks) did the refusing, and it answered 442 hot steps (fix round 2: 105). Whether rule-6 refusals of a trusted class should feed its verdict (they are geometries the class would decide but for the std) is for the re-review to rule on.
 
@@ -4192,20 +4192,60 @@ Standard pass's job count — CH₄ 81³ 384 jobs, 69.9 s (incl. pseudopotential
 95³ 600 jobs, 8.5 / 8.0 s; C₃H₈ 107³ 840 jobs, 37.6 / 30.6 s; H₂O 95³ 300 jobs, 18.7 / 2.8 s; (H₂O)₂
 start 101³ (a 4 Bohr margin then; the test now boxes training clusters at 5) 384 jobs, 22.6 / 10.2 s; (H₂O)₃ start 101³ 588 jobs, 65.0 / 48.9 s.
 
-## M8a capping gate (Task 10a, 2026-11-02; `tests/capping.rs` `capped_segments_train_like_the_whole_molecule`, `#[ignore]`d) — **not yet run**
+## M8a capping gate (Task 10a, 2026-11-02; run 2026-11-12; `tests/capping.rs` `capped_segments_train_like_the_whole_molecule`, `#[ignore]`d) — **FAILS: 11.96× (limit 1.5×)**
 
 Spec §4.5's condition: a collection taught on capped segments of n-butane (the two end cuts, each a
 propane-like 10 + 1-cap segment whose interior is the methyl group, at `COLLECTION_R_CUT` = 6 Bohr)
 must reproduce held-out whole-molecule DFT forces on the interior-class atoms (both methyls, 8 of 14
 atoms) within **1.5×** of a collection taught on the whole molecule's own answers; a control (the
-whole answers restricted to the same rows) separates the capping error from the data volume. The
+whole answers restricted to the same rows) separates the segments' error from the data volume. The
 test-local cut is checked on the CPU (`the_test_cut_keeps_the_selected_atoms_interior`, runs in the
 default suite). Cost probe (`capping_cost_probe`, RX 7900 XTX): butane 125³ — 159 s cold incl. the
 pseudopotential generation, 95 s warm, 90 s cold after a reset; an end segment in the same box 48 s
 cold, 37 s warm. Estimated GPU wall: `relax_butane` (ruling P7: the scene must be relaxed by this
 solver first) 2.6–5.3 h for 100–200 FIRE steps, then the gate 1.5 h (20 training geometries) to
 2.6 h (40) at the probe's times — up to 3.8–6.4 h at Task 6's measured 2.5× run-over-probe factor.
-Over the task's 3 h budget: not run; `scenes/butane.scene` not made. Run, alone: `relax_butane`, then
+Over the task's 3 h budget at first; ruling P22 cut it (segments in their own scene-margin box, 113³;
+20 training geometries; `relax_butane` stopped at FIRE max|F| 2e-3 or 60 steps). Run, alone: `relax_butane`, then
 `cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`
 (`CAPPING_TRAIN=n` sets the training geometries, `CAPPING_REUSE=1` continues a stopped run from
 its stored answers).
+
+**Run (RX 7900 XTX; `ollama` resident and idle, no app.exe open, nothing else on the GPU).**
+`scenes/butane.scene`: 27 FIRE steps, E = −29.237850 Ha, max|F| 1.4e-3 Ha/Bohr, C–C 2.854/2.861/2.854 Bohr.
+The teacher answers were solved 2026-11-02 (≈ 12:58–15:11, ≈ 2.2 h wall including one restart after a
+box-affected draw) by a session that died before reporting; the 2026-11-12 run continued them with
+`CAPPING_REUSE=1` (no solver, `qm`/`qm-gpu`/`sim` or `providers::ks` change between the two; the fits
+and trust verdicts are the fixed code's, 1da27b1) — 2 more held-out solves (161 s, 229 s; 16 SCF/solve)
+and the three fits, 394 s. Box rule 7.2e-6 e/Bohr³: draws "whole 11", "held-out 19", "held-out 20"
+skipped as box-affected. References: 125³ H −0.478151, C −5.536958 Ha; segments' 113³ H −0.478144,
+C −5.536935 Ha. Cap length 2.0839 Bohr; interior class atoms [0, 3, 4, 5, 6, 11, 12, 13] (8 of 14);
+segments 11.0 atoms, 4.00 interior.
+
+| Collection | Samples (fitted) | Energy / force rows | Train rmse F | Held-out F RMSE, interior class | all atoms | Trusted interior-class atoms |
+|---|---|---|---|---|---|---|
+| A (whole) | 20 stored, 18 fitted (2 held by the collection) | 18 / 756 | 1.62e-3 | **3.007e-3** Ha/Bohr | 3.233e-3 | 0/160 |
+| control (whole answers, interior rows) | 20 | 0 / 480 | 1.10e-3 | 3.022e-3 | 2.496e-2 | 0/160 |
+| B (capped segments) | 40 | 0 / 480 | 9.29e-4 | **3.598e-2** | 3.767e-2 | 0/160 |
+
+B/A = **11.96×** (limit 1.5×) — **FAIL**; B/control 11.91× (the segments' error with the data volume
+held equal: the r_cut-interior error of ruling P26, the paragraph below — an interior atom's force row
+is an exact equation of the source molecule only with 2·r_cut + δ of matching surroundings, which a
+cut keeping r_cut does not give; the caps are part of it, not all of it); control/A 1.00× (the interior
+rows alone lose nothing). No model is trusted (every collection: n_samples < Q′ 284; answered
+geometries 0/20): the comparison is on force RMSE, i.e. whether the two training methods are
+equivalent — they are not. The follow-up is the 2·r_cut + δ cut and a long-chain gate (below), not a
+rerun of this one: butane has no interior atom under that cut. Reproduce (≈ 7 min with the stored answers, hours without):
+`CAPPING_REUSE=1 cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments`.
+
+**Train this segment is deferred (user decision 2026-11-12):** the gate above failed with the r_cut cut;
+the diagnosis (the M8a ledger's ruling P26) is that a force row F_i = −Σ_j ∂E_j/∂r_i, summed over the
+centres j within r_cut of i, each E_j seeing r_cut around j, is an exact equation of the source molecule
+only when everything within 2·r_cut of atom i is the source's — so a segment needs ≈ 14 Bohr of
+matching surroundings (2 × 6 Bohr plus δ ≈ 2 Bohr, the Standard pass's largest planned move), and
+butane has no interior atom in any proper segment. The corrected cut (2·r_cut + δ, `app::segment`,
+27b88d5) is implemented and unit-tested but not validated by a gate; a long-chain gate (decane or
+longer) is the follow-up. The user entry points (the Selection and Model tabs' buttons, the Ctrl K
+entry) are hidden behind `app::segment::SEGMENT_TRAINING = false`; `Action::TrainSegment`, the masked
+samples (`surrogate::fit` "Masked samples", `sim::Scene::train_mask`) and their tests stay compiled and
+tested.

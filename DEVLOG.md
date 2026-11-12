@@ -421,7 +421,7 @@ pass on the sampler changes; the user hand-tested and asked for the merge.
   shell check. Still open: measuring the restart's cold solve against a warm-dominated median on a big grid.
 - **Resumable passes:** the pass state (queued jobs with their geometries, counters, the burst's positions,
   velocities and forces, solved shell checks) is a line-based text checkpoint written with the samples file to
-  `%LOCALAPPDATA%tomic-sandbox	raining` at most every 2 s; the Model tab offers Resume / Discard at the next
+  `%LOCALAPPDATA%\atomic-sandbox\training` at most every 2 s; the Model tab offers Resume / Discard at the next
   start. The one thing that cannot be saved is the thermostat's random stream (`StdRng` has no stable state), so
   a resumed burst reseeds it. A test resumes after every solve of a pass and checks the teacher is asked about
   the same remaining geometries.
@@ -451,6 +451,51 @@ The last items before M8: the four minors the M7 final review parked, and the pl
   to "the stopping rule"; the oracle was at a different grid too, so the record now says it is not attributed by
   a run. The merge of main met main's resumable passes in the same function (`finish_pass`); a cancelled pass
   deletes its checkpoint, so "the pass ended before its shell check" stays true.
+
+### M8a: one shared model per solver surface (plan Oct 21; first commit Oct 20 16:01, last Nov 12 02:12, merged Nov 12)
+
+About 23 days of calendar time, but commits on only five of them (Oct 20: 4, Oct 21: 12, Oct 22: 11, Nov 2: 11,
+Nov 12: 3; 39 non-merge commits, about 22,600 lines added across 111 files). The gaps are the user's weekly usage
+cap (the controller stopped at 91 % on Oct 22 and resumed after the reset on Nov 2) and a ten-day pause before the
+last two tasks. One controller session; Fable on the first physics tasks and reviews until the user asked on Oct 21
+to stop using it for tokens, Opus after that, some re-reviews on Sonnet. The user tested builds between tasks, and four of their
+findings became model fixes.
+
+- **What shipped.** The estimated solver learns into one append-only **collection** per solver surface (functional,
+  h, σ, teacher, tolerance, ionic surface; not the box) shared by every neutral scene, with isolated-atom references
+  per box. Trust is a **calibrated, hysteretic verdict per environment** (class, central element, neighbour
+  species) in place of the old leave-one-out knife edge. The basis gained **four-body** invariants, refits became
+  interactive at the fit (≈ 0.17 s per added sample at 10,000 samples; the leave-one-out trust checks around it still
+  take ≈ 20 min at that size, a follow-up), and a collection can be cut into a **specialised model
+  file**. The **knowledge map** (a dock tab, its pop-out and a 3D overlay) shows what the model knows. A **blur**
+  slider for the density dots came in on the side.
+- **User-test fixes.** A shared H collection stuck untrusted: a recovery degree cap set once was never revisited,
+  and one stretched H₂ label spread its misfit over every sample (fixed: the cap is re-judged). Water fell back on
+  every step because one hot-H₃ point blocked the whole many-body class (fixed: the verdict is kept per environment
+  key and re-judged as evidence arrives). A Standard pass on a single H atom made a fresh collection untrusted (fixed:
+  **a lone atom is never trained on**; a pass on one is refused, and stored lone samples are held out at load).
+  Training N₂ into an H/O collection grew the model from 452 to 1,590 columns and every key, water's included, read
+  "not learned yet" (fixed: **each key's sample floor is the columns it touches**, not the whole basis).
+- **An honest negative: fragments do not transfer.** The transfer test taught a collection on CH₄ and C₂H₆ (5.0 h of
+  GPU) and asked it about propane. It refused all 220 propane atoms at both a 6 and a 9 Bohr cutoff, and the refusals
+  were right: its answers there would have been 3 to 14 Ha/Bohr off. Each carbon of propane sees three carbons, the
+  fragments never more than two. The criterion therefore "passed" with nothing trusted. The ruling was to print
+  VACUOUS and write "transfer not demonstrated", not to add an assertion that would just fail. The water half
+  (6 to 10 h estimated) was not run.
+- **The capping gate failed, 12×.** "Train this segment" cuts part of a large molecule out and caps the cut bonds
+  with hydrogens. Its gate compared butane taught on capped segments with butane taught whole, on held-out
+  whole-molecule forces: 11.96× worse against a 1.5× limit, and a control showed the interior rows alone lose
+  nothing (1.00×), so the capping is the whole error. The controller's diagnosis: an atom's force sums the energy
+  derivatives of every centre within r_cut of it, and each of those centres sees r_cut further, so a force row is
+  only right when everything within **2·r_cut** is the real molecule. The cut had used r_cut. Corrected (2·r_cut plus
+  the pass's largest planned move, ≈ 14 Bohr), butane has no interior atom in any proper segment. The user chose to
+  defer the feature and merge: the code and its tests stay, the buttons and the Ctrl K entry are hidden behind one
+  constant, and a gate on a longer chain (decane or longer) is the follow-up.
+- **Process.** The gate's first run died with an old session after about 2.2 h of solves; the stored teacher answers
+  let the Nov 12 run finish in minutes (`CAPPING_REUSE=1`). The knowledge map's UI waited 13 days for the user's
+  mockup approval, which came on Nov 2 with no changes. A deferred-before-merge honesty fix from Task 2 (the
+  calibration's gap is bounded by the audit cadence only for synchronous audits, not at the app's background
+  cadence of 2,000 steps) was carried through three stops and landed in the docs at the end.
 
 ### Docking UI and orbitals by atom (Nov 3 and Nov 11–12; branch `docking`, cut from M8a's tip)
 
@@ -892,7 +937,8 @@ From the ledgers, the plans and the standing order of work:
 3. **The spin-view fix** for the closed-shell noise (queued, Sonnet).
 4. **Orbital Task 8:** core shells reconstructed for display, which waits for M7.
 5. **M8: locality and transfer.** Per-atom models that carry between scenes, fragment training, a shared
-   growing model. The user set M8 to start as soon as M7 is complete.
+   growing model. M8a (the shared model) merged on Nov 12, with fragment transfer measured as not working and
+   Train this segment deferred (see the timeline); a long-chain capping gate is its follow-up.
 6. **After M8, unless reordered:** user data (model library, settings profiles), the small queued items
    (per-atom charge with a Hirshfeld readout, bond-angle follow-ups, a refined bond point, auto-sizing the
    cell, a lowest-of-spin-starts teacher that would also help the 3-hydrogen case), and the precision

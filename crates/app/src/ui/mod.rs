@@ -181,12 +181,15 @@ const SPARK_WINDOW: usize = 400;
 /// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
 /// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
 /// line — all through [`UiState::adopt_file`]), or the molecule builder's Replace (its formula;
-/// Reset sends the built geometry again, `builder::Builder::last_replace`).
+/// Reset sends the built geometry again, `builder::Builder::last_replace`), or a capped segment cut
+/// out of a scene by Train this segment (`crate::segment`; the label of the scene it came from — the
+/// "back to the scene" chip returns there, `UiState::segment_back`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneSource {
     Preset(String),
     File(String),
     Built(String),
+    Segment(String),
 }
 
 impl SceneSource {
@@ -194,7 +197,7 @@ impl SceneSource {
     pub fn preset(&self) -> Option<&str> {
         match self {
             SceneSource::Preset(p) => Some(p),
-            SceneSource::File(_) | SceneSource::Built(_) => None,
+            SceneSource::File(_) | SceneSource::Built(_) | SceneSource::Segment(_) => None,
         }
     }
 
@@ -204,6 +207,7 @@ impl SceneSource {
             SceneSource::Preset(p) => p.clone(),
             SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
             SceneSource::Built(formula) => format!("built {formula}"),
+            SceneSource::Segment(of) => format!("{of} · segment"),
         }
     }
 }
@@ -773,6 +777,28 @@ pub struct UiState {
     pub play_snapshots: std::collections::VecDeque<rewind::PlaySnapshot>,
     /// Readouts ▸ Compare with reference (PySCF out of process; `crate::reference`).
     pub compare: crate::reference::Compare,
+    /// Train this segment (M8a Task 10, `crate::segment`): the cut waiting for its confirmation
+    /// (the card over the view, the rings on the scene), and the way back from an opened segment.
+    pub segment_preview: Option<crate::segment::Segment>,
+    pub segment_back: Option<SegmentBack>,
+}
+
+/// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
+/// panel had for it: "back to the scene" (`Action::BackToScene`) restores them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentBack {
+    pub path: std::path::PathBuf,
+    /// The scene chip's label for it ("butane.scene").
+    pub label: String,
+    pub source: SceneSource,
+    pub scene_path: String,
+    pub backend: Backend,
+    pub ionic: sim::IonicPolicy,
+    pub quality_h: f64,
+    /// The segment's caps (indices in the segment scene) and how many atoms it teaches (the rings
+    /// and the status line).
+    pub caps: Vec<usize>,
+    pub taught: usize,
 }
 
 impl UiState {
@@ -957,6 +983,8 @@ impl UiState {
             activity: activity::ActivityState::new(),
             play_snapshots: std::collections::VecDeque::new(),
             compare: Default::default(),
+            segment_preview: None,
+            segment_back: None,
         }
     }
 
@@ -1222,6 +1250,10 @@ pub struct PanelOutput {
     /// What the detached windows need of the window side (docking spec D-12: open, close, bring
     /// to the front; `workspace::detached`), in order — the UI cannot create OS windows.
     pub windows: Vec<workspace::detached::WindowRequest>,
+    /// A whole new scene, maybe on another solver (`UiState::backend`): Train this segment's Open
+    /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
+    /// changes, so the old one never starts solving it.
+    pub switch_scene: Option<Scene>,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report

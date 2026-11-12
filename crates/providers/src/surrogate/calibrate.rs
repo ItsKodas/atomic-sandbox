@@ -44,8 +44,12 @@
 //! identifiability itself is theirs to judge (an undefined leave-one-out refuses as ∞). The rank
 //! would also cost an eigen-decomposition per key per refit.
 //!
-//! A key no fitted atom holds is held, as before, to its class's count against the whole Q′
-//! (nothing is learned for it), and so is a class-wide verdict.
+//! A key no fitted atom holds has **no samples of its own** (n_k = 0) and is refused on the sample
+//! floor (`ClassKey::Samples`, 0 of Q′ shown — its own q_k needs an atom of it) — never judged on
+//! its class's leave-one-out, which measures other keys' atoms (whole-branch final review 5:
+//! before, it took its class's count against Q′ and, with the class above Q′, could be trusted on
+//! the other keys' numbers). A class-wide verdict (no key of the class fitted) keeps its class's
+//! count against the whole Q′.
 //!
 //! **The whole-model floor** (`TrustKey::Samples`; the review's ruling 2) is the same count for the
 //! whole fit: n_samples ≥ |∪_k S_k|, the columns any fitted atom touches

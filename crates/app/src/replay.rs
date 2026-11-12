@@ -417,6 +417,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SetupPyscf => "setup-pyscf",
         Action::CancelSetup => "cancel-setup",
         Action::Builder(_) => "builder",
+        Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
         Action::Screenshot | Action::Record(_) => "capture",
         _ => "action",
     })

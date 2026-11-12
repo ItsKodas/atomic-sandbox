@@ -220,6 +220,20 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
     ColumnCounts { per_key: per_key.into_iter().map(|(k, (bits, n))| (k, (n, count(&bits)))).collect(), union: count(&union) }
 }
 
+/// The leave-one-out statistics a key no fitted atom holds is judged with (final review 5): its
+/// class's numbers with **n_k = 0** samples of its own — the sample floor refuses it before any
+/// leave-one-out number is read (`calibrate::verdict`), as `ClassKey::Samples`.
+pub(super) fn unseen_key_stats(class: &super::calibrate::ClassStats) -> super::calibrate::ClassStats {
+    super::calibrate::ClassStats { samples: 0, ..*class }
+}
+
+/// The column count a key no fitted atom holds is held to: its own q_k is not known without an
+/// atom of it (the columns its atoms touch, [`key_column_counts`]), so the whole basis's Q′ is
+/// shown — at least 1, so 0 samples never pass the floor.
+pub(super) fn unseen_key_floor(q_prime: usize) -> usize {
+    q_prime.max(1)
+}
+
 /// A sample's per-atom environment keys with the atoms its force mask leaves out set to `None`
 /// (M8a Task 10, `surrogate` module doc "Masked scenes"): only interior atoms describe knowledge.
 pub(super) fn trained_keys(s: &Sample, keys: Vec<Option<surrogate::EnvKey>>) -> Vec<Option<surrogate::EnvKey>> {
@@ -236,7 +250,8 @@ pub(super) struct ClassJudge {
     /// of that key as its sample count (M8a user-fix 3 review, [`key_column_counts`]).
     pub(super) key_stats: BTreeMap<surrogate::EnvKey, super::calibrate::ClassStats>,
     /// Per environment key of the fitted atoms the columns it touches: the sample count it is held
-    /// to (M8a user-fix 3). A key without fitted atoms is held to the whole basis's `q_prime`.
+    /// to (M8a user-fix 3). A key without fitted atoms has no samples of its own and is refused on
+    /// the sample floor ([`unseen_key_stats`], final review 5).
     pub(super) key_q: BTreeMap<surrogate::EnvKey, usize>,
     pub(super) aleatoric: [f64; 2],
     /// The whole basis's Q′: the class-wide verdict's floor and that of a key no fitted atom holds.
@@ -503,10 +518,15 @@ impl SurrogateKs {
                     .map(|(k, kc)| {
                         let (was, since) = self.class_memory.get(k).copied().unwrap_or((false, None));
                         // its own sample count and column count (M8a user-fix 3); a key no fitted
-                        // atom holds keeps the class's count against the whole basis's Q′
+                        // atom holds has n_k = 0 samples of its own: refused on the sample floor
+                        // (0 < q_k), never judged on its class's leave-one-out (final review 5)
+                        let unseen;
                         let (kst, kq) = match (j.key_stats.get(k), j.key_q.get(k)) {
                             (Some(kst), Some(&kq)) => (kst, kq),
-                            (kst, _) => (kst.unwrap_or(&st), j.q_prime),
+                            _ => {
+                                unseen = unseen_key_stats(&st);
+                                (&unseen, unseen_key_floor(j.q_prime))
+                            }
                         };
                         let refusal = entry_between_refits(refusal_of(verdict(*kc, kst, kq, was)), was, kc, j.between_refits);
                         let trusted = refusal.is_none();
@@ -721,10 +741,14 @@ impl SurrogateKs {
             let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
             let energy_rms = if e_samples > 0 { (se / e_samples as f64).sqrt() } else { 0.0 };
             let energy_rms = if energy_max == f64::INFINITY { f64::INFINITY } else { energy_rms };
-            // samples but none with a fitted energy (a key taught only by capped segments): no
-            // energy evidence, which the energy rule reads as failed — the conservative side
-            // (`surrogate` module doc, "Masked samples"; an item for the physics review)
-            let (energy_rms, energy_max) = if samples > 0 && e_samples == 0 { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, energy_max) };
+            // a class or key holding capped segments (fewer energy-bearing samples than samples)
+            // takes its energy evidence from its whole samples only (ruling P25: no force-only
+            // energy calibration), and fewer than MIN_EVIDENCE of them is no evidence — the energy
+            // must not rest on one or two whole samples among many segments (Task 10a review,
+            // finding 1): energy LOO ∞, which the energy rule reads as failed. One of whole
+            // samples only (e_samples = samples) is judged as before.
+            let segments = e_samples < samples;
+            let (energy_rms, energy_max) = if segments && e_samples < super::calibrate::MIN_EVIDENCE { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, energy_max) };
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
@@ -839,8 +863,9 @@ impl SurrogateKs {
     }
 
     /// The class rule's refusal for environment key `k`, `None` when trusted: its own verdict
-    /// (`SpeciesVerdict`), or — for a key no fitted atom and no attributed point holds — the verdict
-    /// its class's species-less evidence gives, without a standing verdict.
+    /// (`SpeciesVerdict`), or — for a key no fitted atom and no attributed point holds — the
+    /// verdict of a key with no samples of its own (n_k = 0: the sample floor refuses it, final
+    /// review 5), without a standing verdict.
     fn one_key_untrusted(&self, k: &surrogate::EnvKey) -> Option<(Refusal, bool)> {
         let q = self.report.as_ref()?.q_prime;
         let c = (k.class as usize).wrapping_sub(1);
@@ -861,13 +886,15 @@ impl SurrogateKs {
             None => {
                 let j = self.class_judge.as_ref()?;
                 let kc = j.cal.key(k);
-                let refusal = match super::calibrate::verdict(kc, &j.stats[c], j.q_prime, false) {
+                // no fitted atom holds it (n_k = 0): the sample floor refuses it (final review 5)
+                let unseen = unseen_key_stats(&j.stats[c]);
+                let refusal = match super::calibrate::verdict(kc, &unseen, unseen_key_floor(j.q_prime), false) {
                     super::calibrate::ClassVerdict::Trusted => None,
                     super::calibrate::ClassVerdict::Untrusted { key, value, limit, .. } => Some((key, value, limit)),
                 };
                 let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
                 let some = |x: f64| (kc.points > 0).then_some(x);
-                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: j.stats[c].samples, columns: j.q_prime }
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime) }
             }
         };
         if s.trusted {
@@ -878,7 +905,12 @@ impl SurrogateKs {
         // verdict and this note, the M8a Task 2 review's M2); `None` cannot occur here
         // (`trusted == refusal.is_none()`) and is worded as the uncalibrated force rule
         let (key, value, limit) = s.refusal.unwrap_or((ClassKey::Force, l.force_max.max(l.force_rms), 1.0));
-        let st = self.class_judge.as_ref().filter(|_| !class_wide).and_then(|j| j.key_stats.get(k).copied()).unwrap_or(super::calibrate::ClassStats { samples: l.samples, force_rms: l.force_rms, force_max: l.force_max, energy_rms: l.energy_rms, energy_max: l.energy_max });
+        let class_st = super::calibrate::ClassStats { samples: l.samples, force_rms: l.force_rms, force_max: l.force_max, energy_rms: l.energy_rms, energy_max: l.energy_max };
+        // a key's own count; a key no fitted atom holds has none (final review 5)
+        let st = match self.class_judge.as_ref().filter(|_| !class_wide) {
+            Some(j) => j.key_stats.get(k).copied().unwrap_or_else(|| unseen_key_stats(&class_st)),
+            None => class_st,
+        };
         let words = super::calibrate::WordsInput {
             samples: st.samples,
             force_rms: st.force_rms,
@@ -1251,12 +1283,18 @@ impl SurrogateKs {
         let mut promoted = 0;
         for i in held {
             let s = self.store.as_ref().expect("held samples are stored").samples[i].clone();
+            // in collection mode a guess whose box lacks a reference holds the teacher's raw
+            // energy, off the canonical surface: it waits for the reference before it is judged
+            // (final review 2; `shared` module doc, "References per box")
+            if self.shared.as_ref().and_then(|sh| sh.box_n.get(i)).is_some_and(|&n| self.box_offset(&s.z, n).is_none()) {
+                continue;
+            }
             if self.geometry_refusal(&s.pos, &s.z).is_some() {
                 continue;
             }
             let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess, pair: None };
             let Some((gap, force_fail, _)) = self.judge_case(&case) else { continue };
-            self.quarantine[i] = Q_NONE;
+            self.quarantine[i] = self.released_code(i);
             // judged as an audit now: its tag says so (a file keeps it fitted, never re-held)
             if let Some(st) = self.store.as_mut() {
                 st.samples[i].tag = SampleTag::Audit;

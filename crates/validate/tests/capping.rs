@@ -23,12 +23,14 @@
 //! r_cut) and leaves a propane-like segment whose interior is C1 and the hydrogens whose own
 //! neighbourhood is whole.
 //!
-//! - **Training geometries**: `CAPPING_TRAIN` (default 40) Gaussian displacements of the relaxed
+//! - **Training geometries**: `CAPPING_TRAIN` (default 20, ruling P22) Gaussian displacements of the relaxed
 //!   molecule (σ = 0.15 Bohr per coordinate, the sampling pass's perturbation size), seeded.
 //! - **Collection A** (the reference method): the whole molecule's DFT answer at each — energy and
 //!   every atom's forces.
 //! - **Collection B** (capping): at each geometry the two end segments (select C1; select C4), cut
-//!   from that geometry, capped, solved, kept through the provider's keep path with the segment
+//!   from that geometry, capped, re-centred in the segments' own box (the scene margin, as the app
+//!   opens a segment; `segment_box`, one box for all so one extra reference set; ruling P22), solved,
+//!   kept through the provider's keep path with the segment
 //!   scene's `train_mask` (= interior) — interior forces only, no energy.
 //! - **Control** (CPU, no extra solve): the whole molecule's answers with the force mask set to the
 //!   **interior class** and no energy — B's rows without the capping, so B against the control
@@ -47,7 +49,7 @@
 //! (`app::segment`, Task 10b, has its own). A dropped H bonded to a kept atom is kept (a cap there
 //! would be the same H); a heavy atom bonded to a kept H is kept.
 //!
-//! # Cost — not yet run (2026-11-02)
+//! # Cost and the run (2026-11-02 / 2026-11-12: FAILS, B/A 11.96× — `references.md`)
 //!
 //! `capping_cost_probe` (RX 7900 XTX, `ollama` resident and idle, nothing else on the GPU): the
 //! start butane in its 125³ box (margin 4 Bohr at h = 0.15) solves in 159 s cold with the
@@ -56,9 +58,9 @@
 //! wall: the gate, `train` × (whole + 2 segments) + 20 held-out, = 1.5 h for 20 training geometries
 //! and 2.6 h for 40 at the probe's times (3.8 h / 6.4 h at Task 6's measured 2.5× run-over-probe
 //! factor); the relaxation that must come first (ruling P7), ≈ 100–200 FIRE steps × 95 s = 2.6–5.3 h.
-//! Over the task's 3 h budget, so the GPU tests are `#[ignore]`d and were not run (Task 10a report).
-//! Cheaper variants, not taken without the controller: the segments in their own smaller box (a
-//! second reference set; ≈ 107³), fewer training geometries.
+//! Over the task's 3 h budget at first; the controller's ruling P22 then cut it: the segments in their
+//! own box, 20 training geometries, `relax_butane` stopped at max|F| 2e-3 Ha/Bohr or 60 FIRE steps
+//! (≈ 1.6 h + ≈ 1.5 h). The measured run: `references.md`, "M8a capping gate".
 //!
 //! # Running it
 //!
@@ -95,7 +97,12 @@ const SEED_HELD: u64 = 0xb07a_0002;
 /// B's interior force RMSE over A's (spec §4.5).
 const FACTOR: f64 = 1.5;
 /// The default number of training geometries (`CAPPING_TRAIN`).
-const TRAIN_DEFAULT: usize = 40;
+const TRAIN_DEFAULT: usize = 20;
+/// `relax_butane` stops at this largest atomic force (Ha/Bohr) or after `RELAX_STEPS` FIRE steps,
+/// whichever first (ruling P22: the gate compares A and B on the same held-out geometries, so a
+/// near-equilibrium start suffices; the scene file records what was reached).
+const RELAX_FMAX: f64 = 2e-3;
+const RELAX_STEPS: usize = 60;
 /// In-run solve time over the probe's warm solve (Task 6 measured 2.5×: ≈ 20 s per C₂H₆ solve in
 /// its passes against an 8 s probe; Task 6 report): the estimate's factor.
 const RUN_OVER_PROBE: f64 = 2.5;
@@ -309,6 +316,29 @@ fn ends(sc: &Scene, bonds: &[(usize, usize)]) -> Vec<usize> {
     (0..sc.nuclei.len()).filter(|&i| heavy(i) && bonds.iter().filter(|&&(a, b)| heavy(a) && heavy(b) && (a == i || b == i)).count() == 1).collect()
 }
 
+/// The segments' own box (ruling P22, as the app opens a segment): the grid points per side of the
+/// largest end segment of `sc` boxed with the scene margin (`boxed`, `MARGIN`), plus 2 points of room
+/// for the training displacements; one box for every segment, so B needs one reference set.
+fn segment_box(sc: &Scene, bonds: &[(usize, usize)], d_cap: f64) -> usize {
+    ends(sc, bonds).into_iter().map(|e| boxed(cut(sc, bonds, &[e], COLLECTION_R_CUT, d_cap).scene.nuclei, MARGIN).cell.n).max().expect("an end") + 2
+}
+
+/// `sc` with its nuclei's bounding box centred at the origin in an n³ cell at h = `H_ACC` (the
+/// training mask and everything else kept).
+fn recentred(sc: &Scene, n: usize) -> Scene {
+    let mut out = sc.clone();
+    for k in 0..3 {
+        let (lo, hi) = out.nuclei.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), x| (l.min(x.pos[k]), h.max(x.pos[k])));
+        let c = 0.5 * (lo + hi);
+        for x in &mut out.nuclei {
+            x.pos[k] -= c;
+        }
+    }
+    out.cell = Cell { n, h: H_ACC };
+    assert!(out.check_inside_cell().is_ok(), "a segment leaves its {n}³ box");
+    out
+}
+
 /// The interior class (module doc): the source atoms interior in the end cuts of `sc`.
 fn interior_class(sc: &Scene, bonds: &[(usize, usize)], d_cap: f64) -> Vec<bool> {
     let mut class = vec![false; sc.nuclei.len()];
@@ -438,7 +468,7 @@ fn judge(s: &SurrogateKs, held: &[Scene], dft: &[(f64, Vec<[f64; 3]>)], class: &
 
 /// The gate (module doc).
 #[test]
-#[ignore = "GPU, hours (not yet run; probe estimate 1.5–2.6 h at 20–40 training geometries, up to 6.4 h at Task 6's 2.5× run factor, after relax_butane): cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments"]
+#[ignore = "GPU, hours (≈ 2.2 h of solves at 20 training geometries; run 2026-11-12: FAILS, B/A 11.96×, references.md; after relax_butane): cargo test -p validate --release --test capping -- --ignored --nocapture --test-threads 1 capped_segments"]
 fn capped_segments_train_like_the_whole_molecule() {
     let Some(ctx) = gpu() else { return };
     let mut out = String::new();
@@ -473,86 +503,134 @@ fn capped_segments_train_like_the_whole_molecule() {
     let key = a.provenance_for(&base).surface_key();
     let wall = Instant::now();
 
-    // ---- references: one box for everything (the segments keep their source coordinates) ----
-    let refs_have = |s: &SurrogateKs, z: u8| s.collection().is_some_and(|c| c.references.contains_key(&(z, base.cell.n)));
+    // ---- references: the whole molecule's box (A, control) and the segments' own box (B) ----
+    let seg_n = segment_box(&base, &b, d_cap);
+    let refs_have = |s: &SurrogateKs, z: u8, n: usize| s.collection().is_some_and(|c| c.references.contains_key(&(z, n)));
     for z in [1u8, 6] {
-        if [&a, &bs, &ctl].iter().all(|s| refs_have(*s, z)) {
-            continue;
-        }
         let mass = Nucleus::new(z, [0.0; 3]).mass;
-        let r = sim::solve_atom(a.teacher_mut(), &base.cell, None, IonicPolicy::Accepted, z, mass, &mut never()).unwrap_or_else(|e| panic!("reference Z = {z}: {e}"));
-        for s in [&mut a, &mut bs, &mut ctl] {
-            s.set_reference_solved(z, r.energy, base.cell.n, r.face_density);
+        if !(refs_have(&a, z, base.cell.n) && refs_have(&ctl, z, base.cell.n)) {
+            let r = sim::solve_atom(a.teacher_mut(), &base.cell, None, IonicPolicy::Accepted, z, mass, &mut never()).unwrap_or_else(|e| panic!("reference Z = {z}: {e}"));
+            for s in [&mut a, &mut ctl] {
+                s.set_reference_solved(z, r.energy, base.cell.n, r.face_density);
+            }
+            let _ = writeln!(out, "  reference Z = {z} in {}³: {:.6} Ha (face density {:?})", base.cell.n, r.energy, r.face_density);
         }
-        let _ = writeln!(out, "  reference Z = {z} in {}³: {:.6} Ha (face density {:?})", base.cell.n, r.energy, r.face_density);
+        if !refs_have(&bs, z, seg_n) {
+            let cell = Cell { n: seg_n, h: H_ACC };
+            let r = sim::solve_atom(a.teacher_mut(), &cell, None, IonicPolicy::Accepted, z, mass, &mut never()).unwrap_or_else(|e| panic!("reference Z = {z}, segment box: {e}"));
+            bs.set_reference_solved(z, r.energy, seg_n, r.face_density);
+            let _ = writeln!(out, "  reference Z = {z} in the segments' {seg_n}³: {:.6} Ha (face density {:?})", r.energy, r.face_density);
+        }
     }
     flush(&mut out);
 
     // ---- the training answers: whole (A, and the control from the same answer), two segments (B) ----
     let rule = providers::box_affected_face_density(H_ACC);
-    let geoms = displaced(&base, train_n, SEED_TRAIN);
-    let mut seg_atoms = 0usize;
-    let mut seg_interior = 0usize;
-    for (i, g) in geoms.iter().enumerate() {
-        let done_a = a.collection().map_or(0, |c| c.samples.len());
-        if i >= done_a {
+    // A box-affected answer (the face density over the box rule — a displaced H near a face) is
+    // skipped and the next draw taken, as the sampling pass and the collection's admission do (the
+    // collection refuses it); the skips are kept in `skipped.txt` so a rerun takes the same draws.
+    // Done answers are found by their geometry in the collections (`holds_geometry`).
+    let skip_path = tmp.join("skipped.txt");
+    let mut skipped: Vec<String> = std::fs::read_to_string(&skip_path).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default();
+    let skip = |what: String, face: Option<f64>, out: &mut String, skipped: &mut Vec<String>| {
+        let _ = writeln!(out, "  {what}: box-affected (face density {face:?} > {rule:.1e}) — skipped, the next draw taken");
+        skipped.push(what);
+        std::fs::write(&skip_path, skipped.join("\n")).expect("skipped.txt");
+    };
+    let pos_of = |sc: &Scene| -> Vec<[f64; 3]> { sc.nuclei.iter().map(|n| n.pos).collect() };
+    let z_of = |sc: &Scene| -> Vec<u8> { sc.nuclei.iter().map(|n| n.z).collect() };
+    let candidates = displaced(&base, 4 * train_n, SEED_TRAIN);
+    let (mut seg_atoms, mut seg_interior, mut accepted, mut segs) = (0usize, 0usize, 0usize, 0usize);
+    for (i, g) in candidates.iter().enumerate() {
+        if accepted == train_n {
+            break;
+        }
+        if skipped.contains(&format!("whole {i}")) {
+            continue;
+        }
+        if !a.collection().expect("attached").holds_geometry(&z_of(g), &pos_of(g)) {
             let t = Instant::now();
             a.teacher_mut().reset();
             let r = solve(a.teacher_mut(), g, &format!("whole {i}"));
-            assert!(r.stats.face_density.is_none_or(|f| f <= rule), "whole {i}: box-affected (face density {:?} > {rule:e})", r.stats.face_density);
+            if r.stats.face_density.is_some_and(|f| f > rule) {
+                skip(format!("whole {i}"), r.stats.face_density, &mut out, &mut skipped);
+                flush(&mut out);
+                continue;
+            }
             a.add_sample_answer(sample_of(g, r.energy, r.forces), g, r.stats.face_density, r.stats.multiplicity).unwrap_or_else(|e| panic!("A refused whole {i}: {e}"));
             let _ = writeln!(out, "  whole {i}: E {:.6} Ha, {} SCF, {:.1} s", r.energy, r.stats.scf_steps, t.elapsed().as_secs_f64());
         }
+        accepted += 1;
         // the control: the same whole answer, B's rows (the interior class, no energy)
-        if ctl.collection().map_or(0, |c| c.samples.len()) <= i {
-            let s = a.collection().expect("attached").samples[i].clone();
+        if !ctl.collection().expect("attached").holds_geometry(&z_of(g), &pos_of(g)) {
+            let s = a.collection().expect("attached").samples.iter().find(|s| s.sample.pos == pos_of(g)).expect("A holds it").clone();
             let mut gm = g.clone();
             gm.train_mask = Some(class.clone());
-            // (its face density was below the box rule when solved — asserted above, not stored)
+            // (its face density was below the box rule when solved — checked above, not stored)
             ctl.add_sample_answer(s.sample.clone(), &gm, Some(0.0), s.multiplicity).unwrap_or_else(|e| panic!("control {i}: {e}"));
         }
         for (k, &end) in end_atoms.iter().enumerate() {
-            let c = cut(g, &b, &[end], COLLECTION_R_CUT, d_cap);
-            seg_atoms += c.scene.nuclei.len();
-            seg_interior += c.interior.iter().filter(|&&x| x).count();
-            if bs.collection().map_or(0, |col| col.samples.len()) > 2 * i + k {
+            let mut c = cut(g, &b, &[end], COLLECTION_R_CUT, d_cap);
+            c.scene = recentred(&c.scene, seg_n);
+            if skipped.contains(&format!("segment {i}/{k}")) {
                 continue;
             }
-            let t = Instant::now();
-            a.teacher_mut().reset();
-            let r = solve(a.teacher_mut(), &c.scene, &format!("segment {i}/{k}"));
-            assert!(r.stats.face_density.is_none_or(|f| f <= rule), "segment {i}/{k}: box-affected");
-            // through the provider's keep path: the scene's train_mask masks the sample (ruling P10)
-            bs.add_sample_answer(sample_of(&c.scene, r.energy, r.forces), &c.scene, r.stats.face_density, r.stats.multiplicity).unwrap_or_else(|e| panic!("B refused segment {i}/{k}: {e}"));
-            let stored = &bs.collection().expect("attached").samples.last().expect("kept").sample;
-            assert_eq!((stored.force_mask.as_deref(), stored.use_energy), (Some(&c.interior[..]), false), "the keep path masked the segment");
-            let _ = writeln!(out, "  segment {i}/{k}: {} atoms ({} interior), {} SCF, {:.1} s", c.scene.nuclei.len(), c.interior.iter().filter(|&&x| x).count(), r.stats.scf_steps, t.elapsed().as_secs_f64());
+            if !bs.collection().expect("attached").holds_geometry(&z_of(&c.scene), &pos_of(&c.scene)) {
+                let t = Instant::now();
+                a.teacher_mut().reset();
+                let r = solve(a.teacher_mut(), &c.scene, &format!("segment {i}/{k}"));
+                if r.stats.face_density.is_some_and(|f| f > rule) {
+                    skip(format!("segment {i}/{k}"), r.stats.face_density, &mut out, &mut skipped);
+                    continue;
+                }
+                // through the provider's keep path: the scene's train_mask masks the sample (ruling P10)
+                bs.add_sample_answer(sample_of(&c.scene, r.energy, r.forces), &c.scene, r.stats.face_density, r.stats.multiplicity).unwrap_or_else(|e| panic!("B refused segment {i}/{k}: {e}"));
+                let stored = &bs.collection().expect("attached").samples.last().expect("kept").sample;
+                assert_eq!((stored.force_mask.as_deref(), stored.use_energy), (Some(&c.interior[..]), false), "the keep path masked the segment");
+                let _ = writeln!(out, "  segment {i}/{k}: {} atoms ({} interior), {} SCF, {:.1} s", c.scene.nuclei.len(), c.interior.iter().filter(|&&x| x).count(), r.stats.scf_steps, t.elapsed().as_secs_f64());
+            }
+            segs += 1;
+            seg_atoms += c.scene.nuclei.len();
+            seg_interior += c.interior.iter().filter(|&&x| x).count();
         }
         flush(&mut out);
     }
-    let _ = writeln!(out, "  training answers: {} (wall so far {:.0} s); segments average {:.1} atoms, {:.2} interior", log.lock().unwrap().summary(), wall.elapsed().as_secs_f64(),
-                     seg_atoms as f64 / (2 * train_n) as f64, seg_interior as f64 / (2 * train_n) as f64);
+    assert_eq!(accepted, train_n, "fewer than {train_n} training geometries below the box rule in {} draws", candidates.len());
+    let _ = writeln!(out, "  training answers: {accepted} whole, {segs} segments ({} draws skipped as box-affected: {skipped:?}); {} (wall so far {:.0} s); segments average {:.1} atoms, {:.2} interior",
+                     skipped.len(), log.lock().unwrap().summary(), wall.elapsed().as_secs_f64(), seg_atoms as f64 / segs.max(1) as f64, seg_interior as f64 / segs.max(1) as f64);
     flush(&mut out);
 
     // ---- the held-out answers (kept in their own collection, so a rerun reuses them) ----
-    let held = displaced(&base, HELD_OUT, SEED_HELD);
+    let mut held: Vec<Scene> = Vec::new();
     let mut dft: Vec<(f64, Vec<[f64; 3]>)> = Vec::new();
     {
         let (mut hc, _) = Collection::open(&roots[3], &key).unwrap_or_else(|e| panic!("held-out collection: {e}"));
-        for (j, g) in held.iter().enumerate() {
-            if j >= hc.samples.len() {
+        for (j, g) in displaced(&base, 4 * HELD_OUT, SEED_HELD).iter().enumerate() {
+            if held.len() == HELD_OUT {
+                break;
+            }
+            if skipped.contains(&format!("held-out {j}")) {
+                continue;
+            }
+            if !hc.holds_geometry(&z_of(g), &pos_of(g)) {
                 let t = Instant::now();
                 a.teacher_mut().reset();
                 let r = solve(a.teacher_mut(), g, &format!("held-out {j}"));
+                if r.stats.face_density.is_some_and(|f| f > rule) {
+                    skip(format!("held-out {j}"), r.stats.face_density, &mut out, &mut skipped);
+                    flush(&mut out);
+                    continue;
+                }
                 hc.append(CollectionSample { sample: sample_of(g, r.energy, r.forces), grid_n: g.cell.n, multiplicity_forced: false, multiplicity: r.stats.multiplicity, scene: "butane held-out".into() }).unwrap_or_else(|e| panic!("held-out {j}: {e}"));
                 let _ = writeln!(out, "  held-out {j}: E {:.6} Ha, {:.1} s", r.energy, t.elapsed().as_secs_f64());
                 flush(&mut out);
             }
-            let s = &hc.samples[j].sample;
-            assert_eq!(s.pos, g.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), "held-out {j}: the stored geometry is this draw's");
+            let s = &hc.samples.iter().find(|s| s.sample.pos == pos_of(g)).expect("stored").sample;
             dft.push((s.energy, s.forces.clone()));
+            held.push(g.clone());
         }
     }
+    assert_eq!(held.len(), HELD_OUT, "fewer than {HELD_OUT} held-out geometries below the box rule");
     let _ = writeln!(out, "  teacher in all: {}; wall {:.0} s", log.lock().unwrap().summary(), wall.elapsed().as_secs_f64());
     flush(&mut out);
 
@@ -630,7 +708,7 @@ fn capping_cost_probe() {
 /// atom's force norm) from the cited start; re-centred in its box and written to
 /// `scenes/butane.scene` (ruling P7). Run once; the gate reads the file.
 #[test]
-#[ignore = "GPU, hours (not yet run; probe estimate 100–200 FIRE steps × 95 s = 2.6–5.3 h): cargo test -p validate --release --test capping -- --ignored --nocapture relax_butane"]
+#[ignore = "GPU, hours (run once: 27 FIRE steps, scenes/butane.scene; do not rerun unless the surface changes): cargo test -p validate --release --test capping -- --ignored --nocapture relax_butane"]
 fn relax_butane() {
     let Some(ctx) = gpu() else { return };
     let (mut t, log) = Locked::new(ctx.clone(), TOL_H2);
@@ -642,10 +720,9 @@ fn relax_butane() {
     let pins = vec![false; sc.nuclei.len()];
     let outcome = loop {
         let st = fire.step(&mut sc, &mut forces, &pins, &mut t, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("FIRE step {}: {e}", fire.steps()));
-        if fire.steps() % 10 == 0 {
-            println!("  butane FIRE {}: E {:.6} Ha, max|F| {:.2e}, Δt {:.2} fs, wall {:.0} s", fire.steps(), st.energy, st.max_force_augmented, units::au_time_to_fs(fire.dt()), wall.elapsed().as_secs_f64());
-        }
-        if st.outcome != FireOutcome::Running {
+        println!("  butane FIRE {}: E {:.6} Ha, max|F| {:.2e}, Δt {:.2} fs, wall {:.0} s", fire.steps(), st.energy, st.max_force_augmented, units::au_time_to_fs(fire.dt()), wall.elapsed().as_secs_f64());
+        // ruling P22: stopped at RELAX_FMAX or RELAX_STEPS, whichever first (recorded in the file)
+        if st.outcome != FireOutcome::Running || st.max_force_augmented <= RELAX_FMAX || fire.steps() >= RELAX_STEPS {
             break (st.outcome, st.energy, st.max_force_augmented);
         }
     };
@@ -659,13 +736,15 @@ fn relax_butane() {
     let cc: Vec<String> = bnd.iter().filter(|&&(x, y)| relaxed.nuclei[x].z == 6 && relaxed.nuclei[y].z == 6).map(|&(x, y)| format!("{:.4}", dist(relaxed.nuclei[x].pos, relaxed.nuclei[y].pos))).collect();
     println!("butane: {:?} after {} FIRE steps in {:.0} s: E {:.6} → {:.6} Ha (re-centred in {}³: E {:.6}, max|F| {fmax:.2e}, face density {:?}); C–C {cc:?} Bohr, C–H mean {:.4} Bohr; {}",
              outcome.0, fire.steps(), wall.elapsed().as_secs_f64(), r0.energy, outcome.1, relaxed.cell.n, check.energy, check.stats.face_density, cap_length(&relaxed, &bnd), log.lock().unwrap().summary());
-    assert_eq!(outcome.0, FireOutcome::Converged, "FIRE ended {:?} at max|F| {:.2e}", outcome.0, outcome.2);
+    assert!(outcome.0 != FireOutcome::Running || outcome.2 <= RELAX_FMAX || fire.steps() >= RELAX_STEPS, "FIRE ended {:?} at max|F| {:.2e}", outcome.0, outcome.2);
+    let reached = if outcome.2 <= RELAX_FMAX { format!("stopped at max|F| <= {RELAX_FMAX:.0e}") } else { format!("stopped at the {RELAX_STEPS}-step cap, max|F| {:.1e} (FIRE {:?})", outcome.2, outcome.0) };
     let comment = vec![
-        "n-Butane (anti, C2h), relaxed on this solver's default surface: FIRE (the app's Relax, F_TOL 1e-3 Ha/Bohr per atom)".to_string(),
-        "at the Accurate grid (h = sigma = 0.15 Bohr) under the accepted pseudopotentials, GPU teacher at tol 1e-6.".to_string(),
-        "Start: all staggered, C-C 1.53 A, CCC 113 degrees (about the gas-phase electron-diffraction structure, Bradford,".to_string(),
-        "Fitzwater & Bartell, J. Mol. Struct. 38, 185 (1977)), C-H 1.09 A, tetrahedral methyl H, HCH 107 degrees on CH2; built".to_string(),
-        "from these parameters (not a literature Cartesian set); the geometry below is this solver's minimum, not experiment.".to_string(),
+        "n-Butane (anti, C2h), relaxed on this solver's default surface: FIRE (the app's Relax) at the Accurate grid".to_string(),
+        "(h = sigma = 0.15 Bohr) under the accepted pseudopotentials, GPU teacher at tol 1e-6, stopped at max|F| 2e-3 Ha/Bohr or".to_string(),
+        format!("60 steps, whichever first (M8a ruling P22: a near-equilibrium geometry for the capping gate) - {reached}."),
+        "Start geometry only (relaxed by this solver): all staggered, C-C 1.53 A, CCC 113 degrees (about the gas-phase".to_string(),
+        "electron-diffraction structure, Bradford, Fitzwater & Bartell, J. Mol. Struct. 38, 185 (1977)), C-H 1.09 A, tetrahedral".to_string(),
+        "methyl H, HCH 107 degrees on CH2; the geometry below is this solver's, not experiment.".to_string(),
         format!("Relaxed: {} FIRE steps, E = {:.6} Ha, max|F| = {fmax:.1e} Ha/Bohr re-centred; C-C {} Bohr.", fire.steps(), check.energy, cc.join(", ")),
         format!("Box: the nuclei's extent + {MARGIN} Bohr per side at h = {H_ACC} ({}^3). Written by validate/tests/capping.rs relax_butane.", relaxed.cell.n),
     ];

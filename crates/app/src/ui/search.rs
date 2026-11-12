@@ -34,6 +34,12 @@ const fn e(name: &'static str, also: &'static str, place: Place, anchor: &'stati
     Entry { name, also, place, anchor }
 }
 
+/// "Train this segment" (Dock ▸ Selection): searchable only while the feature is offered
+/// ([`crate::segment::SEGMENT_TRAINING`]; deferred), so it sits outside [`ENTRIES`] and
+/// [`results`] adds it.
+pub static SEGMENT_ENTRY: Entry =
+    e("Train this segment", "cut out capped fragment teach the selection shared model collection large molecule", Dock(D::Selection), "d-segment");
+
 /// Every control of the chrome by name (Appendix A of the mockup, grouped by anchor).
 pub const ENTRIES: &[Entry] = &[
     // toolbar
@@ -285,8 +291,9 @@ pub fn score(query: &str, entry: &Entry) -> Option<i32> {
 
 /// The results for `query`, best first (at most `n`).
 pub fn results(query: &str, n: usize) -> Vec<&'static Entry> {
+    let segment = crate::segment::SEGMENT_TRAINING.then_some(&SEGMENT_ENTRY);
     let mut v: Vec<(i32, usize, &Entry)> =
-        ENTRIES.iter().enumerate().filter_map(|(i, e)| score(query, e).map(|s| (s, i, e))).collect();
+        ENTRIES.iter().chain(segment).enumerate().filter_map(|(i, e)| score(query, e).map(|s| (s, i, e))).collect();
     v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     v.into_iter().take(n).map(|(_, _, e)| e).collect()
 }
