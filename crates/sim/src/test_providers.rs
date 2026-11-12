@@ -379,6 +379,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::refit(&mut *self.lock())
     }
 
+    fn begin_refit_background(&mut self) -> bool {
+        Trainable::begin_refit_background(&mut *self.lock())
+    }
+
+    fn poll_refit_background(&mut self) -> crate::provider::RefitPoll {
+        Trainable::poll_refit_background(&mut *self.lock())
+    }
+
     fn forget(&mut self) {
         Trainable::forget(&mut *self.lock())
     }

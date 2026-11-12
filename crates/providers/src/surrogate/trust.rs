@@ -964,9 +964,12 @@ impl SurrogateKs {
         });
         let r = self.refit_inner();
         // the quarantine codes a refit moved, and the history it judged by, go to the shared
-        // collection (`shared` module doc)
-        self.sync_collection_status();
-        self.flush_collection();
+        // collection (`shared` module doc) — a background refit's copy writes nothing: the live
+        // provider does after the install (`background` module doc)
+        if !self.refit_fork {
+            self.sync_collection_status();
+            self.flush_collection();
+        }
         r
     }
 
@@ -1438,6 +1441,11 @@ impl SurrogateKs {
     }
 
     fn fit_store_with(&mut self, trust_passes: bool) -> Result<FitReport, FitError> {
+        // a background refit's copy whose provider let it go stops here (`background`); its result
+        // is never installed, so the error's kind is never shown
+        if self.refit_cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(FitError::NoSamples);
+        }
         let Some(store) = self.store.as_ref() else { return Err(FitError::NoSamples) };
         if store.is_empty() {
             return Err(FitError::NoSamples);

@@ -82,6 +82,7 @@ pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
 /// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
+#[derive(Clone)]
 pub(super) struct FenceVote {
     pub(super) near: Vec<usize>,
     pub(super) n: usize,

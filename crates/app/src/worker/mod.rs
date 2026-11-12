@@ -52,7 +52,13 @@
 //!   refits it (through `sim::Trainable`, the only way past the boundary — nothing downcasts the
 //!   provider), between ticks as `providers::surrogate` requires — while playing at most once per
 //!   [`REFIT_INTERVAL`] unless [`REFIT_SAMPLES`] new samples arrived first (a fallback burst does
-//!   not refit every step); paused, at once. The driver notices the new surface epoch and books
+//!   not refit every step); paused, at once. While playing the refit runs **in the background**
+//!   (`Trainable::begin_refit_background`; `providers::surrogate` "background"): the model that
+//!   stands keeps answering, judged by its own verdicts, and each tick polls it; the new model is
+//!   installed between ticks once done (or discarded when more than appended data changed meanwhile —
+//!   it is due again, after the throttle; after [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row the
+//!   next one runs in the tick, so the model still moves). Paused it runs in the tick, as before (nothing steps meanwhile, and the
+//!   order of a paused session's notes stays deterministic). The driver notices the new surface epoch and books
 //!   the jump on its next tick. Every outcome goes to the snapshot notes ("refit #k: rmse …,
 //!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
@@ -590,6 +596,11 @@ struct Worker {
     samples_at_refit: usize,
     /// When the last refit ended (the refit throttle, [`REFIT_INTERVAL`]).
     last_refit_at: Option<Instant>,
+    /// When the running background refit started (playing: `refit_if_pending`), if one runs.
+    refit_started: Option<Instant>,
+    /// Background refits discarded in a row (a conflict each time): from
+    /// [`REFIT_DISCARDS_BEFORE_SYNC`] on, the next refit runs in the tick, so the model still moves.
+    refit_discards: u32,
     refits: u64,
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
@@ -809,6 +820,8 @@ fn worker(
         autosave,
         last_refit: None,
         last_refit_at: None,
+        refit_started: None,
+        refit_discards: 0,
         samples_at_refit: 0,
         refits: 0,
         autoload_refused: None,

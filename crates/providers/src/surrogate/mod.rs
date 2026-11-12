@@ -993,6 +993,7 @@ use surrogate::{
 use surrogate::sidecar::TeacherSolves;
 
 mod audit;
+mod background;
 pub mod calibrate;
 mod inspect;
 mod knowledge;
@@ -1021,6 +1022,7 @@ pub use quarantine::{
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
 pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use background::BackgroundPoll;
 pub use views::Verdict;
 pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
 
@@ -1350,9 +1352,33 @@ pub struct SurrogateKs {
     /// arrival made (the canonical surface moved under a teacher-surface report): booked into the
     /// next evaluation's `refit_jump` (fix round 3; `shared::book_reference_arrival`).
     offset_jump: f64,
+    /// The refit running on its own thread (`background` module doc), if any.
+    background: Option<background::BackgroundRefit>,
+    /// This provider is a background refit's copy: its `refit` writes nothing to the collection
+    /// (the live provider does after the install).
+    refit_fork: bool,
+    /// A background refit's copy: set when the live provider let it go (dropped or replaced) —
+    /// its refit stops at its next fit (`fit_store_with`).
+    refit_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SurrogateKs {
+    /// A refit's outcome in `Trainable::refit`'s words (one line), noting the error while no model
+    /// formed.
+    fn refit_summary(&mut self, r: Result<FitReport, FitError>) -> Result<String, String> {
+        if let Err(e) = &r {
+            if self.model.is_none() {
+                self.last_fit_error = Some(e.to_string());
+            }
+        }
+        // a fit without energy rows measured no energy rmse (Task 10a review, finding 5)
+        r.map(|r| {
+            let e = if r.has_energy_rows() { format!("rmse_E {:.1e} Ha/atom", r.rmse_energy_per_atom) } else { format!("rmse_E — ({})", surrogate::fit::NO_ENERGY_ROWS) };
+            format!("{} samples, {e}, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_force)
+        })
+        .map_err(|e| e.to_string())
+    }
+
     pub fn new(teacher: Box<dyn ForceProvider>, policy: FallbackPolicy) -> SurrogateKs {
         // `name()` returns `&'static str`: a few bytes leaked once per provider built (the
         // worker builds one per backend switch), not per evaluation
@@ -1468,6 +1494,9 @@ impl SurrogateKs {
             specialised: Vec::new(),
             ref_jobs: Vec::new(),
             offset_jump: 0.0,
+            background: None,
+            refit_fork: false,
+            refit_cancel: None,
         }
     }
 
@@ -2673,17 +2702,20 @@ impl Trainable for SurrogateKs {
 
     fn refit(&mut self) -> Result<String, String> {
         let r = SurrogateKs::refit(self);
-        if let Err(e) = &r {
-            if self.model.is_none() {
-                self.last_fit_error = Some(e.to_string());
-            }
+        self.refit_summary(r)
+    }
+
+    fn begin_refit_background(&mut self) -> bool {
+        self.begin_background_refit()
+    }
+
+    fn poll_refit_background(&mut self) -> sim::RefitPoll {
+        match self.poll_background_refit() {
+            BackgroundPoll::Idle => sim::RefitPoll::Idle,
+            BackgroundPoll::Running => sim::RefitPoll::Running,
+            BackgroundPoll::Discarded(why) => sim::RefitPoll::Discarded(why),
+            BackgroundPoll::Installed(r) => sim::RefitPoll::Done(self.refit_summary(r)),
         }
-        // a fit without energy rows measured no energy rmse (Task 10a review, finding 5)
-        r.map(|r| {
-            let e = if r.has_energy_rows() { format!("rmse_E {:.1e} Ha/atom", r.rmse_energy_per_atom) } else { format!("rmse_E — ({})", surrogate::fit::NO_ENERGY_ROWS) };
-            format!("{} samples, {e}, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_force)
-        })
-            .map_err(|e| e.to_string())
     }
 
     fn forget(&mut self) {

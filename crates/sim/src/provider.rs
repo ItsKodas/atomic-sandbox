@@ -869,6 +869,19 @@ pub struct SideDisplay {
 /// [`ForceProvider::as_trainable`] — never by downcasting. Messages for the user that an
 /// operation produces (a pass started or finished, a reference chosen, a model loaded, refused or
 /// forgotten) are queued and handed out by [`take_notes`](Self::take_notes), in order.
+/// What [`Trainable::poll_refit_background`] found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefitPoll {
+    /// No background refit.
+    Idle,
+    /// Still running.
+    Running,
+    /// Installed: [`Trainable::refit`]'s outcome.
+    Done(Result<String, String>),
+    /// Discarded, with the reason (the refit is due again).
+    Discarded(String),
+}
+
 pub trait Trainable {
     /// Plans a sampling pass over `scene` (module doc of `providers::sampling`); `refs` seeds its
     /// isolated-atom reference cache (a reference found there costs no solve). Err with the
@@ -920,6 +933,19 @@ pub trait Trainable {
     /// fit's error (the previous model stays). A refit that moves the energy surface changes
     /// [`ForceProvider::surface_epoch`].
     fn refit(&mut self) -> Result<String, String>;
+    /// Starts a refit off the step path: the model that stands keeps answering — judged by its own
+    /// verdicts, as between two refits — until [`poll_refit_background`](Self::poll_refit_background)
+    /// installs the new one between ticks. `false` when the provider cannot, or one is running or
+    /// nothing is fitted: the caller refits synchronously then. Default: cannot.
+    fn begin_refit_background(&mut self) -> bool {
+        false
+    }
+    /// A background refit's state; `Done` once it is installed, with [`refit`](Self::refit)'s
+    /// outcome; `Discarded` when what changed while it ran was more than appended data (it is due
+    /// again). Default: `Idle`.
+    fn poll_refit_background(&mut self) -> RefitPoll {
+        RefitPoll::Idle
+    }
     /// Drops the model, its samples and references (a running pass is cancelled without a refit;
     /// the reference cache survives): the provider is a pass-through to its teacher again. Noted.
     fn forget(&mut self);

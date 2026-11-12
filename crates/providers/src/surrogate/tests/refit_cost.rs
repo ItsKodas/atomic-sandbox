@@ -86,7 +86,12 @@ fn phases(s: &mut SurrogateKs, label: &str) {
         acc.add(&store.samples[i], &basis, &refs, &opts).unwrap();
     }
     let t_acc = secs(t);
-    rows.push((format!("accumulate {} samples (cold rebuild)", head.len()), t_acc));
+    rows.push((format!("accumulate {} samples one at a time (add)", head.len()), t_acc));
+    let mut acc_many = surrogate::Accumulator::new(&basis);
+    let t = Instant::now();
+    acc_many.add_many(&head.iter().map(|&i| &store.samples[i]).collect::<Vec<_>>(), &basis, &refs, &opts).unwrap();
+    rows.push((format!("accumulate {} samples batched (add_many: the rebuild)", head.len()), secs(t)));
+    assert_eq!(format!("{:?}", acc_many.sums()), format!("{:?}", acc.sums()), "add_many is a loop of add");
     let t = Instant::now();
     let (_, _) = acc.refit(&opts, &prov, &refs).unwrap();
     rows.push((format!("search ({:?})", acc.last_refit()), secs(t)));
@@ -254,36 +259,38 @@ fn refit_cost_on_a_collection() {
 /// once per fit that computes the set).
 fn refit_state(s: &SurrogateKs) -> String {
     let notes: Vec<&String> = s.user_notes.iter().filter(|n| !n.contains("MaxVol")).collect();
-    format!(
-        "model {:?}\nreport {:?}\ntraining {:?}\nclass_loo {:?}\nclass_judge {:?}\nclass_worst {:?}\nclass_blockers {:?}\nclass_memory {:?}\nactive_set {:?}\nnull_space {:?}\nquarantine {:?}\ndegree_cap {:?}\nrecovery {:?}\ntrusted {} {:?}\nfailed_audits {:?}\nfences {:?}\naudit {:?} {:?}\nteach_rounds {:?}\nfits {} accumulated {} members {:?}\nepoch {} jump {:?}\nnotes {:?}\ndeferred {:?}",
-        s.model,
-        s.report,
-        s.training_residuals,
-        s.class_loo,
-        s.class_judge,
-        s.class_worst,
-        s.class_blockers,
-        s.class_memory,
-        s.active_set,
-        s.null_space.as_ref().map(|n| n.dimension()),
-        s.quarantine,
-        s.degree_cap,
-        s.recovery_note(),
-        s.trusted(),
-        s.untrusted_reason(),
-        s.failed_audits.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>(),
-        s.audit_fences.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>(),
-        s.audit_failed,
-        s.audit_force,
-        s.teach_rounds,
-        s.fits,
-        s.accumulated,
-        s.fit_members,
-        s.epoch,
-        s.pending_jump,
-        notes,
-        s.deferred_trust,
-    )
+    let n = s.samples();
+    let mut quarantine = s.quarantine.clone();
+    quarantine.resize(n.max(quarantine.len()), Q_NONE);
+    let store: Vec<(SampleTag, u64, usize)> = s.store.as_ref().map_or(Vec::new(), |st| st.samples.iter().map(|x| (x.tag, x.energy.to_bits(), x.pos.len())).collect());
+    let lines = [
+        format!("store {store:?}"),
+        format!("pending_refit {} votes {:?} kept {:?}", s.pending_refit, s.vote_pending, s.fence_kept),
+        format!("model {:?}", s.model),
+        format!("report {:?}", s.report),
+        format!("training {:?}", s.training_residuals),
+        format!("class_loo {:?}", s.class_loo),
+        format!("class_judge {:?}", s.class_judge),
+        format!("class_worst {:?}", s.class_worst),
+        format!("class_blockers {:?}", s.class_blockers),
+        format!("class_memory {:?}", s.class_memory),
+        format!("active_set {:?}", s.active_set),
+        format!("null_space {:?}", s.null_space.as_ref().map(|n| n.dimension())),
+        format!("quarantine {quarantine:?}"),
+        format!("degree_cap {:?}", s.degree_cap),
+        format!("recovery {:?}", s.recovery_note()),
+        format!("trusted {} {:?}", s.trusted(), s.untrusted_reason()),
+        format!("failed_audits {:?}", s.failed_audits.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>()),
+        format!("fences {:?}", s.audit_fences.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>()),
+        format!("audit {:?} {:?} burst {}", s.audit_failed, s.audit_force, s.audit_burst),
+        format!("teach_rounds {:?}", s.teach_rounds),
+        format!("fits {} accumulated {} members {:?}", s.fits, s.accumulated, s.fit_members),
+        format!("epoch {} jump {:?}", s.epoch, s.pending_jump),
+        format!("notes {notes:?}"),
+        format!("deferred {:?}", s.deferred_trust),
+    ];
+    lines.join("
+")
 }
 
 /// Asserts two states are the same, naming the first line that differs.
@@ -369,4 +376,216 @@ fn deferred_refit_on_a_collection() {
     }
     assert_same_state(&states[0], &states[1]);
     println!("the eager and the deferred refit leave the same state");
+}
+
+/// The stuck-H collection at its live state (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`),
+/// in its own folder copy `name`: the provider before its refit.
+fn stuck_live(name: &str, body4_off: bool) -> SurrogateKs {
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+    let key = surrogate::SurfaceKey {
+        functional: "lsda".into(),
+        h: 0.15,
+        sigma: 0.15,
+        tol: 1e-6,
+        teacher: "Kohn-Sham (GPU)".into(),
+        ionic: "all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8".into(),
+    };
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/stuck-h-collection").join(SLUG);
+    let dir = collection_root(name);
+    std::fs::create_dir_all(dir.join(SLUG)).unwrap();
+    for f in ["key.txt", "references.txt", "samples.bin", "history.bin"] {
+        std::fs::copy(src.join(f), dir.join(SLUG).join(f)).unwrap();
+    }
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    let live = c.quarantine.clone();
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.body4_off = body4_off;
+    s.attach(c).unwrap();
+    s.quarantine = live;
+    s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+    s.species_dirty = true;
+    s.fit_store().unwrap();
+    s.user_notes.clear();
+    // `dir` is removed when dropped: the folder must outlive the provider
+    std::mem::forget(dir);
+    s
+}
+
+/// What the dynamics append while a background refit runs (`background` module doc): kept samples
+/// (jittered copies of stored ones, links `Out` as a refused collection write leaves them), a
+/// failed audit, a kept fence vote.
+fn append_events(s: &mut SurrogateKs, k: usize) {
+    let mut rng = StdRng::seed_from_u64(7 + k as u64);
+    for &i in &[10usize, 120, 300] {
+        let mut x = s.store.as_ref().unwrap().samples[i].clone();
+        for p in x.pos.iter_mut() {
+            for a in 0..3 {
+                p[a] += rng.gen_range(-1e-3..1e-3);
+            }
+        }
+        let raw = x.energy;
+        s.store.as_mut().unwrap().push(x).unwrap();
+        let n = s.samples();
+        s.face.resize(n, f64::NAN);
+        s.quarantine.resize(n, Q_NONE);
+        if let Some(sh) = s.shared.as_mut() {
+            sh.link.push(super::super::shared::Link::Out);
+            sh.raw.push(raw);
+            sh.box_n.push(0);
+        }
+        s.pending_refit = true;
+    }
+    let x = s.store.as_ref().unwrap().samples[200].clone();
+    s.failed_audits.push(FailedAudit { pos: x.pos, z: x.z, energy: x.energy + 0.05, forces: x.forces, index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::default(), pair: None });
+    s.sync_audit_failed();
+    let n = s.samples();
+    s.vote_pending.push((n - 1, vec![3]));
+}
+
+/// A background refit with nothing happening meanwhile installs exactly the state a synchronous
+/// refit leaves (line by line), on the stuck-H collection's body-3 recovery (8 fits through step 3's
+/// restores) and its body-4 one.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_background_refit_installs_the_synchronous_state() {
+    for body4_off in [true, false] {
+        let mut sync = stuck_live(&format!("bg-sync-{body4_off}"), body4_off);
+        let mut bg = stuck_live(&format!("bg-bg-{body4_off}"), body4_off);
+        SurrogateKs::refit(&mut sync).unwrap();
+        assert!(bg.begin_background_refit());
+        assert!(!bg.begin_background_refit(), "one at a time");
+        assert!(bg.background_refit_running());
+        match bg.finish_background_refit() {
+            BackgroundPoll::Installed(r) => {
+                r.unwrap();
+            }
+            _ => panic!("installed"),
+        }
+        assert!(!bg.background_refit_running());
+        assert!(matches!(bg.poll_background_refit(), BackgroundPoll::Idle));
+        assert_same_state(&refit_state(&sync), &refit_state(&bg));
+        println!("body4_off {body4_off}: background = synchronous ({} fits, {} held)", bg.fits, bg.quarantined());
+    }
+}
+
+/// What the dynamics append while a background refit runs — samples, a failed audit, a kept vote —
+/// survives the install, and the result is the state of a synchronous refit followed by the same
+/// appends; the next (synchronous) refit of both is the same too.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn appends_during_a_background_refit_survive_the_install() {
+    let mut sync = stuck_live("bg-app-sync", false);
+    let mut bg = stuck_live("bg-app-bg", false);
+    SurrogateKs::refit(&mut sync).unwrap();
+    append_events(&mut sync, 0);
+    assert!(bg.begin_background_refit());
+    append_events(&mut bg, 0);
+    assert!(matches!(bg.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert!(bg.pending_refit, "the appended samples are the next refit's");
+    assert_eq!(bg.vote_pending.len(), 1);
+    assert!(bg.failed_audits.iter().any(|c| c.index.is_none() && c.origin == AuditOrigin::default()));
+    // the surface epoch is the driver's bookkeeping of what it saw: here the failed audit came
+    // before the install (the model was untrusted when it installed: no flip to book), there after
+    // a trusted install — each right for its own history; everything else is the same
+    let without_epoch = |s: &SurrogateKs| refit_state(s).lines().filter(|l| !l.starts_with("epoch ")).collect::<Vec<_>>().join("
+");
+    assert_same_state(&without_epoch(&sync), &without_epoch(&bg));
+    assert_eq!(bg.pending_jump, None);
+    SurrogateKs::refit(&mut sync).unwrap();
+    SurrogateKs::refit(&mut bg).unwrap();
+    assert_same_state(&without_epoch(&sync), &without_epoch(&bg));
+}
+
+/// More than appends while a background refit runs — a policy change (the model generation moves),
+/// a stored sample's quarantine code — discards its result: the model that stood still stands, and
+/// the refit is due again.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_conflict_discards_a_background_refit() {
+    let mut s = stuck_live("bg-conflict-policy", false);
+    let model = format!("{:?}", s.model);
+    assert!(s.begin_background_refit());
+    let p = s.policy.clone();
+    s.set_policy(p);
+    match s.finish_background_refit() {
+        BackgroundPoll::Discarded(why) => assert!(why.contains("the model, its samples or the policy"), "{why}"),
+        _ => panic!("discarded"),
+    }
+    assert!(s.pending_refit);
+    assert_eq!(format!("{:?}", s.model), model, "the model that stood still stands");
+
+    let mut s = stuck_live("bg-conflict-code", false);
+    let i = (0..s.samples()).find(|&i| !s.excluded(i)).unwrap();
+    assert!(s.begin_background_refit());
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[i] = Q_SUPERSEDED;
+    match s.finish_background_refit() {
+        BackgroundPoll::Discarded(why) => assert!(why.contains("quarantine code"), "{why}"),
+        _ => panic!("discarded"),
+    }
+    assert!(s.pending_refit);
+}
+
+/// Review finding 1: a box reference that arrives while a background refit runs rebases that box's
+/// stored energies without moving the canonical references — a conflict: the result is discarded
+/// (installing it would put the old energies back under the new references).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_box_reference_arriving_mid_refit_discards_it() {
+    let mut s = stuck_live("bg-box-ref", false);
+    assert!(s.begin_background_refit());
+    let sh = s.shared.as_mut().unwrap();
+    let k = *sh.box_refs.keys().next().unwrap();
+    *sh.box_refs.get_mut(&k).unwrap() += 1e-6;
+    match s.finish_background_refit() {
+        BackgroundPoll::Discarded(why) => assert!(why.contains("references"), "{why}"),
+        _ => panic!("discarded"),
+    }
+    assert!(s.pending_refit);
+}
+
+/// Review finding 2: a key the live provider's between-refit evidence made leave while a background
+/// refit ran stays out at the install — the state is a synchronous refit's followed by the same
+/// leave and its re-judge, line by line.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_key_that_left_during_a_background_refit_stays_out() {
+    let mut sync = stuck_live("bg-left-sync", false);
+    let mut bg = stuck_live("bg-left-bg", false);
+    // a first refit each, so that keys stand trusted in the memory
+    SurrogateKs::refit(&mut sync).unwrap();
+    SurrogateKs::refit(&mut bg).unwrap();
+    let key = sync.class_memory.iter().find(|(_, &(t, _))| t).map(|(k, _)| k.clone()).expect("a trusted key");
+    let leave = |s: &mut SurrogateKs| {
+        s.class_memory.insert(key.clone(), (false, None));
+    };
+    SurrogateKs::refit(&mut sync).unwrap();
+    leave(&mut sync);
+    sync.rejudge_classes();
+    assert!(bg.begin_background_refit());
+    leave(&mut bg);
+    assert!(matches!(bg.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_same_state(&refit_state(&sync), &refit_state(&bg));
+    println!("key {key:?}: after the install {:?}", bg.class_memory.get(&key));
+}
+
+/// A background refit asked to stop (its provider let it go) stops at its next fit; its result is
+/// an error and installs nothing new — the model that stood still stands.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_cancelled_background_refit_installs_nothing_new() {
+    let mut s = stuck_live("bg-cancel", false);
+    let model = format!("{:?}", s.model);
+    assert!(s.begin_background_refit());
+    s.background.as_ref().unwrap().cancel_now();
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Err(_)) | BackgroundPoll::Discarded(_) => {}
+        _ => panic!("a cancelled refit must not install a new fit"),
+    }
+    if format!("{:?}", s.model) != model {
+        // the thread may have finished its first fit before the flag was read: then the model is that
+        // fit's, as a synchronous refit interrupted there would leave it — but never trusted anew
+        // without its trust passes
+        assert_eq!(s.deferred_trust, None);
+    }
 }
