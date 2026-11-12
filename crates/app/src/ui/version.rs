@@ -34,8 +34,12 @@
 //!    Restart anyway / Cancel, saying what would be lost.
 //! 2. A playing simulation is never paused by itself: "The simulation is playing." with **Pause and
 //!    restart** (the pause, as the Pause button sends it — the step being solved is dropped — then
-//!    the restart once the run has stopped) / Cancel.
-//! 3. A background job — a sampling pass, a refit, a relax, a background audit ([`running`]) —
+//!    the restart once the run has stopped) / Cancel. Play pressed again while it pauses (once the
+//!    pause has been seen to land) goes back to that question, so a later plain Pause never
+//!    restarts the app.
+//! 3. A background job — a sampling pass, a refit, a relax, a background audit ([`running`]) — or,
+//!    with the run paused, a solve the worker is still busy with (the one after a scene load, an
+//!    Apply grid or a Step; Bonds now; `ui::auto_bonds`' refresh after a drag: [`waiting_for`])
 //!    gets "Waiting for the refit to finish…" with Cancel it and restart / Keep waiting; the restart
 //!    then goes ahead by itself when the job ends.
 //!
@@ -128,9 +132,12 @@ pub enum Guard {
     SaveFirst,
     /// The simulation is playing: Pause and restart / Cancel.
     Playing,
-    /// Pause and restart was pressed: the restart follows once the run has stopped.
-    Pausing,
-    /// A background job runs: the restart waits for it. `prompt`: the card with Cancel it and
+    /// Pause and restart was pressed: the restart follows once the run has stopped. `landed`: a
+    /// frame has seen the run paused since (until then the pause is still on its way); playing
+    /// again after that is the user's Play, which goes back to [`Guard::Playing`].
+    Pausing { landed: bool },
+    /// A background job, or a paused run's solve, runs: the restart waits for it
+    /// ([`waiting_for`]). `prompt`: the card with Cancel it and
     /// restart / Keep waiting (Keep waiting leaves the quieter "Restarting when … finishes" line).
     Waiting { what: &'static str, prompt: bool },
 }
@@ -312,6 +319,21 @@ pub fn running(input: &PanelInput<'_>) -> Option<&'static str> {
     }
 }
 
+/// What the restart waits for (module doc): a background job ([`running`]), else — the run paused —
+/// a solve the worker is still busy with, "the solve" (the one after a scene load, an Apply grid or
+/// a Step; Bonds now; `ui::auto_bonds`' refresh after a drag). A playing run's step solves are not
+/// one: a playing run gets [`Guard::Playing`].
+pub fn waiting_for(input: &PanelInput<'_>) -> Option<&'static str> {
+    running(input).or_else(|| (input.busy && !input.playing).then_some("the solve"))
+}
+
+/// The playing run's question; a "Cancel it and restart" given earlier is spent (it was for the
+/// job, not for whatever runs after the next pause).
+fn ask_playing(u: &mut UpdateState) {
+    u.guard = Guard::Playing;
+    u.force = false;
+}
+
 /// What the restart would lose of the estimated solver's model, in words, or `None` when it keeps
 /// it all (ruling M1): nothing is lost from a shared collection (on disk sample by sample, and
 /// re-attached after the restart), nor what a model file already holds — only the samples learned
@@ -433,11 +455,11 @@ pub(super) fn restart(st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelO
         }
     }
     if input.playing {
-        st.update.guard = Guard::Playing;
+        ask_playing(&mut st.update);
         return;
     }
     if !st.update.force {
-        if let Some(what) = running(input) {
+        if let Some(what) = waiting_for(input) {
             let prompt = match st.update.guard {
                 Guard::Waiting { prompt, .. } => prompt,
                 _ => true,
@@ -506,13 +528,17 @@ pub(super) fn tick(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>
     }
     poll_confirm(st);
     match st.update.guard {
-        Guard::Waiting { what, prompt } => match running(input) {
+        // (playing again with no job left: `restart` asks the playing question)
+        Guard::Waiting { what, prompt } => match waiting_for(input) {
             None => restart(st, input, out),
             Some(w) if w != what => st.update.guard = Guard::Waiting { what: w, prompt },
             Some(_) => {}
         },
         // the pause has landed (the step it stopped has let go of the solver too)
-        Guard::Pausing if !input.playing && !input.busy => restart(st, input, out),
+        Guard::Pausing { .. } if !input.playing && !input.busy => restart(st, input, out),
+        Guard::Pausing { landed: false } if !input.playing => st.update.guard = Guard::Pausing { landed: true },
+        // paused, then Play again: ask again (T4 N5) — a later plain Pause must not restart
+        Guard::Pausing { landed: true } if input.playing => ask_playing(&mut st.update),
         _ => {}
     }
     let u = &st.update;
@@ -699,14 +725,14 @@ fn guard_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.horizontal(|ui| {
                 if probed("guard-pause-restart", ui.button("Pause and restart")).clicked() {
                     acts.push(Action::Pause);
-                    st.update.guard = Guard::Pausing;
+                    st.update.guard = Guard::Pausing { landed: false };
                 }
                 if probed("guard-cancel", ui.button("Cancel")).clicked() {
                     st.update.idle();
                 }
             });
         }),
-        Guard::Pausing => card(ui, |ui| {
+        Guard::Pausing { .. } => card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Pausing, then restarting…");

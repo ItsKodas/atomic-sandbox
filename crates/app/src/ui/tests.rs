@@ -8486,8 +8486,9 @@ mod updates {
 
     /// Restart now while a refit runs waits ("Waiting for the refit to finish…", Cancel it and
     /// restart / Keep waiting) and restarts by itself once it ends; Cancel it and restart goes at
-    /// once; a sampling pass and a background audit are waited for too, a paused step solve is not;
-    /// nothing restarts without a verified download.
+    /// once; a sampling pass and a background audit are waited for too (a paused solve is not a
+    /// background job, but is waited for: `restart_waits_for_a_paused_solve`); nothing restarts
+    /// without a verified download.
     #[test]
     fn restart_waits_for_running_refit() {
         let scene = Scene::preset("h2").unwrap();
@@ -8536,9 +8537,10 @@ mod updates {
         assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
         let audit = PanelInput { probe: Some(sim::ProbeView { side: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
         assert_eq!(version::running(&audit), Some("the background audit"));
-        // a paused step solve in flight is not a background job: no wait
+        // a paused step solve in flight is not a background job, though the restart waits for it
         let solving = PanelInput { busy: true, probe: Some(sim::ProbeView { main: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
         assert_eq!(version::running(&solving), None);
+        assert_eq!(version::waiting_for(&solving), Some("the solve"));
         // Cancel (the download) calls a waiting restart off
         act(&mut st, &idle, Action::CancelUpdateDownload);
         assert_eq!(st.update.guard, Guard::Idle);
@@ -8673,7 +8675,7 @@ mod updates {
         assert_eq!(actions(&outs), [Action::Pause], "the pause, as the Pause button sends it");
         assert!(dyn_commands(&outs).iter().any(|c| matches!(c, DynCommand::Pause)));
         assert!(!outs.iter().any(|o| o.restart_for_update), "not before the run has stopped");
-        assert_eq!(st.update.guard, Guard::Pausing);
+        assert_eq!(st.update.guard, Guard::Pausing { landed: false }, "the pause is on its way (the click's frames still read playing)");
         assert!(has(&shown(&ctx, &mut st, &playing), "Pausing, then restarting…"));
         assert!(!frame(&ctx, &mut st, &stopping, 1400.0, vec![]).restart_for_update, "the step still lets go of the solver");
         assert!(frame(&ctx, &mut st, &stopped, 1400.0, vec![]).restart_for_update, "stopped: the restart follows");
@@ -8682,6 +8684,101 @@ mod updates {
         let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
         act(&mut st, &playing, Action::RestartToUpdate);
         click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Final review I1: Restart now with the run paused but the worker still solving (the solve
+    /// after a scene load, an Apply grid or a Step; Bonds now; the bond refresh after a drag)
+    /// waits for "the solve" with the same card, hands nothing off meanwhile, and restarts by
+    /// itself once the worker is idle; Cancel it and restart goes at once; Play pressed while it
+    /// waits turns it into the playing question.
+    #[test]
+    fn restart_waits_for_a_paused_solve() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let solving = PanelInput { busy: true, ..input(&scene, None, &cam) };
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("paused-solve");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        let out = act(&mut st, &solving, Action::RestartToUpdate);
+        assert!(!out.restart_for_update, "no hand-off while the solve runs");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        let lines = shown(&ctx, &mut st, &solving);
+        for t in ["Waiting for the solve to finish…", "Cancel it and restart", "Keep waiting"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        for _ in 0..3 {
+            assert!(!frame(&ctx, &mut st, &solving, 1400.0, vec![]).restart_for_update, "still solving: still waiting");
+        }
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        // the worker is idle: the restart goes ahead by itself
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Cancel it and restart: at once, the solve still running
+        act(&mut st, &solving, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &solving, "guard-cancel-restart");
+        assert!(outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Play pressed while waiting: the playing question, not a restart once the run stops
+        act(&mut st, &solving, Action::RestartToUpdate);
+        assert!(!frame(&ctx, &mut st, &playing, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(!frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "paused again: no restart without a click");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T4 N5 and N3: Play pressed while Pause and restart is pausing asks again (the playing
+    /// question), so a later plain Pause never restarts the app; and a "Cancel it and restart"
+    /// given for a job is spent when the guard turns to the playing question, so the job is
+    /// waited for again after the next pause.
+    #[test]
+    fn play_while_pausing_asks_again() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let stopping = PanelInput { playing: false, busy: true, ..input(&scene, None, &cam) };
+        let stopped = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("play-while-pausing");
+        ready(&mut st, &stopped, &root);
+        st.update.open = true;
+        act(&mut st, &playing, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert_eq!(st.update.guard, Guard::Pausing { landed: false });
+        // the pause lands; the dropped step still holds the solver
+        assert!(!frame(&ctx, &mut st, &stopping, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Pausing { landed: true });
+        // the user presses Play: asked again
+        assert!(!frame(&ctx, &mut st, &playing, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(has(&shown(&ctx, &mut st, &playing), version::PLAYING));
+        // a later plain Pause: no restart without a new click
+        for inp in [&stopping, &stopped, &stopped] {
+            assert!(!frame(&ctx, &mut st, inp, 1400.0, vec![]).restart_for_update, "a plain Pause never restarts");
+        }
+        assert_eq!(st.update.guard, Guard::Playing);
+        // the new click restarts as before
+        let outs = click_widget(&ctx, &mut st, &stopped, "guard-pause-restart");
+        assert!(outs.iter().any(|o| o.restart_for_update), "paused already: the restart follows");
+        assert_eq!(st.update.guard, Guard::Idle);
+        // N3: Cancel it and restart (for the refit) while playing turns to the playing question
+        // and is spent there; after Pause and restart the refit is waited for again
+        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        act(&mut st, &refit, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let outs = click_widget(&ctx, &mut st, &refit_playing, "guard-cancel-restart");
+        assert!(!outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(!st.update.force, "the cancel was for the job, not for after the pause");
+        click_widget(&ctx, &mut st, &refit_playing, "guard-pause-restart");
         assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
         assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
         let _ = std::fs::remove_dir_all(&root);
