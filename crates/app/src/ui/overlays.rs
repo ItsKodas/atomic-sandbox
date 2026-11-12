@@ -19,7 +19,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     if view.width() < 50.0 || view.height() < 50.0 {
         return;
     }
-    let chip = status_chip(ctx, view, st, input);
+    let chip = status_chip(ctx, view, st, input, acts);
     st.chip_rect = Some(chip);
     bonds_now(ctx, view, st, input, acts);
     // the capture buttons at the top right; the atom card and the offer cards stack under them
@@ -212,8 +212,13 @@ pub fn bond_reference_line(r: &sim::ReferenceProgress) -> String {
     )
 }
 
+/// The status chip's ⚠ Model only pill (user request 2026-11-12), while it is on.
+pub fn model_only_chip(st: &UiState) -> Option<&'static str> {
+    st.model_only.is_some().then_some("model only — no DFT checks")
+}
+
 /// Draws the chip and returns its rect (the draft banner stacks under it).
-fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) -> Rect {
+fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Rect {
     let notes = chip_notes(st, input);
     let errors: Vec<String> = input
         .last_error
@@ -268,9 +273,21 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     if let Some(s) = input.snapshot {
                         let d = &s.dynamics;
                         if s.backend == Backend::Estimated {
-                            theme::pill(ui, source_label(d.source), source_colour(d.source)).on_hover_text(super::SOURCE_TIP);
+                            // lone atoms say so in the chip (rule 0b): the label alone could read as a model answer
+                            let text = if d.source == sim::Source::Reference { "lone atoms: atom references" } else { source_label(d.source) };
+                            theme::pill(ui, text, source_colour(d.source)).on_hover_text(super::source_tip(d.source));
                             if d.history_guess.last() == Some(&true) {
                                 theme::pill(ui, "draft guess", RED).on_hover_text("draft mode: this step is the model's guess, also where it would have fallen back to DFT");
+                            }
+                            // clickable: the way off where the compact toolbar has no room for the
+                            // toggle (a window narrower than about 1090 pt)
+                            if let Some(t) = model_only_chip(st) {
+                                let pill = theme::pill(ui, t, super::AMBER).rect;
+                                // a click area over the whole pill, its text included (registered last: on top)
+                                let r = ui.interact(pill, Id::new("model-only-chip"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if super::probed("model-only-chip", r).on_hover_text(format!("click to turn Model only off (draft mode and the audits as they were before).\n\n{}", super::toolbar::MODEL_ONLY_TIP)).clicked() {
+                                    acts.push(Action::ModelOnly(false));
+                                }
                             }
                         } else {
                             theme::pill(ui, &format!("DFT · {}", s.engine.label()), SPARK_E);

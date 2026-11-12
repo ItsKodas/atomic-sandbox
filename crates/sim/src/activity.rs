@@ -624,6 +624,10 @@ pub struct SolveCounts {
     pub kept: u64,
     /// The model came from a file without the record: solves before it are unrecorded.
     pub unrecorded_before: bool,
+    /// Steps answered from the isolated-atom references (lone atoms, `Source::Reference`) since the
+    /// provider was built or the last forget: **not solves** — not in [`total`](Self::total), not a
+    /// fallback, not a model answer; nothing was learned from them. A session count, never saved.
+    pub reference: u64,
 }
 
 impl SolveCounts {
@@ -928,7 +932,7 @@ mod tests {
 
     #[test]
     fn solve_counts_total_and_not_kept() {
-        let c = SolveCounts { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, unrecorded_before: false };
+        let c = SolveCounts { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, unrecorded_before: false, reference: 0 };
         assert_eq!(c.total(), 362);
         assert_eq!(c.not_kept(), 19);
     }

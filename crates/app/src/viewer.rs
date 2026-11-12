@@ -93,7 +93,8 @@ impl DensityShown {
                     superposition: None,
                 }
             }
-            (None, Source::Surrogate) => self.faded = self.from.is_some(),
+            // no electrons in a model answer, nor in a lone-atom reference answer (rule 0b)
+            (None, Source::Surrogate | Source::Reference) => self.faded = self.from.is_some(),
             (None, _) => {}
         }
     }

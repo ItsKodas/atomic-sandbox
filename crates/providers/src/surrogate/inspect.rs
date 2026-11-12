@@ -169,10 +169,31 @@ impl SurrogateKs {
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let prov = self.scene_provenance(scene);
+        // `evaluate`'s order: a capped segment is the teacher's before any rule (review M6)
+        if scene.train_mask().is_some() {
+            return Some(Readiness {
+                answers: false,
+                rule: Some(TeachRule::Segment),
+                atom: None,
+                text: "a capped segment teaches its interior atoms — the model does not answer here".into(),
+                unlearned: None,
+            });
+        }
+        // rule 0b: strict mode answers lone atoms from the references, whatever the trust; a lone
+        // scene it declines is the teacher's once rules 1–4 pass (review I1)
+        let lone = self.lone_reference(scene, &prov);
+        if let Lone::Answer { .. } = lone {
+            return Some(Readiness { answers: true, rule: None, atom: None, text: "lone atoms: answered from the atom references".into(), unlearned: None });
+        }
         let key = self.verdict_key();
         let refusal = match &self.strict_verdict {
             Some(v) if v.key == key && v.pos == pos && v.z == z => v.refusal.clone(),
-            _ => self.first_refusal(&pos, &z, &self.scene_provenance(scene)),
+            _ => match (self.first_refusal(&pos, &z, &prov), lone) {
+                // the gate passes and rule 5a has not already refused: 0b's refusal (as `evaluate`)
+                (r, Lone::StandAside(why)) if self.gate(&z, &prov).is_ok() && r.as_ref().is_none_or(|r| r.rule != TeachRule::IsolatedAtom) => Some(Self::lone_refusal(&why)),
+                (r, _) => r,
+            },
         };
         // fix (e): the scene's own last pass, none of it in the fit
         let mut species = z.clone();
@@ -255,6 +276,7 @@ impl SurrogateKs {
             d.iter().map(|(i, j, r)| format!("{i}-{j} {r:.3}")).collect::<Vec<_>>().join(", ")
         );
         let _ = writeln!(o, "    would_answer: {:?}", self.would_answer(&pos, &z, &prov));
+        let _ = writeln!(o, "    lone-atom rule (0b, strict mode): {:?}", self.lone_reference(scene, &prov));
         if let Err(g) = self.gate(&z, &prov) {
             let _ = writeln!(o, "    REFUSED by the gate ({:?}): {}", g.reason.rule, g.reason.text);
             return o;

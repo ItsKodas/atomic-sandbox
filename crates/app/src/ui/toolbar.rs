@@ -15,7 +15,7 @@
 use super::icons::{self, Icon};
 use super::menus::dt_field;
 use super::search;
-use super::{probe, probed, source_colour, source_label, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
+use super::{probe, probed, source_colour, source_label, source_tip, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
 use crate::sim::Backend;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Button, Color32, Direction, FontId, Frame, Label, Layout, Margin, RichText, Stroke, TextStyle, Ui, Vec2, WidgetText};
@@ -34,6 +34,11 @@ const EDIT_TIP: &str = "Edit: click an atom, Shift-click to add or remove, drag 
 const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
+
+/// The ⚠ Model only toggle's label and tooltip (user request 2026-11-12; rule 7: it says plainly
+/// what goes unchecked).
+pub const MODEL_ONLY: &str = "⚠ Model only";
+pub const MODEL_ONLY_TIP: &str = "model only: the model answers every step and no DFT solve interrupts the run — draft mode on and the background DFT audits off, in one switch, until you turn it off (it then restores the draft mode and audit cadence you had). Nothing checks the model's answers while it is on: energies and forces can drift from DFT unnoticed, and the model does not learn from audits (there are none). The red draft banner and the red atom tint still show where it extrapolates. Changing draft mode or the audit cadence by hand turns it off and keeps your change; leaving Estimated turns it off and restores. Not saved: every session starts with it off.";
 
 fn estimated_tip(gpu: bool) -> String {
     let teacher = if gpu { "GPU" } else { "CPU" };
@@ -113,6 +118,8 @@ struct Widths {
     c_selection: f32,
     c_solver: f32,
     c_solver_row: f32,
+    /// ⚠ Model only with the item spacing before it.
+    model_only: f32,
     // the compact layout's slots
     c_speed_field: f32,
     c_rate: f32,
@@ -139,7 +146,7 @@ impl Widths {
         let rate = |f: &FontId, unit: &str| max(&[w(&format!("00.0k{unit}"), f), w(&format!("    —{unit}"), f)]);
         let line_w = |parts: &[&str]| parts.iter().enumerate().map(|(k, p)| w(p, if k % 2 == 1 { &sub_mono } else { &sub })).sum::<f32>();
         let kbd = w("Space", &FontId::monospace(10.0)) + 10.0;
-        let solver_sub = 10.0 + sp + w(source_label(sim::Source::Fallback), &sub) + sp + line_w(&["· trusted · ", "100", " % fallback · epoch ", "9999"]);
+        let solver_sub = 10.0 + sp + max(&[w(source_label(sim::Source::Fallback), &sub), w(source_label(sim::Source::Reference), &sub)]) + sp + line_w(&["· trusted · ", "100", " % fallback · epoch ", "9999"]);
 
         let speed_field = field(&MAX_SPEED.to_string());
         let rate_full = rate(&FontId::monospace(15.0), "");
@@ -147,6 +154,9 @@ impl Widths {
         let play = btn("      Pause").max(84.0);
         let relax = btn("Relax").max(btn("Stop")).max(RELAX_W);
         let selection_row = s.spacing.icon_width + s.spacing.icon_spacing + w("Pin", &body) + sp + btn("Focus") + sp + btn("Delete");
+        // ⚠ Model only (shown under Estimated only): small, on the full layout's sub-line (its
+        // main row has no room left at 1400); beside the compact segments where the slot has room
+        let model_only = sp + w(MODEL_ONLY, &sub) + 2.0 * bp;
         let solver_row = segs(&[btn("CPU"), btn("GPU"), btn("Estimated")]);
         let c_speed_field = field(&format!("×{MAX_SPEED}"));
         let c_rate = rate(&mono, " fs/s");
@@ -168,7 +178,7 @@ impl Widths {
             ]) + PAD,
             elements: max(&[caps("Place element · Z 1–10", false), 10.0 * 21.0 + 9.0 * 2.0, w(PTABLE_OPENER, &sub) + 2.0 * bp + sp + w("²²Ne (Z = 10)", &sub)]) + PAD,
             selection: max(&[caps("Selection · He #99", false), selection_row, w("(-0.00, -0.00, -0.00) Bohr", &sub_mono)]) + PAD,
-            solver: max(&[caps("Solver", false), solver_row, solver_sub]) + PAD,
+            solver: max(&[caps("Solver", false), solver_row, model_only + solver_sub]) + PAD,
             solver_row: solver_row + PAD,
             full: 0.0,
             speed_field,
@@ -180,7 +190,8 @@ impl Widths {
             c_tool: segs(&[30.0; 4]),
             c_elements: (w("He ▾", &mono) + 2.0 * bp).max(40.0),
             c_selection: selection_row + sp + w("no selection", &body),
-            c_solver: c_solver_row + sp + solver_sub,
+            c_solver: c_solver_row + model_only + sp + solver_sub,
+            model_only,
             c_solver_row,
             c_speed_field,
             c_rate,
@@ -415,8 +426,11 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     let solver = Widths::last(ui, w.solver, w.solver_row);
     group_body(ui, st, "tb-solver", "Solver", None, solver, |ui, st| {
-        row(ui, |ui| solver_segments(ui, st, false, acts));
-        ui.horizontal(|ui| solver_sub(ui, st, input));
+        let estimated = row(ui, |ui| solver_segments(ui, st, false, acts));
+        ui.horizontal(|ui| {
+            model_only_toggle(ui, st, estimated, acts);
+            solver_sub(ui, st, input)
+        });
     });
 }
 
@@ -471,10 +485,20 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
     ui.separator();
     let solver = Widths::last(ui, w.c_solver, w.c_solver_row);
     let r = slot(ui, solver, |ui| {
-        solver_segments(ui, st, true, acts);
+        let estimated = solver_segments(ui, st, true, acts);
+        // ⚠ Model only where the slot has its room (a window at least about 1090 pt wide); narrower,
+        // it is not drawn (Ctrl K points at Estimated; while it is on, the status chip's pill says
+        // so and a click on it turns it off)
+        let mut used = w.c_solver_row;
+        if solver >= used + w.model_only {
+            model_only_toggle(ui, st, estimated, acts);
+            used += w.model_only;
+        } else {
+            search::mark(ui, st, "tb-model-only", estimated);
+        }
         // the light and a few letters at least, else (a very narrow window) no line at all; the
         // top bar's status chip still names the source
-        if solver >= w.c_solver_row + MIN_SUB {
+        if solver >= used + MIN_SUB {
             solver_sub(ui, st, input);
         }
     });
@@ -632,7 +656,8 @@ fn selection_buttons(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>
     }
 }
 
-fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action>) {
+/// CPU · GPU · Estimated; returns the Estimated button's rect.
+fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action>) -> egui::Rect {
     Frame::new()
         .fill(theme::APP)
         .stroke(Stroke::new(1.0, theme::LINE))
@@ -651,13 +676,31 @@ fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Acti
                 acts.push(Action::Backend(Backend::Gpu));
             }
             let est = if compact { "Est." } else { "Estimated" };
-            if probed("solver-estimated", ui.add(Button::selectable(st.backend == Backend::Estimated, est)))
-                .on_hover_text(estimated_tip(st.gpu_available))
-                .clicked()
-            {
+            let r = probed("solver-estimated", ui.add(Button::selectable(st.backend == Backend::Estimated, est))).on_hover_text(estimated_tip(st.gpu_available));
+            if r.clicked() {
                 acts.push(Action::Backend(Backend::Estimated));
             }
-        });
+            r.rect
+        })
+        .inner
+}
+
+/// ⚠ Model only (user request 2026-11-12): a small amber toggle in the Solver group, only while
+/// Estimated is the solver; otherwise Ctrl K's "model only" points at Estimated (`estimated`, its
+/// button's rect), where it appears.
+fn model_only_toggle(ui: &mut Ui, st: &mut UiState, estimated: egui::Rect, acts: &mut Vec<Action>) {
+    if st.backend != Backend::Estimated {
+        search::mark(ui, st, "tb-model-only", estimated);
+        return;
+    }
+    let on = st.model_only.is_some();
+    let text = RichText::new(MODEL_ONLY).size(SUB).color(if on { theme::APP } else { super::AMBER });
+    let r = probed("model-only", ui.add(Button::new(text).small().fill(if on { super::AMBER } else { Color32::TRANSPARENT }).stroke(Stroke::new(1.0, super::AMBER))))
+        .on_hover_text(MODEL_ONLY_TIP);
+    if r.clicked() {
+        acts.push(Action::ModelOnly(!on));
+    }
+    search::mark(ui, st, "tb-model-only", r.rect);
 }
 
 /// The solver's sub-line: the trust light, who answered this step, trust, fallbacks, epoch
@@ -693,12 +736,18 @@ the fit's own words: {d}"),
             None => tip.to_string(),
         });
     }
+    let src = d.source;
     if t.kind == TrustKind::NoModel {
+        // lone atoms are answered from the references without a model too (rule 0b)
+        if src == sim::Source::Reference {
+            sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(source_tip(src));
+            sub(ui, RichText::new(format!("· {}", t.kind.short())).size(SUB).color(theme::INK_DIM));
+            return;
+        }
         sub(ui, t.kind.short());
         return;
     }
-    let src = d.source;
-    sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(super::SOURCE_TIP);
+    sub(ui, RichText::new(source_label(src)).size(SUB).color(source_colour(src))).on_hover_text(source_tip(src));
     let short = t.kind.short();
     let epoch = m.map_or(0, |m| m.epoch);
     let pct = format!("{:>3.0}", 100.0 * d.fallback_fraction_100);
@@ -709,3 +758,4 @@ the fit's own words: {d}"),
         epoch
     ));
 }
+

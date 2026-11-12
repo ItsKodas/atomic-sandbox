@@ -137,6 +137,11 @@ pub enum Action {
     Cloud { superposition: bool, refresh: bool, refresh_s: f64 },
     /// Draft mode: the model answers every step (unsafe).
     Draft(bool),
+    /// The toolbar's ⚠ Model only (user request 2026-11-12): on = draft on and audits off (the
+    /// previous two kept in `UiState::model_only`), off = those two restored exactly. One action,
+    /// not a Draft + SetAudit pair, so a replay re-saves and restores its own values and a hand
+    /// change of either (which turns Model only off) stays distinguishable. Script word `model-only`.
+    ModelOnly(bool),
     /// The drag pull (Ha/Bohr): Physics ▸ Drag pull's slider and Reset; clamped to the driver's
     /// range, sent only when it changes.
     DragForce(f64),
@@ -228,8 +233,50 @@ pub enum Action {
     Record(bool),
 }
 
-/// Applies one action: the `UiState` change and the commands, as the old panel did.
+/// Applies one action: the `UiState` change and the commands, as the old panel did. ⚠ Model only
+/// lasts only on the estimated solver (user request 2026-11-12): whatever moved the solver off it
+/// (the toolbar, Back to the scene) turns it off and restores what it replaced.
 pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
+    apply_action(st, input, a, out);
+    if st.model_only.is_some() && st.backend != Backend::Estimated {
+        model_only_off(st, out);
+        st.set_status("model only is off (the solver left Estimated): draft mode and the audits are as they were before");
+    }
+}
+
+/// ⚠ Model only on (user request 2026-11-12): keeps the draft mode and audit cadence it replaces,
+/// then draft on and audits off. The "audits on" switch would bring back the cadence it replaced.
+fn model_only_on(st: &mut UiState, out: &mut PanelOutput) {
+    if st.model_only.is_some() {
+        return;
+    }
+    st.model_only = Some(super::ModelOnlySaved { draft: st.draft, audit_every: st.audit_every });
+    if st.audit_every > 0 {
+        st.audit_every_on = st.audit_every;
+    }
+    (st.draft, st.audit_every) = (true, 0);
+    out.commands.push(Command::SetDraft(true));
+    out.commands.push(Command::SetAudit(0));
+}
+
+/// ⚠ Model only off: the draft mode and audit cadence it replaced, exactly.
+fn model_only_off(st: &mut UiState, out: &mut PanelOutput) {
+    let Some(saved) = st.model_only.take() else { return };
+    (st.draft, st.audit_every) = (saved.draft, saved.audit_every);
+    out.commands.push(Command::SetDraft(saved.draft));
+    out.commands.push(Command::SetAudit(saved.audit_every));
+}
+
+/// A hand change of draft mode or the audit cadence while ⚠ Model only is on (user request
+/// 2026-11-12): the user's choice wins — Model only turns itself off and restores nothing over it
+/// (the other setting stays as Model only left it), and the status line says so.
+fn model_only_by_hand(st: &mut UiState, what: &str) {
+    if st.model_only.take().is_some() {
+        st.set_status(format!("model only is off: you changed {what} by hand, so nothing was restored over it"));
+    }
+}
+
+fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
         Action::TogglePlay => {
@@ -548,6 +595,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             st.plan.seed += 1;
         }
         Action::SetAudit(n) => {
+            model_only_by_hand(st, "the audit cadence");
             st.audit_every = n;
             out.commands.push(Command::SetAudit(n));
         }
@@ -571,8 +619,18 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             out.commands.push(st.cloud_command());
         }
         Action::Draft(on) => {
+            model_only_by_hand(st, "draft mode");
             st.draft = on;
             out.commands.push(Command::SetDraft(on));
+        }
+        Action::ModelOnly(on) => {
+            if !on {
+                model_only_off(st, out);
+            } else if st.backend != Backend::Estimated {
+                out.error = Some("model only is the estimated solver's: pick Estimated in the toolbar's Solver group first".into());
+            } else {
+                model_only_on(st, out);
+            }
         }
         Action::DragForce(f) => set_drag_force(st, f.clamp(F_DRAG_LO, F_DRAG_HI), out),
         Action::DragForceWheel(lines) => set_drag_force(st, super::wheel_pull(st.drag_force, lines), out),
@@ -1011,6 +1069,7 @@ impl Action {
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
             Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
             Draft(b) => format!("draft {b}"),
+            ModelOnly(b) => format!("model-only {b}"),
             DragForce(f) => format!("drag-force {f}"),
             DragForceWheel(l) => format!("drag-force-wheel {l}"),
             ShowBonds(b) => format!("bonds {b}"),
@@ -1165,7 +1224,7 @@ impl Action {
                 want(1)?;
                 Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores, accepted or all, got '{}'", args[0]))?)
             }
-            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
+            "gravity" | "com-correction" | "draft" | "model-only" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
                 want(1)?;
                 let b = flag(args[0])?;
                 match head {
@@ -1173,6 +1232,7 @@ impl Action {
                     "gravity" => Gravity(b),
                     "com-correction" => ComCorrection(b),
                     "draft" => Draft(b),
+                    "model-only" => ModelOnly(b),
                     "bonds" => ShowBonds(b),
                     "labels" => ShowLabels(b),
                     "badge" => ShowBadge(b),

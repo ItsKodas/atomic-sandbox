@@ -777,7 +777,7 @@ impl Worker {
 
     /// The per-solve cost estimate and the pass ETA ([`ModelStatus::solve_s`], `pass_eta_s`).
     pub(super) fn track_cost(&mut self, snap: &DynSnapshot) {
-        let teacher_step = snap.source != sim::Source::Surrogate && !snap.forces_stale && snap.eval.solve_ms > 0;
+        let teacher_step = !matches!(snap.source, sim::Source::Surrogate | sim::Source::Reference) && !snap.forces_stale && snap.eval.solve_ms > 0;
         match snap.sampling.as_ref().filter(|p| !p.finished) {
             Some(p) => {
                 // the isolated-atom reference scans (open-shell and cold: 13–15 s each for O)

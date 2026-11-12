@@ -73,13 +73,17 @@ const FORGET_CONFIRM: Duration = Duration::from_secs(4);
 /// Below this width (points) the toolbar and the top bar switch to their compact layouts.
 const COMPACT_WIDTH: f32 = 1240.0;
 
+/// The colour of a step answered from the isolated-atom references (lone atoms, `Source::Reference`).
+pub const TEAL: Color32 = Color32::from_rgb(110, 205, 200);
+
 /// Who answered a step, as a colour: surrogate green, fallback amber, DFT blue (the sparkline's
-/// E colour, so a Kohn-Sham run looks as before).
+/// E colour, so a Kohn-Sham run looks as before), lone atoms answered from the references teal.
 pub fn source_colour(s: Source) -> Color32 {
     match s {
         Source::Surrogate => GREEN,
         Source::Fallback => AMBER,
         Source::Dft => SPARK_E,
+        Source::Reference => TEAL,
     }
 }
 
@@ -88,6 +92,16 @@ pub fn source_label(s: Source) -> &'static str {
         Source::Surrogate => "surrogate",
         Source::Fallback => "fallback (DFT)",
         Source::Dft => "DFT",
+        Source::Reference => "atom references",
+    }
+}
+
+/// The hover of a source label: [`REFERENCE_TIP`] for a lone-atom reference answer, else
+/// [`SOURCE_TIP`].
+pub fn source_tip(s: Source) -> &'static str {
+    match s {
+        Source::Reference => REFERENCE_TIP,
+        _ => SOURCE_TIP,
     }
 }
 
@@ -144,6 +158,14 @@ pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decima
     }
 }
 
+/// What ⚠ Model only replaced (`UiState::model_only`): the draft mode and the audit cadence it
+/// restores when it is turned off (user request 2026-11-12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelOnlySaved {
+    pub draft: bool,
+    pub audit_every: usize,
+}
+
 /// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
 pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
 /// The auto cadence's bounds (answered steps): never more often than every 2000 steps (user request 2026-10-19; was 200), never
@@ -172,7 +194,10 @@ pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits)
 }
 
 /// The source tooltip (the old "this step" readout's).
-const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
+const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step; atom references (teal): lone atoms answered from the isolated-atom references";
+
+/// The hover of a step answered from the atom references (`providers::surrogate`, rule 0b).
+pub const REFERENCE_TIP: &str = "lone atoms: answered from the atom references. No atom has a neighbour within the model's cutoff, so the energy is the sum of the isolated-atom reference energies and every force is zero — exactly what the model answers there, whatever its trust; no DFT solve runs. DFT in this box would differ by its grid and box artefacts, which no model can learn — measured for a lone H in the default 12-Bohr box: the grid's egg-box ripple, about a µHa, and the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces: a finite-box artefact, not the container walls, which still act), about 2 mHa 4 Bohr from the nearest face and 35 mHa at 2 Bohr; the references are free atoms, the more physical answer there. Nothing is learned from these steps and none is audited. DFT answers instead for a charged scene, a reference not solved yet, mixed species, two or more atoms whose shell may be open (their copies can exchange charge in the box), a pair a shell check found still interacting, or a multiplicity other than the atoms' own spins aligned; draft mode answers lone atoms with the model, the same number.";
 
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten
 /// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
@@ -727,6 +752,11 @@ pub struct UiState {
     pub audit_every: usize,
     /// Draft mode (`Command::SetDraft`): per session, off by default.
     pub draft: bool,
+    /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
+    /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored
+    /// exactly when it is turned off or the solver leaves Estimated; a hand change of either turns
+    /// it off without restoring. Per session, off at start (never in a profile).
+    pub model_only: Option<ModelOnlySaved>,
     /// The drag spring's force cap ("pull", Ha/Bohr; `DynCommand::SetDragForce`): the wheel while
     /// dragging scales it by [`DRAG_WHEEL_STEP`] per line within the driver's range. Per session;
     /// it outlives the drag (the next one uses it).
@@ -955,6 +985,7 @@ impl UiState {
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
+            model_only: None,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),
             edit_group: Vec::new(),

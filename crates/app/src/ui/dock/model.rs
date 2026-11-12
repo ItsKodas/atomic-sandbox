@@ -6,7 +6,7 @@
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
 use super::super::sampling_presets as presets;
 use super::super::{
-    duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
+    duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, source_tip,
 };
 use crate::scene::model_path;
 use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
@@ -636,7 +636,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label("this step");
-        ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong()).on_hover_text(SOURCE_TIP);
+        ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong()).on_hover_text(source_tip(d.source));
         ui.end_row();
         ui.label("uncertainty");
         let tip = "the model's epistemic force std per component (max over atoms; the label noise σ_f is left out — a fallback on it would teach nothing, and a fit whose σ_f exceeds 2e-3 Ha/Bohr is untrusted instead) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.";
