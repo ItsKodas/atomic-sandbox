@@ -7758,7 +7758,7 @@ fn a_reference_answer_has_its_own_label_colour_and_tip() {
         assert_eq!(source_tip(other), SOURCE_TIP);
     }
     let tip = source_tip(r);
-    for want in ["lone atoms: answered from the atom references", "grid and box artefacts", "egg-box ripple", "confinement", "2 mHa 4 Bohr from the nearest face", "Nothing is learned", "none is audited"] {
+    for want in ["lone atoms: answered from the atom references", "grid and box artefacts", "measured for a lone H", "egg-box ripple", "Dirichlet boundary", "not the container walls", "2 mHa 4 Bohr from the nearest face", "Nothing is learned", "none is audited", "draft mode answers lone atoms with the model, the same number"] {
         assert!(tip.contains(want), "the tip lacks '{want}': {tip}");
     }
     assert!(SOURCE_TIP.contains("atom references (teal)"));

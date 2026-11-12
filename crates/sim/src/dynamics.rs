@@ -489,11 +489,12 @@
 //! booked), the drift history is cleared once (W is kept: it is the drained energy),
 //! `relax.converged` is `Some(outcome == Converged)` with a note for anything else. On a
 //! provider that can be taught (the surrogate) a converged relax whose last evaluation was the
-//! model's own answer (`Source::Surrogate`, or `Source::Reference` at lone atoms; a fallback step's forces are already the teacher's,
+//! model's own answer (`Source::Surrogate`; a fallback step's forces are already the teacher's,
 //! so they are reported as verified without another solve) is checked by one teacher solve at the result
 //! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
 //! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
-//! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
+//! answer's max|F_i| (none after a lone-atom `Source::Reference` answer: no model was consulted, and the
+//! teacher's force there is the grid box's confinement, an artefact); the positions did not move, so only a surface flip at fixed positions
 //! (teacher − model energy, when the model could not answer) is booked, exactly like a refit
 //! jump. If it exceeds F_TOL the note says so, and a second `Relax` continues from there.
 //! # Thermostat (rulings R7, R10)
@@ -2311,9 +2312,11 @@ impl Dynamics {
         // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
         // last answer's forces were the teacher's already (a fallback step, review M5)
         if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
-            // a lone-atom reference answer (`Source::Reference`) is the model's own value, never a
-            // teacher's: checked the same way
-            if matches!(self.eval.source, Source::Surrogate | Source::Reference) {
+            // a lone-atom reference answer (`Source::Reference`) consulted no model: there is nothing
+            // to verify, and the teacher's force there is the grid box's confinement (its Dirichlet
+            // boundary — an artefact, ~1e-3 Ha/Bohr a few Bohr off-centre), which would read as
+            // "not converged" for an atom at rest. Converged, unverified (no `verified_max_force`)
+            if self.eval.source == Source::Surrogate {
                 self.provider.as_trainable().expect("checked").force_teacher_next();
                 let r = self.provider.evaluate(&self.scene, should_abort);
                 Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
@@ -2346,7 +2349,7 @@ impl Dynamics {
                     Err(ProviderError::Cancelled) => progress.note = Some("verification by the teacher cancelled: the result is the model's".into()),
                     Err(e) => progress.note = Some(format!("verification by the teacher failed ({e}): the result is the model's")),
                 }
-            } else {
+            } else if self.eval.source != Source::Reference {
                 progress.verified_max_force = Some(progress.max_force);
             }
         }

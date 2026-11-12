@@ -178,6 +178,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                     "moving mean over the model's own steps; DFT steps here (fallbacks; audits in the step with the CPU teacher) average {:.0} ms",
                     d.ms_per_step_dft
                 ));
+            } else if d.source == Source::Reference {
+                ui.monospace("answered from the atom references, no SCF").on_hover_text(super::super::REFERENCE_TIP);
             } else {
                 let cost = match d.eval.readbacks {
                     Some(r) => format!("{} SCF iterations, {r} readbacks", d.eval.scf_steps),
@@ -263,6 +265,8 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
             }
             if d.source == Source::Surrogate {
                 ui.weak("surrogate step: only the total is the model's (it has no electrons); the parts above are 0");
+            } else if d.source == Source::Reference {
+                ui.weak("lone atoms, answered from the atom references: only the total is theirs (Σ of the isolated-atom reference energies, no SCF ran); the parts above and the SCF numbers below are 0");
             } else if d.source == Source::Fallback {
                 ui.weak("fallback step: the DFT teacher's breakdown (with a trusted model E_KS above is the model's: total − teacher gap)");
             }

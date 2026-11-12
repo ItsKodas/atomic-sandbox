@@ -183,14 +183,9 @@ pub(super) fn shared_provenance(key: &SurfaceKey) -> Provenance {
 /// surface is the collection's for every session — or, while the collection stores none of `z`
 /// (none solved yet, or a read-only collection), the largest box's this session uses; a stored one
 /// replaces it when it arrives (a rebase, booked like any reference arrival). `None` without any.
-fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
+pub(super) fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
     let species = (z, 0)..=(z, usize::MAX);
     sh.coll.references.range(species.clone()).next_back().map(|(_, r)| r.energy).or_else(|| sh.box_refs.range(species).next_back().map(|(_, &e)| e))
-}
-
-/// [`canonical_ref`] for the lone-atom rule (`lone`): the energy a reference answer sums.
-pub(super) fn canonical_reference(sh: &SharedCollection, z: u8) -> Option<f64> {
-    canonical_ref(sh, z)
 }
 
 /// What changes when the audit history changes: its recorded points and its unrecorded counts.
@@ -679,14 +674,19 @@ impl SurrogateKs {
     /// The canonical shift Σ(ref_own − ref_canonical) of the last report, when it was on the
     /// teacher's surface (0 for a box without its references: the report was the raw answer);
     /// `None` without a report or after a model-surface one (the model's answers do not move until
-    /// the refit, whose jump books them). A lone-atom reference answer (`lone`) reported
-    /// Σ ref_canonical, which moves with the canonical references at once: its "offset" is
-    /// −Σ ref_canonical, so an arrival books Σ Δref_canonical (`None` when one is missing).
+    /// the refit, whose jump books them). A lone-atom reference answer (`lone`) from the provider's
+    /// references reported Σ ref_canonical, which moves with the canonical references at once: its
+    /// "offset" is −Σ ref_canonical, so an arrival books Σ Δref_canonical (`None` when one is
+    /// missing); one from the model's own references moves with the refit, like a model answer.
     fn last_report_offset(&self) -> Option<f64> {
         let l = self.last.as_ref()?;
-        if l.reference {
-            let sh = self.shared.as_ref()?;
-            return l.z.iter().try_fold(0.0, |acc, &z| canonical_ref(sh, z).map(|e| acc - e));
+        match l.reference {
+            Some(LastReference::Provider) => {
+                let sh = self.shared.as_ref()?;
+                return l.z.iter().try_fold(0.0, |acc, &z| canonical_ref(sh, z).map(|e| acc - e));
+            }
+            Some(LastReference::Model) => return None,
+            None => {}
         }
         if l.on_model {
             return None;

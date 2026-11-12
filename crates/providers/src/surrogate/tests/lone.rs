@@ -4,6 +4,7 @@
 //! and stands aside (today's path) when the references cannot answer: a charged scene, a missing
 //! reference, a multiplicity other than the atoms' reference states aligned, mixed species.
 use super::*;
+use sim::AtomReference;
 
 /// One H at a deliberately off-centre spot of a 33³ cell (|x| ≤ 3.25 inside the 3h margin).
 fn lone_h() -> Scene {
@@ -272,6 +273,194 @@ fn no_audit_is_dispatched_at_lone_atoms() {
     assert_eq!(s.side_jobs(), jobs + 1, "H₂ is audited: {:?}", r.stats.notes);
     open.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(auditor_calls.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing was solved for the lone atom");
+}
+
+/// A per-scene species-Morse student of `z`₂ dimers (r ∈ [lo, hi], random orientations) at
+/// `charge`, with the `z` reference, refitted.
+fn dimer_student(z: u8, lo: f64, hi: f64, n: usize, charge: i32) -> (SurrogateKs, Arc<Mutex<SpeciesMorse>>) {
+    let (mut s, t) = pair_student();
+    s.set_reference_energy(z, SpeciesMorse::atom(z));
+    let mut rng = StdRng::seed_from_u64(0x10f);
+    for i in 0..n {
+        let r = lo + (hi - lo) * i as f64 / (n - 1) as f64;
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        let mut sc = dimer(r, unit_vector(&mut rng), origin, z, z);
+        sc.charge = charge;
+        s.add_sample(species_sample(&sc), &sc).unwrap();
+    }
+    s.refit().expect("a fit forms");
+    (s, t)
+}
+
+/// One atom of `z` at the off-centre spot of [`lone_h`].
+fn lone(z: u8) -> Scene {
+    let mut sc = lone_h();
+    sc.nuclei[0].z = z;
+    sc
+}
+
+/// Records a scanned reference of `z` with multiplicity `m` (and the fractional flag) in the
+/// provider's reference cache at `scene`'s settings, as a sampling pass's scan does.
+fn record_scan(s: &mut SurrogateKs, scene: &Scene, z: u8, m: u32, fractional: bool) {
+    let key = atom_key(&s.provenance_for(scene), z);
+    s.ref_cache.insert(key, AtomReference { energy: SpeciesMorse::atom(z), multiplicity: Some(m), fractional: Some(fractional), tol: 1e-6, provider: "pair morse".into(), radial: Default::default(), face_density: Some(0.0) });
+}
+
+/// Review I1: a lone C at automatic multiplicity (1) whose reference is the triplet, under a
+/// **trusted** model — rule 0b declines (the scene is not solved at the reference's spin), and the
+/// teacher answers: rule 5a's refusal for one atom too, never the model's E_ref (before fix round 1
+/// 5a's one-atom exemption let the model answer). The step's own notes and its Activity row say why
+/// (M5); readiness refuses the same way. At M = 3 the same atom is the rule's.
+#[test]
+fn a_lone_atom_the_references_decline_is_the_teachers_not_the_models() {
+    let (mut s, t) = dimer_student(6, 2.4, 3.8, 40, 0);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    // the spread rule (5c) refuses an empty neighbourhood of this dimer-only fit on its own; with
+    // it off nothing else stood between the one-atom scene and the model (5a's exemption)
+    let policy = *s.policy();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, ..policy });
+    let c = lone(6);
+    record_scan(&mut s, &c, 6, 3, false);
+    let _ = s.take_events();
+    let n0 = species_calls(&t);
+    let r = s.evaluate(&c, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(species_calls(&t), n0 + 1, "the teacher answered");
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher, "reported on the teacher's surface");
+    assert!(r.stats.notes.iter().any(|n| n.contains("lone atoms the atom references cannot answer")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("not answered from the atom references") && n.contains("multiplicity 1 (automatic)")), "{:?}", r.stats.notes);
+    let e = s.take_events();
+    let ev = e.last().expect("the fallback's event");
+    assert_eq!(ev.rule, sim::activity::TeachRule::IsolatedAtom);
+    assert!(ev.detail.contains("multiplicity 1 (automatic)"), "the row says why (M5): {}", ev.detail);
+    assert_eq!(s.samples(), 40, "never kept");
+    let ready = s.readiness(&c).unwrap();
+    assert!(!ready.answers && ready.rule == Some(sim::activity::TeachRule::IsolatedAtom), "{ready:?}");
+    // a fresh readiness (no recorded verdict at this geometry) says the same
+    let mut moved = c.clone();
+    moved.nuclei[0].pos[0] += 0.3;
+    let ready = s.readiness(&moved).unwrap();
+    assert!(!ready.answers && ready.rule == Some(sim::activity::TeachRule::IsolatedAtom), "{ready:?}");
+    // at the reference's own spin state the references answer (another provenance than the
+    // model's: the provider's references)
+    let mut triplet = c.clone();
+    triplet.multiplicity = Some(3);
+    let r = s.evaluate(&triplet, &mut never()).unwrap();
+    assert_reference(&r, SpeciesMorse::atom(6), "C at M = 3");
+    // the notes of a declined step do not leak into the next (M5)
+    assert!(!r.stats.notes.iter().any(|n| n.contains("not answered")), "{:?}", r.stats.notes);
+}
+
+/// Review I1: a lone H at charge −1 under a trusted store trained at charge −1 (the same surface, so
+/// rules 1–4 pass) — 0b declines on the charge, the teacher answers, not the model's E_ref(H⁰).
+#[test]
+fn a_charged_lone_atom_under_a_charged_model_is_the_teachers() {
+    let (mut s, t) = dimer_student(1, 1.1, 2.3, 40, -1);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    // as above: without the spread rule nothing else stood between the scene and the model
+    let policy = *s.policy();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, ..policy });
+    let mut h = lone_h();
+    h.charge = -1;
+    let n0 = species_calls(&t);
+    let r = s.evaluate(&h, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(species_calls(&t), n0 + 1);
+    assert!(r.stats.notes.iter().any(|n| n.contains("charge is -1")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("lone atoms the atom references cannot answer")), "{:?}", r.stats.notes);
+    let ready = s.readiness(&h).unwrap();
+    assert!(!ready.answers, "{ready:?}");
+}
+
+/// Review I2: a shell check measured H–H still interacting near the cutoff (its fence) — two lone H
+/// at the parallel multiplicity, which the rule would answer, go to the teacher instead.
+#[test]
+fn a_shell_check_fence_keeps_lone_pairs_of_its_species_with_the_teacher() {
+    let (mut s, t) = h_student(12);
+    s.refit().expect("a fit forms");
+    let r = s.evaluate(&two_h(6.2, Some(3)), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Reference, "the premise: answered without the fence");
+    let check = two_h(5.2, None);
+    s.audit_fences.push(FailedAudit { pos: check.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: 0.0, forces: vec![[0.0; 3]; 2], index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::ShellCheck, pair: Some((1, 1)) });
+    let n0 = species_calls(&t);
+    let r = s.evaluate(&two_h(6.2, Some(3)), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(species_calls(&t), n0 + 1);
+    assert!(r.stats.notes.iter().any(|n| n.contains("shell check measured H–H")), "{:?}", r.stats.notes);
+    // a lone H alone holds no fenced pair
+    assert_eq!(s.evaluate(&lone_h(), &mut never()).unwrap().stats.source, Source::Reference);
+}
+
+/// Review I4 (controller ruling): two or more lone atoms are answered only when their reference is
+/// known to end at a gap — Z = 1; on a pseudised surface a scan that shared no shell. Two lone He
+/// at M* on the all-electron surface (integer aufbau: an open shell would not show) decline.
+#[test]
+fn copies_of_an_atom_not_known_to_end_at_a_gap_are_the_teachers() {
+    assert!(super::super::lone::closed_spin_channels(1, true, None), "one electron");
+    assert!(super::super::lone::closed_spin_channels(2, false, Some(false)), "pseudised surface, no shared shell");
+    assert!(!super::super::lone::closed_spin_channels(8, false, Some(true)), "a shared shell");
+    assert!(!super::super::lone::closed_spin_channels(2, false, None), "not recorded");
+    assert!(!super::super::lone::closed_spin_channels(2, true, Some(false)), "integer aufbau hides an open shell");
+    let (mut s, t) = h_student(3);
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    let mut he2 = two_h(6.2, None);
+    for n in &mut he2.nuclei {
+        n.z = 2;
+    }
+    record_scan(&mut s, &he2, 2, 1, false);
+    // one He alone is its own reference
+    assert_reference(&s.evaluate(&lone(2), &mut never()).unwrap(), SpeciesMorse::atom(2), "one He");
+    let n0 = species_calls(&t);
+    let r = s.evaluate(&he2, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(species_calls(&t), n0 + 1);
+    assert!(r.stats.notes.iter().any(|n| n.contains("2 lone He atoms") && n.contains("integer occupations")), "{:?}", r.stats.notes);
+}
+
+/// Review M1: with a model the answer sums the model's own references, so a reference changed
+/// before the refit moves neither the model's answers nor the reference answers (no unbooked step
+/// at a model ↔ reference switch); the refit then moves both, and its jump is booked at the next
+/// reference answer — for an untrusted refit too.
+#[test]
+fn the_answer_follows_the_models_references_until_a_refit_books_the_change() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let e = MorseDimer::h2().e_atom;
+    let r = s.evaluate(&lone_h(), &mut never()).unwrap();
+    assert_reference(&r, e, "before");
+    s.set_reference_energy(1, e + 1e-3);
+    let r = s.evaluate(&lone_h(), &mut never()).unwrap();
+    assert_reference(&r, e, "the model's reference until the refit");
+    assert_eq!(r.stats.refit_jump, None);
+    let p = s.model().unwrap().predict(&[[1.3, -0.7, 2.1]], &[1], false).unwrap();
+    assert_eq!(p.energy.to_bits(), r.energy.to_bits(), "the model's own answer");
+    s.refit().expect("the refit");
+    let r = s.evaluate(&lone_h(), &mut never()).unwrap();
+    assert_reference(&r, e + 1e-3, "after the refit");
+    let j = r.stats.refit_jump.expect("the refit's jump is booked");
+    assert!((j - 1e-3).abs() < 1e-12, "booked {j:.3e} (trusted {})", s.trusted());
+}
+
+/// Review M3: a relax that ends on a reference answer is converged and **not** re-checked by the
+/// teacher — nothing was consulted, and DFT's force there is the grid box's confinement.
+#[test]
+fn a_relax_on_lone_atoms_is_not_verified_by_the_teacher() {
+    let (s, t) = h_student(3);
+    let (p, _sh) = driven(s);
+    let mut d = Dynamics::new(lone_h(), p, 0.25, 1);
+    assert_eq!(d.snapshot().source, Source::Reference);
+    d.apply(DynCommand::Relax);
+    let r = loop {
+        let snap = d.tick(-1.0, &mut never());
+        let r = snap.relax.clone().expect("relaxing");
+        if r.converged.is_some() {
+            break r;
+        }
+        assert!(r.steps < 100);
+    };
+    assert_eq!(r.converged, Some(true));
+    assert_eq!(r.verified_max_force, None, "nothing to verify");
+    assert_eq!(r.note, None);
+    assert_eq!(species_calls(&t), 0, "no teacher solve");
 }
 
 /// Measurement (not a gate; the brief's "DFT − reference for a lone H at 3 offsets"): the GPU

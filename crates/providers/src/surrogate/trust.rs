@@ -1469,7 +1469,10 @@ impl SurrogateKs {
     /// under draft mode moves the surface the atoms are on, and its jump must be booked too.
     pub(super) fn surface_moved(&mut self, was_trusted: bool, was_model: bool) -> Result<(), surrogate::DescribeError> {
         let model = self.model.as_ref().expect("a model was just installed");
-        let next_is_model = (self.trusted() || self.policy.never_fallback)
+        // a lone-atom reference answer (rule 0b) is the model's own whatever the trust: the next one
+        // at these positions moves with the refit, so its jump is booked untrusted too (review M1)
+        let after_reference = self.last.as_ref().is_some_and(|l| l.reference.is_some());
+        let next_is_model = (self.trusted() || self.policy.never_fallback || after_reference)
             && match &self.last {
                 None => true,
                 Some(l) => self.same_surface(&model.provenance, &l.provenance) && model.basis.species_indices(&l.z).is_ok(),
