@@ -4,15 +4,18 @@
 //! # The download ([`Download`])
 //! On its own thread, into `<user root>\updates`:
 //! 1. `SHA256SUMS.txt` and its `.minisig` (small, held in memory);
-//! 2. the installer, streamed to `<asset>.part` and hashed as it arrives, with `(bytes, total)`
-//!    progress over a channel;
+//! 2. the installer, streamed to the job's own `<asset>.<pid>-<n>.part` and hashed as it arrives,
+//!    with `(bytes, total)` progress over a channel;
 //! 3. [`verify`] (fails closed: the signature under the compiled-in key, then the asset's SHA-256);
-//! 4. only then renamed to `<asset>`.
+//! 4. only then renamed to `<asset>` (an atomic replace: the name only ever holds a whole verified
+//!    file), which [`Download::verified`] hands to [`hand_off`] as a [`Verified`].
 //!
-//! Any failure — a fetch refused, a download that stops part-way or sends more than the release
-//! lists, a full disk, a verification refusal, a cancel — removes the `.part` and reports why; a
-//! retry starts clean. The bytes come from a [`Source`] ([`super::net::Http`] in the app), so the
-//! tests feed them from memory.
+//! Refused up front: an asset whose URL isn't exactly its release's `<tag>/<name>`, an installer
+//! listed at 0 bytes (the listed size bounds what is written), no release key. Any later failure —
+//! a fetch refused, a download that stops part-way or sends more than the release lists, a full
+//! disk, a verification refusal, a cancel, a panic — removes the job's `.part` (a drop guard) and
+//! reports why. A `.part` left by a killed process is Task 4's startup cleanup. The bytes come
+//! from a [`Source`] ([`super::net::Http`] in the app), so the tests feed them from memory.
 //!
 //! # The session ([`Session`])
 //! What a restart after an update brings back (spec, "Builder-check rulings"): the scene as it
@@ -32,7 +35,7 @@
 //!
 //! # The hand-off ([`hand_off`])
 //! Starts the verified installer detached ([`installer_command`]: `/VERYSILENT /SUPPRESSMSGBOXES
-//! /NORESTART /RELAUNCH="<exe> --resume-session <session>"`), then hands back [`CloseForUpdate`]:
+//! /NORESTART /WAITPID=<pid> /RELAUNCH="<exe> --resume-session <session>"`), then hands back [`CloseForUpdate`]:
 //! the caller closes the app through its own clean-exit path (the profile flushed, the window gone)
 //! — this module never exits the process. Installed builds only: a portable copy offers the zip
 //! instead, a dev build has updates off.
@@ -88,10 +91,21 @@ where
 pub enum DownloadState {
     /// The installer's bytes so far and the size the release lists (0 before it starts streaming).
     Running(u64, u64),
-    /// Verified and renamed: the installer to hand to [`hand_off`].
+    /// Verified and renamed: the installer ([`Download::verified`] hands it to [`hand_off`]).
     Ready(PathBuf),
     /// Nothing usable was kept (the `.part` is removed); the reason.
     Failed(String),
+}
+
+/// An installer that passed [`verify`] and was renamed into place: only [`Download::verified`]
+/// makes one (from [`DownloadState::Ready`]), and [`hand_off`] takes nothing else.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verified(PathBuf);
+
+impl Verified {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// [`DownloadState::Failed`]'s reason after [`Download::cancel`].
@@ -116,20 +130,34 @@ impl Download {
     /// per-user folder.
     pub fn start(release: &Release) -> Result<Download, String> {
         let dir = updates_dir().ok_or("there is no per-user folder to download into (LOCALAPPDATA isn't set)")?;
-        Download::start_with(release, dir, Box::new(super::net::Http::new()), RELEASE_KEY)
+        let source = Box::new(super::net::Http::new());
+        #[cfg(not(test))]
+        return Download::start_with(release, dir, source);
+        #[cfg(test)]
+        return Download::start_with(release, dir, source, RELEASE_KEY);
     }
 
-    /// [`Download::start`] into `dir`, from `source`, checked against `pubkey` (the app passes
-    /// only [`RELEASE_KEY`]; the tests, the TEST-ONLY fixture key).
-    pub(crate) fn start_with(release: &Release, dir: PathBuf, source: Box<dyn Source>, pubkey: &'static str) -> Result<Download, String> {
+    /// [`Download::start`] into `dir`, from `source`. Outside the tests the key is always the
+    /// compiled-in [`RELEASE_KEY`]; the tests pass theirs (the TEST-ONLY fixture key).
+    ///
+    /// Refused before anything is fetched: [`installable`]'s refusals, no key, an installer listed
+    /// at 0 bytes (the size bounds what is written to disk), and any of the three assets whose URL
+    /// isn't exactly its release's `<tag>/<name>` ([`super::net::check_asset`]).
+    pub(crate) fn start_with(release: &Release, dir: PathBuf, source: Box<dyn Source>, #[cfg(test)] pubkey: &'static str) -> Result<Download, String> {
+        #[cfg(not(test))]
+        let pubkey = RELEASE_KEY;
         let (setup, sums, sig) = installable(release)?;
         if !has_key(pubkey) {
             return Err(NO_RELEASE_KEY.into());
         }
-        if !plain_file_name(&setup.name) {
-            return Err(format!("the installer's name {:?} isn't a plain file name", setup.name));
+        for a in [setup, sums, sig] {
+            super::net::check_asset(&release.tag, a)?;
         }
-        let job = Job { setup: setup.clone(), sums: sums.clone(), sig: sig.clone(), dir, source, pubkey };
+        if setup.size == 0 {
+            return Err(format!("the release lists {} as 0 bytes: it can't be installed from the app", setup.name));
+        }
+        let part = part_path(&dir, &setup.name);
+        let job = Job { setup: setup.clone(), sums: sums.clone(), sig: sig.clone(), dir, part, source, pubkey };
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
@@ -164,17 +192,25 @@ impl Download {
         state.clone()
     }
 
+    /// The verified installer, once the state is [`DownloadState::Ready`]: what [`hand_off`] takes.
+    pub fn verified(&self) -> Option<Verified> {
+        match self.poll() {
+            DownloadState::Ready(p) => Some(Verified(p)),
+            _ => None,
+        }
+    }
+
     /// Stops the download: the thread removes the `.part` and reports [`CANCELLED`] after its
     /// current read (at most the 30 s read timeout on a stalled connection). Never blocks.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Waits for the thread and returns the final state (tests).
+    /// Waits for the thread (a panic in it included) and returns the final state (tests).
     #[cfg(test)]
     fn finish(mut self) -> DownloadState {
         if let Some(t) = self.thread.take() {
-            t.join().unwrap();
+            let _ = t.join();
         }
         self.poll()
     }
@@ -186,14 +222,22 @@ impl Drop for Download {
     }
 }
 
-/// A name that stays in the folder it is joined to.
-fn plain_file_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.chars().any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+/// Each job's own `.part` (M3: a cancelled job still finishing a read never shares a file with the
+/// next one): `<name>.<pid>-<n>.part`.
+fn part_path(dir: &Path, name: &str) -> PathBuf {
+    static JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = JOBS.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.{}-{n}.part", std::process::id()))
 }
 
-/// `<name>.part` in `dir`.
-fn part_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}.part"))
+/// Removes the job's `.part` when the job ends however it ends — a refusal, a cancel, a panic
+/// (unwinding) — and harmlessly after a successful rename, when it is gone already.
+struct PartGuard<'a>(&'a Path);
+
+impl Drop for PartGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
 }
 
 struct Job {
@@ -201,17 +245,16 @@ struct Job {
     sums: Asset,
     sig: Asset,
     dir: PathBuf,
+    part: PathBuf,
     source: Box<dyn Source>,
     pubkey: &'static str,
 }
 
 impl Job {
     fn run(mut self, tx: &Sender<DownloadState>, cancel: &AtomicBool) {
-        let part = part_path(&self.dir, &self.setup.name);
+        let part = self.part.clone();
+        let _guard = PartGuard(&part);
         let outcome = self.fetch(&part, tx, cancel);
-        if outcome.is_err() {
-            let _ = std::fs::remove_file(&part);
-        }
         let _ = tx.send(match outcome {
             Ok(path) => DownloadState::Ready(path),
             Err(e) => DownloadState::Failed(e),
@@ -228,6 +271,8 @@ impl Job {
         let digest = self.stream(part, tx, cancel)?;
         verify(&sums, &sig, &self.setup.name, &digest, self.pubkey)?;
         let done = self.dir.join(&self.setup.name);
+        // the rename replaces atomically (Windows: replace-existing semantics), so the installer's
+        // name only ever holds one whole verified file — whichever job renamed last, never a part
         std::fs::rename(part, &done).map_err(|e| format!("couldn't rename {} to {}: {e}", part.display(), done.display()))?;
         Ok(done)
     }
@@ -263,14 +308,14 @@ impl Job {
                 Err(e) => return Err(format!("the download of {name} stopped part-way ({got} of {total} bytes): {e}")),
             };
             got += n as u64;
-            if total > 0 && got > total {
+            if got > total {
                 return Err(format!("the download of {name} sent more than the {total} bytes the release lists"));
             }
             hash.update(&buf[..n]);
             f.write_all(&buf[..n]).map_err(|e| format!("couldn't write {}: {e}", part.display()))?;
             let _ = tx.send(DownloadState::Running(got, total));
         }
-        if total > 0 && got < total {
+        if got < total {
             return Err(format!("the download of {name} stopped part-way ({got} of {total} bytes)"));
         }
         // a full disk may only show here
@@ -453,11 +498,18 @@ pub fn load_session(path: &Path) -> Result<Session, String> {
 
 // ---- the hand-off ----
 
-/// The installer's command line: `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, then
-/// [`relaunch_arg`]. The installer's own path is quoted by `Command` (spaces, non-ASCII letters).
-pub fn installer_command(installer: &Path, exe_after: &Path, session: &Path) -> Command {
+/// The installer's command line: `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /WAITPID=<wait_pid>`,
+/// then [`relaunch_arg`]. The installer's own path is quoted by `Command` (spaces, non-ASCII
+/// letters).
+///
+/// `/WAITPID=<pid>` (for the Task 5 script, review M6): the process id of the app handing off. The
+/// script waits for that process to exit (e.g. `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`;
+/// a pid that is already gone means go on) before it replaces any file, so the installer never
+/// races the app's own exit; `CloseApplications` still deals with any other copy.
+pub fn installer_command(installer: &Path, exe_after: &Path, session: &Path, wait_pid: u32) -> Command {
     let mut c = Command::new(installer);
     c.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
+    c.arg(format!("/WAITPID={wait_pid}"));
     let relaunch = relaunch_arg(exe_after, session);
     // verbatim: Rust's own quoting would escape the quotes as \", which Inno Setup doesn't read
     #[cfg(windows)]
@@ -483,8 +535,8 @@ pub fn relaunch_arg(exe_after: &Path, session: &Path) -> OsString {
 }
 
 /// The installer is running: close the app now, through its own clean-exit path (the profile
-/// flushed, the window gone; `main`'s close). The installer's `CloseApplications` deals with a
-/// copy still holding the exe.
+/// flushed, the window gone; `main`'s close). The installer waits for this process to exit
+/// (`/WAITPID`); its `CloseApplications` deals with another copy still holding the exe.
 #[must_use = "the app must now close through its own exit path: the installer is waiting to replace it"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct CloseForUpdate;
@@ -494,11 +546,13 @@ pub struct CloseForUpdate;
 #[cfg(windows)]
 const DETACHED: u32 = 0x0000_0008 | 0x0000_0200;
 
-/// Starts `installer` detached, to install silently and relaunch this exe with `--resume-session
-/// <session>` ([`installer_command`]), then asks the caller to close ([`CloseForUpdate`]). An
-/// installed build only: a portable copy offers the zip instead and a dev build has updates off,
-/// so both are refused here too.
-pub fn hand_off(installer: &Path, session: &Path) -> Result<CloseForUpdate, String> {
+/// Starts the verified `installer` detached, to wait for this process to exit, install silently
+/// and relaunch this exe with `--resume-session <session>` ([`installer_command`]), then asks the
+/// caller to close ([`CloseForUpdate`]). It takes only a [`Verified`] installer (from
+/// [`Download::verified`]). An installed build only: a portable copy offers the zip instead and a
+/// dev build has updates off, so both are refused here too.
+pub fn hand_off(installer: &Verified, session: &Path) -> Result<CloseForUpdate, String> {
+    let installer = installer.path();
     match paths::mode() {
         DataMode::Installed => {}
         DataMode::Portable => return Err("a portable copy isn't updated in place: download the zip instead".into()),
@@ -508,7 +562,7 @@ pub fn hand_off(installer: &Path, session: &Path) -> Result<CloseForUpdate, Stri
         return Err(format!("the installer {} isn't there", installer.display()));
     }
     let exe = std::env::current_exe().map_err(|e| format!("couldn't find this program's path to relaunch it: {e}"))?;
-    let mut c = installer_command(installer, &exe, session);
+    let mut c = installer_command(installer, &exe, session, std::process::id());
     c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut c, DETACHED);
@@ -593,6 +647,10 @@ mod tests {
         let (src, asked) = source(|| Box::new(FIXTURE_SETUP));
         let d = Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap();
         assert_eq!(d.tag(), "v0.2.0");
+        while matches!(d.poll(), DownloadState::Running(..)) {
+            std::thread::yield_now();
+        }
+        assert_eq!(d.verified().as_ref().map(Verified::path), Some(dir.join(SETUP).as_path()), "Ready makes a Verified");
         let state = d.finish();
         assert_eq!(state, DownloadState::Ready(dir.join(SETUP)));
         assert_eq!(std::fs::read(dir.join(SETUP)).unwrap(), FIXTURE_SETUP);
@@ -631,9 +689,9 @@ mod tests {
     }
 
     /// Review Focus 2: a download that stops part-way is never used. A connection that drops, a
-    /// stream that ends short of the listed size, and one whose size the release doesn't list (only
-    /// the checksum can tell) are each refused, and nothing is left behind — no installer, no
-    /// `.part`. A retry then starts clean and succeeds.
+    /// stream that ends short of the listed size, and one longer than listed are each refused, and
+    /// nothing is left behind — no installer, no `.part`; an installer listed at 0 bytes is refused
+    /// before anything is fetched. A retry then starts clean (its own `.part`) and succeeds.
     #[test]
     fn a_truncated_download_is_rejected_and_removed() {
         let dir = temp("truncated");
@@ -648,12 +706,13 @@ mod tests {
         let DownloadState::Failed(e) = Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap().finish() else { panic!() };
         assert!(e.contains(&format!("stopped part-way ({} of {} bytes)", half.len(), FIXTURE_SETUP.len())), "{e}");
         assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
-        // no listed size: the checksum refuses it
+        // listed at 0 bytes: refused up front, nothing fetched (the size bounds what is written)
         let mut unsized_release = release();
         unsized_release.assets.iter_mut().find(|a| a.name == SETUP).unwrap().size = 0;
-        let (src, _) = source(move || Box::new(half));
-        let DownloadState::Failed(e) = Download::start_with(&unsized_release, dir.clone(), src, TEST_KEY).unwrap().finish() else { panic!() };
-        assert!(e.contains("doesn't match SHA256SUMS.txt"), "{e}");
+        let (src, asked) = source(move || Box::new(half));
+        let e = Download::start_with(&unsized_release, dir.clone(), src, TEST_KEY).err().unwrap();
+        assert_eq!(e, format!("the release lists {SETUP} as 0 bytes: it can't be installed from the app"));
+        assert!(asked.lock().unwrap().is_empty());
         assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
         // more than the release lists
         let mut longer = FIXTURE_SETUP.to_vec();
@@ -663,11 +722,14 @@ mod tests {
         let DownloadState::Failed(e) = Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap().finish() else { panic!() };
         assert!(e.contains("sent more than"), "{e}");
         assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
-        // a stale .part from a crashed run does not survive a retry, which starts clean
-        std::fs::write(dir.join(format!("{SETUP}.part")), b"stale bytes from an earlier attempt").unwrap();
+        // a stale .part from a killed run is never reused: the retry writes its own (the stale file
+        // is Task 4's startup cleanup, left untouched here)
+        let stale = format!("{SETUP}.1-0.part");
+        std::fs::write(dir.join(&stale), b"stale bytes from an earlier attempt").unwrap();
         let (src, _) = source(|| Box::new(FIXTURE_SETUP));
         assert_eq!(Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap().finish(), DownloadState::Ready(dir.join(SETUP)));
-        assert_eq!(files_in(&dir), [SETUP]);
+        assert_eq!(files_in(&dir), [SETUP.to_string(), stale]);
+        assert_eq!(std::fs::read(dir.join(SETUP)).unwrap(), FIXTURE_SETUP);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -683,6 +745,73 @@ mod tests {
         assert!(e.contains("doesn't match SHA256SUMS.txt"), "{e}");
         assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that panics mid-stream leaves no `.part` (the drop guard runs as it unwinds) and is
+    /// reported, not stuck at Running.
+    #[test]
+    fn a_panicking_download_leaves_no_part() {
+        let dir = temp("panic");
+        struct Bomb(usize);
+        impl Read for Bomb {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                assert!(self.0 < 3, "a reader that panics (test)");
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let (src, _) = source(|| Box::new(Bomb(0)));
+        let d = Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap();
+        assert_eq!(d.finish(), DownloadState::Failed("the download stopped unexpectedly".into()));
+        assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two jobs of the same asset at once write separate `.part` files; both verify, and the
+    /// installer's name ends up holding one whole verified copy, nothing else left.
+    #[test]
+    fn concurrent_downloads_never_share_a_part() {
+        let dir = temp("concurrent");
+        let jobs: Vec<Download> = (0..2)
+            .map(|_| {
+                let (src, _) = source(|| Box::new(Trickle { bytes: FIXTURE_SETUP, drops: false }));
+                Download::start_with(&release(), dir.clone(), src, TEST_KEY).unwrap()
+            })
+            .collect();
+        for d in jobs {
+            assert_eq!(d.finish(), DownloadState::Ready(dir.join(SETUP)));
+        }
+        assert_eq!(files_in(&dir), [SETUP]);
+        assert_eq!(std::fs::read(dir.join(SETUP)).unwrap(), FIXTURE_SETUP);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each asset's URL is tied to its own release: the sums of another tag, an asset on another
+    /// path, or an encoded name are refused before anything is fetched.
+    #[test]
+    fn asset_urls_are_tied_to_their_release() {
+        let dir = temp("bound");
+        let with = |name: &str, url: &str| {
+            let mut r = release();
+            r.assets.iter_mut().find(|a| a.name == name).unwrap().url = url.to_string();
+            r
+        };
+        for r in [
+            with("SHA256SUMS.txt", "https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.1.0/SHA256SUMS.txt"),
+            with("SHA256SUMS.txt.minisig", "https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/other.minisig"),
+            with(SETUP, "https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/%2e%2e/AtomicSandbox-Setup-0.2.0.exe"),
+            with(SETUP, "https://objects.githubusercontent.com/AtomicSandbox-Setup-0.2.0.exe"),
+        ] {
+            let (src, asked) = source(|| Box::new(FIXTURE_SETUP));
+            assert!(Download::start_with(&r, dir.clone(), src, TEST_KEY).err().unwrap().contains("isn't this release's"));
+            assert!(asked.lock().unwrap().is_empty());
+        }
+        let mut odd = release();
+        odd.tag = "v0.2.0%2f..".into();
+        let (src, _) = source(|| Box::new(FIXTURE_SETUP));
+        assert!(Download::start_with(&odd, dir.clone(), src, TEST_KEY).err().unwrap().contains("isn't a plain file name"));
+        assert!(files_in(&dir).is_empty());
     }
 
     /// Refused before anything is fetched: the placeholder key (this build's), an unsigned
@@ -732,7 +861,9 @@ mod tests {
         while d.poll() != DownloadState::Running(1, FIXTURE_SETUP.len() as u64) {
             std::thread::yield_now();
         }
-        assert_eq!(files_in(&dir), [format!("{SETUP}.part")]);
+        let parts = files_in(&dir);
+        assert!(parts.len() == 1 && parts[0].starts_with(&format!("{SETUP}.{}-", std::process::id())) && parts[0].ends_with(".part"), "{parts:?}");
+        assert_eq!(d.verified(), None, "nothing verified while it runs");
         d.cancel();
         drop(gate_tx); // the blocked read returns
         assert_eq!(d.finish(), DownloadState::Failed(CANCELLED.into()));
@@ -748,16 +879,17 @@ mod tests {
         let installer = Path::new(r"C:\Users\Zoë Ångström\AppData\Local\atomic-sandbox\updates\AtomicSandbox-Setup-0.2.0.exe");
         let exe = Path::new(r"C:\Users\Zoë Ångström\AppData\Local\Programs\Atomic Sandbox\AtomicSandbox.exe");
         let session = Path::new(r"C:\Users\Zoë Ångström\AppData\Local\atomic-sandbox\updates\session.scene");
-        let c = installer_command(installer, exe, session);
+        let c = installer_command(installer, exe, session, 4242);
         assert_eq!(c.get_program(), installer.as_os_str());
         let args: Vec<String> = c.get_args().map(|a| a.to_str().unwrap().to_string()).collect();
         let relaunch = format!("/RELAUNCH=\"{} --resume-session {}\"", exe.display(), session.display());
-        assert_eq!(args, ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", relaunch.as_str()]);
+        assert_eq!(args, ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/WAITPID=4242", relaunch.as_str()]);
         // Inno Setup's (Delphi's) parameter reader over the tail as passed (only the raw
         // argument holds spaces, inside its quotes): whitespace splits outside quotes, quotes dropped
         let params = delphi_params(&args.join(" "));
-        assert_eq!(params.len(), 4, "{params:?}");
-        let value = params[3].strip_prefix("/RELAUNCH=").unwrap();
+        assert_eq!(params.len(), 5, "{params:?}");
+        assert_eq!(params[3], "/WAITPID=4242");
+        let value = params[4].strip_prefix("/RELAUNCH=").unwrap();
         let (exe_back, session_back) = value.split_once(" --resume-session ").unwrap();
         assert_eq!((Path::new(exe_back), Path::new(session_back)), (exe, session));
     }

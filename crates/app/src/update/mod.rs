@@ -30,7 +30,7 @@ pub mod net;
 pub mod release;
 pub mod verify;
 
-pub use apply::{hand_off, installer_command, load_session, save_session, session_path, CloseForUpdate, Download, DownloadState, Session};
+pub use apply::{hand_off, installer_command, load_session, save_session, session_path, CloseForUpdate, Download, DownloadState, Session, Verified};
 pub use formats::{current_formats, downgrade_warnings, Formats};
 pub use net::fetch_releases;
 pub use manifest::{Manifest, ManifestAsset};

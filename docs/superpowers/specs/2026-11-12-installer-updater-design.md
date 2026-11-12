@@ -128,7 +128,12 @@ The user wants:
 
   Each value is read from the code's existing version constants, not typed by hand. A release without `manifest.json`, such as `v0.1.0`, is treated as "format unknown": downgrades to it warn generically.
 - **The updater's network.**
-  - HTTPS GET of `api.github.com/repos/ItsKodas/atomic-sandbox/releases`, unauthenticated (60 requests per hour is plenty), and of the release asset URLs. No other host.
+  - HTTPS GET of `api.github.com/repos/ItsKodas/atomic-sandbox/releases`, unauthenticated (60 requests per hour is plenty), and of the release asset URLs. No other host, except GitHub's own asset CDN.
+  - **Amended 2026-11-13** (Task 3 review I1; the user's intent was "GitHub only, no telemetry"):
+    - GitHub answers every asset URL with a redirect to its download CDN, so the CDN counts as part of "the release asset URLs".
+    - Redirects are followed by hand: at most 2 hops, HTTPS only.
+    - The allowed hosts are exactly `api.github.com`, `github.com`, `release-assets.githubusercontent.com` and `objects.githubusercontent.com`.
+    - Any other host is refused.
   - A plain HTTP client crate (`ureq` or similar, plus `sha2`, `semver`, `minisign-verify`) is plumbing, allowed by CLAUDE.md rule 2.
   - Every network call runs off the UI thread. Offline means a quiet "couldn't check (offline)" in the panel, never an error dialog.
 - **Controls go through `ui::Action`.** Check now, install a version and restart are `ui::Action`s, so `--record` sees them. The channel and auto-check toggles are display settings stored in the profile.

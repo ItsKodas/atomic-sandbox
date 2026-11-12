@@ -30,7 +30,11 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 - **The dev workflow must not change.** `cargo run -p app --release`, `start.bat`, the tests and the replay scripts keep using the repo's `models/`, `profiles/` and `scenes/` exactly as now.
 - **Network.** HTTPS GET only:
   - `https://api.github.com/repos/ItsKodas/atomic-sandbox/releases`, unauthenticated;
-  - that repository's release asset URLs.
+  - that repository's release asset URLs (`https://github.com/ItsKodas/atomic-sandbox/releases/download/<tag>/<name>`), and the redirect GitHub answers them with to its own asset CDN.
+    - **Amended 2026-11-13** (Task 3 review I1): GitHub serves every asset from its CDN.
+    - Redirects are followed by hand: at most 2 hops, HTTPS only.
+    - Only these exact hosts are allowed: `api.github.com`, `github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`.
+    - Any other host is refused ("download redirected to an unexpected host: <host>").
 
   No other host, no telemetry, nothing on the UI thread. Offline shows "couldn't check (offline)" quietly, never a dialog.
 - **Verification fails closed.** Never install an asset unless:
