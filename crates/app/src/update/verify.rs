@@ -4,6 +4,11 @@
 //! decode, a signature that doesn't decode or match (legacy, non-prehashed signatures included), a
 //! sums file that isn't text, an asset listed nowhere or twice with different sums, a mismatch.
 //!
+//! The signature is also tied to its release: its trusted comment (covered by the signature) must
+//! be exactly `atomic-sandbox <tag>` for the release being installed ([`trusted_comment_for`]; the
+//! release workflow signs with `minisign -t "atomic-sandbox <tag>"`), so a valid signature can't be
+//! replayed onto another release's sums.
+//!
 //! The release key (`crates/app/release-key.pub`, compiled in as [`RELEASE_KEY`]) is a placeholder
 //! comment until installer Task 6; a build carrying it installs nothing ([`NO_RELEASE_KEY`]). The
 //! tests sign with the committed `fixtures/TEST-ONLY.*` pair, which signs nothing real.
@@ -51,15 +56,31 @@ pub fn has_key(pubkey: &str) -> bool {
     key_line(pubkey).is_some()
 }
 
-/// `sums` is signed by `pubkey` (`sig`: the `.minisig` file's bytes) and lists `file_name` with
+/// The trusted comment a release's `SHA256SUMS.txt.minisig` must carry: `atomic-sandbox <tag>`
+/// (`v0.2.0` → `atomic-sandbox v0.2.0`).
+pub fn trusted_comment_for(tag: &str) -> String {
+    format!("atomic-sandbox {tag}")
+}
+
+/// `sums` is signed by `pubkey` (`sig`: the `.minisig` file's bytes) for the release `tag` (its
+/// trusted comment is [`trusted_comment_for`] `tag`) and lists `file_name` with
 /// `file_bytes_sha256`: `Ok(())`, else why not (module doc). The signature is checked before the
 /// sums are read.
-pub fn verify(sums: &[u8], sig: &[u8], file_name: &str, file_bytes_sha256: &[u8; 32], pubkey: &str) -> Result<(), String> {
+pub fn verify(sums: &[u8], sig: &[u8], tag: &str, file_name: &str, file_bytes_sha256: &[u8; 32], pubkey: &str) -> Result<(), String> {
     let line = key_line(pubkey).ok_or_else(|| NO_RELEASE_KEY.to_string())?;
     let pk = minisign_verify::PublicKey::from_base64(line).map_err(|e| format!("this build's release key doesn't decode ({e})"))?;
     let sig_text = std::str::from_utf8(sig).map_err(|_| "SHA256SUMS.txt.minisig isn't a minisign signature (not text)".to_string())?;
     let signature = minisign_verify::Signature::decode(sig_text).map_err(|e| format!("SHA256SUMS.txt.minisig isn't a minisign signature ({e})"))?;
     pk.verify(sums, &signature, false).map_err(|e| format!("SHA256SUMS.txt isn't signed by this build's release key ({e})"))?;
+    // the trusted comment is covered by the global signature just checked: it says which release
+    // these sums were signed for
+    let want = trusted_comment_for(tag);
+    if signature.trusted_comment() != want {
+        return Err(format!(
+            "SHA256SUMS.txt was signed for another release (its signature says \"{}\", this release is {tag})",
+            signature.trusted_comment()
+        ));
+    }
     let text = std::str::from_utf8(sums).map_err(|_| "SHA256SUMS.txt isn't text".to_string())?;
     // `<64 hex>  <name>` (text mode) or `<64 hex> *<name>` (binary mode), as sha256sum writes them
     let mut listed: Option<[u8; 32]> = None;
@@ -91,6 +112,8 @@ mod tests {
     pub(super) const FIXTURE_SETUP: &[u8] = b"AtomicSandbox-Setup-0.2.0.exe: a stand-in for the installer, test only\n";
     const FIXTURE_ZIP: &[u8] = b"AtomicSandbox-0.2.0-windows-x64.zip: a stand-in for the zip, test only\n";
     const SETUP: &str = "AtomicSandbox-Setup-0.2.0.exe";
+    /// The release the fixture sums were signed for (trusted comment `atomic-sandbox v0.2.0`).
+    const TAG: &str = "v0.2.0";
     const SUMS: &[u8] = include_bytes!("fixtures/SHA256SUMS.txt");
     const SIG: &[u8] = include_bytes!("fixtures/SHA256SUMS.txt.minisig");
     const TEST_KEY: &str = include_str!("fixtures/TEST-ONLY.pub");
@@ -98,20 +121,20 @@ mod tests {
     #[test]
     fn verify_accepts_the_fixture_and_rejects_a_flipped_byte() {
         let good = sha256(FIXTURE_SETUP);
-        assert_eq!(verify(SUMS, SIG, SETUP, &good, TEST_KEY), Ok(()));
-        assert_eq!(verify(SUMS, SIG, "AtomicSandbox-0.2.0-windows-x64.zip", &sha256(FIXTURE_ZIP), TEST_KEY), Ok(()));
+        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, TEST_KEY), Ok(()));
+        assert_eq!(verify(SUMS, SIG, TAG, "AtomicSandbox-0.2.0-windows-x64.zip", &sha256(FIXTURE_ZIP), TEST_KEY), Ok(()));
         // one flipped byte of the download: its SHA-256 no longer matches
         let mut flipped = FIXTURE_SETUP.to_vec();
         flipped[3] ^= 1;
-        let e = verify(SUMS, SIG, SETUP, &sha256(&flipped), TEST_KEY).unwrap_err();
+        let e = verify(SUMS, SIG, TAG, SETUP, &sha256(&flipped), TEST_KEY).unwrap_err();
         assert!(e.contains("doesn't match SHA256SUMS.txt"), "{e}");
         // an asset the sums don't list
-        let e = verify(SUMS, SIG, "AtomicSandbox-Setup-0.2.1.exe", &good, TEST_KEY).unwrap_err();
+        let e = verify(SUMS, SIG, TAG, "AtomicSandbox-Setup-0.2.1.exe", &good, TEST_KEY).unwrap_err();
         assert!(e.contains("isn't listed"), "{e}");
         // one flipped byte of the sums themselves: the signature fails first
         let mut sums = SUMS.to_vec();
         sums[0] ^= 1;
-        let e = verify(&sums, SIG, SETUP, &good, TEST_KEY).unwrap_err();
+        let e = verify(&sums, SIG, TAG, SETUP, &good, TEST_KEY).unwrap_err();
         assert!(e.contains("isn't signed"), "{e}");
     }
 
@@ -126,18 +149,18 @@ mod tests {
         let c = sig_line.as_bytes()[mid];
         sig_line.replace_range(mid..mid + 1, if c == b'A' { "B" } else { "A" });
         let bad = lines.join("\n") + "\n";
-        assert!(verify(SUMS, bad.as_bytes(), SETUP, &good, TEST_KEY).is_err());
+        assert!(verify(SUMS, bad.as_bytes(), TAG, SETUP, &good, TEST_KEY).is_err());
         // a changed trusted comment breaks the global signature
         let mut lines: Vec<String> = text.lines().map(String::from).collect();
         lines[2].push('!');
         let bad = lines.join("\n") + "\n";
-        assert!(verify(SUMS, bad.as_bytes(), SETUP, &good, TEST_KEY).is_err());
+        assert!(verify(SUMS, bad.as_bytes(), TAG, SETUP, &good, TEST_KEY).is_err());
         // garbage, an empty signature, another key
-        assert!(verify(SUMS, b"not a signature", SETUP, &good, TEST_KEY).is_err());
-        assert!(verify(SUMS, b"", SETUP, &good, TEST_KEY).is_err());
-        assert!(verify(SUMS, &[0xff, 0xfe], SETUP, &good, TEST_KEY).is_err());
+        assert!(verify(SUMS, b"not a signature", TAG, SETUP, &good, TEST_KEY).is_err());
+        assert!(verify(SUMS, b"", TAG, SETUP, &good, TEST_KEY).is_err());
+        assert!(verify(SUMS, &[0xff, 0xfe], TAG, SETUP, &good, TEST_KEY).is_err());
         let other_key = "untrusted comment: another key\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n";
-        let e = verify(SUMS, SIG, SETUP, &good, other_key).unwrap_err();
+        let e = verify(SUMS, SIG, TAG, SETUP, &good, other_key).unwrap_err();
         assert!(e.contains("isn't signed"), "{e}");
     }
 
@@ -153,8 +176,8 @@ mod tests {
     fn placeholder_key_installs_nothing() {
         assert_eq!(RELEASE_KEY.trim(), "# no release key yet", "Task 6 replaces the placeholder");
         let good = sha256(FIXTURE_SETUP);
-        assert_eq!(verify(SUMS, SIG, SETUP, &good, RELEASE_KEY), Err(NO_RELEASE_KEY.to_string()));
-        assert_eq!(verify(SUMS, SIG, SETUP, &good, ""), Err(NO_RELEASE_KEY.to_string()));
+        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, RELEASE_KEY), Err(NO_RELEASE_KEY.to_string()));
+        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, ""), Err(NO_RELEASE_KEY.to_string()));
         assert_eq!(NO_RELEASE_KEY, "this build has no release key");
     }
 
@@ -164,17 +187,41 @@ mod tests {
         minisign::SecretKeyBox::from_string(&std::fs::read_to_string(path).unwrap()).unwrap().into_secret_key(Some(String::new())).unwrap()
     }
 
-    /// `sums` signed on the spot with the TEST-ONLY key.
-    fn signed(sums: &str) -> Vec<u8> {
+    /// `sums` signed on the spot with the TEST-ONLY key, with `trusted_comment`.
+    fn signed(sums: &str, trusted_comment: &str) -> Vec<u8> {
         let sk = test_secret_key();
         let pk = minisign::PublicKey::from_secret_key(&sk).unwrap();
-        minisign::sign(Some(&pk), &sk, std::io::Cursor::new(sums.as_bytes()), None, None).unwrap().into_string().into_bytes()
+        minisign::sign(Some(&pk), &sk, std::io::Cursor::new(sums.as_bytes()), Some(trusted_comment), None).unwrap().into_string().into_bytes()
+    }
+
+    /// A valid signature is tied to its release by its trusted comment: the v0.2.0 fixture
+    /// signature is refused for any other tag, and sums signed for v0.1.0 (or with minisign's
+    /// default comment, as a hand signature without `-t` has) are refused for v0.2.0, though the
+    /// key and the sums are right.
+    #[test]
+    fn a_signature_for_another_release_is_refused() {
+        let good = sha256(FIXTURE_SETUP);
+        assert_eq!(trusted_comment_for(TAG), "atomic-sandbox v0.2.0");
+        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, TEST_KEY), Ok(()));
+        for other in ["v0.2.1", "v0.2.0-beta.1", "0.2.0", ""] {
+            let e = verify(SUMS, SIG, other, SETUP, &good, TEST_KEY).unwrap_err();
+            assert!(e.contains("signed for another release") && e.contains("atomic-sandbox v0.2.0"), "{other}: {e}");
+        }
+        let sums = std::str::from_utf8(SUMS).unwrap();
+        let e = verify(SUMS, &signed(sums, "atomic-sandbox v0.1.0"), TAG, SETUP, &good, TEST_KEY).unwrap_err();
+        assert!(e.contains("signed for another release"), "{e}");
+        let e = verify(SUMS, &signed(sums, "timestamp:1763000000\tfile:SHA256SUMS.txt\thashed"), TAG, SETUP, &good, TEST_KEY).unwrap_err();
+        assert!(e.contains("signed for another release"), "{e}");
+        // a near miss is a miss: the comparison is exact
+        let e = verify(SUMS, &signed(sums, "atomic-sandbox v0.2.0 "), TAG, SETUP, &good, TEST_KEY).unwrap_err();
+        assert!(e.contains("signed for another release"), "{e}");
+        assert_eq!(verify(SUMS, &signed(sums, "atomic-sandbox v0.2.0"), TAG, SETUP, &good, TEST_KEY), Ok(()));
     }
 
     #[test]
     fn sums_entries_are_read_strictly() {
         let (a, b) = (sha256(b"a"), sha256(b"b"));
-        let check = |sums: String, d: &[u8; 32]| verify(sums.as_bytes(), &signed(&sums), "x.exe", d, TEST_KEY);
+        let check = |sums: String, d: &[u8; 32]| verify(sums.as_bytes(), &signed(&sums, "atomic-sandbox v9.9.9"), "v9.9.9", "x.exe", d, TEST_KEY);
         // CRLF lines (a sums file written on Windows), sha256sum's binary mode and upper-case hex read
         let crlf = format!("{}  y.exe\r\n{} *x.exe\r\n", hex(&b), hex(&a).to_uppercase());
         assert!(crlf.contains("\r\n"));
@@ -223,7 +270,7 @@ mod tests {
             hex(&sha256(FIXTURE_ZIP))
         );
         std::fs::write(dir.join("SHA256SUMS.txt"), &sums).unwrap();
-        let sig = minisign::sign(Some(&pk), &sk, std::io::Cursor::new(sums.as_bytes()), Some("TEST-ONLY fixture SHA256SUMS.txt"), Some("signature from the TEST-ONLY key"))
+        let sig = minisign::sign(Some(&pk), &sk, std::io::Cursor::new(sums.as_bytes()), Some(trusted_comment_for(TAG).as_str()), Some("signature from the TEST-ONLY key"))
             .unwrap();
         std::fs::write(dir.join("SHA256SUMS.txt.minisig"), sig.into_string()).unwrap();
     }

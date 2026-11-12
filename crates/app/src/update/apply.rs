@@ -6,7 +6,8 @@
 //! 1. `SHA256SUMS.txt` and its `.minisig` (small, held in memory);
 //! 2. the installer, streamed to the job's own `<asset>.<pid>-<n>.part` and hashed as it arrives,
 //!    with `(bytes, total)` progress over a channel;
-//! 3. [`verify`] (fails closed: the signature under the compiled-in key, then the asset's SHA-256);
+//! 3. [`verify`] (fails closed: the signature under the compiled-in key and for this release's
+//!    tag, then the asset's SHA-256);
 //! 4. only then renamed to `<asset>` (an atomic replace: the name only ever holds a whole verified
 //!    file), which [`Download::verified`] hands to [`hand_off`] as a [`Verified`].
 //!
@@ -195,7 +196,7 @@ impl Download {
             return Err(format!("the release lists {} as 0 bytes: it can't be installed from the app", setup.name));
         }
         let part = part_path(&dir, &setup.name);
-        let job = Job { setup: setup.clone(), sums: sums.clone(), sig: sig.clone(), dir, part, source, pubkey };
+        let job = Job { tag: release.tag.clone(), setup: setup.clone(), sums: sums.clone(), sig: sig.clone(), dir, part, source, pubkey };
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
@@ -279,6 +280,8 @@ impl Drop for PartGuard<'_> {
 }
 
 struct Job {
+    /// The release's tag: its sums must be signed for it (`verify`'s trusted comment).
+    tag: String,
     setup: Asset,
     sums: Asset,
     sig: Asset,
@@ -307,7 +310,7 @@ impl Job {
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("couldn't create {}: {e}", self.dir.display()))?;
         let digest = self.stream(part, tx, cancel)?;
-        verify(&sums, &sig, &self.setup.name, &digest, self.pubkey)?;
+        verify(&sums, &sig, &self.tag, &self.setup.name, &digest, self.pubkey)?;
         let done = self.dir.join(&self.setup.name);
         // the rename replaces atomically (Windows: replace-existing semantics), so the installer's
         // name only ever holds one whole verified file — whichever job renamed last, never a part
