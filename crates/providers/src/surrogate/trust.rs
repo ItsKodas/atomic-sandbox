@@ -299,6 +299,7 @@ pub(super) struct FitState {
     pub(super) class_blockers: Vec<Vec<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
+    pub(super) deferred_trust: Option<usize>,
 }
 
 impl SurrogateKs {
@@ -345,8 +346,21 @@ impl SurrogateKs {
     /// of raises it only by the columns its own atoms touch (and its key is short on its own
     /// floor). The whole basis's Q′ without a class judgement (no store) or when no fitted atom
     /// touches a column.
+    /// |∪_k S_k| of the current fit's members ([`key_column_counts`]; the class judgement's
+    /// `fit_columns`, computed alone for a deferred fit). 0 without a model or a store.
+    fn fit_column_union(&self) -> usize {
+        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return 0 };
+        key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union
+    }
+
     pub(super) fn sample_floor(&self, r: &FitReport) -> usize {
-        self.class_judge.as_ref().map(|j| j.fit_columns).filter(|&u| u > 0).unwrap_or(r.q_prime)
+        // inside a refit whose trust passes are deferred, the standing fit's own count (the same
+        // `key_column_counts` union its class judgement will carry)
+        let union = match self.deferred_trust {
+            Some(u) => Some(u),
+            None => self.class_judge.as_ref().map(|j| j.fit_columns),
+        };
+        union.filter(|&u| u > 0).unwrap_or(r.q_prime)
     }
 
     /// [`trust_checks`](Self::trust_checks) without the allocation: the one sequence that
@@ -638,10 +652,11 @@ impl SurrogateKs {
         // per class: Σ over its fitted atoms of the training force residual ‖F_model − F‖²/3, atoms
         // (the inflation's aleatoric level, `calibrate` "The variance inflation")
         let mut train = [(0.0f64, 0usize); 2];
-        for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
-            if self.excluded(i) {
-                continue;
-            }
+        // every member's leave-one-out on threads (each depends on the model and its sample alone:
+        // the same numbers as one at a time), then the sums below in sample order, as before
+        let members: Vec<(usize, &Sample)> = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).collect();
+        let loos = surrogate::loo::leave_one_out_many(model, &members.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+        for ((i, s), l) in members.into_iter().zip(loos) {
             // only the fitted (interior) atoms of a masked sample describe a class or a key
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().map(|(j, c)| atom_class(c).filter(|_| s.trains_atom(j))).collect();
             let atom_keys = if s.z.len() == s.pos.len() { trained_keys(s, env_keys(&s.pos, &s.z, rc2)) } else { Vec::new() };
@@ -654,7 +669,6 @@ impl SurrogateKs {
                     }
                 }
             }
-            let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
             // no energy evidence from a sample whose energy was not fitted (`None`)
             let e_ratio: Option<f64> = s.use_energy.then(|| l.as_ref().and_then(|l| l.energy).map_or(f64::INFINITY, |e| (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / self.policy.energy_std_per_atom));
@@ -956,18 +970,37 @@ impl SurrogateKs {
         r
     }
 
-    /// [`refit`](Self::refit)'s body.
+    /// [`refit`](Self::refit)'s body. Its fits are [`fit_store_deferred`](Self::fit_store_deferred):
+    /// the class-wise leave-one-out (rule 4b) and the active set (rule 5e) are computed once, for
+    /// the fit that stands (and before the held-out guesses are judged, which read rule 5e) — the
+    /// intermediate fits of the votes, the release and the trust recovery decide on the training
+    /// residuals, the noise and the sample floor only (`references.md` "Refit cost at scale").
     fn refit_inner(&mut self) -> Result<FitReport, FitError> {
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
-        let mut report = self.fit_store()?;
+        let fitted = self.refit_fits();
+        // the standing fit's trust passes, whatever the outcome (an error leaves the last fit
+        // that succeeded in place, with its own verdicts — as before)
+        self.ensure_trust_passes();
+        let report = fitted?;
+        self.rejudge_failed_audits(true);
+        // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
+        self.commit_class_memory();
+        self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
+        Ok(report)
+    }
+
+    /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the fence votes, the
+    /// release, the trust recovery, the held-out guesses — each fit deferred (`fit_store_deferred`).
+    fn refit_fits(&mut self) -> Result<FitReport, FitError> {
+        let mut report = self.fit_store_deferred()?;
         self.recovery = None;
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
         // reproduce is quarantined itself and its region takes no further vote
         let rejected = self.judge_votes();
         if rejected > 0 {
             self.species_dirty = true;
-            report = self.fit_store()?;
+            report = self.fit_store_deferred()?;
             self.recovery = Some(format!(
                 "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined geometry — that region stays fenced"
             ));
@@ -976,7 +1009,7 @@ impl SurrogateKs {
         let released = self.release_reproduced();
         if released > 0 {
             self.species_dirty = true;
-            report = self.fit_store()?;
+            report = self.fit_store_deferred()?;
             self.recovery = Some(format!("{released} quarantined samples released: the model now reproduces them"));
         }
         if self.recoverable_fail() {
@@ -984,16 +1017,22 @@ impl SurrogateKs {
         }
         // the held-out draft guesses strict mode's domain now reaches: judged, promoted, refitted
         if self.judge_held_out() > 0 {
-            report = self.fit_store()?;
+            report = self.fit_store_deferred()?;
             if self.recoverable_fail() {
                 report = self.recover_trust(report);
             }
         }
-        self.rejudge_failed_audits(true);
-        // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
-        self.commit_class_memory();
-        self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
         Ok(report)
+    }
+
+    /// The class-wise leave-one-out and the active set of the fit that stands, when a deferred fit
+    /// left them for later (`deferred_trust`); a no-op otherwise.
+    pub(super) fn ensure_trust_passes(&mut self) {
+        if self.deferred_trust.is_some() {
+            self.refresh_class_loo();
+            self.rebuild_active_set();
+            self.deferred_trust = None;
+        }
     }
 
     /// What the fit that stands predicts at a failed audit's geometry **without** the audited
@@ -1279,6 +1318,8 @@ impl SurrogateKs {
         if held.is_empty() || self.model.is_none() {
             return 0;
         }
+        // `geometry_refusal` reads the active set (rule 5e): the standing fit's, not a deferred one's
+        self.ensure_trust_passes();
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
         let mut promoted = 0;
         for i in held {
@@ -1350,6 +1391,7 @@ impl SurrogateKs {
             class_blockers: self.class_blockers.clone(),
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
+            deferred_trust: self.deferred_trust,
         }
     }
 
@@ -1369,12 +1411,33 @@ impl SurrogateKs {
         self.class_blockers = s.class_blockers;
         self.degree_cap = s.degree_cap;
         self.fit_members = s.fit_members;
+        self.deferred_trust = s.deferred_trust;
         self.model_gen += 1; // a view cache key: the model moved back
     }
 
     /// The fit itself (`surrogate` module doc): incremental, or a rebuild from the store skipping the
-    /// quarantined samples; no surface bookkeeping (`refit` does it once).
+    /// quarantined samples; no surface bookkeeping (`refit` does it once). With the trust passes:
+    /// the training residuals, the class-wise leave-one-out and the active set.
     pub(super) fn fit_store(&mut self) -> Result<FitReport, FitError> {
+        self.fit_store_with(true)
+    }
+
+    /// [`fit_store`](Self::fit_store) inside a refit: the training residuals and the sample floor's
+    /// column count only; the class-wise leave-one-out and the active set — O(P · m · Q′²) and
+    /// O(atoms · p²), the refit's cost at scale — are left to
+    /// [`ensure_trust_passes`](Self::ensure_trust_passes) for the fit that stands. Until then
+    /// `class_loo`, `class_judge`, `class_worst`, `class_blockers` and `active_set` are an earlier
+    /// fit's and nothing may read them (the refit's own decisions do not: `refit_fits`).
+    pub(super) fn fit_store_deferred(&mut self) -> Result<FitReport, FitError> {
+        // the equivalence tests' reference: every fit with its passes, as before the deferral
+        #[cfg(test)]
+        if self.eager_trust_passes {
+            return self.fit_store_with(true);
+        }
+        self.fit_store_with(false)
+    }
+
+    fn fit_store_with(&mut self, trust_passes: bool) -> Result<FitReport, FitError> {
         let Some(store) = self.store.as_ref() else { return Err(FitError::NoSamples) };
         if store.is_empty() {
             return Err(FitError::NoSamples);
@@ -1452,8 +1515,13 @@ impl SurrogateKs {
         // a failed audit is not cleared by the fit itself: `refit` re-judges it once the fit that
         // stands is settled (module doc, rule 8, "A failed audit stays failed")
         self.training_residuals = self.compute_training_residuals();
-        self.refresh_class_loo();
-        self.rebuild_active_set();
+        if trust_passes {
+            self.refresh_class_loo();
+            self.rebuild_active_set();
+            self.deferred_trust = None;
+        } else {
+            self.deferred_trust = Some(self.fit_column_union());
+        }
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;

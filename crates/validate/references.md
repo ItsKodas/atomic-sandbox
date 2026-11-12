@@ -4262,3 +4262,20 @@ Leave-one-out per sample against Q′ (2-atom samples): Q′ 38 0.02 ms, 284 0.2
 | 50 000 | ≈ 4.2 min | ≈ 5 min | ≈ 35 min |
 
 The worker refits between ticks, every 25 new samples or 500 ms while playing (`app::worker` "Refits"), so the simulation stops for the whole refit. At Q′ 2 688 (a fourth species) leave-one-out alone becomes ≈ 6.8× dearer, ≈ 26 min per pass at 50 000. The cost is the per-refit O(P · m · Q′²) leave-one-out pass, multiplied by the number of `fit_store` calls in one refit. The solve, the search, the null space, the calibration and the collection's own writes do not grow with P.
+
+**After fixes 1 and 2 (2026-11-12, the user's go-ahead; same machine, the user's app open).**
+1. *The trust passes once per refit*: the fits inside a refit (votes, release, the recovery's cap retries and quarantine rounds) are `fit_store_deferred`. The class leave-one-out and the active set are computed once, for the fit that stands, by `ensure_trust_passes` (also before the held-out guesses are judged, which read rule 5e). Those fits' own decisions read the training residuals, the noise and the sample floor; the floor's column count is computed alone.
+2. *Leave-one-out on threads* (`surrogate::loo::leave_one_out_many`, up to 16): each sample's residuals depend only on the model and that sample, and the sums run in sample order as before.
+
+Equivalence: an eager refit (every fit with its passes, the test hook `eager_trust_passes`) and the deferred one leave the same state, compared line by line. The state covers the model, the report, the training residuals, the class LOO and judgement, the worst samples and blockers, the hysteresis memory, the active set, the quarantine, the cap, the recovery note, the trust verdict, failed audits and fences, the teach rounds, the jump and the notes. Checked on the stuck-H collection, body-3 (8 fits through step 3's restores) and body-4 (3 fits), two refits each (`a_deferred_refit_leaves_the_eager_refits_state`). Checked also on the user's collection, 7 recovery fits and 180 held (`deferred_refit_on_a_collection`). `leave_one_out_many` is the serial loop bit for bit (`surrogate` `leave_one_out_many_is_the_serial_loop_bit_for_bit`). One edge differs on purpose: a teach-around round count restarts by the standing fit's class verdict, no longer by an intermediate fit's that the recovery replaced.
+
+| on the user's collection (P 1 805, Q′ 1 032) | before | threads only | both fixes |
+|---|---|---|---|
+| attach + cold refit (8 fits) | 123–132 s | 55.0 s | **32.3–32.5 s** |
+| next refit (7 recovery fits, 21 more held) | 100–102 s | 43.6 s | **25.0–25.5 s** |
+| class leave-one-out pass | 8.7 s | 1.07 s | 1.07 s |
+| one `fit_store` with its passes, nothing new | 9.3 s | | 2.8 s |
+
+At 13 068 fitted samples (×8 replicas): leave-one-out 67.2 s serial → **8.1 s**; one `fit_store` with its passes 65.6 → **14.8 s**; a refit without recovery (2 fits) 27.3 s.
+
+Extrapolated now, at Q′ 1 032 and 2.7 atoms per sample, 50 000 samples: one pass ≈ 31 s of leave-one-out + ≈ 21 s of active set + ≈ 3 s, so a refit without recovery is ≈ 1–1.5 min. A refit through 7 recovery rounds is ≈ 6 min. Each round is a rebuild whose accumulate is 0.8 ms per sample (40 s at 50 000), and that is now the largest term. What is left, not done: the recovery's rounds downdate the accumulator instead of rebuilding it (fix 3, a numerics review first); the active set's MaxVol scan on threads; the refit off the step path (fix 4).

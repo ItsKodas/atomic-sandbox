@@ -452,6 +452,16 @@
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
 //!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
+//!   **Once per refit, for the fit that stands** (2026-11-12, `references.md` "Refit cost at
+//!   scale"): the fits inside one refit — the fence votes', the release's, the trust recovery's
+//!   cap retries and quarantine rounds — decide on the training residuals, the force noise and the
+//!   sample floor only, so they leave this pass and the active set (rule 5e) to the fit that
+//!   stands (`fit_store_deferred`, `ensure_trust_passes`; before the held-out guesses are judged,
+//!   which read rule 5e). The verdicts are bit for bit those of a pass after every fit
+//!   (`a_deferred_refit_leaves_the_eager_refits_state`); only a teach-around round count now
+//!   restarts by the standing fit's class verdict, not by an intermediate fit's that the recovery
+//!   replaced. The samples' leave-one-out runs on up to 16 threads
+//!   (`surrogate::loo::leave_one_out_many`, the same numbers in the same order).
 //! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
 //!   `validate/references.md`, "M8a calibrated verdict"): enough samples — per environment key
@@ -1112,6 +1122,15 @@ pub struct SurrogateKs {
     /// and the calibration — so new evidence re-judges them without a refit (`rejudge_classes`,
     /// the controller's ruling 3 of user-test fix 2); `None` before the first fit.
     class_judge: Option<ClassJudge>,
+    /// Inside a refit (`fit_store_deferred`): the current fit's column count |∪_k S_k| (the sample
+    /// floor), while `class_loo`, `class_judge`, `class_worst`, `class_blockers` and `active_set`
+    /// are still an earlier fit's — computed once for the fit that stands (`ensure_trust_passes`).
+    /// `None` outside a refit: those are the current fit's.
+    deferred_trust: Option<usize>,
+    /// Tests only: every fit inside a refit computes its trust passes, as before the deferral —
+    /// the reference the deferred refit is compared with (`refit_cost` tests).
+    #[cfg(test)]
+    eager_trust_passes: bool,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -1430,6 +1449,9 @@ impl SurrogateKs {
             strict_verdict: None,
             class_worst: Vec::new(),
             class_blockers: Vec::new(),
+            deferred_trust: None,
+            #[cfg(test)]
+            eager_trust_passes: false,
             teach_rounds: BTreeMap::new(),
             teach_classes: Vec::new(),
             teach_start: None,
