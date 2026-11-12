@@ -534,6 +534,31 @@ windows) was committed at 17:14 when the user asked to stop, unreviewed. Eight d
 
 ---
 
+### Refit cost at scale (Nov 12, first commit 14:16, fix 4 at 16:03; four fixes)
+
+The user asked: "what happens when we end up with 50,000 samples, are we going to be waiting hours?"
+
+**The measurement.** A timing harness ran on a copy of the user's 1,805-sample H/N/O collection (Q′ 1,032), on species subsets and on jittered replicas up to 14,440 samples. The hyperparameter search, the solve and the collection's own writes do not grow with P.
+
+The per-refit trust pass grows linearly: an exact leave-one-out over every sample, 4.6 ms each at Q′ 1,032 and growing as Q′². The trust recovery then repeated the whole fit seven times per refit. The user's "Refitting · 1:34" was 90 % recovery. Extrapolated, a refit at 50,000 samples would take about 35 minutes, and the simulation stops for all of it.
+
+**The fixes.**
+1. The trust passes run once per refit, for the fit that stands. They are bit for bit those of a pass after every fit, compared line by line.
+2. The leave-one-out runs on threads, bit for bit.
+3. A rebuild's accumulate is batched on threads, bit for bit a loop of `add`.
+   - The downdate first proposed was dropped. Subtracting samples from compensated sums is not bit-exact, and the code promises that a reopened collection's first fit equals the session's last search bit for bit.
+   - The surprise was that the old rebuild spent most of its 0.8 ms per sample spawning threads.
+4. While playing, a refit runs on a copy of the provider in the background. The install keeps whatever the live provider appended meanwhile. Anything else discards the result, which is due again.
+
+**The numbers.** The user's refit went 100 s → 25 s → 21 s. A cold rebuild of 13,043 samples went 10.8 s → 0.45 s. At 50,000 samples a refit is extrapolated at about 1–1.5 min, and while playing it no longer stops the simulation.
+
+**What was wrong along the way.** An independent review of fix 4's merge found two real holes:
+- A box reference landing mid-refit would have put stale energies back under new references.
+- A key that left trust on live evidence could have re-entered on the install's one re-judge.
+
+Both are fixed, with tests. The second test fails without its fix. The merged tree's app suite then caught a third: a background refit in flight when the user paused waited for the next command, because the idle worker blocked on its inbox. A pause now keeps polling until the new model stands.
+- **Gate:** unit crates, `providers`, `app` and validate `surrogate` on the merged tree before the merge.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

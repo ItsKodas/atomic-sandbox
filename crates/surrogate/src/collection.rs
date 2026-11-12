@@ -1043,6 +1043,31 @@ impl Collection {
         self.geometries.contains(&geometry_print(z, pos)) && self.samples.iter().any(|t| t.sample.z == z && bits(&t.sample.pos) == bits(pos))
     }
 
+    /// A read-only view of the key, the references and the codes — **not** the samples or the
+    /// history, which stay empty — with no file and no lock: every write refuses (`read_only`).
+    /// For a computation on another thread that reads the collection's references as they stand
+    /// (the provider's background refit, which holds its own copy of the samples), never a second
+    /// handle of the folder.
+    pub fn detached_view(&self) -> Collection {
+        Collection {
+            key: self.key.clone(),
+            samples: Vec::new(),
+            quarantine: self.quarantine.clone(),
+            references: self.references.clone(),
+            history: AuditHistory::default(),
+            read_only: true,
+            folder: self.folder.clone(),
+            file: None,
+            _lock: None,
+            locked_by: None,
+            seen: HashSet::new(),
+            geometries: HashSet::new(),
+            good_len: self.good_len,
+            #[cfg(test)]
+            fail_next_write: None,
+        }
+    }
+
     /// Records a later quarantine change of sample `index` (a status record; module doc).
     pub fn set_status(&mut self, index: usize, code: u8) -> Result<(), String> {
         self.writable()?;

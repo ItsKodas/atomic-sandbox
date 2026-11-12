@@ -157,7 +157,7 @@ impl AuditOrigin {
 /// A failed audit's case (module doc, rule 8, "A failed audit stays failed"): the audited geometry,
 /// the teacher's labels there, the store index of the kept answer (`None`: not kept — an unfit or
 /// refused answer) and the surface's ionic tag (the force audit's floor).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FailedAudit {
     pub(super) pos: Vec<[f64; 3]>,
     pub(super) z: Vec<u8>,

@@ -161,6 +161,28 @@ pub(super) struct SharedCollection {
     pub(super) pass_start: Option<usize>,
 }
 
+impl SharedCollection {
+    /// A read-only copy for a background refit's copy of the provider (`background` module doc):
+    /// the collection as a detached view (no file, no lock: every write refuses) and this
+    /// bookkeeping as it stands, its write failures already said (the copy writes nothing).
+    pub(super) fn detached(&self) -> SharedCollection {
+        SharedCollection {
+            coll: self.coll.detached_view(),
+            link: self.link.clone(),
+            prov: self.prov.clone(),
+            appended: self.appended,
+            refused: self.refused.clone(),
+            waiting: self.waiting,
+            history_written: self.history_written,
+            raw: self.raw.clone(),
+            box_n: self.box_n.clone(),
+            box_refs: self.box_refs.clone(),
+            write_noted: true,
+            pass_start: self.pass_start,
+        }
+    }
+}
+
 /// The store's provenance in collection mode: the key's settings, any box (`grid_n` 0), neutral,
 /// automatic multiplicity — what `Collection::admit_provenance` accepts, and nothing it does not.
 pub(super) fn shared_provenance(key: &SurfaceKey) -> Provenance {
@@ -189,7 +211,7 @@ pub(super) fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
 }
 
 /// What changes when the audit history changes: its recorded points and its unrecorded counts.
-fn history_stamp(h: &surrogate::AuditHistory) -> (u64, u64) {
+pub(super) fn history_stamp(h: &surrogate::AuditHistory) -> (u64, u64) {
     let u = &h.unrecorded;
     (h.recorded(), u.no_variance + u.box_affected + u.draft + u.unfit)
 }

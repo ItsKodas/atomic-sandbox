@@ -419,6 +419,11 @@ pub(super) const REFIT_INTERVAL: Duration = Duration::from_millis(500);
 /// … or until this many samples arrived since it, whichever comes first.
 pub(super) const REFIT_SAMPLES: usize = 25;
 
+/// Background refits discarded in a row after which the next refit runs in the tick (a conflict
+/// that recurs during every background refit — fence votes releasing stored samples while each one
+/// runs — must not keep the model from moving).
+pub(super) const REFIT_DISCARDS_BEFORE_SYNC: u32 = 2;
+
 impl Worker {
     /// [`Command::EnsureModel`] (`worker` module doc, "Teaching"; "Autosave" for the ownership).
     pub(super) fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan, auto_pass: bool) {
@@ -617,6 +622,32 @@ impl Worker {
     /// is running (a pass refits at its end).
     /// Whether a refit ran.
     pub(super) fn refit_if_pending(&mut self, snap: &DynSnapshot) -> bool {
+        // a background refit (playing): installed or discarded between ticks
+        if let Some(started) = self.refit_started {
+            let Some(s) = trainable(&mut self.dy) else {
+                self.refit_started = None;
+                return false;
+            };
+            match s.poll_refit_background() {
+                sim::RefitPoll::Running => return false,
+                // the provider that ran it is gone (a backend switch, a forget's new provider)
+                sim::RefitPoll::Idle => self.refit_started = None,
+                sim::RefitPoll::Discarded(why) => {
+                    self.refit_started = None;
+                    self.refit_discards += 1;
+                    // the throttle restarts: a discard is a refit's worth of work
+                    self.last_refit_at = Some(Instant::now());
+                    self.dy.add_note(why);
+                    return true;
+                }
+                sim::RefitPoll::Done(fit) => {
+                    self.refit_started = None;
+                    self.refit_discards = 0;
+                    self.log_refit(snap, fit, started.elapsed().as_secs_f64() * 1e3, " (background)");
+                    return true;
+                }
+            }
+        }
         if sampling_active(snap) {
             return false;
         }
@@ -631,15 +662,28 @@ impl Worker {
                 return false;
             }
         }
+        // playing: off the step path (module doc, "Refits") — unless background refits keep being
+        // discarded, then once in the tick
+        if !snap.paused && self.refit_discards < REFIT_DISCARDS_BEFORE_SYNC && s.begin_refit_background() {
+            self.refit_started = Some(Instant::now());
+            return false;
+        }
         let t = Instant::now();
         let fit = s.refit();
-        let ms = t.elapsed().as_secs_f64() * 1e3;
+        self.refit_discards = 0;
+        self.log_refit(snap, fit, t.elapsed().as_secs_f64() * 1e3, "");
+        true
+    }
+
+    /// A refit's note and log (`refit_if_pending`): `how` after its wall (" (background)").
+    fn log_refit(&mut self, snap: &DynSnapshot, fit: Result<String, String>, ms: f64, how: &str) {
+        let Some(s) = trainable(&mut self.dy) else { return };
         self.refits += 1;
         let k = self.refits;
         let st = s.status(&snap.scene, &snap.forces);
         let note = match &fit {
             Ok(summary) => format!(
-                "refit #{k}: {summary}, {ms:.0} ms — trusted: {}{}",
+                "refit #{k}: {summary}, {ms:.0} ms{how} — trusted: {}{}",
                 match &st.untrusted_reason {
                     None => "yes".to_string(),
                     Some(why) => format!("no — {why}"),
@@ -655,7 +699,6 @@ impl Worker {
         self.last_refit = Some(RefitLog { ms, at_step: snap.step, result });
         self.last_refit_at = Some(Instant::now());
         self.dy.add_note(note);
-        true
     }
 
     /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's. The

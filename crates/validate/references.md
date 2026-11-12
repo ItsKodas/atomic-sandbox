@@ -4250,3 +4250,71 @@ longer) is the follow-up. The user entry points (the Selection and Model tabs' b
 entry) are hidden behind `app::segment::SEGMENT_TRAINING = false`; `Action::TrainSegment`, the masked
 samples (`surrogate::fit` "Masked samples", `sim::Scene::train_mask`) and their tests stay compiled and
 tested.
+
+## Refit cost at scale (2026-11-12; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, the user's app open in another worktree)
+
+The user's question: "at 50 000 samples, are we going to be waiting hours?". The test times each phase of one refit-plus-trust cycle (each phase is the provider's own function, called again on its own; nothing is changed) on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, body-4, Q′ 1 032, 2.67 atoms per sample), on species subsets (Q′), and on the collection with jittered replicas (δ ≤ 1e-4 Bohr, relabelled to first order: P × 2/4/8). Reported, never asserted. Command: `COLLECTION_DIR=<copy> REFIT_COST=full,sub,species,rep2,rep4,rep8 [REFIT_WHOLE=0] cargo test -p providers --release --lib refit_cost -- --ignored --nocapture --test-threads 1`.
+
+| phase (Q′ 1 032) | P 1 639 fitted | 3 268 | 6 534 | 13 068 | scaling |
+|---|---|---|---|---|---|
+| accumulate (a rebuild only; the incremental +25 is 0.025 s) | 1.34 s | 2.75 | 5.45 | 10.1 | 0.8 ms/sample |
+| spectral search (5–9 rounds) | 1.5–1.7 s | 1.5 | 1.9 | 2.1 | flat in P |
+| null space (Householder–QL at Q′) | 0.35 s | 0.35 | 0.38 | 0.33 | flat in P, Q′³ |
+| training residuals | 0.03 s | 0.05 | 0.12 | 0.19 | 13 µs/sample |
+| **class leave-one-out (rule 4b)** | **8.7 s** | **15.0** | **32.7** | **60.6** | **4.6 ms/sample** (2 / 3 / 4 atoms: 3.6–4.4 / 5.2–5.8 / 6.7–7.8 ms) |
+| of which calibration (385 history points), key columns, model forces | < 0.05 s | 0.1 | 0.3 | 0.5 | |
+| descriptor cache (cold; a refit adds only the new samples) | 0.02 s | 0.05 | 0.11 | 0.20 | |
+| active set (rule 5e: Gram, eigen, MaxVol per species) | 1.44 s | 2.0 | 3.9 | 5.9 | ≈ 0.8 s + 0.4 ms/sample |
+| collection writes (history, README, status records) | < 0.01 s | | | | flat |
+| **one `fit_store`, nothing new** | **9.3 s** | **17.5** | **34.8** | **65.6** | ≈ 2 s + 5.0 ms/sample |
+
+Leave-one-out per sample against Q′ (2-atom samples): Q′ 38 0.02 ms, 284 0.27 ms, 452 0.68 ms, 1 032 4.4 ms, i.e. ∝ Q′² (the module doc's O(m Q′²)); the body-4 note above measured 122 ms for a 6-atom sample at Q′ 2 688.
+
+**A whole `refit()` is several `fit_store`s.** On the user's collection the training residuals fail at every refit, so `recover_trust` runs its quarantine rounds. Each round is a rebuild (accumulate, search, then every trust pass again). The attach's refit took 8 `fit_store` calls in 123–132 s, and the next `refit()` took 7 calls in 100–102 s; it quarantined 21 more samples, 180 held in all. That is the user's "Refitting · 1 799 samples · 1:34". Without recovery a refit is 2–3 calls (release and held-out re-fits): H + O subset 9.7 s, first half 5.7 s.
+
+**Extrapolated, at Q′ 1 032 and ≈ 2.7 atoms per sample:**
+
+| P | one `fit_store` (warm) | one recovery round (rebuild) | refit with 7 recovery fits (today's collection) |
+|---|---|---|---|
+| 1 800 (measured) | 9–11 s | 13–15 s | 100 s |
+| 10 000 | ≈ 52 s | ≈ 61 s | ≈ 7 min |
+| 50 000 | ≈ 4.2 min | ≈ 5 min | ≈ 35 min |
+
+The worker refits between ticks, every 25 new samples or 500 ms while playing (`app::worker` "Refits"), so the simulation stops for the whole refit. At Q′ 2 688 (a fourth species) leave-one-out alone becomes ≈ 6.8× dearer, ≈ 26 min per pass at 50 000. The cost is the per-refit O(P · m · Q′²) leave-one-out pass, multiplied by the number of `fit_store` calls in one refit. The solve, the search, the null space, the calibration and the collection's own writes do not grow with P.
+
+**After fixes 1 and 2 (2026-11-12, the user's go-ahead; same machine, the user's app open).**
+1. *The trust passes once per refit*: the fits inside a refit (votes, release, the recovery's cap retries and quarantine rounds) are `fit_store_deferred`. The class leave-one-out and the active set are computed once, for the fit that stands, by `ensure_trust_passes` (also before the held-out guesses are judged, which read rule 5e). Those fits' own decisions read the training residuals, the noise and the sample floor; the floor's column count is computed alone.
+2. *Leave-one-out on threads* (`surrogate::loo::leave_one_out_many`, up to 16): each sample's residuals depend only on the model and that sample, and the sums run in sample order as before.
+
+Equivalence: an eager refit (every fit with its passes, the test hook `eager_trust_passes`) and the deferred one leave the same state, compared line by line. The state covers the model, the report, the training residuals, the class LOO and judgement, the worst samples and blockers, the hysteresis memory, the active set, the quarantine, the cap, the recovery note, the trust verdict, failed audits and fences, the teach rounds, the jump and the notes. Checked on the stuck-H collection, body-3 (8 fits through step 3's restores) and body-4 (3 fits), two refits each (`a_deferred_refit_leaves_the_eager_refits_state`). Checked also on the user's collection, 7 recovery fits and 180 held (`deferred_refit_on_a_collection`). `leave_one_out_many` is the serial loop bit for bit (`surrogate` `leave_one_out_many_is_the_serial_loop_bit_for_bit`). One edge differs on purpose: a teach-around round count restarts by the standing fit's class verdict, no longer by an intermediate fit's that the recovery replaced.
+
+| on the user's collection (P 1 805, Q′ 1 032) | before | threads only | both fixes |
+|---|---|---|---|
+| attach + cold refit (8 fits) | 123–132 s | 55.0 s | **32.3–32.5 s** |
+| next refit (7 recovery fits, 21 more held) | 100–102 s | 43.6 s | **25.0–25.5 s** |
+| class leave-one-out pass | 8.7 s | 1.07 s | 1.07 s |
+| one `fit_store` with its passes, nothing new | 9.3 s | | 2.8 s |
+
+At 13 068 fitted samples (×8 replicas): leave-one-out 67.2 s serial → **8.1 s**; one `fit_store` with its passes 65.6 → **14.8 s**; a refit without recovery (2 fits) 27.3 s.
+
+Extrapolated now, at Q′ 1 032 and 2.7 atoms per sample, 50 000 samples: one pass ≈ 31 s of leave-one-out + ≈ 21 s of active set + ≈ 3 s, so a refit without recovery is ≈ 1–1.5 min. A refit through 7 recovery rounds is ≈ 6 min. Each round is a rebuild whose accumulate is 0.8 ms per sample (40 s at 50 000), and that is now the largest term. What is left, not done: the recovery's rounds downdate the accumulator instead of rebuilding it (fix 3, a numerics review first); the active set's MaxVol scan on threads; the refit off the step path (fix 4).
+
+**Fix 3 (2026-11-12): the rebuild's accumulate batched on threads, bit for bit.** `Accumulator::add_many` computes each batch's descriptors and design rows on threads, then adds them in sample order with the two Grams threaded over their rows. Every entry receives `add`'s compensated additions in the same order, so the statistics are a loop of `add` bit for bit (`surrogate` `add_many_is_a_loop_of_add_bit_for_bit`: every statistic, the compensations, the envelope, across batch boundaries, masked samples, the warm path's pending rows and its model, and the error stop). *Not the downdate first proposed:* subtracting a quarantined sample's rows from the sums gives the same totals only to rounding (≈ ε² of the removed terms through the compensation, and a column only removed samples touched is left at ≈ 1e-32 instead of 0). It would also break "the statistics are the in-order sum over the members", which a reopened collection's bit-for-bit first fit rests on. The rebuild of 1 614 samples (Q′ 1 032): 1.58 s → **0.059 s**. Of 13 043: 10.8 s → **0.45 s**. The old per-sample cost was mostly spawning the Gram's threads once per sample. The user's collection's refit through 7 recovery fits: 25.0 s → **21.0 s**, now mostly its 7 spectral searches (1.4–1.6 s each).
+
+**Fix 4 (2026-11-12): the refit off the step path while playing** (`providers::surrogate::background`; `Trainable::begin_refit_background` / `poll_refit_background`; the worker's `refit_if_pending`). While the dynamics play, a refit runs on a copy of the provider on its own thread, and the model that stands keeps answering, judged by its own verdicts. The copy has no teacher and no auditor, and holds a detached read-only collection view (`Collection::detached_view`). The new model is installed between ticks. The live provider's appends while it ran stay: samples after the snapshot, history points, failed audits and fences, kept votes, notes. A key that left trust on live evidence meanwhile stays out. Then the jump is booked at the current geometry, the collection's status records and history are written, and the class verdicts are re-judged against the whole history, between refits (a key can leave on that evidence, not enter). Anything more than appends discards the result, and the refit is due again: a model, store or policy change (`model_gen`), another reference set (canonical or per box) or degree cap, a stored sample's quarantine code, the judged failed audits, fences or votes, the teach-around counts. Paused, the refit stays in the tick, as before.
+- Equivalence: with nothing appended, the install is the synchronous refit's state line by line, on the stuck-H collection's body-3 recovery (16 fits) and its body-4 one (11 fits) (`a_background_refit_installs_the_synchronous_state`).
+- With samples, a failed audit and a kept vote appended while it ran, the state equals a synchronous refit followed by the same appends, and the next refit of both is the same too (`appends_during_a_background_refit_survive_the_install`). The surface epoch differs there, rightly: the failed audit came before the install, so there was no trust flip to book.
+- A policy change or a changed quarantine code discards the result, and the model that stood still stands (`a_conflict_discards_a_background_refit`).
+- An independent review of the merge (2026-11-12) found four issues, all fixed with tests.
+  1. A box reference landing mid-refit rebases that box's stored energies without moving the canonical references. The install wrote the old energies back. Now `box_refs` is part of the conflict test, and the install takes only the tags from the copy (`a_box_reference_arriving_mid_refit_discards_it`).
+  2. A key that left trust on live evidence mid-refit could re-enter on the install's one re-judge, which read the copy's memory ("was trusted": LEAVE, no worst-atom check). Such keys are now marked out before the re-judge (`a_key_that_left_during_a_background_refit_stays_out`, which fails without the fix).
+  3. A refit that ended in an error moved the surface and re-read the failed audits, which a synchronous error does not. It no longer does, and a background refit needs a model to start.
+  4. A provider dropped mid-refit left its thread running a collection-scale refit. The thread now stops at its next fit (`a_cancelled_background_refit_installs_nothing_new`). The probe's refit phase is begun and ended by the live provider. The copy carries neither the descriptor cache nor the collection's samples. A discard restarts the throttle, and after `REFIT_DISCARDS_BEFORE_SYNC` = 2 discards in a row the worker refits in the tick, so a recurring conflict cannot keep the model from moving.
+- The merged tree's app suite then found a fifth issue (`estimated_radio_samples_fades_the_density_and_keeps_the_model_across_a_switch`). A refit started while playing was still in flight when the user paused. The paused, idle worker blocked on its inbox, so the finished refit would wait for the next command. The worker also reported itself not working, so the pause snapshot showed the old fit (78 samples where the restored model had 79). Fixed: a refit in flight keeps the worker polling once a budget, the tick that installs it publishes, and `working` and busy count it.
+
+What the user waits for at 50 000 samples (Q′ 1 032, 2.7 atoms per sample), extrapolated from the measurements above:
+- The refit itself is ≈ 1 min without recovery: leave-one-out ≈ 31 s and active set ≈ 21 s, both linear in P. Through 7 recovery fits it is ≈ 1.5 min (7 searches of ≈ 3 s and 7 rebuilds of ≈ 1.7 s on top).
+- While playing, none of it stops the simulation. The new model arrives that long after the samples that asked for it, and the model that stood answers meanwhile.
+- Paused (or before the first fit), it is still a wait of that length.
+
+What is left: the active set's MaxVol scan on threads, and the recovery's repeated searches.

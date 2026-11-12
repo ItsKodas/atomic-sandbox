@@ -153,6 +153,23 @@ fn solve_small(mut m: Vec<f64>, mut v: Vec<f64>, n: usize) -> Option<Vec<f64>> {
     Some(v)
 }
 
+/// [`leave_one_out`] of every sample in `samples`, in order, on up to 16 threads (contiguous
+/// chunks). Each sample's residuals depend on the model and that sample alone, so the numbers are
+/// bit for bit those of one call at a time; only the wall changes (the provider's class-wise
+/// trust pass, O(P · m · Q′²): 4.6 ms per sample at Q′ 1 032 on one thread, `references.md`
+/// "Refit cost at scale").
+pub fn leave_one_out_many(model: &Model, samples: &[&Sample]) -> Vec<Option<SampleLoo>> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1);
+    if threads == 1 || samples.len() < 2 {
+        return samples.iter().map(|s| leave_one_out(model, s)).collect();
+    }
+    let per = samples.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = samples.chunks(per).map(|chunk| scope.spawn(move || chunk.iter().map(|s| leave_one_out(model, s)).collect::<Vec<_>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().expect("a leave-one-out thread panicked")).collect()
+    })
+}
+
 /// The leave-one-out residuals of a training sample under `model` (module doc). `None` when the
 /// model carries no posterior factor, the sample's species are unknown, or I − H_ss is singular
 /// (a sample that alone determines a direction: its LOO prediction there is undefined).
@@ -290,6 +307,24 @@ mod tests {
     /// store (noisy, weighted rows, so H_ss is far from 0). Masked samples (M8a Task 10) are left
     /// out by their fitted rows only, and report no energy residual without an energy row and no
     /// force residual for a masked-out atom.
+    /// The threaded map is the one-at-a-time loop, bit for bit and in order (the provider's class
+    /// rule reads it: `references.md` "Refit cost at scale").
+    #[test]
+    fn leave_one_out_many_is_the_serial_loop_bit_for_bit() {
+        let (basis, prov, samples, opts) = fixture();
+        let (model, _) = fit(&basis, &prov, &samples, &opts);
+        let refs: Vec<&Sample> = samples.iter().collect();
+        let many = leave_one_out_many(&model, &refs);
+        let serial: Vec<Option<SampleLoo>> = samples.iter().map(|s| leave_one_out(&model, s)).collect();
+        assert_eq!(many.len(), serial.len());
+        let bits = |l: &Option<SampleLoo>| l.as_ref().map(|l| (l.energy.map(f64::to_bits), l.forces.iter().map(|f| f.map(|f| f.map(f64::to_bits))).collect::<Vec<_>>()));
+        for (a, b) in many.iter().zip(&serial) {
+            assert_eq!(bits(a), bits(b));
+        }
+        assert!(serial.iter().all(Option::is_some));
+        assert!(leave_one_out_many(&model, &[]).is_empty());
+    }
+
     #[test]
     fn loo_matches_a_downdate_of_the_fit() {
         let (basis, prov, samples, opts) = fixture();

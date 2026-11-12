@@ -496,6 +496,16 @@
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
 //!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
+//!   **Once per refit, for the fit that stands** (2026-11-12, `references.md` "Refit cost at
+//!   scale"): the fits inside one refit — the fence votes', the release's, the trust recovery's
+//!   cap retries and quarantine rounds — decide on the training residuals, the force noise and the
+//!   sample floor only, so they leave this pass and the active set (rule 5e) to the fit that
+//!   stands (`fit_store_deferred`, `ensure_trust_passes`; before the held-out guesses are judged,
+//!   which read rule 5e). The verdicts are bit for bit those of a pass after every fit
+//!   (`a_deferred_refit_leaves_the_eager_refits_state`); only a teach-around round count now
+//!   restarts by the standing fit's class verdict, not by an intermediate fit's that the recovery
+//!   replaced. The samples' leave-one-out runs on up to 16 threads
+//!   (`surrogate::loo::leave_one_out_many`, the same numbers in the same order).
 //! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
 //!   `validate/references.md`, "M8a calibrated verdict"): enough samples — per environment key
@@ -1027,6 +1037,7 @@ use surrogate::{
 use surrogate::sidecar::TeacherSolves;
 
 mod audit;
+mod background;
 pub mod calibrate;
 mod inspect;
 mod knowledge;
@@ -1057,6 +1068,7 @@ pub use quarantine::{
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
 pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use background::BackgroundPoll;
 pub use views::Verdict;
 pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
 
@@ -1170,6 +1182,15 @@ pub struct SurrogateKs {
     /// and the calibration — so new evidence re-judges them without a refit (`rejudge_classes`,
     /// the controller's ruling 3 of user-test fix 2); `None` before the first fit.
     class_judge: Option<ClassJudge>,
+    /// Inside a refit (`fit_store_deferred`): the current fit's column count |∪_k S_k| (the sample
+    /// floor), while `class_loo`, `class_judge`, `class_worst`, `class_blockers` and `active_set`
+    /// are still an earlier fit's — computed once for the fit that stands (`ensure_trust_passes`).
+    /// `None` outside a refit: those are the current fit's.
+    deferred_trust: Option<usize>,
+    /// Tests only: every fit inside a refit computes its trust passes, as before the deferral —
+    /// the reference the deferred refit is compared with (`refit_cost` tests).
+    #[cfg(test)]
+    eager_trust_passes: bool,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -1395,9 +1416,33 @@ pub struct SurrogateKs {
     /// arrival made (the canonical surface moved under a teacher-surface report): booked into the
     /// next evaluation's `refit_jump` (fix round 3; `shared::book_reference_arrival`).
     offset_jump: f64,
+    /// The refit running on its own thread (`background` module doc), if any.
+    background: Option<background::BackgroundRefit>,
+    /// This provider is a background refit's copy: its `refit` writes nothing to the collection
+    /// (the live provider does after the install).
+    refit_fork: bool,
+    /// A background refit's copy: set when the live provider let it go (dropped or replaced) —
+    /// its refit stops at its next fit (`fit_store_with`).
+    refit_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SurrogateKs {
+    /// A refit's outcome in `Trainable::refit`'s words (one line), noting the error while no model
+    /// formed.
+    fn refit_summary(&mut self, r: Result<FitReport, FitError>) -> Result<String, String> {
+        if let Err(e) = &r {
+            if self.model.is_none() {
+                self.last_fit_error = Some(e.to_string());
+            }
+        }
+        // a fit without energy rows measured no energy rmse (Task 10a review, finding 5)
+        r.map(|r| {
+            let e = if r.has_energy_rows() { format!("rmse_E {:.1e} Ha/atom", r.rmse_energy_per_atom) } else { format!("rmse_E — ({})", surrogate::fit::NO_ENERGY_ROWS) };
+            format!("{} samples, {e}, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_force)
+        })
+        .map_err(|e| e.to_string())
+    }
+
     pub fn new(teacher: Box<dyn ForceProvider>, policy: FallbackPolicy) -> SurrogateKs {
         // `name()` returns `&'static str`: a few bytes leaked once per provider built (the
         // worker builds one per backend switch), not per evaluation
@@ -1496,6 +1541,9 @@ impl SurrogateKs {
             strict_verdict: None,
             class_worst: Vec::new(),
             class_blockers: Vec::new(),
+            deferred_trust: None,
+            #[cfg(test)]
+            eager_trust_passes: false,
             teach_rounds: BTreeMap::new(),
             teach_classes: Vec::new(),
             teach_start: None,
@@ -1512,6 +1560,9 @@ impl SurrogateKs {
             specialised: Vec::new(),
             ref_jobs: Vec::new(),
             offset_jump: 0.0,
+            background: None,
+            refit_fork: false,
+            refit_cancel: None,
         }
     }
 
@@ -2767,17 +2818,20 @@ impl Trainable for SurrogateKs {
 
     fn refit(&mut self) -> Result<String, String> {
         let r = SurrogateKs::refit(self);
-        if let Err(e) = &r {
-            if self.model.is_none() {
-                self.last_fit_error = Some(e.to_string());
-            }
+        self.refit_summary(r)
+    }
+
+    fn begin_refit_background(&mut self) -> bool {
+        self.begin_background_refit()
+    }
+
+    fn poll_refit_background(&mut self) -> sim::RefitPoll {
+        match self.poll_background_refit() {
+            BackgroundPoll::Idle => sim::RefitPoll::Idle,
+            BackgroundPoll::Running => sim::RefitPoll::Running,
+            BackgroundPoll::Discarded(why) => sim::RefitPoll::Discarded(why),
+            BackgroundPoll::Installed(r) => sim::RefitPoll::Done(self.refit_summary(r)),
         }
-        // a fit without energy rows measured no energy rmse (Task 10a review, finding 5)
-        r.map(|r| {
-            let e = if r.has_energy_rows() { format!("rmse_E {:.1e} Ha/atom", r.rmse_energy_per_atom) } else { format!("rmse_E — ({})", surrogate::fit::NO_ENERGY_ROWS) };
-            format!("{} samples, {e}, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_force)
-        })
-            .map_err(|e| e.to_string())
     }
 
     fn forget(&mut self) {

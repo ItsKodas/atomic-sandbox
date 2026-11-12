@@ -82,6 +82,7 @@ pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
 /// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
+#[derive(Clone)]
 pub(super) struct FenceVote {
     pub(super) near: Vec<usize>,
     pub(super) n: usize,
@@ -313,7 +314,7 @@ impl SurrogateKs {
                 // failure for a sample shortfall (Q′ grows with the cap: 176 → 344 for H/O) is not a
                 // recovery — the 2026-10-18 water session's E1(e): one H 0.9 Bohr from O took the
                 // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample
-                match self.fit_store() {
+                match self.fit_store_deferred() {
                     Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
@@ -330,7 +331,7 @@ impl SurrogateKs {
             let saved = self.save_state();
             self.degree_cap = None;
             self.species_dirty = true;
-            match self.fit_store() {
+            match self.fit_store_deferred() {
                 Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
                     self.recovery = Some(format!(
                         "refit with the default basis restored the training residuals (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set no longer did)"
@@ -355,7 +356,7 @@ impl SurrogateKs {
             let entry_held = self.quarantined();
             self.degree_cap = None;
             self.species_dirty = true;
-            if let Ok(r) = self.fit_store() {
+            if let Ok(r) = self.fit_store_deferred() {
                 let r = self.quarantine_rounds(r);
                 if !self.recoverable_fail() && !self.trust_needs_samples() {
                     self.recovery = Some(format!(
@@ -398,7 +399,7 @@ impl SurrogateKs {
                 self.quarantine[i] = Q_HELD;
             }
             self.species_dirty = true; // rebuild without them
-            match self.fit_store() {
+            match self.fit_store_deferred() {
                 Ok(r) => report = r,
                 Err(_) => {
                     self.restore_state(saved);

@@ -685,9 +685,7 @@ pub struct Accumulator {
     warm: Option<Box<WarmState>>,
     pending: Vec<PendingRows>,
     last_refit: RefitKind,
-    // Scratch buffers reused across `add` calls.
-    phi: Vec<f64>,
-    rows: Vec<f64>,
+    // Scratch buffer reused across `rank1_update` calls.
     support: Vec<usize>,
 }
 
@@ -732,8 +730,6 @@ impl Accumulator {
             warm: None,
             pending: Vec::new(),
             last_refit: RefitKind::None,
-            phi: vec![0.0; qr],
-            rows: Vec::new(),
             support: Vec::with_capacity(qr),
         }
     }
@@ -772,8 +768,70 @@ impl Accumulator {
         ref_energy: &[f64],
         opts: &FitOptions,
     ) -> Result<(), DescribeError> {
+        let per_atom = self.check_add(basis, ref_energy, opts);
+        let prep = self.prepare_rows(sample, basis, ref_energy, per_atom, true)?;
+        self.apply_one(prep);
+        Ok(())
+    }
+
+    /// [`add`](Self::add) for every sample of `samples`, in order — bit for bit the same statistics
+    /// as one `add` at a time (module doc, "The large-basis path": a rebuild of a collection's
+    /// accumulator). For a body-4 basis the samples' descriptors and design rows are computed on
+    /// threads, a batch at a time, and the batch is then added in sample order, the Gram threaded
+    /// over its rows: every entry receives the same compensated additions in the same order as
+    /// before, so the totals do not depend on the thread count. A sample that cannot be described
+    /// stops it there with that error, the samples before it added (as a loop of `add` would);
+    /// other bases loop over `add`.
+    ///
+    /// # Panics
+    /// As [`add`](Self::add).
+    pub fn add_many(&mut self, samples: &[&Sample], basis: &Basis, ref_energy: &[f64], opts: &FitOptions) -> Result<(), DescribeError> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        if !self.basis.body4 {
+            for s in samples {
+                self.add(s, basis, ref_energy, opts)?;
+            }
+            return Ok(());
+        }
+        let per_atom = self.check_add(basis, ref_energy, opts);
+        let keep_rows = self.warm.is_some();
+        let threads = add_threads();
+        for batch in samples.chunks(ADD_BATCH) {
+            let preps: Vec<Result<PreparedRows, DescribeError>> = {
+                let this = &*self;
+                let per = batch.len().div_ceil(threads);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .chunks(per)
+                        .map(|chunk| scope.spawn(move || chunk.iter().map(|s| this.prepare_rows(s, basis, ref_energy, per_atom, keep_rows)).collect::<Vec<_>>()))
+                        .collect();
+                    handles.into_iter().flat_map(|h| h.join().expect("a design-row thread panicked")).collect()
+                })
+            };
+            let mut ok = Vec::with_capacity(preps.len());
+            let mut failed = None;
+            for p in preps {
+                match p {
+                    Ok(p) => ok.push(p),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            self.apply_batch(ok, threads);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// `add`'s argument checks; the energy convention (set by the first sample, then held).
+    fn check_add(&mut self, basis: &Basis, ref_energy: &[f64], opts: &FitOptions) -> bool {
         assert_eq!(*basis, self.basis, "Accumulator::add: basis differs from the accumulator's");
-        assert!(sample.shape_ok().is_ok(), "Accumulator::add: sample shapes disagree");
         assert!(
             ref_energy.len() >= basis.n_species(),
             "Accumulator::add: ref_energy shorter than the species list"
@@ -783,24 +841,33 @@ impl Accumulator {
             per_atom, opts.energy_per_atom,
             "Accumulator::add: energy_per_atom differs from the first sample's"
         );
+        per_atom
+    }
+
+    /// One sample's rows on the Q′ columns, without touching the statistics (what `add` adds):
+    /// the envelope's atoms, the energy (or scale) row and its target, the fitted force rows and
+    /// their targets — and, for a body-4 basis, the force block's support and its column-major
+    /// copy (`batch_update`'s). `keep_rows`: keep the force rows themselves (the body-3 path's
+    /// rank-one updates and a warm state's pending rows need them).
+    fn prepare_rows(&self, sample: &Sample, basis: &Basis, ref_energy: &[f64], per_atom: bool, keep_rows: bool) -> Result<PreparedRows, DescribeError> {
+        assert!(sample.shape_ok().is_ok(), "Accumulator::add: sample shapes disagree");
         let s = basis.species_indices(&sample.z)?;
         let desc = describe(basis, &sample.pos, &sample.z)?;
         let p = basis.n_features();
         let qr = self.q_prime;
         let n = sample.pos.len();
-        let w = sample.weight;
         let mask: Vec<bool> = (0..n).map(|j| sample.trains_atom(j)).collect();
         let n_taught = mask.iter().filter(|&&b| b).count();
 
         // Energy row on the representatives (a duplicate column's value is its representative's).
         // Without an energy row the same sum over the masked-in atoms (÷ their count) is the
         // sample's scale row (module doc, "Masked samples").
-        let mut phi = std::mem::take(&mut self.phi);
-        phi.iter_mut().for_each(|v| *v = 0.0);
+        let mut atoms = Vec::with_capacity(n_taught);
+        let mut phi = vec![0.0; qr];
         let mut y = sample.energy;
         for (i, d) in desc.iter().enumerate() {
             if mask[i] {
-                self.envelope.add_atom(s[i], &d.b);
+                atoms.push((s[i], d.b.clone()));
             }
             y -= ref_energy[s[i]];
             if !(sample.use_energy || mask[i]) {
@@ -819,10 +886,6 @@ impl Accumulator {
                 phi.iter_mut().for_each(|v| *v *= inv);
                 y *= inv;
             }
-            rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
-            neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
-            self.n_e += 1;
-            self.sum_log_w_e += w.ln();
         } else {
             // the interior mean (per atom), or the interior sum scaled to N atoms (extensive, as a
             // whole sample's Σ over all N): the quantity a whole sample's energy row holds.
@@ -830,19 +893,9 @@ impl Accumulator {
             let inv = if per_atom { 1.0 / n_taught as f64 } else { n as f64 / n_taught as f64 };
             phi.iter_mut().for_each(|v| *v *= inv);
         }
-        for (c, class) in self.classes.iter().enumerate() {
-            let v2 = phi[c] * phi[c];
-            for &q in class {
-                self.sumsq[q % p] += v2;
-            }
-        }
-        self.n_scale += 1;
-        self.phi = phi;
 
         // Force rows: φ_{F,(j,a)} block s = −Σ_{i: s_i = s} ∂B_i/∂r_{j,a}, 3N rows of Q′.
-        let mut rows = std::mem::take(&mut self.rows);
-        rows.clear();
-        rows.resize(3 * n * qr, 0.0);
+        let mut rows = vec![0.0; 3 * n * qr];
         for (i, d) in desc.iter().enumerate() {
             let off = s[i] * p;
             for (j, g) in &d.grad {
@@ -866,40 +919,147 @@ impl Accumulator {
                 k += 1;
             }
         }
-        let taught: Vec<usize> = (0..n).filter(|&j| mask[j]).collect();
-        let n_rows3 = 3 * taught.len();
+        let n_rows3 = 3 * n_taught;
+        rows.truncate(n_rows3 * qr);
+        let ys: Vec<f64> = (0..n).filter(|&j| mask[j]).flat_map(|j| sample.forces[j].iter().copied()).collect();
+        let (support_f, t) = if self.basis.body4 { block_columns(&rows, ys.len(), qr) } else { (Vec::new(), Vec::new()) };
+        Ok(PreparedRows { w: sample.weight, use_energy: sample.use_energy, atoms, phi, y, rows: if keep_rows || !self.basis.body4 { rows } else { Vec::new() }, ys, support_f, t })
+    }
+
+    /// The statistics' share of one prepared sample, as `add` always added it.
+    fn apply_one(&mut self, prep: PreparedRows) {
+        let qr = self.q_prime;
+        let w = prep.w;
+        for (s, b) in &prep.atoms {
+            self.envelope.add_atom(*s, b);
+        }
+        if prep.use_energy {
+            rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &prep.phi, prep.y, w, &mut self.support);
+            neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * prep.y * prep.y);
+            self.n_e += 1;
+            self.sum_log_w_e += w.ln();
+        }
+        self.add_scale_row(&prep.phi);
         if self.basis.body4 {
             // the large-basis path (module doc): the sample's 3N rows summed into one block first,
             // which is then added compensated — one Neumaier step per entry per sample instead of
             // per row, threaded over the Gram's rows
-            let ys: Vec<f64> = taught.iter().flat_map(|&j| sample.forces[j].iter().copied()).collect();
-            if !ys.is_empty() {
-                batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &rows[..n_rows3 * qr], &ys, w);
+            if !prep.ys.is_empty() {
+                batch_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, &prep.support_f, &prep.t, &prep.ys, w);
             }
-            for &f in &ys {
+            for &f in &prep.ys {
                 neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                 self.n_f += 1;
                 self.sum_log_w_f += w.ln();
             }
         } else {
-            for (jc, &j) in taught.iter().enumerate() {
-                for a in 0..3 {
-                    let f = sample.forces[j][a];
-                    // jc: the compacted row block of atom j (masked-out atoms' rows dropped above)
-                    let row = &rows[(3 * jc + a) * qr..(3 * jc + a + 1) * qr];
-                    rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
-                    neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
-                    self.n_f += 1;
-                    self.sum_log_w_f += w.ln();
-                }
+            for (r, &f) in prep.ys.iter().enumerate() {
+                // r: the compacted row (masked-out atoms' rows dropped by `prepare_rows`)
+                let row = &prep.rows[r * qr..(r + 1) * qr];
+                rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+                neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
+                self.n_f += 1;
+                self.sum_log_w_f += w.ln();
             }
         }
         if self.warm.is_some() {
-            self.pending.push(PendingRows { w, e: sample.use_energy.then(|| self.phi.clone()), f: rows[..n_rows3 * qr].to_vec() });
+            self.pending.push(PendingRows { w, e: prep.use_energy.then(|| prep.phi.clone()), f: prep.rows });
         }
-        self.rows = rows;
         self.n_samples += 1;
-        Ok(())
+    }
+
+    /// The scale row's squares into `sumsq` (per feature, over the column classes).
+    fn add_scale_row(&mut self, phi: &[f64]) {
+        let p = self.basis.n_features();
+        for (c, class) in self.classes.iter().enumerate() {
+            let v2 = phi[c] * phi[c];
+            for &q in class {
+                self.sumsq[q % p] += v2;
+            }
+        }
+        self.n_scale += 1;
+    }
+
+    /// [`apply_one`](Self::apply_one) for a batch of prepared body-4 samples, in their order: the
+    /// per-sample parts (envelope, right-hand sides, yᵀy, counts, scale rows, pending rows) one
+    /// sample after another, and the two Grams on `threads` threads — row i owned by thread
+    /// i mod `threads`, which adds every sample's (i, ·) terms in sample order. Each entry so
+    /// receives exactly `apply_one`'s compensated additions in the same order (the energy Gram's
+    /// `rank1_update` terms (w φ_i) φ_j, the force Gram's `batch_update` terms w (t_i · t_j)).
+    fn apply_batch(&mut self, preps: Vec<PreparedRows>, threads: usize) {
+        if preps.is_empty() {
+            return;
+        }
+        let qr = self.q_prime;
+        // the energy rows' supports (`rank1_update`'s)
+        let support_e: Vec<Vec<usize>> = preps.iter().map(|p| if p.use_energy { (0..qr).filter(|&i| p.phi[i] != 0.0).collect() } else { Vec::new() }).collect();
+        for (prep, se) in preps.iter().zip(&support_e) {
+            let w = prep.w;
+            for (s, b) in &prep.atoms {
+                self.envelope.add_atom(*s, b);
+            }
+            if prep.use_energy {
+                for &i in se {
+                    let wi = w * prep.phi[i];
+                    neumaier_add(&mut self.rhs_e[i], &mut self.comp.rhs_e[i], wi * prep.y);
+                }
+                neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * prep.y * prep.y);
+                self.n_e += 1;
+                self.sum_log_w_e += w.ln();
+            }
+            self.add_scale_row(&prep.phi);
+            if !prep.ys.is_empty() {
+                for (s, &i) in prep.support_f.iter().enumerate() {
+                    neumaier_add(&mut self.rhs_f[i], &mut self.comp.rhs_f[i], w * crate::linalg::dot(&prep.t[s], &prep.ys));
+                }
+            }
+            for &f in &prep.ys {
+                neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
+                self.n_f += 1;
+                self.sum_log_w_f += w.ln();
+            }
+            self.n_samples += 1;
+        }
+        // the Grams, threaded over their rows
+        let threads = threads.clamp(1, qr.max(1));
+        type RowSet<'a> = Vec<(&'a mut [f64], &'a mut [f64], &'a mut [f64], &'a mut [f64])>;
+        let mut work: Vec<RowSet> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, (((ge, gec), gf), gfc)) in self.gram_e.chunks_mut(qr).zip(self.comp.gram_e.chunks_mut(qr)).zip(self.gram_f.chunks_mut(qr)).zip(self.comp.gram_f.chunks_mut(qr)).enumerate() {
+            work[i % threads].push((ge, gec, gf, gfc));
+        }
+        let (preps, support_e) = (&preps, &support_e);
+        std::thread::scope(|scope| {
+            for (me, mut rows) in work.into_iter().enumerate() {
+                scope.spawn(move || {
+                    for (prep, se) in preps.iter().zip(support_e) {
+                        let w = prep.w;
+                        // row i of this thread is its (i / threads)-th
+                        for &i in se.iter().filter(|&&i| i % threads == me) {
+                            let (ge, gec, _, _) = &mut rows[i / threads];
+                            let wi = w * prep.phi[i];
+                            for &j in se {
+                                neumaier_add(&mut ge[j], &mut gec[j], wi * prep.phi[j]);
+                            }
+                        }
+                        if prep.ys.is_empty() {
+                            continue;
+                        }
+                        for (si, &i) in prep.support_f.iter().enumerate().filter(|(_, &i)| i % threads == me) {
+                            let (_, _, gf, gfc) = &mut rows[i / threads];
+                            let ti = &prep.t[si];
+                            for (sj, &j) in prep.support_f.iter().enumerate() {
+                                neumaier_add(&mut gf[j], &mut gfc[j], w * crate::linalg::dot(ti, &prep.t[sj]));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if self.warm.is_some() {
+            for prep in preps.iter() {
+                self.pending.push(PendingRows { w: prep.w, e: prep.use_energy.then(|| prep.phi.clone()), f: prep.rows.clone() });
+            }
+        }
     }
 
     /// Standardise, choose the hyperparameters, solve, and build the model (module doc).
@@ -1428,25 +1588,31 @@ fn rank1_update(
     }
 }
 
-/// G += w Σ_r v_r v_rᵀ, b += w Σ_r y_r v_r for the k rows v_r of `rows` (k×q row-major): the block
-/// summed plainly over its k rows (k ≤ 3N: a few ε relative per entry), then added to each entry
-/// with one compensated step (`neumaier_add`) — the large-basis path's form of [`rank1_update`],
-/// threaded over the rows of G (each entry written by one thread; G stays exactly symmetric,
-/// the block's (i, j) and (j, i) being the same commutative sums).
-#[allow(clippy::too_many_arguments)]
-fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64], q: usize, rows: &[f64], ys: &[f64], w: f64) {
-    let k = ys.len();
+/// The support of a block of k rows (k×q row-major) — the columns any row touches — and the
+/// block's column-major copy on it: t[s] = (rows[r][support[s]])_r, contiguous in r
+/// (`batch_update`'s operands, computed with the rows: `Accumulator::prepare_rows`).
+fn block_columns(rows: &[f64], k: usize, q: usize) -> (Vec<usize>, Vec<Vec<f64>>) {
     debug_assert_eq!(rows.len(), k * q);
     let support: Vec<usize> = (0..q).filter(|&i| (0..k).any(|r| rows[r * q + i] != 0.0)).collect();
+    let t = support.iter().map(|&i| (0..k).map(|r| rows[r * q + i]).collect()).collect();
+    (support, t)
+}
+
+/// G += w Σ_r v_r v_rᵀ, b += w Σ_r y_r v_r for the k rows v_r of a block given by its support and
+/// column-major copy ([`block_columns`]): the block summed plainly over its k rows (k ≤ 3N: a few
+/// ε relative per entry), then added to each entry with one compensated step (`neumaier_add`) —
+/// the large-basis path's form of [`rank1_update`], threaded over the rows of G (each entry
+/// written by one thread; G stays exactly symmetric, the block's (i, j) and (j, i) being the same
+/// commutative sums).
+#[allow(clippy::too_many_arguments)]
+fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64], q: usize, support: &[usize], t: &[Vec<f64>], ys: &[f64], w: f64) {
     if support.is_empty() {
         return;
     }
-    // column-major copy of the support: t[s] = (rows[r][support[s]])_r, contiguous in r
-    let t: Vec<Vec<f64>> = support.iter().map(|&i| (0..k).map(|r| rows[r * q + i]).collect()).collect();
     for (s, &i) in support.iter().enumerate() {
         neumaier_add(&mut rhs[i], &mut bc[i], w * crate::linalg::dot(&t[s], ys));
     }
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1);
+    let threads = add_threads();
     let per = support.len().div_ceil(threads);
     // each thread owns whole rows i of G: split the rows of the support among them
     let mut row_ids: Vec<Vec<usize>> = support.chunks(per).map(|c| c.to_vec()).collect();
@@ -1472,7 +1638,7 @@ fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64
         }
         ix
     };
-    let (t, support, index) = (&t, &support, &index);
+    let index = &index;
     std::thread::scope(|scope| {
         for chunk in work {
             scope.spawn(move || {
@@ -1485,6 +1651,32 @@ fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64
             });
         }
     });
+}
+
+/// Threads for the accumulator's threaded parts (the batch's design rows, the Gram's rows).
+fn add_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1)
+}
+
+/// Samples per batch of [`Accumulator::add_many`]: their prepared rows are held at once (≈ 3N·Q′
+/// doubles each — 66 kB for a 3-atom sample at Q′ 1 032).
+const ADD_BATCH: usize = 256;
+
+/// One sample's rows, prepared off the statistics (`Accumulator::prepare_rows`).
+struct PreparedRows {
+    w: f64,
+    use_energy: bool,
+    /// The envelope's atoms (species index, descriptor), the masked-in ones in atom order.
+    atoms: Vec<(usize, Vec<f64>)>,
+    /// The energy row (÷ N when per atom), or the scale row of a sample without one; its target.
+    phi: Vec<f64>,
+    y: f64,
+    /// The fitted force rows (compacted, 3 per masked-in atom; empty when not kept) and targets.
+    rows: Vec<f64>,
+    ys: Vec<f64>,
+    /// Body-4: the force block's support and column-major copy ([`block_columns`]).
+    support_f: Vec<usize>,
+    t: Vec<Vec<f64>>,
 }
 
 /// yᵀWy − 2 mᵀb + mᵀGm, clamped at 0 (cancellation).
@@ -3025,6 +3217,79 @@ mod tests {
                 Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }
             })
             .collect()
+    }
+
+    /// The statistics of every public field and the compensated totals, as bits.
+    fn statistics_bits(a: &Accumulator) -> Vec<u64> {
+        let s = a.sums();
+        let e = &a.envelope;
+        let mut v: Vec<u64> = [&a.gram_e, &a.rhs_e, &a.gram_f, &a.rhs_f, &a.sumsq, &s.gram_e, &s.rhs_e, &s.gram_f, &s.rhs_f, &e.min, &e.max, &e.sum, &e.sumsq].iter().flat_map(|x| x.iter().map(|y| y.to_bits())).collect();
+        v.extend([a.yy_e, a.yy_f, a.sum_log_w_e, a.sum_log_w_f, s.yy_e, s.yy_f].map(f64::to_bits));
+        v.extend([a.n_e, a.n_f, a.n_scale, a.n_samples].map(|n| n as u64));
+        v.extend(e.count.iter().map(|&n| n as u64));
+        v
+    }
+
+    /// `add_many` is a loop of `add`, bit for bit (fix 3 of "Refit cost at scale"): every
+    /// statistic, the compensations and the envelope, on a body-4 basis across batch boundaries
+    /// (ADD_BATCH + 37 samples), with masked samples and weights; the warm path's pending rows too
+    /// (the warm refits' models equal); a sample that cannot be described stops both at the same
+    /// place with the same samples added; and a body-3 basis loops over `add` itself.
+    #[test]
+    fn add_many_is_a_loop_of_add_bit_for_bit() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let basis4 = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let mut samples = morse_bend_samples(&mut rng, ADD_BATCH + 37);
+        for (k, s) in samples.iter_mut().enumerate() {
+            if k % 7 == 3 {
+                *s = masked(s.clone());
+            }
+            s.weight = 0.5 + (k % 5) as f64 * 0.25;
+        }
+        let (mut one, mut many) = (Accumulator::new(&basis4), Accumulator::new(&basis4));
+        for s in &samples {
+            one.add(s, &basis4, &refs, &opts).unwrap();
+        }
+        many.add_many(&samples.iter().collect::<Vec<_>>(), &basis4, &refs, &opts).unwrap();
+        assert_eq!(statistics_bits(&one), statistics_bits(&many));
+        assert_eq!(one.envelope, many.envelope);
+
+        // the warm path: a search, then pending samples (masked ones among them) added each way
+        let (mut wa, mut wb) = (one.clone(), many.clone());
+        wa.refit(&opts, &provenance(), &refs).unwrap();
+        wb.refit(&opts, &provenance(), &refs).unwrap();
+        let mut pending = morse_bend_samples(&mut rng, 9);
+        pending[1] = masked(pending[1].clone());
+        for s in &pending {
+            wa.add(s, &basis4, &refs, &opts).unwrap();
+        }
+        wb.add_many(&pending.iter().collect::<Vec<_>>(), &basis4, &refs, &opts).unwrap();
+        assert_eq!(statistics_bits(&wa), statistics_bits(&wb));
+        let (ma, _) = wa.refit(&opts, &provenance(), &refs).unwrap();
+        let (mb, _) = wb.refit(&opts, &provenance(), &refs).unwrap();
+        assert_eq!(wa.last_refit(), RefitKind::Warm { samples: 9 });
+        assert_eq!(ma, mb, "the warm refits' models");
+
+        // an undescribable sample (a species outside the basis) stops both at the same place
+        let mut bad = samples[..40].to_vec();
+        bad[25].z[0] = 7;
+        let (mut a, mut b) = (Accumulator::new(&basis4), Accumulator::new(&basis4));
+        let ea = bad.iter().try_for_each(|s| a.add(s, &basis4, &refs, &opts));
+        let eb = b.add_many(&bad.iter().collect::<Vec<_>>(), &basis4, &refs, &opts);
+        assert!(ea.is_err() && eb.is_err());
+        assert_eq!(b.n_samples, 25);
+        assert_eq!(statistics_bits(&a), statistics_bits(&b));
+
+        // body-3: the loop itself
+        let basis3 = Basis::new(&[H, O]);
+        let (mut a, mut b) = (Accumulator::new(&basis3), Accumulator::new(&basis3));
+        for s in &samples[..30] {
+            a.add(s, &basis3, &refs, &opts).unwrap();
+        }
+        b.add_many(&samples[..30].iter().collect::<Vec<_>>(), &basis3, &refs, &opts).unwrap();
+        assert_eq!(statistics_bits(&a), statistics_bits(&b));
     }
 
     /// A small body-4 basis for the large-basis path tests (Q′ in the low hundreds).
