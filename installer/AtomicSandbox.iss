@@ -16,7 +16,9 @@
 ; Install layout (crates/app/src/paths.rs): installed.txt beside the exe puts the app in Installed
 ; mode; the shipped, read-only content is read from {app}\bundled\. The user's own data lives in
 ; %LOCALAPPDATA%\atomic-sandbox and is never touched here, except by the uninstaller's unticked
-; "Also remove my ..." box (below).
+; "Also remove my ..." box (below). The uninstaller always removes that root's updates\ (the
+; updater's own cache: the last downloaded setup and the session saved for its restart; no user
+; data).
 ;
 ; The in-app updater (crates/app/src/update/apply.rs, installer_command) runs this setup as
 ;   <setup> /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /WAITPID=<pid> /RELAUNCH="<exe> --resume-session <session>"
@@ -165,7 +167,8 @@ const
   RelaunchSeparator = ' --resume-session ';
   { the uninstaller's "Also remove my data": the per-user root, and only these four folders in it
     (spec builder-check ruling: what the installed build created; never cache\, training\,
-    current.profile or timings.txt, which dev and portable builds share) }
+    current.profile or timings.txt, which dev and portable builds share); updates\ (the updater's
+    cache, not user data) is removed on every uninstall }
   DataRootName = 'atomic-sandbox';
   AttrDirectory = $10;
   AttrReparsePoint = $400;
@@ -516,7 +519,8 @@ begin
   end;
 end;
 
-{ One of the four data folders under the root: gone whole, unless it is itself a link. }
+{ A folder under the root (updates\, or one of the four data folders): gone whole, unless it is
+  itself a link. }
 procedure RemoveDataFolder(const Root, Name: String);
 var
   Path: String;
@@ -546,15 +550,21 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Root: String;
 begin
-  if (CurUninstallStep = usPostUninstall) and RemoveData then begin
+  if CurUninstallStep = usPostUninstall then begin
     { M5, an assumption kept on purpose: the app finds its root from the LOCALAPPDATA environment
       variable (paths::user_root); the localappdata constant is the shell's known folder. They are the same
-      folder unless the user has overridden the variable by hand; then this removes the four
-      folders under the known folder's atomic-sandbox, not the one the app uses. }
+      folder unless the user has overridden the variable by hand; then this removes the folders
+      under the known folder's atomic-sandbox, not the one the app uses. }
     Root := ExpandConstant('{localappdata}') + '\' + DataRootName;
-    RemoveDataFolder(Root, 'models');
-    RemoveDataFolder(Root, 'profiles');
-    RemoveDataFolder(Root, 'scenes');
-    RemoveDataFolder(Root, 'captures');
+    { final review M7: always, ticked or not, silent too: the updater's cache (the last downloaded
+      AtomicSandbox-Setup-*.exe, a *.part, session.scene), which only the installed build writes;
+      no user data }
+    RemoveDataFolder(Root, 'updates');
+    if RemoveData then begin
+      RemoveDataFolder(Root, 'models');
+      RemoveDataFolder(Root, 'profiles');
+      RemoveDataFolder(Root, 'scenes');
+      RemoveDataFolder(Root, 'captures');
+    end;
   end;
 end;
