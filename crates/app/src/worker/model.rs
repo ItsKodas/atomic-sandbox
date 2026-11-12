@@ -381,6 +381,8 @@ pub enum FirstPass {
 /// Since M6 Task 9 the cold solve is taken at 1× (M5: 1.6×), so the threshold moved with it: a
 /// scene whose trust floor costs 79–126 s at the cold rate now starts without asking, and a
 /// water-like scene then runs ≈ 1.7× that plus its references (references.md, "M6 Task 9").
+// (the worker calls the `_for` form; this one is the tests')
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
     first_pass_for(scene, plan, per_solve_s, false)
 }
@@ -416,6 +418,8 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 /// [`PASS_TARGET_S`]. `Some((plan scaled to the target, the median))` when the plan would take
 /// longer — `PlanSolves::scaled_to`, so never below the solves trust needs — and `None` when it
 /// fits (or nothing was timed). The running pass is shrunk to it by `Trainable::rescale_pass`.
+// (the worker calls the `_for` form; this one is the tests')
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pass_resize(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64]) -> Option<(SamplingPlan, f64)> {
     pass_resize_for(scene, plan, per_solve_s, false)
 }

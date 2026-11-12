@@ -13,7 +13,7 @@ fn main() {
     }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let path = out.join("atomic-sandbox.ico");
-    std::fs::write(&path, icon::ico(&[16, 20, 24, 32, 40, 48, 64, 256])).expect("write the icon");
+    std::fs::write(&path, icon::ico(&icon::ICO_SIZES)).expect("write the icon");
     let mut res = winresource::WindowsResource::new();
     res.set_icon(path.to_str().expect("utf-8 OUT_DIR"));
     // Task Manager's Processes tab shows FileDescription (else the crate's name, "app")

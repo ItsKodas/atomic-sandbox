@@ -617,7 +617,9 @@ pub fn disk_cache() -> Option<std::path::PathBuf> {
 
 /// The app's cache directory for derived pseudopotential data: `ATOMIC_SANDBOX_CACHE_DIR` if set, else
 /// `%LOCALAPPDATA%\atomic-sandbox\cache\pseudo` (Windows), `$XDG_CACHE_HOME/atomic-sandbox/pseudo` or
-/// `$HOME/.cache/atomic-sandbox/pseudo`; `None` when none of these exists.
+/// `$HOME/.cache/atomic-sandbox/pseudo`; `None` when none of these exists. The Windows default is the
+/// app's per-user root (`app::paths::user_root`) + `cache\pseudo`, shared by dev, portable and installed
+/// builds; the app's `pseudo_cache_sits_under_user_root` test keeps the two in step.
 pub fn default_disk_cache_dir() -> Option<std::path::PathBuf> {
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
     var("ATOMIC_SANDBOX_CACHE_DIR")
@@ -629,7 +631,9 @@ pub fn default_disk_cache_dir() -> Option<std::path::PathBuf> {
 /// One recorded answer: the ladder entry (f, local) and what the gate said.
 type Answer = (f64, LocalCandidate, Result<DimerPair, DimerError>);
 
-const DISK_MAGIC: &str = "atomic-sandbox dimer gate v1";
+/// The first line of a disk-cache file: its format, bumped when the layout changes (public for the
+/// app's release manifest, `app::update::formats`).
+pub const DISK_MAGIC: &str = "atomic-sandbox dimer gate v1";
 const CHECKSUM_KEY: &str = "checksum\t";
 
 /// `body` followed by its checksum line (FNV-1a 64 of the body, 16 hex digits).

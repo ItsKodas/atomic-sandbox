@@ -256,6 +256,11 @@ pub const MAGIC_V7: &[u8; 8] = b"ASMODEL7";
 /// The first eight bytes of a version-8 file: version 7 with a body-4 basis (module doc, "Version
 /// 8"; M8a Task 5). A basis without body-4 is still written as version 7, bit for bit.
 pub const MAGIC_V8: &[u8; 8] = b"ASMODEL8";
+/// Every magic this build reads, oldest first (version = index + 1). Its length is the model-file
+/// format a release manifest records (`app::update::formats`): a new version's magic goes here
+/// with its reader in `parse_header` (the app's test that `ASMODEL<len + 1>` is refused as newer
+/// fails until it does).
+pub const MAGICS: [&[u8; 8]; 8] = [MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8];
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its

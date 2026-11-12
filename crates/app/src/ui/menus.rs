@@ -74,7 +74,7 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                             // File: Open… (the File window) and Save… (the Save window), `files`
                             let r = probed("menu-File", ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
                             hot.push(r.rect);
-                            menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 200.0, |ui| file_items(ui, st)));
+                            menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 240.0, |ui| file_items(ui, st, acts)));
                             continue;
                         }
                         let r = probed(&format!("menu-{}", m.title()), ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
@@ -95,6 +95,10 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                         ui.add_space(3.0 * CAPTION_BUTTON_W - 10.0 + 8.0);
                     }
                     hot.push(search_button(ui, st, compact).rect);
+                    // "v0.2.0 available" (installer Task 4): a newer version on the channel, beside the search
+                    if let Some(r) = super::version::chip(ui, st) {
+                        hot.push(r.rect);
+                    }
                 });
             });
             if framed {
@@ -352,13 +356,13 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     });
 }
 
-/// The File menu's entries: Open… (browse the scenes and models), Save… (scene, model or both)
-/// and Profiles…; marked as one search anchor.
-fn file_items(ui: &mut Ui, st: &mut UiState) {
-    anchored(ui, st, "m-files", file_windows);
+/// The File menu's entries: Open… (browse the scenes and models), Save… (scene, model or both),
+/// Builder…, Profiles… and Import data from a folder…; marked as one search anchor.
+fn file_items(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    anchored(ui, st, "m-files", |ui, st| file_windows(ui, st, acts));
 }
 
-fn file_windows(ui: &mut Ui, st: &mut UiState) {
+fn file_windows(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     if ui.add(Button::new(RichText::new("Open…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("browse the scenes and models").clicked() {
         super::files::open(st);
         ui.close();
@@ -376,11 +380,36 @@ fn file_windows(ui: &mut Ui, st: &mut UiState) {
         super::profile::open(st);
         ui.close();
     }
+    ui.separator();
+    // the installed build keeps its data under %LOCALAPPDATA%: bring an older copy's in (copied,
+    // never moved; what is already there is kept)
+    let state = import_item(st.data_mode, st.import_data.is_some());
+    let item = Button::new(RichText::new("Import data from a folder…").size(14.0)).min_size(Vec2::new(190.0, 28.0));
+    if probed("import-data", ui.add_enabled(state.is_ok(), item))
+        .on_disabled_hover_text(state.err().unwrap_or_default())
+        .on_hover_text("copy an older copy's models, profiles and scenes folders into this installed build's data folder; nothing is overwritten or moved")
+        .clicked()
+    {
+        ui.close();
+        if let Some(folder) = rfd::FileDialog::new().set_title("Import data from a folder").pick_folder() {
+            acts.push(Action::ImportData(folder));
+        }
+    }
+}
+
+/// File ▸ Import data from a folder…: enabled (`Ok`) only in the installed build with no import
+/// running, else why not (its disabled tooltip).
+pub(super) fn import_item(mode: crate::paths::DataMode, running: bool) -> Result<(), &'static str> {
+    match (mode, running) {
+        (crate::paths::DataMode::Installed, false) => Ok(()),
+        (crate::paths::DataMode::Installed, true) => Err("an import is running"),
+        _ => Err(crate::paths::IMPORT_ONLY_INSTALLED),
+    }
 }
 
 fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     // the compact layout's File submenu: the two windows first
-    file_items(ui, st);
+    file_items(ui, st, acts);
     ui.separator();
     anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts));
     ui.separator();
@@ -974,6 +1003,15 @@ fn help_menu(ui: &mut Ui, st: &mut UiState) {
             }
         }
         theme::note(ui, "Each opens the long-form text (also README \"Physics, honestly\").");
+    });
+    ui.separator();
+    // the Version panel (installer Task 4): the releases, the channel, the checks, install and restart
+    anchored(ui, st, "m-version", |ui, st| {
+        let r = probed("help-version", ui.add(Button::new(format!("Version…  (v{})", st.update.current)).frame_when_inactive(false)));
+        if r.on_hover_text("the version running, the releases on GitHub, and installing another one").clicked() {
+            st.update.open = true;
+            ui.close();
+        }
     });
 }
 

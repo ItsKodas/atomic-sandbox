@@ -76,6 +76,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Load model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Profiles", "layout look save load reset user", Menu(M::File), "m-files"),
+    e("Import data from a folder", "installed migrate copy older models profiles scenes localappdata", Menu(M::File), "m-files"),
     e("Molecule builder", "builder draw sketch 2D structural formula molecule bonds hydrogens benzene ethanol insert replace", Menu(M::File), "m-files"),
     e("Forget model", "drop samples estimated", Dock(D::Model), "d-model-file"),
     // Scene
@@ -141,6 +142,7 @@ pub const ENTRIES: &[Entry] = &[
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
+    e("Version and updates", "version update upgrade downgrade install release channel stable beta check restart", Menu(M::Help), "m-version"),
     // Window (docking spec D-7)
     e("Show a panel", "window panels open reopen closed tab Model Knowledge Selection Readouts View Orbitals Log Activity Graph", Menu(M::Window), "m-panels"),
     e("Layout: One monitor", "layouts workspace arrangement preset default single screen", Menu(M::Window), "m-layout"),

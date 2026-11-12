@@ -8125,3 +8125,1139 @@ fn a_reference_answer_has_its_own_label_colour_and_tip() {
     }
     assert!(SOURCE_TIP.contains("atom references (teal)"));
 }
+
+/// File ▸ Import data from a folder… (installer Task 1): outside the installed build (these tests
+/// run in dev mode) the item is there but disabled, a click sends nothing, and the action itself
+/// is refused with the tooltip's reason; a finished import's line reaches the status line, and
+/// a thread that died says so. The search finds it.
+#[test]
+fn import_data_is_offered_only_in_the_installed_build() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(crate::paths::mode(), crate::paths::DataMode::Dev);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::File));
+    let outs = click_widget(&ctx, &mut st, &inp, "import-data");
+    egui::Popup::close_all(&ctx);
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "a disabled item sends nothing");
+    assert!(st.import_data.is_none());
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData("C:/old copy".into()), &mut out);
+    assert_eq!(out.error.as_deref(), Some("import data: only the installed app keeps its data in %LOCALAPPDATA%"));
+    assert!(out.commands.is_empty() && st.import_data.is_none());
+    // the thread's line, when it arrives
+    let (tx, rx) = std::sync::mpsc::channel();
+    st.import_data = Some(rx);
+    poll_import(&mut st);
+    assert!(st.import_data.is_some(), "still running");
+    tx.send("imported models from C:/old copy: 3 files copied, 0 already there (kept)".to_string()).unwrap();
+    poll_import(&mut st);
+    assert!(st.import_data.is_none());
+    assert_eq!(st.status, "imported models from C:/old copy: 3 files copied, 0 already there (kept)");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    st.import_data = Some(rx);
+    drop(tx);
+    poll_import(&mut st);
+    assert!(st.import_data.is_none() && st.status.contains("stopped before it finished"), "{}", st.status);
+    let r = search::results("import data", 3);
+    assert!(r.first().is_some_and(|e| e.anchor == "m-files"), "{:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
+    // the item's state, by mode (fix round 1, M5)
+    use crate::paths::{DataMode, IMPORT_ONLY_INSTALLED};
+    assert_eq!(menus::import_item(DataMode::Dev, false), Err(IMPORT_ONLY_INSTALLED));
+    assert_eq!(menus::import_item(DataMode::Portable, false), Err(IMPORT_ONLY_INSTALLED));
+    assert_eq!(menus::import_item(DataMode::Installed, false), Ok(()));
+    assert_eq!(menus::import_item(DataMode::Installed, true), Err("an import is running"));
+}
+
+/// Fix round 1 (M5): the Installed branch of File ▸ Import data from a folder…, with the mode and a
+/// temporary root standing in on `UiState`: the import starts on its thread, the status line says
+/// so, a second one is refused while it runs, its line arrives with the counts, the File window
+/// reads its folders again, and an import of the root itself is refused.
+#[test]
+fn import_data_runs_in_the_installed_build() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let tmp = std::env::temp_dir().join(format!("atomic-import-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (old, root) = (tmp.join("old copy"), tmp.join("Local").join("atomic-sandbox"));
+    std::fs::create_dir_all(old.join("scenes")).unwrap();
+    std::fs::write(old.join("scenes").join("w.scene"), "grid 33 0.25\n").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    (st.data_mode, st.data_root) = (crate::paths::DataMode::Installed, Some(root.clone()));
+    assert!(!st.files.refresh_pending());
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(old.clone()), &mut out);
+    assert_eq!(out.error, None);
+    assert!(st.import_data.is_some() && st.status.starts_with("importing models, profiles and scenes from"), "{}", st.status);
+    let mut again = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(old.clone()), &mut again);
+    assert_eq!(again.error.as_deref(), Some("import data: an import is already running"));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while st.import_data.is_some() && std::time::Instant::now() < until {
+        poll_import(&mut st);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(st.import_data.is_none(), "the import finished");
+    assert!(st.status.starts_with("imported scenes from") && st.status.contains("1 file copied"), "{}", st.status);
+    assert_eq!(std::fs::read_to_string(root.join("scenes").join("w.scene")).unwrap(), "grid 33 0.25\n");
+    assert!(root.join(crate::paths::MIGRATED_FROM).is_file());
+    assert!(st.files.refresh_pending(), "the File window reads its folders again");
+    // the root itself (or a folder inside it) is not an older copy
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(root.join("scenes")), &mut out);
+    assert!(out.error.as_deref().is_some_and(|e| e.contains("is inside this build's own data folder")), "{:?}", out.error);
+    assert!(st.import_data.is_none());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---- the Version panel, the chip and the restart guard (installer Task 4) ----
+//
+// No test touches the network: `UpdateState`'s default network is `version::Offline` in a test
+// build, and the tests that need answers stand in `FixtureNet` (the recorded releases, the signed
+// fixture sums, a stand-in installer from memory).
+
+mod updates {
+    use super::*;
+    use crate::update::{Channel, CheckError, DownloadState, Formats, Release};
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use version::{Guard, UpdateNet, PORTABLE_REFUSED, UPDATES_OFF};
+
+    const RELEASES: &str = include_str!("../update/fixtures/releases.json");
+    const SUMS: &[u8] = include_bytes!("../update/fixtures/SHA256SUMS.txt");
+    const SIG: &[u8] = include_bytes!("../update/fixtures/SHA256SUMS.txt.minisig");
+    const TEST_KEY: &str = include_str!("../update/fixtures/TEST-ONLY.pub");
+    /// The bytes the fixture `SHA256SUMS.txt` lists as the v0.2.0 installer (`update::apply`'s tests).
+    const FIXTURE_SETUP: &[u8] = b"AtomicSandbox-Setup-0.2.0.exe: a stand-in for the installer, test only\n";
+
+    pub(super) fn releases() -> Vec<Release> {
+        crate::update::release::parse_releases(RELEASES).unwrap()
+    }
+
+    pub(super) fn ver(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    /// The recorded answers: the releases list (or a refusal), a manifest's formats, and the
+    /// installer from memory — held back while `gate` is set (a stalled connection). `stalled` is
+    /// set once a download's read is held at the gate, so a test can wait for that state instead
+    /// of racing the job's thread.
+    pub(super) struct FixtureNet {
+        pub list: Result<Vec<Release>, CheckError>,
+        pub manifest: Result<Option<Formats>, String>,
+        pub gate: Arc<AtomicBool>,
+        pub stalled: Arc<AtomicBool>,
+        pub calls: Arc<AtomicUsize>,
+    }
+
+    impl FixtureNet {
+        pub fn new() -> FixtureNet {
+            FixtureNet { list: Ok(releases()), manifest: Ok(None), gate: Arc::new(AtomicBool::new(false)), stalled: Arc::new(AtomicBool::new(false)), calls: Arc::new(AtomicUsize::new(0)) }
+        }
+    }
+
+    /// The installer's bytes, after the gate opens (`stalled` set while a read waits at it).
+    struct Gated {
+        gate: Arc<AtomicBool>,
+        stalled: Arc<AtomicBool>,
+        bytes: &'static [u8],
+    }
+
+    impl Read for Gated {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            while self.gate.load(Ordering::Relaxed) {
+                self.stalled.store(true, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let n = self.bytes.len().min(buf.len()).min(16);
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    impl UpdateNet for FixtureNet {
+        fn releases(&self) -> Result<Vec<Release>, CheckError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.list.clone()
+        }
+        fn manifest(&self, _: &Release) -> Result<Option<Formats>, String> {
+            self.manifest.clone()
+        }
+        fn download(&self, r: &Release, dir: std::path::PathBuf) -> Result<crate::update::Download, String> {
+            let (gate, stalled) = (self.gate.clone(), self.stalled.clone());
+            let setup = crate::update::release::installer_name(&r.version);
+            let source = move |url: &str| -> Result<Box<dyn Read + Send>, String> {
+                match url.rsplit('/').next().unwrap() {
+                    "SHA256SUMS.txt" => Ok(Box::new(SUMS)),
+                    "SHA256SUMS.txt.minisig" => Ok(Box::new(SIG)),
+                    n if n == setup => Ok(Box::new(Gated { gate: gate.clone(), stalled: stalled.clone(), bytes: FIXTURE_SETUP })),
+                    n => Err(format!("no {n}")),
+                }
+            };
+            // the stand-in's size, as listed
+            let mut r = r.clone();
+            let name = crate::update::release::installer_name(&r.version);
+            r.assets.iter_mut().filter(|a| a.name == name).for_each(|a| a.size = FIXTURE_SETUP.len() as u64);
+            crate::update::Download::start_with(&r, dir, Box::new(source), TEST_KEY)
+        }
+    }
+
+    /// A temporary per-user root for an installed build standing in (its `updates\` holds the
+    /// downloads).
+    pub(super) fn temp_root(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("atomic-version-ui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// `st` as an installed build with `root`, the fixture list, this build at `current`, and the
+    /// fixture network.
+    pub(super) fn installed(st: &mut UiState, root: &std::path::Path, current: &str) -> Arc<AtomicBool> {
+        installed_gated(st, root, current).0
+    }
+
+    /// [`installed`], with the fixture network's `gate` and `stalled` flags ([`FixtureNet`]).
+    fn installed_gated(st: &mut UiState, root: &std::path::Path, current: &str) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let net = FixtureNet::new();
+        let flags = (net.gate.clone(), net.stalled.clone());
+        (st.data_mode, st.data_root) = (crate::paths::DataMode::Installed, Some(root.to_path_buf()));
+        st.update.net = Arc::new(net);
+        st.update.releases = releases();
+        st.update.current = ver(current);
+        flags
+    }
+
+    /// Polls `done` every 2 ms until it holds, for at most `secs` (a generous bound: a loaded
+    /// machine only makes it slower, never changes the outcome); whether it held.
+    fn wait_for(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !done() {
+            if t.elapsed().as_secs() >= secs {
+                return done();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
+
+    /// Runs frames until the download is no longer running (at most 60 s).
+    fn wait_download(st: &mut UiState) -> DownloadState {
+        let t = std::time::Instant::now();
+        loop {
+            let s = st.update.download.as_ref().expect("a download").poll();
+            if !matches!(s, DownloadState::Running(..)) || t.elapsed().as_secs() > 60 {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Every text drawn in the third of three frames (a window sizes itself first).
+    pub(super) fn shown(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> Vec<String> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    fn has(lines: &[String], text: &str) -> bool {
+        lines.iter().any(|l| l.contains(text))
+    }
+
+    fn line_at(lines: &[String], text: &str) -> usize {
+        lines.iter().position(|l| l == text).unwrap_or_else(|| panic!("no line {text:?} in {lines:#?}"))
+    }
+
+    fn actions(outs: &[PanelOutput]) -> Vec<Action> {
+        outs.iter().flat_map(|o| o.actions.clone()).collect()
+    }
+
+    fn probed_now(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> bool {
+        PROBES.with(|p| p.borrow_mut().clear());
+        shown(ctx, st, inp);
+        PROBES.with(|p| p.borrow().contains_key(name))
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        ctx
+    }
+
+    /// The chip offers the newest release on the channel that is newer than this build — none
+    /// without a list, none when this build is the newest, a newer pre-release on Beta only — and a
+    /// click on it opens the Version panel.
+    #[test]
+    fn chip_shows_only_when_newer_on_channel() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(version::chip_text(&st.update), None, "no list yet");
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        assert_eq!(version::chip_text(&st.update).as_deref(), Some("v0.2.0 available"));
+        assert!(has(&shown(&ctx, &mut st, &inp), "v0.2.0 available"), "drawn in the top bar");
+        click_widget(&ctx, &mut st, &inp, "update-chip");
+        assert!(st.update.open, "the chip opens the Version panel");
+        st.update.open = false;
+        st.update.current = ver("0.2.0");
+        for ch in [Channel::Stable, Channel::Beta] {
+            st.update.channel = ch;
+            assert_eq!(version::chip_text(&st.update), None, "{ch:?}: v0.2.0 is the newest (its beta is older)");
+        }
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        // a pre-release newer than every release: Beta's chip only
+        let mut beta = releases().into_iter().find(|r| r.tag == "v0.2.0-beta.1").unwrap();
+        (beta.tag, beta.version) = ("v0.3.0-beta.1".into(), ver("0.3.0-beta.1"));
+        st.update.releases.insert(0, beta);
+        st.update.channel = Channel::Stable;
+        assert_eq!(version::chip_text(&st.update), None);
+        assert!(!probed_now(&ctx, &mut st, &inp, "update-chip"));
+        st.update.channel = Channel::Beta;
+        assert_eq!(version::chip_text(&st.update).as_deref(), Some("v0.3.0-beta.1 available"));
+        assert!(probed_now(&ctx, &mut st, &inp, "update-chip"));
+    }
+
+    /// Help ▸ Version… opens the panel: every release of the channel newest first (the draft not
+    /// listed), with its date, the running one marked "installed", the notes collapsed.
+    #[test]
+    fn version_panel_lists_newest_first_and_marks_installed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        st.update.channel = Channel::Beta;
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Help));
+        click_widget(&ctx, &mut st, &inp, "help-version");
+        egui::Popup::close_all(&ctx);
+        assert!(st.update.open, "Help ▸ Version… opens it");
+        let tags: Vec<&str> = st.update.listed().iter().map(|r| r.tag.as_str()).collect();
+        assert_eq!(tags, ["v0.2.0", "v0.2.0-beta.1", "v0.1.0"], "newest first; the draft v0.3.0 is not public");
+        let lines = shown(&ctx, &mut st, &inp);
+        let (a, b, c) = (line_at(&lines, "v0.2.0"), line_at(&lines, "v0.2.0-beta.1"), line_at(&lines, "v0.1.0"));
+        assert!(a < b && b < c, "on screen newest first: {a} {b} {c}");
+        assert_eq!(lines.iter().filter(|l| *l == "installed").count(), 1, "one entry is the running one");
+        let installed = line_at(&lines, "installed");
+        assert!(installed > c, "v0.1.0 is marked installed");
+        for date in ["2026-12-01", "2026-11-20", "2026-11-01"] {
+            assert!(lines.iter().any(|l| l == date), "{date}");
+        }
+        assert!(has(&lines, "release notes"), "the notes, collapsed");
+        assert!(!has(&lines, "Installer and in-app updates"), "collapsed: the body is not drawn");
+        assert!(has(&lines, "Atomic Sandbox v0.1.0"));
+        // the window's close button closes it
+        st.update.open = false;
+        assert!(!has(&shown(&ctx, &mut st, &inp), "v0.2.0-beta.1"));
+    }
+
+    /// Stable lists releases only; Beta (its button) lists the pre-release too, marked "beta".
+    #[test]
+    fn beta_channel_shows_prerelease() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.update.releases = releases();
+        st.update.open = true;
+        assert_eq!(st.update.channel, Channel::Stable, "Stable by default");
+        assert!(st.update.listed().iter().all(|r| !r.prerelease));
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(!has(&lines, "v0.2.0-beta.1") && !lines.iter().any(|l| l == "beta"), "{lines:#?}");
+        click_widget(&ctx, &mut st, &inp, "channel-beta");
+        assert_eq!(st.update.channel, Channel::Beta);
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(lines.iter().any(|l| l == "v0.2.0-beta.1") && lines.iter().any(|l| l == "beta"), "{lines:#?}");
+        click_widget(&ctx, &mut st, &inp, "channel-stable");
+        assert_eq!(st.update.channel, Channel::Stable);
+    }
+
+    /// An unsigned release (v0.1.0: a zip, no SHA256SUMS.txt) is listed with its Install button
+    /// disabled and the reason beside it; a click sends nothing, and the action itself refuses.
+    #[test]
+    fn unsigned_release_button_disabled_with_reason() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("unsigned");
+        installed(&mut st, &root, "0.2.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, crate::update::release::NO_SIGNATURE), "{lines:#?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.1.0");
+        assert!(actions(&outs).is_empty(), "disabled: nothing sent");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none());
+        let out = act(&mut st, &inp, Action::InstallVersion("v0.1.0".into()));
+        assert!(out.error.as_deref().is_some_and(|e| e.contains(crate::update::release::NO_SIGNATURE)), "{:?}", out.error);
+        assert!(st.update.download.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Install and restart on an older release shows its downgrade warnings first — from its
+    /// manifest when it has one (read on a thread), the generic line when it has none — and only
+    /// "Install … anyway" sends `InstallVersion`, which starts the download.
+    #[test]
+    fn install_older_shows_downgrade_warning_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("downgrade");
+        installed(&mut st, &root, "0.3.0");
+        // v0.2.0 carries a manifest: one whose scene format is older than this build's
+        let mut formats = crate::update::current_formats();
+        formats.insert(crate::update::formats::SCENE.into(), 0);
+        st.update.net = Arc::new(FixtureNet { manifest: Ok(Some(formats)), ..FixtureNet::new() });
+        st.update.open = true;
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert!(actions(&outs).is_empty(), "an older target asks first: {:?}", actions(&outs));
+        assert!(st.update.download.is_none(), "nothing started");
+        assert_eq!(st.update.confirm.as_ref().map(|c| c.tag.as_str()), Some("v0.2.0"));
+        let t = std::time::Instant::now();
+        while st.update.confirm.as_ref().is_some_and(|c| c.warnings.is_none()) && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        let w = st.update.confirm.as_ref().unwrap().warnings.clone().expect("the manifest was read");
+        assert_eq!(w, [format!("scenes saved by this version (v{}) may not open in v0.2.0", env!("CARGO_PKG_VERSION"))]);
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, "Before going back to the older v0.2.0") && has(&lines, "scenes saved by this version"), "{lines:#?}");
+        assert!(has(&lines, "Install v0.2.0 anyway"));
+        let outs = click_widget(&ctx, &mut st, &inp, "install-anyway");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        assert!(st.update.confirm.is_none() && st.update.download.is_some(), "the download started");
+        assert_eq!(wait_download(&mut st), DownloadState::Ready(root.join("updates").join("AtomicSandbox-Setup-0.2.0.exe")));
+        // no manifest: the generic warning, at once
+        st.update.download = None;
+        let mut no_manifest = releases();
+        no_manifest.iter_mut().for_each(|r| r.assets.retain(|a| a.name != "manifest.json"));
+        st.update.releases = no_manifest;
+        click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        let w = st.update.confirm.as_ref().unwrap().warnings.clone().expect("no manifest to read");
+        assert_eq!(w, ["v0.2.0 records no data formats: collections, models or profiles saved by this version may not open in it"]);
+        assert!(has(&shown(&ctx, &mut st, &inp), "v0.2.0 records no data formats"));
+        click_widget(&ctx, &mut st, &inp, "install-cancel");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none(), "Cancel: nothing starts");
+        // a newer target asks nothing
+        st.update.current = ver("0.1.0");
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A ready download in an installed build: `st` with v0.2.0 downloaded and verified.
+    fn ready(st: &mut UiState, inp: &PanelInput<'_>, root: &std::path::Path) {
+        installed(st, root, "0.1.0");
+        assert!(act(st, inp, Action::InstallVersion("v0.2.0".into())).error.is_none());
+        assert!(matches!(wait_download(st), DownloadState::Ready(_)));
+        assert!(st.update.verified().is_some());
+    }
+
+    /// Restart now while a refit runs waits ("Waiting for the refit to finish…", Cancel it and
+    /// restart / Keep waiting) and restarts by itself once it ends; Cancel it and restart goes at
+    /// once; a sampling pass and a background audit are waited for too (a paused solve is not a
+    /// background job, but is waited for: `restart_waits_for_a_paused_solve`); nothing restarts
+    /// without a verified download.
+    #[test]
+    fn restart_waits_for_running_refit() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let idle = input(&scene, None, &cam);
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("restart");
+        installed(&mut st, &root, "0.1.0");
+        let out = act(&mut st, &idle, Action::RestartToUpdate);
+        assert!(!out.restart_for_update && out.error.as_deref().is_some_and(|e| e.contains("nothing is downloaded")), "{:?}", out.error);
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        let out = act(&mut st, &refit, Action::RestartToUpdate);
+        assert!(!out.restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let lines = shown(&ctx, &mut st, &refit);
+        for t in ["Waiting for the refit to finish…", "Cancel it and restart", "Keep waiting", "goes ahead when it ends"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        assert!(!has(&lines, "nothing is cut off") && !has(&lines, "installer will ask"), "{lines:#?}");
+        click_widget(&ctx, &mut st, &refit, "guard-keep-waiting");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: false });
+        let lines = shown(&ctx, &mut st, &refit);
+        assert!(has(&lines, "Restarting when the refit finishes…") && has(&lines, "Closing this window calls the restart off"));
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update, "still running: still waiting");
+        // the refit ends: the restart goes ahead by itself
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Cancel it and restart: at once, the refit still running
+        act(&mut st, &refit, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &refit, "guard-cancel-restart");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Idle);
+        // a sampling pass and a background audit are waited for (the pass's model holds no sample
+        // yet here, so nothing is asked about it first)
+        let mut m = model();
+        m.samples = 0;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
+        let sampling = input(&scene, Some(&snap), &cam);
+        assert_eq!(version::running(&sampling), Some("the sampling pass"));
+        act(&mut st, &sampling, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        let audit = PanelInput { probe: Some(sim::ProbeView { side: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert_eq!(version::running(&audit), Some("the background audit"));
+        // a paused step solve in flight is not a background job, though the restart waits for it
+        let solving = PanelInput { busy: true, probe: Some(sim::ProbeView { main: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert_eq!(version::running(&solving), None);
+        assert_eq!(version::waiting_for(&solving), Some("the solve"));
+        // Cancel (the download) calls a waiting restart off
+        act(&mut st, &idle, Action::CancelUpdateDownload);
+        assert_eq!(st.update.guard, Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unsaved in-session model with no collection: Restart now first offers Save model… /
+    /// Restart anyway / Cancel, saying what would be lost; Restart anyway goes on; Save model…
+    /// opens the Save window; a model in a shared collection is kept, so nothing is asked.
+    #[test]
+    fn unsaved_model_offers_save_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(273 samples) isn't in a shared collection or a saved file")), "273 samples, no collection, never saved");
+        st.backend = Backend::Estimated;
+        let root = temp_root("unsaved");
+        ready(&mut st, &inp, &root);
+        st.update.open = true;
+        let out = act(&mut st, &inp, Action::RestartToUpdate);
+        assert!(!out.restart_for_update);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        let lines = shown(&ctx, &mut st, &inp);
+        for t in ["The restart won't keep what this model learned", "(273 samples)", "Save model…", "Restart anyway", "Cancel"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        click_widget(&ctx, &mut st, &inp, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &inp, "guard-save");
+        assert!(st.files.save_open, "the Save window, for the model");
+        assert_eq!(st.update.guard, Guard::Idle);
+        st.files.save_open = false;
+        act(&mut st, &inp, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-anyway");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update), "Restart anyway goes on");
+        assert!(!st.update.model_ack && !st.update.force, "the flags are spent");
+        // a shared collection keeps the model: no question
+        let mut m = model();
+        m.source = sim::ModelSource::Collection { slug: "h2".into(), samples: 273, read_only: false };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let kept = input(&scene, Some(&snap), &cam);
+        assert_eq!(version::save_note(&st.update, &kept), None);
+        assert!(act(&mut st, &kept, Action::RestartToUpdate).restart_for_update);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling M1: Restart now asks only about samples learned since the model was last loaded from
+    /// or saved to a file — a model just loaded, or just saved, is not asked about; ten more samples
+    /// are, by count; the session's autosave is not the user's file.
+    #[test]
+    fn save_first_asks_only_about_what_was_learned_since_load_or_save() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let with = |samples: usize, source: sim::ModelSource, autosave: bool| {
+            let mut m = model();
+            (m.samples, m.source, m.source_is_autosave) = (samples, source, autosave);
+            snapshot(&scene, Backend::Estimated, Some(m))
+        };
+        let file = sim::ModelSource::File("C:/models/h2 water.model".into());
+        // loaded from a file: the frame sees the new source and takes its 273 as the baseline
+        let loaded = with(273, file.clone(), false);
+        let inp = input(&scene, Some(&loaded), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert_eq!(st.update.model_baseline, Some(273));
+        assert_eq!(version::save_note(&st.update, &inp), None, "just loaded: nothing to lose");
+        let more = with(283, file.clone(), false);
+        let inp = input(&scene, Some(&more), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        let note = version::save_note(&st.update, &inp).expect("10 learned since the load");
+        assert!(note.contains("The model from h2 water.model has learned 10 samples since it was loaded or saved") && note.contains("the file itself stays as it was"), "{note}");
+        // Save model: what it holds now is in a file
+        act(&mut st, &inp, Action::SaveModel);
+        assert_eq!((st.update.model_baseline, version::save_note(&st.update, &inp)), (Some(283), None));
+        // a session's model saved once, then learning on
+        let mut st = UiState::new("h2", &scene);
+        let session = with(100, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&session), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        act(&mut st, &inp, Action::SaveModel);
+        let grown = with(101, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&grown), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("has learned 1 sample since you last saved it")));
+        // forgotten and learned anew (fewer samples than the baseline): another model, all of it
+        let anew = with(40, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&anew), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(40 samples) isn't in a shared collection")));
+        // the solver switch's autosave is removed at the exit: not a file of the user's
+        let mut st = UiState::new("h2", &scene);
+        let auto = with(50, sim::ModelSource::File("C:/temp/autosave.model".into()), true);
+        let inp = input(&scene, Some(&auto), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert_eq!(st.update.model_baseline, None);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(50 samples)")));
+    }
+
+    /// Ruling I2: Restart now never pauses by itself. A playing run gets "The simulation is
+    /// playing." with Pause and restart / Cancel; Pause and restart sends the pause (the recorded
+    /// Pause action) and the restart follows once the run has stopped; a background job after the
+    /// pause is still waited for.
+    #[test]
+    fn a_playing_run_is_paused_only_by_its_own_click() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let stopping = PanelInput { playing: false, busy: true, ..input(&scene, None, &cam) };
+        let stopped = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("playing");
+        ready(&mut st, &stopped, &root);
+        st.update.open = true;
+        let out = act(&mut st, &playing, Action::RestartToUpdate);
+        assert!(out.commands.is_empty() && !out.restart_for_update, "nothing sent by itself: {:?}", out.commands);
+        assert_eq!(st.update.guard, Guard::Playing);
+        let lines = shown(&ctx, &mut st, &playing);
+        for t in [version::PLAYING, "Pause and restart", "Cancel", "the step being solved is dropped"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        click_widget(&ctx, &mut st, &playing, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        act(&mut st, &playing, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert_eq!(actions(&outs), [Action::Pause], "the pause, as the Pause button sends it");
+        assert!(dyn_commands(&outs).iter().any(|c| matches!(c, DynCommand::Pause)));
+        assert!(!outs.iter().any(|o| o.restart_for_update), "not before the run has stopped");
+        assert_eq!(st.update.guard, Guard::Pausing { landed: false }, "the pause is on its way (the click's frames still read playing)");
+        assert!(has(&shown(&ctx, &mut st, &playing), "Pausing, then restarting…"));
+        assert!(!frame(&ctx, &mut st, &stopping, 1400.0, vec![]).restart_for_update, "the step still lets go of the solver");
+        assert!(frame(&ctx, &mut st, &stopped, 1400.0, vec![]).restart_for_update, "stopped: the restart follows");
+        assert_eq!(st.update.guard, Guard::Idle);
+        // paused onto a running refit: that is still waited for
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        act(&mut st, &playing, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Final review I1: Restart now with the run paused but the worker still solving (the solve
+    /// after a scene load, an Apply grid or a Step; Bonds now; the bond refresh after a drag)
+    /// waits for "the solve" with the same card, hands nothing off meanwhile, and restarts by
+    /// itself once the worker is idle; Cancel it and restart goes at once; Play pressed while it
+    /// waits turns it into the playing question.
+    #[test]
+    fn restart_waits_for_a_paused_solve() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let solving = PanelInput { busy: true, ..input(&scene, None, &cam) };
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("paused-solve");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        let out = act(&mut st, &solving, Action::RestartToUpdate);
+        assert!(!out.restart_for_update, "no hand-off while the solve runs");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        let lines = shown(&ctx, &mut st, &solving);
+        for t in ["Waiting for the solve to finish…", "Cancel it and restart", "Keep waiting"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        for _ in 0..3 {
+            assert!(!frame(&ctx, &mut st, &solving, 1400.0, vec![]).restart_for_update, "still solving: still waiting");
+        }
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        // the worker is idle: the restart goes ahead by itself
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Cancel it and restart: at once, the solve still running
+        act(&mut st, &solving, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &solving, "guard-cancel-restart");
+        assert!(outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Idle);
+        // Play pressed while waiting: the playing question, not a restart once the run stops
+        act(&mut st, &solving, Action::RestartToUpdate);
+        assert!(!frame(&ctx, &mut st, &playing, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(!frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "paused again: no restart without a click");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Final re-review R1: Bonds now, the refresh after a drag and the estimated solver's graph
+    /// solve run with the worker not `busy`; the probe's Main slot shows the solve, and the restart
+    /// waits for it the same way, then goes ahead once the slot is idle.
+    #[test]
+    fn restart_waits_for_a_bond_solve_the_worker_does_not_count() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let main = sim::activity::SlotView { running: true, ..Default::default() };
+        let bonds = PanelInput { probe: Some(sim::ProbeView { main, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert!(!bonds.busy);
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("bond-solve");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        assert!(!act(&mut st, &bonds, Action::RestartToUpdate).restart_for_update, "no hand-off during the bond solve");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        assert!(!frame(&ctx, &mut st, &bonds, 1400.0, vec![]).restart_for_update);
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "the slot idle: the restart goes ahead");
+        assert_eq!(st.update.guard, Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T4 N5 and N3: Play pressed while Pause and restart is pausing asks again (the playing
+    /// question), so a later plain Pause never restarts the app; and a "Cancel it and restart"
+    /// given for a job is spent when the guard turns to the playing question, so the job is
+    /// waited for again after the next pause.
+    #[test]
+    fn play_while_pausing_asks_again() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let stopping = PanelInput { playing: false, busy: true, ..input(&scene, None, &cam) };
+        let stopped = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("play-while-pausing");
+        ready(&mut st, &stopped, &root);
+        st.update.open = true;
+        act(&mut st, &playing, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert_eq!(st.update.guard, Guard::Pausing { landed: false });
+        // the pause lands; the dropped step still holds the solver
+        assert!(!frame(&ctx, &mut st, &stopping, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Pausing { landed: true });
+        // the user presses Play: asked again
+        assert!(!frame(&ctx, &mut st, &playing, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(has(&shown(&ctx, &mut st, &playing), version::PLAYING));
+        // a later plain Pause: no restart without a new click
+        for inp in [&stopping, &stopped, &stopped] {
+            assert!(!frame(&ctx, &mut st, inp, 1400.0, vec![]).restart_for_update, "a plain Pause never restarts");
+        }
+        assert_eq!(st.update.guard, Guard::Playing);
+        // the new click restarts as before
+        let outs = click_widget(&ctx, &mut st, &stopped, "guard-pause-restart");
+        assert!(outs.iter().any(|o| o.restart_for_update), "paused already: the restart follows");
+        assert_eq!(st.update.guard, Guard::Idle);
+        // N3: Cancel it and restart (for the refit) while playing turns to the playing question
+        // and is spent there; after Pause and restart the refit is waited for again
+        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        act(&mut st, &refit, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let outs = click_widget(&ctx, &mut st, &refit_playing, "guard-cancel-restart");
+        assert!(!outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::Playing);
+        assert!(!st.update.force, "the cancel was for the job, not for after the pause");
+        click_widget(&ctx, &mut st, &refit_playing, "guard-pause-restart");
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling I1: closing the Version window calls a pending restart off — waiting, pausing or
+    /// asking — with a status line; the download stays ready, and Restart now is offered again.
+    #[test]
+    fn closing_the_panel_calls_a_pending_restart_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("close");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        act(&mut st, &refit, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &refit, "guard-keep-waiting");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: false });
+        version::close_panel(&mut st);
+        assert!(!st.update.open);
+        assert_eq!(st.update.guard, Guard::Idle);
+        assert_eq!(st.status, version::CALLED_OFF);
+        assert!(st.update.verified().is_some(), "the download stays ready");
+        assert!(!frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "the refit ending restarts nothing");
+        st.update.open = true;
+        assert!(has(&shown(&ctx, &mut st, &idle), "Restart now"), "offered again");
+        // closing with nothing pending says nothing
+        st.set_status("x");
+        version::close_panel(&mut st);
+        assert_eq!(st.status, "x");
+        // the window's own close button goes through it (the guard asking about the model)
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let unsaved = input(&scene, Some(&snap), &cam);
+        st.update.open = true;
+        act(&mut st, &unsaved, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        version::close_panel(&mut st);
+        assert_eq!((st.update.guard, st.status.as_str()), (Guard::Idle, version::CALLED_OFF));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling I4, the reviewer's path: Restart now during a first pass (waiting), the pass learns,
+    /// Cancel it and restart → the model question → Cancel; later, during another pass, Restart now
+    /// → Restart anyway must wait for the pass again, not cut it off with the stale "cancel it".
+    #[test]
+    fn a_stale_cancel_it_never_skips_the_wait() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let pass = |samples: usize| {
+            let mut m = model();
+            m.samples = samples;
+            let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+            snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
+            snap
+        };
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("stale");
+        ready(&mut st, &input(&scene, None, &cam), &root);
+        st.update.open = true;
+        let first = pass(0);
+        let inp = input(&scene, Some(&first), &cam);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        let learned = pass(30);
+        let inp = input(&scene, Some(&learned), &cam);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-cancel-restart");
+        assert!(!outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::SaveFirst, "the pass learned: asked about the model first");
+        click_widget(&ctx, &mut st, &inp, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        assert!(!st.update.force && !st.update.model_ack, "Cancel clears every flag");
+        let second = pass(30);
+        let inp = input(&scene, Some(&second), &cam);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-anyway");
+        assert!(!outs.iter().any(|o| o.restart_for_update), "Restart anyway agrees to losing the model, not to cutting the pass off");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        // Save model… and install() clear the flags too
+        st.update.force = true;
+        st.update.guard = Guard::SaveFirst;
+        click_widget(&ctx, &mut st, &inp, "guard-save");
+        assert!((!st.update.force, !st.update.model_ack, st.update.guard) == (true, true, Guard::Idle));
+        st.update.force = true;
+        st.update.model_ack = true;
+        st.update.download = None;
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        assert!(!st.update.force && !st.update.model_ack && st.update.guard == Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling M6 (and I3, M2): the viewer's hand-off writes the session first and hands nothing
+    /// off when that write fails; with a good root the session is written, and the hand-off itself
+    /// refuses here (the test process is a build from source) — no close, the error line says
+    /// why, and no "handing over" status is claimed.
+    #[test]
+    fn a_failed_session_write_means_no_hand_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let root = temp_root("handoff");
+        let mut v = crate::viewer::Viewer::new("h2").unwrap();
+        ready(&mut v.ui, &input(&scene, None, &cam), &root);
+        // a root that is a file: the session can't be written under it
+        let blocked = root.join("not a folder");
+        std::fs::write(&blocked, b"x").unwrap();
+        v.ui.data_root = Some(blocked.clone());
+        let status = v.ui.status.clone();
+        v.apply(Action::RestartToUpdate);
+        assert!(v.close_for_update.is_none(), "no hand-off");
+        assert!(v.last_error.as_deref().is_some_and(|e| e.starts_with("restart to update: couldn't save the session")), "{:?}", v.last_error);
+        assert_eq!(v.ui.status, status, "no status claims a hand-off");
+        // a good root: the session is written, then the hand-off refuses (not an installed process)
+        v.ui.data_root = Some(root.clone());
+        v.last_error = None;
+        v.apply(Action::RestartToUpdate);
+        assert!(root.join("updates").join(crate::update::apply::SESSION_FILE).is_file(), "the session first");
+        assert!(v.close_for_update.is_none());
+        assert_eq!(v.last_error.as_deref(), Some(format!("restart to update: {UPDATES_OFF}").as_str()));
+        assert_eq!(v.ui.status, status);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A portable copy offers each release's zip as a link (this repository's own asset), no
+    /// install button and no downgrade warnings; the actions refuse.
+    #[test]
+    fn portable_mode_shows_download_links() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        st.data_mode = crate::paths::DataMode::Portable;
+        st.update.releases = releases();
+        st.update.current = ver("0.3.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert_eq!(lines.iter().filter(|l| *l == "Download zip").count(), 2, "v0.2.0 and v0.1.0: {lines:#?}");
+        assert!(!has(&lines, "Install and restart") && !has(&lines, crate::update::release::NO_SIGNATURE));
+        assert!(PROBES.with(|p| p.borrow().contains_key("zip-v0.2.0") && p.borrow().contains_key("zip-v0.1.0")));
+        let r = st.update.releases.iter().find(|r| r.tag == "v0.2.0").unwrap();
+        assert_eq!(version::zip_link(r), Some("https://github.com/ItsKodas/atomic-sandbox/releases/download/v0.2.0/AtomicSandbox-0.2.0-windows-x64.zip"));
+        // a zip whose address isn't its release's own is no link
+        let mut moved = r.clone();
+        moved.assets.iter_mut().filter(|a| a.name.ends_with(".zip")).for_each(|a| a.url = "https://example.com/a.zip".into());
+        assert_eq!(version::zip_link(&moved), None);
+        click_widget(&ctx, &mut st, &inp, "zip-v0.2.0");
+        assert!(st.update.confirm.is_none() && st.update.download.is_none(), "a link only: no warnings, no download");
+        for a in [Action::InstallVersion("v0.2.0".into()), Action::RestartToUpdate] {
+            assert_eq!(act(&mut st, &inp, a).error.as_deref(), Some(PORTABLE_REFUSED));
+        }
+    }
+
+    /// A build from source lists only ("running from source: updates are off"), never checks by
+    /// itself — the window's automatic check included — and refuses the actions; Check now still
+    /// lists (here: the tests' offline network, its quiet line).
+    #[test]
+    fn dev_mode_says_updates_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(st.data_mode, crate::paths::DataMode::Dev);
+        st.update.background = true; // as the window sets it
+        st.update.releases = releases();
+        st.update.current = ver("0.1.0");
+        st.update.open = true;
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, UPDATES_OFF), "{lines:#?}");
+        assert!(!has(&lines, "Install and restart") && !has(&lines, "Download zip") && !has(&lines, "Restart now"));
+        assert!(lines.iter().any(|l| l == "v0.2.0"), "the list is shown");
+        assert!(!st.update.checking() && st.update.last_started.is_none(), "no automatic check from source");
+        for a in [Action::InstallVersion("v0.2.0".into()), Action::RestartToUpdate] {
+            assert_eq!(act(&mut st, &inp, a).error.as_deref(), Some(UPDATES_OFF));
+        }
+        act(&mut st, &inp, Action::CheckUpdates);
+        let t = std::time::Instant::now();
+        while st.update.checking() && t.elapsed().as_secs() < 10 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert_eq!(st.update.error.as_deref(), Some("couldn't check (offline)"));
+        assert_eq!(st.update.releases.len(), releases().len(), "the last list stays");
+    }
+
+    /// Each of the panel's buttons sends its action: Check for updates now, Install and restart,
+    /// the download's Cancel ("Cancelling…" until the stalled read lets go), Restart now.
+    ///
+    /// Deterministic under load: the cancel is clicked only once the job's read is held at the
+    /// gate (`stalled`), so the job can't report its cancel before the panel has drawn
+    /// "Cancelling…" (it used to, when a busy machine left the job thread short of the installer's
+    /// read at the click: it then saw the cancel between reads and ended at once); every wait
+    /// polls its condition with a generous bound.
+    #[test]
+    fn buttons_emit_actions() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("buttons");
+        let (gate, stalled) = installed_gated(&mut st, &root, "0.1.0");
+        st.update.releases.clear();
+        st.update.open = true;
+        assert!(has(&shown(&ctx, &mut st, &inp), "No list yet"));
+        let outs = click_widget(&ctx, &mut st, &inp, "check-now");
+        assert_eq!(actions(&outs), [Action::CheckUpdates]);
+        let t = std::time::Instant::now();
+        while st.update.checking() && t.elapsed().as_secs() < 60 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert_eq!(st.update.releases, releases(), "the list arrived");
+        assert!(st.update.error.is_none());
+        // a stalled download: its read held at the gate before anything else
+        gate.store(true, Ordering::Relaxed);
+        let outs = click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert_eq!(actions(&outs), [Action::InstallVersion("v0.2.0".into())]);
+        assert!(wait_for(60, || stalled.load(Ordering::Relaxed)), "the job reached the installer's read");
+        assert!(matches!(st.update.download.as_ref().unwrap().poll(), DownloadState::Running(..)));
+        assert!(has(&shown(&ctx, &mut st, &inp), "downloading:"));
+        let outs = click_widget(&ctx, &mut st, &inp, "cancel-download");
+        assert_eq!(actions(&outs), [Action::CancelUpdateDownload]);
+        assert!(st.update.download.is_none() && st.update.cancelling());
+        assert!(has(&shown(&ctx, &mut st, &inp), "Cancelling…"), "until the stalled read lets go");
+        gate.store(false, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        while st.update.cancelling() && t.elapsed().as_secs() < 60 {
+            shown(&ctx, &mut st, &inp);
+        }
+        assert!(!st.update.cancelling() && !has(&shown(&ctx, &mut st, &inp), "Cancelling…"));
+        // (the job removes its .part as it ends, just after reporting)
+        let parts = || root.join("updates").read_dir().unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".part"));
+        assert!(wait_for(60, || !parts()), "the cancelled .part is gone");
+        // again, to the end: Restart now
+        click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
+        assert!(matches!(wait_download(&mut st), DownloadState::Ready(_)));
+        let lines = shown(&ctx, &mut st, &inp);
+        assert!(has(&lines, "Restart now") && has(&lines, "downloaded and verified"), "{lines:#?}");
+        assert!(!has(&lines, "installer will ask"), "the installer never closes another window: {lines:#?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "restart-now");
+        assert_eq!(actions(&outs), [Action::RestartToUpdate]);
+        assert!(outs.iter().any(|o| o.restart_for_update), "nothing running: it goes ahead");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One download at a time: starting another release's cancels the first ("Cancelling…" while
+    /// it finishes its read); the same release again is left as it is.
+    #[test]
+    fn starting_another_download_cancels_the_first() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("one-at-a-time");
+        let gate = installed(&mut st, &root, "0.1.0");
+        // a v0.2.1 like v0.2.0, its assets at its own addresses
+        let mut next = st.update.releases.iter().find(|r| r.tag == "v0.2.0").unwrap().clone();
+        (next.tag, next.version) = ("v0.2.1".into(), ver("0.2.1"));
+        for a in &mut next.assets {
+            a.name = a.name.replace("0.2.0", "0.2.1");
+            a.url = crate::update::net::asset_url("v0.2.1", &a.name);
+        }
+        st.update.releases.insert(0, next);
+        gate.store(true, Ordering::Relaxed);
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        assert!(!st.update.cancelling(), "the same release again: left running");
+        act(&mut st, &inp, Action::InstallVersion("v0.2.1".into()));
+        assert_eq!(st.update.download.as_ref().map(|d| d.tag()), Some("v0.2.1"));
+        assert!(st.update.cancelling(), "v0.2.0 is cancelled, finishing its read");
+        gate.store(false, Ordering::Relaxed);
+        // v0.2.1's stand-in isn't in the fixture sums: verification refuses it (nothing installed)
+        assert!(matches!(wait_download(&mut st), DownloadState::Failed(e) if e.contains("SHA256SUMS")), "fails closed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The window's automatic check (installed build, Check automatically on): at launch, then
+    /// not again until 6 hours have passed; off with the switch. A refused check keeps the last
+    /// list; a redirect the client refused is said as it is.
+    #[test]
+    fn the_automatic_check_runs_at_launch_then_every_six_hours() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("auto");
+        installed(&mut st, &root, "0.1.0");
+        let net = FixtureNet::new();
+        let calls = net.calls.clone();
+        st.update.net = Arc::new(net);
+        st.update.releases.clear();
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "headless (no window): no automatic check");
+        st.update.background = true;
+        let wait = |st: &mut UiState, ctx: &egui::Context| {
+            let t = std::time::Instant::now();
+            while st.update.checking() && t.elapsed().as_secs() < 10 {
+                shown(ctx, st, &inp);
+            }
+        };
+        shown(&ctx, &mut st, &inp);
+        wait(&mut st, &ctx);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "at launch");
+        assert_eq!(st.update.releases.len(), 3);
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "not again within 6 hours");
+        let Some(earlier) = std::time::Instant::now().checked_sub(version::CHECK_EVERY) else { return };
+        st.update.last_started = Some(earlier);
+        shown(&ctx, &mut st, &inp);
+        wait(&mut st, &ctx);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "6 hours on");
+        st.update.auto_check = false;
+        st.update.last_started = Some(earlier);
+        shown(&ctx, &mut st, &inp);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "Check automatically off");
+        // refusals: one quiet line, the last list kept
+        st.update.open = true;
+        for (e, line) in [
+            (CheckError::RateLimited, "couldn't check (GitHub said: rate limited, try later)".to_string()),
+            (CheckError::Malformed("GitHub's releases list redirected to an unexpected host: evil.example".into()), "couldn't check: GitHub's releases list redirected to an unexpected host: evil.example".to_string()),
+            (CheckError::Malformed("not JSON (x)".into()), "couldn't check (GitHub's answer wasn't a releases list: not JSON (x))".to_string()),
+        ] {
+            assert_eq!(version::check_error_line(&e), line);
+            st.update.net = Arc::new(FixtureNet { list: Err(e), ..FixtureNet::new() });
+            act(&mut st, &inp, Action::CheckUpdates);
+            wait(&mut st, &ctx);
+            assert_eq!(st.update.error.as_deref(), Some(line.as_str()));
+            assert_eq!(st.update.releases.len(), 3, "the last list stays");
+            assert!(has(&shown(&ctx, &mut st, &inp), &line), "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The channel and Check automatically are kept in the profile (a profile without them gives
+    /// Stable and on).
+    #[test]
+    fn channel_and_auto_check_persist_in_profile() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!((st.update.channel, st.update.auto_check), (Channel::Stable, true), "the defaults");
+        let text = profile::capture(&st);
+        assert!(text.contains("update_channel = Stable\n") && text.contains("update_auto_check = true\n"), "{text}");
+        (st.update.channel, st.update.auto_check) = (Channel::Beta, false);
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!((fresh.update.channel, fresh.update.auto_check), (Channel::Beta, false));
+        // an older profile without the lines, and unreadable values: the defaults
+        let mut old = UiState::new("h2", &scene);
+        profile::apply(&mut old, "update_channel = Nightly\nupdate_auto_check = maybe\n");
+        assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
+        let defaults = profile::defaults(&old);
+        profile::apply(&mut old, &defaults);
+        assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
+    }
+}

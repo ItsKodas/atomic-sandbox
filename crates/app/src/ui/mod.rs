@@ -42,6 +42,7 @@ mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
+pub mod version;
 mod workspace;
 
 pub use actions::Action;
@@ -824,6 +825,18 @@ pub struct UiState {
     /// (the card over the view, the rings on the scene), and the way back from an opened segment.
     pub segment_preview: Option<crate::segment::Segment>,
     pub segment_back: Option<SegmentBack>,
+    /// File ▸ Import data from a folder… in flight (`Action::ImportData`, `paths::spawn_import`):
+    /// its status line arrives here when the copy is done.
+    pub import_data: Option<std::sync::mpsc::Receiver<String>>,
+    /// Where the data lives (`crate::paths`): the process's mode and per-user root, read once at
+    /// start. The Import item, its action and the Profiles window's timings row follow these, so a
+    /// test can stand in an installed build with a temporary root.
+    pub data_mode: crate::paths::DataMode,
+    pub data_root: Option<std::path::PathBuf>,
+    /// Help ▸ Version… and the top bar's chip (`version`, installer Task 4): the releases list,
+    /// the check, the one download, the restart guard; the channel and Check automatically are
+    /// kept in the profile.
+    pub update: version::UpdateState,
 }
 
 /// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
@@ -1032,6 +1045,10 @@ impl UiState {
             compare: Default::default(),
             segment_preview: None,
             segment_back: None,
+            import_data: None,
+            data_mode: crate::paths::mode(),
+            data_root: crate::paths::user_root(),
+            update: version::UpdateState::default(),
         }
     }
 
@@ -1304,6 +1321,9 @@ pub struct PanelOutput {
     /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
     /// changes, so the old one never starts solving it.
     pub switch_scene: Option<Scene>,
+    /// Restart now went past its guard (`version::restart`): the viewer saves the session, hands
+    /// the verified installer off and closes the app (`Viewer::restart_for_update`).
+    pub restart_for_update: bool,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
@@ -1328,6 +1348,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.log.record(&st.status, st.status_seq, input);
     // the reference comparison's results (a helper process on its own thread; never blocks)
     st.compare.poll(input.snapshot);
+    // an import of data folders (its own thread) reports when done
+    poll_import(st);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
     // the latest DFT solve's cost (the quality levels' estimates)
@@ -1362,13 +1384,32 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     files::show_save(root.ctx(), st, input, &mut acts);
     crate::builder::ui::show(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
+    version::show(root.ctx(), st, &mut acts);
     profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
+    // the updater's threads (the check, the download, a manifest) and a restart waiting on a job
+    version::tick(root.ctx(), st, input, &mut out);
     window_requests(st, &mut out);
     out
+}
+
+/// File ▸ Import data from a folder…'s result, once its thread is done: the counts and failures on
+/// the status line.
+pub(crate) fn poll_import(st: &mut UiState) {
+    use std::sync::mpsc::TryRecvError;
+    let Some(rx) = &st.import_data else { return };
+    let line = match rx.try_recv() {
+        Ok(line) => line,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => "import data: the copy stopped before it finished (see the console)".into(),
+    };
+    st.import_data = None;
+    st.set_status(line);
+    // the File window shows what came in
+    st.files.refresh_soon();
 }
 
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the

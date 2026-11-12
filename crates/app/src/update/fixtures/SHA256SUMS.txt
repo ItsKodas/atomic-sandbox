@@ -1,0 +1,2 @@
+815957ae6acbdbbc7fc36b7e2b6259a460f59aa0ca8ccb25a57702ed87e54dfb  AtomicSandbox-Setup-0.2.0.exe
+58d346889ed573cb6bb922ad7151a37a7e66799d49b41291a50574d68c008589  AtomicSandbox-0.2.0-windows-x64.zip

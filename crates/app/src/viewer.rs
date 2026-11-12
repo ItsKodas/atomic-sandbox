@@ -483,6 +483,13 @@ pub struct Viewer {
     /// The next estimated worker resumes the interrupted pass in this folder instead of its
     /// `EnsureModel` ([`Viewer::resume_training`]).
     resume_next: Option<PathBuf>,
+    /// The clock (atomic time units) the next worker's driver goes on from, once
+    /// (`DynCommand::SetClock`): a session resumed after an update (`--resume-session`,
+    /// `update::apply::Session`); `None` = time starts at 0, as for any new run.
+    pub resume_clock: Option<f64>,
+    /// The installer is running ([`Viewer::restart_for_update`]): `main` closes the app through
+    /// its own clean-exit path (the profile flushed, the window gone), as for the close button.
+    pub close_for_update: Option<crate::update::CloseForUpdate>,
     /// Bonds guessed from experience (`crate::bond_experience`; user request 2026-11-13): the
     /// verdicts of the fresh graphs seen, and the drawing of the latest stale one.
     pub bond_exp: crate::bond_experience::Experience,
@@ -547,6 +554,8 @@ impl Viewer {
             training_dir: None,
             collections_dir: None,
             resume_next: None,
+            resume_clock: None,
+            close_for_update: None,
             bond_exp: Default::default(),
         })
     }
@@ -597,11 +606,16 @@ impl Viewer {
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
         self.ui.activity.knowledge = None; // the new worker ships its own model's map
+        let mut settings = self.ui.run_settings();
+        // a resumed session's clock goes to its first driver only (a later solver switch restarts it)
+        if let Some(t) = self.resume_clock.take() {
+            settings.push(DynCommand::SetClock(t));
+        }
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
             gpu.clone(),
-            self.ui.run_settings(),
+            settings,
             estimated.then(|| self.autosave.clone()),
         ));
         self.gpu = gpu;
@@ -1296,6 +1310,9 @@ impl Viewer {
         for cmd in out.commands {
             self.send(cmd);
         }
+        if out.restart_for_update {
+            self.restart_for_update();
+        }
         if let Some(resume) = out.training {
             // it switches the solver itself (and says so)
             return self.resume_training(resume);
@@ -1307,6 +1324,36 @@ impl Viewer {
                 self.backend.label()
             ));
         }
+    }
+
+    /// Restart now, past its guard (`ui::version`; installer Task 4): refused while another copy of
+    /// this install runs (`crate::instance`: the silent installer must not close it), else the
+    /// scene and its settings saved as the session file (`update::save_session`, under the per-user
+    /// root's `updates\`), then — only once that write succeeded — the verified installer started
+    /// (`update::hand_off`) and the app asked to close ([`Viewer::close_for_update`]). Anything
+    /// refused is the error line, and the app stays.
+    fn restart_for_update(&mut self) {
+        match self.hand_off_update() {
+            Ok(close) => {
+                self.close_for_update = Some(close);
+                self.ui.set_status("the installer is starting: the app closes and reopens updated, paused where you left it");
+            }
+            Err(e) => self.last_error = Some(format!("restart to update: {e}")),
+        }
+    }
+
+    fn hand_off_update(&self) -> Result<crate::update::CloseForUpdate, String> {
+        let verified = self.ui.update.verified().ok_or("nothing is downloaded and verified yet")?;
+        if self.ui.data_mode != crate::paths::DataMode::Installed {
+            return Err("only the installed build updates itself".into());
+        }
+        let root = self.ui.data_root.as_ref().ok_or("there is no per-user folder (LOCALAPPDATA isn't set)")?;
+        if crate::instance::another_copy_running() {
+            return Err(crate::instance::OTHER_COPY.into());
+        }
+        let session = root.join("updates").join(crate::update::apply::SESSION_FILE);
+        crate::update::save_session(self, &session)?;
+        crate::update::hand_off(&verified, &session)
     }
 
     /// Starts a Select-drag of nucleus `index` (the button went down on it). Nothing is sent

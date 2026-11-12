@@ -239,6 +239,30 @@ pub enum Action {
     Screenshot,
     /// The capture's Record (true) / Stop (false) button (display only, not replayable).
     Record(bool),
+    /// File ▸ Import data from a folder… (installer spec; the installed build only): the folder's
+    /// `models`, `profiles` and `scenes` copied into the per-user root on a thread
+    /// (`paths::import_into`: nothing overwritten, nothing moved), the folder recorded in
+    /// `migrated_from.txt`, the counts and failures on the status line. Recorded as `# not
+    /// replayable: import-data` (a replay touches only its script); a replay skips it (it changes
+    /// no run).
+    ImportData(std::path::PathBuf),
+    /// Help ▸ Version…'s "Check for updates now" (installer Task 4, `ui::version`): GitHub's
+    /// releases list fetched on a thread of its own; a failure is one quiet line and the last list
+    /// stays. Any build (a build from source lists only). Recorded as `# not replayable: update`;
+    /// a replay skips it (it never touches the network).
+    CheckUpdates,
+    /// An entry's "Install and restart" (or an older one's "Install … anyway", after its downgrade
+    /// warnings): that release's installer downloaded and verified in the background, cancelling
+    /// another download. The installed build only. Recorded as `# not replayable: update`.
+    InstallVersion(String),
+    /// "Restart now" once the download is verified, through the restart guard (an unsaved model
+    /// first, then a playing run, then a background job: `ui::version`): refused while another copy
+    /// runs, else the session saved, the installer handed off, the app closed. Recorded as
+    /// `# not replayable: update`.
+    RestartToUpdate,
+    /// The download's Cancel ("Cancelling…" until it has stopped; a waiting restart is called off).
+    /// Recorded as `# not replayable: update`.
+    CancelUpdateDownload,
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did. ⚠ Model only
@@ -483,6 +507,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
             st.set_status(format!("saving the model to {}", path.display()));
+            // what it holds now is in a file: Restart now asks only about samples learned after this
+            st.update.note_saved(input);
         }
         Action::LoadModel => {
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
@@ -592,6 +618,24 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
                 out.commands.push(Command::ImportModel(path));
             }
         }
+        Action::ImportData(folder) => {
+            // the mode and the root are `UiState`'s (the process's; a test sets them)
+            if st.import_data.is_some() {
+                out.error = Some("import data: an import is already running".into());
+            } else {
+                match crate::paths::start_import(st.data_mode, st.data_root.as_deref(), folder.clone()) {
+                    Ok(rx) => {
+                        st.set_status(format!("importing models, profiles and scenes from {}…", folder.display()));
+                        st.import_data = Some(rx);
+                    }
+                    Err(why) => out.error = Some(why),
+                }
+            }
+        }
+        Action::CheckUpdates => super::version::check_now(st),
+        Action::InstallVersion(tag) => super::version::install(st, &tag, out),
+        Action::RestartToUpdate => super::version::restart(st, input, out),
+        Action::CancelUpdateDownload => super::version::cancel_download(st),
         Action::DiscardTraining => {
             if st.resume.take().is_some() {
                 out.training = Some(false);
@@ -1133,7 +1177,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 

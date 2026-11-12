@@ -196,6 +196,34 @@ fn rewind_retraces_the_trajectory() {
     assert!(worst < 1e-8, "{worst}");
 }
 
+/// `SetClock` (a resumed session's clock, installer Task 3): accepted before the first step, the
+/// time then advances from it by dt per step exactly as from 0 — the trajectory itself is the one
+/// an unclocked driver takes; refused once a step was taken, or for a non-finite or negative time.
+#[test]
+fn set_clock_moves_the_time_only_and_only_before_the_first_step() {
+    let (s, h) = harmonic_three();
+    let mut plain = Dynamics::new(s.clone(), Box::new(h.clone()), DT_FS, 1);
+    let mut clocked = Dynamics::new(s.clone(), Box::new(h), DT_FS, 1);
+    for bad in [f64::NAN, -1.0, f64::INFINITY] {
+        clocked.apply(DynCommand::SetClock(bad));
+        assert!(clocked.snapshot().last_rejection.is_some(), "clock {bad}");
+        assert_eq!(clocked.snapshot().sim_time, 0.0);
+    }
+    let t0 = 1234.5;
+    clocked.apply(DynCommand::SetClock(t0));
+    let c = clocked.snapshot();
+    assert!(c.last_rejection.is_none());
+    assert_eq!((c.sim_time, c.step), (t0, 0));
+    let (a, b) = (step_n(&mut plain, 10), step_n(&mut clocked, 10));
+    assert!((b.sim_time - (t0 + 10.0 * dt_au())).abs() < 1e-9, "{}", b.sim_time);
+    assert_eq!(b.step, 10);
+    assert_eq!(a.scene.nuclei.iter().map(|n| (n.pos, n.vel)).collect::<Vec<_>>(), b.scene.nuclei.iter().map(|n| (n.pos, n.vel)).collect::<Vec<_>>(), "the same trajectory");
+    assert_eq!(a.total.to_bits(), b.total.to_bits());
+    clocked.apply(DynCommand::SetClock(0.0));
+    assert!(clocked.snapshot().last_rejection.as_deref().is_some_and(|r| r.contains("before the first step")));
+    assert_eq!(clocked.snapshot().sim_time, b.sim_time, "a refused clock changes nothing");
+}
+
 fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }

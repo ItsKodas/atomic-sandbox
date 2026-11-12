@@ -606,6 +606,53 @@ history from snapshots and found the cause:
 
 Parked: one diagnostic count (`box_blocks_trust`) double-subtracts a forgotten box-affected sample.
 
+### Bonds between solves, from experience (Nov 12–13; branches `stale-bonds`, `bond-experience`)
+
+In estimated mode the density-based bond graph is only as fresh as the last DFT solve, so a stretched H₃ kept
+showing its bonds after it came apart. First, stale bonds were drawn dashed with a label, and a bond refresh
+ran about 1 s after a drag. Then the user asked for bonds "guessed from experience":
+- **How it works.** Every fresh DFT graph is recorded pair by pair: the two Z, each end's crowding (the number of
+  neighbours within 8 Bohr, capped at 6), the distance and the verdict. The examples go into
+  `bond_experience.txt` in the collection's folder. Over a stale graph, a pair is shown bonded or not bonded only
+  when at least 3 examples of the same key within 0.1 Bohr all agree. Otherwise it stays dashed.
+- **Within rule 1.** It is learned from the app's own DFT, not typed-in chemistry. It is also display only:
+  names, charges and the Selection panel keep the DFT graph.
+- **The review found the speed problem.** The first version scanned every stored example near each pair, on the
+  render thread, even with the setting off: 8 ms per frame at 300 atoms. With per-key running counts each lookup
+  became two binary searches (0.29 ms for all the lookups at 300 atoms on a full store). Nothing is computed when
+  the setting is off, and the result is reused while nothing moves. The timing test is a measurement
+  (`#[ignore]`), not a gate.
+
+### The Windows installer and the in-app updater (Nov 12–13; branch `installer`, six tasks)
+
+The user asked for a real installer: download it, click Next, and it opens on H₂. They also asked for in-app
+updates, with a way to pick older versions and betas, all over GitHub Releases. Linux was dropped because the
+user can't test it.
+- **What landed:**
+  - **Installer.** A per-user Inno Setup installer.
+  - **Data folders.** Three modes: dev, portable and installed. Data lives in `%LOCALAPPDATA%\atomic-sandbox`,
+    seeded from `bundled\`, and re-seeded add-missing-only at the first launch of each version.
+  - **Version panel.** A chip and panel showing stable and beta builds, with downgrade warnings driven by a
+    format manifest.
+  - **Downloads.** Fetched from GitHub hosts only (an exact four-host allowlist, manual redirects), then checked
+    against SHA-256 and a minisign signature whose trusted comment names the tag.
+  - **Restart now.** It never interrupts a solve, refit, pass, relax or audit without the user's click. It
+    resumes the session after the update.
+  - **CI.** GitHub Actions builds every tag, signs in a tag-only job behind the `release` Environment, and opens
+    a draft release.
+- **Security review changed the CI design.** The first workflow could sign from a branch build. The signing
+  key now lives only in a tag-only job, and that job downloads nothing but `SHA256SUMS.txt`.
+- **CI's first three runs failed on one line.** Inno Setup's compiler has no version resource, its banner shows
+  only the major version, and `ISCC /?` exits non-zero. Run 4 compiled the `.iss` for the first time.
+- **The final review caught a restart that didn't wait.** Restart now didn't wait for a paused solve. The
+  re-review then found three more solves (Bonds now, the drag refresh, the estimated graph solve) that run while
+  the worker reports idle; the guard now also reads the probe's Main slot. It also corrected the record: the
+  app exits through `process::exit`, so a CPU solve can never hold the installer's 120 s wait.
+- **Not yet run:** the sign job, the release job and the uninstaller's `[Code]`. No key is committed and no tag
+  is pushed. These wait for the user to set up the `release` Environment and to hand-test the first beta draft.
+
+**Gate (Nov 13, merged tree):** app 673 passed, 0 failed, 4 ignored; `surface_reconfigure` 1 passed.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

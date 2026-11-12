@@ -2,7 +2,8 @@
 //! after loading it, keyed by the scene, its grid, its ionic potential and the solver — for the
 //! Activity tab's ETAs. The user's own times live in `%LOCALAPPDATA%\atomic-sandbox\timings.txt`
 //! (an average per key, updated as they happen); times shipped with the repository
-//! (`timings/timings.txt`, `scene::timings_dir`) fill in what the user has not measured yet. The
+//! (`timings/timings.txt`, `scene::timings_dir`; an installed build's are read-only in its install
+//! folder, `bundled\timings`) fill in what the user has not measured yet. The
 //! Profiles window copies the user's into the repository file, to commit. One `key = seconds count`
 //! line per entry. Display only: nothing here reaches the solver.
 use std::collections::BTreeMap;
@@ -77,6 +78,11 @@ impl Timings {
     /// The user's times merged into the repository's file (`timings/timings.txt`, created when
     /// missing), the user's winning where both have a key — to commit and share.
     pub fn publish(&mut self) -> Result<PathBuf, String> {
+        // the installed build reads its shipped times from the install folder, read-only (its
+        // Profiles window hides the button)
+        if crate::paths::mode() == crate::paths::DataMode::Installed {
+            return Err("the installed build's shipped times are read-only".into());
+        }
         let dir = crate::scene::timings_dir().unwrap_or_else(|| PathBuf::from("timings"));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut merged = self.shipped.clone();
