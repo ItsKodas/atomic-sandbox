@@ -204,7 +204,7 @@ These supersede the text above where the two differ.
     - that no release for the tag exists yet.
 
     Then it creates the draft.
-  - **Build-only:** `workflow_dispatch` and a push to the `installer` branch never sign, never see a secret and never create a release. The branch trigger is for the installer's first compile and is removed in that branch's final merge.
+  - **Build-only:** `workflow_dispatch` never signs, never sees a secret and never creates a release. (A push to the `installer` branch did the same for the installer's first compile; that trigger was removed before the branch merged.)
 - **Secrets live only in the `release` Environment.**
   - The user creates the Environment and a tag ruleset for `v[0-9]*` (no updates, no deletions, no bypass actors) *before* adding the secrets, because a job that names a missing Environment creates it unprotected.
   - The secrets are then added with `--env release`.

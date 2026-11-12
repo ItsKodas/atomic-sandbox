@@ -18,10 +18,10 @@
 #   -beta.N). Publishing the draft is a person's click on GitHub, after the physics suites ran
 #   locally on the tagged commit.
 #
-# workflow_dispatch (on any ref, a tag included) and a push to the installer branch are build-only:
-# they run the build job alone (the installer compile included), never sign, never see a secret and
-# never create a release. The installer-branch trigger is for the first compile of the installer
-# before any tag; it is removed in the branch's final merge, leaving tag pushes and dispatch.
+# workflow_dispatch (on any ref, a tag included) is build-only: it runs the build job alone (the
+# installer compile included), never signs, never sees a secret and never creates a release. (A
+# push to the installer branch did the same for the installer's first compile; that trigger was
+# removed in the branch's final merge.)
 #
 # Tools are pinned: Inno Setup 6.6.1 (the 6.6.x that installer/AtomicSandbox.iss targets) and
 # minisign 0.12, each a fixed download checked against its SHA-256 (the runner image's own Inno
@@ -32,14 +32,13 @@ name: Release
 on:
   push:
     tags: ['v*']
-    branches: [installer]
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
-  # a newer push to the branch supersedes a build-only run; a tag run is never cancelled
+  # a newer dispatch on the same ref supersedes a build-only run; a tag run is never cancelled
   cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref_type == 'tag') }}
 
 env:

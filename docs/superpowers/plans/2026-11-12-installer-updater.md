@@ -314,14 +314,14 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 **Files:**
 - Create `.github/workflows/release.yml`.
   - **Amended 2026-11-13** (security review and fix rounds 1-2; this supersedes the bullets below where they differ):
-    - **Triggers:** `push: tags: ['v*']` (the release path); `workflow_dispatch` and `push: branches: [installer]` (build-only).
+    - **Triggers:** `push: tags: ['v*']` (the release path); `workflow_dispatch` (build-only). `push: branches: [installer]` (build-only, for the installer's first compile) was removed in the branch's final merge.
     - **Three jobs**, top-level `permissions: {}`:
       - **build** (every run, `contents: read`, no secret referenced);
       - **sign** (only for a pushed tag, `github.event_name == 'push' && github.ref_type == 'tag'`; `permissions: {}`; `environment: release`, which holds the secrets). It downloads only `SHA256SUMS.txt`, signs it with `minisign -S -H -t "atomic-sandbox <tag>"` and uploads the `.minisig`. It never checks out or builds repository code;
       - **release** (only for a pushed tag, `contents: write`, no secrets). It verifies the signature against the tagged commit's `release-key.pub`, plus the trusted comment, the sums and `manifest.json`. It refuses when a release for the tag already exists, then creates the draft.
     - Build-only runs never sign and never see a secret.
     - Inno Setup 6.6.1 and minisign 0.12 are pinned downloads with SHA-256 checks; actions are pinned to commit SHAs.
-    - **After this branch merges**, the `push: branches: [installer]` trigger is removed in the final merge commit, leaving tag pushes and `workflow_dispatch`. It stays until then for the installer's first compile.
+    - **Done in the final fix round (2026-11-13):** the `push: branches: [installer]` trigger was removed before the merge, leaving tag pushes and `workflow_dispatch`.
   - **Trigger:** `on: push: tags: ['v*']`, runner `windows-latest`.
   - **The tag check:** the tag (without `v`) must equal the root `Cargo.toml` `version`, or fail.
   - **Build and package:** `cargo build -p app --release`. Run the `build.bat` layout steps non-interactively (factor them into `scripts/package.ps1` or a `build.bat --ci` flag, so CI and local share one layout). Then ISCC (preinstalled on `windows-latest`; if not, install `innosetup` via choco).
