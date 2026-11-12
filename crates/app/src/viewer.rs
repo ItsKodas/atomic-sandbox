@@ -457,8 +457,12 @@ pub struct Viewer {
     pub trails: crate::trails::Trails,
     /// The 3D view's mouse ([`Viewer::input`]).
     pub mouse: Mouse,
-    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
+    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`; the main
+    /// window's, then each detached window's by id), for `--record`.
     pub chrome_actions: Vec<ui::Action>,
+    /// What the detached windows asked of the window side (docking spec D-12; `PanelOutput::windows`),
+    /// until `main.rs` takes them ([`Viewer::take_window_requests`]).
+    pub window_requests: Vec<ui::WindowRequest>,
     /// The window size of the last `run_ui` (physical pixels): a resize's viewport estimate
     /// ([`Viewer::input`]) keeps the margins to it.
     screen: Option<(f32, f32)>,
@@ -531,6 +535,7 @@ impl Viewer {
             trails: Default::default(),
             mouse: Mouse::default(),
             chrome_actions: Vec::new(),
+            window_requests: Vec::new(),
             screen: None,
             last_play_log: None,
             ghost: Default::default(),
@@ -829,8 +834,10 @@ impl Viewer {
     /// snapshot mirror `self.scene`, never the interpolated `shown_scene` (S5: display only).
     pub fn input(&mut self, e: &replay::Event, consumed: bool) {
         use replay::{Button, Event, KeyName};
-        // the molecule builder's window has the mouse and the keys (Space, Delete, Esc are its own)
-        let consumed = consumed || self.ui.builder.open;
+        // the molecule builder's window has the mouse and the keys (Space, Delete, Esc are its own);
+        // while a tab is dragged between windows the keys are the drag's (Esc cancels it, and must
+        // not also clear the selection: docking Task 11 review M4)
+        let consumed = consumed || self.ui.builder.open || (matches!(e, Event::Key { .. }) && self.ui.workspace.dragging().is_some());
         let vp = self.viewport;
         // the Edit tool's group is its own: another tool selects one nucleus
         if self.ui.mode != ui::ToolMode::Edit {
@@ -910,18 +917,30 @@ impl Viewer {
         }
     }
 
+    /// Whether the chrome takes a button press at the cursor now (docking spec D-16: a press the
+    /// UI takes — a widget, a separator or a grip, its grab margin just outside the drawn edge
+    /// included — never moves the camera or starts a tool; `ui::takes_press`). The window ORs it
+    /// into egui-winit's `consumed` for a press, which misses those margins.
+    pub fn ui_takes_press(&self) -> bool {
+        let ppp = self.egui_ctx.pixels_per_point();
+        ui::takes_press(&self.egui_ctx, egui::pos2(self.mouse.pos.0 / ppp, self.mouse.pos.1 / ppp))
+    }
+
     /// The window was resized to `w × h` physical pixels: until the next frame lays the chrome out,
-    /// the viewport keeps its margins to the window's edges (the panels have fixed widths), so a
-    /// cursor event before that frame maps through the new rect, not the old one. The next
-    /// `run_ui` replaces the estimate with the chrome's own rect (a layout switch to compact).
+    /// the viewport is estimated — across, it scales with the width (the workspace spans the
+    /// window and its splits are fractions, `ui::workspace`); down, it keeps its margins (the top
+    /// bar and the toolbar have fixed heights) — so a cursor event before that frame maps through
+    /// the new rect, not the old one. Exact for the default layout, whose 3D tile spans the
+    /// workspace's height; the next `run_ui` replaces the estimate with the chrome's own rect (a
+    /// stacked layout, a switch to compact).
     fn resize_viewport(&mut self, w: f32, h: f32) {
-        let Some((sw, sh)) = self.screen.filter(|_| w > 0.0 && h > 0.0) else { return };
+        let Some((sw, sh)) = self.screen.filter(|&(sw, _)| w > 0.0 && h > 0.0 && sw > 0.0) else { return };
         let vp = self.viewport;
-        let right = sw - (vp.origin[0] + vp.size[0]);
+        let sx = w / sw;
         let bottom = sh - (vp.origin[1] + vp.size[1]);
         self.viewport = Viewport {
-            origin: vp.origin,
-            size: [(w - vp.origin[0] - right).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+            origin: [vp.origin[0] * sx, vp.origin[1]],
+            size: [(vp.size[0] * sx).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
         };
         self.screen = Some((w, h));
     }
@@ -1218,7 +1237,8 @@ impl Viewer {
 
     /// What a frame's (or one action's) chrome output implies: the error line, the selection, the
     /// camera focus, play / pause, the commands, and a worker re-spawn when the solver changed.
-    fn act_on(&mut self, out: ui::PanelOutput) {
+    fn act_on(&mut self, mut out: ui::PanelOutput) {
+        self.window_requests.append(&mut out.windows);
         if let Some(e) = out.error {
             self.last_error = Some(e);
         }
@@ -2524,6 +2544,20 @@ impl Viewer {
 
     /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
+        self.run_ui_with(raw, Vec::new()).0
+    }
+
+    /// The detached windows' requests since the last call (`main.rs` opens, closes and focuses
+    /// the OS windows; docking spec D-12).
+    pub fn take_window_requests(&mut self) -> Vec<ui::WindowRequest> {
+        std::mem::take(&mut self.window_requests)
+    }
+
+    /// [`Viewer::run_ui`] for the main window, then each detached window's panels (docking spec
+    /// D-12) in its own egui context — `windows`: (id, context, its input), in id order — from
+    /// the same state and the same `PanelInput`; their actions follow the main window's, in that
+    /// order. Returns each context's output, the detached windows' with their ids.
+    pub fn run_ui_with(&mut self, raw: egui::RawInput, windows: Vec<(u32, egui::Context, egui::RawInput)>) -> (egui::FullOutput, Vec<(u32, egui::FullOutput)>) {
         let mut outs = Vec::new();
         self.poll_retiring();
         // Trails switched off forget their history; switched on while paused (no snapshot comes)
@@ -2611,6 +2645,30 @@ impl Viewer {
             self.label_overlay(root, &shown, viewport, &lv);
             self.reference_arrows(root, &shown, viewport);
         });
+        // the detached windows' panels, after the main window's, by id
+        let mut fulls = Vec::with_capacity(windows.len());
+        for (id, wctx, wraw) in windows {
+            let input = ui::PanelInput {
+                scene: &self.scene,
+                snapshot: self.snapshot.as_ref(),
+                busy: self.busy,
+                playing: self.playing,
+                last_error: self.last_error.as_deref(),
+                selected: self.tool.selected,
+                measured_fs_per_s,
+                camera: &self.camera,
+                density_label: density_label.clone(),
+                orbital_label: orbital_label.clone(),
+                orbital_waiting,
+                pseudo_generating: providers::pseudo::generating(),
+                draft_banner: draft_banner.clone(),
+                bonds_label: bonds_label.clone(),
+                probe,
+            };
+            let ui_state = &mut self.ui;
+            let full = wctx.run_ui(wraw, |root| outs.push(ui::show_window(root, ui_state, &input, id)));
+            fulls.push((id, full));
+        }
         self.viewport = viewport;
         let ppp = ctx.pixels_per_point();
         if let Some(s) = screen_points {
@@ -2623,7 +2681,7 @@ impl Viewer {
             self.chrome_actions.append(&mut out.actions);
             self.act_on(out);
         }
-        full
+        (full, fulls)
     }
 }
 
@@ -2877,7 +2935,7 @@ mod tests {
         use sim::{OrbitalDisplay, OrbitalRequest, Spin};
         let payload = |what| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows: Vec::new(), field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
         };
         let empty = sim::BondGraph { bonds: Vec::new(), components: Vec::new(), step: 0, sim_time: 0.0, n_nuclei: 0 };
         let mut v = Viewer::new("h2").unwrap();
@@ -3263,6 +3321,85 @@ nucleus 1 {a} {} {}
         full.textures_delta.clear();
     }
 
+    /// Docking spec D-16 (user report 2026-11-12: resizing a panel near its edge also orbited the
+    /// camera): a press 3 pt into the 3D view beside the separator on its left — outside the
+    /// separator's drawn line and its 1.5-pt grab band, inside egui's `interact_radius` (5 pt) of
+    /// it, so egui's hit test gives it the press — is the UI's alone. egui-winit's own `consumed`
+    /// (the last frame's `wants_pointer_input`) misses it; with `ui_takes_press` the window's path
+    /// (cursor, `consumed`, press, a 60-px drag, release; a frame drawn after each, as the window
+    /// does) moves the separator and leaves the camera alone. In the middle of the view the same
+    /// drag still orbits.
+    #[test]
+    fn a_press_the_ui_takes_never_moves_the_camera() {
+        use crate::replay::{to_view, Button, Event};
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.mode = ui::ToolMode::Orbit; // a left drag on the view orbits
+        let run = |v: &mut Viewer, events: Vec<egui::Event>| discard(v.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), events, ..Default::default() }));
+        for _ in 0..3 {
+            run(&mut v, vec![]);
+        }
+        // one press as the window delivers it: (egui-winit's `consumed`, the window's)
+        let press = |v: &mut Viewer, at: (f32, f32)| -> (bool, bool) {
+            let cursor = |v: &mut Viewer, (x, y): (f32, f32)| {
+                run(v, vec![egui::Event::PointerMoved(egui::pos2(x, y))]);
+                let (vx, vy) = to_view((x, y), v.viewport);
+                v.input(&Event::Cursor { x: vx, y: vy }, false);
+            };
+            let button = |v: &mut Viewer, (x, y): (f32, f32), down: bool, consumed: bool| {
+                v.input(&Event::Button { which: Button::Left, down }, consumed);
+                run(v, vec![egui::Event::PointerButton { pos: egui::pos2(x, y), button: egui::PointerButton::Primary, pressed: down, modifiers: egui::Modifiers::NONE }]);
+            };
+            cursor(v, at);
+            let winit = v.egui_ctx.egui_wants_pointer_input();
+            let consumed = winit || v.ui_takes_press();
+            button(v, at, true, consumed);
+            for k in 1..=3 {
+                cursor(v, (at.0 + 20.0 * k as f32, at.1));
+            }
+            button(v, (at.0 + 60.0, at.1), false, false);
+            (winit, consumed)
+        };
+        let vp = v.viewport;
+        let (left, mid) = (vp.origin[0], vp.origin[1] + vp.size[1] / 2.0);
+        let cam = v.camera;
+        assert_eq!(press(&mut v, (left + 3.0, mid)), (false, true), "egui-winit misses the margin; the hit test does not");
+        assert_eq!(v.camera, cam, "the camera never moved");
+        assert!(v.viewport.origin[0] > left + 30.0, "the separator took the drag: {} → {}", left, v.viewport.origin[0]);
+        let vp = v.viewport;
+        let cam = v.camera;
+        assert_eq!(press(&mut v, (vp.origin[0] + vp.size[0] / 2.0, mid)), (false, false), "the middle of the view is the view's");
+        assert_ne!(v.camera, cam, "it orbits");
+        assert_eq!(v.viewport, vp, "and moves no separator");
+    }
+
+    /// Docking Task 11 review M4: while a tab is dragged between windows the keys are the drag's —
+    /// the window's Esc reaches the 3D view as consumed (the selection stays) and the chrome's
+    /// frame cancels the drag with it; after the drag Esc deselects again.
+    #[test]
+    fn esc_during_a_tab_drag_is_the_drags() {
+        use crate::replay::{Event, KeyName};
+        let mut v = Viewer::new("h2").unwrap();
+        let run = |v: &mut Viewer, events: Vec<egui::Event>| discard(v.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), events, ..Default::default() }));
+        for _ in 0..3 {
+            run(&mut v, vec![]);
+        }
+        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Graph").copied()).expect("the Graph tab").center();
+        let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        run(&mut v, vec![egui::Event::PointerMoved(c), button(c, true)]);
+        for dx in [12.0, 50.0] {
+            run(&mut v, vec![egui::Event::PointerMoved(c + egui::vec2(dx, 0.0))]);
+        }
+        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Graph));
+        v.tool.selected = Some(0);
+        v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
+        assert_eq!(v.tool.selected, Some(0), "the drag's Esc does not deselect");
+        run(&mut v, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert_eq!(v.ui.workspace.dragging(), None, "it cancels the drag");
+        run(&mut v, vec![button(c + egui::vec2(50.0, 0.0), false)]);
+        v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
+        assert_eq!(v.tool.selected, None, "after the drag Esc deselects");
+    }
+
     /// The wheel over the 3D view: without a drag it zooms; during a Select-drag it leaves the
     /// camera alone and queues the pull for the next frame's chrome, which sends `SetDragForce`
     /// (×1.25 per line); the pull outlives the drag (the user's words: "scroll wheel change how
@@ -3289,8 +3426,8 @@ nucleus 1 {a} {} {}
         assert!((v.ui.drag_force - 0.15625).abs() < 1e-15, "the pull stays for the next drag");
     }
 
-    /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and
-    /// strip on the right), in physical pixels, snapped to whole pixels at a fractional scale.
+    /// The frame's viewport is the 3D view's tile (top bar above, toolbar below, the workspace's
+    /// panels either side), in physical pixels, snapped to whole pixels at a fractional scale.
     #[test]
     fn the_viewport_is_the_rect_the_chrome_leaves() {
         let mut v = Viewer::new("h2").unwrap();
@@ -3307,33 +3444,39 @@ nucleus 1 {a} {} {}
             }
             v.viewport
         };
-        // the default (2026-10-19): both docks open — the left on Activity, the right on Model —
-        // each 336 pt wide (`UiState::dock_w`) beside its icon strip
+        // the default workspace (docking spec D-9): the left column at 24 % of the window, the 3D
+        // view, the right column at 30 % of what is left
+        use crate::ui::DockTab;
         let both = v.viewport;
         eprintln!("viewport at 1400×900: {both:?}");
-        assert!((360.0..400.0).contains(&both.origin[0]), "the left dock and its strip are on the left: {both:?}");
+        assert!((330.0..350.0).contains(&both.origin[0]), "the left column is on the left: {both:?}");
         assert!((30.0..60.0).contains(&both.origin[1]), "the top bar is above: {both:?}");
         let bottom = both.origin[1] + both.size[1];
-        assert!((1000.0..1040.0).contains(&(both.origin[0] + both.size[0])), "the right dock and its strip are on the right: {both:?}");
+        assert!((1060.0..1100.0).contains(&(both.origin[0] + both.size[0])), "the right column is on the right: {both:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
-        // folding the right dock gives its width back, up to its strip
-        v.ui.dock_open = false;
+        // closing the right column's panels gives its width back, to the window's edge
+        // (Activity and Graph are tabbed with the Log since docking Task 4)
+        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity, DockTab::Graph] {
+            v.ui.workspace.close_panel(t);
+        }
         let left_only = frames(&mut v);
-        assert_eq!(left_only.origin, both.origin, "the left dock did not move");
-        assert!((1330.0..1360.0).contains(&(left_only.origin[0] + left_only.size[0])), "only the right dock's strip is on the right: {left_only:?}");
-        // opening it again (another tab) takes the width back from the right
-        v.ui.open_tab(crate::ui::DockTab::Selection);
-        assert_eq!(frames(&mut v), both, "the right dock keeps its width across tabs");
-        // folding the left dock widens the view on the left, to its strip
-        v.ui.left_open = false;
+        assert_eq!(left_only.origin, both.origin, "the left column did not move");
+        assert!((1390.0..=1400.0).contains(&(left_only.origin[0] + left_only.size[0])), "nothing is on the right: {left_only:?}");
+        // a panel shown again goes back beside the view, at the default's share
+        v.ui.open_tab(DockTab::Log);
+        assert_eq!(frames(&mut v), both, "the right column is back at its width");
+        // closing the left column's panels widens the view on the left, to the window's edge
+        for t in [DockTab::Model, DockTab::Knowledge, DockTab::Selection, DockTab::Readouts] {
+            v.ui.workspace.close_panel(t);
+        }
         let right_only = frames(&mut v);
-        assert!((30.0..60.0).contains(&right_only.origin[0]), "{right_only:?}");
-        assert!(right_only.size[0] > both.size[0] + 250.0, "{right_only:?}");
-        // both folded: the view spans the window between the two strips
-        v.ui.dock_open = false;
+        assert!(right_only.origin[0] < 10.0, "{right_only:?}");
+        assert!(right_only.size[0] > both.size[0] + 200.0, "the left column's 24 %, less the right column's share of it: {right_only:?}");
+        // every panel closed: the view spans the window
+        v.ui.workspace.close_panel(DockTab::Log);
         let none = frames(&mut v);
         assert!(none.size[0] > right_only.size[0] + 250.0, "{none:?}");
-        assert!((1340.0..1370.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 60.0, "{none:?}");
+        assert!((1390.0..=1400.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 10.0, "{none:?}");
         // points → physical pixels, whole pixels
         let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
         assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });
@@ -3702,11 +3845,11 @@ nucleus 1 {a} {} {}
         use sim::{OrbitalDisplay, OrbitalInfo, OrbitalLabel, OrbitalRequest, Spin};
         let row = |spin, track| OrbitalInfo {
             spin, index: 0, track, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
         };
         let payload = |what, rows| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
         };
         let mut v = pinned("h2");
         let mut d = sim::DynSnapshot::default();

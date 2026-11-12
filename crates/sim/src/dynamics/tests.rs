@@ -2454,7 +2454,7 @@ impl Orbiting {
         log.payloads += 1;
         let row = OrbitalInfo {
             spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
         };
         // a view with unoccupied orbitals: a status, saying "interrupted" for the next
         // `interrupt_next` payloads (Task 4 re-review N2)
@@ -2468,7 +2468,7 @@ impl Orbiting {
         });
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
-            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom,
+            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None,
         })
     }
 }
@@ -2684,12 +2684,12 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
     let side = |job: u64, what: OrbitalRequest, tracks: &[u32], unocc: u8| -> SideDisplay {
         let rows = tracks.iter().enumerate().map(|(i, &t)| OrbitalInfo {
             spin: Spin::Up, index: i, track: t, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(i + 1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
         }).collect();
         let unoccupied = (unocc > 0).then(|| UnoccupiedStatus { requested: unocc, ..Default::default() });
         let o = OrbitalDisplay {
             cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None, spin: SpinSummary::default(),
-            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom,
+            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None,
         };
         let display = Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 };
         SideDisplay { display, orbitals: Some(o), kind: SideKind::Audit, job, positions: Vec::new() }
@@ -2886,6 +2886,179 @@ fn partial_charges_follow_the_graph_and_side_densities() {
     d.apply(DynCommand::Pause);
     d.apply(DynCommand::RemoveNucleus(1));
     assert!(d.snapshot().charges.is_none());
+}
+
+/// What a [`ShareRecorder`] saw: every `set_share_tables` the driver sent and its evaluations.
+#[derive(Default)]
+struct ShareLog {
+    sent: Vec<Option<Arc<crate::provider::ShareTables>>>,
+    evals: usize,
+}
+
+/// Records every `set_share_tables` the driver sends to the wrapped provider (the orbital share
+/// tables, module doc "Orbital share tables"), and stands in for an orbital producer: with a view
+/// on, every evaluation and `orbital_display_now` makes a one-row payload whose shares (an even
+/// split) and `share_z` are set exactly when the held tables fit the evaluated species.
+struct ShareRecorder {
+    inner: crate::test_providers::Gaussians,
+    log: Arc<std::sync::Mutex<ShareLog>>,
+    view: crate::provider::OrbitalViewRequest,
+    tables: Option<Arc<crate::provider::ShareTables>>,
+    last: Option<(Vec<[f64; 3]>, Vec<u8>, Cell)>,
+}
+
+impl ShareRecorder {
+    fn new() -> (ShareRecorder, Arc<std::sync::Mutex<ShareLog>>) {
+        let log = Arc::new(std::sync::Mutex::new(ShareLog::default()));
+        let g = crate::test_providers::Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+        (ShareRecorder { inner: g, log: log.clone(), view: Default::default(), tables: None, last: None }, log)
+    }
+
+    fn payload(&self) -> Option<OrbitalDisplay> {
+        use crate::provider::*;
+        let (positions, z, cell) = self.last.clone()?;
+        if self.view.what.is_off() {
+            return None;
+        }
+        let fit = self.tables.as_ref().is_some_and(|t| t.z == z);
+        let row = OrbitalInfo {
+            spin: Spin::Up, index: 0, track: 0, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
+            shares: fit.then(|| vec![1.0 / z.len() as f64; z.len()]),
+        };
+        Some(OrbitalDisplay {
+            cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(), unoccupied: None, notes: Vec::new(),
+            what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: fit.then_some(z),
+        })
+    }
+}
+
+impl ForceProvider for ShareRecorder {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.log.lock().unwrap().evals += 1;
+        let mut r = self.inner.evaluate(scene, a)?;
+        self.last = Some((scene.nuclei.iter().map(|n| n.pos).collect(), scene.nuclei.iter().map(|n| n.z).collect(), scene.cell.clone()));
+        r.orbitals = self.payload();
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "share recorder"
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+    fn set_orbital_view(&mut self, request: crate::provider::OrbitalViewRequest) {
+        self.view = request;
+    }
+    fn orbital_display_now(&mut self, _a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.payload()
+    }
+    fn set_share_tables(&mut self, tables: Option<Arc<crate::provider::ShareTables>>) {
+        self.log.lock().unwrap().sent.push(tables.clone());
+        self.tables = tables;
+    }
+}
+
+/// The newest tables sent (`Some(None)`: the provider was told there are none).
+fn last_sent(log: &Arc<std::sync::Mutex<ShareLog>>) -> Option<Option<Arc<crate::provider::ShareTables>>> {
+    log.lock().unwrap().sent.last().cloned()
+}
+
+/// Orbital-atom-shares Task 2: the driver sends the share tables as data — nothing before the
+/// references exist (a provider starts with none), `Some` with the scene's Z list (one table per nucleus, one `Arc` per
+/// species) once they do, `None` again right after an edit adds a species without a reference,
+/// `Some` for the new Z list once it lands; nothing is resent while nothing changes (a move
+/// included: the inputs are unchanged, so `ionic_tag` is not even asked). Fix round 1 (M6): a
+/// same-count reorder sends the reordered tables at once (both references exist); a same-count
+/// species swap, a grid change and a σ change (new keys) send `None`, then `Some` for the new
+/// key once its references land.
+#[test]
+fn dynamics_sends_tables_when_references_exist() {
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let (p, log) = ShareRecorder::new();
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    assert_eq!(d.snapshot().bonds_pending, vec![1], "the H reference is queued");
+    d.tick(f64::INFINITY, &mut never());
+    assert!(log.lock().unwrap().sent.is_empty(), "before the references: nothing (the provider holds none)");
+    settle_references(&mut d);
+    let t = last_sent(&log).flatten().expect("Some once the H reference landed");
+    assert_eq!(t.z, vec![1, 1]);
+    assert_eq!(t.tables.len(), 2);
+    assert!(Arc::ptr_eq(&t.tables[0], &t.tables[1]), "one table per species");
+    let h_table = d.references().iter().find(|(k, _)| k.z == 1).map(|(_, r)| r.radial.clone()).expect("the H entry");
+    assert_eq!(*t.tables[0], h_table, "the charges' reference table");
+    let calls = log.lock().unwrap().sent.len();
+    d.tick(f64::INFINITY, &mut never());
+    step_n(&mut d, 2);
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [-0.85, 0.0, 0.0] });
+    d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().sent.len(), calls, "nothing changed (steps, a move): nothing resent");
+    // an O added (a species without a reference): None at once, before the re-evaluation
+    d.apply(DynCommand::AddNucleus(Nucleus::new(8, [0.0, 2.0, 0.0])));
+    assert_eq!(last_sent(&log), Some(None), "the edit: None until O's reference exists");
+    assert_eq!(d.snapshot().bonds_pending, vec![8]);
+    settle_references(&mut d);
+    let t = last_sent(&log).flatten().expect("Some once the O reference landed");
+    assert_eq!(t.z, vec![1, 1, 8]);
+    assert!(Arc::ptr_eq(&t.tables[0], &t.tables[1]) && !Arc::ptr_eq(&t.tables[0], &t.tables[2]));
+    // a removed H: the same species' tables for the new Z list
+    d.apply(DynCommand::RemoveNucleus(0));
+    let t = last_sent(&log).flatten().expect("both references exist");
+    assert_eq!(t.z, vec![1, 8]);
+    let (h, o) = (t.tables[0].clone(), t.tables[1].clone());
+    // the same count reordered: both references exist, so the reordered tables at once
+    let two = |z0: u8, z1: u8, cell: Cell, sigma: Option<f64>| Scene { cell, sigma, ..scene(vec![Nucleus::new(z0, [-0.8, 0.0, 0.0]), Nucleus::new(z1, [0.8, 0.0, 0.0])]) };
+    let c33 = Cell { n: 33, h: 0.25 };
+    d.apply(DynCommand::ReplaceScene(two(8, 1, c33.clone(), None)));
+    let t = last_sent(&log).flatten().expect("a reorder: both references exist");
+    assert_eq!(t.z, vec![8, 1]);
+    assert!(*t.tables[0] == *o && *t.tables[1] == *h, "each nucleus its own species' table");
+    // a same-count species swap, a grid change, a σ change: None, then Some for the new key
+    for (sc, what) in [
+        (two(1, 6, c33.clone(), None), "O swapped for C"),
+        (two(1, 6, Cell { n: 37, h: 0.25 }, None), "a grid change"),
+        (two(1, 6, Cell { n: 37, h: 0.25 }, Some(0.3)), "a σ change"),
+    ] {
+        let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+        d.apply(DynCommand::ReplaceScene(sc));
+        assert_eq!(last_sent(&log), Some(None), "{what}: None until the new key's references exist");
+        settle_references(&mut d);
+        let t = last_sent(&log).flatten().unwrap_or_else(|| panic!("{what}: Some once the references landed"));
+        assert_eq!(t.z, z, "{what}");
+    }
+}
+
+/// Fix round 1 (I1): paused, the payload shown before the references existed gains its shares
+/// when they land — the driver re-reads it once (`orbital_display_now`, no evaluation, no step).
+#[test]
+fn paused_payload_gains_shares_when_references_land() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let (p, log) = ShareRecorder::new();
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    let s0 = d.snapshot();
+    let o = s0.orbitals.clone().expect("shown at once while paused");
+    assert!(o.share_z.is_none() && o.rows[0].shares.is_none(), "no references yet: no shares");
+    assert_eq!(s0.bonds_pending, vec![1]);
+    let evals = log.lock().unwrap().evals;
+    let t = settle_references(&mut d);
+    assert!(t.paused && t.step == 0);
+    assert!(t.orbitals_seq > s0.orbitals_seq, "a new payload was published");
+    let o = t.orbitals.clone().expect("the payload");
+    assert_eq!(o.share_z, Some(vec![1, 1]), "the shares came with the references");
+    assert_eq!(o.rows[0].shares, Some(vec![0.5, 0.5]));
+    assert_eq!(log.lock().unwrap().evals, evals, "a re-read, no evaluation");
+    // and only once: further idle ticks publish nothing new
+    let seq = t.orbitals_seq;
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(t.orbitals_seq, seq);
 }
 
 /// M8a Task 10 (ruling P10): a capped segment's training mask rides with the scene through moves

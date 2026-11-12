@@ -1,12 +1,24 @@
-//! Profiles (user request 2026-10-19): the viewer's own look and layout — where the dock tabs are,
-//! which dock is open on which tab and how wide, the view and density-look settings, the units —
-//! as a small text file of `key = value` lines. Display state only: nothing here is an `Action`
+//! Profiles (user request 2026-10-19): the viewer's own look and layout — the workspace's
+//! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
+//! and active tabs in `workspace::layout`'s grammar; `hidden = Graph:left:340, …`, the auto-hidden
+//! panels with their edge and size, spec D-10; `window = 2552,-8,1920,1009 max
+//! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
+//! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
+//! `workspace::detached`), the view and density-look settings and which
+//! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
+//! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
 //!
 //! The window keeps the state in force in `%LOCALAPPDATA%\atomic-sandbox\current.profile`
 //! (written a moment after each change, read at launch: the app opens as it was left); named
 //! profiles are saved to and loaded from the `profiles` folder (`scene::profiles_dir`) so they can
 //! be shared; Reset puts back the built-in defaults. File ▸ Profiles… is the window.
+//!
+//! A profile from before the workspace (docking spec D-8) has `left_tabs` / `right_tabs` lines
+//! (and `left_tab` / `right_tab`, the tab each dock showed) instead of `layout`: they are read into
+//! the D1 default's shape (`workspace::layout::from_sides`), each dock's tab active in its leaf.
+//! Its `left_width` / `right_width` / `dock_open` / `left_open` lines are ignored.
+use super::workspace::{detached, layout};
 use super::{theme, DockTab, EnergyUnits, TempUnits, UiState};
 use crate::names::NameStyle;
 use egui::{Color32, RichText, Stroke, Vec2};
@@ -17,19 +29,18 @@ macro_rules! fields {
     ($m:ident) => {
         $m!(show_partial_core, show_bonds, show_labels, show_badge, show_ghost, show_angles, show_bond_lengths, show_charges, follow_selected,
             shimmer, dots_by_orbital, orbital_phase, colour_additive, colour_physical, show_cell, show_floor, show_axes,
-            show_place_grid, grid_in_angstrom, show_trails, show_knowledge, hide_cloud, warp_fields, camera_view, dots_float, dots_glow, smooth_motion, dock_open, left_open, show_atom_card, graph_all;
+            show_place_grid, grid_in_angstrom, show_trails, show_knowledge, hide_cloud, warp_fields, camera_view, dots_float, dots_glow, smooth_motion, show_atom_card, graph_all;
             gamma, opacity, iso, phase_iso, spin_iso, trail_opacity, trail_fs, volume_mode, motion_blur, shutter, exposure_ev, camera_solidity, camera_size, camera_smooth, fov_deg, label_opacity, dots_drift, dots_amount, dots_size, dots_brightness, dots_feather, dots_blur, bloom, bloom_threshold)
     };
 }
 
-fn tab_name(t: DockTab) -> String {
-    format!("{t:?}")
-}
+/// The panel an old profile's word names (`DockTab::name`, which was its `Debug` word).
 fn tab_of(w: &str) -> Option<DockTab> {
-    DockTab::ALL.iter().copied().find(|t| tab_name(*t) == w)
+    DockTab::PANELS.into_iter().find(|t| t.name() == w)
 }
-fn tabs_of(v: &str) -> Option<Vec<DockTab>> {
-    v.split_whitespace().map(tab_of).collect()
+/// An old profile's tab list; unknown words are dropped.
+fn tabs_of(v: &str) -> Vec<DockTab> {
+    v.split_whitespace().filter_map(tab_of).collect()
 }
 fn pick<T: Copy + std::fmt::Debug>(all: &[T], w: &str) -> Option<T> {
     all.iter().copied().find(|t| format!("{t:?}") == w)
@@ -53,23 +64,33 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("name_style = {:?}\n", st.name_style);
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
-    out += &format!("left_tab = {}\nright_tab = {}\n", tab_name(st.left_tab), tab_name(st.dock_tab));
-    let names = |v: &[DockTab]| v.iter().map(|t| tab_name(*t)).collect::<Vec<_>>().join(" ");
-    out += &format!("left_tabs = {}\nright_tabs = {}\n", names(&st.left_tabs), names(&st.right_tabs));
-    out += &format!("left_width = {:.0}\nright_width = {:.0}\n", st.dock_w[0], st.dock_w[1]);
+    out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
+    out += &format!("hidden = {}\n", layout::encode_hidden(st.workspace.hidden()));
+    for (rect, max, tree) in st.workspace.saved_windows() {
+        out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
+    }
+    out += &format!("view_sections = {}\n", st.view_sections.encode());
     out
 }
 
-/// Applies a profile's text to `st`: unknown keys and unreadable values are skipped, a tab
-/// layout that names a tab twice is ignored, and a tab it does not name (one added since it was
-/// saved: Knowledge, M8a Task 9) joins its default dock at its default place.
+/// Applies a profile's text to `st`: unknown keys and unreadable values are skipped. `layout` sets
+/// the workspace (a tree that does not parse, or has no 3D view, gives the default), `hidden`
+/// its auto-hidden panels (none without the line; one already in the tree stays there) and the
+/// `window` lines its detached windows, in order (none without them; a panel already placed
+/// keeps that place; a window usable on no connected monitor docks back when the window side
+/// would open it, `Workspace::take_requests`); without it,
+/// an old profile's `left_tabs` / `right_tabs` are migrated (every panel placed once, the ones
+/// they do not name added: `layout::from_sides`); a profile with neither leaves the arrangement
+/// as it is.
 pub fn apply(st: &mut UiState, text: &str) {
-    let kv: std::collections::HashMap<&str, &str> = text
+    // the `key = value` lines, in order (`window` may repeat; the map keeps one of each key)
+    let lines: Vec<(&str, &str)> = text
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim(), v.trim()))
         .collect();
+    let kv: std::collections::HashMap<&str, &str> = lines.iter().copied().collect();
     macro_rules! get {
         ($($b:ident),*; $($n:ident),*) => {
             $(if let Some(v) = kv.get(stringify!($b)).and_then(|v| v.parse().ok()) { st.$b = v; })*
@@ -95,52 +116,32 @@ pub fn apply(st: &mut UiState, text: &str) {
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
     }
-    if let (Some(mut l), Some(mut r)) = (kv.get("left_tabs").and_then(|v| tabs_of(v)), kv.get("right_tabs").and_then(|v| tabs_of(v))) {
-        let mut all: Vec<u8> = l.iter().chain(&r).map(|t| *t as u8).collect();
-        all.sort_unstable();
-        all.dedup();
-        if all.len() == l.len() + r.len() {
-            for (list, defaults) in [(&mut l, &DockTab::LEFT[..]), (&mut r, &DockTab::RIGHT[..])] {
-                for (k, &t) in defaults.iter().enumerate() {
-                    if !all.contains(&(t as u8)) {
-                        list.insert(k.min(list.len()), t);
-                    }
-                }
+    // the View panel's open sections (docking Task 4); a profile from before it opens the default two
+    st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
+    if let Some(v) = kv.get("layout") {
+        st.workspace.close_windows();
+        st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
+        st.workspace.set_hidden(layout::parse_hidden(kv.get("hidden").copied().unwrap_or_default()));
+        // every `window` line, in order
+        let windows = lines.iter().filter(|(k, _)| *k == "window").filter_map(|(_, v)| detached::parse_window(v)).collect();
+        st.workspace.set_windows(windows);
+    } else if kv.contains_key("left_tabs") || kv.contains_key("right_tabs") {
+        let side = |k: &str| kv.get(k).map(|v| tabs_of(v)).unwrap_or_default();
+        st.workspace.set_node(layout::from_sides(&side("left_tabs"), &side("right_tabs")));
+        // the tab each old dock showed, active in its leaf
+        for k in ["left_tab", "right_tab"] {
+            if let Some(t) = kv.get(k).and_then(|w| tab_of(w)) {
+                st.workspace.show_panel(t);
             }
-            (st.left_tabs, st.right_tabs) = (l, r);
         }
-    }
-    if let Some(t) = kv.get("left_tab").and_then(|w| tab_of(w)).filter(|t| st.left_tabs.contains(t)) {
-        st.left_tab = t;
-    }
-    if let Some(t) = kv.get("right_tab").and_then(|w| tab_of(w)).filter(|t| st.right_tabs.contains(t)) {
-        st.dock_tab = t;
-    }
-    if st.left_tabs.is_empty() {
-        st.left_open = false;
-    } else if !st.left_tabs.contains(&st.left_tab) {
-        st.left_tab = st.left_tabs[0];
-    }
-    if st.right_tabs.is_empty() {
-        st.dock_open = false;
-    } else if !st.right_tabs.contains(&st.dock_tab) {
-        st.dock_tab = st.right_tabs[0];
-    }
-    let w = |k: &str| kv.get(k).and_then(|v| v.parse::<f32>().ok()).map(|x| x.clamp(280.0, 720.0));
-    if let (Some(l), Some(r)) = (w("left_width"), w("right_width")) {
-        st.dock_w_set = Some([l, r]);
     }
 }
 
 /// The built-in defaults (a fresh state's profile).
 pub fn defaults(st: &UiState) -> String {
     let fresh = UiState::new("h2", &crate::scene::Scene::preset("h2").expect("the h2 preset"));
-    let mut text = capture(&fresh);
-    // the docks' default width (a fresh state has not measured them)
-    text = text.replace(&format!("left_width = {:.0}", fresh.dock_w[0]), "left_width = 336");
-    text = text.replace(&format!("right_width = {:.0}", fresh.dock_w[1]), "right_width = 336");
     let _ = st;
-    text
+    capture(&fresh)
 }
 
 /// The window's profile bookkeeping: where the state in force lives, and when it was last written.
@@ -245,7 +246,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState) {
                     }
                 });
             });
-            theme::note(ui, "A profile is the app's layout and look: where the dock tabs are, which docks are open and how wide, the view and density settings, the units. The app keeps what you change and opens as you left it.");
+            theme::note(ui, "A profile is the app's layout and look: where the panels are (their splits, tabs and sizes), the view and density settings, the units. The app keeps what you change and opens as you left it.");
             ui.add_space(8.0);
             let dir = crate::scene::profiles_dir().unwrap_or_else(|| PathBuf::from("profiles"));
             ui.label(RichText::new(dir.display().to_string()).monospace().size(10.5).color(theme::INK_FAINT));

@@ -1055,6 +1055,7 @@ mod tests {
             notes: Vec::new(),
             what,
             lone_atom: LoneAtomLabels::NotLoneAtom,
+            share_z: None,
         }
     }
 

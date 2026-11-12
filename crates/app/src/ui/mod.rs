@@ -6,12 +6,14 @@
 //!   the scene chip (preset picker and Reset), and the Ctrl K control search (`search`);
 //! - a **bottom toolbar** (`toolbar`) for what the hands do: time, speed with the measured fs/s,
 //!   dt, the tool, the element to place, the selection's actions, the solver with its trust light;
-//! - a **right dock** (`dock`) for what is read: Readouts, Graph, Model, Selection and Log tabs,
-//!   collapsible to an icon strip whose dots keep drift, trust and errors visible;
+//! - the **workspace** (`workspace`, docking spec D-2..D-5): the 3D view and the panels (`dock`:
+//!   Model, Knowledge, Selection, Readouts, Activity, Graph, View, Orbitals, Log) as one tree of
+//!   splits and tabbed leaves the user rearranges, whose tabs keep drift, trust and errors visible;
 //! - **overlays** in the 3D view (`overlays`): the status chip, the atom card, the faded-density
 //!   label, toasts, the sampling and first-pass cards, the Volume / Isosurface switch and the axes
-//!   gizmo. The view is the space the panels leave (no `CentralPanel`: egui would then count the
-//!   pointer over the 3D view as over egui, and the mouse tools would stop working).
+//!   gizmo. The view is the 3D tile's rect, and the root `Ui` is left holding exactly that rect
+//!   (`workspace::tree::show`; no `CentralPanel`): egui counts the pointer there as not over egui,
+//!   so the mouse tools keep working wherever the tile sits.
 //!
 //! The chrome never edits the scene directly: widgets emit [`Action`]s, and [`actions::apply`]
 //! turns them into the same [`Command`]s the old side panel sent (the viewer sends them to the
@@ -39,11 +41,17 @@ mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
+mod workspace;
 
 pub use actions::Action;
 #[cfg(test)]
 pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
+/// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.
+pub use workspace::presets::Preset as LayoutPreset;
+/// Detached windows (docking spec D-12): what the UI asks of the window side, and where a window is.
+pub use workspace::detached::{WinRect, WindowRequest, MIN_WINDOW};
+pub use workspace::drag::Place;
 
 use crate::scene::Scene;
 use crate::sim::{Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
@@ -215,16 +223,9 @@ pub enum ToolMode {
     Edit,
 }
 
-/// Which edge a dock sits on (user request 2026-10-19: the left dock is what is going on — stats —
-/// the right is what you configure).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockSide {
-    Left,
-    Right,
-}
-
-/// The docks' tabs: [`DockTab::LEFT`] on the left dock, [`DockTab::RIGHT`] on the right.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The workspace's panels (docking spec D-2: "dock tab" now means "panel"); every one is in
+/// [`DockTab::PANELS`]. Where each sits is the workspace tree's (`UiState::workspace`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
     Readouts,
     Graph,
@@ -237,22 +238,40 @@ pub enum DockTab {
     Log,
     /// What the shared model knows (M8a Task 9, `knowledge`): elements, pairs, distances, angles.
     Knowledge,
+    /// Every control of the old View menu, regrouped into folding sections (docking spec D-6,
+    /// `dock::view`).
+    View,
 }
 
 impl DockTab {
-    /// Every tab, the left dock's first (the tests' sweep, the saved layout's parser).
-    pub const ALL: [DockTab; 8] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
-    /// The left dock's tabs, in strip order: stats and what is going on.
-    pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
-    /// The right dock's tabs, in strip order: configuring things.
-    pub const RIGHT: [DockTab; 5] = [DockTab::Model, DockTab::Knowledge, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
-
-    /// The dock this tab starts in (the tests; the layout can move it: `UiState::side_of`).
-    #[cfg(test)]
-    pub fn side(self) -> DockSide {
+    /// Every panel of the workspace (docking spec D-2), View included (the tests' sweep, the saved
+    /// layout's parser, the screenshot harness's `tab=`; the order a migrated layout adds panels
+    /// an old profile never listed, `workspace::layout`).
+    pub const PANELS: [DockTab; 9] = [
+        DockTab::Model,
+        DockTab::Knowledge,
+        DockTab::Selection,
+        DockTab::Readouts,
+        DockTab::View,
+        DockTab::Orbitals,
+        DockTab::Log,
+        DockTab::Activity,
+        DockTab::Graph,
+    ];
+    /// The panel's one-word name: its tab's label (docking spec D-4), its word in a saved layout
+    /// (spec D-9: `[Model*,Knowledge]`) and in an old profile's `left_tabs` / `right_tabs` lines,
+    /// and the screenshot harness's `tab=` (any case).
+    pub fn name(self) -> &'static str {
         match self {
-            DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
-            DockTab::Model | DockTab::Knowledge | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+            DockTab::Readouts => "Readouts",
+            DockTab::Graph => "Graph",
+            DockTab::Model => "Model",
+            DockTab::Activity => "Activity",
+            DockTab::Orbitals => "Orbitals",
+            DockTab::Selection => "Selection",
+            DockTab::Log => "Log",
+            DockTab::Knowledge => "Knowledge",
+            DockTab::View => "View",
         }
     }
 
@@ -266,17 +285,7 @@ impl DockTab {
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
             DockTab::Knowledge => "Knowledge · what the model knows",
-        }
-    }
-}
-
-impl DockSide {
-    /// The tabs this dock starts with, in strip order (the tests; the layout: `UiState::tabs`).
-    #[cfg(test)]
-    pub fn tabs(self) -> &'static [DockTab] {
-        match self {
-            DockSide::Left => &DockTab::LEFT,
-            DockSide::Right => &DockTab::RIGHT,
+            DockTab::View => "View",
         }
     }
 }
@@ -729,28 +738,14 @@ pub struct UiState {
     /// (display only; empty outside the Edit tool).
     pub edit_group: Vec<usize>,
     // ---- the chrome's own view state (M6 redesign) ----
-    /// The RIGHT dock's tab (one of [`DockTab::RIGHT`]), and whether it is open (else only its icon
-    /// strip shows). Display state: not recorded.
-    pub dock_tab: DockTab,
-    pub dock_open: bool,
-    /// The LEFT dock's tab (one of [`DockTab::LEFT`]) and whether it is open — its own state, a width
-    /// of its own (user request 2026-10-19). Display state: not recorded.
-    pub left_tab: DockTab,
-    pub left_open: bool,
-    /// Each dock's tabs in strip order (user request 2026-10-19: drag a strip icon up or down, or
-    /// across to the other dock). Starts as [`DockTab::LEFT`] / [`DockTab::RIGHT`]; the window
-    /// keeps it in `layout_file`. Every tab is in exactly one of them.
-    pub left_tabs: Vec<DockTab>,
-    pub right_tabs: Vec<DockTab>,
-    /// The strip icon being dragged, and each strip's rect and button rects this frame (left, right).
-    pub drag_tab: Option<DockTab>,
-    pub strip_geom: [Option<(egui::Rect, Vec<(DockTab, egui::Rect)>)>; 2],
-    /// Where the window saves the tab layout (`None`: headless, never saved).
-    pub layout_file: Option<std::path::PathBuf>,
-    /// Each dock's panel width as last drawn (left, right), and a width a profile asks for
-    /// (applied for one frame).
-    pub dock_w: [f32; 2],
-    pub dock_w_set: Option<[f32; 2]>,
+    /// The workspace (docking spec D-2, D-3): the 3D view and the panels as one tree of splits and
+    /// tabbed leaves, plus the auto-hidden panels and the detached windows. Starts as the D1 default
+    /// (`workspace::layout::default_layout`); the profile keeps it (`layout = …`). Display state:
+    /// not recorded.
+    pub workspace: workspace::Workspace,
+    /// The View panel's folding sections that are open (`dock::view`; the profile's
+    /// `view_sections`). Display state: not recorded.
+    pub view_sections: dock::view::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -764,7 +759,7 @@ pub struct UiState {
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
     pub graph_series: GraphSeries,
     pub graph_all: bool,
-    /// The session log (Log tab, toasts, the strip's counter) and its filter.
+    /// The session log (the Log panel and its tab's unread count, toasts) and its filter.
     pub log: LogBook,
     pub log_filter: LogFilter,
     /// The Ctrl K control search, and the control it last revealed.
@@ -807,94 +802,50 @@ pub struct SegmentBack {
 }
 
 impl UiState {
-    /// Opens `tab`'s dock on it (a dock is only ever asked for its own tabs): the search, the
-    /// Activity bar, a view mode that needs the Orbitals tab. Display state, never recorded.
+    /// Shows `tab` (`Workspace::show_panel`: made the active tab of its leaf, its flyout opened
+    /// when it is auto-hidden, or put back beside the 3D view when it was closed): the search, the Activity bar, a view mode that needs the
+    /// Orbitals tab. Display state, never recorded.
     pub fn open_tab(&mut self, tab: DockTab) {
-        match self.side_of(tab) {
-            DockSide::Left => (self.left_open, self.left_tab) = (true, tab),
-            DockSide::Right => (self.dock_open, self.dock_tab) = (true, tab),
-        }
+        self.workspace.show_panel(tab);
     }
 
-    /// Whether `tab` is on screen: its dock is open and showing it.
+    /// Whether `tab` is on screen: in the workspace and the active tab of its leaf, or out in the
+    /// auto-hide flyout (`Workspace::visible`).
     pub fn tab_shown(&self, tab: DockTab) -> bool {
-        match self.side_of(tab) {
-            DockSide::Left => self.left_open && self.left_tab == tab,
-            DockSide::Right => self.dock_open && self.dock_tab == tab,
-        }
+        self.workspace.visible(tab)
     }
 
-    /// The dock `tab` is in now (the layout can move it).
-    pub fn side_of(&self, tab: DockTab) -> DockSide {
-        if self.left_tabs.contains(&tab) { DockSide::Left } else { DockSide::Right }
-    }
-
-    /// A dock's tabs in strip order.
-    pub fn tabs(&self, side: DockSide) -> &[DockTab] {
-        match side {
-            DockSide::Left => &self.left_tabs,
-            DockSide::Right => &self.right_tabs,
-        }
-    }
-
-    /// Moves `tab` to `side` at `index` (clamped) and opens it there; the dock it left shows its
-    /// first remaining tab, or folds when it has none. Saves the layout.
-    pub fn move_tab(&mut self, tab: DockTab, side: DockSide, index: usize) {
-        let from = self.side_of(tab);
-        let was_shown = self.tab_shown(tab);
-        self.left_tabs.retain(|&t| t != tab);
-        self.right_tabs.retain(|&t| t != tab);
-        let list = match side {
-            DockSide::Left => &mut self.left_tabs,
-            DockSide::Right => &mut self.right_tabs,
-        };
-        list.insert(index.min(list.len()), tab);
-        self.fix_selection(from);
-        if from != side || was_shown {
-            self.open_tab(tab);
-        }
-        self.save_layout();
-    }
-
-    /// A dock whose selected tab left it shows its first tab, or folds when it has none.
-    fn fix_selection(&mut self, side: DockSide) {
-        let tabs = self.tabs(side).to_vec();
-        let (open, sel) = self.dock_mut(side);
-        match tabs.first() {
-            None => *open = false,
-            Some(&f) => {
-                if !tabs.contains(sel) {
-                    *sel = f;
-                }
-            }
-        }
-    }
-
-    /// The default tab layout back.
+    /// The default layout back (spec D-11): the One monitor preset (the D1 default,
+    /// `workspace::layout::default_layout`; nothing auto-hidden), or Two monitors when a second
+    /// monitor is connected.
     pub fn reset_layout(&mut self) {
-        self.left_tabs = DockTab::LEFT.to_vec();
-        self.right_tabs = DockTab::RIGHT.to_vec();
-        self.fix_selection(DockSide::Left);
-        self.fix_selection(DockSide::Right);
-        self.save_layout();
+        use workspace::presets::Preset;
+        self.apply_layout(if self.workspace.monitor_count() >= 2 { Preset::TwoMonitors } else { Preset::OneMonitor });
     }
 
-    fn save_layout(&self) {
-        let Some(p) = &self.layout_file else { return };
-        let names = |v: &[DockTab]| v.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(p, format!("left {}
-right {}
-", names(&self.left_tabs), names(&self.right_tabs)));
-    }
-
-    /// A dock's open flag and tab, to read or change.
-    pub fn dock_mut(&mut self, side: DockSide) -> (&mut bool, &mut DockTab) {
-        match side {
-            DockSide::Left => (&mut self.left_open, &mut self.left_tab),
-            DockSide::Right => (&mut self.dock_open, &mut self.dock_tab),
+    /// Rearranges the workspace as the built-in layout `p` (Window ▸ Layouts, spec D-11): its tree
+    /// and its auto-hidden panels replace the current ones (detached windows and the flyout go);
+    /// Two monitors also opens its detached window filling the second monitor (spec D-12) — with
+    /// one monitor it is One monitor and the status says so. The profile's
+    /// autosave then keeps it. Display state, never recorded. From a tab's menu (the tree lent
+    /// out) every part of it — windows, tree, hidden panels, the new window — is done in order when
+    /// the tree is back.
+    pub fn apply_layout(&mut self, p: workspace::presets::Preset) {
+        use workspace::presets::Preset;
+        let second = self.workspace.second_monitor();
+        let p = match (p, second) {
+            (Preset::TwoMonitors, None) => {
+                self.set_status("Only one monitor found: the Two monitors layout is One monitor here (Activity and Graph stay tabbed with Log)");
+                Preset::OneMonitor
+            }
+            _ => p,
+        };
+        let (tree, hidden) = p.tree();
+        self.workspace.close_windows();
+        self.workspace.set_node(tree);
+        self.workspace.set_hidden(hidden);
+        if let Some(w) = p.window() {
+            self.workspace.open_window(w, second, true);
         }
     }
 
@@ -1014,17 +965,8 @@ right {}
             bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
-            dock_tab: DockTab::Model,
-            dock_open: true,
-            left_tab: DockTab::Activity,
-            left_open: true,
-            left_tabs: DockTab::LEFT.to_vec(),
-            right_tabs: DockTab::RIGHT.to_vec(),
-            drag_tab: None,
-            strip_geom: [None, None],
-            layout_file: None,
-            dock_w: [336.0, 336.0],
-            dock_w_set: None,
+            workspace: workspace::Workspace::default(),
+            view_sections: dock::view::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
@@ -1293,8 +1235,8 @@ pub struct PanelOutput {
     pub deselect: bool,
     /// A UI-side failure (invalid grid, unreadable file) to show in red.
     pub error: Option<String>,
-    /// The 3D view: the rect (points) the top bar, toolbar and dock leave. The viewer turns it into
-    /// the frame's `render::camera::Viewport`.
+    /// The 3D view: its tile's rect (points) in the workspace (`workspace::tree::show`). The viewer
+    /// turns it into the frame's `render::camera::Viewport`.
     pub view: Option<egui::Rect>,
     /// The actions the chrome's own widgets and keys emitted this frame, in order (not the ones
     /// queued from the 3D view, which the recorder already has as input events): what
@@ -1305,6 +1247,9 @@ pub struct PanelOutput {
     /// The interrupted training's offer was answered: resume it (true) or discard it (false)
     /// (`Viewer::resume_training`).
     pub training: Option<bool>,
+    /// What the detached windows need of the window side (docking spec D-12: open, close, bring
+    /// to the front; `workspace::detached`), in order — the UI cannot create OS windows.
+    pub windows: Vec<workspace::detached::WindowRequest>,
     /// A whole new scene, maybe on another solver (`UiState::backend`): Train this segment's Open
     /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
     /// changes, so the old one never starts solving it.
@@ -1333,21 +1278,26 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.log.record(&st.status, st.status_seq, input);
     // the reference comparison's results (a helper process on its own thread; never blocks)
     st.compare.poll(input.snapshot);
+    // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
+    st.workspace.drag_escape(root.ctx(), None);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
     }
     keys(root.ctx(), st, &mut acts);
-    // the activity headline (the chip, the bar, the strip's peek): rebuilt at most every 100 ms
+    // the activity headline (the chip, the bar, the Activity tab's hover peek): rebuilt at most every 100 ms
     let reference = st.activity.current_reference();
     st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
     let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
     activity::bar(root, st, input, bar_rect);
-    dock::show(root, st, input, &mut acts);
-    let view = root.available_rect_before_wrap();
+    let view = workspace::tree::show(root, st, input, &mut acts);
     out.view = Some(view);
+    // the Log's unread count is read once the Log is on screen (its tab's badge goes)
+    if st.tab_shown(DockTab::Log) {
+        st.log.unread = 0;
+    }
     // the training views are built only while shown (activity spec §6)
     let want = st.tab_shown(DockTab::Activity) && st.activity.training_open;
     if want != st.activity.views_sent {
@@ -1356,7 +1306,6 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     }
     overlays::show(root.ctx(), view, st, input, &mut acts);
     knowledge::legend(root.ctx(), view, st, input);
-    knowledge::window(root.ctx(), st, input);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);
@@ -1368,7 +1317,61 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
+    window_requests(st, &mut out);
     out
+}
+
+/// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the
+/// same frame as [`show`] and after it, from the same state: its panels' actions are applied as
+/// the main window's are, and the viewer appends them to the frame's (main window first, then
+/// the windows by id), so `--record` sees them. An unknown `id` draws nothing.
+pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>, id: u32) -> PanelOutput {
+    let mut out = PanelOutput::default();
+    let mut acts = Vec::new();
+    st.workspace.drag_escape(root.ctx(), Some(id));
+    workspace::tree::show_window(root, st, input, &mut acts, id);
+    out.actions = acts.clone();
+    for a in acts {
+        actions::apply(st, input, a, &mut out);
+    }
+    window_requests(st, &mut out);
+    out
+}
+
+/// The panels a comma-separated list names (`DockTab::name`, any case): the windowed app's
+/// `--detach` and the screenshot's `--ui detach=`. An unknown name or an empty list is an error.
+pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
+    let tabs = list
+        .split(',')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w)).ok_or_else(|| format!("unknown panel {w}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if tabs.is_empty() {
+        return Err("no panel named".into());
+    }
+    Ok(tabs)
+}
+
+/// Whether the chrome takes a press at `p` (points) — docking spec D-16, user report 2026-11-12:
+/// pressing a panel's resize grip just outside its drawn edge also orbited the camera. egui-winit's
+/// `consumed` for a press is the last frame's `wants_pointer_input`, which looks at the layer
+/// under the pointer and the root's remaining rect (the 3D view's tile: `workspace::tree::show`
+/// leaves the root exactly that), not at widgets: a separator's or a grip's grab band reaching
+/// into the tile, and egui's hit test, which takes a widget within `interact_radius` of the
+/// pointer, were the UI's and the 3D view's at once. This asks what egui's hit test asks: any
+/// widget that can take a click or a drag (the last pass's) within `interact_radius` of `p`.
+pub fn takes_press(ctx: &egui::Context, p: egui::Pos2) -> bool {
+    let radius = ctx.global_style().interaction.interact_radius;
+    ctx.interactive_rects_last_pass().iter().any(|r| r.expand(radius).contains(p))
+}
+
+/// The workspace's requests for the window side, and its notes as the status line.
+fn window_requests(st: &mut UiState, out: &mut PanelOutput) {
+    out.windows = st.workspace.take_requests();
+    for n in st.workspace.take_notes() {
+        st.set_status(n);
+    }
 }
 
 #[cfg(test)]
@@ -1381,12 +1384,18 @@ thread_local! {
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
 #[inline]
 fn probe(name: &str, r: &egui::Response) {
+    probe_rect(name, r.rect);
+}
+
+/// [`probe`] for a rect painted without a widget of its own (the workspace's leaf close icon).
+#[inline]
+fn probe_rect(name: &str, rect: egui::Rect) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(name.to_string(), r.rect);
+        p.borrow_mut().insert(name.to_string(), rect);
     });
     #[cfg(not(test))]
-    let _ = (name, r);
+    let _ = (name, rect);
 }
 
 /// [`probe`] in expression position: records and passes the response on.
@@ -1655,16 +1664,21 @@ pub fn open_ptable(ctx: &egui::Context) {
     egui::Popup::open_id(ctx, ptable::popup_id());
 }
 
-/// Opens a top-bar menu by its name ("file", "scene", "view", "physics", "help"); `None` for an
-/// unknown name (the screenshot flag's `menu=`).
-pub fn open_menu(ctx: &egui::Context, name: &str) -> Option<()> {
+/// Opens a top-bar menu by its name ("file", "scene", "physics", "window", "help"); "view", the
+/// View menu before the View panel replaced it (docking spec D-6), shows the View panel instead.
+/// `None` for an unknown name (the screenshot flag's `menu=`).
+pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()> {
+    if name.eq_ignore_ascii_case("view") {
+        st.open_tab(DockTab::View);
+        return Some(());
+    }
     let m = menus::MenuId::ALL.into_iter().find(|m| m.title().eq_ignore_ascii_case(name))?;
     egui::Popup::open_id(ctx, menus::popup_id(m));
     Some(())
 }
 
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
-/// open menu or the search).
+/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`).
 fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
         st.search.toggle();
@@ -1673,6 +1687,7 @@ fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
         && !st.builder.open
         && !ctx.egui_wants_keyboard_input()
         && !egui::Popup::is_any_open(ctx)
+        && st.workspace.flyout().is_none()
         && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     {
         acts.push(Action::Deselect);

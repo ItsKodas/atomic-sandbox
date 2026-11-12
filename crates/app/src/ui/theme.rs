@@ -24,6 +24,9 @@ pub const ACCENT: Color32 = rgb(0xa78bfa);
 pub const ACCENT_INK: Color32 = rgb(0xcbbcff);
 pub const ACCENT_BG: Color32 = rgb(0x2d2547);
 pub const GLOW: Color32 = rgb(0x8b5cf6);
+/// The duotone icons' fill (`icons::paint`): the accent at 32 % (alpha 82), whatever the stroke
+/// colour; half that on a disabled control.
+pub const ICON_FILL: Color32 = Color32::from_rgba_unmultiplied_const(0xa7, 0x8b, 0xfa, 82);
 /// A danger button's text.
 pub const DANGER_INK: Color32 = rgb(0xffb4b4);
 /// The overlays' translucent card fill.
@@ -140,6 +143,15 @@ pub fn segmented<T: Copy + PartialEq>(
     current: T,
     options: &[(T, &str, &str)],
 ) -> Option<T> {
+    segmented_in(ui, current, options, false)
+}
+
+/// [`segmented`] whose options wrap onto more rows when the space is narrow (a panel).
+pub fn segmented_wrapped<T: Copy + PartialEq>(ui: &mut egui::Ui, current: T, options: &[(T, &str, &str)]) -> Option<T> {
+    segmented_in(ui, current, options, true)
+}
+
+fn segmented_in<T: Copy + PartialEq>(ui: &mut egui::Ui, current: T, options: &[(T, &str, &str)], wrap: bool) -> Option<T> {
     let mut picked = None;
     egui::Frame::new()
         .fill(APP)
@@ -149,7 +161,7 @@ pub fn segmented<T: Copy + PartialEq>(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            ui.horizontal(|ui| {
+            let add = |ui: &mut egui::Ui| {
                 for &(v, label, tip) in options {
                     let r = ui.add(egui::Button::selectable(current == v, label));
                     let r = if tip.is_empty() { r } else { r.on_hover_text(tip) };
@@ -157,7 +169,12 @@ pub fn segmented<T: Copy + PartialEq>(
                         picked = Some(v);
                     }
                 }
-            });
+            };
+            if wrap {
+                ui.horizontal_wrapped(add);
+            } else {
+                ui.horizontal(add);
+            }
         });
     picked
 }

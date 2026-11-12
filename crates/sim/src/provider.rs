@@ -58,7 +58,7 @@
 //! the solvers, which handle empty spin channels: `qm::scf` module doc.) The driver itself never
 //! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
 //! the other callers.
-use crate::references::{AtomReference, AtomReferences};
+use crate::references::{AtomReference, AtomReferences, RadialDensity};
 use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
@@ -237,6 +237,23 @@ pub struct OrbitalInfo {
     /// walls bend it ("boundary touches the box: enlarge the box").
     /// `false` in every other view.
     pub touches_box: bool,
+    /// The row's Hirshfeld share on each nucleus in scene order (`crate::charges::orbital_shares`;
+    /// a degenerate set's members carry the set's mean, `crate::charges::set_average`):
+    /// s_A = ∫ w_A |ψ|², a split of space, not a measured quantity. `None` = not computed (no
+    /// free-atom tables, a failed Σ_A s = 1 check, or a producer that does not compute them).
+    pub shares: Option<Vec<f64>>,
+}
+
+/// The free-atom tables the orbital shares are weighted by (orbital-atom-shares spec, "The physics,
+/// stated plainly"): `tables[i]` is nucleus i's isolated-atom density (`crate::references`, the
+/// same entries the partial charges use; one `Arc` per species may be shared by its nuclei), and
+/// `z` the scene's species in order when they were taken — a producer whose scene's Z list
+/// differs computes no shares (never shares indexed to the wrong atoms). Plain data: the provider
+/// needs no `AtomReferences`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShareTables {
+    pub tables: Vec<Arc<RadialDensity>>,
+    pub z: Vec<u8>,
 }
 
 /// The spin readout (spec §5.5; `qm::orbitals::SpinSummary` with its display scale): occupied
@@ -359,6 +376,10 @@ impl std::fmt::Debug for OrbitalField {
 /// draw — `notes` says why), the spin readout, the unoccupied state, and notes for the tab. `what`
 /// is the request this payload answers *as resolved* — the orbital actually shown after a
 /// selection fallback, the tracks actually included — and `lone_atom` the labelling verdict.
+/// `share_z` is the species list the rows' `OrbitalInfo::shares` index (the evaluated nuclei's Z
+/// in scene order, the free-atom tables' `ShareTables::z`), set together with the shares and
+/// `None` when no row has any: a consumer names the atoms from it and refuses shares whose
+/// species are not the scene's it shows them on (a side job's payload can outlive an edit).
 #[derive(Clone, Debug)]
 pub struct OrbitalDisplay {
     pub cell: Cell,
@@ -371,6 +392,7 @@ pub struct OrbitalDisplay {
     pub notes: Vec<String>,
     pub what: OrbitalRequest,
     pub lone_atom: LoneAtomLabels,
+    pub share_z: Option<Vec<u8>>,
 }
 
 /// The converged total density ρ↑ + ρ↓ (e/Bohr³) on the evaluation's grid, for display only.
@@ -831,6 +853,14 @@ pub trait ForceProvider: Send {
     fn valence_charges(&self, scene: &Scene) -> Option<Vec<f64>> {
         Some(scene.nuclei.iter().map(|n| n.z as f64).collect())
     }
+    /// The free-atom tables the orbital shares are weighted by ([`ShareTables`]; orbital-atom-
+    /// shares spec), or `None` (a reference still missing, the scene's species changed). The
+    /// driver sends them whenever they change (`crate::dynamics`, "Orbital share tables"); the
+    /// producer computes shares only for a payload whose evaluated species equal `z`, at that
+    /// payload's own positions (never a scene edited since). Display only: they reach no solve,
+    /// force or sample. No-op by default: a provider without orbitals (a surrogate forwards them
+    /// to its teachers).
+    fn set_share_tables(&mut self, _tables: Option<Arc<ShareTables>>) {}
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task

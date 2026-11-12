@@ -3691,7 +3691,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -4097,7 +4097,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -5571,12 +5571,12 @@ impl ForceProvider for Producer {
             self.tracker += 1;
             let row = sim::OrbitalInfo {
                 spin: sim::Spin::Up, index: 0, track: self.tracker, slot: 0, energy: -0.6, eps_range: (-0.6, -0.6), occupation: 1.0, label: sim::OrbitalLabel::Index(1),
-                cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false,
+                cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
             };
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
                 field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-                lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
             });
         }
         Ok(r)
@@ -5633,6 +5633,88 @@ fn the_auditor_teacher_polls_the_drivers_display_interrupt() {
     refresh(&mut s);
     assert_eq!(side_log.lock().unwrap().polled, [true, false], "the same interrupt, read live");
     assert!(step_log.lock().unwrap().polled.is_empty(), "the stepping teacher shows no orbitals");
+}
+
+/// Orbital-atom-shares plan Task 2 (Review Focus 4): the share tables reach the background
+/// auditor's teacher with every job, and it weights them at the positions it solved — the job's,
+/// not another one's. Two refreshes on a CPU auditor, each checked against an independent cold
+/// `CpuKs` solve of the same scene with the same tables (fix round 1, I2 — the bounds are derived,
+/// not fitted to a run):
+/// - **First, H₂ at R = 1.6 centred at the origin.** It is the auditor's first solve, so it is
+///   cold, and the CPU solver is deterministic (a fixed pseudo-random start, single-threaded): its
+///   shares must equal the independent cold solve's **bit for bit**. Its σ_g must also split evenly
+///   within 1e-9. This bound is empirical, not derived: the pseudo-random start breaks the mirror
+///   symmetry at the SCF and eigensolver tolerances, and a cold solve of this kind measures
+///   |s₀ − s₁| ≤ 2e-10 (`ks::tests::cpu_payload_carries_shares`, and this test's output). Being
+///   deterministic, it moves only when the solver's code does. The bit-for-bit check is the exact one.
+/// - **Then the scene's H₂: R = 1.4, centred 0.5 Bohr off the origin** (the box makes it lopsided,
+///   0.505 / 0.495). The auditor warm-starts it from the first job (`discontinuity`), so it differs
+///   from the cold solve by SCF convergence only. The bound comes from the tolerance:
+///   - H₂ is a closed shell with one orbital per channel, so |ψ_σ|² = ρ_σ = ρ/2, and
+///     |s_A − s′_A| = |∫ w_A (ρ_σ − ρ′_σ)| ≤ ½ ‖ρ − ρ′‖₁ (0 ≤ w_A ≤ 1).
+///   - Each solve stopped at ∫|ρ_out − ρ_in| ≤ tol = 1e-6 within `max_iter` = 200 steps, from
+///     ∫|ρ_out − ρ_in| ≤ 2N = 4. Read as a geometric contraction, that is q ≤ (tol/4)^(1/200) =
+///     0.927 per step. Each output then lies within q/(1 − q)·tol ≤ 13 tol of the fixed point, so
+///     |Δs| ≤ ½ · 2 · 13 tol = 1.3e-5.
+///   - The assertion is at 1e-4: 8× headroom over that estimate, because DIIS is not a uniform
+///     contraction. That is still 50× below the 0.005 a split at the other job's (centred)
+///     positions would be off by.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn side_solve_shares_use_the_job_geometry() {
+    use crate::ks::CpuKs;
+    use sim::{OrbitalRequest, OrbitalViewRequest, RadialDensity, ShareTables};
+    let tol = 1e-6;
+    let view = OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) };
+    let t = Arc::new(RadialDensity::from_fn(|r: f64| (-2.0 * r).exp() / std::f64::consts::PI, 12.0, 0.05));
+    let tables = Arc::new(ShareTables { tables: vec![t.clone(), t], z: vec![1, 1] });
+    let mut s = SurrogateKs::new(Box::new(CpuKs::new(tol)), FallbackPolicy::default()).with_auditor(Box::new(CpuKs::new(tol)));
+    s.set_orbital_view(view.clone());
+    s.set_share_tables(Some(tables.clone()));
+    let refresh = |s: &mut SurrogateKs, sc: &Scene| -> sim::OrbitalDisplay {
+        assert!(s.request_display(sc));
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(d) = s.take_side_display() {
+                return d.orbitals.expect("the refresh carries the orbitals");
+            }
+            assert!(t0.elapsed().as_secs_f64() < 120.0, "no refresh within 120 s");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    // the same scene solved cold on an independent CpuKs with the same view and tables
+    let cold = |sc: &Scene| -> sim::OrbitalDisplay {
+        let mut c = CpuKs::new(tol);
+        c.set_orbital_view(view.clone());
+        c.set_share_tables(Some(tables.clone()));
+        c.evaluate(sc, &mut || false).expect("the cold solve").orbitals.expect("its payload")
+    };
+    let shares = |o: &sim::OrbitalDisplay| -> Vec<(sim::Spin, Vec<f64>)> {
+        o.rows.iter().map(|r| (r.spin, r.shares.clone().expect("shares on every row"))).collect()
+    };
+    let job = h2(1.6);
+    let scene_now = dimer(1.4, [1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 1, 1);
+    for (k, sc) in [&job, &scene_now].into_iter().enumerate() {
+        let o = refresh(&mut s, sc);
+        let want: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(o.positions, want, "the payload is the job's geometry");
+        assert_eq!(o.share_z, Some(vec![1, 1]));
+        let (side, reference) = (shares(&o), shares(&cold(sc)));
+        assert_eq!(side.len(), reference.len());
+        for ((spin, sh), (rspin, rsh)) in side.iter().zip(&reference) {
+            assert_eq!(spin, rspin);
+            let sum = sim::share_sum(sh);
+            let dev = sh.iter().zip(rsh).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            println!("job {k} at {want:?}: {spin:?} shares {sh:?}, Σ − 1 = {:+.2e}, s₀ − s₁ = {:+.2e}, |side − cold| = {dev:.2e}", sum - 1.0, sh[0] - sh[1]);
+            assert!((sum - 1.0).abs() <= 1e-9, "Σ = {sum}");
+            if k == 0 {
+                assert_eq!(sh, rsh, "a cold, deterministic solve: bit for bit the independent one's");
+                assert!((sh[0] - sh[1]).abs() <= 1e-9, "symmetric about the job's own centre: {sh:?}");
+            } else {
+                assert!(dev <= 1e-4, "within the SCF-tolerance bound of the cold solve: {sh:?} vs {rsh:?}");
+            }
+        }
+    }
 }
 
 /// Review SHOULD 12 (spec §4.3): estimated mode has exactly one orbital producer, the background
@@ -7381,7 +7463,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -7407,7 +7489,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();

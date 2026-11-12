@@ -1,12 +1,10 @@
-//! The two docks. The LEFT dock is what is going on (Activity, Readouts, Graph: stats), the RIGHT
-//! one is what you configure (Model, Knowledge, Orbitals, Selection, Log) — user request 2026-10-19. Both are
-//! built the same way: an icon strip (one button per tab, with the status dots: drift and box
-//! health on Readouts, work running on Activity, trust on Model, the unread error / refusal count
-//! on Log; hovering a button peeks its key numbers) and, when open, the tab's panel (resizable).
-//! Clicking the open tab's button, or the chevron, collapses that dock to its strip. Each side has
-//! its own open flag, selected tab and ONE width shared by its tabs (`UiState::left_*` / `dock_*`);
-//! the panel sits at the window's edge and the strip next to the 3D view, mirrored on the left.
-//! All of it is display state: none of it is an `Action`, so nothing here is recorded.
+//! The workspace's panels (docking spec D-2: "dock tab" now means "panel"): what each tab draws
+//! (`body`: its title row, then its own scroll area round the per-panel `show`), its icon, its
+//! status (`status`: drift and box health on Readouts, work running on Activity, trust on Model,
+//! the unread error / refusal count on Log — the old icon strip's dots, spec D-4) and the key
+//! numbers its tab peeks on hover (`peek`). Where a panel sits — which leaf, which split, which
+//! window — is the workspace tree's (`super::workspace::tree`), which draws the tabs and frames these
+//! bodies. All of it is display state: none of it is an `Action`, so nothing here is recorded.
 mod compare;
 mod graph;
 mod log;
@@ -14,6 +12,7 @@ pub mod model;
 pub mod orbitals;
 mod readouts;
 mod selection;
+pub mod view;
 
 #[cfg(test)]
 pub use log::last_refusal;
@@ -21,52 +20,10 @@ pub use model::{model_file_buttons, offer, progress, teach_row};
 #[cfg(test)]
 pub use model::{AUDIT_OFF_NOTE, AUDIT_WHY};
 
-use super::icons::{self, Icon};
-use super::{box_warning, drift_colour, theme, trust, Action, DockSide, DockTab, EnergyUnits, PanelInput, UiState};
+use super::icons::Icon;
+use super::{box_warning, drift_colour, theme, trust, Action, DockTab, EnergyUnits, PanelInput, UiState};
 use crate::sim::Backend;
-use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
-
-pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    side(root, st, input, acts, DockSide::Left);
-    side(root, st, input, acts, DockSide::Right);
-    st.dock_w_set = None; // a profile's widths are applied for one frame
-    drag_tabs(root.ctx(), st);
-    if st.tab_shown(DockTab::Log) {
-        st.log.unread = 0;
-    }
-}
-
-/// One dock: its panel (when open) at the window's edge, then its strip next to the 3D view. The
-/// `view` the chrome leaves (`PanelOutput::view`) is what remains between the two docks.
-fn side(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, side: DockSide) {
-    let (panel, strip_panel) = match side {
-        DockSide::Left => (egui::Panel::left("ldock-body"), egui::Panel::left("ldock-strip")),
-        DockSide::Right => (egui::Panel::right("dock-body"), egui::Panel::right("dock-strip")),
-    };
-    if *st.dock_mut(side).0 {
-        // one width for every tab of a side: a resize carries over when you switch tabs (user
-        // request 2026-10-18; the Activity tab used to keep its own)
-        let margin = match side {
-            DockSide::Left => Margin { left: 8, right: 12, top: 8, bottom: 8 },
-            DockSide::Right => Margin { left: 12, right: 8, top: 8, bottom: 8 },
-        };
-        let panel = match st.dock_w_set {
-            Some(w) => panel.exact_size(w[side as usize]),
-            None => panel.default_size(336.0), // 420 − 20 % (user request 2026-10-19)
-        };
-        let shown = panel
-            .resizable(true)
-            .size_range(280.0..=720.0)
-            .frame(Frame::new().fill(theme::PANEL).inner_margin(margin))
-            .show(root, |ui| body(ui, st, input, acts, side));
-        st.dock_w[side as usize] = shown.response.rect.width();
-    }
-    strip_panel
-        .exact_size(44.0)
-        .resizable(false)
-        .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(5, 8)).stroke(Stroke::new(1.0, theme::LINE)))
-        .show(root, |ui| strip(ui, st, input, side));
-}
+use egui::{Color32, RichText, Ui};
 
 /// A grid spanning the dock's full width: each of its `cols` columns is at least an equal share,
 /// and long values wrap at the dock's edge instead of a fixed column width.
@@ -77,7 +34,8 @@ pub(super) fn wide_grid(ui: &Ui, id: &str, cols: usize) -> egui::Grid {
     egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(w.max(share))
 }
 
-fn icon(tab: DockTab) -> Icon {
+/// The panel's icon (its tab, docking spec D-4).
+pub(super) fn icon(tab: DockTab) -> Icon {
     match tab {
         DockTab::Readouts => Icon::Readouts,
         DockTab::Graph => Icon::Graph,
@@ -87,10 +45,11 @@ fn icon(tab: DockTab) -> Icon {
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
         DockTab::Knowledge => Icon::Knowledge,
+        DockTab::View => Icon::View,
     }
 }
 
-/// The Readouts button's dot: the drift colour above 1e-4 Ha/ps, else the box warning's.
+/// The Readouts tab's dot: the drift colour above 1e-4 Ha/ps, else the box warning's.
 fn readouts_dot(input: &PanelInput<'_>) -> Option<Color32> {
     let s = input.snapshot?;
     s.dynamics
@@ -99,18 +58,37 @@ fn readouts_dot(input: &PanelInput<'_>) -> Option<Color32> {
         .or_else(|| box_warning(&s.scene).map(|w| w.0))
 }
 
-/// The Model button's dot: the trust colour (estimated solver only).
+/// The Model tab's dot: the trust colour (estimated solver only).
 fn model_dot(st: &UiState, input: &PanelInput<'_>) -> Option<Color32> {
     (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model(), input.scene, st).colour)
 }
 
-/// The Activity button's dot: work is running (a pass, a solve, a refit, an audit).
+/// The Activity tab's dot: work is running (a pass, a solve, a refit, an audit).
 fn activity_dot(input: &PanelInput<'_>) -> bool {
     input.sampling() || input.probe.is_some_and(|p| p.main.running || p.side.running || p.refit.is_some())
 }
 
-/// The key numbers a strip button shows on hover.
-fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
+/// Whether `tab` can carry a status dot ([`status`]): its tab keeps the dot's room always, so its
+/// width holds still when the dot comes and goes.
+pub(super) fn can_flag(tab: DockTab) -> bool {
+    matches!(tab, DockTab::Readouts | DockTab::Model | DockTab::Activity | DockTab::Log)
+}
+
+/// What a panel's tab shows after its name (docking spec D-4, the old strip's dots): the dot's
+/// colour, and the text in it when it counts something (the Log's unread errors and refusals).
+/// `None`: nothing to flag. Only the [`can_flag`] tabs have one.
+pub(super) fn status(tab: DockTab, st: &UiState, input: &PanelInput<'_>) -> Option<(Color32, Option<String>)> {
+    match tab {
+        DockTab::Readouts => readouts_dot(input).map(|c| (c, None)),
+        DockTab::Model => model_dot(st, input).map(|c| (c, None)),
+        DockTab::Activity => activity_dot(input).then_some((theme::ACCENT, None)),
+        DockTab::Log => (st.log.unread > 0).then(|| (super::RED, Some(st.log.unread.min(99).to_string()))),
+        _ => None,
+    }
+}
+
+/// The key numbers a panel's tab shows on hover.
+pub(super) fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
     let d = input.snapshot.map(|s| &s.dynamics);
     match tab {
         DockTab::Readouts => match d {
@@ -156,6 +134,8 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
             None => "Selection\nnothing selected".into(),
         },
         DockTab::Knowledge => super::knowledge::peek(st),
+        DockTab::View => "View
+what the 3D view shows and how it looks".into(),
         DockTab::Log => {
             let newest = st.log.entries.back().map_or(String::new(), |e| format!("\n{}: {}", e.kind.label(), e.text));
             format!("Log\n{} entries, {} unread errors or refusals{newest}", st.log.entries.len(), st.log.unread)
@@ -163,128 +143,9 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
     }
 }
 
-fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, side: DockSide) {
-    let mut geom = Vec::new();
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        for tab in st.tabs(side).to_vec() {
-            let selected = st.tab_shown(tab);
-            let tip = peek(st, input, tab);
-            // a click opens the tab; a drag moves it (up or down, or onto the other strip)
-            let r = icons::strip_button(ui, icon(tab), selected).interact(egui::Sense::click_and_drag());
-            geom.push((tab, r.rect));
-            if r.drag_started() {
-                st.drag_tab = Some(tab);
-            }
-            r.context_menu(|ui| {
-                let other = match st.side_of(tab) {
-                    DockSide::Left => DockSide::Right,
-                    DockSide::Right => DockSide::Left,
-                };
-                let name = if other == DockSide::Left { "Move to the left dock" } else { "Move to the right dock" };
-                if ui.button(name).clicked() {
-                    let n = st.tabs(other).len();
-                    st.move_tab(tab, other, n);
-                    ui.close();
-                }
-                if ui.button("Reset the tab layout").clicked() {
-                    st.reset_layout();
-                    ui.close();
-                }
-            });
-            super::probe(&format!("dock-tab-{tab:?}"), &r);
-            let p = ui.painter();
-            let dot = match tab {
-                DockTab::Readouts => readouts_dot(input),
-                DockTab::Model => model_dot(st, input),
-                DockTab::Activity => activity_dot(input).then_some(theme::ACCENT),
-                _ => None,
-            };
-            if let Some(c) = dot {
-                let at = r.rect.right_top() + Vec2::new(-8.0, 8.0);
-                // the Activity dot pulses while work runs
-                let pulse = if tab == DockTab::Activity { 0.85 + 0.15 * (ui.input(|i| i.time) * 7.0).sin() as f32 } else { 1.0 };
-                p.circle_filled(at, 4.5, theme::PANEL);
-                p.circle_filled(at, 3.5 * pulse, c);
-            }
-            if tab == DockTab::Log && st.log.unread > 0 {
-                let at = r.rect.right_top() + Vec2::new(-8.0, 9.0);
-                p.circle_filled(at, 7.5, super::RED);
-                p.text(at, egui::Align2::CENTER_CENTER, st.log.unread.min(99).to_string(), egui::FontId::monospace(9.0), Color32::WHITE);
-            }
-            let hint = if selected { "\n(click to collapse the dock; drag to move the tab, right-click for more)" } else { "\n(drag to move the tab, right-click for more)" };
-            if r.on_hover_text(format!("{tip}{hint}")).clicked() {
-                if selected {
-                    *st.dock_mut(side).0 = false;
-                } else {
-                    st.open_tab(tab);
-                }
-            }
-        }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            let open = *st.dock_mut(side).0;
-            // the chevron points the way the panel goes: toward the window's edge when collapsing
-            let toward_right = (side == DockSide::Right) == open;
-            let (i, tip) = (if toward_right { Icon::ChevronRight } else { Icon::ChevronLeft }, if open { "Collapse the dock" } else { "Open the dock" });
-            let r = icons::strip_button(ui, i, false);
-            super::probe(&format!("dock-chevron-{side:?}"), &r);
-            if r.on_hover_text(tip).clicked() {
-                *st.dock_mut(side).0 = !open;
-            }
-        });
-    });
-    st.strip_geom[side as usize] = Some((ui.max_rect(), geom));
-}
-
-/// Where a dragged tab would land: the strip under the pointer (a little wider than drawn) and
-/// the index among its other tabs, by the buttons' centres.
-fn drop_target(st: &UiState, tab: DockTab, at: egui::Pos2) -> Option<(DockSide, usize, f32, egui::Rect)> {
-    for side in [DockSide::Left, DockSide::Right] {
-        let Some((rect, buttons)) = &st.strip_geom[side as usize] else { continue };
-        if !rect.expand2(Vec2::new(24.0, 0.0)).contains(at) {
-            continue;
-        }
-        let others: Vec<&(DockTab, egui::Rect)> = buttons.iter().filter(|(t, _)| *t != tab).collect();
-        let index = others.iter().filter(|(_, r)| r.center().y < at.y).count();
-        let y = match (index.checked_sub(1).and_then(|i| others.get(i)), others.get(index)) {
-            (_, Some((_, r))) => r.top() - 2.0,
-            (Some((_, r)), None) => r.bottom() + 2.0,
-            (None, None) => rect.top() + 6.0,
-        };
-        return Some((side, index, y, *rect));
-    }
-    None
-}
-
-/// The tab being dragged: its icon under the pointer, the line where it would land, and the move
-/// on release (nowhere near a strip: nothing moves).
-fn drag_tabs(ctx: &egui::Context, st: &mut UiState) {
-    let Some(tab) = st.drag_tab else { return };
-    // released outside the window: the drag is over without a drop
-    if !ctx.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
-        st.drag_tab = None;
-        return;
-    }
-    let Some(at) = ctx.pointer_interact_pos() else { return };
-    let target = drop_target(st, tab, at);
-    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dock-drag")));
-    if let Some((_, _, y, rect)) = target {
-        p.line_segment([egui::pos2(rect.left() + 4.0, y), egui::pos2(rect.right() - 4.0, y)], Stroke::new(2.0, theme::ACCENT));
-    }
-    let r = egui::Rect::from_center_size(at, Vec2::splat(30.0));
-    p.rect_filled(r, 6.0, theme::ACCENT_BG.gamma_multiply(0.9));
-    icons::paint(&p, r.shrink(7.0), icon(tab), theme::ACCENT_INK);
-    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-    if ctx.input(|i| i.pointer.any_released()) {
-        st.drag_tab = None;
-        if let Some((side, index, _, _)) = target {
-            st.move_tab(tab, side, index);
-        }
-    }
-}
-
-fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, side: DockSide) {
-    let tab = *st.dock_mut(side).1;
+/// A panel's body inside its tile: its title row (Readouts: with the energy units), a separator,
+/// and its contents in a scroll area of their own.
+pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, tab: DockTab) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(tab.title()).strong().size(14.0));
         if tab == DockTab::Readouts {
@@ -314,6 +175,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
                 DockTab::Knowledge => super::knowledge::tab(ui, st, input),
+                DockTab::View => view::show(ui, st, acts),
             }
         });
 }

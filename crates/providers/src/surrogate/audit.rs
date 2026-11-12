@@ -206,6 +206,9 @@ pub(super) struct AuditJob {
     /// An audit dispatched in draft mode whose geometry the strict policy would not have answered
     /// (fix (b), 2026-10-18): its answer is a `DraftAudit` sample, held out of the strict fit.
     pub(super) draft_guess: bool,
+    /// The orbital shares' free-atom tables (`SurrogateKs::share_tables`), handed to the teacher
+    /// before it solves; it weights them at this job's positions (module doc, "Orbitals").
+    pub(super) shares: Option<Arc<ShareTables>>,
 }
 
 /// What the auditor's teacher returned for an audit or a display job.
@@ -287,6 +290,8 @@ impl Auditor {
                     if let Some(i) = &job.interrupt {
                         teacher.set_display_interrupt(i.clone());
                     }
+                    // the share tables (orbital-atom-shares): weighted at this job's positions
+                    teacher.set_share_tables(job.shares.clone());
                     let t = Instant::now();
                     let g = job.generation;
                     let mut scf_steps = None;
@@ -514,7 +519,7 @@ impl SurrogateKs {
         let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess };
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone() };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);

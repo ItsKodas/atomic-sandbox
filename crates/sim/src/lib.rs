@@ -26,9 +26,9 @@ pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
     AuditRecord, AuditVerdict, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, ModelSource, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
     ColourLook, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
-    RefitPoll, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
+    RefitPoll, ShareTables, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
-pub use charges::{ChargeSource, PartialCharges};
+pub use charges::{orbital_shares, orbital_shares_many, set_average, share_sum, ChargeSource, PartialCharges, Weights};
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};
 pub use sampling::{allowed_multiplicities, GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost, ReferenceCache, SamplingPlan, SamplingProgress};
