@@ -801,7 +801,9 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
     if !busy {
         st.bonds_refresh = None;
     }
-    let line = st.show_bonds.then(|| super::bonds_label(&s.dynamics)).flatten().filter(|_| s.dynamics.bonds_pending.is_empty());
+    // experience's line when it draws over the stale bonds (`crate::bond_experience`), else whose
+    // they are
+    let line = st.show_bonds.then(|| input.stale_bonds_line.clone().or_else(|| super::bonds_label(&s.dynamics))).flatten().filter(|_| s.dynamics.bonds_pending.is_empty());
     let button = egui::Area::new(Id::new("bonds-now"))
         .pivot(Align2::RIGHT_BOTTOM)
         .fixed_pos(view.max - Vec2::splat(14.0))

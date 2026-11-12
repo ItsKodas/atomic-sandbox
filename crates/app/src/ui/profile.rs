@@ -69,6 +69,7 @@ pub fn capture(st: &UiState) -> String {
     }
     fields!(put);
     out += &format!("auto_refresh_bonds = {}\n", st.auto_refresh_bonds);
+    out += &format!("guess_bonds = {}\n", st.guess_bonds);
     out += &format!("nucleus_scale = {}\n", st.nucleus_scale.map_or("auto".into(), |x| x.to_string()));
     out += &format!("background = {}\n", st.background.map_or("default".into(), |c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])));
     out += &format!("name_style = {:?}\n", st.name_style);
@@ -113,6 +114,7 @@ pub fn apply(st: &mut UiState, text: &str) {
     fields!(get);
     // added 2026-11-13: a profile from before it (or an unreadable value) reads as on, its default
     st.auto_refresh_bonds = kv.get("auto_refresh_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
+    st.guess_bonds = kv.get("guess_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
     if let Some(v) = kv.get("nucleus_scale") {
         st.nucleus_scale = v.parse().ok();
     }

@@ -124,6 +124,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Bond lengths", "distance Å angstrom label", Dock(D::View), "m-bonds"),
     e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Dock(D::View), "m-bonds"),
     e("Refresh bonds after a drag", "solve bonds now automatic auto stale dashed faded estimated surrogate drag move", Dock(D::View), "m-bonds"),
+    e("Guess bonds from experience", "bond experience learned remembered stale dashed faded estimated surrogate broken pulled apart guess", Dock(D::View), "m-bonds"),
     e("Label opacity", "labels transparent faint names lengths angles charges", Dock(D::View), "m-bonds"),
     e("Reset view settings", "defaults look display aids camera bonds restore", Dock(D::View), "m-view-reset"),
     // Physics

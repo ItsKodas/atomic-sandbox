@@ -547,6 +547,11 @@ pub struct UiState {
     pub auto_refresh_bonds: bool,
     /// That refresh's debounce (`auto_bonds::AutoBonds`).
     pub auto_bonds: auto_bonds::AutoBonds,
+    /// View ▸ Bonds & labels ▸ guess bonds from experience (user request 2026-11-13): while the
+    /// bonds are stale (estimated solver), each pair is drawn as the app's own earlier DFT graphs
+    /// called it at the same distance and surroundings (`crate::bond_experience`). Display only,
+    /// not recorded; on by default, and a profile without the key reads as on.
+    pub guess_bonds: bool,
     /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
     /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
     pub follow_selected: bool,
@@ -917,6 +922,7 @@ impl UiState {
             show_charges: true,
             auto_refresh_bonds: true,
             auto_bonds: Default::default(),
+            guess_bonds: true,
             follow_selected: false,
             audit_every_on: 2000,
             audit_auto: true,
@@ -1250,6 +1256,9 @@ pub struct PanelInput<'a> {
     /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
     /// the surrogate has no electrons"), under the density's.
     pub bonds_label: Option<String>,
+    /// The stale bonds' line while experience draws over them (`viewer::stale_bonds_line`: "bonds
+    /// from experience (N pairs) · last DFT t = … fs"); `None` for the plain `bonds_label` line.
+    pub stale_bonds_line: Option<String>,
     /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
     /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
     /// snapshot still moves on screen.
