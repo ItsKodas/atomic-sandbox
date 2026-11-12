@@ -1026,7 +1026,7 @@ impl SurrogateKs {
             self.species_dirty = true;
             report = self.fit_store_deferred()?;
             self.recovery = Some(format!(
-                "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined geometry — that region stays fenced"
+                "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined or forgotten geometry — that region stays fenced"
             ));
         }
         // release what the new model reproduces (`surrogate` module doc, "Release")

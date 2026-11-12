@@ -87,19 +87,22 @@ pub const QUARANTINE_ROUNDS: usize = 5;
 pub const SUSPECTS_SHOWN: usize = 8;
 
 /// A stored sample's check value for the Model tab's buttons ([`sim::SampleId`], fix round 1 M8):
-/// FNV-1a over its Z and the exact bits of its positions. Two different samples at one index (after
-/// a model switch) differ here; a collection refuses bit-identical duplicates.
+/// FNV-1a over its Z and the exact bits of its positions, energy and forces (re-review N1: two
+/// stores built from one preset hold the same geometry at the same index, so positions alone do
+/// not tell their samples apart; the teacher answer almost always does, and a collision only ever
+/// refuses on the safe side or names the same answer).
 pub(super) fn sample_key(s: &Sample) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
     for &z in &s.z {
         eat(z);
     }
-    for p in &s.pos {
+    for p in s.pos.iter().chain(&s.forces) {
         for c in p {
             c.to_bits().to_le_bytes().into_iter().for_each(&mut eat);
         }
     }
+    s.energy.to_bits().to_le_bytes().into_iter().for_each(&mut eat);
     h
 }
 
