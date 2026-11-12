@@ -8756,6 +8756,30 @@ mod updates {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Final re-review R1: Bonds now, the refresh after a drag and the estimated solver's graph
+    /// solve run with the worker not `busy`; the probe's Main slot shows the solve, and the restart
+    /// waits for it the same way, then goes ahead once the slot is idle.
+    #[test]
+    fn restart_waits_for_a_bond_solve_the_worker_does_not_count() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let main = sim::activity::SlotView { running: true, ..Default::default() };
+        let bonds = PanelInput { probe: Some(sim::ProbeView { main, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert!(!bonds.busy);
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("bond-solve");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        assert!(!act(&mut st, &bonds, Action::RestartToUpdate).restart_for_update, "no hand-off during the bond solve");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
+        assert!(!frame(&ctx, &mut st, &bonds, 1400.0, vec![]).restart_for_update);
+        assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "the slot idle: the restart goes ahead");
+        assert_eq!(st.update.guard, Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// T4 N5 and N3: Play pressed while Pause and restart is pausing asks again (the playing
     /// question), so a later plain Pause never restarts the app; and a "Cancel it and restart"
     /// given for a job is spent when the guard turns to the playing question, so the job is
