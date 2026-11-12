@@ -150,12 +150,13 @@ jobs:
             Write-Output "::error::The Inno Setup install failed (exit $($p.ExitCode)); no $iscc."
             exit 1
           }
-          # ISCC.exe carries no version resource (it reads 0.0.0.0), so the version is read from its
-          # own banner; the installer's SHA-256 above is what pins it, this only confirms the copy run
+          # ISCC.exe carries no version resource (0.0.0.0) and its banner names only the major
+          # version ("Inno Setup 6 Command-Line Compiler"): the installer's SHA-256 above is what pins
+          # 6.6.1; this only confirms the copy installed is an Inno Setup 6 compiler
           $banner = (& $iscc '/?' 2>&1 | Out-String)
           Write-Output "ISCC.exe: $iscc"
-          if ($banner -notmatch [regex]::Escape($env:INNO_VERSION)) {
-            Write-Output "::error::$iscc does not report version $env:INNO_VERSION. Its banner: $($banner.Trim() -split "`n" | Select-Object -First 3)"
+          if ($banner -notmatch 'Inno Setup 6') {
+            Write-Output "::error::$iscc is not an Inno Setup 6 compiler. Its banner: $($banner.Trim() -split "`n" | Select-Object -First 3)"
             exit 1
           }
           # first on PATH for the later steps, ahead of any ISCC.exe the image has (scripts\package.ps1
