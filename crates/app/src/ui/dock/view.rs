@@ -350,8 +350,12 @@ fn camera(ui: &mut Ui, st: &mut UiState) {
     });
 }
 
+/// The tooltip of View ▸ Bonds & labels ▸ refresh bonds after a drag (`ui::auto_bonds`).
+pub const AUTO_BONDS_TIP: &str = "estimated solver: the model has no electrons, so after you drag an atom (or move a selection with the handles) the bonds shown are left from the last DFT step — dashed and faded. With this on, a second after the last drag ends the bottom-right \"Solve Bonds\" runs by itself: one DFT solve at the new positions, then the bonds. A new drag restarts the wait; nothing runs while a solve for the bonds is already going, when the bonds are hidden or already fresh, or without a trained model. Display only; on by default";
+
 /// Bonds & labels (Q6 and Q7 of Appendix B, M6): the bonds read off the density, the molecule
-/// names and their style, the composition badge, angles, lengths, partial charges, label opacity.
+/// names and their style, the composition badge, angles, lengths, partial charges, the refresh of
+/// the bonds after a drag (estimated solver), label opacity.
 fn bonds(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     ui.horizontal_wrapped(|ui| {
         let (mut b, mut l) = (st.show_bonds, st.show_labels);
@@ -386,6 +390,9 @@ fn bonds(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         "each drawn bond's length in Å at its middle (the nuclei's distance as drawn now; Bohr in the hover of the Selection tab). With more than 12 bonds only those of the selected or hovered atom are labelled. Display only",
     );
     probed("show-charges", ui.checkbox(&mut st.show_charges, "partial charges")).on_hover_text(CHARGES_TIP);
+    if st.backend == Backend::Estimated {
+        probed("auto-refresh-bonds", ui.checkbox(&mut st.auto_refresh_bonds, "refresh bonds after a drag")).on_hover_text(AUTO_BONDS_TIP);
+    }
     ui.horizontal(|ui| {
         ui.label("label opacity");
         ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
@@ -506,7 +513,7 @@ fn reset(st: &mut UiState, acts: &mut Vec<Action>) {
     back!(
         gamma, opacity, iso, shimmer, dots_float, dots_glow, dots_drift, dots_amount, dots_feather, dots_size, dots_blur, dots_brightness, dots_by_orbital, bloom, bloom_threshold,
         camera_view, exposure_ev, shutter, fov_deg, camera_solidity, camera_size, camera_smooth, motion_blur, background,
-        show_bond_lengths, show_charges, label_opacity,
+        show_bond_lengths, show_charges, auto_refresh_bonds, label_opacity,
         show_cell, show_floor, show_axes, show_place_grid, grid_in_angstrom, show_trails, trail_fs, trail_opacity, show_knowledge, show_ghost, nucleus_scale
     );
 }

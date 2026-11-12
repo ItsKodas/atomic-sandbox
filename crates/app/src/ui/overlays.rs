@@ -2,7 +2,8 @@
 //! (top-left: state, who answered, time, step, T, thermostat; red with the error when there is
 //! one), the atom card (top-right), the long first-pass offer (top-right, under the card), the
 //! sampling card (bottom centre, while a pass runs), the faded-density label (bottom centre),
-//! toasts (bottom-right) and the Volume / Isosurface switch with the axes gizmo (bottom-left).
+//! the estimated view's "Bonds now" with the stale bonds' line over it (bottom-right), toasts
+//! (bottom-right, above those) and the Volume / Isosurface switch with the axes gizmo (bottom-left).
 //! The distance guides, drag spring and pin squares stay with the viewer (`viewer.rs`), which
 //! projects them from the camera; the cell, floor, axes and placement plane are 3D lines
 //! (`overlay.rs`).
@@ -21,7 +22,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     }
     let chip = status_chip(ctx, view, st, input, acts);
     st.chip_rect = Some(chip);
-    bonds_now(ctx, view, st, input, acts);
+    let corner = bonds_now(ctx, view, st, input, acts);
+    auto_refresh_bonds(ctx, st, input, acts);
     // the capture buttons at the top right; the atom card and the offer cards stack under them
     let mut right_y = super::capture::show(ctx, view, st, input.camera, acts) + 10.0;
     if st.show_atom_card {
@@ -66,7 +68,12 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let mut bottom = view.bottom() - 14.0 - 40.0 * rows as f32;
     // in an orbital mode the orbitals' own label or note replaces the density's
     let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
-    let label = match (layer_label, &input.bonds_label) {
+    // the stale bonds' line sits over "Bonds now" when that is drawn: not repeated here
+    let bonds_label = match (&input.bonds_label, &corner.line) {
+        (Some(b), Some(l)) => Some(b.lines().filter(|x| x != l).collect::<Vec<_>>().join("\n")).filter(|x| !x.is_empty()),
+        (b, _) => b.clone(),
+    };
+    let label = match (layer_label, &bonds_label) {
         (Some(d), Some(b)) => Some(format!("{d}\n{b}")),
         (d, b) => d.clone().or_else(|| b.clone()),
     };
@@ -96,7 +103,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     if let Some(top) = relax_card(ctx, view, bottom, input, acts) {
         bottom = top - 8.0;
     }
-    toast(ctx, view, bottom, st);
+    toast(ctx, view, bottom, corner.top, st);
     view_switch(ctx, view, st, input, acts);
     legend(ctx, view, st, input);
     draft_banner(ctx, view, chip, input);
@@ -487,7 +494,7 @@ fn relax_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'
 
 /// A status line toasts at the bottom right of the view; a refusal above the toolbar (bottom centre,
 /// over the density label and the sampling card).
-fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
+fn toast(ctx: &egui::Context, view: Rect, bottom: f32, corner_top: Option<f32>, st: &mut UiState) {
     let Some((kind, text)) = st.log.current_toast() else { return };
     let text = text.to_string();
     let mut open_log = false;
@@ -495,9 +502,9 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
     let (pivot, at) = if refused {
         (Align2::CENTER_BOTTOM, pos2(view.center().x, bottom))
     } else {
-        // above the estimated view's "Bonds now" button
-        let lift = if st.backend == crate::sim::Backend::Estimated { 52.0 } else { 0.0 };
-        (Align2::RIGHT_BOTTOM, view.max - Vec2::new(14.0, 14.0 + lift))
+        // above the estimated view's "Bonds now" button and its stale line
+        let y = corner_top.map_or(view.bottom() - 14.0, |t| t - 8.0);
+        (Align2::RIGHT_BOTTOM, pos2(view.right() - 14.0, y))
     };
     egui::Area::new(Id::new("toast"))
         .pivot(pivot)
@@ -751,17 +758,40 @@ fn gizmo(ui: &mut egui::Ui, input: &PanelInput<'_>) {
     r.on_hover_text("the world axes as the camera sees them: x red, y green (up), z blue (View › Display aids › axes)");
 }
 
+/// What the bottom-right corner drew: the top of its stack (the toasts go above it) and the stale
+/// bonds' line it shows (the bottom-centre label leaves it out).
+#[derive(Default)]
+struct Corner {
+    top: Option<f32>,
+    line: Option<String>,
+}
+
+/// The widest the stale bonds' line over "Bonds now" gets (points): inside the 280-point margin
+/// the bottom-centre label leaves at each side, so the two never meet on a wide view.
+pub const STALE_LINE_WIDTH: f32 = 260.0;
+
+/// "Bonds now" after a drag (`auto_bonds`): one frame of the debounce; asks for the frame that
+/// fires it, so an idle window still does.
+fn auto_refresh_bonds(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    match super::auto_bonds::step(st, input, std::time::Instant::now()) {
+        super::auto_bonds::Poll::Fire => acts.push(Action::RefreshBonds),
+        super::auto_bonds::Poll::Wait(d) => ctx.request_repaint_after(d),
+        super::auto_bonds::Poll::Idle => {}
+    }
+}
+
 /// The estimated view's "Bonds now" (bottom right; user request 2026-10-19): the surrogate's steps
 /// carry no density, so the bonds and angles are an earlier DFT step's; this asks for one teacher
 /// solve between steps (`Action::RefreshBonds`) and shows the bonds, lengths and angles. It spins
-/// until the graph is fresh (at most 20 s).
-fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+/// until the graph is fresh (at most 20 s). While the bonds on screen are stale (and shown), a
+/// small quiet line over it says whose they are (`ui::bonds_label`; user request 2026-11-13).
+fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Corner {
     if st.backend != crate::sim::Backend::Estimated {
-        return;
+        return Corner::default();
     }
-    let Some(s) = input.snapshot else { return };
+    let Some(s) = input.snapshot else { return Corner::default() };
     if s.scene.nuclei.len() < 2 {
-        return;
+        return Corner::default();
     }
     if s.dynamics.bonds_pending.is_empty() {
         st.ref_seen = None;
@@ -771,7 +801,8 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
     if !busy {
         st.bonds_refresh = None;
     }
-    egui::Area::new(Id::new("bonds-now"))
+    let line = st.show_bonds.then(|| super::bonds_label(&s.dynamics)).flatten().filter(|_| s.dynamics.bonds_pending.is_empty());
+    let button = egui::Area::new(Id::new("bonds-now"))
         .pivot(Align2::RIGHT_BOTTOM)
         .fixed_pos(view.max - Vec2::splat(14.0))
         .order(Order::Middle)
@@ -859,8 +890,34 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
             let r = ui.add_enabled(!input.sampling(), b).on_hover_text(
                 "the model's steps carry no density, so the bonds and angles shown are from the last DFT step: this solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
             );
+            super::probe("bonds-now", &r);
             if r.clicked() {
                 acts.push(Action::RefreshBonds);
             }
         });
+    let mut top = button.response.rect.top();
+    if let Some(text) = &line {
+        // quiet: small dim text on a faint backing, not interactable (never takes a click from the
+        // view), right-aligned with the button and wrapping on a narrow view
+        let r = egui::Area::new(Id::new("bonds-stale-line"))
+            .pivot(Align2::RIGHT_BOTTOM)
+            .fixed_pos(pos2(view.right() - 14.0, top - 6.0))
+            .interactable(false)
+            .order(Order::Middle)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(110))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(ui, |ui| {
+                        // the frame's 6-point margins inside STALE_LINE_WIDTH (and the view's width)
+                        ui.set_max_width((STALE_LINE_WIDTH.min(view.width() - 40.0) - 12.0).max(108.0));
+                        ui.add(egui::Label::new(RichText::new(text).size(11.0).color(theme::INK_DIM)).wrap());
+                    });
+            });
+        super::probe("bonds-stale-line", &r.response);
+        top = r.response.rect.top();
+    }
+    Corner { top: Some(top), line }
 }

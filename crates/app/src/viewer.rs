@@ -1018,6 +1018,7 @@ impl Viewer {
             // paused already: the mirror is the driver's state; playing: read after the Pause lands
             let base = if resume { Vec::new() } else { set.iter().map(|&i| (i, self.scene.nuclei[i].pos)).collect() };
             self.tool.gizmo = Some(tools::GizmoDrag { handle: h, base, centre: c, start, resume, delta: [0.0; 3], start_angle, angle: 0.0 });
+            self.ui.auto_bonds.drag_started();
         } else if let Some(i) = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei) {
             if self.mouse.shift {
                 let mut g = set;
@@ -1161,6 +1162,10 @@ impl Viewer {
         if let Some(g) = self.tool.gizmo.take() {
             if g.resume && !self.playing {
                 self.send(Command::Dyn(DynCommand::Play));
+            }
+            // a handle that moved the group: the bonds a second later (`ui::auto_bonds`)
+            if g.delta != [0.0; 3] || g.angle != 0.0 {
+                self.ui.auto_bonds.drag_ended(Instant::now());
             }
         }
         if let Some(a) = self.tool.boxing.take() {
@@ -1307,6 +1312,8 @@ impl Viewer {
         self.tool.dragging = true;
         self.tool.spring = false;
         self.tool.drag_plane = Some(plane);
+        self.tool.drag_moved = false;
+        self.ui.auto_bonds.drag_started();
     }
 
     /// One motion event of the current Select-drag: the position is clamped into the cell
@@ -1317,16 +1324,22 @@ impl Viewer {
         };
         let pos = tools::clamp_into_cell(pos, &self.scene);
         for c in tools::drag_commands(&mut self.tool.spring, self.playing, index, pos) {
+            self.tool.drag_moved = true;
             self.send(c);
         }
     }
 
     /// Ends the Select-drag: button release, focus loss or the cursor leaving the window
-    /// (`DragEnd` if the spring is active).
+    /// (`DragEnd` if the spring is active). A drag that moved its nucleus arms the refresh of the
+    /// bonds a second later (`ui::auto_bonds`).
     pub fn end_drag(&mut self) {
         if self.tool.dragging && self.tool.spring {
             self.send(Command::Dyn(DynCommand::DragEnd));
         }
+        if self.tool.dragging && self.tool.drag_moved {
+            self.ui.auto_bonds.drag_ended(Instant::now());
+        }
+        self.tool.drag_moved = false;
         self.tool.dragging = false;
         self.tool.spring = false;
         self.tool.drag_plane = None;
@@ -3108,10 +3121,12 @@ nucleus 1 {a} {} {}
         let mut fewer = shown.clone();
         fewer.nuclei.pop();
         assert!(v.angle_labels(&fewer).is_empty(), "a graph of another nucleus count");
-        // a stale graph: faded arcs and labels
+        // a stale graph: faded arcs and labels, the arcs broken into the stale dashes (user request
+        // 2026-11-13: fewer chords than the solid arcs)
+        let stale_bonds = overlay::bond_lines(&pos, &ch4, true).len();
         v.snapshot = Some(snapshot_with_bonds(&shown, ch4, true));
-        let stale = arcs(&v);
-        assert_eq!(stale.len(), fresh.len());
+        let stale = v.overlay_lines(&shown).split_off(stale_bonds);
+        assert!(!stale.is_empty() && stale.len() < fresh.len(), "{} vs {}", stale.len(), fresh.len());
         assert!(stale.iter().all(|p| p.colour[3] == overlay::STALE_BOND_ALPHA));
         assert!(v.angle_labels(&shown).iter().all(|l| (l.alpha, l.bg) == (110, 70)));
     }
