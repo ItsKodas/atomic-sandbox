@@ -3585,7 +3585,11 @@ fn fnv1a(text: &str) -> u64 {
 /// the same one sample quarantined, only the note's words ("the model cannot represent them" → "the
 /// fit without each predicts it at up to 49× its bound, and keeping them breaks the fit of their
 /// neighbours"); with the old wording substituted back the trace hashes to the old pin exactly.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xd180_e6f1_231a_cb8f;
+/// **Re-pinned for the note's fix round 2 wording** (0xd180_e6f1_231a_cb8f → below): the same one
+/// line, now "1 samples quarantined this refit (1 held in all) — the fit without each of them
+/// predicts it at up to 49× its bound, …"; with the round-1 words substituted back the trace hashes
+/// to the round-1 pin exactly.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xdd8a_dc25_aa37_49e3;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -9431,7 +9435,8 @@ impl ForceProvider for StubKsGpu {
 /// earlier recovery had set. Under the cap one sample (H₂ at 5.585 Bohr in the 101³ box, its
 /// restricted-spin label 40 mHa above two atoms) drives the energy noise to 2e-2 Ha/atom and the
 /// misfit spreads over every H₂ sample (−25 mHa/atom each, the sample itself −6 mHa/atom): the
-/// worst offenders are 380 samples, past the quarantine's 10 % cap, so the old recovery did
+/// worst offenders are 379 samples (re-measured 2026-11-12, `recovery_loo::stuck_collection_rounds_under_both_rankings`,
+/// by either ranking; 380 when first recorded on 2026-10-21), past the quarantine's 10 % cap, so the old recovery did
 /// nothing — untrusted at every refit, and (every fallback a copy of a stored sample) no refit
 /// changed it. The recovery now re-judges the cap against the default basis (steps 1b/3): the
 /// refit ends trusted, every held sample is written to the collection as a status record, and a

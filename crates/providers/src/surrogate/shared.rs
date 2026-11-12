@@ -826,6 +826,13 @@ impl SurrogateKs {
                 Some(o) => {
                     let e = raw[i] - o;
                     let st = self.store.as_mut().expect("stored");
+                    // the label moves without the fit (no `model_gen` bump; a refit is pending):
+                    // the leave-one-out ratios cached for the fit stay its own, but a recompute
+                    // before the next fit (`ensure_loo_ratios` after a restore whose cache was not
+                    // that fit's) would pair these new labels' residuals with the old fit's hat
+                    // matrix — not a leave-one-out. Harmless inside a refit; Task 2's between-refit
+                    // display must not recompute after a rebase (or the rebase must bump the key).
+                    // (Fix round 2, M7: flagged for Task 2.)
                     if st.samples[i].energy.to_bits() != e.to_bits() {
                         st.samples[i].energy = e;
                         changed = true;

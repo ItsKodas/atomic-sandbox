@@ -93,7 +93,8 @@ fn own_training_ratio(s: &SurrogateKs, k: usize) -> f64 {
 /// round, trusted. Nearby variants behave alike (0.85–1.0 Bohr, forces × 1.6–2.5, seeds 1804, 1,
 /// 2, with the outlier's own ratio 0.57–0.98): the training ranking holds 5–8 victims, never the
 /// outlier, and the leave-one-out ranking the outlier alone; with a gentler outlier (× ≤ 1.8 at
-/// 0.85–0.95 Bohr) step 1's degree-cap retry recovers first, under either ranking.
+/// 0.85–0.95 Bohr) step 1's degree-cap retry recovers first, under either ranking. (That sweep
+/// was an exploration and is not pinned; `references.md` says so.)
 #[test]
 fn a_high_leverage_outlier_is_held_alone_and_trust_returns() {
     // the premise, on the entry fit
@@ -126,6 +127,7 @@ fn a_high_leverage_outlier_is_held_alone_and_trust_returns() {
         old_way.untrusted_reason()
     );
     assert!(old_way.quarantined() >= 5 && !old_way.is_quarantined(OUTLIER), "the training ranking holds victims");
+    assert!(!old_way.trusted(), "and ends untrusted: {:?}", old_way.untrusted_reason());
 
     // the refit as it is: the outlier alone, trusted
     let mut s = outlier_store();
@@ -137,7 +139,7 @@ fn a_high_leverage_outlier_is_held_alone_and_trust_returns() {
     assert_eq!(s.degree_cap, None, "step 2 recovered it on the default basis (step 1's cap retry did not)");
     assert_eq!(
         s.recovery_note(),
-        Some("1 samples quarantined — the fit without each predicts it at up to 29× its bound, and keeping them breaks the fit of their neighbours (1 this refit; kept, excluded from the fit; geometries near them fall back)")
+        Some("1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 29× its bound, and keeping them breaks the fit of their neighbours (kept, excluded from the fit; geometries near them fall back)")
     );
     assert_eq!(s.samples(), OUTLIER + 1, "never dropped");
 }
@@ -245,7 +247,8 @@ fn undefined_leave_one_out_ranks_first_and_never_crosses_the_cap() {
     let many: Vec<usize> = (0..20).collect();
     inject(&mut s, &many);
     let report = s.report().unwrap().clone();
-    let (_, worst, ranking) = s.quarantine_rounds(report);
+    let (_, held, ranking) = s.quarantine_rounds(report);
+    let worst = held.worst;
     println!("20 undefined: held {}, trusted {} {:?}; {ranking:?}", s.quarantined(), s.trusted(), s.untrusted_reason());
     // the leave-one-out rounds hold none; the training ranking's fallback (7 victims, untrusted on
     // this fixture) does not recover either, so the leave-one-out result stands
@@ -455,6 +458,83 @@ fn recovery_on_a_collection_snapshot() {
     if s.samples() == 1805 {
         assert!(held_1804, "#1804 is held");
     }
+}
+
+/// Fix round 2, M4: the **energy channel** of the ratio on a real fit. A dimer whose energy label
+/// is 0.1 Ha off (`a_stray_sample_is_quarantined_then_superseded_and_trust_returns`'s glitch) among
+/// 40 exact ones: its ratio is the energy channel |r_E|/N/`energy_std_per_atom` of its own
+/// leave-one-out (the fit's energy per atom or not, as `loo_ratio` reads it), far above its force
+/// channel, and the leave-one-out ranking names it alone.
+#[test]
+fn the_energy_channel_of_the_ratio_names_an_energy_glitch() {
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.fit_store().unwrap();
+    let (model, smp) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap().samples[40].clone());
+    let l = surrogate::loo::leave_one_out(model, &smp).expect("defined");
+    let e = l.energy.unwrap().abs() / if model.energy_per_atom { 1.0 } else { 2.0 } / s.policy.energy_std_per_atom;
+    let f = l
+        .forces
+        .iter()
+        .zip(&smp.forces)
+        .filter_map(|(r, f)| r.map(|r| {
+            let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+            d / b
+        }))
+        .fold(0.0, f64::max);
+    let rho = s.loo_ratios().unwrap().iter().find(|x| x.0 == 40).unwrap().1;
+    println!("energy glitch: ρ {rho:.2} = energy channel {e:.2} (force channel {f:.2e})");
+    assert_eq!(rho, e, "the ratio is the energy channel");
+    assert!(e > 10.0 * f.max(1.0), "the energy channel decides");
+    assert_eq!(s.worst_offenders().0, vec![40], "and names the glitch alone");
+}
+
+/// Fix round 2, I1 (the coordinator's ruling): step 3 — the default-basis retry when an earlier
+/// recovery set `degree_cap` — runs whenever step 2's result is **not recovered**, also when that
+/// result passes its residuals but is short of samples (Q′ grows with the cap). The store:
+/// `dimers_and_a_tight_triangle(49)` (49 H₂ and one tight H₃, Q′ 51 at cap 6, 29 at cap 4) plus one
+/// dimer whose energy label is 0.05 Ha off, entered at cap 6 as an earlier recovery would leave it.
+/// Step 1b (the default basis alone) fails on both outliers; step 2 (cap 6) holds the glitch and
+/// the triangle (#50, #49): residuals pass, but 49 samples < Q′ 51 — not recovered, by either
+/// ranking, so the leave-one-out result stands with `recoverable_fail()` false. Measured with the
+/// old gate ("residuals or noise fail"): step 3 was skipped and the refit ended untrusted, "n_samples
+/// 49 < 51", cap 6 — this test failed. Gated on "not recovered", step 3 runs from the entry codes
+/// on the default basis (Q′ 29) and recovers: the same two held, trusted. (The twin pins the
+/// premise with the glitch alone held: residuals pass, short of samples.)
+#[test]
+fn step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples() {
+    let make = || {
+        let mut s = dimers_and_a_tight_triangle(49);
+        let glitch = in_cell_65(dimer(1.7, [0.0, 0.6, 0.8], [0.0; 3], 1, 1));
+        let mut bad = morse_sample(&MorseDimer::h2(), &glitch);
+        bad.energy += 0.05;
+        s.add_sample(bad, &glitch).unwrap();
+        s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+        s
+    };
+    let glitch = 50;
+    // the premise, on a twin: at cap 6 with the glitch held the residuals pass, the samples do not
+    let mut twin = make();
+    twin.fit_store().unwrap();
+    assert!(twin.recoverable_fail(), "the premise: the entry fit fails its residuals: {:?}", twin.untrusted_reason());
+    twin.quarantine.resize(twin.samples(), Q_NONE);
+    twin.quarantine[glitch] = Q_HELD;
+    twin.species_dirty = true;
+    twin.fit_store().unwrap();
+    println!("twin, cap 6, glitch held: residuals fail {}, short of samples {} ({:?})", twin.recoverable_fail(), twin.trust_needs_samples(), twin.untrusted_reason());
+    assert!(!twin.recoverable_fail() && twin.trust_needs_samples(), "the premise: step 2's result passes its residuals but is short of samples");
+    // the refit: step 3 runs and recovers on the default basis
+    let mut s = make();
+    s.refit().unwrap();
+    let held: Vec<usize> = (0..s.samples()).filter(|&i| s.is_quarantined(i)).collect();
+    println!("after the refit: cap {:?}, held {held:?}, trusted {} {:?}; {:?}", s.degree_cap, s.trusted(), s.untrusted_reason(), s.recovery_note());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert_eq!(s.degree_cap, None, "step 3: the default basis");
+    assert!(s.is_quarantined(glitch));
+    assert!(s.recovery_note().is_some_and(|n| n.starts_with("back to the default basis")), "{:?}", s.recovery_note());
 }
 
 /// Fix round 1 (option A): where the leave-one-out rounds do not recover, the training-residual

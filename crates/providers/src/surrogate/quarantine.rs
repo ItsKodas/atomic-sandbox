@@ -189,23 +189,41 @@ pub(super) enum Ranking {
     Training,
 }
 
+/// What a refit's quarantine rounds held, for the note: the largest ratio among the samples they
+/// held (0 when none; ∞ for an undefined leave-one-out, ruling R1a) and, when that round ranked
+/// against the absolute force tier (only the force noise failed), that tier (Ha/Bohr).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Held {
+    pub(super) worst: f64,
+    pub(super) tier: Option<f64>,
+}
+
+impl Held {
+    pub(super) const NONE: Held = Held { worst: 0.0, tier: None };
+}
+
 /// The recovery note's words for quarantine rounds (spec R1, "The recovery note says what was
-/// done"): `held` samples quarantined in all, `added` of them by this refit, `worst` the largest
-/// ratio among the ones the rounds held by `ranking` — for the leave-one-out ranking ∞ when one of
-/// them has no leave-one-out prediction (ruling R1a). Rounded: a whole number from 10×, one
-/// decimal below. The words name the ranking that recovered (fix round 1).
-pub(super) fn quarantine_words(held: usize, added: usize, worst: f64, ranking: Ranking) -> String {
+/// done"; fix round 2, M3): `added` samples quarantined **by this refit** — the ones whose ratio
+/// it measured — with `held` in all, and `h` the largest ratio among them by `ranking` (the
+/// ranking whose result stands, fix round 1), against each sample's own bound or, in the
+/// noise-only mode, the absolute force tier. Rounded: a whole number from 10×, one decimal below.
+pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Ranking) -> String {
+    let worst = h.worst;
     let r = if worst >= 10.0 { format!("{worst:.0}") } else { format!("{worst:.1}") };
+    let bound = match h.tier {
+        Some(t) => format!("the {t:.0e} Ha/Bohr force-noise tier"),
+        None => "its bound".to_string(),
+    };
     let why = match ranking {
         Ranking::LeaveOneOut if worst.is_finite() => {
-            format!("the fit without each predicts it at up to {r}× its bound, and keeping them breaks the fit of their neighbours")
+            format!("the fit without each of them predicts it at up to {r}× {bound}, and keeping them breaks the fit of their neighbours")
         }
         Ranking::LeaveOneOut => "the fit without one of them cannot predict it at all (it alone spans a direction of the fit), and keeping them breaks the fit of their neighbours".to_string(),
         Ranking::Training => format!(
-            "ranked by their own training residual (the leave-one-out ranking did not recover the fit), the fit misses each by up to {r}× its bound: the model cannot represent them"
+            "ranked by their own training residual (the leave-one-out ranking did not recover the fit), the fit misses each by up to {r}× {bound}: the model cannot represent them"
         ),
     };
-    format!("{held} samples quarantined — {why} ({added} this refit; kept, excluded from the fit; geometries near them fall back)")
+    format!("{added} samples quarantined this refit ({held} held in all) — {why} (kept, excluded from the fit; geometries near them fall back)")
 }
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
@@ -437,8 +455,13 @@ impl SurrogateKs {
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
-        // stands only if it recovers (the trust rule, its counts included), else step 2's result does
-        if let Some((saved, flags, dirty)) = entry.filter(|_| self.recoverable_fail()) {
+        // stands only if it recovers (the trust rule, its counts included), else step 2's result
+        // does. Run whenever step 2's result is **not recovered** (fix round 2, I1, the
+        // coordinator's ruling) — not only while its residuals or noise fail: a step-2 result that
+        // passes its residuals but is short of samples (Q′ grows with the cap) must not suppress
+        // the default-basis retry, or option A's leave-one-out-first order could be worse than
+        // the ranking before it
+        if let Some((saved, flags, dirty)) = entry.filter(|_| !self.recovered()) {
             let capped = (self.save_state(), self.quarantine.clone(), report.clone(), self.species_dirty, self.recovery.clone());
             self.restore_state(saved);
             self.quarantine = flags;
@@ -481,12 +504,12 @@ impl SurrogateKs {
     /// the ranking before 2026-11-12). Their result stands only if it recovers; else the
     /// leave-one-out result does (a misfit stays untrusted either way). So the recovery is never
     /// worse than the training ranking's and keeps the leave-one-out ranking's wins, for up to
-    /// [`QUARANTINE_ROUNDS`] more fits on a refit that is failing anyway. Measured: the stuck-H
-    /// collection's step 3 needs the fallback (leave-one-out 47 held, 1.60×; training 38 held,
-    /// trusted), a high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report
-    /// that stands, the largest ratio among the samples its rounds held (0 when none) and the
-    /// ranking whose result stands.
-    pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, f64, Ranking) {
+    /// [`QUARANTINE_ROUNDS`] more fits on a refit that is failing anyway (with step 3 gated on
+    /// "not recovered", fix round 2). Measured: the stuck-H collection's step 3 needs the fallback
+    /// (leave-one-out 47 held, 1.60×; training 38 held, trusted), a high-leverage outlier the
+    /// first (`tests/recovery_loo.rs`). Returns the report that stands, what its rounds held
+    /// ([`Held`]) and the ranking whose result stands.
+    pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
         // tests: the training ranking alone, the recovery before spec R1
         #[cfg(test)]
         if self.training_ranking {
@@ -521,15 +544,17 @@ impl SurrogateKs {
     /// the cap is checked before a round holds anything, so a round whose offenders would cross it
     /// (many undefined leave-one-out residuals, all ranked ∞, among them) holds none of them and
     /// ends the rounds; a failed fit restores the previous one and stops. Returns the report that
-    /// stands and the largest ratio among the samples it held (0 when none).
-    fn rounds_by(&mut self, report: FitReport, ranking: Ranking) -> (FitReport, f64) {
+    /// stands and what it held ([`Held`]).
+    fn rounds_by(&mut self, report: FitReport, ranking: Ranking) -> (FitReport, Held) {
         let mut report = report;
-        let mut held_worst = 0.0f64;
+        let mut held = Held::NONE;
         let n_store = self.samples();
         for _ in 0..QUARANTINE_ROUNDS {
             if !self.recoverable_fail() {
                 break;
             }
+            // the bound both rankings rank against this round (their own `absolute` switch)
+            let tier = (!self.residuals_fail()).then_some(self.policy.force_std_abs);
             let (worst, ratio) = match ranking {
                 Ranking::LeaveOneOut => self.worst_offenders(),
                 Ranking::Training => self.training_offenders(),
@@ -548,7 +573,9 @@ impl SurrogateKs {
             match self.fit_store_deferred() {
                 Ok(r) => {
                     report = r;
-                    held_worst = held_worst.max(ratio);
+                    if !(ratio <= held.worst) {
+                        held = Held { worst: ratio, tier };
+                    }
                 }
                 Err(_) => {
                     self.restore_state(saved);
@@ -557,12 +584,12 @@ impl SurrogateKs {
                 }
             }
         }
-        (report, held_worst)
+        (report, held)
     }
 
     /// The recovery note of quarantine rounds that added samples since `before` held; `worst` is
-    /// the largest ratio among the samples they held by `ranking`, the one whose result stands.
-    fn note_quarantined(&mut self, before: usize, report: FitReport, worst: f64, ranking: Ranking) -> FitReport {
+    /// what they held by `ranking`, the one whose result stands.
+    fn note_quarantined(&mut self, before: usize, report: FitReport, worst: Held, ranking: Ranking) -> FitReport {
         let added = self.quarantined().saturating_sub(before);
         if added > 0 {
             self.recovery = Some(quarantine_words(self.quarantined(), added, worst, ranking));
@@ -705,8 +732,8 @@ impl SurrogateKs {
         self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
-    /// The recovery's offenders (spec R1, since 2026-11-12): the fitted samples (not excluded, not
-    /// box-affected) whose **leave-one-out ratio** ([`loo_ratio`]: how far the fit *without* the
+    /// The recovery's offenders (spec R1, since 2026-11-12): the fitted samples (not excluded — at
+    /// the fit or since — and not box-affected) whose **leave-one-out ratio** ([`loo_ratio`]: how far the fit *without* the
     /// sample misses it — the per-atom energy over its threshold or the worst atom's force over
     /// its bound) exceeds 1 and is within a factor 2 of the worst such ratio; and that worst ratio
     /// (0 without a fit). The force bound is the policy's per-atom bound while the training
@@ -728,7 +755,10 @@ impl SurrogateKs {
         let absolute = !self.residuals_fail();
         let Some(c) = self.ensure_loo_ratios() else { return (Vec::new(), 0.0) };
         let ratios: Vec<(usize, f64)> = c.rows.iter().zip(&c.tier).map(|(&(i, own), &tier)| (i, if absolute { tier } else { own })).collect();
-        let ratios: Vec<(usize, f64)> = ratios.into_iter().filter(|&(i, _)| !self.is_box(i)).collect();
+        // the standing fit's members, less any sample excluded since that fit (a hold, a forget:
+        // fix round 2, M1 — never named twice, never counted twice against the cap) and the
+        // box-affected ones
+        let ratios: Vec<(usize, f64)> = ratios.into_iter().filter(|&(i, _)| !self.excluded(i) && !self.is_box(i)).collect();
         let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
         if worst <= 1.0 {
             return (Vec::new(), worst);

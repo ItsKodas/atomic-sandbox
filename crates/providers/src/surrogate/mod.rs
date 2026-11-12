@@ -724,13 +724,22 @@
 //!    in-sample training residual (`training_offenders`, the ranking before); that result stands only
 //!    if it recovers, else the leave-one-out one does, and the note names the ranking that stood
 //!    ("ranked by their own training residual (the leave-one-out ranking did not recover the fit)").
-//!    The recovery is thus never worse than before, for up to [`QUARANTINE_ROUNDS`] more fits on a
-//!    refit that is failing anyway. Why both: once a label error is held, the leave-one-out ratio
+//!    Step 3 (below) then runs whenever the result standing after step 2 is not recovered —
+//!    residuals, noise **or the counts** (fix round 2, I1: before, only while the residuals or the
+//!    noise failed, so a leave-one-out result that passed its residuals short of samples suppressed
+//!    the default-basis retry; `step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples`).
+//!    With both, the recovery is never worse than before, for up to [`QUARANTINE_ROUNDS`] more fits
+//!    per ranking on a refit that is failing anyway. The note counts the samples **this refit**
+//!    held and measured ("K samples quarantined this refit (N held in all) — …"), against each one's
+//!    own bound or, in the noise-only mode, "the 2e-3 Ha/Bohr force-noise tier". Why both: once a label error is held, the leave-one-out ratio
 //!    can go on naming high-leverage samples whose own fit is fine — the stuck-H collection's step 3
 //!    (below) ends untrusted at 47 held by it, trusted at 38 held by the fallback. On the user's
 //!    pre-1805 snapshot #1804 is held in round 1, but the refit's release step (run first, against
 //!    the fit #1804 bends) puts #1455 back: the first refit ends untrusted at 1.0185× (128 held,
-//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). Not changed: the
+//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). The holds of a
+//!    recovery that did not restore trust stay (and are written to a collection): a sample held by
+//!    the leave-one-out ranking is one the fit without it misses, so a later refit's release by
+//!    reproduction rarely takes it back — only supersede or (Task 2) the user's Restore. Not changed: the
 //!    rounds, the cap, the degree-cap steps, release and supersede, and the trust rule that judges
 //!    every fit;
 //! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
@@ -739,7 +748,8 @@
 //!    recover either, the same quarantine rounds run again from the default basis (from the state
 //!    the refit entered with) — that result stands only if it is trusted, else step 2's does. The
 //!    case (`references.md` "M8a stuck collection"): one stretched-H₂ label under cap 6 drove the
-//!    energy noise to 2e-2 Ha/atom and spread its misfit over all 380 H₂ samples, so step 2 named
+//!    energy noise to 2e-2 Ha/atom and spread its misfit over the H₂ samples (379 named as
+//!    offenders, re-measured 2026-11-12; 380 when first recorded), so step 2 named
 //!    no offender within its cap and the cap could never be undone — untrusted at every refit. A quarantined sample stays in the store (and in
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
@@ -3351,7 +3361,7 @@ impl PassCoverage {
             ));
         }
         if self.quarantined > 0 {
-            why.push(format!("{} are quarantined (the model cannot represent them)", self.quarantined));
+            why.push(format!("{} are quarantined (held out by the trust recovery: each bent the fit of its neighbours, or the fit could not reproduce it)", self.quarantined));
         }
         if self.other > 0 {
             why.push(format!("{} are otherwise left out", self.other));
