@@ -672,6 +672,12 @@ pub enum DynCommand {
     Pin(usize, bool),
     /// Paused only: a new scene, time restarts.
     ReplaceScene(Scene),
+    /// The clock a resumed session goes on from (atomic time units; the app's
+    /// `--resume-session` after an update): accepted only before this driver's first step
+    /// (`step` = 0) and for a finite t ≥ 0, else rejected. It sets `sim_time` alone — the step
+    /// count, the energy history and its drift fit start afresh, as for any new driver — so
+    /// nothing physical changes.
+    SetClock(f64),
     /// Paused only: teleport, velocity zeroed, provider reset.
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
     /// Paused only (the Edit tool, user request 2026-10-20): each listed nucleus to its new
@@ -1353,6 +1359,15 @@ impl Dynamics {
                 self.work += self.scene.kinetic_energy() - k0;
             }
             DynCommand::SetComCorrection(on) => self.com_correction = on,
+            DynCommand::SetClock(t) => {
+                if !(t.is_finite() && t >= 0.0) {
+                    return self.reject(format!("clock {t} a.u.: must be finite and ≥ 0"));
+                }
+                if self.step != 0 {
+                    return self.reject(format!("the clock is set only before the first step (this run is at step {})", self.step));
+                }
+                self.sim_time = t;
+            }
             DynCommand::SetWalls(w) => {
                 if let Some(w) = w {
                     let max = Walls::max_half_width(&self.scene.cell);

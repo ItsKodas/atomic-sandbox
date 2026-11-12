@@ -34,6 +34,10 @@ semver = "1"
 sha2 = "0.10"
 # the minisign signature over SHA256SUMS.txt, verified with the compiled-in key (plumbing; installer spec)
 minisign-verify = "0.2"
+# the updater's HTTPS GETs (GitHub's releases list and its asset downloads) over rustls with the
+# bundled Mozilla roots, no native-tls (plumbing; installer spec). 2.x: its per-read timeout keeps a
+# slow download going while a stalled one fails (3.x times the whole body)
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 # test only: signs the updater's fixtures with the committed TEST-ONLY key (an ignored helper, `update::verify`)
 [dev-dependencies]

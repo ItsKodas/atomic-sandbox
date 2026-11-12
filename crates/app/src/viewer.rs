@@ -483,6 +483,10 @@ pub struct Viewer {
     /// The next estimated worker resumes the interrupted pass in this folder instead of its
     /// `EnsureModel` ([`Viewer::resume_training`]).
     resume_next: Option<PathBuf>,
+    /// The clock (atomic time units) the next worker's driver goes on from, once
+    /// (`DynCommand::SetClock`): a session resumed after an update (`--resume-session`,
+    /// `update::apply::Session`); `None` = time starts at 0, as for any new run.
+    pub resume_clock: Option<f64>,
 }
 
 impl Viewer {
@@ -544,6 +548,7 @@ impl Viewer {
             training_dir: None,
             collections_dir: None,
             resume_next: None,
+            resume_clock: None,
         })
     }
 
@@ -593,11 +598,16 @@ impl Viewer {
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
         self.ui.activity.knowledge = None; // the new worker ships its own model's map
+        let mut settings = self.ui.run_settings();
+        // a resumed session's clock goes to its first driver only (a later solver switch restarts it)
+        if let Some(t) = self.resume_clock.take() {
+            settings.push(DynCommand::SetClock(t));
+        }
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
             gpu.clone(),
-            self.ui.run_settings(),
+            settings,
             estimated.then(|| self.autosave.clone()),
         ));
         self.gpu = gpu;

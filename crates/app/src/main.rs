@@ -29,7 +29,8 @@ mod sim;
 mod tools;
 mod trails;
 mod ui;
-// the in-app updater's release logic (installer Task 2); the fetch and the Version panel (Tasks 3, 4) use the rest
+// the in-app updater: release logic (installer Task 2), the fetch, download, session and hand-off
+// (Task 3; `--resume-session` uses the session); the Version panel (Task 4) uses the rest
 #[allow(dead_code, unused_imports)]
 mod update;
 mod viewer;
@@ -411,6 +412,9 @@ fn main() {
     let mut start_layout = None;
     // input replay (M6 spec §8): record the window's session, or run a script headlessly
     let (mut record, mut replay_path) = (None, None);
+    // hidden, the installer's relaunch after an update (`update::apply`): the session saved
+    // before it, reopened paused (the window only)
+    let mut resume_session: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -464,6 +468,7 @@ fn main() {
                     .unwrap_or_else(|e| panic!("{e}"))
             }
             "--scene" => flags.scene = Some(args.next().expect("--scene needs a file")),
+            "--resume-session" => resume_session = Some(PathBuf::from(args.next().expect("--resume-session needs a session file"))),
             "--walls" => {
                 flags.walls = Some(
                     args.next()
@@ -542,6 +547,16 @@ fn main() {
         }
         return;
     }
+    // the session from before an update: its backend is the one the window starts on. A session
+    // that can't be read is said and skipped — the app opens as at any start, never not at all
+    let (session, session_error) = match resume_session.as_deref().map(update::load_session) {
+        Some(Ok(s)) => (Some(s), None),
+        Some(Err(e)) => (None, Some(format!("couldn't restore the session from before the update: {e}"))),
+        None => (None, None),
+    };
+    if let Some(s) = &session {
+        backend = s.backend;
+    }
     let mut viewer = Viewer::new(&preset)
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
     // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
@@ -563,6 +578,16 @@ fn main() {
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");
         std::process::exit(1);
+    }
+    // after the profile and the flags: the session's scene and settings win, paused
+    let resumed = session.is_some();
+    if let Some(s) = session {
+        s.apply(&mut viewer);
+        viewer.ui.set_status("restored the session from before the update (paused)");
+    }
+    if let Some(e) = session_error {
+        eprintln!("{e}");
+        viewer.ui.set_status(e);
     }
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
@@ -587,7 +612,7 @@ fn main() {
         // grid; a preset is recorded with the quality it was loaded at (the quality first, so the
         // preset loads at it), so a replay does not depend on the app's default quality
         let mut start = match u.source.preset() {
-            Some(p) if flags.scene.is_none() => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
+            Some(p) if flags.scene.is_none() && !resumed => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
             _ => vec![],
         };
         // the ionic policy first (M7): a preset loads under the policy in force, so the pin precedes it — and
@@ -610,7 +635,9 @@ fn main() {
         if u.cloud_refresh {
             start.push(ui::Action::Cloud { superposition: u.cloud_superposition, refresh: true, refresh_s: u.cloud_refresh_s });
         }
-        let scene = flags.scene.as_ref().map(|f| std::path::absolute(f).map_or(f.clone(), |p| p.display().to_string()));
+        // a resumed session is recorded as its file, which reads as a plain scene file
+        let resumed_file = resume_session.as_ref().filter(|_| resumed).map(|p| p.display().to_string());
+        let scene = flags.scene.as_ref().or(resumed_file.as_ref()).map(|f| std::path::absolute(f).map_or(f.clone(), |p| p.display().to_string()));
         Record { path, start, scene, recorder: None, was_idle: false }
     });
     let event_loop = EventLoop::new().expect("event loop");

@@ -45,6 +45,12 @@ fn key_line(pubkey: &str) -> Option<&str> {
     pubkey.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("untrusted comment:"))
 }
 
+/// Whether `pubkey` holds a key at all (not the placeholder): the download is refused before
+/// anything is fetched without one (`apply::Download`). [`verify`] still decides.
+pub fn has_key(pubkey: &str) -> bool {
+    key_line(pubkey).is_some()
+}
+
 /// `sums` is signed by `pubkey` (`sig`: the `.minisig` file's bytes) and lists `file_name` with
 /// `file_bytes_sha256`: `Ok(())`, else why not (module doc). The signature is checked before the
 /// sums are read.
