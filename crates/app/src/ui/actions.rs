@@ -248,8 +248,9 @@ pub enum Action {
     /// another download. The installed build only. Recorded as `# not replayable: update`.
     InstallVersion(String),
     /// "Restart now" once the download is verified, through the restart guard (an unsaved model
-    /// first, then a running job: `ui::version`): the session saved, the installer handed off, the
-    /// app closed. Recorded as `# not replayable: update`.
+    /// first, then a playing run, then a background job: `ui::version`): refused while another copy
+    /// runs, else the session saved, the installer handed off, the app closed. Recorded as
+    /// `# not replayable: update`.
     RestartToUpdate,
     /// The download's Cancel ("Cancelling…" until it has stopped; a waiting restart is called off).
     /// Recorded as `# not replayable: update`.
@@ -498,6 +499,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
             st.set_status(format!("saving the model to {}", path.display()));
+            // what it holds now is in a file: Restart now asks only about samples learned after this
+            st.update.note_saved(input);
         }
         Action::LoadModel => {
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));

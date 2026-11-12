@@ -22,24 +22,35 @@
 //!
 //! **The check** runs on its own thread, never in a frame: Check for updates now (any build), and
 //! — in the window of an installed or portable build with Check automatically on — at launch and
-//! then every [`CHECK_EVERY`]. A build from source never checks by itself, so the tests, replays
-//! and `start.bat` make no network call. A failed check is one quiet line, and the last list stays.
+//! then again once [`CHECK_EVERY`] has passed since the last one started. That is tested against
+//! the last check's `Instant` at every frame, so a window that draws no frame (idle, minimised)
+//! checks at its next frame after the 6 hours, not on the minute. A build from source never checks
+//! by itself, so the tests, replays and `start.bat` make no network call. A failed check is one
+//! quiet line, and the last list stays.
 //!
-//! **The restart guard** (`Action::RestartToUpdate`): an unsaved in-session model with no
-//! collection attached is not kept by the restart, so the panel first offers Save model… /
-//! Restart anyway / Cancel. Then, while a sampling pass, a refit, a relax or a solve runs (a
-//! playing run is paused first, as the restart opens paused anyway), it shows "Waiting for the
-//! refit to finish…" with Cancel it and restart / Keep waiting, and restarts by itself when the
-//! job ends. Both cards (and Restart now) say that another open window will be asked to close by
-//! the installer. The restart itself is the viewer's (`PanelOutput::restart_for_update`): the
-//! session saved, the verified installer handed off, the app closed through its own exit path.
+//! **The restart guard** (`Action::RestartToUpdate`; [`Guard`]):
+//! 1. A model the restart wouldn't keep — samples learned since it was last loaded from or saved to
+//!    a file, with no shared collection attached ([`save_note`]) — first gets Save model… /
+//!    Restart anyway / Cancel, saying what would be lost.
+//! 2. A playing simulation is never paused by itself: "The simulation is playing." with **Pause and
+//!    restart** (the pause, as the Pause button sends it — the step being solved is dropped — then
+//!    the restart once the run has stopped) / Cancel.
+//! 3. A background job — a sampling pass, a refit, a relax, a background audit ([`running`]) —
+//!    gets "Waiting for the refit to finish…" with Cancel it and restart / Keep waiting; the restart
+//!    then goes ahead by itself when the job ends.
+//!
+//! Closing the Version window calls a pending restart off (its card is drawn only there): the
+//! status line says so, and the download stays ready. Every way back to [`Guard::Idle`] clears the
+//! guard's flags. The restart itself is the viewer's (`PanelOutput::restart_for_update`): refused
+//! while another copy of this install runs (`crate::instance` — the silent installer must not
+//! close it), else the session saved, the verified installer handed off, the app closed through its
+//! own exit path.
 //!
 //! The channel and Check automatically are display settings kept in the profile; Check now,
 //! Install, Restart now and Cancel are `ui::Action`s, so `--record` sees them (a replay skips them:
 //! it never touches the network or installs).
 use super::{probed, theme, Action, PanelInput, PanelOutput, UiState, AMBER, GREEN};
 use crate::paths::DataMode;
-use crate::sim::Command;
 use crate::update::release::MANIFEST_NAME;
 use crate::update::{self, Channel, CheckError, Download, DownloadState, Formats, Release, Verified};
 use egui::{Button, Margin, RichText, Stroke, Ui};
@@ -52,9 +63,10 @@ use std::time::{Duration, Instant};
 pub const UPDATES_OFF: &str = "running from source: updates are off";
 /// A portable copy's refusal of an install.
 pub const PORTABLE_REFUSED: &str = "a portable copy isn't updated in place: download the zip instead";
-/// Said wherever a restart is offered (plan review focus 4: the installer's `CloseApplications`
-/// closes or reports another copy holding the exe).
-pub const OTHER_WINDOW: &str = "If another Atomic Sandbox window is open, the installer will ask to close it.";
+/// The playing card's line (ruling I2: the restart never pauses by itself).
+pub const PLAYING: &str = "The simulation is playing.";
+/// The status line when closing the Version window calls a pending restart off (ruling I1).
+pub const CALLED_OFF: &str = "Restart for the update called off";
 /// The background check's interval (after the one at launch).
 pub const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -112,10 +124,14 @@ impl UpdateNet for Offline {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guard {
     Idle,
-    /// An unsaved in-session model with no collection: Save model… / Restart anyway / Cancel.
+    /// A model the restart wouldn't keep ([`save_note`]): Save model… / Restart anyway / Cancel.
     SaveFirst,
-    /// A job runs: the restart waits for it. `prompt`: the card with Cancel it and restart / Keep
-    /// waiting (Keep waiting leaves the quieter "Restarting when … finishes" line).
+    /// The simulation is playing: Pause and restart / Cancel.
+    Playing,
+    /// Pause and restart was pressed: the restart follows once the run has stopped.
+    Pausing,
+    /// A background job runs: the restart waits for it. `prompt`: the card with Cancel it and
+    /// restart / Keep waiting (Keep waiting leaves the quieter "Restarting when … finishes" line).
     Waiting { what: &'static str, prompt: bool },
 }
 
@@ -146,7 +162,7 @@ pub struct UpdateState {
     pub releases: Vec<Release>,
     /// The last check's quiet error line.
     pub error: Option<String>,
-    /// When the last check ended, and when the last one started.
+    /// When the last check ended, and when the last one started (the 6-hour test, every frame).
     pub checked_at: Option<Instant>,
     pub last_started: Option<Instant>,
     check: Option<Receiver<Result<Vec<Release>, CheckError>>>,
@@ -156,11 +172,16 @@ pub struct UpdateState {
     /// An older target's warnings, waiting for "Install … anyway".
     pub confirm: Option<Confirm>,
     pub guard: Guard,
-    /// The guard's "Restart anyway" (the unsaved model) and "Cancel it and restart" were pressed:
-    /// the next `RestartToUpdate` skips that check. Cleared when the restart goes ahead or is
-    /// called off.
+    /// The guard's "Restart anyway" (the model) and "Cancel it and restart" (the job) were
+    /// pressed: the next `RestartToUpdate` skips that question. Cleared on every way back to Idle.
     pub model_ack: bool,
     pub force: bool,
+    /// What the SaveFirst card says would be lost ([`save_note`], set as it opens).
+    pub save_text: String,
+    /// The model's samples when it was last loaded from or saved to a file (ruling M1), and the
+    /// file the model was last seen loaded from (a change of it is a load).
+    pub model_baseline: Option<usize>,
+    pub seen_file: Option<PathBuf>,
     pub net: Arc<dyn UpdateNet>,
 }
 
@@ -187,6 +208,9 @@ impl Default for UpdateState {
             guard: Guard::Idle,
             model_ack: false,
             force: false,
+            save_text: String::new(),
+            model_baseline: None,
+            seen_file: None,
             net,
         }
     }
@@ -223,6 +247,19 @@ impl UpdateState {
         self.download.as_ref().filter(|d| d.tag() == tag).map(Download::poll)
     }
 
+    /// No restart pending: the guard Idle and its flags cleared (ruling I4: every way back).
+    pub fn idle(&mut self) {
+        self.guard = Guard::Idle;
+        (self.model_ack, self.force) = (false, false);
+    }
+
+    /// The model was saved to a file now (`Action::SaveModel`): what it holds is the baseline.
+    pub fn note_saved(&mut self, input: &PanelInput<'_>) {
+        if let Some(m) = input.model() {
+            self.model_baseline = Some(m.samples);
+        }
+    }
+
     fn start_check(&mut self, now: Instant) {
         let net = self.net.clone();
         let (tx, rx) = channel();
@@ -257,8 +294,9 @@ pub fn zip_link(r: &Release) -> Option<&str> {
     r.assets.iter().find(|a| a.name.ends_with(".zip") && update::net::check_asset(&r.tag, a).is_ok()).map(|a| a.url.as_str())
 }
 
-/// What the restart would wait for (module doc), named: a sampling pass, a refit, a relax, a
-/// solve (the step's or a background audit's); `None` when nothing runs.
+/// The background job the restart waits for (module doc), named: a sampling pass, a refit, a
+/// relax, a background audit; `None` when none runs. The step solves of a playing run are not one:
+/// a playing run gets its own question ([`Guard::Playing`]).
 pub fn running(input: &PanelInput<'_>) -> Option<&'static str> {
     let probe = input.probe.as_ref();
     if input.sampling() {
@@ -267,18 +305,38 @@ pub fn running(input: &PanelInput<'_>) -> Option<&'static str> {
         Some("the refit")
     } else if input.relaxing() {
         Some("the relax")
-    } else if input.busy || probe.is_some_and(|p| p.main.running || p.side.running) {
-        Some("the solve")
+    } else if probe.is_some_and(|p| p.side.running) {
+        Some("the background audit")
     } else {
         None
     }
 }
 
-/// The estimated solver holds a model the restart wouldn't keep: samples, and no shared
-/// collection attached (a collection is on disk sample by sample, and re-attaches after the
-/// restart; anything else lives in this session).
-pub fn unsaved_model(input: &PanelInput<'_>) -> bool {
-    input.model().is_some_and(|m| m.samples > 0 && !matches!(m.source, sim::ModelSource::Collection { .. }))
+/// What the restart would lose of the estimated solver's model, in words, or `None` when it keeps
+/// it all (ruling M1): nothing is lost from a shared collection (on disk sample by sample, and
+/// re-attached after the restart), nor what a model file already holds — only the samples learned
+/// since the model was last loaded from or saved to a file (`UpdateState::model_baseline`), or
+/// all of a model this session learned and never saved.
+pub fn save_note(u: &UpdateState, input: &PanelInput<'_>) -> Option<String> {
+    let m = input.model()?;
+    if m.samples == 0 || matches!(m.source, sim::ModelSource::Collection { .. }) {
+        return None;
+    }
+    let since = u.model_baseline.filter(|&b| b <= m.samples);
+    let new = m.samples - since.unwrap_or(0);
+    if new == 0 {
+        return None;
+    }
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    Some(match (&m.source, since) {
+        (sim::ModelSource::File(p), Some(_)) if !m.source_is_autosave => format!(
+            "The model from {} has learned {new} sample{} since it was loaded or saved. The restart reopens the scene without them (the file itself stays as it was): save the model first to keep them.",
+            p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            s(new)
+        ),
+        (_, Some(_)) => format!("This session's model has learned {new} sample{} since you last saved it. The restart doesn't keep them: save the model first to keep them.", s(new)),
+        (_, None) => format!("This session's model ({new} sample{}) isn't in a shared collection or a saved file, so the restart doesn't keep it: save it first to keep it.", s(new)),
+    })
 }
 
 /// The installed build's refusals of an update (the other two modes).
@@ -300,7 +358,8 @@ pub(super) fn check_now(st: &mut UiState) {
 }
 
 /// `Action::InstallVersion(tag)`: the release's download, verified in the background (module
-/// doc). Starting it cancels another; the same release already downloading or ready is left.
+/// doc). Starting it cancels another, and any pending restart; the same release already
+/// downloading or ready is left.
 pub(super) fn install(st: &mut UiState, tag: &str, out: &mut PanelOutput) {
     if let Some(why) = refused(st.data_mode) {
         out.error = Some(why.into());
@@ -334,7 +393,7 @@ pub(super) fn install(st: &mut UiState, tag: &str, out: &mut PanelOutput) {
                 }
             }
             st.update.confirm = None;
-            st.update.guard = Guard::Idle;
+            st.update.idle();
             st.set_status(format!("downloading {tag}: it is verified before anything is installed"));
         }
         Err(e) => out.error = Some(format!("install {tag}: {e}")),
@@ -344,8 +403,7 @@ pub(super) fn install(st: &mut UiState, tag: &str, out: &mut PanelOutput) {
 /// `Action::CancelUpdateDownload`: the download stops (a running one reports at its next read;
 /// "Cancelling…" until then), and a pending restart is called off.
 pub(super) fn cancel_download(st: &mut UiState) {
-    st.update.guard = Guard::Idle;
-    (st.update.model_ack, st.update.force) = (false, false);
+    st.update.idle();
     let Some(d) = st.update.download.take() else { return };
     if matches!(d.poll(), DownloadState::Running(..)) {
         d.cancel();
@@ -355,8 +413,9 @@ pub(super) fn cancel_download(st: &mut UiState) {
 }
 
 /// `Action::RestartToUpdate` and the guard (module doc): the restart goes ahead
-/// (`PanelOutput::restart_for_update`) only with a verified installer, past the unsaved-model
-/// question, and with nothing running (or "Cancel it and restart").
+/// (`PanelOutput::restart_for_update`) only with a verified installer, past the model question,
+/// with the simulation not playing, and with no background job running (or "Cancel it and
+/// restart"). The status line is the viewer's, once the hand-off has worked (ruling M2).
 pub(super) fn restart(st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelOutput) {
     if let Some(why) = refused(st.data_mode) {
         out.error = Some(why.into());
@@ -366,35 +425,44 @@ pub(super) fn restart(st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelO
         out.error = Some("restart to update: nothing is downloaded and verified yet (Install and restart a version first)".into());
         return;
     }
-    if !st.update.model_ack && unsaved_model(input) {
-        st.update.guard = Guard::SaveFirst;
+    if !st.update.model_ack {
+        if let Some(text) = save_note(&st.update, input) {
+            st.update.save_text = text;
+            st.update.guard = Guard::SaveFirst;
+            return;
+        }
+    }
+    if input.playing {
+        st.update.guard = Guard::Playing;
         return;
     }
     if !st.update.force {
         if let Some(what) = running(input) {
             let prompt = match st.update.guard {
                 Guard::Waiting { prompt, .. } => prompt,
-                _ => {
-                    // no new step starts (the restart opens paused anyway); the job in flight finishes
-                    if input.playing {
-                        out.commands.push(Command::Dyn(sim::DynCommand::Pause));
-                    }
-                    true
-                }
+                _ => true,
             };
             st.update.guard = Guard::Waiting { what, prompt };
             return;
         }
     }
-    st.update.guard = Guard::Idle;
-    (st.update.model_ack, st.update.force) = (false, false);
-    st.set_status("handing over to the installer: the app closes and reopens updated, paused where you left it");
+    st.update.idle();
     out.restart_for_update = true;
 }
 
+/// Closing the Version window (ruling I1): a pending restart is called off — its card is drawn only
+/// in the window — with a status line; the download stays ready, so Restart now is offered again.
+pub fn close_panel(st: &mut UiState) {
+    st.update.open = false;
+    if st.update.guard != Guard::Idle {
+        st.update.idle();
+        st.set_status(CALLED_OFF);
+    }
+}
+
 /// Once a frame, after the actions (`ui::show`): the check's answer, the automatic check, the
-/// cancelled downloads, an older target's manifest, and a waiting restart once its job is done.
-/// Never blocks.
+/// cancelled downloads, an older target's manifest, the model's load baseline, and a pending
+/// restart once its run has stopped or its job is done. Never blocks.
 pub(super) fn tick(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelOutput) {
     let now = Instant::now();
     let u = &mut st.update;
@@ -413,29 +481,45 @@ pub(super) fn tick(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>
             }
         }
     }
+    // the 6-hour test against the last check's start, every frame (module doc)
     let automatic = u.background && u.auto_check && st.data_mode != DataMode::Dev;
     let due = u.last_started.is_none_or(|t| now.saturating_duration_since(t) >= CHECK_EVERY);
     if automatic && due && u.check.is_none() {
         u.start_check(now);
     }
     u.cancelling.retain(|d| matches!(d.poll(), DownloadState::Running(..)));
+    // a model newly loaded from a file: what it holds now is the baseline (ruling M1); a session's
+    // autosave isn't the user's file (it is removed at the exit)
+    if let Some(m) = input.model() {
+        let file = match &m.source {
+            sim::ModelSource::File(p) if !m.source_is_autosave => Some(p.clone()),
+            _ => None,
+        };
+        if file != u.seen_file {
+            u.model_baseline = file.as_ref().map(|_| m.samples);
+            u.seen_file = file;
+        }
+        // fewer samples than the baseline: another model (forgotten and learned anew)
+        if u.model_baseline.is_some_and(|b| m.samples < b) {
+            u.model_baseline = None;
+        }
+    }
     poll_confirm(st);
-    if let Guard::Waiting { what, prompt } = st.update.guard {
-        match running(input) {
+    match st.update.guard {
+        Guard::Waiting { what, prompt } => match running(input) {
             None => restart(st, input, out),
             Some(w) if w != what => st.update.guard = Guard::Waiting { what: w, prompt },
             Some(_) => {}
-        }
+        },
+        // the pause has landed (the step it stopped has let go of the solver too)
+        Guard::Pausing if !input.playing && !input.busy => restart(st, input, out),
+        _ => {}
     }
     let u = &st.update;
     let downloading = u.download.as_ref().is_some_and(|d| matches!(d.poll(), DownloadState::Running(..)));
     let reading = u.confirm.as_ref().is_some_and(|c| c.rx.is_some());
     if u.checking() || u.cancelling() || downloading || reading || u.guard != Guard::Idle {
         ctx.request_repaint_after(Duration::from_millis(250));
-    } else if automatic {
-        if let Some(t) = u.last_started {
-            ctx.request_repaint_after(CHECK_EVERY.saturating_sub(now.saturating_duration_since(t)));
-        }
     }
 }
 
@@ -500,7 +584,7 @@ pub(super) fn chip(ui: &mut Ui, st: &mut UiState) -> Option<egui::Response> {
     Some(r)
 }
 
-/// The Version panel, while open.
+/// The Version panel, while open. Its close button calls a pending restart off ([`close_panel`]).
 pub(super) fn show(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
     if !st.update.open {
         return;
@@ -515,7 +599,7 @@ pub(super) fn show(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| body(ui, st, acts));
     if !open {
-        st.update.open = false;
+        close_panel(st);
     }
 }
 
@@ -524,7 +608,7 @@ fn body(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     let mode = st.data_mode;
     ui.label(RichText::new(format!("Atomic Sandbox v{}", st.update.current)).size(16.0).strong());
     match mode {
-        DataMode::Installed => theme::note(ui, "The installed build: it installs any listed version from this repository's GitHub releases, verified first."),
+        DataMode::Installed => theme::note(ui, "The installed build: it installs any signed version from this repository's GitHub releases, verified before anything is replaced."),
         DataMode::Portable => theme::note(ui, "A portable copy: it isn't updated in place — download a release's zip to change version."),
         DataMode::Dev => ui.label(RichText::new(UPDATES_OFF).color(AMBER)),
     };
@@ -540,13 +624,13 @@ fn body(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         let checking = st.update.checking();
         if probed("check-now", ui.add_enabled(!checking, Button::new("Check for updates now")))
-            .on_hover_text("ask GitHub for this repository's releases (an HTTPS GET of the releases list; nothing about you is sent)")
+            .on_hover_text("only GitHub's public release list is read (an HTTPS GET); GitHub sees your IP address as with any web request")
             .clicked()
         {
             acts.push(Action::CheckUpdates);
         }
         let r = probed("auto-check", ui.add_enabled(mode != DataMode::Dev, egui::Checkbox::new(&mut st.update.auto_check, "Check automatically")));
-        r.on_hover_text("at launch, then every 6 hours while the app is open; it only ever shows the chip, never a popup").on_disabled_hover_text(UPDATES_OFF);
+        r.on_hover_text("at launch, then every 6 hours while the app is open (checked at the next frame once they have passed); it only ever shows the chip, never a popup").on_disabled_hover_text(UPDATES_OFF);
         if checking {
             ui.spinner();
             ui.label(RichText::new("checking…").color(theme::INK_DIM));
@@ -593,27 +677,47 @@ fn guard_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     match st.update.guard {
         Guard::Idle => {}
         Guard::SaveFirst => card(ui, |ui| {
-            ui.label(RichText::new("The restart won't keep this session's model").strong());
-            theme::note(ui, "It isn't in a shared collection, so the session saved for the restart doesn't hold it: what it learned here is lost unless you save it first.");
-            theme::note(ui, OTHER_WINDOW);
+            ui.label(RichText::new("The restart won't keep what this model learned").strong());
+            theme::note(ui, st.update.save_text.clone());
             ui.horizontal(|ui| {
                 if probed("guard-save", ui.button("Save model…")).on_hover_text("save the model to a file; then Restart now again").clicked() {
-                    st.update.guard = Guard::Idle;
+                    st.update.idle();
                     super::files::open_save_model(st);
                 }
-                if probed("guard-anyway", ui.button("Restart anyway")).on_hover_text("restart without the model").clicked() {
+                if probed("guard-anyway", ui.button("Restart anyway")).on_hover_text("restart without what it learned").clicked() {
                     st.update.model_ack = true;
                     acts.push(Action::RestartToUpdate);
                 }
                 if probed("guard-cancel", ui.button("Cancel")).clicked() {
-                    st.update.guard = Guard::Idle;
+                    st.update.idle();
+                }
+            });
+        }),
+        Guard::Playing => card(ui, |ui| {
+            ui.label(RichText::new(PLAYING).strong());
+            theme::note(ui, "The restart doesn't stop it by itself. Pause and restart pauses the run as the Pause button does (the step being solved is dropped), then restarts; the app reopens paused where it stopped.");
+            ui.horizontal(|ui| {
+                if probed("guard-pause-restart", ui.button("Pause and restart")).clicked() {
+                    acts.push(Action::Pause);
+                    st.update.guard = Guard::Pausing;
+                }
+                if probed("guard-cancel", ui.button("Cancel")).clicked() {
+                    st.update.idle();
+                }
+            });
+        }),
+        Guard::Pausing => card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Pausing, then restarting…");
+                if probed("guard-dont-restart", ui.button("Don't restart")).clicked() {
+                    st.update.idle();
                 }
             });
         }),
         Guard::Waiting { what, prompt: true } => card(ui, |ui| {
             ui.label(RichText::new(format!("Waiting for {what} to finish…")).strong());
-            theme::note(ui, format!("The restart waits for it, so nothing is cut off, and goes ahead when it ends. Or cancel it: the app closes now and {what} stops with it, as when you close the window."));
-            theme::note(ui, OTHER_WINDOW);
+            theme::note(ui, format!("The restart waits for it and goes ahead when it ends. Or cancel it: the app closes now and {what} stops with it, as when you close the window."));
             ui.horizontal(|ui| {
                 if probed("guard-cancel-restart", ui.button("Cancel it and restart")).clicked() {
                     st.update.force = true;
@@ -629,11 +733,10 @@ fn guard_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 ui.spinner();
                 ui.label(format!("Restarting when {what} finishes…"));
                 if probed("guard-dont-restart", ui.button("Don't restart")).clicked() {
-                    st.update.guard = Guard::Idle;
-                    (st.update.model_ack, st.update.force) = (false, false);
+                    st.update.idle();
                 }
             });
-            theme::note(ui, OTHER_WINDOW);
+            theme::note(ui, "Closing this window calls the restart off.");
         }),
     }
 }
@@ -679,7 +782,7 @@ fn entry(ui: &mut Ui, st: &mut UiState, r: &Release, acts: &mut Vec<Action>) {
                     }
                     Some(DownloadState::Ready(_)) => {
                         let b = Button::new(RichText::new("Restart now").strong().color(egui::Color32::WHITE)).fill(theme::GLOW);
-                        if probed("restart-now", ui.add(b)).on_hover_text(format!("save the session, close, install {} and reopen paused where you left it. {OTHER_WINDOW}", r.tag)).clicked() {
+                        if probed("restart-now", ui.add(b)).on_hover_text(format!("save the session, close, install {} and reopen paused where you left it (another open Atomic Sandbox window must be closed first)", r.tag)).clicked() {
                             acts.push(Action::RestartToUpdate);
                         }
                     }
@@ -703,7 +806,6 @@ fn entry(ui: &mut Ui, st: &mut UiState, r: &Release, acts: &mut Vec<Action>) {
                 }
                 Some(DownloadState::Ready(_)) => {
                     theme::note(ui, format!("{} is downloaded and verified (its SHA-256 and signature checked).", r.tag));
-                    theme::note(ui, OTHER_WINDOW);
                 }
                 Some(DownloadState::Failed(e)) if e != update::apply::CANCELLED => {
                     ui.label(RichText::new(format!("the download failed: {e} — nothing was installed")).size(12.5).color(AMBER));

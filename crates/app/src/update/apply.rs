@@ -94,8 +94,10 @@ fn clean_updates_at(dir: &Path, current: &semver::Version, now: std::time::Syste
             continue;
         }
         let name = e.file_name().to_string_lossy().into_owned();
+        // the time through a handle (`fs::metadata`), not the directory entry's (`DirEntry::metadata`,
+        // which NTFS may update late while another window's download still writes the file)
         let stale_part = name.ends_with(".part")
-            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age >= STALE_PART));
+            && std::fs::metadata(e.path()).and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age >= STALE_PART));
         let old_installer = name.starts_with("AtomicSandbox-Setup-") && name.ends_with(".exe") && name != keep;
         if (stale_part || old_installer) && std::fs::remove_file(e.path()).is_ok() {
             removed.push(e.path());

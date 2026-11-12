@@ -12,6 +12,7 @@ mod cloud;
 mod detached;
 mod frame;
 mod icon;
+mod instance;
 mod timings;
 mod gfx;
 mod ghost;
@@ -586,6 +587,8 @@ fn main() {
     // the window's automatic update checks (at launch, then every 6 hours; never in a build from
     // source, nor headless: `ui::version`)
     viewer.ui.update.background = true;
+    // this window's hold on its install's name: Restart now refuses while another copy holds it too
+    instance::claim();
     // after the profile and the flags: the session's scene and settings win, paused
     let resumed = session.is_some();
     if let Some(s) = session {

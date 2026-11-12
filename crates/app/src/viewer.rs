@@ -1316,10 +1316,12 @@ impl Viewer {
         }
     }
 
-    /// Restart now, past its guard (`ui::version`; installer Task 4): the scene and its settings
-    /// saved as the session file (`update::save_session`, under the per-user root's `updates\`),
-    /// then the verified installer started (`update::hand_off`) and the app asked to close
-    /// ([`Viewer::close_for_update`]). Anything refused is the error line, and the app stays.
+    /// Restart now, past its guard (`ui::version`; installer Task 4): refused while another copy of
+    /// this install runs (`crate::instance`: the silent installer must not close it), else the
+    /// scene and its settings saved as the session file (`update::save_session`, under the per-user
+    /// root's `updates\`), then — only once that write succeeded — the verified installer started
+    /// (`update::hand_off`) and the app asked to close ([`Viewer::close_for_update`]). Anything
+    /// refused is the error line, and the app stays.
     fn restart_for_update(&mut self) {
         match self.hand_off_update() {
             Ok(close) => {
@@ -1336,6 +1338,9 @@ impl Viewer {
             return Err("only the installed build updates itself".into());
         }
         let root = self.ui.data_root.as_ref().ok_or("there is no per-user folder (LOCALAPPDATA isn't set)")?;
+        if crate::instance::another_copy_running() {
+            return Err(crate::instance::OTHER_COPY.into());
+        }
         let session = root.join("updates").join(crate::update::apply::SESSION_FILE);
         crate::update::save_session(self, &session)?;
         crate::update::hand_off(&verified, &session)

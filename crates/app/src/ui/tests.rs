@@ -7865,7 +7865,7 @@ mod updates {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use version::{Guard, UpdateNet, OTHER_WINDOW, PORTABLE_REFUSED, UPDATES_OFF};
+    use version::{Guard, UpdateNet, PORTABLE_REFUSED, UPDATES_OFF};
 
     const RELEASES: &str = include_str!("../update/fixtures/releases.json");
     const SUMS: &[u8] = include_bytes!("../update/fixtures/SHA256SUMS.txt");
@@ -8198,9 +8198,9 @@ mod updates {
     }
 
     /// Restart now while a refit runs waits ("Waiting for the refit to finish…", Cancel it and
-    /// restart / Keep waiting, the other-window note) and restarts by itself once it ends; Cancel it
-    /// and restart goes at once; a playing run is paused first; nothing restarts without a
-    /// verified download.
+    /// restart / Keep waiting) and restarts by itself once it ends; Cancel it and restart goes at
+    /// once; a sampling pass and a background audit are waited for too, a paused step solve is not;
+    /// nothing restarts without a verified download.
     #[test]
     fn restart_waits_for_running_refit() {
         let scene = Scene::preset("h2").unwrap();
@@ -8219,13 +8219,14 @@ mod updates {
         assert!(!out.restart_for_update);
         assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
         let lines = shown(&ctx, &mut st, &refit);
-        for t in ["Waiting for the refit to finish…", "Cancel it and restart", "Keep waiting", OTHER_WINDOW] {
+        for t in ["Waiting for the refit to finish…", "Cancel it and restart", "Keep waiting", "goes ahead when it ends"] {
             assert!(has(&lines, t), "{t:?} in {lines:#?}");
         }
+        assert!(!has(&lines, "nothing is cut off") && !has(&lines, "installer will ask"), "{lines:#?}");
         click_widget(&ctx, &mut st, &refit, "guard-keep-waiting");
         assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: false });
         let lines = shown(&ctx, &mut st, &refit);
-        assert!(has(&lines, "Restarting when the refit finishes…") && has(&lines, OTHER_WINDOW));
+        assert!(has(&lines, "Restarting when the refit finishes…") && has(&lines, "Closing this window calls the restart off"));
         assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update, "still running: still waiting");
         // the refit ends: the restart goes ahead by itself
         assert!(frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update);
@@ -8236,21 +8237,21 @@ mod updates {
         assert_eq!(actions(&outs), [Action::RestartToUpdate]);
         assert!(outs.iter().any(|o| o.restart_for_update));
         assert_eq!(st.update.guard, Guard::Idle);
-        // a playing run is paused first (the job in flight finishes; the restart opens paused anyway)
-        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
-        let out = act(&mut st, &playing, Action::RestartToUpdate);
-        assert!(matches!(one_dyn(&out), DynCommand::Pause), "{:?}", out.commands);
-        assert_eq!(st.update.guard, Guard::Waiting { what: "the solve", prompt: true });
-        assert!(act(&mut st, &playing, Action::RestartToUpdate).commands.is_empty(), "paused once");
-        // a sampling pass is named (its model's samples asked about first: acknowledged here)
-        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        // a sampling pass and a background audit are waited for (the pass's model holds no sample
+        // yet here, so nothing is asked about it first)
+        let mut m = model();
+        m.samples = 0;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
         snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
         let sampling = input(&scene, Some(&snap), &cam);
         assert_eq!(version::running(&sampling), Some("the sampling pass"));
-        st.update.guard = Guard::Idle;
-        st.update.model_ack = true;
         act(&mut st, &sampling, Action::RestartToUpdate);
         assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        let audit = PanelInput { probe: Some(sim::ProbeView { side: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert_eq!(version::running(&audit), Some("the background audit"));
+        // a paused step solve in flight is not a background job: no wait
+        let solving = PanelInput { busy: true, probe: Some(sim::ProbeView { main: sim::activity::SlotView { running: true, ..Default::default() }, ..Default::default() }), ..input(&scene, None, &cam) };
+        assert_eq!(version::running(&solving), None);
         // Cancel (the download) calls a waiting restart off
         act(&mut st, &idle, Action::CancelUpdateDownload);
         assert_eq!(st.update.guard, Guard::Idle);
@@ -8258,7 +8259,7 @@ mod updates {
     }
 
     /// An unsaved in-session model with no collection: Restart now first offers Save model… /
-    /// Restart anyway / Cancel (with the other-window note); Restart anyway goes on; Save model…
+    /// Restart anyway / Cancel, saying what would be lost; Restart anyway goes on; Save model…
     /// opens the Save window; a model in a shared collection is kept, so nothing is asked.
     #[test]
     fn unsaved_model_offers_save_first() {
@@ -8266,9 +8267,9 @@ mod updates {
         let cam = camera();
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
         let inp = input(&scene, Some(&snap), &cam);
-        assert!(version::unsaved_model(&inp), "273 samples, no collection");
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(273 samples) isn't in a shared collection or a saved file")), "273 samples, no collection, never saved");
         st.backend = Backend::Estimated;
         let root = temp_root("unsaved");
         ready(&mut st, &inp, &root);
@@ -8277,7 +8278,7 @@ mod updates {
         assert!(!out.restart_for_update);
         assert_eq!(st.update.guard, Guard::SaveFirst);
         let lines = shown(&ctx, &mut st, &inp);
-        for t in ["The restart won't keep this session's model", "Save model…", "Restart anyway", "Cancel", OTHER_WINDOW] {
+        for t in ["The restart won't keep what this model learned", "(273 samples)", "Save model…", "Restart anyway", "Cancel"] {
             assert!(has(&lines, t), "{t:?} in {lines:#?}");
         }
         click_widget(&ctx, &mut st, &inp, "guard-cancel");
@@ -8291,13 +8292,232 @@ mod updates {
         let outs = click_widget(&ctx, &mut st, &inp, "guard-anyway");
         assert_eq!(actions(&outs), [Action::RestartToUpdate]);
         assert!(outs.iter().any(|o| o.restart_for_update), "Restart anyway goes on");
+        assert!(!st.update.model_ack && !st.update.force, "the flags are spent");
         // a shared collection keeps the model: no question
         let mut m = model();
         m.source = sim::ModelSource::Collection { slug: "h2".into(), samples: 273, read_only: false };
         let snap = snapshot(&scene, Backend::Estimated, Some(m));
         let kept = input(&scene, Some(&snap), &cam);
-        assert!(!version::unsaved_model(&kept));
+        assert_eq!(version::save_note(&st.update, &kept), None);
         assert!(act(&mut st, &kept, Action::RestartToUpdate).restart_for_update);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling M1: Restart now asks only about samples learned since the model was last loaded from
+    /// or saved to a file — a model just loaded, or just saved, is not asked about; ten more samples
+    /// are, by count; the session's autosave is not the user's file.
+    #[test]
+    fn save_first_asks_only_about_what_was_learned_since_load_or_save() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let with = |samples: usize, source: sim::ModelSource, autosave: bool| {
+            let mut m = model();
+            (m.samples, m.source, m.source_is_autosave) = (samples, source, autosave);
+            snapshot(&scene, Backend::Estimated, Some(m))
+        };
+        let file = sim::ModelSource::File("C:/models/h2 water.model".into());
+        // loaded from a file: the frame sees the new source and takes its 273 as the baseline
+        let loaded = with(273, file.clone(), false);
+        let inp = input(&scene, Some(&loaded), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert_eq!(st.update.model_baseline, Some(273));
+        assert_eq!(version::save_note(&st.update, &inp), None, "just loaded: nothing to lose");
+        let more = with(283, file.clone(), false);
+        let inp = input(&scene, Some(&more), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        let note = version::save_note(&st.update, &inp).expect("10 learned since the load");
+        assert!(note.contains("The model from h2 water.model has learned 10 samples since it was loaded or saved") && note.contains("the file itself stays as it was"), "{note}");
+        // Save model: what it holds now is in a file
+        act(&mut st, &inp, Action::SaveModel);
+        assert_eq!((st.update.model_baseline, version::save_note(&st.update, &inp)), (Some(283), None));
+        // a session's model saved once, then learning on
+        let mut st = UiState::new("h2", &scene);
+        let session = with(100, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&session), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        act(&mut st, &inp, Action::SaveModel);
+        let grown = with(101, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&grown), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("has learned 1 sample since you last saved it")));
+        // forgotten and learned anew (fewer samples than the baseline): another model, all of it
+        let anew = with(40, sim::ModelSource::None, false);
+        let inp = input(&scene, Some(&anew), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(40 samples) isn't in a shared collection")));
+        // the solver switch's autosave is removed at the exit: not a file of the user's
+        let mut st = UiState::new("h2", &scene);
+        let auto = with(50, sim::ModelSource::File("C:/temp/autosave.model".into()), true);
+        let inp = input(&scene, Some(&auto), &cam);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert_eq!(st.update.model_baseline, None);
+        assert!(version::save_note(&st.update, &inp).is_some_and(|t| t.contains("(50 samples)")));
+    }
+
+    /// Ruling I2: Restart now never pauses by itself. A playing run gets "The simulation is
+    /// playing." with Pause and restart / Cancel; Pause and restart sends the pause (the recorded
+    /// Pause action) and the restart follows once the run has stopped; a background job after the
+    /// pause is still waited for.
+    #[test]
+    fn a_playing_run_is_paused_only_by_its_own_click() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let playing = PanelInput { playing: true, busy: true, ..input(&scene, None, &cam) };
+        let stopping = PanelInput { playing: false, busy: true, ..input(&scene, None, &cam) };
+        let stopped = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("playing");
+        ready(&mut st, &stopped, &root);
+        st.update.open = true;
+        let out = act(&mut st, &playing, Action::RestartToUpdate);
+        assert!(out.commands.is_empty() && !out.restart_for_update, "nothing sent by itself: {:?}", out.commands);
+        assert_eq!(st.update.guard, Guard::Playing);
+        let lines = shown(&ctx, &mut st, &playing);
+        for t in [version::PLAYING, "Pause and restart", "Cancel", "the step being solved is dropped"] {
+            assert!(has(&lines, t), "{t:?} in {lines:#?}");
+        }
+        click_widget(&ctx, &mut st, &playing, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        act(&mut st, &playing, Action::RestartToUpdate);
+        let outs = click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert_eq!(actions(&outs), [Action::Pause], "the pause, as the Pause button sends it");
+        assert!(dyn_commands(&outs).iter().any(|c| matches!(c, DynCommand::Pause)));
+        assert!(!outs.iter().any(|o| o.restart_for_update), "not before the run has stopped");
+        assert_eq!(st.update.guard, Guard::Pausing);
+        assert!(has(&shown(&ctx, &mut st, &playing), "Pausing, then restarting…"));
+        assert!(!frame(&ctx, &mut st, &stopping, 1400.0, vec![]).restart_for_update, "the step still lets go of the solver");
+        assert!(frame(&ctx, &mut st, &stopped, 1400.0, vec![]).restart_for_update, "stopped: the restart follows");
+        assert_eq!(st.update.guard, Guard::Idle);
+        // paused onto a running refit: that is still waited for
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        act(&mut st, &playing, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
+        assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling I1: closing the Version window calls a pending restart off — waiting, pausing or
+    /// asking — with a status line; the download stays ready, and Restart now is offered again.
+    #[test]
+    fn closing_the_panel_calls_a_pending_restart_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let idle = input(&scene, None, &cam);
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("close");
+        ready(&mut st, &idle, &root);
+        st.update.open = true;
+        act(&mut st, &refit, Action::RestartToUpdate);
+        click_widget(&ctx, &mut st, &refit, "guard-keep-waiting");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: false });
+        version::close_panel(&mut st);
+        assert!(!st.update.open);
+        assert_eq!(st.update.guard, Guard::Idle);
+        assert_eq!(st.status, version::CALLED_OFF);
+        assert!(st.update.verified().is_some(), "the download stays ready");
+        assert!(!frame(&ctx, &mut st, &idle, 1400.0, vec![]).restart_for_update, "the refit ending restarts nothing");
+        st.update.open = true;
+        assert!(has(&shown(&ctx, &mut st, &idle), "Restart now"), "offered again");
+        // closing with nothing pending says nothing
+        st.set_status("x");
+        version::close_panel(&mut st);
+        assert_eq!(st.status, "x");
+        // the window's own close button goes through it (the guard asking about the model)
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let unsaved = input(&scene, Some(&snap), &cam);
+        st.update.open = true;
+        act(&mut st, &unsaved, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        version::close_panel(&mut st);
+        assert_eq!((st.update.guard, st.status.as_str()), (Guard::Idle, version::CALLED_OFF));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling I4, the reviewer's path: Restart now during a first pass (waiting), the pass learns,
+    /// Cancel it and restart → the model question → Cancel; later, during another pass, Restart now
+    /// → Restart anyway must wait for the pass again, not cut it off with the stale "cancel it".
+    #[test]
+    fn a_stale_cancel_it_never_skips_the_wait() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let pass = |samples: usize| {
+            let mut m = model();
+            m.samples = samples;
+            let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+            snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
+            snap
+        };
+        let ctx = ctx();
+        let mut st = UiState::new("h2", &scene);
+        let root = temp_root("stale");
+        ready(&mut st, &input(&scene, None, &cam), &root);
+        st.update.open = true;
+        let first = pass(0);
+        let inp = input(&scene, Some(&first), &cam);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        let learned = pass(30);
+        let inp = input(&scene, Some(&learned), &cam);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-cancel-restart");
+        assert!(!outs.iter().any(|o| o.restart_for_update));
+        assert_eq!(st.update.guard, Guard::SaveFirst, "the pass learned: asked about the model first");
+        click_widget(&ctx, &mut st, &inp, "guard-cancel");
+        assert_eq!(st.update.guard, Guard::Idle);
+        assert!(!st.update.force && !st.update.model_ack, "Cancel clears every flag");
+        let second = pass(30);
+        let inp = input(&scene, Some(&second), &cam);
+        act(&mut st, &inp, Action::RestartToUpdate);
+        assert_eq!(st.update.guard, Guard::SaveFirst);
+        let outs = click_widget(&ctx, &mut st, &inp, "guard-anyway");
+        assert!(!outs.iter().any(|o| o.restart_for_update), "Restart anyway agrees to losing the model, not to cutting the pass off");
+        assert_eq!(st.update.guard, Guard::Waiting { what: "the sampling pass", prompt: true });
+        // Save model… and install() clear the flags too
+        st.update.force = true;
+        st.update.guard = Guard::SaveFirst;
+        click_widget(&ctx, &mut st, &inp, "guard-save");
+        assert!((!st.update.force, !st.update.model_ack, st.update.guard) == (true, true, Guard::Idle));
+        st.update.force = true;
+        st.update.model_ack = true;
+        st.update.download = None;
+        act(&mut st, &inp, Action::InstallVersion("v0.2.0".into()));
+        assert!(!st.update.force && !st.update.model_ack && st.update.guard == Guard::Idle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ruling M6 (and I3, M2): the viewer's hand-off writes the session first and hands nothing
+    /// off when that write fails; with a good root the session is written, and the hand-off itself
+    /// refuses here (the test process is a build from source) — no close, the error line says
+    /// why, and no "handing over" status is claimed.
+    #[test]
+    fn a_failed_session_write_means_no_hand_off() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let root = temp_root("handoff");
+        let mut v = crate::viewer::Viewer::new("h2").unwrap();
+        ready(&mut v.ui, &input(&scene, None, &cam), &root);
+        // a root that is a file: the session can't be written under it
+        let blocked = root.join("not a folder");
+        std::fs::write(&blocked, b"x").unwrap();
+        v.ui.data_root = Some(blocked.clone());
+        let status = v.ui.status.clone();
+        v.apply(Action::RestartToUpdate);
+        assert!(v.close_for_update.is_none(), "no hand-off");
+        assert!(v.last_error.as_deref().is_some_and(|e| e.starts_with("restart to update: couldn't save the session")), "{:?}", v.last_error);
+        assert_eq!(v.ui.status, status, "no status claims a hand-off");
+        // a good root: the session is written, then the hand-off refuses (not an installed process)
+        v.ui.data_root = Some(root.clone());
+        v.last_error = None;
+        v.apply(Action::RestartToUpdate);
+        assert!(root.join("updates").join(crate::update::apply::SESSION_FILE).is_file(), "the session first");
+        assert!(v.close_for_update.is_none());
+        assert_eq!(v.last_error.as_deref(), Some(format!("restart to update: {UPDATES_OFF}").as_str()));
+        assert_eq!(v.ui.status, status);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8412,7 +8632,8 @@ mod updates {
         click_widget(&ctx, &mut st, &inp, "install-v0.2.0");
         assert!(matches!(wait_download(&mut st), DownloadState::Ready(_)));
         let lines = shown(&ctx, &mut st, &inp);
-        assert!(has(&lines, "Restart now") && has(&lines, OTHER_WINDOW), "{lines:#?}");
+        assert!(has(&lines, "Restart now") && has(&lines, "downloaded and verified"), "{lines:#?}");
+        assert!(!has(&lines, "installer will ask"), "the installer never closes another window: {lines:#?}");
         let outs = click_widget(&ctx, &mut st, &inp, "restart-now");
         assert_eq!(actions(&outs), [Action::RestartToUpdate]);
         assert!(outs.iter().any(|o| o.restart_for_update), "nothing running: it goes ahead");
