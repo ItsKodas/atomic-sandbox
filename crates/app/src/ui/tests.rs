@@ -2164,6 +2164,159 @@ fn the_stale_bonds_are_labelled_under_the_surrogate() {
     assert_eq!(bonds_label(&s.dynamics).as_deref(), Some("bonds from the last DFT step (t = 12.50 fs) — the surrogate has no electrons"));
 }
 
+/// An estimated snapshot of `scene` whose bond graph is an earlier DFT step's (`stale`) or this
+/// one's.
+fn bonds_snapshot(scene: &Scene, backend: Backend, stale: bool) -> Snapshot {
+    let mut s = snapshot(scene, backend, (backend == Backend::Estimated).then(model));
+    s.dynamics.bonds = Some(graph(scene.nuclei.len(), &[(0, 1)], vec![(0..scene.nuclei.len()).collect()], 12.5 / units::au_time_to_fs(1.0)));
+    s.dynamics.bonds_stale = stale;
+    s
+}
+
+/// User request 2026-11-13: a drag that ends under the estimated solver with the bonds stale sends
+/// one `RefreshBonds` a second later, through the frame's actions (so `--record` sees it), and it
+/// leaves the lengths and angles toggles as they were (the button turns them on); not with the
+/// setting off, the bonds fresh or hidden, or under DFT.
+#[test]
+fn a_drag_refreshes_the_stale_bonds_a_second_later() {
+    use super::auto_bonds::{step, Poll, DELAY};
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let stale = bonds_snapshot(&scene, Backend::Estimated, true);
+    let fresh = bonds_snapshot(&scene, Backend::Estimated, false);
+    let dft = bonds_snapshot(&scene, Backend::Gpu, true);
+    let fresh_st = || {
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st
+    };
+    let t0 = std::time::Instant::now();
+    // fires once, after the delay
+    let mut st = fresh_st();
+    st.show_angles = false;
+    let inp = input(&scene, Some(&stale), &cam);
+    assert!(st.auto_refresh_bonds, "on by default");
+    st.auto_bonds.drag_ended(t0);
+    assert!(matches!(step(&mut st, &inp, t0 + DELAY / 2), Poll::Wait(_)));
+    assert_eq!(step(&mut st, &inp, t0 + DELAY), Poll::Fire);
+    assert_eq!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Idle, "once");
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::RefreshBonds, &mut out);
+    assert!(out.commands.iter().any(|c| matches!(c, Command::Dyn(sim::DynCommand::RefreshBonds))));
+    assert!(!st.show_angles, "the refresh after a drag leaves the angles off");
+    assert!(st.bonds_refresh.is_some() && !st.auto_bonds.fired);
+    // the button's own press still shows everything it solved for
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::RefreshBonds, &mut out);
+    assert!(st.show_angles);
+    // a running refresh holds it; a new drag restarts it
+    let mut st = fresh_st();
+    st.auto_bonds.drag_ended(t0);
+    st.auto_bonds.drag_started();
+    st.auto_bonds.drag_ended(t0 + DELAY / 2);
+    assert!(matches!(step(&mut st, &inp, t0 + DELAY), Poll::Wait(_)), "restarted by the second drag");
+    st.bonds_refresh = Some(t0);
+    assert!(matches!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Wait(_)), "a refresh running: held");
+    st.bonds_refresh = None;
+    assert_eq!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Fire);
+    // never with the setting off, the bonds fresh or hidden, under DFT, or without a model
+    let no_model = snapshot(&scene, Backend::Estimated, None);
+    let mut unfitted = bonds_snapshot(&scene, Backend::Estimated, true);
+    unfitted.model.as_mut().unwrap().fitted = false;
+    for (snap, off, hidden, dft_ui, why) in [
+        (&stale, true, false, false, "the setting off"),
+        (&fresh, false, false, false, "the bonds fresh"),
+        (&stale, false, true, false, "the bonds hidden"),
+        (&dft, false, false, true, "DFT"),
+        (&no_model, false, false, false, "no model"),
+        (&unfitted, false, false, false, "an unfitted model"),
+    ] {
+        let mut st = fresh_st();
+        st.auto_refresh_bonds = !off;
+        st.show_bonds = !hidden;
+        if dft_ui {
+            st.backend = Backend::Gpu;
+        }
+        let inp = input(&scene, Some(snap), &cam);
+        st.auto_bonds.drag_ended(t0);
+        assert_eq!(step(&mut st, &inp, t0 + DELAY), Poll::Idle, "{why}");
+        assert!(!st.auto_bonds.armed() && !st.auto_bonds.fired, "{why}");
+    }
+    // through a frame: the action is in the frame's output, once
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = fresh_st();
+    // laid out first (a first frame may run a discarded sizing pass, whose output the helper drops;
+    // the viewer keeps every pass's)
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.auto_bonds.drag_ended(std::time::Instant::now() - DELAY);
+    let outs: Vec<PanelOutput> = (0..3).map(|_| frame(&ctx, &mut st, &inp, 1400.0, vec![])).collect();
+    assert!(st.bonds_refresh.is_some(), "applied");
+    let fired: usize = outs.iter().map(|o| o.actions.iter().filter(|a| matches!(a, Action::RefreshBonds)).count()).sum();
+    assert_eq!(fired, 1, "one refresh in the frames' actions");
+    assert!(outs.iter().flat_map(|o| &o.commands).any(|c| matches!(c, Command::Dyn(sim::DynCommand::RefreshBonds))));
+}
+
+/// The setting is display state: in the profile as `auto_refresh_bonds`, read back, and an old
+/// profile without the key reads as on.
+#[test]
+fn the_refresh_after_a_drag_round_trips_through_the_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    assert!(profile::capture(&st).contains("\nauto_refresh_bonds = true\n"));
+    st.auto_refresh_bonds = false;
+    let text = profile::capture(&st);
+    assert!(text.contains("\nauto_refresh_bonds = false\n"), "{text}");
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert!(!back.auto_refresh_bonds);
+    // an old profile: no key → on, even over a state that had it off
+    let old: String = text.lines().filter(|l| !l.starts_with("auto_refresh_bonds")).map(|l| format!("{l}\n")).collect();
+    profile::apply(&mut back, &old);
+    assert!(back.auto_refresh_bonds);
+    profile::apply(&mut back, "auto_refresh_bonds = nonsense\n");
+    assert!(back.auto_refresh_bonds, "unreadable: the default");
+}
+
+/// User request 2026-11-13: with the bonds stale the 3D view says so in a small line just over the
+/// bottom-right "Solve Bonds", right-aligned with it, inside the view and narrower than the
+/// bottom-centre label's margin, at a wide and a compact width; the Selection panel keeps its note;
+/// a fresh graph has no line; the toasts sit above it.
+#[test]
+fn the_stale_bonds_line_sits_over_bonds_now() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let stale = bonds_snapshot(&scene, Backend::Estimated, true);
+    let fresh = bonds_snapshot(&scene, Backend::Estimated, false);
+    for w in [1400.0, 760.0] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.auto_refresh_bonds = false;
+        let mut inp = input(&scene, Some(&stale), &cam);
+        inp.bonds_label = bonds_label(&stale.dynamics);
+        PROBES.with(|p| p.borrow_mut().clear());
+        let mut view = None;
+        for _ in 0..3 {
+            view = frame(&ctx, &mut st, &inp, w, vec![]).view;
+        }
+        let (line, button) = (probed_rect("bonds-stale-line"), probed_rect("bonds-now"));
+        let view = view.expect("the 3D view");
+        assert!(line.bottom() <= button.top() + 0.5 && button.top() - line.bottom() < 12.0, "{w}: just over the button: {line:?} {button:?}");
+        assert!((line.right() - button.right()).abs() < 2.0, "{w}: right-aligned: {line:?} {button:?}");
+        assert!(view.contains_rect(line), "{w}: inside the view {view:?}: {line:?}");
+        assert!(line.width() <= overlays::STALE_LINE_WIDTH + 1.0 && line.height() < 50.0, "{w}: small: {line:?}");
+        // fresh: no line
+        let inp = input(&scene, Some(&fresh), &cam);
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(&ctx, &mut st, &inp, w, vec![]);
+        assert!(PROBES.with(|p| p.borrow().get("bonds-stale-line").is_none()), "{w}: fresh bonds: no line");
+    }
+}
+
 /// Partial charges (`sim::charges`): drawn only for the scene's nuclei and when they add up to the
 /// scene's charge; current at the geometry they were measured at, else faded with "charges from
 /// t = … fs" naming the density; the text carries the sign always and a true minus, near-zero is

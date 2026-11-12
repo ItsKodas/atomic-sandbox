@@ -53,6 +53,14 @@ const DASH: f32 = 0.22;
 const GAP: f32 = 0.14;
 const DOT: f32 = 0.05;
 const DOT_GAP: f32 = 0.12;
+/// A stale graph's dash and gap (Bohr; user request 2026-11-13): the bonds of an earlier DFT step
+/// are broken into long dashes as well as faded, so they read as "not this geometry's" even where
+/// the fade is hard to see. The dash holds two closed-shell dashes or four dots whole (2 × (0.22 +
+/// 0.14) − 0.14 = 0.58; four dots end at 3 × 0.17 + 0.05 = 0.56), and the gap is almost twice
+/// either kind's own, so a stale bond's kind still shows inside its dashes; a gap sits on the
+/// bond's middle, so even a short bond between two spheres shows the break. Display only.
+pub const STALE_DASH: f32 = 0.58;
+pub const STALE_GAP: f32 = 0.26;
 
 /// Where ρ_b sits on the display scale: ln(ρ_b/ρ_floor)/ln(ρ_strong/ρ_floor), clamped to [0, 1]
 /// (0 for a non-finite ρ_b).
@@ -70,9 +78,56 @@ fn pattern(kind: sim::BondKind) -> Option<(f32, f32)> {
     }
 }
 
+/// The drawn pieces (start, end) along a line of length `len` (Bohr) with the dash pattern `kind`
+/// ([`pattern`]; `None` solid): the kind's pattern from the start, or when `stale` the long
+/// [`STALE_DASH`]es with a [`STALE_GAP`] centred on the middle, the kind's pattern laid afresh in
+/// each dash (so a stale solid line is long dashes, a stale dashed or dotted one groups of its
+/// dashes or dots). Pieces shorter than 1e-4 Bohr are left out.
+pub fn dash_pieces(len: f32, kind: Option<(f32, f32)>, stale: bool) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    if !(len > 0.0) {
+        return out;
+    }
+    let lay = |out: &mut Vec<(f32, f32)>, s0: f32, s1: f32| match kind {
+        None => out.push((s0, s1)),
+        Some((on, gap)) => {
+            let mut s = s0;
+            while s < s1 {
+                let e = (s + on).min(s1);
+                out.push((s, e));
+                s = e + gap;
+            }
+        }
+    };
+    if !stale {
+        lay(&mut out, 0.0, len);
+    } else {
+        // a gap centred on the middle: the dash before it ends at len/2 − gap/2, the others one
+        // period apart from there, back to the first one that reaches past the start
+        let period = STALE_DASH + STALE_GAP;
+        let first_end = 0.5 * (len - STALE_GAP);
+        let mut s = first_end - STALE_DASH - period * (first_end / period).floor();
+        while s < len {
+            let (a, b) = (s.max(0.0), (s + STALE_DASH).min(len));
+            if b > a {
+                // the kind's pattern from the dash's own start (a clipped first dash: from 0)
+                lay(&mut out, a, b);
+            }
+            s += period;
+        }
+    }
+    out.retain(|&(a, b)| b - a > 1e-4);
+    if out.is_empty() {
+        // a line shorter than the centred gap (a tiny arc): its kind's pattern, never nothing
+        lay(&mut out, 0.0, len);
+    }
+    out
+}
+
 /// The bonds of `graph` between the nuclei at `pos` (the positions drawn now — the topology of the
-/// last DFT graph between the CURRENT nuclei, spec §3.4), faded when `stale`. Nothing when the
-/// graph's nucleus count is not `pos.len()` (a graph with wrong indices is never drawn).
+/// last DFT graph between the CURRENT nuclei, spec §3.4), faded and broken into the long stale
+/// dashes ([`dash_pieces`], [`STALE_DASH`]) when `stale`. Nothing when the graph's nucleus count is
+/// not `pos.len()` (a graph with wrong indices is never drawn).
 pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<LineVertex> {
     let mut out = Vec::new();
     if graph.n_nuclei != pos.len() {
@@ -92,19 +147,17 @@ pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<
         let colour = [rgb[0], rgb[1], rgb[2], base * (MIN_ALPHA + (1.0 - MIN_ALPHA) * f)];
         let radius = BOND_RADIUS * (MIN_WIDTH + (1.0 - MIN_WIDTH) * f);
         let (u, v) = plane_basis(axis / len);
+        let pieces = dash_pieces(len, pattern(b.kind()), stale);
         for k in 0..BOND_STRANDS {
             let t = k as f32 * std::f32::consts::TAU / BOND_STRANDS as f32;
             let off = radius * (t.cos() * u + t.sin() * v);
-            match pattern(b.kind()) {
-                Some((on, gap)) => {
-                    let mut s = 0.0;
-                    while s < len {
-                        let e = (s + on).min(len);
-                        lines::segment(&mut out, (a + off + axis * (s / len)).to_array(), (a + off + axis * (e / len)).to_array(), colour);
-                        s = e + gap;
-                    }
+            for &(s, e) in &pieces {
+                if s == 0.0 && e == len {
+                    // a solid bond: exactly its two nuclei's ends
+                    lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), colour);
+                } else {
+                    lines::segment(&mut out, (a + off + axis * (s / len)).to_array(), (a + off + axis * (e / len)).to_array(), colour);
                 }
-                None => lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), colour),
             }
         }
     }
@@ -275,7 +328,8 @@ fn arc_frame(pos: &[[f64; 3]], m: &AngleMark) -> Option<(Vec3, Vec3, Vec3)> {
 }
 
 /// An arc round the vertex from the direction of `a` to that of `b`, of radius [`angle_arc_radius`]
-/// (`vertex_radius`: the vertex sphere's drawn radius), faded like the bonds when `stale`.
+/// (`vertex_radius`: the vertex sphere's drawn radius), faded and broken into the stale dashes
+/// like the bonds when `stale` ([`dash_pieces`]).
 ///
 /// The pattern is M6's bond pattern measured along the arc ([`pattern`]): `Shared` solid, `Contact`
 /// dashed and faint (as M6's weakest contact), `Indeterminate` dotted (at one strand the dots would
@@ -305,19 +359,7 @@ pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, vertex_radius: f32, stal
         let phi = k as f32 * std::f32::consts::TAU / ANGLE_STRANDS as f32;
         v + radius * radial + ANGLE_TUBE_RADIUS * (phi.cos() * radial + phi.sin() * normal)
     };
-    let pieces: Vec<(f32, f32)> = match dash {
-        None => vec![(0.0, len)],
-        Some((on, gap)) => {
-            let (mut p, mut s) = (Vec::new(), 0.0f32);
-            while s < len {
-                let e = (s + on).min(len);
-                p.push((s, e));
-                s = e + gap;
-            }
-            p
-        }
-    };
-    for (s0, s1) in pieces {
+    for (s0, s1) in dash_pieces(len, dash, stale) {
         let k = ((s1 - s0) / len * ANGLE_ARC_SEGMENTS as f32).ceil().max(1.0) as usize;
         for c in 0..k {
             let (a, b) = (s0 + (s1 - s0) * c as f32 / k as f32, s0 + (s1 - s0) * (c + 1) as f32 / k as f32);
@@ -457,22 +499,31 @@ mod tests {
     /// Spec §3.4 / plan Task 10 step 1: a bond is drawn between the CURRENT positions (a strand
     /// bundle of radius `BOND_RADIUS` around the segment between them), at alpha 0.3 when the graph
     /// is stale and full alpha when not; a graph whose nucleus count is not the scene's draws
-    /// nothing.
+    /// nothing. (A stale bond is also dashed: `a_stale_bond_is_dashed_and_a_fresh_one_keeps_its_pattern`.)
     #[test]
     fn bond_lines_follow_current_positions_with_the_stale_fade() {
         let g = graph(2, &[(0, 1, false)]);
         // positions that moved since the graph's evaluation: the lines follow them
         let pos = [[-1.0, 0.2, 0.0], [1.5, 0.2, 0.3]];
-        for (stale, alpha) in [(true, STALE_BOND_ALPHA), (false, BOND_ALPHA)] {
-            let v = bond_lines(&pos, &g, stale);
-            assert_eq!(v.len(), 2 * BOND_STRANDS, "one bond, {BOND_STRANDS} strands");
-            assert!(v.iter().all(|p| p.colour[3] == alpha));
-            for pair in v.chunks(2) {
-                for (p, end) in pair.iter().zip(pos) {
-                    let d = (Vec3::from_array(p.pos) - Vec3::from_array(end.map(|x| x as f32))).length();
-                    assert!((d - BOND_RADIUS).abs() < 1e-5, "a strand ends {d} from its nucleus");
-                }
+        let v = bond_lines(&pos, &g, false);
+        assert_eq!(v.len(), 2 * BOND_STRANDS, "one bond, {BOND_STRANDS} strands");
+        assert!(v.iter().all(|p| p.colour[3] == BOND_ALPHA));
+        for pair in v.chunks(2) {
+            for (p, end) in pair.iter().zip(pos) {
+                let d = (Vec3::from_array(p.pos) - Vec3::from_array(end.map(|x| x as f32))).length();
+                assert!((d - BOND_RADIUS).abs() < 1e-5, "a strand ends {d} from its nucleus");
             }
+        }
+        // stale: faded, and every piece on the strands' cylinder round the CURRENT segment
+        let v = bond_lines(&pos, &g, true);
+        assert!(!v.is_empty() && v.iter().all(|p| p.colour[3] == STALE_BOND_ALPHA));
+        let (a, c) = (Vec3::from_array(pos[0].map(|x| x as f32)), Vec3::from_array(pos[1].map(|x| x as f32)));
+        let axis = (c - a).normalize();
+        for p in &v {
+            let r = Vec3::from_array(p.pos) - a;
+            let along = r.dot(axis);
+            assert!(along > -1e-5 && along < (c - a).length() + 1e-5, "within the bond");
+            assert!(((r - axis * along).length() - BOND_RADIUS).abs() < 1e-5, "on the strand cylinder");
         }
         assert_eq!(STALE_BOND_ALPHA, 0.3);
         // a nucleus count change: nothing (never a graph with wrong indices)
@@ -508,6 +559,109 @@ mod tests {
         assert!(dotted.len() > dashed.len() && dotted.len() % (2 * BOND_STRANDS) == 0, "indeterminate: dotted ({} vs {})", dotted.len(), dashed.len());
         let seg = |v: &[LineVertex]| (Vec3::from_array(v[1].pos) - Vec3::from_array(v[0].pos)).length();
         assert!((seg(&dashed) - DASH).abs() < 1e-5 && (seg(&dotted) - DOT).abs() < 1e-5);
+    }
+
+    /// (start, end) along the bond of each piece of strand 0 (the first `pieces` segments).
+    fn strand_pieces(v: &[LineVertex], a: [f64; 3], c: [f64; 3]) -> Vec<(f32, f32)> {
+        let (a, c) = (Vec3::from_array(a.map(|x| x as f32)), Vec3::from_array(c.map(|x| x as f32)));
+        let axis = (c - a).normalize();
+        let n = v.len() / 2 / BOND_STRANDS;
+        v.chunks(2).take(n).map(|s| ((Vec3::from_array(s[0].pos) - a).dot(axis), (Vec3::from_array(s[1].pos) - a).dot(axis))).collect()
+    }
+
+    /// User request 2026-11-13: a stale line is long dashes with a gap on its middle, mirror-symmetric,
+    /// and each dash carries its kind's own pattern (two closed-shell dashes, four dots); a fresh line
+    /// is its kind's pattern from the start, as before.
+    #[test]
+    fn stale_dash_pieces_are_long_dashes_round_a_middle_gap() {
+        for len in [1.4f32, 2.06, 3.0, 5.2] {
+            let p = dash_pieces(len, None, true);
+            assert!(p.len() >= 2, "{len}: {p:?}");
+            assert!(p.iter().all(|&(a, b)| 0.0 <= a && a < b && b <= len && b - a <= STALE_DASH + 1e-5), "{len}: {p:?}");
+            assert!(p.iter().all(|&(a, b)| !(a < 0.5 * len && 0.5 * len < b)), "{len}: the middle is a gap: {p:?}");
+            for w in p.windows(2) {
+                assert!((w[1].0 - w[0].1 - STALE_GAP).abs() < 1e-5, "{len}: every gap is STALE_GAP: {p:?}");
+            }
+            for (x, y) in p.iter().zip(p.iter().rev()) {
+                assert!((x.0 - (len - y.1)).abs() < 1e-4 && (x.1 - (len - y.0)).abs() < 1e-4, "{len}: symmetric about the middle: {p:?}");
+            }
+            assert_eq!(dash_pieces(len, None, false), vec![(0.0, len)], "fresh solid: one piece");
+        }
+        // a long line: its whole dashes are STALE_DASH long
+        let p = dash_pieces(5.2, None, true);
+        assert!(p.iter().filter(|&&(a, b)| a > 0.0 && b < 5.2).all(|&(a, b)| (b - a - STALE_DASH).abs() < 1e-5));
+        // the gap is clearly longer than either kind's, the dash than either kind's period
+        assert!(STALE_GAP > 1.5 * GAP.max(DOT_GAP) && STALE_DASH > DASH + GAP);
+        // inside each whole stale dash, the kind's own pattern: two dashes or four dots
+        let whole = |kind| {
+            let all = dash_pieces(5.2, Some(kind), true);
+            let outer = dash_pieces(5.2, None, true);
+            let (a, b) = outer[outer.len() / 2];
+            all.into_iter().filter(|&(s, e)| s >= a - 1e-5 && e <= b + 1e-5).collect::<Vec<_>>()
+        };
+        let dashes = whole((DASH, GAP));
+        assert_eq!(dashes.len(), 2, "{dashes:?}");
+        assert!(dashes.iter().all(|&(s, e)| (e - s - DASH).abs() < 1e-5));
+        let dots = whole((DOT, DOT_GAP));
+        assert_eq!(dots.len(), 4, "{dots:?}");
+        // fresh: the kind's pattern from 0, unchanged
+        let fresh = dash_pieces(2.0, Some((DASH, GAP)), false);
+        assert_eq!(fresh[0], (0.0, DASH));
+        assert!((fresh[1].0 - (DASH + GAP)).abs() < 1e-6);
+        // shorter than the gap: still drawn
+        assert!(!dash_pieces(0.1, None, true).is_empty());
+        assert!(dash_pieces(0.0, None, true).is_empty());
+    }
+
+    /// User request 2026-11-13: a stale graph's bond is drawn as pieces with gaps (faded), a gap on
+    /// the bond's middle; a fresh one keeps its old pattern — solid shared, closed-shell dashed from
+    /// the first nucleus.
+    #[test]
+    fn a_stale_bond_is_dashed_and_a_fresh_one_keeps_its_pattern() {
+        let pos = [[-1.0, 0.0, 0.0], [1.06, 0.0, 0.0]];
+        let len = 2.06f32;
+        let shared = graph(2, &[(0, 1, false)]);
+        let fresh = bond_lines(&pos, &shared, false);
+        assert_eq!(fresh.len(), 2 * BOND_STRANDS, "fresh shared: one solid segment per strand");
+        assert_eq!(strand_pieces(&fresh, pos[0], pos[1]).len(), 1);
+        let stale = bond_lines(&pos, &shared, true);
+        assert!(stale.len() > 2 * BOND_STRANDS && stale.len() % (2 * BOND_STRANDS) == 0, "stale: several pieces per strand ({})", stale.len());
+        let p = strand_pieces(&stale, pos[0], pos[1]);
+        let drawn: f32 = p.iter().map(|&(a, b)| b - a).sum();
+        assert!(drawn < len - STALE_GAP + 1e-4, "gaps left out: {drawn} of {len}");
+        assert!(p.iter().all(|&(a, b)| !(a < 0.5 * len && 0.5 * len < b)), "the middle is a gap: {p:?}");
+        assert!(stale.iter().all(|v| v.colour[3] == STALE_BOND_ALPHA), "and faded");
+        // a closed-shell contact: fresh, its own dashes from the first nucleus; stale, other pieces
+        let contact = graph_with(2, &[(0, 1, false)], 0.02, 0.5);
+        let fresh = strand_pieces(&bond_lines(&pos, &contact, false), pos[0], pos[1]);
+        let old = dash_pieces(len, Some((DASH, GAP)), false);
+        assert_eq!(fresh.len(), old.len());
+        assert!(fresh.iter().zip(&old).all(|(f, o)| (f.0 - o.0).abs() < 1e-5 && (f.1 - o.1).abs() < 1e-5), "{fresh:?} vs {old:?}");
+        assert!(fresh[0].0.abs() < 1e-5 && (fresh[0].1 - DASH).abs() < 1e-5, "{fresh:?}");
+        let stale = strand_pieces(&bond_lines(&pos, &contact, true), pos[0], pos[1]);
+        let widest = |p: &[(f32, f32)]| p.windows(2).map(|w| w[1].0 - w[0].1).fold(0.0f32, f32::max);
+        assert!((widest(&fresh) - GAP).abs() < 1e-4, "fresh: only the contact's own gaps {fresh:?}");
+        assert!(widest(&stale) > STALE_GAP - 1e-4, "stale: the long stale gaps between groups {stale:?}");
+        assert!(stale.iter().all(|&(a, b)| !(a < 0.5 * len && 0.5 * len < b)), "the middle is a gap: {stale:?}");
+    }
+
+    /// User request 2026-11-13: a stale arc is the stale dash along the arc (faded); a fresh one keeps
+    /// its pattern.
+    #[test]
+    fn a_stale_arc_is_dashed_and_a_fresh_one_keeps_its_pattern() {
+        let pos = vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]];
+        let mark = |style| AngleMark { vertex: 0, a: 1, b: 2, radians: angle_between(pos[1], pos[2]), style };
+        let fresh = angle_arc_lines(&pos, &mark(AngleStyle::Shared), 0.0, false);
+        assert_eq!(fresh.len(), 2 * ANGLE_ARC_SEGMENTS * ANGLE_STRANDS, "fresh: solid, as before");
+        let stale = angle_arc_lines(&pos, &mark(AngleStyle::Shared), 0.0, true);
+        assert!(!stale.is_empty() && stale.len() < fresh.len(), "stale: gaps ({} of {})", stale.len(), fresh.len());
+        assert!(stale.iter().all(|p| p.colour[3] == STALE_BOND_ALPHA));
+        // the arc's middle direction is a gap: no chord end lies within the gap's half-width of it
+        let m = mark(AngleStyle::Shared);
+        let r = angle_arc_radius(&pos, &m, 0.0);
+        let half = 0.5 * m.radians as f32;
+        let mid = Vec3::new(half.cos(), half.sin(), 0.0);
+        assert!(stale.iter().all(|p| Vec3::from_array(p.pos).normalize().angle_between(mid) * r > 0.5 * STALE_GAP - ANGLE_TUBE_RADIUS - 1e-3), "a gap on the middle");
     }
 
     /// M7 Task 9 (spec §5.6): an overlapping pair is a red strand bundle between the current positions; an
