@@ -1166,8 +1166,10 @@ pub struct SurrogateKs {
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
     /// keyed by a fingerprint of those samples and that basis (`fit_floor`; the status asks for it
-    /// every snapshot, a descriptor pass over the store each time would cost ms).
-    fit_floor_cache: std::sync::Mutex<Option<(u64, usize)>>,
+    /// every snapshot, a descriptor pass over the store each time would cost ms). One slot per
+    /// body-4 degree: a refit asks for the floor at each degree it weighs
+    /// ([`grown_body4_degree`](Self::grown_body4_degree)), and the two must not evict each other.
+    fit_floor_cache: std::sync::Mutex<BTreeMap<usize, (u64, usize)>>,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1181,6 +1183,11 @@ pub struct SurrogateKs {
     lone_codes: BTreeMap<usize, u8>,
     /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
     degree_cap: Option<usize>,
+    /// The body-4 degree D₄ a collection's basis is built at (spec 2026-11-13 §4.1): chosen at every
+    /// fit by [`grown_body4_degree`](Self::grown_body4_degree) and written here when the fit
+    /// succeeds, set from a loaded file's basis; [`surrogate::BODY4_DEGREE_START`] otherwise. Only a
+    /// basis with the body-4 block carries it (`default_basis`): a per-scene basis keeps the start.
+    body4_degree: usize,
     /// Thinned candidates since the last kept fallback sample (thinning; the no-model cap).
     since_kept: usize,
     /// Per stored sample: its atoms' (species index, descriptor) under `desc_basis`.
@@ -1341,6 +1348,10 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: the body-4 degree every fit takes instead of the growth rule's
+    /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
+    #[cfg(test)]
+    pub(super) body4_force: Option<usize>,
     /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach
     /// measurement set another ([`SurrogateKs::with_collection_r_cut`]).
     collection_r_cut: f64,
@@ -1425,12 +1436,13 @@ impl SurrogateKs {
             last: None,
             consults: 0,
             last_variance: None,
-            fit_floor_cache: std::sync::Mutex::new(None),
+            fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
             lone_codes: BTreeMap::new(),
             degree_cap: None,
+            body4_degree: surrogate::BODY4_DEGREE_START,
             since_kept: THIN_EVERY,
             desc_cache: Vec::new(),
             desc_basis: None,
@@ -1497,6 +1509,8 @@ impl SurrogateKs {
             shared: None,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            body4_force: None,
             collection_r_cut: surrogate::COLLECTION_R_CUT,
             collection_note: Vec::new(),
             source_file: None,
@@ -2443,17 +2457,53 @@ impl SurrogateKs {
             (&s.force_mask, s.use_energy).hash(&mut h);
         }
         self.quarantine.hash(&mut h);
-        (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.r_cut.to_bits()).hash(&mut h);
+        (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.body4_degree, basis.r_cut.to_bits()).hash(&mut h);
         let key = h.finish();
-        if let Some((k, f)) = *self.fit_floor_cache.lock().unwrap() {
+        if let Some(&(k, f)) = self.fit_floor_cache.lock().unwrap().get(&basis.body4_degree) {
             if k == key {
                 return f;
             }
         }
         let union = trust::key_column_counts(basis, store.samples.iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
         let f = if union > 0 { union } else { basis.n_independent_columns() };
-        *self.fit_floor_cache.lock().unwrap() = Some((key, f));
+        self.fit_floor_cache.lock().unwrap().insert(basis.body4_degree, (key, f));
         f
+    }
+
+    /// The body-4 degree a fit of these species is built at (spec 2026-11-13 §4.1, "grown with the
+    /// store"): the highest D₄ from [`surrogate::BODY4_DEGREE_CAP`] down to
+    /// [`surrogate::BODY4_DEGREE_START`] whose `Samples` floor — [`fit_floor`](Self::fit_floor) of
+    /// [`fit_basis`](Self::fit_basis) at that degree, the columns the fitted atoms touch — the
+    /// samples a fit would use meet (`FitReport::n_samples`, the count the `Samples` row compares).
+    /// It steps down only when samples are forgotten or held below the floor. Without the body-4
+    /// block (per scene) the start, which such a basis carries unused.
+    pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
+        let start = surrogate::BODY4_DEGREE_START;
+        let basis = self.fit_basis(species);
+        if !basis.body4 {
+            return start;
+        }
+        #[cfg(test)]
+        if let Some(d) = self.body4_force {
+            return d;
+        }
+        let Some(store) = self.store.as_ref() else { return start };
+        let fitted = (0..store.samples.len()).filter(|&i| !self.excluded(i)).count();
+        (start + 1..=surrogate::BODY4_DEGREE_CAP)
+            .rev()
+            .find(|&d| {
+                let mut at = basis.clone();
+                at.body4_degree = d;
+                fitted >= self.fit_floor(&at)
+            })
+            .unwrap_or(start)
+    }
+
+    /// The standing model's body-4 degree D₄ (spec 2026-11-13 §4.1; the Model tab's fit line):
+    /// `Some` only while its basis has the body-4 block (a collection's), `None` per scene or
+    /// without a model.
+    pub fn body4_degree(&self) -> Option<usize> {
+        self.model.as_ref().filter(|m| m.basis.body4).map(|m| m.basis.body4_degree)
     }
 
     /// The basis a fit of these species is built on: the default (`Basis::new`), the recovery
@@ -2481,6 +2531,11 @@ impl SurrogateKs {
         #[cfg(test)]
         {
             b.body4 &= !self.body4_off;
+        }
+        // the degree the last fit chose (`grown_body4_degree`); a basis without body-4 keeps
+        // `Basis::new`'s, bit for bit
+        if b.body4 {
+            b.body4_degree = self.body4_degree;
         }
         b
     }
@@ -2868,6 +2923,7 @@ impl Trainable for SurrogateKs {
             pending_refit: self.pending_refit(),
             epoch: self.epoch(),
             fit: self.report().map(|r| (r.n_samples, r.q_prime, r.rmse_energy_per_atom, r.rmse_force)),
+            body4_degree: self.body4_degree(),
             residuals: self.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
             force_bound: self.policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
             provenance_mismatch: self.provenance_mismatch(scene),

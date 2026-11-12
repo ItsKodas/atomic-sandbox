@@ -8758,6 +8758,171 @@ fn collection_mode_learns_across_scenes() {
     }
 }
 
+// ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----
+
+/// A provider learning into a collection of its own under `dir`, with the H and He references of
+/// the 33³ box.
+fn d4_student(dir: &CollectionRoot) -> SurrogateKs {
+    let (mut s, _) = pair_student();
+    s.attach_collection(dir, &h2(1.4)).unwrap();
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    s.set_reference_solved(2, SpeciesMorse::atom(2), 33, Some(0.0));
+    s
+}
+
+/// A random cluster of the species `z` near the origin: each atom 1.3–2.6 Bohr from a random
+/// earlier one.
+fn d4_cluster(z: &[u8], rng: &mut StdRng) -> Vec<[f64; 3]> {
+    let mut pos = vec![[rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)]];
+    while pos.len() < z.len() {
+        let from = pos[rng.gen_range(0..pos.len())];
+        let (u, r) = (unit_vector(rng), rng.gen_range(1.3..2.6));
+        let p: [f64; 3] = std::array::from_fn(|k| from[k] + r * u[k]);
+        let near = pos.iter().all(|q| (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f64>() >= 1.2 * 1.2);
+        if near && p.iter().all(|x| x.abs() < 2.8) {
+            pos.push(p);
+        }
+    }
+    pos
+}
+
+/// Keeps teacher answers of random clusters, their species cycling through `kinds`, until the
+/// store holds `total` samples.
+fn d4_keep(s: &mut SurrogateKs, kinds: &[&[u8]], total: usize, rng: &mut StdRng) {
+    let prov = s.provenance_for(&h2(1.4));
+    let mut notes = Vec::new();
+    for i in s.samples()..total {
+        let z = kinds[i % kinds.len()];
+        let pos = d4_cluster(z, rng);
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, z);
+        assert!(s.keep_sample(&pos, z, e, &f, Some(0.0), Some(1), &prov, SampleTag::Scan, &mut notes), "{notes:?}");
+    }
+}
+
+/// The species of `s`'s store.
+fn d4_species(s: &SurrogateKs) -> Vec<u8> {
+    let mut sp: Vec<u8> = s.store.as_ref().unwrap().samples.iter().flat_map(|x| x.z.iter().copied()).collect();
+    sp.sort_unstable();
+    sp.dedup();
+    sp
+}
+
+/// The basis a fit of `s`'s store builds (`fit_basis`) at body-4 degree `d`.
+fn basis_at(s: &SurrogateKs, d: usize) -> Basis {
+    let mut b = s.fit_basis(&d4_species(s));
+    b.body4_degree = d;
+    b
+}
+
+/// The species mix of the body-4 degree tests: S = 2 (H, He), whose floors at D₄ = 2 and 3 are
+/// 284 and 468 columns — room for f₂ + 30 ≤ n < f₃ (H alone: 38 and 52, none).
+const D4_KINDS: [&[u8]; 5] = [&[1, 1], &[1, 1, 1], &[1, 1, 2], &[1, 2], &[1, 1, 2, 2]];
+
+/// Spec 2026-11-13 §4.1: a collection's refit picks the highest body-4 degree whose `Samples`
+/// floor (the columns the fitted atoms touch at that degree) its fitted samples meet — 2 below
+/// f₃, 3 once the store meets it, and 2 again when samples are held back below it.
+#[test]
+fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
+    let dir = collection_root("d4-grow");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(3);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let (f2, f3) = (s.fit_floor(&basis_at(&s, 2)), s.fit_floor(&basis_at(&s, 3)));
+    println!("floors at 50 samples: D₄ = 2: {f2}, D₄ = 3: {f3}");
+    assert!(f2 < f3, "{f2} vs {f3}");
+    assert!(f2 + 30 < f3, "room between the floors: {f2} vs {f3}");
+    // f₂ + 30 ≤ n < f₃: degree 2
+    d4_keep(&mut s, &D4_KINDS, f2 + 30, &mut rng);
+    assert_eq!((s.fit_floor(&basis_at(&s, 2)), s.fit_floor(&basis_at(&s, 3))), (f2, f3), "the floors hold");
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(s.body4_degree(), Some(2));
+    assert_eq!(s.model().unwrap().basis.body4_degree, 2);
+    assert_eq!(s.basis().unwrap().body4_degree, 2, "the accumulator's basis too");
+    assert_eq!(rep.q_prime, basis_at(&s, 2).n_independent_columns());
+    // n ≥ f₃ + 30: degree 3
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (3, 3));
+    assert_eq!(rep.q_prime, basis_at(&s, 3).n_independent_columns());
+    // held back below f₃ (superseded codes, written to the collection): degree 2 again
+    let n = s.samples();
+    let hold = n - (f3 - 1);
+    s.quarantine.resize(n, Q_NONE);
+    for q in &mut s.quarantine[n - hold..] {
+        *q = Q_SUPERSEDED;
+    }
+    s.sync_collection_status();
+    let rep = s.refit().unwrap();
+    println!("{hold} held: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert!(rep.n_samples < f3, "{} fitted", rep.n_samples);
+    assert_eq!(s.body4_degree(), Some(2));
+    assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (2, 2));
+}
+
+/// Spec 2026-11-13 §4.1: a per-scene model's basis is `Basis::new`'s as before (no body-4, the
+/// start degree it never uses), and it has no body-4 degree to show.
+#[test]
+fn a_per_scene_model_keeps_its_basis() {
+    let (s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let mut want = Basis::new(&[1]);
+    if let Some(d) = s.degree_cap.filter(|_| want.body3) {
+        want.degree_cap = d;
+    }
+    let b = &s.model().unwrap().basis;
+    assert_eq!(*b, want);
+    assert!(!b.body4);
+    assert_eq!(b.body4_degree, surrogate::BODY4_DEGREE_START);
+    assert_eq!(s.body4_degree(), None);
+    assert_eq!(s.body4_degree, surrogate::BODY4_DEGREE_START);
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).body4_degree, None);
+}
+
+/// Spec 2026-11-13 §4.1, old files: a fitted model file written at D₄ = 2 loads and answers at 2
+/// (no refit, no refusal). A model file is a per-scene model (`install_sidecar` lets a collection
+/// go), so its own next refit is per scene — no body-4 block; the collection whose degree-2 fit
+/// it was steps up to 3 at its next refit, its store meeting f₃.
+#[test]
+fn a_loaded_degree_2_model_steps_up_at_its_next_refit() {
+    let dir = collection_root("d4-loaded");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(5);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(2);
+    s.refit().unwrap();
+    s.body4_force = None;
+    assert_eq!(s.body4_degree(), Some(2), "the premise: a degree-2 fit of a store that meets f₃");
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).body4_degree, Some(2), "the status carries it");
+    // a collection writes no model file (`save_sidecar`): the fit, written as `save_sidecar` writes one
+    let path = std::env::temp_dir().join(format!("as-d4-loaded-{}.model", std::process::id()));
+    surrogate::sidecar::write_full(&path, s.model().unwrap(), s.accumulator().unwrap(), s.report(), &s.store.as_ref().unwrap().samples, Some(surrogate::sidecar::REFERENCE_RULE), &[], &[], None).unwrap();
+    let sc = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((sc.model.basis.body4, sc.model.basis.body4_degree), (true, 2), "the file's own degree");
+    let (mut t, _) = pair_student();
+    t.install_sidecar(sc).unwrap();
+    assert_eq!(t.body4_degree(), Some(2));
+    assert_eq!(t.body4_degree, 2);
+    assert_eq!(t.basis().unwrap().body4_degree, 2);
+    // it answers as the saved model did
+    let pos = d4_cluster(&[1, 1, 2], &mut rng);
+    let (a, b) = (s.model().unwrap().predict(&pos, &[1, 1, 2], true).unwrap(), t.model().unwrap().predict(&pos, &[1, 1, 2], true).unwrap());
+    assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+    assert_eq!(a.forces, b.forces);
+    // its own next refit is per scene: the basis without body-4, at the start degree
+    t.refit().unwrap();
+    assert_eq!(t.body4_degree(), None);
+    assert_eq!((t.basis().unwrap().body4, t.basis().unwrap().body4_degree), (false, surrogate::BODY4_DEGREE_START));
+    // the collection's degree-2 fit steps up at its next refit
+    s.refit().unwrap();
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!(s.model().unwrap().basis.body4_degree, 3);
+}
+
 /// A collection reopened by a new provider rebuilds the same fit from what it stored: samples,
 /// statuses and references — bit for bit the same predictions.
 #[test]

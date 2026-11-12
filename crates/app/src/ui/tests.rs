@@ -160,6 +160,7 @@ pub(crate) fn model() -> ModelStatus {
         pending_refit: false,
         epoch: 3,
         fit: Some((271, 40, 2.1e-6, 1.6e-5)),
+        body4_degree: None,
         residuals: None,
         force_bound: 2e-3,
         provenance_mismatch: None,

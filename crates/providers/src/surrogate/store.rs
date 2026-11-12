@@ -158,6 +158,7 @@ impl SurrogateKs {
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = None;
+        self.body4_degree = surrogate::BODY4_DEGREE_START;
         self.since_kept = THIN_EVERY;
         self.desc_cache.clear();
         self.desc_basis = None;
@@ -424,6 +425,9 @@ impl SurrogateKs {
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = (model.basis.body3 && model.basis.degree_cap != Basis::new(&[]).degree_cap).then_some(model.basis.degree_cap);
+        // the file's own body-4 degree (spec 2026-11-13 §4.1: a D₄ = 2 file answers at 2 — no
+        // refit, no refusal; its later refits follow the growth rule)
+        self.body4_degree = model.basis.body4_degree;
         self.desc_cache.clear();
         self.desc_basis = None;
         self.since_kept = THIN_EVERY;

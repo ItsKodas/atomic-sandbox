@@ -277,7 +277,7 @@ fn refit_state(s: &SurrogateKs) -> String {
         format!("active_set {:?}", s.active_set),
         format!("null_space {:?}", s.null_space.as_ref().map(|n| n.dimension())),
         format!("quarantine {quarantine:?}"),
-        format!("degree_cap {:?}", s.degree_cap),
+        format!("degree_cap {:?} body4_degree {}", s.degree_cap, s.body4_degree),
         format!("recovery {:?}", s.recovery_note()),
         format!("trusted {} {:?}", s.trusted(), s.untrusted_reason()),
         format!("failed_audits {:?}", s.failed_audits.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>()),
@@ -588,4 +588,40 @@ fn a_cancelled_background_refit_installs_nothing_new() {
         // without its trust passes
         assert_eq!(s.deferred_trust, None);
     }
+}
+
+/// Spec 2026-11-13 §4.1: the body-4 degree is provider state a background refit carries — a fork
+/// that steps a degree-2 fit up to 3 installs it, no conflict; a live degree other than the
+/// snapshot's is a conflict, named.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_background_refit_carries_its_body4_degree() {
+    let dir = collection_root("bg-d4");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(9);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(2);
+    s.refit().unwrap();
+    s.body4_force = None;
+    assert_eq!(s.body4_degree(), Some(2), "the premise");
+    assert!(s.begin_background_refit());
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(r) => {
+            r.unwrap();
+        }
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("installed"),
+    }
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!(s.body4_degree, 3);
+    assert_eq!(s.basis().unwrap().body4_degree, 3);
+    assert!(!s.user_notes.iter().any(|n| n.contains("discarded")), "{:?}", s.user_notes);
+    // a refit that started at degree 2 against the live provider at 3
+    let mut snap = s.snapshot();
+    assert_eq!(s.background_conflict(&snap), None);
+    snap.body4_degree = 2;
+    let why = s.background_conflict(&snap).expect("a conflict");
+    assert!(why.contains("the body-4 degree"), "{why}");
 }

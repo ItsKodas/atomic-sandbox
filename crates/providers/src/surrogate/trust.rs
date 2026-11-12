@@ -298,6 +298,7 @@ pub(super) struct FitState {
     pub(super) class_worst: Vec<Option<(usize, f64)>>,
     pub(super) class_blockers: Vec<Vec<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
+    pub(super) body4_degree: usize,
     pub(super) fit_members: (usize, Vec<u8>),
     pub(super) deferred_trust: Option<usize>,
 }
@@ -1393,6 +1394,7 @@ impl SurrogateKs {
             class_worst: self.class_worst.clone(),
             class_blockers: self.class_blockers.clone(),
             degree_cap: self.degree_cap,
+            body4_degree: self.body4_degree,
             fit_members: self.fit_members.clone(),
             deferred_trust: self.deferred_trust,
         }
@@ -1413,6 +1415,7 @@ impl SurrogateKs {
         self.class_worst = s.class_worst;
         self.class_blockers = s.class_blockers;
         self.degree_cap = s.degree_cap;
+        self.body4_degree = s.body4_degree;
         self.fit_members = s.fit_members;
         self.deferred_trust = s.deferred_trust;
         self.model_gen += 1; // a view cache key: the model moved back
@@ -1457,17 +1460,24 @@ impl SurrogateKs {
         let opts = FitOptions { sigma_f_min: force_noise_prior(&provenance.ionic), ..FitOptions::default() };
         // (Re)build the accumulator: from scratch after a species or reference change, else
         // only the samples added since the last refit.
-        // (a collection attached or let go changes the basis: body-4 and the reach follow `shared`)
+        // (a collection attached or let go changes the basis: body-4 and the reach follow `shared`;
+        // the body-4 degree grows with the store — spec 2026-11-13 §4.1 — and another degree than
+        // the accumulator's is another basis)
         let default = self.default_basis(&[]);
+        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        let degree = self.grown_body4_degree(&species);
         let rebuild = self.accumulator.is_none()
             || self.species_dirty
             || self.refs_dirty
-            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != default.body4 || a.basis.r_cut != default.r_cut);
+            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != default.body4 || a.basis.r_cut != default.r_cut || a.basis.body4_degree != degree);
         let basis = if rebuild {
-            let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
-            species.sort_unstable();
-            species.dedup();
-            self.fit_basis(&species)
+            let mut b = self.fit_basis(&species);
+            if b.body4 {
+                b.body4_degree = degree;
+            }
+            b
         } else {
             self.accumulator.as_ref().expect("checked").basis.clone()
         };
@@ -1512,6 +1522,7 @@ impl SurrogateKs {
         self.accumulated = accumulated;
         self.species_dirty = false;
         self.refs_dirty = false;
+        self.body4_degree = degree;
         self.model = Some(model);
         self.report = Some(report.clone());
         self.fits += 1;

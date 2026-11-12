@@ -35,7 +35,8 @@
 //! Anything else is a **conflict** and the result is discarded, never merged: a model, store or
 //! policy that changed (`model_gen`: a forget, a load, an install, an attach, a policy change, a
 //! pass's or teaching round's own fit), another reference set — canonical or per box: a box
-//! reference's arrival rebases that box's stored energies (the review's finding 1) — or degree cap, a quarantine code of
+//! reference's arrival rebases that box's stored energies (the review's finding 1) — or degree cap
+//! or body-4 degree (spec 2026-11-13 §4.1: the degree a fit chose is provider state), a quarantine code of
 //! a sample < P (a reference arrival's rebase, a fence vote's release or supersession), the failed
 //! audits or fences the copy judged, the teach-around counts. The refit is then simply due again
 //! (`pending_refit`) — the model that stood keeps standing until a refit installs. So the state
@@ -91,13 +92,15 @@ impl Drop for BackgroundRefit {
 }
 
 /// The live state a background refit started from, as far as the install's conflict test needs it.
-struct Snapshot {
+pub(super) struct Snapshot {
     /// The store length: the copy refits these samples.
     p: usize,
     model_gen: u64,
     quarantine: Vec<u8>,
     refs: BTreeMap<u8, f64>,
     degree_cap: Option<usize>,
+    /// The body-4 degree the standing fit chose (`SurrogateKs::body4_degree`, spec 2026-11-13 §4.1).
+    pub(super) body4_degree: usize,
     failed_audits: Vec<FailedAudit>,
     audit_fences: Vec<FailedAudit>,
     vote_pending: Vec<(usize, Vec<usize>)>,
@@ -160,6 +163,7 @@ impl SurrogateKs {
         f.quarantine = self.quarantine.clone();
         f.lone_codes = self.lone_codes.clone();
         f.degree_cap = self.degree_cap;
+        f.body4_degree = self.body4_degree;
         // the descriptor cache is not copied: the copy's active set fills its own, off the step
         // path, and the install takes it
         f.recovery = self.recovery.clone();
@@ -182,6 +186,7 @@ impl SurrogateKs {
         #[cfg(test)]
         {
             f.body4_off = self.body4_off;
+            f.body4_force = self.body4_force;
             f.eager_trust_passes = self.eager_trust_passes;
         }
         f
@@ -194,21 +199,7 @@ impl SurrogateKs {
         if self.background.is_some() || self.pass.is_some() || self.model.is_none() || self.store.as_ref().is_none_or(|s| s.is_empty()) {
             return false;
         }
-        let snap = Snapshot {
-            p: self.samples(),
-            model_gen: self.model_gen,
-            quarantine: self.quarantine.clone(),
-            refs: self.refs.clone(),
-            degree_cap: self.degree_cap,
-            failed_audits: self.failed_audits.clone(),
-            audit_fences: self.audit_fences.clone(),
-            vote_pending: self.vote_pending.clone(),
-            teach_rounds: self.teach_rounds.clone(),
-            audit_burst: self.audit_burst,
-            history: shared::history_stamp(&self.audit_history),
-            box_refs: self.shared.as_ref().map(|sh| sh.box_refs.clone()),
-            class_memory: self.class_memory.clone(),
-        };
+        let snap = self.snapshot();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut fork = self.fork_for_refit();
         fork.refit_cancel = Some(cancel.clone());
@@ -225,6 +216,26 @@ impl SurrogateKs {
         }
         self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe });
         true
+    }
+
+    /// The live state a background refit starting now would start from (its [`Snapshot`]).
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            p: self.samples(),
+            model_gen: self.model_gen,
+            quarantine: self.quarantine.clone(),
+            refs: self.refs.clone(),
+            degree_cap: self.degree_cap,
+            body4_degree: self.body4_degree,
+            failed_audits: self.failed_audits.clone(),
+            audit_fences: self.audit_fences.clone(),
+            vote_pending: self.vote_pending.clone(),
+            teach_rounds: self.teach_rounds.clone(),
+            audit_burst: self.audit_burst,
+            history: shared::history_stamp(&self.audit_history),
+            box_refs: self.shared.as_ref().map(|sh| sh.box_refs.clone()),
+            class_memory: self.class_memory.clone(),
+        }
     }
 
     /// Whether a background refit is running.
@@ -272,7 +283,7 @@ impl SurrogateKs {
 
     /// Why the live provider's changes since `snap` are not appends (module doc), `None` when they
     /// are.
-    fn background_conflict(&self, snap: &Snapshot) -> Option<String> {
+    pub(super) fn background_conflict(&self, snap: &Snapshot) -> Option<String> {
         let why = |s: &str| Some(format!("background refit discarded: {s} changed while it ran — it is due again"));
         if self.model_gen != snap.model_gen {
             return why("the model, its samples or the policy");
@@ -285,6 +296,9 @@ impl SurrogateKs {
         }
         if self.degree_cap != snap.degree_cap {
             return why("the degree cap");
+        }
+        if self.body4_degree != snap.body4_degree {
+            return why("the body-4 degree");
         }
         let code = |q: &[u8], i: usize| q.get(i).copied().unwrap_or(Q_NONE);
         if (0..snap.p).any(|i| code(&self.quarantine, i) != code(&snap.quarantine, i)) {
@@ -354,6 +368,7 @@ impl SurrogateKs {
         self.class_blockers = std::mem::take(&mut f.class_blockers);
         self.deferred_trust = f.deferred_trust;
         self.degree_cap = f.degree_cap;
+        self.body4_degree = f.body4_degree;
         self.fit_members = std::mem::take(&mut f.fit_members);
         self.fits = f.fits;
         self.model_gen = self.model_gen.max(f.model_gen);
@@ -367,7 +382,7 @@ impl SurrogateKs {
             self.desc_basis = f.desc_basis.take();
         }
         self.curve_cache = None;
-        *self.fit_floor_cache.lock().unwrap() = None;
+        self.fit_floor_cache.lock().unwrap().clear();
         // the failed audits and fences the copy judged, then the live ones added since
         let added_audits = self.failed_audits.split_off(snap.failed_audits.len());
         let added_fences = self.audit_fences.split_off(snap.audit_fences.len());
@@ -420,6 +435,7 @@ impl Snapshot {
             quarantine: Vec::new(),
             refs: BTreeMap::new(),
             degree_cap: None,
+            body4_degree: surrogate::BODY4_DEGREE_START,
             failed_audits: Vec::new(),
             audit_fences: Vec::new(),
             vote_pending: Vec::new(),

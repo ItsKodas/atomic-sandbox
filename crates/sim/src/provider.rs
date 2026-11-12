@@ -1166,6 +1166,9 @@ pub struct TrainableStatus {
     pub epoch: u64,
     /// The last fit: (samples, Q′, rmse E per atom, rmse F).
     pub fit: Option<(usize, usize, f64, f64)>,
+    /// The standing model's body-4 degree D₄ (a shared collection's basis, grown with its samples:
+    /// `providers::surrogate`, spec 2026-11-13 §4.1); `None` without body-4 (per scene) or a model.
+    pub body4_degree: Option<usize>,
     /// Worst training residuals: (energy per atom, force, that atom's force bound).
     pub residuals: Option<(f64, f64, f64)>,
     /// The per-component force bound at the smallest force of `status`'s `forces` (Ha/Bohr).
