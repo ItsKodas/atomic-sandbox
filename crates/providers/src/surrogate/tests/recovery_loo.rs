@@ -43,10 +43,10 @@ fn h3(rng: &mut StdRng, lo: f64, hi: f64) -> Scene {
 }
 
 /// The outlier's store index in [`outlier_store`].
-const OUTLIER: usize = 130;
+pub(super) const OUTLIER: usize = 130;
 
 /// The module doc's fixture: 100 H₃, 30 H₂, then the outlier (index [`OUTLIER`]); not fitted.
-fn outlier_store() -> SurrogateKs {
+pub(super) fn outlier_store() -> SurrogateKs {
     let (mut s, _) = pair_student();
     s.set_reference_energy(1, SpeciesMorse::atom(1));
     let mut rng = StdRng::seed_from_u64(1804);
@@ -166,17 +166,46 @@ fn the_leave_one_out_ratio_is_the_class_rules_reading() {
     let l = SampleLoo { energy: Some(-6e-3), forces: vec![Some([0.0, 0.03 * 3f64.sqrt(), 0.0]), Some([0.0, 0.0, 0.004 * 3f64.sqrt()]), None] };
     // energy: 6e-3 / 3 atoms / 1e-3 = 2 (whole-energy fit), 6 per atom;
     // atom 0: d 0.03 / 1e-2 = 3 (ρ), / 2e-3 = 15 (ρ_σ); atom 1: d 0.004 / 2e-3 = 2 both
-    let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12;
-    assert!(close(loo_ratio(&p, false, &s, Some(&l)), (3.0, 15.0)), "{:?}", loo_ratio(&p, false, &s, Some(&l)));
-    assert!(close(loo_ratio(&p, true, &s, Some(&l)), (6.0, 15.0)), "{:?}", loo_ratio(&p, true, &s, Some(&l)));
+    // (ρ, ρ_σ, the channel attaining ρ_σ — re-review N1)
+    let close = |a: (f64, f64, Channel), b: (f64, f64, Channel)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12 && a.2 == b.2;
+    assert!(close(loo_ratio(&p, false, &s, Some(&l)), (3.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, false, &s, Some(&l)));
+    assert!(close(loo_ratio(&p, true, &s, Some(&l)), (6.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, true, &s, Some(&l)));
     let no_energy = Sample { use_energy: false, ..s.clone() };
     let l2 = SampleLoo { energy: None, ..l.clone() };
-    assert!(close(loo_ratio(&p, false, &no_energy, Some(&l2)), (3.0, 15.0)));
+    assert!(close(loo_ratio(&p, false, &no_energy, Some(&l2)), (3.0, 15.0, Channel::Force)));
     let small = SampleLoo { energy: Some(1e-4), forces: vec![Some([0.0; 3]), Some([0.0; 3]), None] };
-    assert!(close(loo_ratio(&p, true, &s, Some(&small)), (0.1, 0.1)));
-    assert_eq!(loo_ratio(&p, false, &s, None), (f64::INFINITY, f64::INFINITY), "undefined (ruling R1a)");
+    assert!(close(loo_ratio(&p, true, &s, Some(&small)), (0.1, 0.1, Channel::Energy)), "the energy channel attains ρ_σ");
+    // an energy outlier whose forces the rest predicts: ρ_σ is its energy ratio (#1804's shape)
+    let energy_outlier = SampleLoo { energy: Some(0.05), forces: vec![Some([0.0, 0.003, 0.0]), Some([0.0; 3]), None] };
+    let (own, tier, ch) = loo_ratio(&p, true, &s, Some(&energy_outlier));
+    assert!((own - 50.0).abs() < 1e-9 && (tier - 50.0).abs() < 1e-9 && ch == Channel::Energy, "{own} {tier} {ch:?}");
+    assert_eq!(loo_ratio(&p, false, &s, None), (f64::INFINITY, f64::INFINITY, Channel::Force), "undefined (ruling R1a)");
     let nan = SampleLoo { energy: Some(f64::NAN), ..l.clone() };
-    assert_eq!(loo_ratio(&p, false, &s, Some(&nan)), (f64::INFINITY, f64::INFINITY), "not a number: the worst");
+    let (own, tier, _) = loo_ratio(&p, false, &s, Some(&nan));
+    assert_eq!((own, tier), (f64::INFINITY, f64::INFINITY), "not a number: the worst");
+}
+
+/// Re-review N1 and N2: the note's words. In the noise-only mode it names the tier of the channel
+/// that attained the worst ratio (an energy outlier's against its 1e-3 Ha/atom energy tier, not the
+/// force tier); "keeping them breaks the fit of their neighbours" only when the result recovered
+/// (a ratio above 1 says only that the rest of the data could not predict the sample).
+#[test]
+fn the_recovery_note_names_the_channel_and_claims_no_repair_it_did_not_see() {
+    let loo = |worst, bound| Held { worst, bound };
+    assert_eq!(
+        quarantine_words(1, 1, loo(962.0, Bound::EnergyTier(1e-3)), Ranking::LeaveOneOut, true),
+        "1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 962× its 1e-3 Ha/atom energy tier, and keeping them breaks the fit of their neighbours (kept, excluded from the fit; geometries near them fall back)"
+    );
+    assert_eq!(
+        quarantine_words(3, 2, loo(4.24, Bound::ForceTier(2e-3)), Ranking::LeaveOneOut, false),
+        "2 samples quarantined this refit (3 held in all) — the fit without each of them predicts it at up to 4.2× the 2e-3 Ha/Bohr force-noise tier (kept, excluded from the fit; geometries near them fall back)"
+    );
+    assert_eq!(
+        quarantine_words(1, 1, loo(f64::INFINITY, Bound::Own), Ranking::LeaveOneOut, false),
+        "1 samples quarantined this refit (1 held in all) — the fit without one of them cannot predict it at all (it alone spans a direction of the fit) (kept, excluded from the fit; geometries near them fall back)"
+    );
+    assert!(!quarantine_words(128, 23, loo(2.2, Bound::Own), Ranking::LeaveOneOut, false).contains("neighbours"), "an unrecovered result claims no repair");
+    assert_eq!((ratio_words(38.4), ratio_words(9.96), ratio_words(f64::INFINITY)), ("38".to_string(), "10.0".to_string(), "∞".to_string()));
 }
 
 /// Ruling R1b and the plan's review focus 2: the class pass leaves its ratios cached for its own
@@ -239,7 +268,8 @@ fn undefined_leave_one_out_ranks_first_and_never_crosses_the_cap() {
     let inject = |s: &mut SurrogateKs, undefined: &[usize]| {
         let rows: Vec<(usize, f64)> = rows.iter().map(|&(i, r)| (i, if undefined.contains(&i) { f64::INFINITY } else { r })).collect();
         let tier = rows.iter().map(|r| r.1).collect();
-        s.loo_ratios = Some(LooRatios { gen, rows, tier });
+        let tier_channel = vec![Channel::Force; rows.len()];
+        s.loo_ratios = Some(LooRatios { gen, rows, tier, tier_channel });
     };
     inject(&mut s, &[3, 40]);
     assert_eq!(s.worst_offenders(), (vec![3, 40], f64::INFINITY), "only the undefined ones, ahead of the outlier");
@@ -489,6 +519,9 @@ fn the_energy_channel_of_the_ratio_names_an_energy_glitch() {
     println!("energy glitch: ρ {rho:.2} = energy channel {e:.2} (force channel {f:.2e})");
     assert_eq!(rho, e, "the ratio is the energy channel");
     assert!(e > 10.0 * f.max(1.0), "the energy channel decides");
+    let c = s.fresh_loo_ratios().unwrap();
+    let k = c.rows.iter().position(|x| x.0 == 40).unwrap();
+    assert_eq!(c.tier_channel[k], Channel::Energy, "and the cache says so, for the noise-only note (re-review N1)");
     assert_eq!(s.worst_offenders().0, vec![40], "and names the glitch alone");
 }
 
@@ -534,6 +567,7 @@ fn step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples() {
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
     assert_eq!(s.degree_cap, None, "step 3: the default basis");
     assert!(s.is_quarantined(glitch));
+    assert_eq!(held, vec![49, 50], "the triangle and the glitch, as the doc says (re-review N3)");
     assert!(s.recovery_note().is_some_and(|n| n.starts_with("back to the default basis")), "{:?}", s.recovery_note());
 }
 

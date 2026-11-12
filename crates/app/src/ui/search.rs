@@ -189,6 +189,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    e("Worst-fitting samples (forget / restore one)", "leave-one-out outlier bad sample forget restore estimated", Dock(D::Model), "d-suspects"),
     // Knowledge (M8a Task 9)
     e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
     // Activity

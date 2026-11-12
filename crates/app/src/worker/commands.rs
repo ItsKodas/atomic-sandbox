@@ -77,6 +77,13 @@ pub enum Command {
     /// Estimated solver: import a `.model` file's samples into the attached collection
     /// (`Trainable::import_model`); the outcome is `ModelStatus::last_import`. Never an edit.
     ImportModel(PathBuf),
+    /// Estimated solver: the Model tab's "Worst-fitting samples" › Forget (spec 2026-11-12 R2): the
+    /// stored sample with this index is held out of the fit until Restore (`Trainable::forget_sample`;
+    /// its status written at once), then a refit. Never an edit, never aborts.
+    ForgetSample(usize),
+    /// Estimated solver: Restore of a forgotten sample (`Trainable::restore_sample`), then a refit.
+    /// Never an edit, never aborts.
+    RestoreSample(usize),
     /// Estimated solver: "Save a specialised model…" (M8a Task 7): the attached collection's samples
     /// made only of `species` written to `path` (`Trainable::save_specialised`); noted, an error
     /// when refused. Never an edit (a file write).
@@ -172,6 +179,8 @@ impl Command {
             | Command::Collections(_)
             | Command::UseModel(_)
             | Command::ImportModel(_)
+            | Command::ForgetSample(_)
+            | Command::RestoreSample(_)
             | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
             | Command::SetAudit(_)
@@ -205,6 +214,8 @@ impl Command {
             | Command::TrainingCheckpoints(_)
             | Command::Collections(_)
             | Command::ImportModel(_)
+            | Command::ForgetSample(_)
+            | Command::RestoreSample(_)
             | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
             | Command::SetDraft(_)
@@ -244,6 +255,8 @@ impl Command {
                 | Command::Collections(_)
                 | Command::UseModel(_)
                 | Command::ImportModel(_)
+                | Command::ForgetSample(_)
+                | Command::RestoreSample(_)
                 | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
@@ -284,6 +297,8 @@ impl Command {
             | Command::TrainingCheckpoints(_)
             | Command::Collections(_)
             | Command::ImportModel(_)
+            | Command::ForgetSample(_)
+            | Command::RestoreSample(_)
             | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
@@ -390,6 +405,8 @@ impl Worker {
             Command::Collections(dir) => self.collections = dir,
             Command::UseModel(choice) => self.use_model(choice),
             Command::ImportModel(path) => self.import_model(&path),
+            Command::ForgetSample(i) => self.user_sample(i, true),
+            Command::RestoreSample(i) => self.user_sample(i, false),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {

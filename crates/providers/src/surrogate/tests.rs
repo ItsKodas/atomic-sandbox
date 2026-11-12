@@ -955,7 +955,7 @@ fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
     let r = s.evaluate(&stray, &mut never()).unwrap();
     println!("at the stray geometry: {:?}, notes {:?}", r.stats.source, r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("quarantined geometry")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("of a sample held out of the fit (quarantined")), "{:?}", r.stats.notes);
     assert!(r.stats.notes.iter().any(|n| n.contains("0 released, 1 superseded")), "{:?}", r.stats.notes);
     assert_eq!((s.samples(), calls(&h), s.quarantined(), s.superseded()), (42, calls0 + 1, 0, 1));
     s.refit().unwrap();
@@ -3589,7 +3589,14 @@ fn fnv1a(text: &str) -> u64 {
 /// line, now "1 samples quarantined this refit (1 held in all) — the fit without each of them
 /// predicts it at up to 49× its bound, …"; with the round-1 words substituted back the trace hashes
 /// to the round-1 pin exactly.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xdd8a_dc25_aa37_49e3;
+/// **Re-pinned for the fence's refusal wording** (plan 2026-11-12 Task 2, re-review N3;
+/// 0xdd8a_dc25_aa37_49e3 → below): one string, at step 86 (the fence at the quarantined glitch),
+/// "of a quarantined geometry the model cannot represent" → "of a sample held out of the fit
+/// (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or
+/// forgotten by the user)"; with the old words substituted back the trace hashes to the old pin
+/// exactly (checked on the GOLDEN_TRACE output). The recovery note's words are unchanged (that
+/// refit recovers, so "keeping them breaks the fit of their neighbours" stays).
+const SCRIPTED_SESSION_DIGEST: u64 = 0xfcf7_5e47_a07c_7000;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -10189,6 +10196,9 @@ mod lone;
 
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
 mod recovery_loo;
+
+/// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
+mod forget;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

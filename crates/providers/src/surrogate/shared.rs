@@ -581,7 +581,22 @@ impl SurrogateKs {
         }
     }
 
-    fn note_write_failure(&mut self, e: &str) {
+    /// Writes stored sample `i`'s current code to the attached collection at once (the user's
+    /// Forget and Restore, spec R2), when the collection holds it and its status differs: `Ok(true)`
+    /// when the collection holds it (written, or already that code), `Ok(false)` when there is no
+    /// collection or it does not hold the sample (a session-only one: the code lives in the store,
+    /// and the session autosave), `Err` when the write failed (a read-only collection).
+    pub(super) fn write_status_now(&mut self, i: usize) -> Result<bool, String> {
+        let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
+        let Some(sh) = self.shared.as_mut() else { return Ok(false) };
+        let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
+        if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
+            sh.coll.set_status(k, code)?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn note_write_failure(&mut self, e: &str) {
         if let Some(sh) = self.shared.as_mut().filter(|s| !s.write_noted) {
             sh.write_noted = true;
             let slug = sh.coll.key.slug();
@@ -830,9 +845,12 @@ impl SurrogateKs {
                     // the leave-one-out ratios cached for the fit stay its own, but a recompute
                     // before the next fit (`ensure_loo_ratios` after a restore whose cache was not
                     // that fit's) would pair these new labels' residuals with the old fit's hat
-                    // matrix — not a leave-one-out. Harmless inside a refit; Task 2's between-refit
-                    // display must not recompute after a rebase (or the rebase must bump the key).
-                    // (Fix round 2, M7: flagged for Task 2.)
+                    // matrix — not a leave-one-out. Harmless inside a refit (its next fit replaces
+                    // it). The between-refit display (the Model tab's "Worst-fitting samples",
+                    // `sample_suspects`, plan Task 2) never recomputes: it reads the fit's own
+                    // cache (`fresh_loo_ratios`) or shows nothing — so the rebase keeps
+                    // `model_gen` (a bump would also void every fence vote and view cache keyed on
+                    // it, for a label change the pending refit takes anyway).
                     if st.samples[i].energy.to_bits() != e.to_bits() {
                         st.samples[i].energy = e;
                         changed = true;

@@ -43,6 +43,14 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         no_model_row(ui, m, sampling, acts);
         teach_row(ui, m, sampling, acts);
     }
+    // spec 2026-11-12 R2: the fit's worst-fitting samples, each with Forget; the forgotten ones
+    // with Restore
+    let r = egui::CollapsingHeader::new("Worst-fitting samples")
+        .id_salt("suspects")
+        .default_open(false)
+        .open(search::opens(st, "d-suspects"))
+        .show(ui, |ui| suspects(ui, m, acts));
+    search::mark(ui, st, "d-suspects", r.header_response.rect);
     if let Some(m) = m {
         // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
         // set recorded with it — recorded, never compared (ruling P2)
@@ -253,6 +261,84 @@ fn specialise_row(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, scene_z: &[u8]
             }
         }
     });
+}
+
+/// A leave-one-out ratio as the "Worst-fitting samples" rows round it (as the recovery note does):
+/// a whole number from 10×, one decimal below, "∞" when undefined (the sample alone spans a
+/// direction of the fit).
+pub fn ratio_words(r: f64) -> String {
+    if !r.is_finite() {
+        "∞".to_string()
+    } else if r >= 10.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r:.1}")
+    }
+}
+
+/// One "Worst-fitting samples" row (spec R2): `#1804 · HO · fallback · 38× its bound` — the store
+/// index, the formula from Z, the origin from the sample's tag, and how far the fit without it
+/// predicts it over its own bound; "not in the fit" for a forgotten sample the fit that stands
+/// does not hold.
+pub fn suspect_line(s: &sim::SampleSuspect) -> String {
+    let ratio = match s.loo_ratio {
+        Some(r) => format!("{}× its bound", ratio_words(r)),
+        None => "not in the fit".to_string(),
+    };
+    format!("#{} · {} · {} · {ratio}", s.index, s.formula, s.origin)
+}
+
+/// Below the list (spec R2).
+pub const SUSPECTS_CAPTION: &str = "Ranked by how badly the fit without each sample predicts it.";
+/// The section without a model.
+pub const SUSPECTS_NO_MODEL: &str = "no model yet: the samples are ranked once a fit stands";
+/// The section with a model whose ranking is not computed yet.
+pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the next refit";
+/// The hover of a row's Forget.
+const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it";
+
+/// The "Worst-fitting samples" section's body (spec R2): the fit's worst samples by their
+/// leave-one-out ratio (`ModelStatus::suspects`), each with **Forget** (`Action::ForgetSample`),
+/// the caption, and the forgotten samples, each with **Restore** (`Action::RestoreSample`); with no
+/// model, or no ranking yet, it says why.
+pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
+    match m {
+        None => {
+            ui.weak(SUSPECTS_NO_MODEL);
+        }
+        Some(m) if !m.fitted => {
+            ui.weak(SUSPECTS_NO_MODEL);
+        }
+        Some(m) if m.suspects.is_empty() => {
+            ui.weak(SUSPECTS_NO_RANKING);
+        }
+        Some(m) => {
+            for s in &m.suspects {
+                ui.horizontal(|ui| {
+                    let worst = s.loo_ratio.is_some_and(|r| !(r <= 1.0));
+                    ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(if worst { AMBER } else { theme::INK }));
+                    if super::super::probed(&format!("forget-sample-{}", s.index), ui.small_button("Forget")).on_hover_text(FORGET_SAMPLE_TIP).clicked() {
+                        acts.push(Action::ForgetSample(s.index));
+                    }
+                });
+            }
+            ui.label(RichText::new(SUSPECTS_CAPTION).size(11.0).color(theme::INK_DIM));
+        }
+    }
+    let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else { return };
+    ui.add_space(4.0);
+    ui.label(RichText::new(format!("forgotten ({}): held out of the fit until restored", m.forgotten_samples.len())).size(11.5));
+    for s in &m.forgotten_samples {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));
+            if super::super::probed(&format!("restore-sample-{}", s.index), ui.small_button("Restore"))
+                .on_hover_text("put this sample back into the fit (written at once; the model refits with it)")
+                .clicked()
+            {
+                acts.push(Action::RestoreSample(s.index));
+            }
+        });
+    }
 }
 
 /// "imported N, refused M" of an import (the Model tab).
@@ -624,6 +710,17 @@ mod tests {
         assert_eq!(super::species_line("many-body", &s(8, vec![1], None, 967, 38)), "  many-body around O, with H: learned · 967 samples for 38 columns");
         assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], Some((sim::ClassKey::Samples, 12.0, 146.0)), 12, 146)), "  many-body around H, with H and O: not learned yet (DFT) · 12 of 146 samples needed");
         assert_eq!(super::species_line("pair", &s(1, vec![7], Some((sim::ClassKey::Force, 2.5, 1.0)), 300, 29)), "  pair around H, with N: not learned yet (DFT) · 300 samples for 29 columns");
+    }
+
+    /// Spec 2026-11-12 R2: the "Worst-fitting samples" row text — the spec's own example, a ratio
+    /// below 10 (one decimal), an undefined one (∞), and a forgotten sample the fit does not hold.
+    #[test]
+    fn a_worst_fitting_row_names_the_sample_and_its_left_out_ratio() {
+        let s = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { index, formula: formula.into(), origin: origin.into(), loo_ratio };
+        assert_eq!(super::suspect_line(&s(1804, "HO", "fallback", Some(38.46))), "#1804 · HO · fallback · 38× its bound");
+        assert_eq!(super::suspect_line(&s(1133, "H2O", "pass perturbation", Some(5.23))), "#1133 · H2O · pass perturbation · 5.2× its bound");
+        assert_eq!(super::suspect_line(&s(7, "H3", "pass scan", Some(f64::INFINITY))), "#7 · H3 · pass scan · ∞× its bound");
+        assert_eq!(super::suspect_line(&s(40, "H2", "audit", None)), "#40 · H2 · audit · not in the fit");
     }
 }
 

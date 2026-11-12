@@ -736,6 +736,9 @@ pub enum SampleState {
     /// Lone atoms (no atom with a neighbour within the cutoff) loaded from before the keep rule
     /// refused them: held out of the fit — they teach nothing.
     Lone,
+    /// Forgotten by the user (the Model tab's "Worst-fitting samples" › Forget): held out of the
+    /// fit and fencing, until Restore.
+    Forgotten,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).

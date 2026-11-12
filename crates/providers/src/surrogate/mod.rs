@@ -767,6 +767,15 @@
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
 //!
+//! **Forgotten samples** (spec `2026-11-12-sample-recovery-design.md` R2; `Q_FORGOTTEN` = 7, its
+//! doc in `surrogate::quarantine`): the user's Forget in the Model tab's "Worst-fitting samples"
+//! (`forget_sample`; the list is `sample_suspects`, the fit's own leave-one-out ranking). Excluded
+//! like a held sample (fit, envelope, grade, leave-one-out) and fencing like one, but never
+//! released by a refit nor superseded by a fresh answer — only `restore_sample` clears it — and
+//! counted with the held samples against [`QUARANTINE_MAX_FRACTION`]. The status is written at
+//! once (a collection status record, else the store's code for the model file); a background
+//! refit that lands after it re-applies it (`background` module doc, "The user's codes").
+//!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
@@ -1113,7 +1122,7 @@ pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
-    RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
+    RECOVERY_DEGREE_CAP, SUSPECTS_SHOWN, THIN_EVERY, THIN_FRACTION,
 };
 pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use background::BackgroundPoll;
@@ -2202,7 +2211,7 @@ impl ForceProvider for SurrogateKs {
         if reason.is_none() && !near.is_empty() {
             reason = Some(Refusal::new(
                 format!(
-                    "surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent",
+                    "surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)",
                     QUARANTINE_FRACTION * self.policy.max_descriptor_distance
                 ),
                 TeachRule::NearQuarantine,
@@ -3038,6 +3047,7 @@ impl Trainable for SurrogateKs {
             draft: self.policy.never_fallback,
             quarantined: self.quarantined(),
             superseded: self.superseded(),
+            forgotten: self.forgotten(),
             box_excluded: self.box_excluded(),
             held_out: self.held_out(),
             lone: self.lone_held_out(),
@@ -3075,6 +3085,22 @@ impl Trainable for SurrogateKs {
 
     fn pending_refit(&self) -> bool {
         SurrogateKs::pending_refit(self)
+    }
+
+    fn forget_sample(&mut self, index: usize) -> Result<(), String> {
+        SurrogateKs::forget_sample(self, index)
+    }
+
+    fn restore_sample(&mut self, index: usize) -> Result<(), String> {
+        SurrogateKs::restore_sample(self, index)
+    }
+
+    fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {
+        SurrogateKs::sample_suspects(self)
+    }
+
+    fn forgotten_samples(&self) -> Vec<sim::SampleSuspect> {
+        SurrogateKs::forgotten_samples(self)
     }
 
     fn set_audit_every(&mut self, n: usize) {
@@ -3361,7 +3387,7 @@ impl PassCoverage {
             ));
         }
         if self.quarantined > 0 {
-            why.push(format!("{} are quarantined (held out by the trust recovery: each bent the fit of its neighbours, or the fit could not reproduce it)", self.quarantined));
+            why.push(format!("{} are quarantined (held out by the trust recovery: the rest of the data could not predict it, or the fit could not reproduce it)", self.quarantined));
         }
         if self.other > 0 {
             why.push(format!("{} are otherwise left out", self.other));

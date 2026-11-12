@@ -478,8 +478,9 @@ impl SurrogateKs {
         // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
         self.loo_ratios = loo.is_some().then(|| LooRatios {
             gen: self.model_gen,
-            rows: ratios.iter().map(|&(i, own, _)| (i, own)).collect(),
-            tier: ratios.iter().map(|&(_, _, t)| t).collect(),
+            rows: ratios.iter().map(|&(i, own, _, _)| (i, own)).collect(),
+            tier: ratios.iter().map(|&(_, _, t, _)| t).collect(),
+            tier_channel: ratios.iter().map(|&(_, _, _, c)| c).collect(),
         });
         self.class_judge = loo.as_ref().map(|l| l.1.clone());
         self.class_loo = loo.map(|l| l.0).unwrap_or_default();
@@ -647,7 +648,7 @@ impl SurrogateKs {
     /// `quarantine::loo_ratio`, spec R1/R1b): what the recovery ranks by and the Model tab lists,
     /// from the same leave-one-out.
     #[allow(clippy::type_complexity)]
-    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<(usize, f64, f64)>) {
+    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<(usize, f64, f64, Channel)>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
             return (None, Vec::new(), Vec::new(), Vec::new());
         };
@@ -670,10 +671,10 @@ impl SurrogateKs {
         // the same numbers as one at a time), then the sums below in sample order, as before
         let members: Vec<(usize, &Sample)> = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).collect();
         let loos = surrogate::loo::leave_one_out_many(model, &members.iter().map(|&(_, s)| s).collect::<Vec<_>>());
-        let mut sample_ratios: Vec<(usize, f64, f64)> = Vec::with_capacity(members.len());
+        let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(members.len());
         for ((i, s), l) in members.into_iter().zip(loos) {
-            let (own, tier) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
-            sample_ratios.push((i, own, tier));
+            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+            sample_ratios.push((i, own, tier, channel));
             // only the fitted (interior) atoms of a masked sample describe a class or a key
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().map(|(j, c)| atom_class(c).filter(|_| s.trains_atom(j))).collect();
             let atom_keys = if s.z.len() == s.pos.len() { trained_keys(s, env_keys(&s.pos, &s.z, rc2)) } else { Vec::new() };
@@ -1129,7 +1130,7 @@ impl SurrogateKs {
             self.audit_failed = None;
             self.audit_force = None;
         }
-        let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
+        let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED) | Some(&Q_FORGOTTEN)));
         let cases = std::mem::take(&mut self.failed_audits);
         for mut case in cases {
             if quarantined(self, &case) {
