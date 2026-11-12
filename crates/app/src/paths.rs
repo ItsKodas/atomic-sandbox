@@ -9,17 +9,18 @@
 //! - **Installed** (`installed.txt`, written by the installer) keeps the user's `models\` (with
 //!   `models\collections`), `profiles\`, `scenes\` and `captures\` under the per-user root
 //!   [`user_root`], `%LOCALAPPDATA%\atomic-sandbox`, created on first use. The shipped, read-only
-//!   content sits in the install folder's `bundled\{models,scenes}` ([`bundled_dir`]) and is copied
-//!   into the root once ([`seed_installed`]).
+//!   content sits in the install folder's `bundled\{models,scenes,timings}` ([`bundled_dir`]); the
+//!   models and scenes are copied into the root once ([`seed_installed`]), the shipped completion
+//!   times are read from there ([`DataDir::Timings`]).
 //!
-//! Every mode already shares four things under the root: `current.profile`, `timings.txt`,
-//! `training\` and `cache\pseudo` (`providers::pseudo::default_disk_cache_dir`). In Installed mode
-//! [`DataDir::Timings`] is the root itself, so the "shipped" timings are the user's own
-//! `timings.txt` there (an installed build ships none) and no extra `timings\` folder is made.
+//! Every mode already shares four things under the root: `current.profile`, `timings.txt` (the
+//! user's own completion times), `training\` and `cache\pseudo`
+//! (`providers::pseudo::default_disk_cache_dir`).
 //!
 //! **Nothing here moves, deletes or converts user data.** [`copy_tree_new`] only adds files that
-//! are missing, through a `*.part` file renamed into place, so nothing is ever half-written or
-//! overwritten; the first-run seed and File ▸ Import data from a folder… both use it.
+//! are missing, each through a fresh part file linked into place (never a replace), copies a
+//! shared collection whole or not at all, never follows links and never copies a `.lock`; the
+//! first-run seed and File ▸ Import data from a folder… both use it.
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -123,8 +124,9 @@ fn here() -> Ctx {
 }
 
 impl Ctx {
-    /// Installed (with a root): under the root, created on first use. Otherwise the lookups the
-    /// app always had ([`legacy`]).
+    /// Installed (with a root): under the root, created on first use — except the shipped
+    /// completion times, read-only in the install folder ([`Ctx::bundled`]; the user's own
+    /// `timings.txt` stays at the root). Otherwise the lookups the app always had ([`legacy`]).
     fn dir(&self, kind: DataDir) -> Option<PathBuf> {
         match (&self.mode, &self.root) {
             (DataMode::Installed, Some(root)) => {
@@ -133,7 +135,7 @@ impl Ctx {
                     DataDir::Collections => root.join("models").join("collections"),
                     DataDir::Scenes => root.join("scenes"),
                     DataDir::Profiles => root.join("profiles"),
-                    DataDir::Timings => root.clone(),
+                    DataDir::Timings => return self.bundled(kind),
                     DataDir::Captures => root.join("captures"),
                 };
                 if let Err(e) = std::fs::create_dir_all(&d) {
@@ -145,7 +147,8 @@ impl Ctx {
         }
     }
 
-    /// Installed: the install folder's read-only `bundled\models` and `bundled\scenes`.
+    /// Installed: the install folder's read-only `bundled\models`, `bundled\scenes` and
+    /// `bundled\timings`.
     fn bundled(&self, kind: DataDir) -> Option<PathBuf> {
         if self.mode != DataMode::Installed {
             return None;
@@ -153,6 +156,7 @@ impl Ctx {
         let name = match kind {
             DataDir::Models => "models",
             DataDir::Scenes => "scenes",
+            DataDir::Timings => "timings",
             _ => return None,
         };
         Some(self.exe_dir.as_ref()?.join("bundled").join(name))
@@ -178,13 +182,14 @@ fn legacy(kind: DataDir, exe_dir: Option<&Path>, cwd: Option<&Path>) -> Option<P
 }
 
 /// The folder for `kind` in this process's mode: Installed → under [`user_root`] (created on
-/// first use); Dev and Portable → beside the exe, else in the working directory, as always.
+/// first use; the shipped timings: [`bundled_dir`]); Dev and Portable → beside the exe, else in
+/// the working directory, as always.
 pub fn dir(kind: DataDir) -> Option<PathBuf> {
     here().dir(kind)
 }
 
-/// The install folder's shipped, read-only content (`exe_dir\bundled\{models,scenes}`) in
-/// Installed mode; `None` otherwise and for the other kinds.
+/// The install folder's shipped, read-only content (`exe_dir\bundled\{models,scenes,timings}`)
+/// in Installed mode; `None` otherwise and for the other kinds.
 pub fn bundled_dir(kind: DataDir) -> Option<PathBuf> {
     here().bundled(kind)
 }
@@ -197,6 +202,11 @@ pub struct CopyReport {
     pub skipped_existing: usize,
     /// The files (or folders) that could not be copied, with why; nothing of them is left behind.
     pub failed: Vec<(PathBuf, String)>,
+    /// Symlinks and junctions in the source: never followed, never copied.
+    pub skipped_links: Vec<PathBuf>,
+    /// Collections the destination already had (by folder name): kept whole, the source's not
+    /// merged into them ([`copy_tree_new`]).
+    pub kept_collections: Vec<String>,
 }
 
 impl CopyReport {
@@ -204,42 +214,87 @@ impl CopyReport {
         self.copied += other.copied;
         self.skipped_existing += other.skipped_existing;
         self.failed.extend(other.failed);
+        self.skipped_links.extend(other.skipped_links);
+        self.kept_collections.extend(other.kept_collections);
     }
 }
 
+/// The file a collection's owner holds while it has it open (`surrogate::collection`): never
+/// copied, so a copy never looks held by another process.
+const LOCK_FILE: &str = ".lock";
+
 /// Copies the files under `src` that are not already in `dst` (recursively; `dst` and its
-/// folders created as needed). Never overwrites, moves or deletes anything: each file is copied
-/// into `<name>.part` beside its target and renamed into place, so a failed copy leaves nothing
-/// half-written (its `.part` is removed) and the next run starts clean. `Err` only when `src` is
-/// not a readable folder or `dst` cannot be created; a file's failure is in
-/// [`CopyReport::failed`] and the rest go on.
+/// folders created as needed). Never overwrites, moves or deletes anything:
+/// - each file is written to a fresh `<name>.<pid>.<n>.part` beside its target (`create_new`),
+///   then hard-linked into place (or, where hard links are not supported, renamed without
+///   replacing), which fails rather than replace a target that appeared meanwhile; the part is
+///   removed after, and a failed copy leaves nothing behind;
+/// - symlinks and junctions are not followed ([`CopyReport::skipped_links`]);
+/// - a **collection** — a folder inside a `collections` folder, or any folder holding `key.txt`
+///   and `samples.bin` — is copied whole (into a part folder renamed into place) only when the
+///   destination has no folder of that name, else kept as it is ([`CopyReport::kept_collections`]):
+///   two collections are never merged file by file;
+/// - `.lock` files are never copied.
+///
+/// `Err` only when `src` is not a folder (or is a link) or `dst` cannot be created; a file's
+/// failure is in [`CopyReport::failed`] and the rest go on.
 pub fn copy_tree_new(src: &Path, dst: &Path) -> Result<CopyReport, String> {
-    copy_tree_with(src, dst, &|from, to| std::fs::copy(from, to).map(|_| ()))
+    copy_tree_with(src, dst, &copy_contents)
 }
 
-/// [`copy_tree_new`] with the file copy passed in (the tests make one fail part-way).
-fn copy_tree_with(src: &Path, dst: &Path, copy: &dyn Fn(&Path, &Path) -> std::io::Result<()>) -> Result<CopyReport, String> {
-    if !src.is_dir() {
+/// The file copy [`copy_tree_new`] uses: `from`'s bytes into the freshly created part file, its
+/// modification time kept.
+fn copy_contents(from: &Path, out: &mut std::fs::File) -> std::io::Result<()> {
+    let mut f = std::fs::File::open(from)?;
+    std::io::copy(&mut f, out)?;
+    if let Ok(t) = f.metadata().and_then(|m| m.modified()) {
+        let _ = out.set_modified(t);
+    }
+    Ok(())
+}
+
+/// The file copy seam: `from`'s contents into the open part file (the tests make one fail part-way).
+type CopyFn<'a> = &'a dyn Fn(&Path, &mut std::fs::File) -> std::io::Result<()>;
+
+/// [`copy_tree_new`] with the file copy passed in.
+fn copy_tree_with(src: &Path, dst: &Path, copy: CopyFn) -> Result<CopyReport, String> {
+    let meta = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{} is a link (not followed)", src.display()));
+    }
+    if !meta.is_dir() {
         return Err(format!("{} is not a folder", src.display()));
     }
     std::fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let in_collections = src.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("collections"));
     let mut report = CopyReport::default();
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
+        let (entry, kind) = match entry.and_then(|e| Ok((e.file_type()?, e))) {
+            Ok((t, e)) => (e, t),
             Err(e) => {
                 report.failed.push((src.to_path_buf(), e.to_string()));
                 continue;
             }
         };
+        let name = entry.file_name();
         let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            match copy_tree_with(&from, &to, copy) {
-                Ok(r) => report.add(r),
-                Err(e) => report.failed.push((from, e)),
+        let to = dst.join(&name);
+        // `DirEntry::file_type` does not follow links; on Windows `is_symlink` is true for
+        // symlinks and junctions alike
+        if kind.is_symlink() {
+            report.skipped_links.push(from);
+        } else if kind.is_dir() {
+            if in_collections || is_collection(&from) {
+                copy_collection(&from, &to, &name.to_string_lossy(), copy, &mut report);
+            } else {
+                match copy_tree_with(&from, &to, copy) {
+                    Ok(r) => report.add(r),
+                    Err(e) => report.failed.push((from, e)),
+                }
             }
+        } else if name == LOCK_FILE {
+            // a lock names its owner's process: never copied
         } else if std::fs::symlink_metadata(&to).is_ok() {
             report.skipped_existing += 1;
         } else {
@@ -253,29 +308,108 @@ fn copy_tree_with(src: &Path, dst: &Path, copy: &dyn Fn(&Path, &Path) -> std::io
     Ok(report)
 }
 
-/// `to` with `.part` appended to its file name (`a.model` → `a.model.part`).
-fn part_path(to: &Path) -> PathBuf {
+/// A folder that is a shared collection (`surrogate::collection`'s layout): `key.txt` and
+/// `samples.bin` in it.
+fn is_collection(d: &Path) -> bool {
+    d.join("key.txt").is_file() && d.join("samples.bin").is_file()
+}
+
+/// One collection, whole or not at all: kept when `to` exists; else copied into a fresh part
+/// folder, renamed into place only when every file copied (and `to` is still absent), the part
+/// folder removed otherwise.
+fn copy_collection(from: &Path, to: &Path, key: &str, copy: CopyFn, report: &mut CopyReport) {
+    if std::fs::symlink_metadata(to).is_ok() {
+        report.kept_collections.push(key.to_string());
+        return;
+    }
+    let part = unique_part(to);
+    if let Err(e) = std::fs::create_dir(&part) {
+        report.failed.push((from.to_path_buf(), e.to_string()));
+        return;
+    }
+    let r = match copy_tree_with(from, &part, copy) {
+        Ok(r) if r.failed.is_empty() => r,
+        Ok(r) => {
+            let _ = std::fs::remove_dir_all(&part);
+            report.skipped_links.extend(r.skipped_links);
+            report.failed.extend(r.failed);
+            return;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&part);
+            report.failed.push((from.to_path_buf(), e));
+            return;
+        }
+    };
+    match rename_no_replace(&part, to) {
+        Ok(()) => report.add(r),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&part);
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                report.kept_collections.push(key.to_string());
+            } else {
+                report.failed.push((from.to_path_buf(), e.to_string()));
+            }
+        }
+    }
+}
+
+/// A name beside `to` that no one else uses: `<name>.<pid>.<n>.part`.
+fn unique_part(to: &Path) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = to.file_name().map(OsString::from).unwrap_or_default();
-    name.push(".part");
+    name.push(format!(".{}.{n}.part", std::process::id()));
     to.with_file_name(name)
 }
 
-/// One file through its `.part`: `Ok(false)` when `to` appeared meanwhile (kept; ours dropped).
-fn copy_one(from: &Path, to: &Path, copy: &dyn Fn(&Path, &Path) -> std::io::Result<()>) -> Result<bool, String> {
-    let part = part_path(to);
-    if let Err(e) = copy(from, &part) {
+/// One file through a fresh part file: `Ok(false)` when `to` exists by the time it is placed
+/// (kept; ours dropped).
+fn copy_one(from: &Path, to: &Path, copy: CopyFn) -> Result<bool, String> {
+    let part = unique_part(to);
+    // `create_new`: the part is ours alone, so removing it never removes anything else
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&part).map_err(|e| e.to_string())?;
+    let wrote = copy(from, &mut out);
+    drop(out);
+    if let Err(e) = wrote {
         let _ = std::fs::remove_file(&part);
         return Err(e.to_string());
     }
-    if std::fs::symlink_metadata(to).is_ok() {
-        let _ = std::fs::remove_file(&part);
-        return Ok(false);
+    let placed = match std::fs::hard_link(&part, to) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // no hard links here (FAT, some network shares): a rename that refuses an existing target
+        Err(_) => match rename_no_replace(&part, to) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e.to_string()),
+        },
+    };
+    let _ = std::fs::remove_file(&part);
+    placed
+}
+
+/// Renames `from` to `to`, failing (`AlreadyExists`) when `to` exists: never a replace.
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (a, b) = (wide(from), wide(to));
+    // flags 0: without MOVEFILE_REPLACE_EXISTING an existing target is an error
+    if unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(a.as_ptr(), b.as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    std::fs::rename(&part, to).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        e.to_string()
-    })?;
-    Ok(true)
+}
+
+/// Renames `from` to `to`, failing when `to` exists (best effort off Windows, which ships no build).
+#[cfg(not(windows))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    std::fs::rename(from, to)
 }
 
 /// The first launch of an installed build: the install folder's `bundled\models` and
@@ -294,7 +428,7 @@ pub fn seed_installed() {
     let (models, scenes) = (bundled_dir(DataDir::Models), bundled_dir(DataDir::Scenes));
     if let Some(r) = seed_from(models.as_deref(), scenes.as_deref(), &root) {
         if !r.failed.is_empty() {
-            eprintln!("first run: {} of the bundled files could not be copied into {}:", r.failed.len(), root.display());
+            eprintln!("first run: not everything could be copied into {} (the next launch tries again):", root.display());
             for (p, why) in &r.failed {
                 eprintln!("  {}: {why}", p.display());
             }
@@ -303,7 +437,8 @@ pub fn seed_installed() {
 }
 
 /// [`seed_installed`]'s work with the paths passed in: `None` when the root's marker says it
-/// already ran, else what was copied. A missing bundled folder is skipped.
+/// already ran, else what was copied. A missing bundled folder is skipped; the root is created
+/// for the marker.
 fn seed_from(models: Option<&Path>, scenes: Option<&Path>, root: &Path) -> Option<CopyReport> {
     let marker = root.join(SEEDED_MARKER);
     if marker.exists() {
@@ -319,7 +454,7 @@ fn seed_from(models: Option<&Path>, scenes: Option<&Path>, root: &Path) -> Optio
     }
     if report.failed.is_empty() {
         let text = format!("bundled models and scenes copied in by Atomic Sandbox v{}\n", env!("CARGO_PKG_VERSION"));
-        if let Err(e) = std::fs::write(&marker, text) {
+        if let Err(e) = std::fs::create_dir_all(root).and_then(|()| std::fs::write(&marker, text)) {
             report.failed.push((marker, e.to_string()));
         }
     }
@@ -338,12 +473,14 @@ pub struct ImportReport {
 }
 
 impl ImportReport {
-    /// The status line: the counts, and the first failures with why.
+    /// The status line: the counts, the collections kept, the links skipped, and the first
+    /// failures with why.
     pub fn line(&self, src: &Path) -> String {
-        if self.found.is_empty() {
-            return format!("nothing imported: {} has no models, profiles or scenes folder", src.display());
-        }
         let c = &self.copy;
+        if self.found.is_empty() {
+            let links = if c.skipped_links.is_empty() { String::new() } else { format!(" ({} of them a link, not followed)", c.skipped_links.len()) };
+            return format!("nothing imported: {} has no models, profiles or scenes folder{links}", src.display());
+        }
         let mut s = format!(
             "imported {} from {}: {} file{} copied, {} already there (kept)",
             self.found.join(", "),
@@ -352,6 +489,12 @@ impl ImportReport {
             if c.copied == 1 { "" } else { "s" },
             c.skipped_existing
         );
+        if !c.kept_collections.is_empty() {
+            s += &format!("; kept yours: {} (the older copy's collection not merged in)", c.kept_collections.join(", "));
+        }
+        if !c.skipped_links.is_empty() {
+            s += &format!("; {} link{} skipped (not followed)", c.skipped_links.len(), if c.skipped_links.len() == 1 { "" } else { "s" });
+        }
         if !c.failed.is_empty() {
             let first: Vec<String> = c.failed.iter().take(3).map(|(p, why)| format!("{} ({why})", p.display())).collect();
             s += &format!("; {} failed: {}{}", c.failed.len(), first.join(", "), if c.failed.len() > 3 { ", …" } else { "" });
@@ -361,14 +504,21 @@ impl ImportReport {
 }
 
 /// `Action::ImportData`'s work: `<src>/{models,profiles,scenes}` copied into the same folders
-/// under `root` ([`copy_tree_new`]: nothing overwritten, nothing moved), and `src` appended to
-/// the root's `migrated_from.txt` when it had any of them.
+/// under `root` ([`copy_tree_new`]: nothing overwritten, nothing moved, collections whole), and
+/// `src` appended to the root's `migrated_from.txt` when it had any of them. A folder of the
+/// three that is itself a link is skipped. [`check_import`] refuses a source that overlaps the
+/// root first.
 pub fn import_into(src: &Path, root: &Path) -> ImportReport {
     let mut report = ImportReport::default();
     for name in IMPORTED {
         let from = src.join(name);
-        if !from.is_dir() {
-            continue;
+        match std::fs::symlink_metadata(&from) {
+            Ok(m) if m.file_type().is_symlink() => {
+                report.copy.skipped_links.push(from);
+                continue;
+            }
+            Ok(m) if m.is_dir() => {}
+            _ => continue,
         }
         report.found.push(name);
         match copy_tree_new(&from, &root.join(name)) {
@@ -379,7 +529,9 @@ pub fn import_into(src: &Path, root: &Path) -> ImportReport {
     if !report.found.is_empty() {
         use std::io::Write;
         let line = format!("{}\n", src.display());
-        let wrote = std::fs::OpenOptions::new().create(true).append(true).open(root.join(MIGRATED_FROM)).and_then(|mut f| f.write_all(line.as_bytes()));
+        let wrote = std::fs::create_dir_all(root)
+            .and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(root.join(MIGRATED_FROM)))
+            .and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = wrote {
             report.copy.failed.push((root.join(MIGRATED_FROM), e.to_string()));
         }
@@ -387,9 +539,48 @@ pub fn import_into(src: &Path, root: &Path) -> ImportReport {
     report
 }
 
-/// [`import_into`] on its own thread (a models folder with collections can be large): the status
-/// line arrives on the receiver.
-pub fn spawn_import(src: PathBuf, root: PathBuf) -> std::sync::mpsc::Receiver<String> {
+/// `p` resolved as far as it exists (links and `..` resolved by the OS), the rest appended: so a
+/// root that does not exist yet still compares by its real parent.
+fn resolved(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) if parent != p => resolved(parent).join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Whether File ▸ Import data from a folder… may copy `src` into the data root, given the mode and
+/// the root (passed in, so the tests reach the Installed branch): the root to import into, or the
+/// refusal for the status line. Refused outside Installed mode, without a root, and when `src` is
+/// the root, inside it or holds it (an import of the root into itself).
+pub fn check_import(mode: DataMode, root: Option<&Path>, src: &Path) -> Result<PathBuf, String> {
+    if mode != DataMode::Installed {
+        return Err(format!("import data: {IMPORT_ONLY_INSTALLED}"));
+    }
+    let root = root.ok_or("import data: no LOCALAPPDATA folder to import into")?;
+    let (s, r) = (resolved(src), resolved(root));
+    if s.starts_with(&r) || r.starts_with(&s) {
+        return Err(format!(
+            "import data: {} {} this build's own data folder ({}); pick an older copy's folder",
+            src.display(),
+            if s == r { "is" } else if s.starts_with(&r) { "is inside" } else { "holds" },
+            root.display()
+        ));
+    }
+    Ok(root.to_path_buf())
+}
+
+/// [`check_import`], then [`import_into`] on its own thread (a models folder with collections can
+/// be large): the status line arrives on the receiver.
+pub fn start_import(mode: DataMode, root: Option<&Path>, src: PathBuf) -> Result<std::sync::mpsc::Receiver<String>, String> {
+    let root = check_import(mode, root, &src)?;
+    Ok(spawn_import(src, root))
+}
+
+/// [`import_into`] on its own thread: the status line arrives on the receiver.
+fn spawn_import(src: PathBuf, root: PathBuf) -> std::sync::mpsc::Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let r = import_into(&src, &root);
@@ -426,6 +617,9 @@ mod tests {
             std::fs::write(&p, text).unwrap();
             p
         }
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.0.join(rel)).unwrap()
+        }
     }
 
     impl Drop for Tmp {
@@ -438,18 +632,41 @@ mod tests {
         Ctx { mode, exe_dir: Some(exe.to_path_buf()), cwd: Some(cwd.to_path_buf()), root: root.map(Path::to_path_buf) }
     }
 
-    /// Every `.part` file under `d`.
+    /// Every `.part` file or folder under `d`.
     fn parts(d: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for e in std::fs::read_dir(d).unwrap().flatten() {
             let p = e.path();
-            if p.is_dir() {
-                out.extend(parts(&p));
-            } else if p.extension().is_some_and(|x| x == "part") {
+            if p.extension().is_some_and(|x| x == "part") {
                 out.push(p);
+            } else if e.file_type().unwrap().is_dir() {
+                out.extend(parts(&p));
             }
         }
         out
+    }
+
+    /// A directory link `link` → `target`: a symlink where that is permitted, else (Windows, no
+    /// developer mode) a junction, which needs no privilege; `false` when neither can be made.
+    fn dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return true;
+            }
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
     }
 
     #[test]
@@ -467,6 +684,7 @@ mod tests {
         // the test binary itself runs in Dev mode (no marker in target/)
         assert_eq!(mode(), DataMode::Dev);
         assert_eq!(bundled_dir(DataDir::Models), None);
+        assert_eq!(bundled_dir(DataDir::Timings), None);
     }
 
     #[test]
@@ -480,9 +698,11 @@ mod tests {
         // portable data stays beside the exe, as always, even with a root at hand
         let root = t.mk("root");
         let models = t.mk("exe/models");
+        let timings = t.mk("exe/timings");
         let c = ctx(DataMode::Portable, &exe, &cwd, Some(&root));
         assert_eq!(c.dir(DataDir::Models), Some(models.clone()));
         assert_eq!(c.dir(DataDir::Collections), Some(models.join("collections")));
+        assert_eq!(c.dir(DataDir::Timings), Some(timings));
         assert_eq!(c.dir(DataDir::Captures), Some(exe.join("captures")));
         assert_eq!(c.bundled(DataDir::Models), None);
         assert!(std::fs::read_dir(&root).unwrap().next().is_none(), "nothing created under the root");
@@ -505,16 +725,22 @@ mod tests {
             (DataDir::Collections, root.join("models").join("collections")),
             (DataDir::Scenes, root.join("scenes")),
             (DataDir::Profiles, root.join("profiles")),
-            (DataDir::Timings, root.clone()),
             (DataDir::Captures, root.join("captures")),
         ];
         for (kind, path) in want {
             assert_eq!(c.dir(kind), Some(path.clone()), "{kind:?}");
             assert!(path.is_dir(), "{kind:?} created on first use");
         }
+        // the shipped completion times: read-only in the install folder, never created; the
+        // user's own timings.txt stays at the root (`main`)
+        let shipped = exe.join("bundled").join("timings");
+        assert_eq!(c.dir(DataDir::Timings), Some(shipped.clone()));
+        assert!(!shipped.exists());
+        assert_eq!(c.bundled(DataDir::Timings), Some(shipped));
         assert_eq!(c.bundled(DataDir::Models), Some(exe.join("bundled").join("models")));
         assert_eq!(c.bundled(DataDir::Scenes), Some(exe.join("bundled").join("scenes")));
         assert_eq!(c.bundled(DataDir::Profiles), None);
+        assert_eq!(c.bundled(DataDir::Captures), None);
         // without LOCALAPPDATA the lookups fall back to the old ones rather than to nothing
         let c = ctx(DataMode::Installed, &exe, &cwd, None);
         assert_eq!(c.dir(DataDir::Models), Some(exe.join("models")));
@@ -590,6 +816,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("scenes").join("h2o ø.scene")).unwrap(), "s");
         t.file("Old Copy é/profiles/mine.profile", "p");
         let src = t.0.join("Old Copy é");
+        assert_eq!(check_import(DataMode::Installed, Some(&root), &src), Ok(root.clone()));
         let r = import_into(&src, &root);
         assert_eq!((r.found.clone(), r.copy.copied), (vec!["profiles"], 1), "{r:?}");
         assert_eq!(std::fs::read_to_string(root.join(MIGRATED_FROM)).unwrap(), format!("{}\n", src.display()));
@@ -600,28 +827,61 @@ mod tests {
         let t = Tmp::new("copy");
         t.file("src/a.model", "new a");
         t.file("src/b.model", "new b");
-        t.file("src/collections/h2/samples.bin", "new samples");
+        t.file("src/sub/c.scene", "new c");
         t.file("dst/a.model", "the user's a");
-        t.file("dst/collections/h2/samples.bin", "the user's samples");
+        t.file("dst/sub/c.scene", "the user's c");
         t.file("dst/mine.model", "only the user's");
         let (src, dst) = (t.0.join("src"), t.0.join("dst"));
         let r = copy_tree_new(&src, &dst).unwrap();
-        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 2, failed: vec![] });
-        assert_eq!(std::fs::read_to_string(dst.join("a.model")).unwrap(), "the user's a");
-        assert_eq!(std::fs::read_to_string(dst.join("b.model")).unwrap(), "new b");
-        assert_eq!(std::fs::read_to_string(dst.join("collections/h2/samples.bin")).unwrap(), "the user's samples");
-        assert_eq!(std::fs::read_to_string(dst.join("mine.model")).unwrap(), "only the user's");
+        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 2, ..Default::default() });
+        assert_eq!(t.read("dst/a.model"), "the user's a");
+        assert_eq!(t.read("dst/b.model"), "new b");
+        assert_eq!(t.read("dst/sub/c.scene"), "the user's c");
+        assert_eq!(t.read("dst/mine.model"), "only the user's");
         // the source is untouched (a copy, never a move)
-        assert_eq!(std::fs::read_to_string(src.join("a.model")).unwrap(), "new a");
+        assert_eq!(t.read("src/a.model"), "new a");
         // again: everything is there now
         let r = copy_tree_new(&src, &dst).unwrap();
-        assert_eq!(r, CopyReport { copied: 0, skipped_existing: 3, failed: vec![] });
+        assert_eq!(r, CopyReport { copied: 0, skipped_existing: 3, ..Default::default() });
         assert!(parts(&dst).is_empty());
         // into a destination that does not exist yet
         let fresh = t.0.join("fresh").join("models");
         let r = copy_tree_new(&src, &fresh).unwrap();
         assert_eq!((r.copied, r.skipped_existing), (3, 0));
         assert!(copy_tree_new(&t.0.join("missing"), &dst).is_err(), "a missing source is an error");
+        // a source holding both a.model and a.model.part: two files, neither lost (the part
+        // files are unique, `create_new`)
+        t.file("src2/a.model", "a");
+        t.file("src2/a.model.part", "the user's part-named file");
+        let r = copy_tree_new(&t.0.join("src2"), &t.0.join("dst2")).unwrap();
+        assert_eq!(r, CopyReport { copied: 2, ..Default::default() });
+        assert_eq!(t.read("dst2/a.model"), "a");
+        assert_eq!(t.read("dst2/a.model.part"), "the user's part-named file");
+        assert_eq!(std::fs::read_dir(t.0.join("dst2")).unwrap().count(), 2, "no part file left");
+    }
+
+    /// M1: a target that appears while its part is being written (a model autosave of the same
+    /// name, a second copy importing) is never replaced: the copy counts it as already there.
+    #[test]
+    fn a_target_that_appears_during_the_copy_is_kept() {
+        let t = Tmp::new("race");
+        t.file("src/a.model", "ours");
+        let dst = t.mk("dst");
+        let target = dst.join("a.model");
+        let racing = |from: &Path, out: &mut std::fs::File| -> std::io::Result<()> {
+            std::fs::write(&target, "theirs")?;
+            copy_contents(from, out)
+        };
+        let r = copy_tree_with(&t.0.join("src"), &dst, &racing).unwrap();
+        assert_eq!(r, CopyReport { skipped_existing: 1, ..Default::default() });
+        assert_eq!(t.read("dst/a.model"), "theirs");
+        assert!(parts(&dst).is_empty(), "{:?}", parts(&dst));
+        // the rename fallback refuses an existing target too
+        let (a, b) = (t.file("x", "x"), t.file("y", "y"));
+        assert_eq!(rename_no_replace(&a, &b).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!((t.read("x"), t.read("y")), ("x".to_string(), "y".to_string()));
+        rename_no_replace(&a, &t.0.join("z")).unwrap();
+        assert_eq!(t.read("z"), "x");
     }
 
     #[test]
@@ -632,12 +892,13 @@ mod tests {
         t.file("src/sub/also.scene", "also");
         let (src, dst) = (t.0.join("src"), t.0.join("dst"));
         // a copy that writes half of bad.model, then fails (a full disk, a pulled drive)
-        let flaky = |from: &Path, to: &Path| -> std::io::Result<()> {
+        let flaky = |from: &Path, out: &mut std::fs::File| -> std::io::Result<()> {
             if from.file_name().is_some_and(|n| n == "bad.model") {
-                std::fs::write(to, "ba")?;
+                use std::io::Write;
+                out.write_all(b"ba")?;
                 return Err(std::io::Error::other("disk full"));
             }
-            std::fs::copy(from, to).map(|_| ())
+            copy_contents(from, out)
         };
         let r = copy_tree_with(&src, &dst, &flaky).unwrap();
         assert_eq!((r.copied, r.skipped_existing), (2, 0), "{r:?}");
@@ -646,17 +907,128 @@ mod tests {
         assert!(r.failed[0].1.contains("disk full"), "{:?}", r.failed);
         assert!(!dst.join("bad.model").exists(), "no half-written file");
         assert!(parts(&dst).is_empty(), "no .part left: {:?}", parts(&dst));
-        assert_eq!(std::fs::read_to_string(dst.join("sub/also.scene")).unwrap(), "also");
+        assert_eq!(t.read("dst/sub/also.scene"), "also");
         // a retry starts clean and completes
         let r = copy_tree_new(&src, &dst).unwrap();
-        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 2, failed: vec![] });
-        assert_eq!(std::fs::read_to_string(dst.join("bad.model")).unwrap(), "bad");
-        // a real failure: a folder where a file's target should go is kept, the file is reported
-        t.file("src2/x.model", "x");
-        t.mk("dst2/x.model.part");
-        let r = copy_tree_new(&t.0.join("src2"), &t.0.join("dst2")).unwrap();
-        assert_eq!((r.copied, r.failed.len()), (0, 1), "{r:?}");
-        assert!(!t.0.join("dst2/x.model").exists());
+        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 2, ..Default::default() });
+        assert_eq!(t.read("dst/bad.model"), "bad");
+        // a real failure: a source file another process holds open exclusively
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = t.file("src3/held.model", "held");
+            t.file("src3/free.model", "free");
+            let _lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&held).unwrap();
+            let r = copy_tree_new(&t.0.join("src3"), &t.0.join("dst3")).unwrap();
+            assert_eq!((r.copied, r.failed.len()), (1, 1), "{r:?}");
+            assert_eq!(r.failed[0].0, held);
+            assert!(!t.0.join("dst3/held.model").exists());
+            assert!(parts(&t.0.join("dst3")).is_empty());
+        }
+    }
+
+    /// I1: links (symlinks, junctions) are never followed: a junction back to an ancestor does not
+    /// recurse, and the link is counted.
+    #[test]
+    fn copy_tree_new_does_not_follow_links() {
+        let t = Tmp::new("links");
+        t.file("src/models/a.model", "a");
+        let looped = t.0.join("src/models/loop");
+        if !dir_link(&t.0.join("src"), &looped) {
+            eprintln!("copy_tree_new_does_not_follow_links: no directory link could be made here; skipped");
+            return;
+        }
+        let dst = t.0.join("dst");
+        let r = copy_tree_new(&t.0.join("src/models"), &dst).unwrap();
+        assert_eq!((r.copied, r.failed.len()), (1, 0), "{r:?}");
+        assert_eq!(r.skipped_links, vec![looped.clone()]);
+        assert!(!dst.join("loop").exists());
+        // a link as the folder itself is refused, and an import skips a linked models folder
+        assert!(copy_tree_new(&looped, &t.0.join("dst2")).unwrap_err().contains("link"));
+        let old = t.mk("old");
+        assert!(dir_link(&t.0.join("src/models"), &old.join("models")));
+        let r = import_into(&old, &t.0.join("root"));
+        assert!(r.found.is_empty() && r.copy.skipped_links == vec![old.join("models")], "{r:?}");
+        assert!(r.line(&old).contains("a link, not followed"), "{}", r.line(&old));
+        // remove the links before the temp folder (`remove_dir_all` does not follow them either)
+        let _ = std::fs::remove_dir(&looped);
+        let _ = std::fs::remove_dir(old.join("models"));
+    }
+
+    /// I2: a collection is copied whole or not at all, never merged into the destination's, and no
+    /// `.lock` is ever copied.
+    #[test]
+    fn collections_are_copied_whole_or_kept() {
+        let t = Tmp::new("collections");
+        // the installed build already learnt into an h2 collection
+        t.file("root/models/collections/h2/key.txt", "h2 key");
+        t.file("root/models/collections/h2/samples.bin", "installed samples");
+        // the older copy: a large h2 collection, a water one, and a collection kept elsewhere
+        for (k, f, s) in [
+            ("h2", "key.txt", "h2 key"),
+            ("h2", "samples.bin", "old samples"),
+            ("h2", "history.bin", "old history"),
+            ("h2", "references.txt", "old refs"),
+            ("h2", ".lock", "pid 42"),
+            ("h2o", "key.txt", "h2o key"),
+            ("h2o", "samples.bin", "h2o samples"),
+            ("h2o", ".lock", "pid 42"),
+        ] {
+            t.file(&format!("old/models/collections/{k}/{f}"), s);
+        }
+        t.file("old/models/mine/key.txt", "k");
+        t.file("old/models/mine/samples.bin", "s");
+        t.file("old/models/h2o.model", "m");
+        t.file("old/scenes/.lock", "not a collection's, still never copied");
+        t.file("old/scenes/w.scene", "w");
+        t.file("root/models/mine/samples.bin", "the installed build's");
+        let (src, root) = (t.0.join("old"), t.0.join("root"));
+        let r = import_into(&src, &root);
+        let mut kept = r.copy.kept_collections.clone();
+        kept.sort();
+        assert_eq!(kept, vec!["h2".to_string(), "mine".to_string()], "{r:?}");
+        assert!(r.copy.failed.is_empty(), "{r:?}");
+        // h2: the installed build's, untouched, with nothing of the old one beside it
+        assert_eq!(t.read("root/models/collections/h2/samples.bin"), "installed samples");
+        for f in ["history.bin", "references.txt", ".lock"] {
+            assert!(!root.join("models/collections/h2").join(f).exists(), "{f}");
+        }
+        // h2o: whole, without its lock
+        assert_eq!(t.read("root/models/collections/h2o/samples.bin"), "h2o samples");
+        assert_eq!(t.read("root/models/collections/h2o/key.txt"), "h2o key");
+        assert!(!root.join("models/collections/h2o/.lock").exists());
+        assert!(!root.join("models/mine/key.txt").exists(), "a collection outside collections/ is a unit too");
+        assert!(!root.join("scenes/.lock").exists());
+        assert_eq!(r.copy.copied, 4, "h2o's two, h2o.model, w.scene: {r:?}");
+        let line = r.line(&src);
+        assert!(line.contains("kept yours: ") && line.contains("h2") && line.contains("mine"), "{line}");
+        assert!(parts(&root).is_empty(), "{:?}", parts(&root));
+    }
+
+    /// I2: a collection that fails part-way leaves nothing: no half collection, no part folder.
+    #[test]
+    fn a_collection_that_fails_part_way_leaves_nothing() {
+        let t = Tmp::new("collfail");
+        t.file("src/collections/h2o/key.txt", "k");
+        t.file("src/collections/h2o/samples.bin", "s");
+        t.file("src/collections/h2o/history.bin", "h");
+        t.file("src/plain.model", "m");
+        let (src, dst) = (t.0.join("src"), t.0.join("dst"));
+        let flaky = |from: &Path, out: &mut std::fs::File| -> std::io::Result<()> {
+            if from.file_name().is_some_and(|n| n == "history.bin") {
+                return Err(std::io::Error::other("disk full"));
+            }
+            copy_contents(from, out)
+        };
+        let r = copy_tree_with(&src, &dst, &flaky).unwrap();
+        assert_eq!(r.copied, 1, "only plain.model: {r:?}");
+        assert_eq!(r.failed.len(), 1);
+        assert!(!dst.join("collections/h2o").exists());
+        assert!(parts(&dst).is_empty(), "{:?}", parts(&dst));
+        // the retry copies it whole
+        let r = copy_tree_new(&src, &dst).unwrap();
+        assert_eq!((r.copied, r.skipped_existing, r.failed.len()), (3, 1, 0), "{r:?}");
+        assert_eq!(t.read("dst/collections/h2o/history.bin"), "h");
     }
 
     #[test]
@@ -670,29 +1042,32 @@ mod tests {
         let c = ctx(DataMode::Installed, &exe, &exe, Some(&root));
         let (m, s) = (c.bundled(DataDir::Models), c.bundled(DataDir::Scenes));
         let r = seed_from(m.as_deref(), s.as_deref(), &root).expect("the first launch seeds");
-        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 1, failed: vec![] });
-        assert_eq!(std::fs::read_to_string(root.join("models/hydrogen.model")).unwrap(), "h");
-        assert_eq!(std::fs::read_to_string(root.join("scenes/h2o.scene")).unwrap(), "the user's own h2o", "never overwritten");
+        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 1, ..Default::default() });
+        assert_eq!(t.read("root/models/hydrogen.model"), "h");
+        assert_eq!(t.read("root/scenes/h2o.scene"), "the user's own h2o", "never overwritten");
         assert!(root.join(SEEDED_MARKER).is_file());
         // the user deletes a seeded model: the next launch does not bring it back
         std::fs::remove_file(root.join("models/hydrogen.model")).unwrap();
         assert_eq!(seed_from(m.as_deref(), s.as_deref(), &root), None);
         assert!(!root.join("models/hydrogen.model").exists());
-        // a failed seed leaves the marker unwritten, so the next launch tries again
+        // a failed seed (a file where models\ should be) leaves the marker unwritten, so the next
+        // launch tries again
         let root2 = t.0.join("root2");
-        t.mk("root2/models/hydrogen.model.part");
+        t.file("root2/models", "not a folder");
         let r = seed_from(m.as_deref(), s.as_deref(), &root2).unwrap();
         assert_eq!((r.copied, r.failed.len()), (1, 1), "{r:?}");
         assert!(!root2.join(SEEDED_MARKER).exists());
-        std::fs::remove_dir(root2.join("models/hydrogen.model.part")).unwrap();
+        std::fs::remove_file(root2.join("models")).unwrap();
         let r = seed_from(m.as_deref(), s.as_deref(), &root2).unwrap();
-        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 1, failed: vec![] });
+        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 1, ..Default::default() });
         assert!(root2.join(SEEDED_MARKER).is_file());
-        // no bundled folder (a broken install): nothing copied, marker written
-        let root3 = t.0.join("root3");
-        std::fs::create_dir_all(&root3).unwrap();
+        // M3: no bundled folder (a broken install) and no root yet: nothing copied, the root made
+        // for the marker, so the next launch is quiet
+        let root3 = t.0.join("not yet").join("root3");
         assert_eq!(seed_from(None, Some(&t.0.join("nowhere")), &root3), Some(CopyReport::default()));
-        // and outside Installed mode seeding does nothing at all
+        assert!(root3.join(SEEDED_MARKER).is_file());
+        assert_eq!(seed_from(None, None, &root3), None);
+        // and outside Installed mode there is nothing bundled to seed from
         assert_eq!(ctx(DataMode::Dev, &exe, &exe, Some(&root)).bundled(DataDir::Models), None);
     }
 
@@ -700,7 +1075,8 @@ mod tests {
     fn import_copies_the_three_folders_and_records_the_source() {
         let t = Tmp::new("import");
         t.file("old/models/h2o.model", "m");
-        t.file("old/models/collections/h2o/s.bin", "c");
+        t.file("old/models/collections/h2o/key.txt", "k");
+        t.file("old/models/collections/h2o/samples.bin", "c");
         t.file("old/profiles/mine.profile", "p");
         t.file("old/scenes/w.scene", "s");
         t.file("old/captures/shot.png", "not imported");
@@ -708,16 +1084,16 @@ mod tests {
         let (src, root) = (t.0.join("old"), t.0.join("root"));
         let r = import_into(&src, &root);
         assert_eq!(r.found, vec!["models", "profiles", "scenes"]);
-        assert_eq!(r.copy, CopyReport { copied: 3, skipped_existing: 1, failed: vec![] });
-        assert_eq!(std::fs::read_to_string(root.join("models/collections/h2o/s.bin")).unwrap(), "c");
-        assert_eq!(std::fs::read_to_string(root.join("scenes/w.scene")).unwrap(), "the installed build's own");
+        assert_eq!(r.copy, CopyReport { copied: 4, skipped_existing: 1, ..Default::default() });
+        assert_eq!(t.read("root/models/collections/h2o/samples.bin"), "c");
+        assert_eq!(t.read("root/scenes/w.scene"), "the installed build's own");
         assert!(!root.join("captures").exists());
         assert!(src.join("models/h2o.model").is_file(), "copied, not moved");
         let line = r.line(&src);
-        assert!(line.contains("3 files copied") && line.contains("1 already there"), "{line}");
-        // a second import appends its source
+        assert!(line.contains("4 files copied") && line.contains("1 already there"), "{line}");
+        // a second import appends its source (the collection now kept whole)
         let r = import_into(&src, &root);
-        assert_eq!(r.copy.copied, 0);
+        assert_eq!((r.copy.copied, r.copy.kept_collections.clone()), (0, vec!["h2o".to_string()]));
         assert_eq!(std::fs::read_to_string(root.join(MIGRATED_FROM)).unwrap(), format!("{0}\n{0}\n", src.display()));
         // a folder without any of the three: nothing copied, nothing recorded
         let empty = t.mk("empty");
@@ -726,9 +1102,38 @@ mod tests {
         assert!(r.found.is_empty() && !root2.join(MIGRATED_FROM).exists());
         assert!(r.line(&empty).starts_with("nothing imported"), "{}", r.line(&empty));
         // the threaded form sends the same line
-        let rx = spawn_import(src.clone(), t.0.join("root3"));
+        let rx = start_import(DataMode::Installed, Some(&t.0.join("root3")), src.clone()).unwrap();
         let line = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
-        assert!(line.contains("4 files copied"), "{line}");
+        assert!(line.contains("5 files copied"), "{line}");
+    }
+
+    /// I1 / M5: the import's checks, with the mode and the root passed in.
+    #[test]
+    fn check_import_refuses_outside_installed_and_the_root_itself() {
+        let t = Tmp::new("check");
+        let local = t.mk("Local");
+        let root = local.join("atomic-sandbox");
+        let old = t.mk("old copy");
+        let only = format!("import data: {IMPORT_ONLY_INSTALLED}");
+        assert_eq!(check_import(DataMode::Dev, Some(&root), &old), Err(only.clone()));
+        assert_eq!(check_import(DataMode::Portable, Some(&root), &old), Err(only));
+        assert!(check_import(DataMode::Installed, None, &old).unwrap_err().contains("no LOCALAPPDATA"));
+        // the root not made yet: still compared by its real parent
+        assert_eq!(check_import(DataMode::Installed, Some(&root), &old), Ok(root.clone()));
+        let e = check_import(DataMode::Installed, Some(&root), &local).unwrap_err();
+        assert!(e.contains("holds this build's own data folder"), "{e}");
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let e = check_import(DataMode::Installed, Some(&root), &root).unwrap_err();
+        assert!(e.contains(" is this build's own data folder"), "{e}");
+        let e = check_import(DataMode::Installed, Some(&root), &root.join("models")).unwrap_err();
+        assert!(e.contains("is inside this build's own data folder"), "{e}");
+        // spelled another way (a `..`): the same folder
+        let e = check_import(DataMode::Installed, Some(&root), &root.join("models").join("..")).unwrap_err();
+        assert!(e.contains(" is this build's own data folder"), "{e}");
+        // a sibling whose name starts like the root's is not inside it
+        let sibling = t.mk("Local/atomic-sandbox-old");
+        assert_eq!(check_import(DataMode::Installed, Some(&root), &sibling), Ok(root.clone()));
+        assert!(start_import(DataMode::Dev, Some(&root), old).is_err());
     }
 
     /// The pseudopotential cache (`providers::pseudo::default_disk_cache_dir`, unchanged) sits

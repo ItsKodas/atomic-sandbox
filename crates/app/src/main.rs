@@ -534,7 +534,7 @@ fn main() {
         eprintln!("note: no models folder beside the exe or in the working directory: the estimated solver keeps this session's model only (no shared collection)");
     }
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
-    // (`%LOCALAPPDATA%tomic-sandbox`, `paths::user_root`: the same in every mode)
+    // (`%LOCALAPPDATA%\atomic-sandbox`, `paths::user_root`: the same in every mode)
     if let Some(root) = paths::user_root() {
         viewer.ui.profiles.current_file = Some(root.join("current.profile"));
         ui::profile::load_current(&mut viewer.ui);

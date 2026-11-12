@@ -379,10 +379,10 @@ fn file_windows(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     ui.separator();
     // the installed build keeps its data under %LOCALAPPDATA%: bring an older copy's in (copied,
     // never moved; what is already there is kept)
-    let installed = crate::paths::mode() == crate::paths::DataMode::Installed;
+    let state = import_item(st.data_mode, st.import_data.is_some());
     let item = Button::new(RichText::new("Import data from a folder…").size(14.0)).min_size(Vec2::new(190.0, 28.0));
-    if probed("import-data", ui.add_enabled(installed && st.import_data.is_none(), item))
-        .on_disabled_hover_text(if installed { "an import is running" } else { crate::paths::IMPORT_ONLY_INSTALLED })
+    if probed("import-data", ui.add_enabled(state.is_ok(), item))
+        .on_disabled_hover_text(state.err().unwrap_or_default())
         .on_hover_text("copy an older copy's models, profiles and scenes folders into this installed build's data folder; nothing is overwritten or moved")
         .clicked()
     {
@@ -390,6 +390,16 @@ fn file_windows(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         if let Some(folder) = rfd::FileDialog::new().set_title("Import data from a folder").pick_folder() {
             acts.push(Action::ImportData(folder));
         }
+    }
+}
+
+/// File ▸ Import data from a folder…: enabled (`Ok`) only in the installed build with no import
+/// running, else why not (its disabled tooltip).
+pub(super) fn import_item(mode: crate::paths::DataMode, running: bool) -> Result<(), &'static str> {
+    match (mode, running) {
+        (crate::paths::DataMode::Installed, false) => Ok(()),
+        (crate::paths::DataMode::Installed, true) => Err("an import is running"),
+        _ => Err(crate::paths::IMPORT_ONLY_INSTALLED),
     }
 }
 

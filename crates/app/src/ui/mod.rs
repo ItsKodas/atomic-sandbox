@@ -814,6 +814,11 @@ pub struct UiState {
     /// File ▸ Import data from a folder… in flight (`Action::ImportData`, `paths::spawn_import`):
     /// its status line arrives here when the copy is done.
     pub import_data: Option<std::sync::mpsc::Receiver<String>>,
+    /// Where the data lives (`crate::paths`): the process's mode and per-user root, read once at
+    /// start. The Import item, its action and the Profiles window's timings row follow these, so a
+    /// test can stand in an installed build with a temporary root.
+    pub data_mode: crate::paths::DataMode,
+    pub data_root: Option<std::path::PathBuf>,
 }
 
 /// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
@@ -1020,6 +1025,8 @@ impl UiState {
             segment_preview: None,
             segment_back: None,
             import_data: None,
+            data_mode: crate::paths::mode(),
+            data_root: crate::paths::user_root(),
         }
     }
 
@@ -1370,6 +1377,8 @@ pub(crate) fn poll_import(st: &mut UiState) {
     };
     st.import_data = None;
     st.set_status(line);
+    // the File window shows what came in
+    st.files.refresh_soon();
 }
 
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the

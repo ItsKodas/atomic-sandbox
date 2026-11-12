@@ -338,7 +338,7 @@ impl Default for Capture {
 /// The `captures` folder ([`crate::paths`]): dev and portable builds keep it beside the executable
 /// in a dist folder (one with `models/` beside the exe), else in the working directory (the
 /// repository root under `start.bat`; gitignored); an installed build under
-/// `%LOCALAPPDATA%tomic-sandbox`.
+/// `%LOCALAPPDATA%\atomic-sandbox`.
 pub fn captures_dir() -> PathBuf {
     crate::paths::dir(crate::paths::DataDir::Captures).unwrap_or_else(|| PathBuf::from("captures"))
 }

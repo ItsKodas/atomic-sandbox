@@ -7803,4 +7803,52 @@ fn import_data_is_offered_only_in_the_installed_build() {
     assert!(st.import_data.is_none() && st.status.contains("stopped before it finished"), "{}", st.status);
     let r = search::results("import data", 3);
     assert!(r.first().is_some_and(|e| e.anchor == "m-files"), "{:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
+    // the item's state, by mode (fix round 1, M5)
+    use crate::paths::{DataMode, IMPORT_ONLY_INSTALLED};
+    assert_eq!(menus::import_item(DataMode::Dev, false), Err(IMPORT_ONLY_INSTALLED));
+    assert_eq!(menus::import_item(DataMode::Portable, false), Err(IMPORT_ONLY_INSTALLED));
+    assert_eq!(menus::import_item(DataMode::Installed, false), Ok(()));
+    assert_eq!(menus::import_item(DataMode::Installed, true), Err("an import is running"));
+}
+
+/// Fix round 1 (M5): the Installed branch of File ▸ Import data from a folder…, with the mode and a
+/// temporary root standing in on `UiState`: the import starts on its thread, the status line says
+/// so, a second one is refused while it runs, its line arrives with the counts, the File window
+/// reads its folders again, and an import of the root itself is refused.
+#[test]
+fn import_data_runs_in_the_installed_build() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let tmp = std::env::temp_dir().join(format!("atomic-import-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (old, root) = (tmp.join("old copy"), tmp.join("Local").join("atomic-sandbox"));
+    std::fs::create_dir_all(old.join("scenes")).unwrap();
+    std::fs::write(old.join("scenes").join("w.scene"), "grid 33 0.25\n").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    (st.data_mode, st.data_root) = (crate::paths::DataMode::Installed, Some(root.clone()));
+    assert!(!st.files.refresh_pending());
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(old.clone()), &mut out);
+    assert_eq!(out.error, None);
+    assert!(st.import_data.is_some() && st.status.starts_with("importing models, profiles and scenes from"), "{}", st.status);
+    let mut again = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(old.clone()), &mut again);
+    assert_eq!(again.error.as_deref(), Some("import data: an import is already running"));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while st.import_data.is_some() && std::time::Instant::now() < until {
+        poll_import(&mut st);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(st.import_data.is_none(), "the import finished");
+    assert!(st.status.starts_with("imported scenes from") && st.status.contains("1 file copied"), "{}", st.status);
+    assert_eq!(std::fs::read_to_string(root.join("scenes").join("w.scene")).unwrap(), "grid 33 0.25\n");
+    assert!(root.join(crate::paths::MIGRATED_FROM).is_file());
+    assert!(st.files.refresh_pending(), "the File window reads its folders again");
+    // the root itself (or a folder inside it) is not an older copy
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData(root.join("scenes")), &mut out);
+    assert!(out.error.as_deref().is_some_and(|e| e.contains("is inside this build's own data folder")), "{:?}", out.error);
+    assert!(st.import_data.is_none());
+    let _ = std::fs::remove_dir_all(&tmp);
 }

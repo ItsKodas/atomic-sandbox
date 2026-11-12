@@ -343,7 +343,7 @@ pub fn model_path(scene_path: &str) -> std::path::PathBuf {
 /// The `models` folder ([`crate::paths`]): dev and portable builds look next to the running
 /// executable (`build.bat`'s dist folder), else in the working directory (the repository's
 /// `models/` when run from the root, as `start.bat` does); an installed build keeps it under
-/// `%LOCALAPPDATA%tomic-sandbox`. The model Save/Open dialogs start there unless a model file
+/// `%LOCALAPPDATA%\atomic-sandbox`. The model Save/Open dialogs start there unless a model file
 /// was already chosen.
 pub fn models_dir() -> Option<std::path::PathBuf> {
     crate::paths::dir(crate::paths::DataDir::Models)

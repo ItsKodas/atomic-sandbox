@@ -756,6 +756,14 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
 }
 
 impl Browser {
+    /// The folders changed (an import finished): read them again at the next frame it is open.
+    pub(crate) fn refresh_soon(&mut self) {
+        self.refresh_at = Some(std::time::Instant::now());
+    }
+    #[cfg(test)]
+    pub(crate) fn refresh_pending(&self) -> bool {
+        self.refresh_at.is_some()
+    }
     /// A save was sent: read the folders again shortly (the worker writes the model).
     fn pending_refresh(&mut self) {
         self.refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(800));

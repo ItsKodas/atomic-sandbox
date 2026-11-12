@@ -592,14 +592,16 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             }
         }
         Action::ImportData(folder) => {
-            use crate::paths;
-            match paths::user_root() {
-                _ if paths::mode() != paths::DataMode::Installed => out.error = Some(format!("import data: {}", paths::IMPORT_ONLY_INSTALLED)),
-                _ if st.import_data.is_some() => out.error = Some("import data: an import is already running".into()),
-                None => out.error = Some("import data: no LOCALAPPDATA folder to import into".into()),
-                Some(root) => {
-                    st.set_status(format!("importing models, profiles and scenes from {}…", folder.display()));
-                    st.import_data = Some(paths::spawn_import(folder, root));
+            // the mode and the root are `UiState`'s (the process's; a test sets them)
+            if st.import_data.is_some() {
+                out.error = Some("import data: an import is already running".into());
+            } else {
+                match crate::paths::start_import(st.data_mode, st.data_root.as_deref(), folder.clone()) {
+                    Ok(rx) => {
+                        st.set_status(format!("importing models, profiles and scenes from {}…", folder.display()));
+                        st.import_data = Some(rx);
+                    }
+                    Err(why) => out.error = Some(why),
                 }
             }
         }
