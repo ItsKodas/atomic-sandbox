@@ -10,8 +10,9 @@
 //!   `models\collections`), `profiles\`, `scenes\` and `captures\` under the per-user root
 //!   [`user_root`], `%LOCALAPPDATA%\atomic-sandbox`, created on first use. The shipped, read-only
 //!   content sits in the install folder's `bundled\{models,scenes,timings}` ([`bundled_dir`]); the
-//!   models and scenes are copied into the root once ([`seed_installed`]), the shipped completion
-//!   times are read from there ([`DataDir::Timings`]).
+//!   models and scenes are copied into the root at the first launch of each version
+//!   ([`seed_installed`]: missing files only), the shipped completion times are read from there
+//!   ([`DataDir::Timings`]).
 //!
 //! Every mode already shares four things under the root: `current.profile`, `timings.txt` (the
 //! user's own completion times), `training\` and `cache\pseudo`
@@ -29,7 +30,8 @@ use std::sync::OnceLock;
 pub const PORTABLE_MARKER: &str = "portable.txt";
 /// The marker beside the exe the installer writes.
 pub const INSTALLED_MARKER: &str = "installed.txt";
-/// Under the root: the first installed launch copied the bundled models and scenes in.
+/// Under the root: the bundled models and scenes were copied in, by the version on its
+/// `version=` line ([`seed_installed`]).
 pub const SEEDED_MARKER: &str = "installed_seeded.txt";
 /// Under the root: the folders File ▸ Import data from a folder… copied from, one per line.
 pub const MIGRATED_FROM: &str = "migrated_from.txt";
@@ -38,9 +40,12 @@ pub const IMPORT_ONLY_INSTALLED: &str = "only the installed app keeps its data i
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataMode {
-    /// No marker: the repository checkout or a `build.bat` dist folder, the lookups as always.
+    /// No marker: the repository checkout (`cargo run`, `start.bat`, the tests, the replays), the
+    /// lookups as always.
     Dev,
-    /// `portable.txt` beside the exe: the lookups as always (the data stays beside the exe).
+    /// `portable.txt` beside the exe (the release zip, and a `build.bat` dist folder, which
+    /// `scripts/package.ps1` gives the marker): the lookups as always (the data stays beside the
+    /// exe); it checks GitHub at launch and offers "Download zip".
     Portable,
     /// `installed.txt` beside the exe: the user's folders under [`user_root`].
     Installed,
@@ -418,23 +423,28 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// The first launch of an installed build: the install folder's `bundled\models` and
-/// `bundled\scenes` copied into the root's `models\` and `scenes\` ([`copy_tree_new`]: what the
-/// user already has is kept), then `installed_seeded.txt` written so it runs once. Nothing
-/// outside Installed mode. A failure is printed and leaves the marker unwritten, so the next
-/// launch tries again (only the missing files).
+/// The first launch of each installed version: the install folder's `bundled\models` and
+/// `bundled\scenes` copied into the root's `models\` and `scenes\` ([`copy_tree_new`]: only the
+/// missing files, so what the user already has — edited or not — is kept), then
+/// `installed_seeded.txt` written with this version, so it runs once per version (final review
+/// I2: a model or library scene an update adds reaches an installed user). Nothing outside
+/// Installed mode. A failure is printed and leaves the marker as it was, so the next launch tries
+/// again (only the missing files).
+///
+/// Accepted trade-off: a bundled file the user deleted comes back at the first launch after an
+/// update (never at a later launch of the same version).
 pub fn seed_installed() {
     if mode() != DataMode::Installed {
         return;
     }
     let Some(root) = user_root() else {
-        eprintln!("first run: no LOCALAPPDATA, so the bundled models and scenes were not copied in");
+        eprintln!("bundled content: no LOCALAPPDATA, so the bundled models and scenes were not copied in");
         return;
     };
     let (models, scenes) = (bundled_dir(DataDir::Models), bundled_dir(DataDir::Scenes));
     if let Some(r) = seed_from(models.as_deref(), scenes.as_deref(), &root) {
         if !r.failed.is_empty() {
-            eprintln!("first run: not everything could be copied into {} (the next launch tries again):", root.display());
+            eprintln!("bundled content: not everything could be copied into {} (the next launch tries again):", root.display());
             for (p, why) in &r.failed {
                 eprintln!("  {}: {why}", p.display());
             }
@@ -442,9 +452,11 @@ pub fn seed_installed() {
     }
 }
 
-/// [`seed_installed`]'s work with the paths passed in: `None` when the root's marker says it
-/// already ran, else what was copied. A missing bundled folder is skipped; the root is created
-/// for the marker.
+/// [`seed_installed`]'s work with the paths passed in: `None` when the root's marker says this
+/// version already seeded, else what was copied. A marker without a `version=` line (the format
+/// before final review I2) or with another version's seeds again — missing files only, never an
+/// overwrite or a delete — and is rewritten. A missing bundled folder is skipped; the root is
+/// created for the marker.
 ///
 /// A root with neither `models\` nor `scenes\` is seeded again whatever the marker says (installer
 /// Task 5 fix round 1, I2): the uninstaller's "Also remove my models, profiles, scenes and
@@ -452,8 +464,9 @@ pub fn seed_installed() {
 /// bundled models or library scenes. It still never overwrites ([`copy_tree_new`]).
 fn seed_from(models: Option<&Path>, scenes: Option<&Path>, root: &Path) -> Option<CopyReport> {
     let marker = root.join(SEEDED_MARKER);
+    let version = env!("CARGO_PKG_VERSION");
     let emptied = !root.join("models").exists() && !root.join("scenes").exists();
-    if marker.exists() && !emptied {
+    if seeded_version(&marker).as_deref() == Some(version) && !emptied {
         return None;
     }
     let mut report = CopyReport::default();
@@ -465,12 +478,19 @@ fn seed_from(models: Option<&Path>, scenes: Option<&Path>, root: &Path) -> Optio
         }
     }
     if report.failed.is_empty() {
-        let text = format!("bundled models and scenes copied in by Atomic Sandbox v{}\n", env!("CARGO_PKG_VERSION"));
+        let text = format!("version={version}\nbundled models and scenes copied in (missing files only) by Atomic Sandbox v{version}; another version copies again what is missing\n");
         if let Err(e) = std::fs::create_dir_all(root).and_then(|()| std::fs::write(&marker, text)) {
             report.failed.push((marker, e.to_string()));
         }
     }
     Some(report)
+}
+
+/// The version on the seed marker's `version=` line; `None` when there is no marker, it can't be
+/// read, or it has no such line (the first format).
+fn seeded_version(marker: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    text.lines().find_map(|l| l.trim().strip_prefix("version=")).map(|v| v.trim().to_string())
 }
 
 /// The folders File ▸ Import data from a folder… copies, each into the same name under the root.
@@ -1081,7 +1101,8 @@ mod tests {
         assert_eq!(t.read("root/models/hydrogen.model"), "h");
         assert_eq!(t.read("root/scenes/h2o.scene"), "the user's own h2o", "never overwritten");
         assert!(root.join(SEEDED_MARKER).is_file());
-        // the user deletes a seeded model: the next launch does not bring it back
+        assert_eq!(seeded_version(&root.join(SEEDED_MARKER)).as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        // the user deletes a seeded model: the next launch of this version does not bring it back
         std::fs::remove_file(root.join("models/hydrogen.model")).unwrap();
         assert_eq!(seed_from(m.as_deref(), s.as_deref(), &root), None);
         assert!(!root.join("models/hydrogen.model").exists());
@@ -1131,6 +1152,48 @@ mod tests {
         assert_eq!((t.read("root/models/hydrogen.model").as_str(), t.read("root/scenes/h2o.scene").as_str()), ("h", "w"));
         // and the next launch is quiet again
         assert_eq!(seed_from(Some(&m), Some(&s), &root), None);
+    }
+
+    /// Final review I2: the first launch of another version copies in what its bundle adds —
+    /// missing files only, a file the user edited untouched — and rewrites the marker; a marker
+    /// of the first format (no `version=` line) counts as another version; the same version
+    /// copies nothing.
+    #[test]
+    fn seed_runs_again_for_another_version() {
+        let t = Tmp::new("seed-version");
+        t.file("exe/bundled/models/hydrogen.model", "h");
+        t.file("exe/bundled/scenes/h2o.scene", "w");
+        let (m, s, root) = (t.0.join("exe/bundled/models"), t.0.join("exe/bundled/scenes"), t.0.join("root"));
+        let marker = root.join(SEEDED_MARKER);
+        let this = env!("CARGO_PKG_VERSION");
+        // the first format's marker (an earlier build), the user's edit of a seeded scene, and a
+        // model the new bundle adds
+        t.file("root/models/hydrogen.model", "h");
+        t.file("root/scenes/h2o.scene", "the user's edit");
+        t.file("root/installed_seeded.txt", "bundled models and scenes copied in by Atomic Sandbox v0.1.0\n");
+        t.file("exe/bundled/models/helium.model", "he");
+        assert_eq!(seeded_version(&marker), None, "no version= line");
+        let r = seed_from(Some(&m), Some(&s), &root).expect("a marker without a version seeds again");
+        assert_eq!(r, CopyReport { copied: 1, skipped_existing: 2, ..Default::default() });
+        assert_eq!(t.read("root/models/helium.model"), "he", "the new bundled file is added");
+        assert_eq!(t.read("root/scenes/h2o.scene"), "the user's edit", "never overwritten");
+        assert_eq!(seeded_version(&marker).as_deref(), Some(this), "the marker rewritten with this version");
+        // the same version: nothing copied, even a deleted bundled file stays deleted
+        std::fs::remove_file(root.join("models/helium.model")).unwrap();
+        t.file("exe/bundled/scenes/benzene.scene", "b");
+        assert_eq!(seed_from(Some(&m), Some(&s), &root), None);
+        assert!(!root.join("models/helium.model").exists() && !root.join("scenes/benzene.scene").exists());
+        // another version (an update): the new file added, the existing ones untouched, the marker
+        // rewritten; the deleted bundled file comes back (the accepted trade-off)
+        t.file("root/installed_seeded.txt", "version=0.0.1-old\nbundled models and scenes copied in\n");
+        assert_eq!(seeded_version(&marker).as_deref(), Some("0.0.1-old"));
+        let r = seed_from(Some(&m), Some(&s), &root).expect("another version seeds again");
+        assert_eq!(r, CopyReport { copied: 2, skipped_existing: 2, ..Default::default() });
+        assert_eq!(t.read("root/scenes/benzene.scene"), "b");
+        assert_eq!(t.read("root/models/helium.model"), "he", "a deleted bundled file returns after an update");
+        assert_eq!((t.read("root/models/hydrogen.model").as_str(), t.read("root/scenes/h2o.scene").as_str()), ("h", "the user's edit"));
+        assert_eq!(seeded_version(&marker).as_deref(), Some(this));
+        assert_eq!(seed_from(Some(&m), Some(&s), &root), None, "and quiet again");
     }
 
     #[test]
