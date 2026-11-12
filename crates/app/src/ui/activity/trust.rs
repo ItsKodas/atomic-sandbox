@@ -14,7 +14,26 @@ pub struct Line {
     pub why: bool,
     pub text: String,
     pub hover: String,
+    /// A failed residual line's worst sample when Forget would take it (code 0): the line's
+    /// Forget link pushes `Action::ForgetSample` with it (2026-11-13).
+    pub forget: Option<sim::SampleId>,
 }
+
+impl Line {
+    fn new(met: bool, why: bool, text: String, hover: String) -> Line {
+        Line { met, why, text, hover, forget: None }
+    }
+}
+
+/// The Forget link of a residual check's line: its worst sample, only when the check fails and
+/// the provider says Forget would take the sample now (code 0); the provider still re-checks the
+/// identity (a stale id is refused, "the sample list changed").
+pub fn forget_target(c: &sim::activity::TrustCheck) -> Option<sim::SampleId> {
+    c.worst.as_ref().filter(|w| !c.met && w.forgettable).map(|w| w.id)
+}
+
+/// The hover of a Forget link on a trust line.
+pub const FORGET_WORST_TIP: &str = "forget the sample that holds this worst value: it is held out of the fit until you restore it (Model tab › Worst-fitting samples), geometries near it fall back to DFT, and the model refits without it — the same Forget as the Worst-fitting rows";
 
 /// What the classes mean (plan review N8: two separate H₂ molecules are "two-atom").
 pub const CLASS_HELP: &str = "two-atom: every atom has at most one neighbour within the model's reach (two separate H₂ molecules count too); three or more: some atom has two or more";
@@ -30,6 +49,7 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
             // b counts the box-affected samples in the fit, n the samples held (plan review N6)
             text: format!("Samples clear of the box walls — {b} in the fit touch them ({n} held). {}", crate::ui::box_advice(scene, st)),
             hover: format!("the fit's own check failed: {}", m.untrusted_reason.as_deref().unwrap_or("?")),
+            forget: None,
         });
     }
     let first = m.trust_checks.iter().position(|c| !c.met);
@@ -45,7 +65,9 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
             text = format!("{text} — unverified: {} audits near the cell faces could not judge the model", m.audits_box_unjudged);
             met = false;
         }
-        v.push(Line { met, why: boxed.is_none() && Some(k) == first, text, hover: format!("value {:.3e}, limit {:.3e}", c.value, c.limit) });
+        // a residual line's worst sample: its origin on hover (the line names index and formula)
+        let at = c.worst.as_ref().map_or(String::new(), |w| format!("; worst in #{} · {} · {}", w.id.index, w.formula, w.origin));
+        v.push(Line { met, why: boxed.is_none() && Some(k) == first, text, hover: format!("value {:.3e}, limit {:.3e}{at}", c.value, c.limit), forget: forget_target(c) });
     }
     if boxed.is_none() && first.is_none() && m.fitted {
         // box-affected samples below the trust floor are fitted, and a model can still pass with
@@ -61,7 +83,7 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
         if m.box_excluded > 0 {
             text = format!("{text}; {} box-affected samples are left out of the fit (they taught nothing: a bigger cell would)", m.box_excluded);
         }
-        v.push(Line { met: true, why: false, text, hover: "box-affected samples are not keeping the model untrusted".into() });
+        v.push(Line::new(true, false, text, "box-affected samples are not keeping the model untrusted".into()));
     }
     // the strict policy at this geometry (fix (a), 2026-10-18): the line that says whether the
     // checklist above means the model answers *here*; "this is why" when everything above is met
@@ -75,9 +97,10 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
                 format!("Strict mode answers at this geometry — no: {}{}", r.text, if m.draft { " (draft mode is answering anyway)" } else { "" })
             },
             hover: format!("the fallback policy's verdict here, draft mode off: rule {:?}{}", r.rule, r.atom.map_or(String::new(), |a| format!(", atom {a}"))),
+            forget: None,
         });
         if let Some(u) = &r.unlearned {
-            v.push(Line { met: false, why: r.answers && boxed.is_none() && first.is_none(), text: format!("This scene's own sampling pass is in the fit — no: {u}"), hover: "the last sampling pass of these species: what its samples became in the fit that stands".into() });
+            v.push(Line::new(false, r.answers && boxed.is_none() && first.is_none(), format!("This scene's own sampling pass is in the fit — no: {u}"), "the last sampling pass of these species: what its samples became in the fit that stands".into()));
         }
     }
     for l in &m.class_loo {
@@ -96,6 +119,7 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
                     _ => "; no DFT comparisons yet".to_string(),
                 }
             ),
+            forget: None,
         });
         // per environment species when the class holds more than one (an atom answers by its own),
         // and always for a refused class: its key's row says which key is short and of what (M8a
@@ -113,6 +137,7 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
                         _ => " — none yet".to_string(),
                     }
                 ),
+                forget: None,
             });
         }
     }
@@ -154,6 +179,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 theme::pill(ui, "this is why", AMBER);
             }
             ui.add(egui::Label::new(RichText::new(&l.text).size(12.0).color(theme::INK)).wrap()).on_hover_text(&l.hover);
+            if let Some(id) = l.forget {
+                if crate::ui::probed(&format!("trust-forget-{}", id.index), ui.small_button("Forget")).on_hover_text(FORGET_WORST_TIP).clicked() {
+                    acts.push(crate::ui::actions::Action::ForgetSample(id));
+                }
+            }
         });
     }
     crate::ui::dock::model::teach_row(ui, m, input.sampling(), acts);

@@ -4340,7 +4340,7 @@ fn the_refusal_strings_are_unchanged() {
 fn the_audit_check_is_per_atom_and_names_forces() {
     use sim::activity::TrustKey;
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
-    let audit = |s: &SurrogateKs| *s.trust_checks().last().unwrap();
+    let audit = |s: &SurrogateKs| s.trust_checks().last().unwrap().clone();
     assert!(s.last_audit().is_none());
     let c = audit(&s);
     assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::Audit, true, 0.0, s.policy.energy_std_per_atom));
@@ -4653,7 +4653,7 @@ fn a_refit_leaves_the_last_audit_to_an_earlier_fit() {
     assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed), "the record stays, for the Log");
     assert!(!s.last_audit_this_fit(), "no audit judged this fit yet");
     assert!(!Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
-    let c = *s.trust_checks().last().unwrap();
+    let c = s.trust_checks().last().unwrap().clone();
     assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0));
     audit_now(&mut s);
     assert!(s.last_audit_this_fit(), "the next audit judges this fit");
@@ -10204,6 +10204,10 @@ mod recovery_loo;
 
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;
+
+/// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
+/// the stored scenes, a measurement only (`scope_measure.rs`).
+mod scope_measure;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

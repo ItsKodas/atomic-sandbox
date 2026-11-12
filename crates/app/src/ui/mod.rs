@@ -1843,13 +1843,16 @@ struct TrustView {
     /// The provider's own technical text for what the plain line says (the old refusal or stuck
     /// string): shown on hover after the tip.
     detail: Option<String>,
+    /// The refusal line's Forget link (`activity::trust::Line::forget`): the failed residual
+    /// check's worst sample, when Forget would take it (2026-11-13).
+    forget: Option<sim::SampleId>,
 }
 
 /// The trust readout in plain words (activity spec §5.3): the first unmet line of the checklist
 /// for a refusal, the stuck sentence for a trusted model that keeps falling back; the provider's
 /// own text stays on hover (`detail`).
 fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
-    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None };
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None, forget: None };
     let Some(m) = m.filter(|m| m.fitted) else {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
@@ -1885,7 +1888,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let tip = if crate::sim::box_blocks_trust(m).is_some() { BOX_TRUST_TIP } else { UNTRUSTED_TIP };
         let reason = m.untrusted_reason.clone();
         match activity::trust::lines(m, scene, st).into_iter().find(|l| l.why) {
-            Some(l) => TrustView { detail: reason, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
+            Some(l) => TrustView { detail: reason, forget: l.forget, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
             None => v(TrustKind::Untrusted, AMBER, format!("no — {}", reason.as_deref().unwrap_or("?")), Some(tip)),
         }
     }

@@ -692,12 +692,33 @@ impl TeachBuffer {
 }
 
 /// One condition of the trust rule (spec §3.3.4, A4).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrustCheck {
     pub key: TrustKey,
     pub met: bool,
     pub value: f64,
     pub limit: f64,
+    /// Where `value` was found, for the training-residual checks (`EnergyResidual`,
+    /// `ForceResidual`): display only, never read by the rule. `None` for every other check, and
+    /// when the provider did not record it or the sample it names has changed since.
+    pub worst: Option<TrustWorst>,
+}
+
+/// The training sample (and, for a force, the atom) that holds a residual check's worst value
+/// (2026-11-13: the trust line names what blocks trust). Display only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrustWorst {
+    /// Which stored sample, with its check value: what `Trainable::forget_sample` takes.
+    pub id: crate::provider::SampleId,
+    /// Its formula from Z in Hill order ("H2O"), as the Worst-fitting rows show it.
+    pub formula: String,
+    /// Where it came from, in a word or two ("fallback", "pass perturbation").
+    pub origin: String,
+    /// The atom within the sample and its Z (the force residual's worst atom); `None` for a
+    /// per-sample value (the energy residual).
+    pub atom: Option<(usize, u8)>,
+    /// Whether `forget_sample` would take it now (its code is 0: in the fit, not held out).
+    pub forgettable: bool,
 }
 
 /// A trusted model that keeps falling back (spec A5; `SurrogateKs::stuck` in structured form).
