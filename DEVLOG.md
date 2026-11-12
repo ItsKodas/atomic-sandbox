@@ -559,6 +559,53 @@ The per-refit trust pass grows linearly: an exact leave-one-out over every sampl
 Both are fixed, with tests. The second test fails without its fix. The merged tree's app suite then caught a third: a background refit in flight when the user paused waited for the next command, because the idle worker blocked on its inbox. A pause now keeps polling until the new model stands.
 - **Gate:** unit crates, `providers`, `app` and validate `surrogate` on the merged tree before the merge.
 
+### One bad sample, and a Forget button (Nov 12–13; branch `sample-recovery`, two tasks)
+
+The user's shared collection went untrusted after a session of play. A debug agent replayed the collection's own
+history from snapshots and found the cause:
+- **The cause.** One sample, #1804, a lone OH radical squeezed to O–H 1.31 Bohr with 0.72 Ha/Bohr on each atom.
+  The fit reproduced it within its own (large) bound, but it bent the shared O–H pair term, so 34 water and H₃O
+  samples failed: the worst ratio went from 1.00 to 2.36.
+- **Why recovery missed it.** Recovery ranked samples by their own training residual, so it never named #1804. It
+  quarantined the victims instead, round after round, and ran out of rounds at exactly the user's 3.7e-3. The
+  leave-one-out residual, which the class rule already computes every fit, put #1804 first at 38× its bound.
+
+**What landed:**
+- **Task 1:** recovery rounds rank by the leave-one-out ratio.
+- **Task 2:** a Model-tab list of the worst-fitting samples, with Forget and Restore (code 7, written to the
+  collection at once).
+
+**It took more rounds than planned:**
+- **Stuck-H regression.** The leave-one-out ranking alone made the stuck-H test (the user's earlier H collection)
+  worse: trusted at 0.961 became untrusted at 1.60, because after the right sample it kept holding samples that
+  fit fine. The ruling: leave-one-out rounds first; if they do not recover, the old rounds from the same entry
+  state, kept only if they recover. The recovery is never worse than before.
+- **A plan expectation that was wrong.** The plan expected the user's pre-1805 snapshot to end trusted with under
+  110 held. The debug number had skipped the release step that runs first. Measured: the first refit ends just
+  untrusted (1.0185×, 128 held; the old ranking 1.46×, 165 held), and the next refit is trusted (0.995, 122
+  held). Both are pinned in `references.md`.
+- **Reviews caught three safety holes before merge:**
+  - forgetting a failed audit's own sample let the next refit drop the audit unjudged, so one click could make
+    the model trusted;
+  - a step could be skipped when the leave-one-out result passed its residuals but lacked samples;
+  - next to a forgotten sample every agreeing DFT answer was kept unthinned, for as long as it stayed forgotten.
+
+  Each has a test that fails without its fix.
+- **Honest wording, more than once.** Notes that said "the model cannot represent them" or "breaks the fit of
+  their neighbours" claimed more than a leave-one-out ratio shows; they now say what was measured.
+
+**Gate (Nov 13, before merge):**
+
+| Suite | Passed | Failed |
+|---|---|---|
+| providers | 358 | 0 |
+| validate `surrogate` | 7 | 0 |
+| app | 554 | 0 |
+| surrogate | 95 | 0 |
+| sim | 142 | 0 |
+
+Parked: one diagnostic count (`box_blocks_trust`) double-subtracts a forgotten box-affected sample.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

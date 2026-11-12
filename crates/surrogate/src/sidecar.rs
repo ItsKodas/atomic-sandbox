@@ -68,10 +68,12 @@
 //!
 //! | name | length | content |
 //! |---|---|---|
-//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded (exact integral f64) |
+//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded, 7 forgotten by the user (exact integral f64) |
 //!
 //! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
-//! file with nothing quarantined is written exactly as before.
+//! file with nothing quarantined is written exactly as before. Code 7 (`crate::quarantine::Q_FORGOTTEN`,
+//! 2026-11-12) is new: a build before it refuses a file holding one ("sample_quarantine[i] = 7 is
+//! not 0, 1, 2 or 3"), and a file without one reads in either build as before.
 //!
 //! **Optional, both versions** (Task 9 fix round 1, box-affected samples): when the writer marks
 //! any stored sample's teacher answer as box-affected, one more array follows (after
@@ -280,8 +282,9 @@ pub struct Sidecar {
     pub created_by: String,
     /// How the reference energies were made (header `reference_rule`; module doc).
     pub reference_rule: Option<String>,
-    /// Per stored sample: 0 trained on, 1 quarantined, 2 superseded, 3 box-affected (all kept,
-    /// 1–3 excluded from the fit; module doc). Empty when the file has no `sample_quarantine` array.
+    /// Per stored sample: 0 trained on, 1 quarantined, 2 superseded, 3 box-affected, 7 forgotten by
+    /// the user (all kept, 1–3 and 7 excluded from the fit; module doc). Empty when the file has no
+    /// `sample_quarantine` array.
     pub quarantine: Vec<u8>,
     /// Per stored sample: the teacher's face density (e/Bohr³; NaN = not known). Empty when the
     /// file has no `sample_face_density` array.
@@ -850,10 +853,10 @@ fn sample_arrays(samples: &[Sample]) -> io::Result<[Vec<f64>; 7]> {
     ])
 }
 
-/// The quarantine codes as array values (checked 0 to 3).
+/// The quarantine codes as array values (checked: 0 to 3, or 7 — `crate::quarantine::is_persisted_code`).
 fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
-    if let Some(&q) = quarantine.iter().find(|&&q| q > 3) {
-        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2 or 3)")));
+    if let Some(&q) = quarantine.iter().find(|&&q| !crate::quarantine::is_persisted_code(q)) {
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2, 3 or 7)")));
     }
     Ok(quarantine.iter().map(|&q| q as f64).collect())
 }
@@ -1595,11 +1598,16 @@ fn read_arrays(bytes: &[u8], declared: &[(String, usize)], fixed: &[(&str, Optio
     Ok(arrays)
 }
 
-/// The `sample_quarantine` array's codes (each 0, 1, 2 or 3).
+/// The `sample_quarantine` array's codes (each 0, 1, 2, 3 or 7 — 7 = forgotten by the user since
+/// 2026-11-12, `crate::quarantine::Q_FORGOTTEN`; a build before it refuses a file holding one).
 fn decode_quarantine(v: &[f64]) -> Result<Vec<u8>, String> {
     v.iter()
         .enumerate()
-        .map(|(i, &q)| if q == 0.0 || q == 1.0 || q == 2.0 || q == 3.0 { Ok(q as u8) } else { Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2 or 3")) })
+        .map(|(i, &q)| match q {
+            0.0 | 1.0 | 2.0 | 3.0 | 7.0 => Ok(q as u8),
+            _ if q.fract() == 0.0 && q > 3.0 && q < 256.0 => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3 or 7 (a code of a newer build?)")),
+            _ => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3 or 7")),
+        })
         .collect()
 }
 
@@ -2566,14 +2574,16 @@ pub(crate) mod tests {
     }
 
     /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions; codes 0–3,
-    /// 3 = box-affected since Task 9 fix round 1); a file with nothing quarantined is
-    /// byte-identical to the plain writer's and reads as empty flags; a flag other than 0–3 is
-    /// refused; a flag count that does not match is refused on write.
+    /// 3 = box-affected since Task 9 fix round 1, and 7 = forgotten by the user since 2026-11-12);
+    /// a file with nothing quarantined is byte-identical to the plain writer's and reads as empty
+    /// flags; a flag other than 0–3 or 7 is refused (on read, an integral one as a newer build's;
+    /// on write, the provider-only codes 4–6); a flag count that does not match is refused on write.
     #[test]
     fn quarantine_flags_round_trip_and_stay_optional() {
         for (seed, body3) in [(23u64, false), (29, true)] {
             let orig = random_sidecar(seed, body3);
-            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 0, 1, 0, 2, 3][i % 7]).collect();
+            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 7, 1, 0, 2, 3][i % 7]).collect();
+            assert!(flags.contains(&7), "the forgotten code is exercised");
             let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
             write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
             assert_eq!(read(&with).unwrap().quarantine, flags);
@@ -2590,6 +2600,15 @@ pub(crate) mod tests {
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err();
             assert!(e.to_string().contains("sample_quarantine"), "{e}");
+            bytes[at..at + 8].copy_from_slice(&8.0f64.to_le_bytes());
+            std::fs::write(&with, &bytes).unwrap();
+            let e = read(&with).unwrap_err().to_string();
+            assert!(e.contains("is not 0, 1, 2, 3 or 7 (a code of a newer build?)"), "{e}");
+            for q in [4u8, 5, 6] {
+                let mut bad = flags.clone();
+                bad[0] = q;
+                assert!(write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &bad).is_err(), "code {q} is the provider's own, never written");
+            }
             let short = vec![1u8; n - 1];
             assert!(write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &short).is_err());
         }

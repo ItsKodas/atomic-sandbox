@@ -691,17 +691,70 @@
 //!    sample could trade a residual failure for a sample shortfall: the water investigation's
 //!    E1(e), one H 0.9 Bohr from O → n 333 < Q′ 344, every step DFT until 11 more samples, then
 //!    the many-body class untrusted by that one sample; the quarantine below handles it instead);
-//! 2. otherwise **quarantines** the worst offenders — the samples whose per-atom energy or worst
-//!    force residual, relative to its threshold, is within a factor 2 of the worst — and refits
-//!    without them, up to [`QUARANTINE_ROUNDS`] rounds, never more than
-//!    [`QUARANTINE_MAX_FRACTION`] of the store;
+//! 2. otherwise **quarantines** the worst offenders and refits without them, up to
+//!    [`QUARANTINE_ROUNDS`] rounds, never more than [`QUARANTINE_MAX_FRACTION`] of the store (the
+//!    cap is checked before a round holds anything). **The offenders are ranked by their
+//!    leave-one-out ratio** (since 2026-11-12, spec `2026-11-12-sample-recovery-design.md` R1;
+//!    `quarantine::loo_ratio`): how far the fit *without* the sample misses it — the larger of its
+//!    leave-one-out energy residual per atom over `energy_std_per_atom` (when its energy was
+//!    fitted) and, over its fitted atoms, the leave-one-out force residual
+//!    `force_residual(F − r, F)`'s d over the atom's bound — the class rule's own reading of the
+//!    same `surrogate::loo` residuals. A round takes every fitted, not box-affected sample whose
+//!    ratio exceeds 1 and is within a factor 2 of the worst. The bound is each atom's own while the
+//!    training residuals fail, `force_std_abs` when only the force noise does. An undefined
+//!    leave-one-out (the sample alone spans a direction of the fit) is ∞ and ranks first (ruling
+//!    R1a: as the class rule reads it). The ratios are the class pass's (`refresh_class_loo`),
+//!    cached per fit (`LooRatios`, keyed by the model generation and the fit's own members; ruling
+//!    R1b) — the fits inside a refit defer that pass, so a round computes them once for its own fit
+//!    (`ensure_loo_ratios`; ≈ 1 s at Q′ 1 032 and 1 700 samples on 16 threads). Until then the
+//!    ranking was the in-sample training residual, which a **high-leverage** sample hides from: the
+//!    fit reproduces it inside its own (wide) bound at its neighbours' expense. The user's
+//!    collection (2026-11-12, `references.md` "Leave-one-out recovery ranking"): one compressed OH
+//!    at 0.72 Ha/Bohr (bound: the 1e-2 cap) bent the shared O–H pair term and 34 H₂O/H₃O samples
+//!    failed; the rounds held those victims, round after round, and ended untrusted at 165 held,
+//!    while the sample's leave-one-out ratio was 962× (rank 1 of 1 700; the next 5.2×). Pinned on
+//!    an analytic fixture (`tests/recovery_loo.rs`): one force-only compressed H₂ among H₃ and H₂ —
+//!    the training ranking holds 7 victims and ends untrusted, the leave-one-out ranking holds the
+//!    outlier alone and trusts. The recovery note names the worst ratio held ("3 samples
+//!    quarantined — the fit without each predicts it at up to 38× its bound, and the fit without
+//!    them recovers (…)"; "…, and the fit without them passes" when its residuals and noise pass
+//!    short of the trust rule's counts). **The fallback** (fix round 1, the coordinator's
+//!    option A; `quarantine_rounds`): when the leave-one-out rounds do not recover the fit (the
+//!    residuals, the noise and the trust rule's counts), the state the rounds started from is
+//!    restored (the fit, the codes, `species_dirty`, the note) and the rounds run again ranked by the
+//!    in-sample training residual (`training_offenders`, the ranking before); that result stands only
+//!    if it recovers, else the leave-one-out one does, and the note names the ranking that stood
+//!    ("ranked by their own training residual (the leave-one-out ranking did not recover the fit)").
+//!    Step 3 (below) then runs whenever the result standing after step 2 is not recovered —
+//!    residuals, noise **or the counts** (fix round 2, I1: before, only while the residuals or the
+//!    noise failed, so a leave-one-out result that passed its residuals short of samples suppressed
+//!    the default-basis retry; `step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples`).
+//!    With both, the recovery is never worse than before, for up to [`QUARANTINE_ROUNDS`] more fits
+//!    per ranking on a refit that is failing anyway. The note counts the samples **this refit**
+//!    held and measured ("K samples quarantined this refit (N held in all) — …"), against each one's
+//!    own bound or, in the noise-only mode, "the 2e-3 Ha/Bohr force-noise tier". Why both: once a label error is held, the leave-one-out ratio
+//!    can go on naming high-leverage samples whose own fit is fine — the stuck-H collection's step 3
+//!    (below) ends untrusted at 47 held by it, trusted at 38 held by the fallback. On the user's
+//!    pre-1805 snapshot #1804 is held in round 1, but the refit's release step (run first, against
+//!    the fit #1804 bends) puts #1455 back: the first refit ends untrusted at 1.0185× (128 held,
+//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). The holds of a
+//!    recovery that did not restore trust stay (and are written to a collection): a sample held by
+//!    the leave-one-out ranking is one the fit without it misses, so a later refit's release by
+//!    reproduction rarely takes it back. A held sample leaves the hold only when a later fit
+//!    reproduces it (released into the fit) or a fresh agreeing teacher answer next to it
+//!    supersedes it — which ends its fence but keeps it out of the fit. The user's Restore does not
+//!    apply to it: Restore clears only a forgotten sample, and only a code-0 sample can be
+//!    forgotten. Not changed: the
+//!    rounds, the cap, the degree-cap steps, release and supersede, and the trust rule that judges
+//!    every fit;
 //! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
 //!    capped fit fails, the default basis is tried first exactly as step 1 tries the cap (kept if
 //!    it alone passes, counts included), and when the quarantine on the capped basis cannot
 //!    recover either, the same quarantine rounds run again from the default basis (from the state
 //!    the refit entered with) — that result stands only if it is trusted, else step 2's does. The
 //!    case (`references.md` "M8a stuck collection"): one stretched-H₂ label under cap 6 drove the
-//!    energy noise to 2e-2 Ha/atom and spread its misfit over all 380 H₂ samples, so step 2 named
+//!    energy noise to 2e-2 Ha/atom and spread its misfit over the H₂ samples (379 named as
+//!    offenders, re-measured 2026-11-12; 380 when first recorded), so step 2 named
 //!    no offender within its cap and the cap could never be undone — untrusted at every refit. A quarantined sample stays in the store (and in
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
@@ -718,6 +771,22 @@
 //! model now reproduces it too, or else marked **superseded** — contradicted by a fresh answer
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
+//!
+//! **Forgotten samples** (spec `2026-11-12-sample-recovery-design.md` R2; `Q_FORGOTTEN` = 7, its
+//! doc in `surrogate::quarantine`): the user's Forget in the Model tab's "Worst-fitting samples"
+//! (`forget_sample`; the list is `sample_suspects`, the fit's own leave-one-out ranking). Excluded
+//! like a held sample (fit, envelope, grade, leave-one-out) and fencing like one, but never
+//! released by a refit nor superseded by a fresh answer — only `restore_sample` clears it — and
+//! counted with the held samples against [`QUARANTINE_MAX_FRACTION`]. The status is written at
+//! once (a collection status record, else the store's code for the model file); a background
+//! refit that lands after it re-applies it (`background` module doc, "The user's codes"). Only a
+//! sample in the fit (code 0) can be forgotten, so Restore returns it to exactly that; the buttons
+//! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
+//! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
+//! as before (rule 8, Task 2 fix round 1 I1). Its fence is therefore permanent while it stays
+//! forgotten, so an agreeing teacher answer next to it — where nothing is released or superseded —
+//! is an ordinary one: thinned and copy-checked like an envelope (rule 5) fallback's (`admit`; final review
+//! I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`), not a new sample at every step.
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
@@ -796,8 +865,8 @@
 //! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
 //! Thinned: the envelope rule (5), an untrusted model (rule 4) whose trust does not wait for
 //! samples, and an untrusted class that already holds Q′ samples (4b; short of them its fallbacks
-//! are exempt). **Copies** (round 1 of the 2026-10-18 trust review, MUST-2): a fallback under rules
-//! 4, 4b or 5, exempt or not, whose labels repeat a stored sample's within the fit's own noise (the
+//! are exempt); and a refusal by the fence alone next to forgotten samples (final review I1). **Copies** (round 1 of the 2026-10-18 trust review, MUST-2): a fallback under rules
+//! 4, 4b or 5 or the forgotten-sample fence, exempt or not, whose labels repeat a stored sample's within the fit's own noise (the
 //! nearest one of the same atom sequence inside the thinning radius: |ΔE| ≤ N·s_E, every atom's
 //! |F| within s_F — `is_label_copy`) is never kept: copies satisfy the count conditions by
 //! repetition and, fitted, shrink the two-noise evidence's s_F and with it rule 6's bound
@@ -1065,7 +1134,7 @@ pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
-    RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
+    RECOVERY_DEGREE_CAP, SUSPECTS_SHOWN, THIN_EVERY, THIN_FRACTION,
 };
 pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use background::BackgroundPoll;
@@ -1187,6 +1256,11 @@ pub struct SurrogateKs {
     /// are still an earlier fit's — computed once for the fit that stands (`ensure_trust_passes`).
     /// `None` outside a refit: those are the current fit's.
     deferred_trust: Option<usize>,
+    /// The per-sample leave-one-out ratios of a fit (`quarantine::LooRatios`, spec ruling R1b): the
+    /// class pass's, kept for the recovery's offender ranking and the Model tab's worst-fitting
+    /// samples. Keyed to the fit (`model_gen` and its members, `fit_members`); read only through
+    /// `fresh_loo_ratios` / `ensure_loo_ratios`, which never return an earlier fit's.
+    loo_ratios: Option<LooRatios>,
     /// Tests only: every fit inside a refit computes its trust passes, as before the deferral —
     /// the reference the deferred refit is compared with (`refit_cost` tests).
     #[cfg(test)]
@@ -1397,6 +1471,10 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: the recovery's rounds rank by the training residual alone, as before spec R1
+    /// (`training_offenders`, no leave-one-out rounds first) — the premise a test compares with.
+    #[cfg(test)]
+    training_ranking: bool,
     /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach
     /// measurement set another ([`SurrogateKs::with_collection_r_cut`]).
     collection_r_cut: f64,
@@ -1542,6 +1620,7 @@ impl SurrogateKs {
             class_worst: Vec::new(),
             class_blockers: Vec::new(),
             deferred_trust: None,
+            loo_ratios: None,
             #[cfg(test)]
             eager_trust_passes: false,
             teach_rounds: BTreeMap::new(),
@@ -1554,6 +1633,8 @@ impl SurrogateKs {
             shared: None,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            training_ranking: false,
             collection_r_cut: surrogate::COLLECTION_R_CUT,
             collection_note: Vec::new(),
             source_file: None,
@@ -2139,10 +2220,15 @@ impl ForceProvider for SurrogateKs {
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)
         let near = self.near_quarantined(&pos, &z);
-        if reason.is_none() && !near.is_empty() {
+        // refused by the fence alone (final review I1): its answer is thinned and copy-checked as an
+        // envelope (rule 5) fallback's is — which reaches `admit`'s checks only where forgotten samples
+        // alone fence (a held one is released or superseded by an agreeing answer, and a
+        // disagreeing one is never kept but by a fence vote)
+        let by_fence = reason.is_none() && !near.is_empty();
+        if by_fence {
             reason = Some(Refusal::new(
                 format!(
-                    "surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent",
+                    "surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)",
                     QUARANTINE_FRACTION * self.policy.max_descriptor_distance
                 ),
                 TeachRule::NearQuarantine,
@@ -2235,8 +2321,8 @@ impl ForceProvider for SurrogateKs {
                 // the variance rules' fallbacks are the answers active learning asks for, and so
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
                 // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
-                thin: (by_envelope || by_class) && !class_short && !forced,
-                dedup: (by_envelope || by_class || by_audit_fence) && !forced,
+                thin: (by_envelope || by_class || by_fence) && !class_short && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence || by_fence) && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
                 audit,
@@ -2498,6 +2584,7 @@ impl SurrogateKs {
             match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
                 Q_BOX => c.box_excluded += 1,
                 Q_HELD | Q_SUPERSEDED => c.quarantined += 1,
+                Q_FORGOTTEN => c.forgotten += 1,
                 Q_NONE if i < self.accumulated => c.fitted += 1,
                 _ => c.other += 1,
             }
@@ -2978,6 +3065,8 @@ impl Trainable for SurrogateKs {
             draft: self.policy.never_fallback,
             quarantined: self.quarantined(),
             superseded: self.superseded(),
+            forgotten: self.forgotten(),
+            forgotten_in_fit: self.forgotten_in_fit(),
             box_excluded: self.box_excluded(),
             held_out: self.held_out(),
             lone: self.lone_held_out(),
@@ -3015,6 +3104,22 @@ impl Trainable for SurrogateKs {
 
     fn pending_refit(&self) -> bool {
         SurrogateKs::pending_refit(self)
+    }
+
+    fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        SurrogateKs::forget_sample(self, id)
+    }
+
+    fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        SurrogateKs::restore_sample(self, id)
+    }
+
+    fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {
+        SurrogateKs::sample_suspects(self)
+    }
+
+    fn forgotten_samples(&self) -> Vec<sim::SampleSuspect> {
+        SurrogateKs::forgotten_samples(self)
     }
 
     fn set_audit_every(&mut self, n: usize) {
@@ -3280,6 +3385,8 @@ pub(crate) struct PassCoverage {
     pub(crate) fitted: usize,
     pub(crate) box_excluded: usize,
     pub(crate) quarantined: usize,
+    /// Forgotten by the user (`Q_FORGOTTEN`, Task 2 fix round 1 M5).
+    pub(crate) forgotten: usize,
     /// Kept since the refit, or held out otherwise.
     pub(crate) other: usize,
     /// Box-affected, fitted or not (below the trust floor they are fitted).
@@ -3301,7 +3408,10 @@ impl PassCoverage {
             ));
         }
         if self.quarantined > 0 {
-            why.push(format!("{} are quarantined (the model cannot represent them)", self.quarantined));
+            why.push(format!("{} are quarantined (held out by the trust recovery: the rest of the data could not predict it, or the fit could not reproduce it)", self.quarantined));
+        }
+        if self.forgotten > 0 {
+            why.push(format!("{} were forgotten by you (Model tab, Worst-fitting samples — Restore puts them back)", self.forgotten));
         }
         if self.other > 0 {
             why.push(format!("{} are otherwise left out", self.other));

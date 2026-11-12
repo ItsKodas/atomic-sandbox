@@ -123,6 +123,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Bond angles", "angle degrees geometry bonds HOH water", Dock(D::View), "m-bonds"),
     e("Bond lengths", "distance Å angstrom label", Dock(D::View), "m-bonds"),
     e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Dock(D::View), "m-bonds"),
+    e("Refresh bonds after a drag", "solve bonds now automatic auto stale dashed faded estimated surrogate drag move", Dock(D::View), "m-bonds"),
     e("Label opacity", "labels transparent faint names lengths angles charges", Dock(D::View), "m-bonds"),
     e("Reset view settings", "defaults look display aids camera bonds restore", Dock(D::View), "m-view-reset"),
     // Physics
@@ -191,6 +192,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    e("Worst-fitting samples (forget / restore one)", "leave-one-out outlier bad sample forget restore estimated", Dock(D::Model), "d-suspects"),
     // Knowledge (M8a Task 9)
     e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
     // Activity

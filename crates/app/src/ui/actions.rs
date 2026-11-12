@@ -126,6 +126,14 @@ pub enum Action {
     SaveSpecialised(std::path::PathBuf),
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
+    /// The Model tab's "Worst-fitting samples" › Forget (spec 2026-11-12 R2): the stored sample
+    /// this id names (its index and check value — fix round 1, M8: a sample list that changed
+    /// before the click is refused, never another sample forgotten) leaves the fit until Restore
+    /// (`Command::ForgetSample`). Recorded, not replayable (it writes the shared collection's
+    /// status record).
+    ForgetSample(sim::SampleId),
+    /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
+    RestoreSample(sim::SampleId),
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -638,6 +646,14 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
             st.plan.seed += 1;
         }
+        Action::ForgetSample(id) => {
+            st.set_status(format!("forgetting sample #{}: held out of the fit until Restore; refitting", id.index));
+            out.commands.push(Command::ForgetSample(id));
+        }
+        Action::RestoreSample(id) => {
+            st.set_status(format!("restoring sample #{}; refitting", id.index));
+            out.commands.push(Command::RestoreSample(id));
+        }
         Action::SetAudit(n) => {
             model_only_by_hand(st, "the audit cadence");
             st.audit_every = n;
@@ -685,9 +701,15 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::NameStyle(s) => st.name_style = s,
         Action::RefreshBonds => {
             out.commands.push(dyn_(DynCommand::RefreshBonds));
-            (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+            // the button shows everything it solved for; the refresh after a drag (`auto_bonds`,
+            // only with the bonds shown) leaves the lengths and angles as the user set them
+            if std::mem::take(&mut st.auto_bonds.fired) {
+                st.set_status("solving the density once for the bonds after the drag");
+            } else {
+                (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+                st.set_status("solving the density once for the bonds and angles");
+            }
             st.bonds_refresh = Some(Instant::now());
-            st.set_status("solving the density once for the bonds and angles");
         }
         Action::Relax => {
             if input.sampling() {
@@ -1155,7 +1177,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 

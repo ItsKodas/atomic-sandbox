@@ -412,6 +412,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::UseCollection => "use-collection",
         Action::ImportModel(_) => "import-model",
         Action::SaveSpecialised(_) => "specialised",
+        Action::ForgetSample(_) => "forget-sample",
+        Action::RestoreSample(_) => "restore-sample",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",

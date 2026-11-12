@@ -24,6 +24,7 @@
 //! (rule 8).
 pub mod actions;
 pub mod activity;
+pub mod auto_bonds;
 mod capture;
 mod dock;
 mod files;
@@ -539,6 +540,13 @@ pub struct UiState {
     /// as a small label on it, blue + / red −, also in Dock ▸ Selection and the badge. Display only,
     /// not recorded; on by default.
     pub show_charges: bool,
+    /// View ▸ Bonds & labels ▸ refresh bonds after a drag (user request 2026-11-13): under the
+    /// estimated solver, a drag that leaves the bonds stale sends one "Bonds now" a second after it
+    /// ends (`auto_bonds`). Display only, not recorded (the `RefreshBonds` it sends is); on by
+    /// default, and a profile without the key reads as on.
+    pub auto_refresh_bonds: bool,
+    /// That refresh's debounce (`auto_bonds::AutoBonds`).
+    pub auto_bonds: auto_bonds::AutoBonds,
     /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
     /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
     pub follow_selected: bool,
@@ -907,6 +915,8 @@ impl UiState {
             show_angles: true,
             show_bond_lengths: true,
             show_charges: true,
+            auto_refresh_bonds: true,
+            auto_bonds: Default::default(),
             follow_selected: false,
             audit_every_on: 2000,
             audit_auto: true,
@@ -1865,13 +1875,16 @@ struct TrustView {
     /// The provider's own technical text for what the plain line says (the old refusal or stuck
     /// string): shown on hover after the tip.
     detail: Option<String>,
+    /// The refusal line's Forget link (`activity::trust::Line::forget`): the failed residual
+    /// check's worst sample, when Forget would take it (2026-11-13).
+    forget: Option<sim::SampleId>,
 }
 
 /// The trust readout in plain words (activity spec §5.3): the first unmet line of the checklist
 /// for a refusal, the stuck sentence for a trusted model that keeps falling back; the provider's
 /// own text stays on hover (`detail`).
 fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
-    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None };
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None, forget: None };
     let Some(m) = m.filter(|m| m.fitted) else {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
@@ -1898,7 +1911,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let view = v(kind, AMBER, text, Some(if class { CLASS_UNTRUSTED_TIP } else { NOT_HERE_TIP }));
         TrustView { detail: m.untrusted_reason.clone(), ..view }
     } else if m.trusted && m.quarantined > 0 {
-        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
+        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (held out of the fit: the rest of the data could not predict it, or the fit could not reproduce it)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
     } else {
@@ -1907,7 +1920,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let tip = if crate::sim::box_blocks_trust(m).is_some() { BOX_TRUST_TIP } else { UNTRUSTED_TIP };
         let reason = m.untrusted_reason.clone();
         match activity::trust::lines(m, scene, st).into_iter().find(|l| l.why) {
-            Some(l) => TrustView { detail: reason, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
+            Some(l) => TrustView { detail: reason, forget: l.forget, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
             None => v(TrustKind::Untrusted, AMBER, format!("no — {}", reason.as_deref().unwrap_or("?")), Some(tip)),
         }
     }

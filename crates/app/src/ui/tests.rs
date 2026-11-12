@@ -173,12 +173,15 @@ pub(crate) fn model() -> ModelStatus {
         last_gap: Some((-5.3e-5, 1600)),
         quarantined: 2,
         recovery: None,
+        forgotten: 0,
+        suspects: Vec::new(),
+        forgotten_samples: Vec::new(),
         superseded: 0,
         box_excluded: 0,
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -1228,6 +1231,87 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
 }
 
+/// Spec 2026-11-12 R2: the Model tab's "Worst-fitting samples" — the rows (the spec's text), the
+/// caption, the forgotten list; clicking Forget and Restore emits `Action::ForgetSample` /
+/// `RestoreSample`, which send `Command::ForgetSample` / `RestoreSample` and are recorded as not
+/// replayable; with no model, or no ranking yet, the section says why. Rendered: the frame's text
+/// shapes are searched.
+#[test]
+fn the_worst_fitting_samples_forget_and_restore_one() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    // the id carries a check value (fix round 1, M8): the buttons send it as given
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus {
+        suspects: vec![suspect(1804, "HO", "fallback", Some(38.46)), suspect(1133, "H2O", "pass perturbation", Some(5.23))],
+        forgotten_samples: vec![suspect(40, "H2", "audit", None)],
+        forgotten: 1,
+        ..model()
+    };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    // the section is collapsed by default: open it the way Ctrl K does
+    let reveal = |st: &mut UiState, inp: &PanelInput<'_>| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, inp, 1400.0, vec![]);
+        }
+    };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("#1804 · HO · fallback · 38× its bound"), "{t}");
+    assert!(t.contains("#1133 · H2O · pass perturbation · 5.2× its bound"), "{t}");
+    assert!(t.contains(super::dock::model::SUSPECTS_CAPTION), "{t}");
+    assert!(t.contains("forgotten (1): held out of the fit until restored") && t.contains("#40 · H2 · audit · not in the fit"), "{t}");
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "forget-sample-1804"));
+    assert!(matches!(c.as_slice(), [Command::ForgetSample(sim::SampleId { index: 1804, key })] if *key == 0xabc0 + 1804), "{c:?}");
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "restore-sample-40"));
+    assert!(matches!(c.as_slice(), [Command::RestoreSample(sim::SampleId { index: 40, key })] if *key == 0xabc0 + 40), "{c:?}");
+    let id = sim::SampleId { index: 1804, key: 1 };
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(id)), Some("forget-sample"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(id)), Some("restore-sample"));
+    // the forgotten count beside the held one
+    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
+    // no ranking yet (a model, no list), and no model: the section says why
+    for (m, why) in [
+        (ModelStatus { suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_RANKING),
+        (ModelStatus { fitted: false, trusted: false, fit: None, suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_MODEL),
+    ] {
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        reveal(&mut st, &inp);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains(why), "{why}: {t}");
+        assert!(!t.contains("#1804"), "{t}");
+    }
+}
+
 /// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
 /// the import's outcome line; the tab draws them (and the switch) without sending anything; the
 /// switch's and the import's actions send their commands and are recorded as not replayable.
@@ -2080,6 +2164,159 @@ fn the_stale_bonds_are_labelled_under_the_surrogate() {
     assert_eq!(bonds_label(&s.dynamics).as_deref(), Some("bonds from the last DFT step (t = 12.50 fs) — the surrogate has no electrons"));
 }
 
+/// An estimated snapshot of `scene` whose bond graph is an earlier DFT step's (`stale`) or this
+/// one's.
+fn bonds_snapshot(scene: &Scene, backend: Backend, stale: bool) -> Snapshot {
+    let mut s = snapshot(scene, backend, (backend == Backend::Estimated).then(model));
+    s.dynamics.bonds = Some(graph(scene.nuclei.len(), &[(0, 1)], vec![(0..scene.nuclei.len()).collect()], 12.5 / units::au_time_to_fs(1.0)));
+    s.dynamics.bonds_stale = stale;
+    s
+}
+
+/// User request 2026-11-13: a drag that ends under the estimated solver with the bonds stale sends
+/// one `RefreshBonds` a second later, through the frame's actions (so `--record` sees it), and it
+/// leaves the lengths and angles toggles as they were (the button turns them on); not with the
+/// setting off, the bonds fresh or hidden, or under DFT.
+#[test]
+fn a_drag_refreshes_the_stale_bonds_a_second_later() {
+    use super::auto_bonds::{step, Poll, DELAY};
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let stale = bonds_snapshot(&scene, Backend::Estimated, true);
+    let fresh = bonds_snapshot(&scene, Backend::Estimated, false);
+    let dft = bonds_snapshot(&scene, Backend::Gpu, true);
+    let fresh_st = || {
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st
+    };
+    let t0 = std::time::Instant::now();
+    // fires once, after the delay
+    let mut st = fresh_st();
+    st.show_angles = false;
+    let inp = input(&scene, Some(&stale), &cam);
+    assert!(st.auto_refresh_bonds, "on by default");
+    st.auto_bonds.drag_ended(t0);
+    assert!(matches!(step(&mut st, &inp, t0 + DELAY / 2), Poll::Wait(_)));
+    assert_eq!(step(&mut st, &inp, t0 + DELAY), Poll::Fire);
+    assert_eq!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Idle, "once");
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::RefreshBonds, &mut out);
+    assert!(out.commands.iter().any(|c| matches!(c, Command::Dyn(sim::DynCommand::RefreshBonds))));
+    assert!(!st.show_angles, "the refresh after a drag leaves the angles off");
+    assert!(st.bonds_refresh.is_some() && !st.auto_bonds.fired);
+    // the button's own press still shows everything it solved for
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::RefreshBonds, &mut out);
+    assert!(st.show_angles);
+    // a running refresh holds it; a new drag restarts it
+    let mut st = fresh_st();
+    st.auto_bonds.drag_ended(t0);
+    st.auto_bonds.drag_started();
+    st.auto_bonds.drag_ended(t0 + DELAY / 2);
+    assert!(matches!(step(&mut st, &inp, t0 + DELAY), Poll::Wait(_)), "restarted by the second drag");
+    st.bonds_refresh = Some(t0);
+    assert!(matches!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Wait(_)), "a refresh running: held");
+    st.bonds_refresh = None;
+    assert_eq!(step(&mut st, &inp, t0 + 2 * DELAY), Poll::Fire);
+    // never with the setting off, the bonds fresh or hidden, under DFT, or without a model
+    let no_model = snapshot(&scene, Backend::Estimated, None);
+    let mut unfitted = bonds_snapshot(&scene, Backend::Estimated, true);
+    unfitted.model.as_mut().unwrap().fitted = false;
+    for (snap, off, hidden, dft_ui, why) in [
+        (&stale, true, false, false, "the setting off"),
+        (&fresh, false, false, false, "the bonds fresh"),
+        (&stale, false, true, false, "the bonds hidden"),
+        (&dft, false, false, true, "DFT"),
+        (&no_model, false, false, false, "no model"),
+        (&unfitted, false, false, false, "an unfitted model"),
+    ] {
+        let mut st = fresh_st();
+        st.auto_refresh_bonds = !off;
+        st.show_bonds = !hidden;
+        if dft_ui {
+            st.backend = Backend::Gpu;
+        }
+        let inp = input(&scene, Some(snap), &cam);
+        st.auto_bonds.drag_ended(t0);
+        assert_eq!(step(&mut st, &inp, t0 + DELAY), Poll::Idle, "{why}");
+        assert!(!st.auto_bonds.armed() && !st.auto_bonds.fired, "{why}");
+    }
+    // through a frame: the action is in the frame's output, once
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = fresh_st();
+    // laid out first (a first frame may run a discarded sizing pass, whose output the helper drops;
+    // the viewer keeps every pass's)
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    st.auto_bonds.drag_ended(std::time::Instant::now() - DELAY);
+    let outs: Vec<PanelOutput> = (0..3).map(|_| frame(&ctx, &mut st, &inp, 1400.0, vec![])).collect();
+    assert!(st.bonds_refresh.is_some(), "applied");
+    let fired: usize = outs.iter().map(|o| o.actions.iter().filter(|a| matches!(a, Action::RefreshBonds)).count()).sum();
+    assert_eq!(fired, 1, "one refresh in the frames' actions");
+    assert!(outs.iter().flat_map(|o| &o.commands).any(|c| matches!(c, Command::Dyn(sim::DynCommand::RefreshBonds))));
+}
+
+/// The setting is display state: in the profile as `auto_refresh_bonds`, read back, and an old
+/// profile without the key reads as on.
+#[test]
+fn the_refresh_after_a_drag_round_trips_through_the_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    assert!(profile::capture(&st).contains("\nauto_refresh_bonds = true\n"));
+    st.auto_refresh_bonds = false;
+    let text = profile::capture(&st);
+    assert!(text.contains("\nauto_refresh_bonds = false\n"), "{text}");
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert!(!back.auto_refresh_bonds);
+    // an old profile: no key → on, even over a state that had it off
+    let old: String = text.lines().filter(|l| !l.starts_with("auto_refresh_bonds")).map(|l| format!("{l}\n")).collect();
+    profile::apply(&mut back, &old);
+    assert!(back.auto_refresh_bonds);
+    profile::apply(&mut back, "auto_refresh_bonds = nonsense\n");
+    assert!(back.auto_refresh_bonds, "unreadable: the default");
+}
+
+/// User request 2026-11-13: with the bonds stale the 3D view says so in a small line just over the
+/// bottom-right "Solve Bonds", right-aligned with it, inside the view and narrower than the
+/// bottom-centre label's margin, at a wide and a compact width; the Selection panel keeps its note;
+/// a fresh graph has no line; the toasts sit above it.
+#[test]
+fn the_stale_bonds_line_sits_over_bonds_now() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let stale = bonds_snapshot(&scene, Backend::Estimated, true);
+    let fresh = bonds_snapshot(&scene, Backend::Estimated, false);
+    for w in [1400.0, 760.0] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.auto_refresh_bonds = false;
+        let mut inp = input(&scene, Some(&stale), &cam);
+        inp.bonds_label = bonds_label(&stale.dynamics);
+        PROBES.with(|p| p.borrow_mut().clear());
+        let mut view = None;
+        for _ in 0..3 {
+            view = frame(&ctx, &mut st, &inp, w, vec![]).view;
+        }
+        let (line, button) = (probed_rect("bonds-stale-line"), probed_rect("bonds-now"));
+        let view = view.expect("the 3D view");
+        assert!(line.bottom() <= button.top() + 0.5 && button.top() - line.bottom() < 12.0, "{w}: just over the button: {line:?} {button:?}");
+        assert!((line.right() - button.right()).abs() < 2.0, "{w}: right-aligned: {line:?} {button:?}");
+        assert!(view.contains_rect(line), "{w}: inside the view {view:?}: {line:?}");
+        assert!(line.width() <= overlays::STALE_LINE_WIDTH + 1.0 && line.height() < 50.0, "{w}: small: {line:?}");
+        // fresh: no line
+        let inp = input(&scene, Some(&fresh), &cam);
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(&ctx, &mut st, &inp, w, vec![]);
+        assert!(PROBES.with(|p| p.borrow().get("bonds-stale-line").is_none()), "{w}: fresh bonds: no line");
+    }
+}
+
 /// Partial charges (`sim::charges`): drawn only for the scene's nuclei and when they add up to the
 /// scene's charge; current at the geometry they were measured at, else faded with "charges from
 /// t = … fs" naming the density; the text carries the sign always and a true minus, near-zero is
@@ -2343,7 +2580,7 @@ fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
     [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
         .into_iter()
-        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0 })
+        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0, worst: None })
         .collect()
 }
 
@@ -4677,7 +4914,7 @@ mod activity_trust {
         use activity::words::{trust_line, AuditSeen};
         use sim::activity::{TrustCheck, TrustKey as K};
         use sim::AuditVerdict as V;
-        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3 };
+        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3, worst: None };
         let rec = |verdict| sim::AuditRecord { gap: 2e-4, verdict, face_density: None, unaudited_steps: 0, asynchronous: true, teacher_ms: 90.0 };
         let head = "Last check against DFT — no failed check since the last refit";
         assert_eq!(trust_line(&met, AuditSeen::Never, 20), format!("{head} (last check: none yet, one every 20 answered steps)"));
@@ -4690,15 +4927,65 @@ mod activity_trust {
             format!("{head} (last check: none since the last refit — the fit before it was last checked: passed)")
         );
         assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
-        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
+        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3, worst: None };
         assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (until a refit predicts it without that sample)");
-        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
+        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3, worst: None };
         assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (until a refit predicts it without that sample)");
         // the three states come from the status
         let m = model();
         assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
         assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit_this_fit: false, ..model() }), AuditSeen::EarlierFit(_)));
         assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit: None, last_audit_this_fit: false, ..model() }), AuditSeen::Never));
+    }
+
+    /// 2026-11-13: the training-residual lines name the sample (and for the forces the atom) that
+    /// holds the worst value — store index and formula as the Worst-fitting rows show them, the
+    /// origin on hover — and a failed one whose sample Forget would take carries the Forget link
+    /// (the Model tab's line too). Without a location the lines read exactly as before.
+    #[test]
+    fn the_residual_lines_name_the_worst_sample_and_atom() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K, TrustWorst};
+        let id = sim::SampleId { index: 1234, key: 0xabc };
+        let at = |atom, forgettable| Some(TrustWorst { id, formula: "H3O".into(), origin: "fallback".into(), atom, forgettable });
+        let force = TrustCheck { key: K::ForceResidual, met: false, value: 3.4e-3, limit: 2e-3, worst: at(Some((2, 8)), true) };
+        assert_eq!(trust_line(&force, AuditSeen::Never, 20), "Reproduces its own training forces — worst 3.4 in #1234 · H3O (atom 2, O), allowed 2 mHa/Bohr for that atom");
+        let energy = TrustCheck { key: K::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3, worst: at(None, true) };
+        assert_eq!(trust_line(&energy, AuditSeen::Never, 20), "Reproduces its own training energies to the accuracy it claims — worst 2.2 mHa/atom in #1234 · H3O, allowed 1 mHa/atom");
+        // the fallback: no location (an old status, no model, a changed sample) — today's text
+        let old_f = TrustCheck { worst: None, ..force.clone() };
+        assert_eq!(trust_line(&old_f, AuditSeen::Never, 20), "Reproduces its own training forces — worst 3.4, allowed 2 mHa/Bohr for that atom");
+        let old_e = TrustCheck { worst: None, ..energy.clone() };
+        assert_eq!(trust_line(&old_e, AuditSeen::Never, 20), "Reproduces its own training energies to the accuracy it claims — worst 2.2 mHa/atom, allowed 1 mHa/atom");
+        // the Forget link: a failed check whose sample is code 0 only
+        assert_eq!(activity::trust::forget_target(&force), Some(id));
+        assert_eq!(activity::trust::forget_target(&TrustCheck { worst: at(Some((2, 8)), false), ..force.clone() }), None, "held out: Forget would refuse it");
+        assert_eq!(activity::trust::forget_target(&TrustCheck { met: true, ..force.clone() }), None, "a met check blocks nothing");
+        assert_eq!(activity::trust::forget_target(&old_f), None);
+        // the checklist and the Model tab's refusal line
+        let checks = |f: TrustCheck| {
+            let mut v = checks_failing(K::ForceResidual);
+            let k = v.iter().position(|c| c.key == K::ForceResidual).unwrap();
+            v[k] = f;
+            v
+        };
+        let m = ModelStatus { trusted: false, untrusted_reason: Some("max training force residual 3.4e-3 > 2.0e-3 Ha/Bohr".into()), quarantined: 0, box_affected: 0, readiness: None, trust_checks: checks(force.clone()), ..model() };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        let l = lines.iter().find(|l| l.why).expect("this is why");
+        assert_eq!(l.text, trust_line(&force, AuditSeen::Never, 20));
+        assert!(l.hover.ends_with("; worst in #1234 · H3O · fallback"), "{}", l.hover);
+        assert_eq!(l.forget, Some(id));
+        let t = trust(Some(&m), &scene, &st);
+        assert_eq!(t.text, format!("no — {}", l.text));
+        assert_eq!(t.forget, Some(id));
+        // without a location: today's line, no link
+        let m = ModelStatus { trust_checks: checks(old_f.clone()), ..m };
+        let t = trust(Some(&m), &scene, &st);
+        assert_eq!(t.text, "no — Reproduces its own training forces — worst 3.4, allowed 2 mHa/Bohr for that atom");
+        assert_eq!(t.forget, None);
+        assert!(activity::trust::lines(&m, &scene, &st).iter().all(|l| l.forget.is_none()));
     }
 
     /// Plan review M3: the class line words the class's own verdict, so an energy-only failure
@@ -4737,7 +5024,7 @@ mod activity_trust {
         let scene = Scene::preset("h2").unwrap();
         let st = UiState::new("h2", &scene);
         let mut m = model();
-        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 }];
+        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3, worst: None }];
         let plain = lines(&m, &scene, &st);
         assert!(!plain.iter().any(|l| l.text.contains("near the cell faces")), "{plain:?}");
         m.audits_box_unjudged = 3;
@@ -4763,13 +5050,13 @@ mod activity_trust {
             box_excluded: 0,
             trust_floor: Some(59),
             trust_checks: vec![
-                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0 },
-                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0 },
-                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0 },
-                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3 },
-                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3 },
-                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3 },
-                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 },
+                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0, worst: None },
+                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0, worst: None },
+                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0, worst: None },
+                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3, worst: None },
+                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3, worst: None },
+                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3, worst: None },
+                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3, worst: None },
             ],
             ..model()
         };
@@ -4809,7 +5096,7 @@ mod activity_trust {
         let m = ModelStatus {
             trusted: false,
             untrusted_reason: Some("n_samples 12 < q_prime 16".into()),
-            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0 }],
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0, worst: None }],
             ..model()
         };
         let scene = Scene::preset("h2").unwrap();
@@ -4818,7 +5105,7 @@ mod activity_trust {
         assert!(lines[0].why && lines[0].text == "Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
         assert_eq!(trust(Some(&m), &scene, &st).text, "no — Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
         // met: every line ✓, none "this is why", the box line ✓, the class lines after
-        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }], ..model() };
+        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0, worst: None }], ..model() };
         let lines = activity::trust::lines(&ok, &scene, &st);
         assert!(lines.iter().all(|l| l.met && !l.why), "{lines:?}");
         assert!(lines.last().unwrap().text.starts_with("Two-atom arrangements"));
@@ -5086,7 +5373,7 @@ mod activity_final {
             untrusted_reason: None,
             box_affected,
             box_excluded: 0,
-            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }],
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0, worst: None }],
             ..model()
         };
         let text = |m: &ModelStatus| activity::trust::lines(m, &scene, &st).into_iter().map(|l| l.text).find(|t| t.to_lowercase().contains("box walls")).unwrap();

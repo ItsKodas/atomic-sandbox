@@ -43,6 +43,18 @@
 //! the live provider's appended events: `a_background_refit_installs_the_synchronous_state` and
 //! `appends_during_a_background_refit_survive_the_install` compare them line by line.
 //!
+//! # The user's codes
+//!
+//! A **Forget** or **Restore** of a stored sample (spec R2, `SurrogateKs::forget_sample`) while the
+//! copy runs is the one quarantine change of a sample < P that does not discard it: the live
+//! provider writes the status at once (the collection's record) and records the code on the
+//! running refit (`note_user_code`); the conflict test skips those samples, and the install
+//! **re-applies** the user's codes over the copy's — so the refit that lands never brings a
+//! forgotten sample back (nor re-forgets a restored one), the status record it then syncs is the
+//! user's, and a rebuild is due (`pending_refit`): the installed fit still holds what it was
+//! started with, as a fit does between a forget and the next refit. Pinned by
+//! `a_forget_during_a_background_refit_survives_its_install`.
+//!
 //! What a background refit changes is *when* the new model stands (a refit's wall later, as the
 //! refit throttle already delays it by up to `REFIT_INTERVAL`), never what any verdict is: the
 //! model that answers meanwhile is judged by its own verdicts, exactly as between two refits.
@@ -71,6 +83,9 @@ pub(super) struct BackgroundRefit {
     snap: Snapshot,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     probe: Option<Arc<sim::ActivityProbe>>,
+    /// The user's Forget / Restore codes set while it runs (module doc, "The user's codes"): the
+    /// last one per sample, re-applied at the install.
+    user_codes: BTreeMap<usize, u8>,
 }
 
 impl BackgroundRefit {
@@ -148,6 +163,7 @@ impl SurrogateKs {
         f.class_memory = self.class_memory.clone();
         f.class_judge = self.class_judge.clone();
         f.deferred_trust = self.deferred_trust;
+        f.loo_ratios = self.loo_ratios.clone();
         f.audit_failed = self.audit_failed;
         f.audit_force = self.audit_force;
         f.failed_audits = self.failed_audits.clone();
@@ -223,13 +239,21 @@ impl SurrogateKs {
         if let Some(p) = &probe {
             p.begin_refit(self.samples());
         }
-        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe });
+        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new() });
         true
     }
 
     /// Whether a background refit is running.
     pub fn background_refit_running(&self) -> bool {
         self.background.is_some()
+    }
+
+    /// The user's code `code` of sample `i` (Forget, Restore), for a running background refit's
+    /// install (module doc, "The user's codes"); a no-op without one.
+    pub(super) fn note_user_code(&mut self, i: usize, code: u8) {
+        if let Some(b) = self.background.as_mut() {
+            b.user_codes.insert(i, code);
+        }
     }
 
     /// Installs a finished background refit, or discards it on a conflict (module doc); `Running`
@@ -243,6 +267,7 @@ impl SurrogateKs {
         let mut done = self.background.take().expect("checked");
         let handle = done.handle.take().expect("a running refit has its thread");
         let snap = std::mem::replace(&mut done.snap, Snapshot::empty());
+        let user = std::mem::take(&mut done.user_codes);
         // `done` drops at the end: the probe's refit phase ends whatever the outcome
         let (fork, result) = match handle.join() {
             Ok(x) => x,
@@ -251,11 +276,11 @@ impl SurrogateKs {
                 return BackgroundPoll::Discarded("the background refit panicked; it is due again".into());
             }
         };
-        if let Some(why) = self.background_conflict(&snap) {
+        if let Some(why) = self.background_conflict(&snap, &user) {
             self.pending_refit = true;
             return BackgroundPoll::Discarded(why);
         }
-        self.install_fork(*fork, &snap, result.is_ok());
+        self.install_fork(*fork, &snap, result.is_ok(), &user);
         BackgroundPoll::Installed(result)
     }
 
@@ -271,8 +296,9 @@ impl SurrogateKs {
     }
 
     /// Why the live provider's changes since `snap` are not appends (module doc), `None` when they
-    /// are.
-    fn background_conflict(&self, snap: &Snapshot) -> Option<String> {
+    /// are. The samples whose code the user set while it ran (`user`) are not a conflict (module
+    /// doc, "The user's codes").
+    fn background_conflict(&self, snap: &Snapshot, user: &BTreeMap<usize, u8>) -> Option<String> {
         let why = |s: &str| Some(format!("background refit discarded: {s} changed while it ran — it is due again"));
         if self.model_gen != snap.model_gen {
             return why("the model, its samples or the policy");
@@ -287,7 +313,7 @@ impl SurrogateKs {
             return why("the degree cap");
         }
         let code = |q: &[u8], i: usize| q.get(i).copied().unwrap_or(Q_NONE);
-        if (0..snap.p).any(|i| code(&self.quarantine, i) != code(&snap.quarantine, i)) {
+        if (0..snap.p).any(|i| !user.contains_key(&i) && code(&self.quarantine, i) != code(&snap.quarantine, i)) {
             return why("a stored sample's quarantine code");
         }
         if !self.failed_audits.starts_with(&snap.failed_audits) || !self.audit_fences.starts_with(&snap.audit_fences) {
@@ -306,7 +332,7 @@ impl SurrogateKs {
     /// provider's appends after them; then what a synchronous refit does at its end — the jump
     /// booked at the current geometry, the collection's status records and history — and the class
     /// verdicts re-judged against the whole history.
-    fn install_fork(&mut self, mut f: SurrogateKs, snap: &Snapshot, ok: bool) {
+    fn install_fork(&mut self, mut f: SurrogateKs, snap: &Snapshot, ok: bool, user: &BTreeMap<usize, u8>) {
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         let p = snap.p;
@@ -324,11 +350,18 @@ impl SurrogateKs {
             q.extend(self.quarantine.iter().skip(p).copied());
         }
         self.quarantine = q;
+        // the user's Forget / Restore while it ran, over the copy's codes (module doc, "The user's
+        // codes"): the copy fitted with what it started from; the next refit takes the user's
+        let user_moved = user.iter().any(|(&i, &c)| i < p && self.quarantine.get(i).copied().unwrap_or(Q_NONE) != c);
+        for (&i, &c) in user.iter().filter(|(&i, _)| i < p) {
+            self.quarantine.resize(self.quarantine.len().max(i + 1), Q_NONE);
+            self.quarantine[i] = c;
+        }
         // the fit and its trust state
         self.accumulator = f.accumulator.take();
         self.accumulated = f.accumulated;
         self.refs_dirty = f.refs_dirty;
-        self.species_dirty = f.species_dirty || self.store.as_ref().is_some_and(|st| {
+        self.species_dirty = f.species_dirty || user_moved || self.store.as_ref().is_some_and(|st| {
             let basis = self.accumulator.as_ref().map(|a| &a.basis);
             st.samples[p.min(st.len())..].iter().any(|s| basis.is_none_or(|b| b.species_indices(&s.z).is_err()))
         });
@@ -353,6 +386,9 @@ impl SurrogateKs {
         self.class_worst = std::mem::take(&mut f.class_worst);
         self.class_blockers = std::mem::take(&mut f.class_blockers);
         self.deferred_trust = f.deferred_trust;
+        // the copy's leave-one-out ratios, keyed to its fit (`model_gen` below is the copy's: the
+        // conflict test saw no live change of it), re-checked against the members at every read
+        self.loo_ratios = f.loo_ratios.take();
         self.degree_cap = f.degree_cap;
         self.fit_members = std::mem::take(&mut f.fit_members);
         self.fits = f.fits;
@@ -391,7 +427,7 @@ impl SurrogateKs {
         // what `fit_store` and `refit` do once the fit stands
         self.consults = 0;
         self.last_variance = None;
-        self.pending_refit = self.samples() > p || f.pending_refit;
+        self.pending_refit = self.samples() > p || f.pending_refit || user_moved;
         // a refit that ended in an error re-judges nothing and moves no surface (`refit_inner`): the
         // failed audits stay as they stood
         if ok {

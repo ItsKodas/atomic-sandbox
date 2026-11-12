@@ -19,7 +19,9 @@
 //! | `Audit` | an audit failed since the refit, on the energy (\|gap\|/N > the tier) | \|gap\|/N / the tier (Ha/atom) |
 //! | `AuditForces` | an audit failed since the refit, on the forces (`audit_force` set) | the worst atom's residual / its bound (Ha/Bohr) |
 //!
-//! The two residual rows exist only when training residuals were computed. The audit row is met
+//! The two residual rows exist only when training residuals were computed; in `trust_checks` they
+//! also name where their value sits (`TrustCheck::worst`: the sample, and for the forces the atom,
+//! recorded by the residual pass; display only, no condition reads it). The audit row is met
 //! at value 0 when no audit failed since the refit, which says nothing about whether one ran
 //! (plan review M1). Every comparison is its predicate's own, so a NaN or a value at the limit
 //! lands on the same side for the checklist, the refusal and `trusted`. A value at its limit
@@ -130,6 +132,13 @@ pub struct TrainingResiduals {
     pub force: f64,
     /// … and the policy's force bound for that atom (its teacher force magnitude).
     pub force_bound: f64,
+    /// The sample that holds `energy_per_atom` (display only, 2026-11-13: the trust line names
+    /// it): its identity when the pass recorded it; `None` when every residual was 0 or no fitted
+    /// sample has an energy row.
+    pub energy_at: Option<sim::SampleId>,
+    /// The sample and the atom within it that hold `force` (display only); `None` when no
+    /// fitted atom was compared.
+    pub force_at: Option<(sim::SampleId, usize)>,
 }
 
 /// The environment classes of the class-wise trust rule (module doc, "Class-wise trust"), by
@@ -300,6 +309,10 @@ pub(super) struct FitState {
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
     pub(super) deferred_trust: Option<usize>,
+    /// The leave-one-out ratios' cache and the `model_gen` of the saved fit: a restore keeps them
+    /// only when they were that fit's (`restore_state`).
+    pub(super) loo_ratios: Option<LooRatios>,
+    pub(super) model_gen: u64,
 }
 
 impl SurrogateKs {
@@ -337,8 +350,42 @@ impl SurrogateKs {
     /// ran, so the UI words that line from `last_audit` and `last_audit_this_fit` (none yet /
     /// none since the refit / passed / box-affected), never as "passed" (plan review M1, Task 3
     /// review I1).
+    /// The two training-residual entries carry where their worst value sits
+    /// ([`TrustCheck::worst`], display only: the sample, and for the forces the atom), when the
+    /// residual pass recorded it and that store index still holds the same sample.
     pub fn trust_checks(&self) -> Vec<TrustCheck> {
-        self.checks().collect()
+        let t = self.training_residuals.as_ref();
+        self.checks()
+            .map(|mut c| {
+                c.worst = match c.key {
+                    TrustKey::EnergyResidual => t.and_then(|t| t.energy_at).and_then(|id| self.trust_worst(id, None)),
+                    TrustKey::ForceResidual => t.and_then(|t| t.force_at).and_then(|(id, j)| self.trust_worst(id, Some(j))),
+                    _ => None,
+                };
+                c
+            })
+            .collect()
+    }
+
+    /// Stored sample `id` as a residual check's location ([`TrustCheck::worst`]); `None` when the
+    /// index now holds another sample (the same check value Forget refuses on) or the atom is not
+    /// in it.
+    fn trust_worst(&self, id: sim::SampleId, atom: Option<usize>) -> Option<sim::activity::TrustWorst> {
+        if self.sample_id(id.index) != Some(id) {
+            return None;
+        }
+        let s = self.store.as_ref()?.samples.get(id.index)?;
+        let atom = match atom {
+            Some(j) => Some((j, *s.z.get(j)?)),
+            None => None,
+        };
+        Some(sim::activity::TrustWorst {
+            id,
+            formula: shared::formula(&s.z),
+            origin: super::quarantine::origin_word(s.tag).to_string(),
+            atom,
+            forgettable: self.quarantine.get(id.index).is_none_or(|&q| q == Q_NONE),
+        })
     }
 
     /// The whole-model sample floor (`TrustKey::Samples`; M8a user-fix 3 review, ruling 2): the
@@ -365,9 +412,10 @@ impl SurrogateKs {
 
     /// [`trust_checks`](Self::trust_checks) without the allocation: the one sequence that
     /// `trusted`, `untrusted_check` and the checklist read.
-    fn checks(&self) -> impl Iterator<Item = TrustCheck> + use<> {
+    pub(super) fn checks(&self) -> impl Iterator<Item = TrustCheck> + use<> {
         let p = &self.policy;
-        let check = |key, fails: bool, value: f64, limit: f64| TrustCheck { key, met: !fails, value, limit };
+        // no location here: `trust_checks` adds it (the rule's hot path builds no strings)
+        let check = |key, fails: bool, value: f64, limit: f64| TrustCheck { key, met: !fails, value, limit, worst: None };
         let r = self.report.as_ref();
         let t = r.and(self.training_residuals.as_ref());
         let fails = audit_fails(self.audit_failed);
@@ -441,8 +489,10 @@ impl SurrogateKs {
     /// "Trust rule").
     pub(super) fn compute_training_residuals(&self) -> Option<TrainingResiduals> {
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
-        let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
+        let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY, energy_at: None, force_at: None };
         let mut worst_ratio = 0.0f64;
+        // the argmaxes (display only): store indices, turned into checked identities at the end
+        let (mut energy_at, mut force_at) = (None, None);
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
@@ -451,9 +501,14 @@ impl SurrogateKs {
             let n = s.pos.len().max(1) as f64;
             // the fitted rows only (a masked sample: no energy, the interior atoms' forces)
             if s.use_energy {
-                worst.energy_per_atom = max_nan(worst.energy_per_atom, (p.energy - s.energy).abs() / n);
+                let before = worst.energy_per_atom;
+                worst.energy_per_atom = max_nan(before, (p.energy - s.energy).abs() / n);
+                // the sample that moved the max holds it (a NaN sticks with its first sample)
+                if worst.energy_per_atom.to_bits() != before.to_bits() {
+                    energy_at = Some(i);
+                }
             }
-            for (_, (fm, fs)) in p.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
+            for (j, (fm, fs)) in p.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
                 let (d, bound) = self.policy.force_residual(fm, fs);
                 // a NaN ratio is the worst and stays so (activity Task 3b)
                 let ratio = d / bound;
@@ -461,16 +516,26 @@ impl SurrogateKs {
                     worst_ratio = ratio;
                     worst.force = d;
                     worst.force_bound = bound;
+                    force_at = Some((i, j));
                 }
             }
         }
+        worst.energy_at = energy_at.and_then(|i| self.sample_id(i));
+        worst.force_at = force_at.and_then(|(i, j)| self.sample_id(i).map(|id| (id, j)));
         Some(worst)
     }
 
     /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
-        let (loo, worst, blockers) = self.compute_class_loo_full();
+        let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
+        // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
+        self.loo_ratios = loo.is_some().then(|| LooRatios {
+            gen: self.model_gen,
+            rows: ratios.iter().map(|&(i, own, _, _)| (i, own)).collect(),
+            tier: ratios.iter().map(|&(_, _, t, _)| t).collect(),
+            tier_channel: ratios.iter().map(|&(_, _, _, c)| c).collect(),
+        });
         self.class_judge = loo.as_ref().map(|l| l.1.clone());
         self.class_loo = loo.map(|l| l.0).unwrap_or_default();
         // the class verdicts carry rule 6/7's variance inflation (M8a Task 2 fix round 3): a cached
@@ -632,10 +697,14 @@ impl SurrogateKs {
     /// or energy) — the readiness readout's worst sample, deciding nothing. Held-out draft guesses
     /// (`Q_DRAFT`) are excluded like every other excluded sample (`surrogate` module doc, "Draft
     /// mode"). Empty without a model.
+    ///
+    /// The fourth part is every member's leave-one-out ratios in store order (store index, ρ, ρ_σ;
+    /// `quarantine::loo_ratio`, spec R1/R1b): what the recovery ranks by and the Model tab lists,
+    /// from the same leave-one-out.
     #[allow(clippy::type_complexity)]
-    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
+    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<(usize, f64, f64, Channel)>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return (None, Vec::new(), Vec::new());
+            return (None, Vec::new(), Vec::new(), Vec::new());
         };
         // the environment keys of the fitted atoms (`calibrate`, "Per environment species") and
         // their leave-one-out sums (as `acc`, per key)
@@ -656,7 +725,10 @@ impl SurrogateKs {
         // the same numbers as one at a time), then the sums below in sample order, as before
         let members: Vec<(usize, &Sample)> = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).collect();
         let loos = surrogate::loo::leave_one_out_many(model, &members.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+        let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(members.len());
         for ((i, s), l) in members.into_iter().zip(loos) {
+            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+            sample_ratios.push((i, own, tier, channel));
             // only the fitted (interior) atoms of a masked sample describe a class or a key
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().map(|(j, c)| atom_class(c).filter(|_| s.trains_atom(j))).collect();
             let atom_keys = if s.z.len() == s.pos.len() { trained_keys(s, env_keys(&s.pos, &s.z, rc2)) } else { Vec::new() };
@@ -787,7 +859,7 @@ impl SurrogateKs {
         for b in &mut blockers {
             b.sort_by(|x, y| y.1.total_cmp(&x.1));
         }
-        (Some((loo, judge)), worst, blockers)
+        (Some((loo, judge)), worst, blockers, sample_ratios)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
@@ -985,6 +1057,9 @@ impl SurrogateKs {
         // the standing fit's trust passes, whatever the outcome (an error leaves the last fit
         // that succeeded in place, with its own verdicts — as before)
         self.ensure_trust_passes();
+        // and its per-sample leave-one-out ratios (the Model tab reads them between refits): the
+        // class pass's just now, unless the standing fit's passes were not re-run (a restored fit)
+        self.ensure_loo_ratios();
         let report = fitted?;
         self.rejudge_failed_audits(true);
         // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
@@ -1005,7 +1080,7 @@ impl SurrogateKs {
             self.species_dirty = true;
             report = self.fit_store_deferred()?;
             self.recovery = Some(format!(
-                "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined geometry — that region stays fenced"
+                "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined or forgotten geometry — that region stays fenced"
             ));
         }
         // release what the new model reproduces (`surrogate` module doc, "Release")
@@ -1109,6 +1184,9 @@ impl SurrogateKs {
             self.audit_failed = None;
             self.audit_force = None;
         }
+        // a refit's quarantine only — never the user's Forget (`Q_FORGOTTEN`): a failed audit whose
+        // sample was forgotten is re-judged as before and fences only after the usual limit, so
+        // forgetting never lifts rule 8's global untrust (Task 2 fix round 1, I1)
         let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
         let cases = std::mem::take(&mut self.failed_audits);
         for mut case in cases {
@@ -1395,6 +1473,8 @@ impl SurrogateKs {
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
             deferred_trust: self.deferred_trust,
+            loo_ratios: self.loo_ratios.clone(),
+            model_gen: self.model_gen,
         }
     }
 
@@ -1416,6 +1496,10 @@ impl SurrogateKs {
         self.fit_members = s.fit_members;
         self.deferred_trust = s.deferred_trust;
         self.model_gen += 1; // a view cache key: the model moved back
+        // the restored model is the saved one: its leave-one-out ratios, when the cache held that
+        // fit's, are this generation's (`fit_members` is restored with it; re-checked at every read)
+        let gen = self.model_gen;
+        self.loo_ratios = s.loo_ratios.filter(|c| c.gen == s.model_gen).map(|c| LooRatios { gen, ..c });
     }
 
     /// The fit itself (`surrogate` module doc): incremental, or a rebuild from the store skipping the

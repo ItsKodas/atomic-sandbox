@@ -136,6 +136,7 @@ impl SurrogateKs {
         self.class_worst = Vec::new();
         self.class_blockers = Vec::new();
         self.deferred_trust = None;
+        self.loo_ratios = None;
         self.teach_rounds.clear();
         self.teach_classes.clear();
         self.teach_start = None;

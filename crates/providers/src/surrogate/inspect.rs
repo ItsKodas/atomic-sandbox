@@ -67,6 +67,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
     match code {
         Some(Q_HELD) => "quarantined",
         Some(Q_SUPERSEDED) => "superseded",
+        Some(Q_FORGOTTEN) => "forgotten (by the user)",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
@@ -151,7 +152,7 @@ impl SurrogateKs {
         }
         if !self.near_quarantined_cached(pos, z).is_empty() {
             return Some(Refusal::new(
-                format!("surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent", QUARANTINE_FRACTION * self.policy.max_descriptor_distance),
+                format!("surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)", QUARANTINE_FRACTION * self.policy.max_descriptor_distance),
                 TeachRule::NearQuarantine,
                 None,
             ));
@@ -537,7 +538,7 @@ impl SurrogateKs {
                 c.f_ratio
             );
         }
-        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.lone_held_out(), self.unfitted());
+        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, forgotten {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.forgotten(), self.lone_held_out(), self.unfitted());
         // references and atomisation energies (an outlier flags a reference mix-up)
         let _ = writeln!(
             o,
