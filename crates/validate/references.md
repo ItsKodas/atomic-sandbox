@@ -4231,3 +4231,34 @@ longer) is the follow-up. The user entry points (the Selection and Model tabs' b
 entry) are hidden behind `app::segment::SEGMENT_TRAINING = false`; `Action::TrainSegment`, the masked
 samples (`surrogate::fit` "Masked samples", `sim::Scene::train_mask`) and their tests stay compiled and
 tested.
+
+## Refit cost at scale (2026-11-12; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, the user's app open in another worktree)
+
+The user's question: "at 50 000 samples, are we going to be waiting hours?". The test times each phase of one refit-plus-trust cycle (each phase is the provider's own function, called again on its own; nothing is changed) on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, body-4, Q′ 1 032, 2.67 atoms per sample), on species subsets (Q′), and on the collection with jittered replicas (δ ≤ 1e-4 Bohr, relabelled to first order: P × 2/4/8). Reported, never asserted. Command: `COLLECTION_DIR=<copy> REFIT_COST=full,sub,species,rep2,rep4,rep8 [REFIT_WHOLE=0] cargo test -p providers --release --lib refit_cost -- --ignored --nocapture --test-threads 1`.
+
+| phase (Q′ 1 032) | P 1 639 fitted | 3 268 | 6 534 | 13 068 | scaling |
+|---|---|---|---|---|---|
+| accumulate (a rebuild only; the incremental +25 is 0.025 s) | 1.34 s | 2.75 | 5.45 | 10.1 | 0.8 ms/sample |
+| spectral search (5–9 rounds) | 1.5–1.7 s | 1.5 | 1.9 | 2.1 | flat in P |
+| null space (Householder–QL at Q′) | 0.35 s | 0.35 | 0.38 | 0.33 | flat in P, Q′³ |
+| training residuals | 0.03 s | 0.05 | 0.12 | 0.19 | 13 µs/sample |
+| **class leave-one-out (rule 4b)** | **8.7 s** | **15.0** | **32.7** | **60.6** | **4.6 ms/sample** (2 / 3 / 4 atoms: 3.6–4.4 / 5.2–5.8 / 6.7–7.8 ms) |
+| of which calibration (385 history points), key columns, model forces | < 0.05 s | 0.1 | 0.3 | 0.5 | |
+| descriptor cache (cold; a refit adds only the new samples) | 0.02 s | 0.05 | 0.11 | 0.20 | |
+| active set (rule 5e: Gram, eigen, MaxVol per species) | 1.44 s | 2.0 | 3.9 | 5.9 | ≈ 0.8 s + 0.4 ms/sample |
+| collection writes (history, README, status records) | < 0.01 s | | | | flat |
+| **one `fit_store`, nothing new** | **9.3 s** | **17.5** | **34.8** | **65.6** | ≈ 2 s + 5.0 ms/sample |
+
+Leave-one-out per sample against Q′ (2-atom samples): Q′ 38 0.02 ms, 284 0.27 ms, 452 0.68 ms, 1 032 4.4 ms, i.e. ∝ Q′² (the module doc's O(m Q′²)); the body-4 note above measured 122 ms for a 6-atom sample at Q′ 2 688.
+
+**A whole `refit()` is several `fit_store`s.** On the user's collection the training residuals fail at every refit, so `recover_trust` runs its quarantine rounds. Each round is a rebuild (accumulate, search, then every trust pass again). The attach's refit took 8 `fit_store` calls in 123–132 s, and the next `refit()` took 7 calls in 100–102 s; it quarantined 21 more samples, 180 held in all. That is the user's "Refitting · 1 799 samples · 1:34". Without recovery a refit is 2–3 calls (release and held-out re-fits): H + O subset 9.7 s, first half 5.7 s.
+
+**Extrapolated, at Q′ 1 032 and ≈ 2.7 atoms per sample:**
+
+| P | one `fit_store` (warm) | one recovery round (rebuild) | refit with 7 recovery fits (today's collection) |
+|---|---|---|---|
+| 1 800 (measured) | 9–11 s | 13–15 s | 100 s |
+| 10 000 | ≈ 52 s | ≈ 61 s | ≈ 7 min |
+| 50 000 | ≈ 4.2 min | ≈ 5 min | ≈ 35 min |
+
+The worker refits between ticks, every 25 new samples or 500 ms while playing (`app::worker` "Refits"), so the simulation stops for the whole refit. At Q′ 2 688 (a fourth species) leave-one-out alone becomes ≈ 6.8× dearer, ≈ 26 min per pass at 50 000. The cost is the per-refit O(P · m · Q′²) leave-one-out pass, multiplied by the number of `fit_store` calls in one refit. The solve, the search, the null space, the calibration and the collection's own writes do not grow with P.
