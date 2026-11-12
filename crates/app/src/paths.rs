@@ -445,9 +445,15 @@ pub fn seed_installed() {
 /// [`seed_installed`]'s work with the paths passed in: `None` when the root's marker says it
 /// already ran, else what was copied. A missing bundled folder is skipped; the root is created
 /// for the marker.
+///
+/// A root with neither `models\` nor `scenes\` is seeded again whatever the marker says (installer
+/// Task 5 fix round 1, I2): the uninstaller's "Also remove my models, profiles, scenes and
+/// captures" takes those folders but leaves the marker, and a reinstall must not open with no
+/// bundled models or library scenes. It still never overwrites ([`copy_tree_new`]).
 fn seed_from(models: Option<&Path>, scenes: Option<&Path>, root: &Path) -> Option<CopyReport> {
     let marker = root.join(SEEDED_MARKER);
-    if marker.exists() {
+    let emptied = !root.join("models").exists() && !root.join("scenes").exists();
+    if marker.exists() && !emptied {
         return None;
     }
     let mut report = CopyReport::default();
@@ -1095,9 +1101,36 @@ mod tests {
         let root3 = t.0.join("not yet").join("root3");
         assert_eq!(seed_from(None, Some(&t.0.join("nowhere")), &root3), Some(CopyReport::default()));
         assert!(root3.join(SEEDED_MARKER).is_file());
-        assert_eq!(seed_from(None, None, &root3), None);
+        // (it has neither models\ nor scenes\, so a later launch looks again — and, with nothing
+        // bundled, still copies nothing and says nothing)
+        assert_eq!(seed_from(None, None, &root3), Some(CopyReport::default()));
         // and outside Installed mode there is nothing bundled to seed from
         assert_eq!(ctx(DataMode::Dev, &exe, &exe, Some(&root)).bundled(DataDir::Models), None);
+    }
+
+    /// Installer Task 5 fix round 1, I2: the uninstaller's "Also remove my data" takes models\ and
+    /// scenes\ (and profiles\, captures\) but leaves the marker; a reinstall seeds them again. One
+    /// of the two still there means the user's own: no re-seed.
+    #[test]
+    fn seed_runs_again_when_models_and_scenes_are_both_gone() {
+        let t = Tmp::new("reseed");
+        t.file("exe/bundled/models/hydrogen.model", "h");
+        t.file("exe/bundled/scenes/h2o.scene", "w");
+        let (m, s, root) = (t.0.join("exe/bundled/models"), t.0.join("exe/bundled/scenes"), t.0.join("root"));
+        let r = seed_from(Some(&m), Some(&s), &root).expect("the first launch seeds");
+        assert_eq!(r.copied, 2);
+        // only scenes\ removed: models\ is there, the marker holds
+        std::fs::remove_dir_all(root.join("scenes")).unwrap();
+        assert_eq!(seed_from(Some(&m), Some(&s), &root), None);
+        assert!(!root.join("scenes").exists());
+        // both removed (the uninstaller's box): seeded again, the marker left as it was
+        std::fs::remove_dir_all(root.join("models")).unwrap();
+        assert!(root.join(SEEDED_MARKER).is_file(), "the uninstaller leaves the marker");
+        let r = seed_from(Some(&m), Some(&s), &root).expect("re-seeded");
+        assert_eq!(r, CopyReport { copied: 2, ..Default::default() });
+        assert_eq!((t.read("root/models/hydrogen.model").as_str(), t.read("root/scenes/h2o.scene").as_str()), ("h", "w"));
+        // and the next launch is quiet again
+        assert_eq!(seed_from(Some(&m), Some(&s), &root), None);
     }
 
     #[test]

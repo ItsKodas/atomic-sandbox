@@ -108,10 +108,26 @@ pub use imp::Held;
 
 static OWN: std::sync::Mutex<Option<Held>> = std::sync::Mutex::new(None);
 
-/// Takes this window's handle (`main`, the window only), for the process's lifetime.
+/// The fixed name an installed build's window also holds (installer Task 5 fix round 1, M7): the
+/// uninstaller and an interactive setup (`installer/AtomicSandbox.iss`) check it with Inno's
+/// `CheckForMutexes` and ask the user to close the app first. No `Local\` prefix: a name without
+/// one is the session's own (the same namespace as `Local\`), and the script names it the same
+/// way. Not Inno's `AppMutex`, which would also stop the silent update while the app is still
+/// closing (its own `/WAITPID` path).
+pub const INSTALLED_RUNNING: &str = "AtomicSandboxInstalledRunning";
+
+static INSTALLED: std::sync::Mutex<Option<Held>> = std::sync::Mutex::new(None);
+
+/// Takes this window's handle (`main`, the window only), for the process's lifetime; an installed
+/// build also takes [`INSTALLED_RUNNING`].
 pub fn claim() {
     if let Some(h) = own_name().and_then(|n| Held::create(&n)) {
         *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+    if crate::paths::mode() == crate::paths::DataMode::Installed {
+        if let Some(h) = Held::create(INSTALLED_RUNNING) {
+            *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+        }
     }
 }
 

@@ -1,5 +1,9 @@
 ; Atomic Sandbox - the per-user Windows installer (Inno Setup 6; installer spec 2026-11-12, plan Task 5).
 ;
+; TARGET: Inno Setup 6.6.x, the newest 6.6 release (the release workflow, plan Task 6, pins that
+; exact version on the runner, so builds are reproducible). Older 6.x still compile through the
+; #if Ver branches (x64compatible from 6.3.0, CreateCustomForm's new signature from 6.6.0).
+;
 ; Built by scripts\package.ps1 (build.bat locally, the release workflow on CI) from a staging folder
 ; of committed files only:
 ;
@@ -22,7 +26,12 @@
 ;   hand-off itself while another copy of this install runs).
 ; - /RELAUNCH: Inno's parameter reader drops the quotes, so {param:RELAUNCH} is
 ;   "<exe> --resume-session <session>" with no inner quotes. After a silent install it is split at
-;   the first " --resume-session " and run as "<exe>" --resume-session "<session>" (RunRelaunch).
+;   the first " --resume-session " and run as "<exe>" --resume-session "<session>" (RunRelaunch),
+;   only when <exe> is this install's own {app}\AtomicSandbox.exe. A silent install that got past
+;   the wait but failed relaunches with --update-failed added, and the app says so.
+; - An installed window holds the mutex AtomicSandboxInstalledRunning (crates/app/src/instance.rs).
+;   The uninstaller and an interactive setup check it (CheckForMutexes) and ask the user to close
+;   the app. Not AppMutex: that would also hold up the silent update while the app is closing.
 ;
 ; Every Setup and Uninstall run writes a log (SetupLogging, UninstallLogging) in %TEMP%: a silent
 ; update has no window, so the log is where a failure is told.
@@ -120,9 +129,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [InstallDelete]
 ; the shipped, read-only content is replaced whole on every install, so a model, scene or picture
 ; a newer version dropped doesn't linger (install folder only; the user's copies in
-; %LOCALAPPDATA%\atomic-sandbox are theirs)
-Type: filesandordirs; Name: "{app}\bundled"
-Type: filesandordirs; Name: "{app}\docs\images"
+; %LOCALAPPDATA%\atomic-sandbox are theirs). Only in a folder that is this app's install, or new
+; or empty (IsOurInstallDir): never in one with portable.txt or a Cargo.toml, whatever /DIR= says.
+Type: filesandordirs; Name: "{app}\bundled"; Check: IsOurInstallDir
+Type: filesandordirs; Name: "{app}\docs\images"; Check: IsOurInstallDir
 
 [Files]
 Source: "{#StageDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -159,6 +169,10 @@ const
   DataRootName = 'atomic-sandbox';
   AttrDirectory = $10;
   AttrReparsePoint = $400;
+  { OpenProcess's error for a PID that names no process (ERROR_INVALID_PARAMETER) }
+  ErrorInvalidParameter = 87;
+  { crates/app/src/instance.rs INSTALLED_RUNNING: held by every installed window }
+  InstalledRunningMutex = 'AtomicSandboxInstalledRunning';
 
 var
   { the setup got past the /WAITPID wait: a failed silent install may reopen what is installed }
@@ -177,14 +191,37 @@ function CloseHandle(hObject: THandle): BOOL;
 
 { ---- install ---- }
 
+{ True when an installed Atomic Sandbox window is running (its fixed-name mutex is held). }
+function InstalledAppRunning(): Boolean;
+begin
+  Result := CheckForMutexes(InstalledRunningMutex);
+end;
+
+{ Asks the user to close every installed Atomic Sandbox window first (Retry), or to stop (Cancel,
+  False). Silent with /SUPPRESSMSGBOXES: Cancel. Setup never closes the app itself. }
+function AskToCloseApp(const Doing: String): Boolean;
+begin
+  Result := True;
+  while InstalledAppRunning() do begin
+    Log('Atomic Sandbox is running: asking the user to close it before ' + Doing);
+    if SuppressibleMsgBox('Atomic Sandbox is running. Close every Atomic Sandbox window, then click Retry to go on with ' + Doing + '.',
+         mbError, MB_RETRYCANCEL, IDCANCEL) <> IDRETRY then begin
+      Log('the app was left running: ' + Doing + ' called off');
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
 { /WAITPID=<pid>: wait (up to WaitPidTimeoutMs) for that process to exit before anything is
-  replaced. No /WAITPID: go on. A PID that can't be opened has already exited: go on. Still running
-  at the cap, or a value that isn't a PID: the install is called off (False), nothing replaced and
-  nothing closed. }
+  replaced. No /WAITPID: go on. A PID that names no process (OpenProcess fails with
+  ERROR_INVALID_PARAMETER) has already exited: go on. Any other failure to open it (access denied:
+  it is alive), still running at the cap, or a value that isn't a PID: the install is called off
+  (False), nothing replaced and nothing closed. }
 function WaitForPid(): Boolean;
 var
   Text: String;
-  Pid: Integer;
+  Pid, Err: Integer;
   ProcessHandle: THandle;
   Waited: DWORD;
 begin
@@ -201,7 +238,13 @@ begin
   { only the right to wait on it: Setup never asks for, or uses, the right to end a process }
   ProcessHandle := OpenProcess(ProcessSynchronize, False, Pid);
   if ProcessHandle = 0 then begin
-    Log(Format('/WAITPID=%d: that process has already exited; installing', [Pid]));
+    Err := DLLGetLastError();
+    if Err = ErrorInvalidParameter then
+      Log(Format('/WAITPID=%d: that process has already exited; installing', [Pid]))
+    else begin
+      Log(Format('/WAITPID=%d: could not open it to wait (error %d: %s), so it may still be running: install called off, nothing was replaced and nothing was closed', [Pid, Err, SysErrorMessage(Err)]));
+      Result := False;
+    end;
     Exit;
   end;
   try
@@ -218,18 +261,74 @@ begin
   end;
 end;
 
+{ An interactive setup first asks the user to close a running installed app (the silent update
+  waits for its own app through /WAITPID instead, and never asks). }
 function InitializeSetup(): Boolean;
 begin
+  MayRelaunch := False;
+  if not WizardSilent() then begin
+    Result := AskToCloseApp('the install');
+    if not Result then
+      Exit;
+  end;
   Result := WaitForPid();
   MayRelaunch := Result;
 end;
 
-{ /RELAUNCH="<exe> --resume-session <session>": split at the first " --resume-session " and run
-  "<exe>" --resume-session "<session>" (Exec quotes the file name itself). Without the separator the
-  whole value is the exe, run with no arguments. }
-procedure RunRelaunch(const Why: String);
+{ M1: the [InstallDelete] entries' check. True for this app's install folder (installed.txt in it),
+  a folder that doesn't exist yet, or an empty one; never for a folder holding portable.txt (a
+  portable copy) or Cargo.toml (a source checkout), whatever /DIR= pointed at. }
+function IsOurInstallDir(): Boolean;
 var
-  Value, Exe, Session, Params: String;
+  Dir: String;
+  Rec: TFindRec;
+  Empty: Boolean;
+begin
+  Dir := ExpandConstant('{app}');
+  if FileExists(Dir + '\portable.txt') or FileExists(Dir + '\Cargo.toml') then begin
+    Log('not clearing bundled\ or docs\images\ in ' + Dir + ': it holds portable.txt or Cargo.toml');
+    Result := False;
+    Exit;
+  end;
+  if FileExists(Dir + '\installed.txt') or (not DirExists(Dir)) then begin
+    Result := True;
+    Exit;
+  end;
+  Empty := True;
+  if FindFirst(Dir + '\*', Rec) then begin
+    try
+      repeat
+        if (Rec.Name <> '.') and (Rec.Name <> '..') then
+          Empty := False;
+      until (not Empty) or (not FindNext(Rec));
+    finally
+      FindClose(Rec);
+    end;
+  end;
+  Result := Empty;
+  if not Result then
+    Log('not clearing bundled\ or docs\images\ in ' + Dir + ': it is neither this app''s install folder nor empty');
+end;
+
+{ The installed exe, AtomicSandbox.exe in the app folder, expanded; empty while the app folder
+  isn't known yet. }
+function InstalledExe(): String;
+begin
+  try
+    Result := ExpandFileName(ExpandConstant('{app}\{#AppExe}'));
+  except
+    Result := '';
+  end;
+end;
+
+{ /RELAUNCH="<exe> --resume-session <session>": split at the first " --resume-session " and run
+  "<exe>" --resume-session "<session>" (Exec quotes the file name itself), plus Extra. Without the
+  separator the whole value is the exe, run with Extra only. Only ever this install's own exe
+  (M3: compared without case to the app folder's AtomicSandbox.exe): anything else is logged,
+  not run. }
+procedure RunRelaunch(const Why, Extra: String);
+var
+  Value, Exe, Session, Params, Expected: String;
   At, Code: Integer;
 begin
   Value := Trim(ExpandConstant('{param:RELAUNCH|}'));
@@ -247,6 +346,16 @@ begin
     Exe := Value;
     Params := '';
   end;
+  if Extra <> '' then begin
+    if Params <> '' then
+      Params := Params + ' ';
+    Params := Params + Extra;
+  end;
+  Expected := InstalledExe();
+  if (Expected = '') or (CompareText(ExpandFileName(Exe), Expected) <> 0) then begin
+    Log(Format('/RELAUNCH (%s): %s is not this install''s %s; nothing started', [Why, Exe, Expected]));
+    Exit;
+  end;
   if not FileExists(Exe) then begin
     Log(Format('/RELAUNCH (%s): %s is not there; nothing started', [Why, Exe]));
     Exit;
@@ -262,17 +371,20 @@ begin
   if CurStep = ssDone then begin
     InstallSucceeded := True;
     if WizardSilent() then
-      RunRelaunch('installed');
+      RunRelaunch('installed', '');
   end;
 end;
 
 { A silent update that got past the wait but didn't finish (a full disk, a locked file): the app
   has already closed itself, so reopen what is installed now, on the saved session, rather than
-  leave the user with nothing. Not after the wait was called off: the app is still running then. }
+  leave the user with nothing, with --update-failed so it says so (M4): Inno's rollback removes
+  the files it added but doesn't restore the ones it replaced or deleted, so the install may be
+  partly updated (old and new files mixed). Not after the wait was called off: the app is still
+  running then. }
 procedure DeinitializeSetup();
 begin
   if MayRelaunch and (not InstallSucceeded) and WizardSilent() then
-    RunRelaunch('the install did not finish; reopening what is installed');
+    RunRelaunch('the install did not finish; reopening what is installed, which may be partly updated', '--update-failed');
 end;
 
 { ---- uninstall ---- }
@@ -289,11 +401,19 @@ var
   Intro, Note: TNewStaticText;
   UninstallButton, CancelButton: TNewButton;
 begin
+#if Ver >= EncodeVer(6, 6, 0)
+  { 6.6.0 changed the signature: the client size is passed in unscaled (the function scales it);
+    KeepSize True, so WizardSizePercent doesn't stretch the layout below }
+  Form := CreateCustomForm(460, 180, True, True);
+#else
   Form := CreateCustomForm();
+#endif
   try
-    Form.Caption := 'Uninstall {#AppName}';
+#if Ver < EncodeVer(6, 6, 0)
     Form.ClientWidth := ScaleX(460);
-    Form.ClientHeight := ScaleY(160);
+    Form.ClientHeight := ScaleY(180);
+#endif
+    Form.Caption := 'Uninstall {#AppName}';
 
     Intro := TNewStaticText.Create(Form);
     Intro.Parent := Form;
@@ -322,8 +442,9 @@ begin
     Note.Left := ScaleX(16 + 18);
     Note.Top := ScaleY(74);
     Note.Width := Form.ClientWidth - ScaleX(32 + 18);
-    Note.Height := ScaleY(34);
-    Note.Caption := '(in %LOCALAPPDATA%\atomic-sandbox). Your pseudopotential cache and training checkpoints are kept.';
+    Note.Height := ScaleY(52);
+    { M6: models\ holds models\collections, the samples the app has learned from }
+    Note.Caption := '(in %LOCALAPPDATA%\atomic-sandbox; models includes models\collections, your learned collections). Your pseudopotential cache and training checkpoints are kept.';
     Note.OnClick := @RemoveDataNoteClick;
 
     CancelButton := TNewButton.Create(Form);
@@ -353,11 +474,15 @@ begin
   end;
 end;
 
-{ A silent uninstall keeps all data (the box is never ticked without a person to tick it). }
+{ A silent uninstall keeps all data (the box is never ticked without a person to tick it). A
+  running installed app is asked to be closed first (M7; silent with /SUPPRESSMSGBOXES: the
+  uninstall is called off rather than remove files the app holds). }
 function InitializeUninstall(): Boolean;
 begin
   RemoveData := False;
-  Result := True;
+  Result := AskToCloseApp('the uninstall');
+  if not Result then
+    Exit;
   if not UninstallSilent() then
     Result := AskUninstall();
   Log(Format('Also remove my models, profiles, scenes and captures: %d', [Ord(RemoveData)]));
@@ -422,6 +547,10 @@ var
   Root: String;
 begin
   if (CurUninstallStep = usPostUninstall) and RemoveData then begin
+    { M5, an assumption kept on purpose: the app finds its root from the LOCALAPPDATA environment
+      variable (paths::user_root); the localappdata constant is the shell's known folder. They are the same
+      folder unless the user has overridden the variable by hand; then this removes the four
+      folders under the known folder's atomic-sandbox, not the one the app uses. }
     Root := ExpandConstant('{localappdata}') + '\' + DataRootName;
     RemoveDataFolder(Root, 'models');
     RemoveDataFolder(Root, 'profiles');

@@ -263,9 +263,38 @@ impl StartFlags {
     }
 }
 
+/// The status line after `--update-failed`: the installer's relaunch after a silent update that
+/// got past its wait but did not finish (`installer/AtomicSandbox.iss`, `DeinitializeSetup`).
+/// Inno's rollback removes the files it added but doesn't restore the ones it replaced or
+/// deleted, so the install may be part old, part new; the user's data is untouched.
+const UPDATE_FAILED: &str =
+    "The update did not finish: the installed files may be mixed. Run the installer again from the Version panel, or download it from GitHub.";
+
+/// Says [`UPDATE_FAILED`] on the status line (and stderr) when the flag was given.
+fn note_update_failed(ui: &mut ui::UiState, update_failed: bool) {
+    if update_failed {
+        eprintln!("{UPDATE_FAILED}");
+        ui.set_status(UPDATE_FAILED);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--update-failed` (installer Task 5 fix round 1, M4) puts its line on the status, as a new
+    /// message; without the flag the status is left alone.
+    #[test]
+    fn the_update_failed_flag_sets_the_status() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.set_status("restored the session from before the update (paused)");
+        let seq = v.ui.status_seq;
+        note_update_failed(&mut v.ui, false);
+        assert_eq!((v.ui.status.as_str(), v.ui.status_seq), ("restored the session from before the update (paused)", seq));
+        note_update_failed(&mut v.ui, true);
+        assert_eq!((v.ui.status.as_str(), v.ui.status_seq), (UPDATE_FAILED, seq + 1));
+        assert!(UPDATE_FAILED.starts_with("The update did not finish: the installed files may be mixed."));
+    }
 
     /// `--scene` loads the file the way File ▸ Load does (final review app I1/I3): the chip
     /// names it, Save / Load point at it, its spacing is the quality, the walls follow its cell.
@@ -433,6 +462,9 @@ fn main() {
     // hidden, the installer's relaunch after an update (`update::apply`): the session saved
     // before it, reopened paused (the window only)
     let mut resume_session: Option<PathBuf> = None;
+    // hidden, the installer's relaunch after a silent update that did not finish (installer Task 5
+    // fix round 1, M4): said on the status line (`note_update_failed`)
+    let mut update_failed = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -487,6 +519,7 @@ fn main() {
             }
             "--scene" => flags.scene = Some(args.next().expect("--scene needs a file")),
             "--resume-session" => resume_session = Some(PathBuf::from(args.next().expect("--resume-session needs a session file"))),
+            "--update-failed" => update_failed = true,
             "--walls" => {
                 flags.walls = Some(
                     args.next()
@@ -612,6 +645,8 @@ fn main() {
         eprintln!("{e}");
         viewer.ui.set_status(e);
     }
+    // last, so it is the line the window opens on
+    note_update_failed(&mut viewer.ui, update_failed);
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
