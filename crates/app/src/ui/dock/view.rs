@@ -353,9 +353,12 @@ fn camera(ui: &mut Ui, st: &mut UiState) {
 /// The tooltip of View ▸ Bonds & labels ▸ refresh bonds after a drag (`ui::auto_bonds`).
 pub const AUTO_BONDS_TIP: &str = "estimated solver: the model has no electrons, so after you drag an atom (or move a selection with the handles) the bonds shown are left from the last DFT step — dashed and faded. With this on, a second after the last drag ends the bottom-right \"Solve Bonds\" runs by itself: one DFT solve at the new positions, then the bonds. A new drag restarts the wait; nothing runs while a solve for the bonds is already going, when the bonds are hidden or already fresh, or without a trained model. Display only; on by default";
 
+/// The tooltip of View ▸ Bonds & labels ▸ guess bonds from experience (`crate::bond_experience`).
+pub const GUESS_BONDS_TIP: &str = "estimated solver: between DFT solves the bonds shown are the last DFT step's (dashed and faded). Every fresh DFT bond graph is remembered — each pair's elements, distance, how many atoms sit within 8 Bohr of each end, and whether the density bonded it (in the shared collection's folder when the model learns into one, else for this session). With this on, while the bonds are stale each pair is looked up among pairs seen before with the same elements and neighbour counts within 0.1 Bohr: if at least three were seen and all agree, the view follows them — a mint bond where they were bonded, no bond where they were not — and otherwise keeps the last DFT step's bond, dashed. Angle arcs between guessed bonds are mint too, and the angle and length labels on them mint-tinted and half-faded. Learned from this app's own DFT, nothing typed in per element; molecule names and the Selection panel stay the last DFT graph's. Display only; on by default";
+
 /// Bonds & labels (Q6 and Q7 of Appendix B, M6): the bonds read off the density, the molecule
 /// names and their style, the composition badge, angles, lengths, partial charges, the refresh of
-/// the bonds after a drag (estimated solver), label opacity.
+/// the bonds after a drag and the guess from experience (estimated solver), label opacity.
 fn bonds(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     ui.horizontal_wrapped(|ui| {
         let (mut b, mut l) = (st.show_bonds, st.show_labels);
@@ -392,6 +395,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     probed("show-charges", ui.checkbox(&mut st.show_charges, "partial charges")).on_hover_text(CHARGES_TIP);
     if st.backend == Backend::Estimated {
         probed("auto-refresh-bonds", ui.checkbox(&mut st.auto_refresh_bonds, "refresh bonds after a drag")).on_hover_text(AUTO_BONDS_TIP);
+        probed("guess-bonds", ui.checkbox(&mut st.guess_bonds, "guess bonds from experience")).on_hover_text(GUESS_BONDS_TIP);
     }
     ui.horizontal(|ui| {
         ui.label("label opacity");
@@ -513,7 +517,7 @@ fn reset(st: &mut UiState, acts: &mut Vec<Action>) {
     back!(
         gamma, opacity, iso, shimmer, dots_float, dots_glow, dots_drift, dots_amount, dots_feather, dots_size, dots_blur, dots_brightness, dots_by_orbital, bloom, bloom_threshold,
         camera_view, exposure_ev, shutter, fov_deg, camera_solidity, camera_size, camera_smooth, motion_blur, background,
-        show_bond_lengths, show_charges, auto_refresh_bonds, label_opacity,
+        show_bond_lengths, show_charges, auto_refresh_bonds, guess_bonds, label_opacity,
         show_cell, show_floor, show_axes, show_place_grid, grid_in_angstrom, show_trails, trail_fs, trail_opacity, show_knowledge, show_ghost, nucleus_scale
     );
 }
