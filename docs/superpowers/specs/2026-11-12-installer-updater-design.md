@@ -161,7 +161,7 @@ These supersede the text above where the two differ.
     - Sharing the pseudo cache saves regeneration.
     - A newcomer has no such folder, so they still open on H₂ with the defaults.
   - Every "`%APPDATA%\Atomic Sandbox`" above now reads `%LOCALAPPDATA%\atomic-sandbox`.
-- **Uninstall "also remove my data"** is unticked by default. When ticked, it deletes only what the installed build created: `models\`, `profiles\`, `scenes\` and `captures\` under the root. It never touches `cache\`, `training\`, `current.profile` or `timings.txt`, which dev builds share. The checkbox text says so.
+- **Uninstall "also remove my data"** is unticked by default. When ticked, it deletes only what the installed build created: `models\`, `profiles\`, `scenes\` and `captures\` under the root. It never touches `cache\`, `training\`, `current.profile` or `timings.txt`, which dev builds share. The checkbox text says so. Every uninstall, ticked or not, removes the root's `updates\` (the updater's cache: the last setup exe and `session.scene`, not user data; final review M7).
 - **Scenes and profiles get no version marker.** The scene parser rejects unknown lines, so a marker would itself break every older build.
   - The manifest records a code-only format number for each, bumped when its format changes.
   - A downgrade across a bump warns by type ("scenes saved since v0.3 may not open in v0.2"), not by file.
@@ -212,6 +212,12 @@ These supersede the text above where the two differ.
 - **Each signature is tied to its release.**
   - The trusted comment of `SHA256SUMS.txt.minisig` is exactly `atomic-sandbox <tag>`.
   - `app::update::verify` refuses a signature whose trusted comment isn't `atomic-sandbox <the tag being installed>`, so a valid signature can't be replayed onto another release's sums.
+
+- **Final review fix round** (2026-11-13).
+  - Restart now also waits for a solve that runs while the simulation is paused (after a scene load, an Apply grid or a Step; Bonds now; the automatic bond refresh after a drag), with the same "Cancel it and restart" / "Keep waiting" card (I1).
+  - Play pressed while Pause and restart is pausing goes back to the playing question, so a later plain Pause never restarts the app (T4 N5).
+  - The bundled models and scenes are copied in (missing files only) at the first launch of each installed version, not once: the seed marker records the version (I2). Accepted trade-off: a bundled file the user deleted comes back after an update.
+  - The uninstaller always removes `updates\` (M7).
 
 ## Left to the builder
 
