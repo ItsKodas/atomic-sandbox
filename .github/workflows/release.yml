@@ -7,19 +7,21 @@
 # - build (every run; read-only token; no secret is referenced in it): the tag check, the app build,
 #   the packaging (portable zip and installer, through scripts\package.ps1), SHA256SUMS.txt and
 #   manifest.json. The files are kept as a workflow artifact for 7 days.
-# - sign (v* tags only): runs in the GitHub Environment "release", which holds the two signing
+# - sign (pushed v* tags only): runs in the GitHub Environment "release", which holds the two signing
 #   secrets, only lets v* tags deploy and waits for its required reviewer. It downloads only
 #   SHA256SUMS.txt, signs it with minisign (prehashed, trusted comment "atomic-sandbox <tag>",
 #   which the app checks against the release it installs), and uploads the .minisig. It never
 #   checks out or builds repository code and has no repository token.
-# - release (v* tags only; the only job that can write to the repository, and it never sees a
+# - release (pushed v* tags only; the only job that can write to the repository, and it never sees a
 #   secret): checks the signature against the committed crates/app/release-key.pub and the sums
 #   against the files, then creates a DRAFT GitHub release with the five assets (pre-release for
 #   -beta.N). Publishing the draft is a person's click on GitHub, after the physics suites ran
 #   locally on the tagged commit.
 #
-# workflow_dispatch and a push to the installer branch are build-only: they run the build job alone
-# (the installer compile included), never sign, never see a secret and never create a release.
+# workflow_dispatch (on any ref, a tag included) and a push to the installer branch are build-only:
+# they run the build job alone (the installer compile included), never sign, never see a secret and
+# never create a release. The installer-branch trigger is for the first compile of the installer
+# before any tag; it is removed in the branch's final merge, leaving tag pushes and dispatch.
 #
 # Tools are pinned: Inno Setup 6.6.1 (the 6.6.x that installer/AtomicSandbox.iss targets) and
 # minisign 0.12, each a fixed download checked against its SHA-256 (the runner image's own Inno
@@ -38,7 +40,7 @@ permissions: {}
 concurrency:
   group: release-${{ github.ref }}
   # a newer push to the branch supersedes a build-only run; a tag run is never cancelled
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref_type == 'tag') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,7 +85,8 @@ jobs:
             Write-Output "::error::The workspace version '$version' is neither X.Y.Z nor X.Y.Z-beta.N."
             exit 1
           }
-          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+          # a release run is a pushed tag (a dispatch on a tag ref is build-only, like any dispatch)
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_TYPE -eq 'tag') {
             $tag = $env:GITHUB_REF_NAME
             if ($tag -cnotmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
               Write-Output "::error::The tag '$tag' is neither vX.Y.Z (a release) nor vX.Y.Z-beta.N (a pre-release)."
@@ -100,7 +103,7 @@ jobs:
           Write-Output "Version $version (pre-release: $pre; ref $env:GITHUB_REF, commit $env:GITHUB_SHA)"
 
       - name: A release needs the real public key
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           # the key the app compiles in (crates/app/src/update/verify.rs reads its first line that is
           # neither blank, a # comment nor minisign's "untrusted comment:")
@@ -235,7 +238,7 @@ jobs:
           compression-level: 0
 
       - name: Keep SHA256SUMS.txt alone for the sign job
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sums-${{ steps.version.outputs.version }}
@@ -247,9 +250,9 @@ jobs:
   sign:
     name: Sign SHA256SUMS.txt
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: windows-latest
-    # the signing secrets are Environment secrets of "release" (deployment rule: v* tags only;
+    # the signing secrets are Environment secrets of "release" (deployment rule: v[0-9]* tags only;
     # a required reviewer approves each run); no repository token is needed here
     environment: release
     permissions: {}
@@ -286,7 +289,7 @@ jobs:
 
       - name: Sign (minisign, prehashed, trusted comment "atomic-sandbox <tag>")
         # the job is tag-only already; the step that touches the secrets says so too
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           VERSION: ${{ needs.build.outputs.version }}
           TAG: ${{ github.ref_name }}
@@ -333,7 +336,7 @@ jobs:
   release:
     name: Draft release
     needs: [build, sign]
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -403,6 +406,25 @@ jobs:
             if ($got -cne $sum) { Write-Output "::error::$name has SHA-256 $got, SHA256SUMS.txt says $sum."; exit 1 }
             Write-Output "$name OK"
           }
+          # manifest.json (unsigned; it drives the downgrade warnings): this version, and the very
+          # files attached, by name, size and SHA-256
+          $m = Get-Content -LiteralPath manifest.json -Raw | ConvertFrom-Json
+          if ("v$($m.version)" -cne $env:TAG) { Write-Output "::error::manifest.json says version '$($m.version)', the tag is $env:TAG."; exit 1 }
+          $want = @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip")
+          $listed = @($m.assets)
+          if ((@($listed | ForEach-Object { $_.name }) -join '|') -cne ($want -join '|')) {
+            Write-Output "::error::manifest.json lists the assets '$(@($listed | ForEach-Object { $_.name }) -join ', ')', not '$($want -join ', ')'."
+            exit 1
+          }
+          foreach ($a in $listed) {
+            $f = Get-Item -LiteralPath $a.name
+            $got = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ([int64]$a.size -ne $f.Length -or $a.sha256 -cne $got) {
+              Write-Output "::error::manifest.json says $($a.name) is $($a.size) bytes, SHA-256 $($a.sha256); the file is $($f.Length) bytes, $got."
+              exit 1
+            }
+            Write-Output "manifest.json: $($a.name) OK"
+          }
 
       - name: Release notes
         env:
@@ -433,6 +455,16 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
           PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
+          # no second draft for one tag: a re-run after a create that failed part-way would add one
+          $view = & gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "::error::A release for $env:TAG already exists — delete the stale draft first (gh release delete $env:TAG), then re-run this job. ($view)"
+            exit 1
+          }
+          if ("$view" -notmatch 'release not found') {
+            Write-Output "::error::gh release view $env:TAG failed: $view"
+            exit 1
+          }
           $ghArgs = @('release', 'create', $env:TAG, '--repo', $env:GITHUB_REPOSITORY, '--draft', '--verify-tag',
             '--title', "Atomic Sandbox $env:VERSION", '--notes-file', (Join-Path $env:RUNNER_TEMP 'notes.md'))
           if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }

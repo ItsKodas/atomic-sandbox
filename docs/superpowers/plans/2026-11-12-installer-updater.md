@@ -39,7 +39,8 @@ Inno Setup 6. GitHub Actions `windows-latest`.
   No other host, no telemetry, nothing on the UI thread. Offline shows "couldn't check (offline)" quietly, never a dialog.
 - **Verification fails closed.** Never install an asset unless:
   - its SHA-256 matches `SHA256SUMS.txt`;
-  - `SHA256SUMS.txt` carries a valid minisign signature (`SHA256SUMS.txt.minisig`) under the compiled-in public key.
+  - `SHA256SUMS.txt` carries a valid minisign signature (`SHA256SUMS.txt.minisig`) under the compiled-in public key;
+  - **Amended 2026-11-13** (Task 6 security review): that signature's trusted comment is exactly `atomic-sandbox <tag>` for the release being installed (`update::verify::trusted_comment_for`), so a valid signature can't be replayed onto another release's sums.
 
   A build without a real public key installs nothing and says "this build has no release key".
 - **Tags.** `vX.Y.Z` is a release and `vX.Y.Z-beta.N` a pre-release. The tag must equal the root `Cargo.toml` workspace `version`.
@@ -48,6 +49,9 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 - **`ui::Action`.** Check now, install a version and restart are `ui::Action`s, so `--record` sees them. The channel (Stable/Beta) and the auto-check toggle are display settings stored in the profile.
 - **Check interval:** at launch, then every 6 hours.
 - **Publishing.** Claude never pushes a tag and never publishes a release without asking the user. Claude never handles the signing secret: the user creates and adds it.
+  - **Amended 2026-11-13** (Task 6 security review): the signing key and its password exist only as secrets of the GitHub Environment `release`, set with `--env release`. Repository-level secrets of those names must not exist.
+  - The user creates that Environment (required reviewer, no admin bypass, deployments from `v[0-9]*` tags only) and a `v[0-9]*` tag ruleset before adding the secrets.
+  - The commands are in `docs/dev-reference.md` "Releasing", the one source of the user's commands.
 - **Shipping.** Personal profiles and untracked models (`bh3.model`, `nh4+.model`, `ph3.model`) never ship and are never committed. Releases contain committed files only.
 - **Repo rules:**
   - edit files with Edit/Write or Python, never PowerShell `Set-Content`;
@@ -309,30 +313,32 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 
 **Files:**
 - Create `.github/workflows/release.yml`.
+  - **Amended 2026-11-13** (security review and fix rounds 1-2; this supersedes the bullets below where they differ):
+    - **Triggers:** `push: tags: ['v*']` (the release path); `workflow_dispatch` and `push: branches: [installer]` (build-only).
+    - **Three jobs**, top-level `permissions: {}`:
+      - **build** (every run, `contents: read`, no secret referenced);
+      - **sign** (only for a pushed tag, `github.event_name == 'push' && github.ref_type == 'tag'`; `permissions: {}`; `environment: release`, which holds the secrets). It downloads only `SHA256SUMS.txt`, signs it with `minisign -S -H -t "atomic-sandbox <tag>"` and uploads the `.minisig`. It never checks out or builds repository code;
+      - **release** (only for a pushed tag, `contents: write`, no secrets). It verifies the signature against the tagged commit's `release-key.pub`, plus the trusted comment, the sums and `manifest.json`. It refuses when a release for the tag already exists, then creates the draft.
+    - Build-only runs never sign and never see a secret.
+    - Inno Setup 6.6.1 and minisign 0.12 are pinned downloads with SHA-256 checks; actions are pinned to commit SHAs.
+    - **After this branch merges**, the `push: branches: [installer]` trigger is removed in the final merge commit, leaving tag pushes and `workflow_dispatch`. It stays until then for the installer's first compile.
   - **Trigger:** `on: push: tags: ['v*']`, runner `windows-latest`.
   - **The tag check:** the tag (without `v`) must equal the root `Cargo.toml` `version`, or fail.
   - **Build and package:** `cargo build -p app --release`. Run the `build.bat` layout steps non-interactively (factor them into `scripts/package.ps1` or a `build.bat --ci` flag, so CI and local share one layout). Then ISCC (preinstalled on `windows-latest`; if not, install `innosetup` via choco).
   - **Checksums and signature:**
     - write `SHA256SUMS.txt` over the installer and the zip;
-    - sign it with minisign, using the secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` (install `minisign` via choco or a pinned release download);
+    - sign it with minisign, using the `release` Environment's secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` (amended: in the sign job only; minisign is a pinned release download);
     - run `AtomicSandbox.exe --write-manifest manifest.json`, then fill in the assets' name, size and sha256.
   - **The release:** `gh release create <tag> --draft --title "Atomic Sandbox <ver>" --notes-file <notes>`, with `--prerelease` when the tag contains `-beta.`. Attach the installer, the zip, `SHA256SUMS.txt`, `SHA256SUMS.txt.minisig` and `manifest.json`. The notes include the line: "Windows may show 'Windows protected your PC' — the installer isn't code-signed yet: More info → Run anyway."
-  - **Permissions:** `contents: write` only.
-- `crates/app/release-key.pub`: **left as the placeholder.** The controller gives the user these commands, and the user runs them:
-
-  ```bash
-  minisign -G -p release-key.pub -s release-key.sec
-  ```
-
-  ```bash
-  gh secret set MINISIGN_SECRET_KEY < release-key.sec
-  ```
-
-  ```bash
-  gh secret set MINISIGN_PASSWORD
-  ```
-
-  Then the user, or Claude on their word, commits the `.pub` contents into `crates/app/release-key.pub`. The `.sec` never enters the repo.
+  - **Permissions:** amended, per job (above): `contents: read` for build, none for sign, `contents: write` for release only.
+- `crates/app/release-key.pub`: **left as the placeholder.**
+  - **Amended 2026-11-13:** the user's one-time commands are only in `docs/dev-reference.md` "Releasing". The controller relays those and no others. They cover, in order:
+    1. the tag ruleset;
+    2. the `release` Environment with its rules;
+    3. `minisign -G`;
+    4. the two secrets with `--env release`;
+    5. the check that no repository-level secrets of those names exist.
+  - Then the user, or Claude on their word, commits the `.pub` contents into `crates/app/release-key.pub`: exactly minisign's two lines. The `.sec` never enters the repo.
 - `docs/dev-reference.md`: a new section, "Releasing":
   - the tag scheme;
   - the checklist: run the gates locally on the tagged commit (`cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release`, `cargo test -p validate --release`, `cargo test -p app --release`), push the tag (ask first), check the draft, publish (ask first);

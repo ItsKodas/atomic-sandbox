@@ -92,12 +92,13 @@ The user wants:
   - The workflow marks a `-beta.N` tag as a GitHub pre-release automatically.
   - The tag must equal the workspace `version` in the root `Cargo.toml`, or the workflow fails.
   - The app's own version comes from `CARGO_PKG_VERSION`.
-- **Releases are built by GitHub Actions on a pushed tag** (`windows-latest`, free for a public repo). This is my call: builds are reproducible and don't depend on the user's PC.
+- **Releases are built by GitHub Actions on a pushed tag** (`windows-latest`, free for a public repo). This is my call: releases are built from a clean checkout by CI and don't depend on the user's PC. They are not bit-reproducible: the stable Rust toolchain and the runner image change over time. Inno Setup and minisign are pinned.
   - The workflow builds the app.
   - It lays out the same folder `build.bat` does.
   - It produces the zip and the installer.
   - It writes `SHA256SUMS.txt`, signs it, and writes `manifest.json`.
   - It creates the GitHub release with the assets, as a draft.
+  - **Amended 2026-11-13:** three jobs with per-job permissions (see "Amendments 2026-11-13").
 - **Physics gates stay on the user's PC.** The Actions runner has no GPU, so the GPU suites can't run there. The release checklist (in `docs/dev-reference.md`) says: run the gates locally on the tagged commit before publishing the draft. The runner may run the CPU-only suites; that's left to the builder.
 - **Publishing is always confirmed by the user.** A tag push and a draft becoming a published release are both outward-facing. Claude asks before each.
 - **The installer is Inno Setup**, installing per-user to `%LOCALAPPDATA%\Programs\Atomic Sandbox`.
@@ -118,9 +119,14 @@ The user wants:
   - **If a copy fails:** that folder is skipped and named; nothing is half-written.
   - The detail of finding the old folder is left to the builder. A simple "Import data from a folder…" prompt on first launch is acceptable.
 - **Signing.**
-  - **What gets signed:** `SHA256SUMS.txt`, signed with minisign (Ed25519).
+  - **What gets signed:** `SHA256SUMS.txt`, signed with minisign (Ed25519), prehashed.
   - **The public key** is compiled into the app.
   - **The private key** is a GitHub Actions secret. **The user creates and adds the secret**: Claude doesn't handle secrets. Claude gives exact commands.
+  - **Amended 2026-11-13:**
+    - The key and its password exist only as secrets of the GitHub Environment `release`, set with `gh secret set … --env release`. Repository-level secrets of those names must not exist.
+    - The signature's trusted comment is `atomic-sandbox <tag>`, and the app refuses any other.
+    - The exact commands are in `docs/dev-reference.md` "Releasing", the one source of the user's commands.
+    - See "Amendments 2026-11-13".
 - **The manifest.** `manifest.json` per release holds:
   - the version and the channel;
   - per asset: name, size, sha256;
@@ -173,6 +179,39 @@ These supersede the text above where the two differ.
   - Personal profiles never ship.
   - `build.bat` switches to committed files for `models\` and `profiles\`, as it already does for `scenes\`, so a local package equals the CI one.
   - Trained models: only the ones already committed ship. The user's untracked test models (`bh3.model`, `nh4+.model`, `ph3.model`) stay local and are never committed (user, 2026-11-12: "dont commit my test training models").
+
+## Amendments 2026-11-13
+
+These supersede the text above where the two differ.
+
+- **The updater's network.** GitHub serves every release asset from its download CDN, so the allowed hosts are exactly `api.github.com`, `github.com`, `release-assets.githubusercontent.com` and `objects.githubusercontent.com`.
+  - Redirects are followed by hand: at most 2 hops, HTTPS only.
+  - Any other host is refused.
+  - This was Task 3 review I1, already in "The updater's network" above.
+- **The release workflow has three jobs** (`.github/workflows/release.yml`; Task 6 security review). The top-level permissions are `{}`.
+  - **build** runs on every trigger, with `contents: read`, and references no secret. It covers the tag check, the build, the packaging, `SHA256SUMS.txt` and `manifest.json`. For a pushed tag it also uploads `SHA256SUMS.txt` alone.
+  - **sign** runs only for a pushed `v*` tag (`github.event_name == 'push' && github.ref_type == 'tag'`), with `permissions: {}`, in the GitHub Environment `release`.
+    - That Environment holds the two signing secrets.
+    - It admits only tags matching `v[0-9]*`.
+    - It has the user as required reviewer, and admins can't bypass it.
+    - The job downloads only `SHA256SUMS.txt`, checks that it lists exactly this version's installer and zip, signs it (`minisign -S -H -t "atomic-sandbox <tag>"`) and uploads the `.minisig`.
+    - It never checks out or builds repository code.
+  - **release** also runs only for a pushed tag, with `contents: write`, and never sees a secret. It checks:
+    - the signature, under the tagged commit's `crates/app/release-key.pub`;
+    - the trusted comment;
+    - the sums against the files;
+    - `manifest.json` against the tag and the files;
+    - that no release for the tag exists yet.
+
+    Then it creates the draft.
+  - **Build-only:** `workflow_dispatch` and a push to the `installer` branch never sign, never see a secret and never create a release. The branch trigger is for the installer's first compile and is removed in that branch's final merge.
+- **Secrets live only in the `release` Environment.**
+  - The user creates the Environment and a tag ruleset for `v[0-9]*` (no updates, no deletions, no bypass actors) *before* adding the secrets, because a job that names a missing Environment creates it unprotected.
+  - The secrets are then added with `--env release`.
+  - Repository-level secrets named `MINISIGN_SECRET_KEY` or `MINISIGN_PASSWORD` must not exist: an Environment secret silently shadows them, and any branch run could read them.
+- **Each signature is tied to its release.**
+  - The trusted comment of `SHA256SUMS.txt.minisig` is exactly `atomic-sandbox <tag>`.
+  - `app::update::verify` refuses a signature whose trusted comment isn't `atomic-sandbox <the tag being installed>`, so a valid signature can't be replayed onto another release's sums.
 
 ## Left to the builder
 

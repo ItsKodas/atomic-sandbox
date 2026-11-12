@@ -1,7 +1,7 @@
 ; Atomic Sandbox - the per-user Windows installer (Inno Setup 6; installer spec 2026-11-12, plan Task 5).
 ;
 ; TARGET: Inno Setup 6.6.x, the newest 6.6 release (the release workflow, plan Task 6, pins that
-; exact version on the runner, so builds are reproducible). Older 6.x still compile through the
+; exact version on the runner, so every CI build compiles with the same Inno Setup). Older 6.x still compile through the
 ; #if Ver branches (x64compatible from 6.3.0, CreateCustomForm's new signature from 6.6.0).
 ;
 ; Built by scripts\package.ps1 (build.bat locally, the release workflow on CI) from a staging folder
