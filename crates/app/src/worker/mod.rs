@@ -63,7 +63,9 @@
 //!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
 //!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
-//!   then quarantine of the samples the model cannot represent — `providers::surrogate` module doc).
+//!   then quarantine rounds — `providers::surrogate` module doc). The Model tab's Forget / Restore
+//!   of one sample (`Command::ForgetSample`, spec 2026-11-12 R2) asks for a refit at the next tick,
+//!   not throttled.
 //!   A pass that ends — finished or cancelled — with fewer usable samples than its basis's Q′
 //!   is not fitted (M6 Task 3 fix round 2: below Q′ no fit can earn trust) and leaves **no
 //!   model**: its samples are kept, and since this refit needs a fitted model they are not
@@ -601,6 +603,9 @@ struct Worker {
     /// Background refits discarded in a row (a conflict each time): from
     /// [`REFIT_DISCARDS_BEFORE_SYNC`] on, the next refit runs in the tick, so the model still moves.
     refit_discards: u32,
+    /// The user's Forget / Restore of a sample asked for a refit (`user_sample`): the next one is
+    /// not throttled.
+    refit_requested: bool,
     refits: u64,
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
@@ -822,6 +827,7 @@ fn worker(
         last_refit_at: None,
         refit_started: None,
         refit_discards: 0,
+        refit_requested: false,
         samples_at_refit: 0,
         refits: 0,
         autoload_refused: None,

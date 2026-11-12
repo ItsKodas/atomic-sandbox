@@ -1857,7 +1857,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let view = v(kind, AMBER, text, Some(if class { CLASS_UNTRUSTED_TIP } else { NOT_HERE_TIP }));
         TrustView { detail: m.untrusted_reason.clone(), ..view }
     } else if m.trusted && m.quarantined > 0 {
-        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
+        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (held out of the fit: the rest of the data could not predict it, or the fit could not reproduce it)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
     } else {

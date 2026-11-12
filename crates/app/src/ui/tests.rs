@@ -173,12 +173,15 @@ pub(crate) fn model() -> ModelStatus {
         last_gap: Some((-5.3e-5, 1600)),
         quarantined: 2,
         recovery: None,
+        forgotten: 0,
+        suspects: Vec::new(),
+        forgotten_samples: Vec::new(),
         superseded: 0,
         box_excluded: 0,
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -1226,6 +1229,87 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     }
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
+}
+
+/// Spec 2026-11-12 R2: the Model tab's "Worst-fitting samples" — the rows (the spec's text), the
+/// caption, the forgotten list; clicking Forget and Restore emits `Action::ForgetSample` /
+/// `RestoreSample`, which send `Command::ForgetSample` / `RestoreSample` and are recorded as not
+/// replayable; with no model, or no ranking yet, the section says why. Rendered: the frame's text
+/// shapes are searched.
+#[test]
+fn the_worst_fitting_samples_forget_and_restore_one() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    // the id carries a check value (fix round 1, M8): the buttons send it as given
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus {
+        suspects: vec![suspect(1804, "HO", "fallback", Some(38.46)), suspect(1133, "H2O", "pass perturbation", Some(5.23))],
+        forgotten_samples: vec![suspect(40, "H2", "audit", None)],
+        forgotten: 1,
+        ..model()
+    };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    // the section is collapsed by default: open it the way Ctrl K does
+    let reveal = |st: &mut UiState, inp: &PanelInput<'_>| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, inp, 1400.0, vec![]);
+        }
+    };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("#1804 · HO · fallback · 38× its bound"), "{t}");
+    assert!(t.contains("#1133 · H2O · pass perturbation · 5.2× its bound"), "{t}");
+    assert!(t.contains(super::dock::model::SUSPECTS_CAPTION), "{t}");
+    assert!(t.contains("forgotten (1): held out of the fit until restored") && t.contains("#40 · H2 · audit · not in the fit"), "{t}");
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "forget-sample-1804"));
+    assert!(matches!(c.as_slice(), [Command::ForgetSample(sim::SampleId { index: 1804, key })] if *key == 0xabc0 + 1804), "{c:?}");
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "restore-sample-40"));
+    assert!(matches!(c.as_slice(), [Command::RestoreSample(sim::SampleId { index: 40, key })] if *key == 0xabc0 + 40), "{c:?}");
+    let id = sim::SampleId { index: 1804, key: 1 };
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(id)), Some("forget-sample"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(id)), Some("restore-sample"));
+    // the forgotten count beside the held one
+    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
+    // no ranking yet (a model, no list), and no model: the section says why
+    for (m, why) in [
+        (ModelStatus { suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_RANKING),
+        (ModelStatus { fitted: false, trusted: false, fit: None, suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_MODEL),
+    ] {
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        reveal(&mut st, &inp);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains(why), "{why}: {t}");
+        assert!(!t.contains("#1804"), "{t}");
+    }
 }
 
 /// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
