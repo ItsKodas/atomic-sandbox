@@ -811,6 +811,9 @@ pub struct UiState {
     /// (the card over the view, the rings on the scene), and the way back from an opened segment.
     pub segment_preview: Option<crate::segment::Segment>,
     pub segment_back: Option<SegmentBack>,
+    /// File ▸ Import data from a folder… in flight (`Action::ImportData`, `paths::spawn_import`):
+    /// its status line arrives here when the copy is done.
+    pub import_data: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 /// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
@@ -1016,6 +1019,7 @@ impl UiState {
             compare: Default::default(),
             segment_preview: None,
             segment_back: None,
+            import_data: None,
         }
     }
 
@@ -1309,6 +1313,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.log.record(&st.status, st.status_seq, input);
     // the reference comparison's results (a helper process on its own thread; never blocks)
     st.compare.poll(input.snapshot);
+    // an import of data folders (its own thread) reports when done
+    poll_import(st);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
     // the latest DFT solve's cost (the quality levels' estimates)
@@ -1350,6 +1356,20 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     }
     window_requests(st, &mut out);
     out
+}
+
+/// File ▸ Import data from a folder…'s result, once its thread is done: the counts and failures on
+/// the status line.
+pub(crate) fn poll_import(st: &mut UiState) {
+    use std::sync::mpsc::TryRecvError;
+    let Some(rx) = &st.import_data else { return };
+    let line = match rx.try_recv() {
+        Ok(line) => line,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => "import data: the copy stopped before it finished (see the console)".into(),
+    };
+    st.import_data = None;
+    st.set_status(line);
 }
 
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the

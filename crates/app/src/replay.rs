@@ -420,6 +420,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::Builder(_) => "builder",
         Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
         Action::Screenshot | Action::Record(_) => "capture",
+        Action::ImportData(_) => "import-data",
         _ => "action",
     })
 }
@@ -428,8 +429,9 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 /// other unreplayable action would make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture")
+    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
+    // nor an import of data folders (it copies files into the installed build's root; a replay never does)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

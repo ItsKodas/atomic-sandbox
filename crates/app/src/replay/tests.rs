@@ -565,6 +565,24 @@ fn unreplayable_recorded_actions_are_skipped_or_refused() {
     assert_eq!(unreplayable_kind(&Action::Play), None);
 }
 
+/// File ▸ Import data from a folder… (installer Task 1): recorded as a `# not replayable:
+/// import-data` line, which reads back as that kind, and a replay skips it with a warning (it
+/// copies files into the installed build's root and changes no run; a replay never does).
+#[test]
+fn import_data_records_as_a_line_a_replay_skips() {
+    let a = Action::ImportData(std::path::PathBuf::from(r"C:\Users\Zoë Q\old copy"));
+    assert_eq!(a.describe(), None, "no script form: a replay touches only its script");
+    assert_eq!(unreplayable_kind(&a), Some("import-data"));
+    let text = write(&[Line::Action(a.clone()), Line::Expect(Expect::Nuclei(2))]);
+    assert!(text.contains("# not replayable: import-data "), "{text}");
+    assert_eq!(parse(&text).unwrap(), vec![Line::NotReplayable("import-data".into()), Line::Expect(Expect::Nuclei(2))]);
+    assert_eq!(write_line(&Line::NotReplayable("import-data".into())), "# not replayable: import-data");
+    assert!(harmless("import-data"));
+    let (mut v, mut host) = morse_h2();
+    let mut p = Player::new(&mut host, (1400, 900));
+    assert!(p.play(&mut v, &text).is_ok());
+}
+
 /// `mark` and what is counted from it: the largest distance seen, the fallbacks (none on an analytic
 /// provider), the model's samples (none); a `scene` line loads a file relative to the script.
 #[test]

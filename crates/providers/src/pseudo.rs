@@ -617,7 +617,9 @@ pub fn disk_cache() -> Option<std::path::PathBuf> {
 
 /// The app's cache directory for derived pseudopotential data: `ATOMIC_SANDBOX_CACHE_DIR` if set, else
 /// `%LOCALAPPDATA%\atomic-sandbox\cache\pseudo` (Windows), `$XDG_CACHE_HOME/atomic-sandbox/pseudo` or
-/// `$HOME/.cache/atomic-sandbox/pseudo`; `None` when none of these exists.
+/// `$HOME/.cache/atomic-sandbox/pseudo`; `None` when none of these exists. The Windows default is the
+/// app's per-user root (`app::paths::user_root`) + `cache\pseudo`, shared by dev, portable and installed
+/// builds; the app's `pseudo_cache_sits_under_user_root` test keeps the two in step.
 pub fn default_disk_cache_dir() -> Option<std::path::PathBuf> {
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
     var("ATOMIC_SANDBOX_CACHE_DIR")

@@ -17,6 +17,7 @@ mod gfx;
 mod ghost;
 mod names;
 mod overlay;
+mod paths;
 mod progress;
 mod quality;
 mod reference;
@@ -375,6 +376,11 @@ fn main() {
     // the dimer gate's derived verdicts are kept per species identity in the cache directory, so pseudo-H/He cost their
     // minute once per recipe, not per launch (M7 Task 11 fix round; `providers::pseudo` "The disk cache")
     providers::pseudo::set_disk_cache(providers::pseudo::default_disk_cache_dir());
+    // an installed build's first launch: the shipped models and scenes copied into the per-user
+    // root, once (`paths`; dev and portable builds keep their folders beside the exe)
+    if paths::mode() == paths::DataMode::Installed {
+        paths::seed_installed();
+    }
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
@@ -528,12 +534,13 @@ fn main() {
         eprintln!("note: no models folder beside the exe or in the working directory: the estimated solver keeps this session's model only (no shared collection)");
     }
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));
+    // (`%LOCALAPPDATA%tomic-sandbox`, `paths::user_root`: the same in every mode)
+    if let Some(root) = paths::user_root() {
+        viewer.ui.profiles.current_file = Some(root.join("current.profile"));
         ui::profile::load_current(&mut viewer.ui);
-        viewer.ui.timings = timings::Timings::load(Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("timings.txt")));
+        viewer.ui.timings = timings::Timings::load(Some(root.join("timings.txt")));
         // a running sampling pass is kept resumable there (`worker::checkpoint`), and offered at the next start
-        viewer.training_dir = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("training"));
+        viewer.training_dir = Some(root.join("training"));
     }
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");

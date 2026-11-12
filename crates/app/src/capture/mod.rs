@@ -30,7 +30,7 @@ pub mod writer;
 
 use clock::{Sample, SimClock, SimFrame, WallClock, FPS};
 use readback::{Pool, Tag};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 use writer::{Image, Note, Writer};
@@ -335,14 +335,12 @@ impl Default for Capture {
     }
 }
 
-/// The `captures` folder: beside the executable in a dist folder (one with `models/` beside the
-/// exe), else in the working directory (the repository root under `start.bat`; gitignored).
+/// The `captures` folder ([`crate::paths`]): dev and portable builds keep it beside the executable
+/// in a dist folder (one with `models/` beside the exe), else in the working directory (the
+/// repository root under `start.bat`; gitignored); an installed build under
+/// `%LOCALAPPDATA%tomic-sandbox`.
 pub fn captures_dir() -> PathBuf {
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
-    match exe_dir.filter(|d| d.join("models").is_dir()) {
-        Some(d) => d.join("captures"),
-        None => std::env::current_dir().unwrap_or_default().join("captures"),
-    }
+    crate::paths::dir(crate::paths::DataDir::Captures).unwrap_or_else(|| PathBuf::from("captures"))
 }
 
 /// `2026-10-20_14-03-22_h2o` (local time; the scene's name made file-safe).

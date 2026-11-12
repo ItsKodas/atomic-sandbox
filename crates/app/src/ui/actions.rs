@@ -231,6 +231,13 @@ pub enum Action {
     Screenshot,
     /// The capture's Record (true) / Stop (false) button (display only, not replayable).
     Record(bool),
+    /// File ▸ Import data from a folder… (installer spec; the installed build only): the folder's
+    /// `models`, `profiles` and `scenes` copied into the per-user root on a thread
+    /// (`paths::import_into`: nothing overwritten, nothing moved), the folder recorded in
+    /// `migrated_from.txt`, the counts and failures on the status line. Recorded as `# not
+    /// replayable: import-data` (a replay touches only its script); a replay skips it (it changes
+    /// no run).
+    ImportData(std::path::PathBuf),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did. ⚠ Model only
@@ -582,6 +589,18 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             } else {
                 st.set_status(format!("importing {} into the shared collection", path.display()));
                 out.commands.push(Command::ImportModel(path));
+            }
+        }
+        Action::ImportData(folder) => {
+            use crate::paths;
+            match paths::user_root() {
+                _ if paths::mode() != paths::DataMode::Installed => out.error = Some(format!("import data: {}", paths::IMPORT_ONLY_INSTALLED)),
+                _ if st.import_data.is_some() => out.error = Some("import data: an import is already running".into()),
+                None => out.error = Some("import data: no LOCALAPPDATA folder to import into".into()),
+                Some(root) => {
+                    st.set_status(format!("importing models, profiles and scenes from {}…", folder.display()));
+                    st.import_data = Some(paths::spawn_import(folder, root));
+                }
             }
         }
         Action::DiscardTraining => {
@@ -1111,7 +1130,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) => return None,
         })
     }
 

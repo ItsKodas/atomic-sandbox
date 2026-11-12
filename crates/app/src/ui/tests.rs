@@ -7763,3 +7763,44 @@ fn a_reference_answer_has_its_own_label_colour_and_tip() {
     }
     assert!(SOURCE_TIP.contains("atom references (teal)"));
 }
+
+/// File ▸ Import data from a folder… (installer Task 1): outside the installed build (these tests
+/// run in dev mode) the item is there but disabled, a click sends nothing, and the action itself
+/// is refused with the tooltip's reason; a finished import's line reaches the status line, and
+/// a thread that died says so. The search finds it.
+#[test]
+fn import_data_is_offered_only_in_the_installed_build() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(crate::paths::mode(), crate::paths::DataMode::Dev);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::File));
+    let outs = click_widget(&ctx, &mut st, &inp, "import-data");
+    egui::Popup::close_all(&ctx);
+    assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "a disabled item sends nothing");
+    assert!(st.import_data.is_none());
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ImportData("C:/old copy".into()), &mut out);
+    assert_eq!(out.error.as_deref(), Some("import data: only the installed app keeps its data in %LOCALAPPDATA%"));
+    assert!(out.commands.is_empty() && st.import_data.is_none());
+    // the thread's line, when it arrives
+    let (tx, rx) = std::sync::mpsc::channel();
+    st.import_data = Some(rx);
+    poll_import(&mut st);
+    assert!(st.import_data.is_some(), "still running");
+    tx.send("imported models from C:/old copy: 3 files copied, 0 already there (kept)".to_string()).unwrap();
+    poll_import(&mut st);
+    assert!(st.import_data.is_none());
+    assert_eq!(st.status, "imported models from C:/old copy: 3 files copied, 0 already there (kept)");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    st.import_data = Some(rx);
+    drop(tx);
+    poll_import(&mut st);
+    assert!(st.import_data.is_none() && st.status.contains("stopped before it finished"), "{}", st.status);
+    let r = search::results("import data", 3);
+    assert!(r.first().is_some_and(|e| e.anchor == "m-files"), "{:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
+}
