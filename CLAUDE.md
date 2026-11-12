@@ -28,7 +28,7 @@ Tag every plan task and dispatch subagents accordingly: **Fable 5.1** (`claude-f
 
 ## Crates
 
-`units` · `qm` (CPU f64 reference solver) · `qm-gpu` (the GPU solver) · `gpu` · `render` · `sim` (scene, integrator, thermostat, the `Dynamics` driver, relax, bonds, charges; the `ForceProvider`/`Trainable` boundary) · `providers` (Kohn-Sham adapters `ks.rs`; the surrogate provider `surrogate/` — its decision list is `mod.rs`'s module doc; the sampling pass `sampling/`; the pseudopotential cache `pseudo`) · `surrogate` (the model: descriptors, basis, Bayesian fit, sidecar, the shared collections) · `app` (the viewer; worker in `src/worker/`, UI in `src/ui/`, builder in `src/builder/`, replay in `src/replay.rs`) · `validate` (the suites).
+`units` · `qm` (CPU f64 reference solver) · `qm-gpu` (the GPU solver) · `gpu` · `render` · `sim` (scene, integrator, thermostat, the `Dynamics` driver, relax, bonds, charges; the `ForceProvider`/`Trainable` boundary) · `providers` (Kohn-Sham adapters `ks.rs`; the surrogate provider `surrogate/` — its decision list is `mod.rs`'s module doc; the sampling pass `sampling/`; the pseudopotential cache `pseudo`) · `surrogate` (the model: descriptors, basis, Bayesian fit, sidecar, the shared collections) · `app` (the viewer; worker in `src/worker/`, UI in `src/ui/` — the docking workspace in `src/ui/workspace/`: tree, auto-hide, layouts, detached windows, drag — builder in `src/builder/`, replay in `src/replay.rs`) · `validate` (the suites).
 
 ## Build and run
 
