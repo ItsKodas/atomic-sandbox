@@ -691,10 +691,40 @@
 //!    sample could trade a residual failure for a sample shortfall: the water investigation's
 //!    E1(e), one H 0.9 Bohr from O → n 333 < Q′ 344, every step DFT until 11 more samples, then
 //!    the many-body class untrusted by that one sample; the quarantine below handles it instead);
-//! 2. otherwise **quarantines** the worst offenders — the samples whose per-atom energy or worst
-//!    force residual, relative to its threshold, is within a factor 2 of the worst — and refits
-//!    without them, up to [`QUARANTINE_ROUNDS`] rounds, never more than
-//!    [`QUARANTINE_MAX_FRACTION`] of the store;
+//! 2. otherwise **quarantines** the worst offenders and refits without them, up to
+//!    [`QUARANTINE_ROUNDS`] rounds, never more than [`QUARANTINE_MAX_FRACTION`] of the store (the
+//!    cap is checked before a round holds anything). **The offenders are ranked by their
+//!    leave-one-out ratio** (since 2026-11-12, spec `2026-11-12-sample-recovery-design.md` R1;
+//!    `quarantine::loo_ratio`): how far the fit *without* the sample misses it — the larger of its
+//!    leave-one-out energy residual per atom over `energy_std_per_atom` (when its energy was
+//!    fitted) and, over its fitted atoms, the leave-one-out force residual
+//!    `force_residual(F − r, F)`'s d over the atom's bound — the class rule's own reading of the
+//!    same `surrogate::loo` residuals. A round takes every fitted, not box-affected sample whose
+//!    ratio exceeds 1 and is within a factor 2 of the worst. The bound is each atom's own while the
+//!    training residuals fail, `force_std_abs` when only the force noise does. An undefined
+//!    leave-one-out (the sample alone spans a direction of the fit) is ∞ and ranks first (ruling
+//!    R1a: as the class rule reads it). The ratios are the class pass's (`refresh_class_loo`),
+//!    cached per fit (`LooRatios`, keyed by the model generation and the fit's own members; ruling
+//!    R1b) — the fits inside a refit defer that pass, so a round computes them once for its own fit
+//!    (`ensure_loo_ratios`; ≈ 1 s at Q′ 1 032 and 1 700 samples on 16 threads). Until then the
+//!    ranking was the in-sample training residual, which a **high-leverage** sample hides from: the
+//!    fit reproduces it inside its own (wide) bound at its neighbours' expense. The user's
+//!    collection (2026-11-12, `references.md` "Leave-one-out recovery ranking"): one compressed OH
+//!    at 0.72 Ha/Bohr (bound: the 1e-2 cap) bent the shared O–H pair term and 34 H₂O/H₃O samples
+//!    failed; the rounds held those victims, round after round, and ended untrusted at 165 held,
+//!    while the sample's leave-one-out ratio was 962× (rank 1 of 1 700; the next 5.2×). Pinned on
+//!    an analytic fixture (`tests/recovery_loo.rs`): one force-only compressed H₂ among H₃ and H₂ —
+//!    the training ranking holds 7 victims and ends untrusted, the leave-one-out ranking holds the
+//!    outlier alone and trusts. The recovery note names the worst ratio held ("3 samples
+//!    quarantined — the fit without each predicts it at up to 38× its bound, and keeping them
+//!    breaks the fit of their neighbours (…)"). Not changed: the rounds, the cap, the degree-cap
+//!    steps, release and supersede, and the trust rule that judges every fit. **Open (2026-11-12,
+//!    `references.md` "Leave-one-out recovery ranking"):** on the stuck-H collection (step 3 below)
+//!    the ranking, once the label error is held, goes on to name high-leverage samples whose own fit
+//!    is fine, and the rounds end untrusted (47 held) where the training ranking trusted (38 held);
+//!    on the user's pre-1805 snapshot #1804 is held in round 1 but the refit's release step (run
+//!    first, against the fit #1804 bends) puts #1455 back, and the attach's refit ends at 1.0185×
+//!    (128 held) — the next refit trusts it (122 held);
 //! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
 //!    capped fit fails, the default basis is tried first exactly as step 1 tries the cap (kept if
 //!    it alone passes, counts included), and when the quarantine on the capped basis cannot
@@ -1187,6 +1217,11 @@ pub struct SurrogateKs {
     /// are still an earlier fit's — computed once for the fit that stands (`ensure_trust_passes`).
     /// `None` outside a refit: those are the current fit's.
     deferred_trust: Option<usize>,
+    /// The per-sample leave-one-out ratios of a fit (`quarantine::LooRatios`, spec ruling R1b): the
+    /// class pass's, kept for the recovery's offender ranking and the Model tab's worst-fitting
+    /// samples. Keyed to the fit (`model_gen` and its members, `fit_members`); read only through
+    /// `fresh_loo_ratios` / `ensure_loo_ratios`, which never return an earlier fit's.
+    loo_ratios: Option<LooRatios>,
     /// Tests only: every fit inside a refit computes its trust passes, as before the deferral —
     /// the reference the deferred refit is compared with (`refit_cost` tests).
     #[cfg(test)]
@@ -1397,6 +1432,10 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: the recovery ranks its offenders by their training residual, as before spec R1
+    /// (`training_offenders`) — the premise a test compares the leave-one-out ranking with.
+    #[cfg(test)]
+    training_ranking: bool,
     /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach
     /// measurement set another ([`SurrogateKs::with_collection_r_cut`]).
     collection_r_cut: f64,
@@ -1542,6 +1581,7 @@ impl SurrogateKs {
             class_worst: Vec::new(),
             class_blockers: Vec::new(),
             deferred_trust: None,
+            loo_ratios: None,
             #[cfg(test)]
             eager_trust_passes: false,
             teach_rounds: BTreeMap::new(),
@@ -1554,6 +1594,8 @@ impl SurrogateKs {
             shared: None,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            training_ranking: false,
             collection_r_cut: surrogate::COLLECTION_R_CUT,
             collection_note: Vec::new(),
             source_file: None,

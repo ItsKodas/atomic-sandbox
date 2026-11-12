@@ -1,0 +1,515 @@
+//! Spec `2026-11-12-sample-recovery-design.md` R1: the trust recovery ranks its offenders by their
+//! **leave-one-out ratio** (`quarantine::loo_ratio`), not by their training residual; the ratios
+//! are the class pass's, cached per fit (ruling R1b); an undefined one ranks first (R1a).
+//!
+//! The fixture (`outlier_store`): [`SpeciesMorse`]'s exact, pair-additive H surface — 100 H₃
+//! triangles (every pair 1.0–3.0 Bohr) and 30 H₂ (1.2–2.6 Bohr) — and one **high-leverage outlier**,
+//! H₂ compressed to 0.9 Bohr with forces 2.5× the surface's (|F| 0.83 Ha/Bohr: its bound is the
+//! 1e-2 cap). It mirrors the user's #1804 (a lone OH squeezed to 1.31 Bohr, 0.72 Ha/Bohr): the
+//! fit reproduces the outlier inside its own wide bound by bending the shared H–H pair term, and
+//! the victims — samples with small forces and the 2e-3–6e-3 bounds — fail.
+//!
+//! **The outlier's energy row is left out** (`use_energy: false`, as a capped segment's): #1804's
+//! energy was fitted by directions of its own (in-sample within the tier, leave-one-out 962×),
+//! and this H-only basis (Q′ 29) has no such direction for one dimer's energy — with its energy
+//! (the surface's, consistent) the outlier fails its own 1e-3 Ha/atom tier in-sample, and both
+//! rankings name it (measured: 1.4e-2 Ha/atom at 0.95 Bohr × 2; the exploration's other variants —
+//! dimers only, a lone dimer among H₃, a compressed H₃ on another Morse — likewise, or else span
+//! their own directions and untrust nothing). The force-only outlier is the closest honest variant
+//! of the mechanism: a wide bound that hides the sample from its own residual.
+use super::*;
+
+/// [`SpeciesMorse`]'s H surface at the scene (`SpeciesMorse::energy_and_forces`): the teacher's
+/// exact answer.
+fn h_sample(sc: &Scene) -> Sample {
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let z = vec![1; pos.len()];
+    let (energy, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
+    Sample { pos, z, energy, forces, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }
+}
+
+/// H₃: a random triangle with every pair in [lo, hi] (65³ cell).
+fn h3(rng: &mut StdRng, lo: f64, hi: f64) -> Scene {
+    loop {
+        let p: Vec<[f64; 3]> = (0..3).map(|_| [rng.gen_range(-1.6..1.6), rng.gen_range(-1.6..1.6), rng.gen_range(-1.6..1.6)]).collect();
+        let d = |a: usize, b: usize| (0..3).map(|k| (p[a][k] - p[b][k]).powi(2)).sum::<f64>().sqrt();
+        if [(0, 1), (0, 2), (1, 2)].iter().all(|&(a, b)| (lo..=hi).contains(&d(a, b))) {
+            let mut sc = in_cell_65(h2(1.4));
+            sc.nuclei = p.into_iter().map(|x| Nucleus::new(1, x)).collect();
+            return sc;
+        }
+    }
+}
+
+/// The outlier's store index in [`outlier_store`].
+const OUTLIER: usize = 130;
+
+/// The module doc's fixture: 100 H₃, 30 H₂, then the outlier (index [`OUTLIER`]); not fitted.
+fn outlier_store() -> SurrogateKs {
+    let (mut s, _) = pair_student();
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    let mut rng = StdRng::seed_from_u64(1804);
+    for _ in 0..100 {
+        let sc = h3(&mut rng, 1.0, 3.0);
+        s.add_sample(h_sample(&sc), &sc).unwrap();
+    }
+    for i in 0..30 {
+        let r = 1.2 + 1.4 * i as f64 / 29.0;
+        let sc = in_cell_65(dimer(r, unit_vector(&mut rng), [rng.gen_range(-0.3..0.3), 0.0, 0.0], 1, 1));
+        s.add_sample(h_sample(&sc), &sc).unwrap();
+    }
+    let sc = in_cell_65(dimer(0.9, unit_vector(&mut rng), [0.0; 3], 1, 1));
+    let mut out = h_sample(&sc);
+    out.forces.iter_mut().for_each(|f| f.iter_mut().for_each(|x| *x *= 2.5));
+    out.use_energy = false;
+    s.add_sample(out, &sc).unwrap();
+    assert_eq!(s.samples(), OUTLIER + 1);
+    s
+}
+
+/// The sample's own in-sample force residual over its bound (the training ranking's number).
+fn own_training_ratio(s: &SurrogateKs, k: usize) -> f64 {
+    let smp = &s.store.as_ref().unwrap().samples[k];
+    let pr = s.model.as_ref().unwrap().predict(&smp.pos, &smp.z, false).unwrap();
+    pr.forces
+        .iter()
+        .zip(&smp.forces)
+        .map(|(m, f)| {
+            let (d, b) = s.policy.force_residual(m, f);
+            d / b
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Spec R1's pinned behaviour: the training-residual ranking would hold the victims; the
+/// leave-one-out ranking holds the outlier alone and the model is trusted after the refit.
+///
+/// Measured (seed 1804): the entry fit is untrusted by a victim (max training force residual
+/// 2.6e-2 > 5.8e-3 Ha/Bohr, the H₂ at 1.2 Bohr) while the outlier's own residual is 0.86× its
+/// bound; the training ranking names 2 victims (the H₂ at 1.2 and 1.25 Bohr), and its five rounds
+/// hold 7 and end untrusted (6.0e-3 > 5.4e-3 Ha/Bohr) — the user's failure — the outlier still
+/// fitted; the leave-one-out ranking names the outlier alone at 28.8× (the next sample 6.0×), one
+/// round, trusted. Nearby variants behave alike (0.85–1.0 Bohr, forces × 1.6–2.5, seeds 1804, 1,
+/// 2, with the outlier's own ratio 0.57–0.98): the training ranking holds 5–8 victims, never the
+/// outlier, and the leave-one-out ranking the outlier alone; with a gentler outlier (× ≤ 1.8 at
+/// 0.85–0.95 Bohr) step 1's degree-cap retry recovers first, under either ranking.
+#[test]
+fn a_high_leverage_outlier_is_held_alone_and_trust_returns() {
+    // the premise, on the entry fit
+    let mut s = outlier_store();
+    s.fit_store().unwrap();
+    let t = s.training_residuals().unwrap();
+    println!("entry fit: {:?}; worst training force {:.2e} / {:.2e}; outlier's own training ratio {:.2}", s.untrusted_reason(), t.force, t.force_bound, own_training_ratio(&s, OUTLIER));
+    assert!(!s.trusted() && s.residuals_fail(), "the premise: the outlier untrusts the fit: {:?}", s.untrusted_reason());
+    assert!(own_training_ratio(&s, OUTLIER) <= 1.0, "the premise: the outlier is inside its own bound");
+    let (old, _) = s.training_offenders();
+    assert!(!old.is_empty() && !old.contains(&OUTLIER), "the premise: the training ranking names victims, not the outlier: {old:?}");
+    let (new, worst) = s.worst_offenders();
+    println!("training ranking {old:?}; leave-one-out ranking {new:?} (worst {worst:.2})");
+    assert_eq!(new, vec![OUTLIER], "the leave-one-out ranking names the outlier alone");
+    let ratios = s.loo_ratios().unwrap().to_vec();
+    let next = ratios.iter().filter(|r| r.0 != OUTLIER).map(|r| r.1).fold(0.0, f64::max);
+    println!("leave-one-out: outlier {worst:.2}, next {next:.2}");
+    assert!(worst > 2.0 * next, "every other sample below half the outlier's ratio");
+
+    // the recovery the training ranking would have run: victims held, the outlier fitted
+    let mut old_way = outlier_store();
+    old_way.training_ranking = true;
+    old_way.refit().unwrap();
+    println!(
+        "training ranking's refit: trusted {}, {} held ({:?}), outlier held {}; {:?}",
+        old_way.trusted(),
+        old_way.quarantined(),
+        (0..old_way.samples()).filter(|&i| old_way.is_quarantined(i)).collect::<Vec<_>>(),
+        old_way.is_quarantined(OUTLIER),
+        old_way.untrusted_reason()
+    );
+    assert!(old_way.quarantined() >= 5 && !old_way.is_quarantined(OUTLIER), "the training ranking holds victims");
+
+    // the refit as it is: the outlier alone, trusted
+    let mut s = outlier_store();
+    s.refit().unwrap();
+    let held: Vec<usize> = (0..s.samples()).filter(|&i| s.is_quarantined(i)).collect();
+    println!("leave-one-out ranking's refit: trusted {}, held {held:?}; note {:?}", s.trusted(), s.recovery_note());
+    assert_eq!(held, vec![OUTLIER], "the outlier is held, no victim is");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert_eq!(s.degree_cap, None, "step 2 recovered it on the default basis (step 1's cap retry did not)");
+    assert_eq!(
+        s.recovery_note(),
+        Some("1 samples quarantined — the fit without each predicts it at up to 29× its bound, and keeping them breaks the fit of their neighbours (1 this refit; kept, excluded from the fit; geometries near them fall back)")
+    );
+    assert_eq!(s.samples(), OUTLIER + 1, "never dropped");
+}
+
+/// [`loo_ratio`] on hand-made residuals (atomic units): ρ_E = |r_E|/N/tier for a whole-energy fit,
+/// |r_E|/tier per atom; d_j = ‖r_j‖/√3 against the atom's own bound max(2e-3, 10 %|F_j|) capped at
+/// 1e-2 (ρ) and against `force_std_abs` (ρ_σ); a masked-out atom (`None`) is skipped; an undefined
+/// leave-one-out and a NaN are ∞.
+#[test]
+fn the_leave_one_out_ratio_is_the_class_rules_reading() {
+    use surrogate::loo::SampleLoo;
+    let p = FallbackPolicy::default();
+    let s = Sample {
+        pos: vec![[0.0; 3], [1.4, 0.0, 0.0], [0.0, 3.0, 0.0]],
+        z: vec![1, 1, 1],
+        energy: -1.5,
+        // |F| 0.5 (bound capped at 1e-2), 0.01 (bound the 2e-3 floor), 0.05 (masked out below)
+        forces: vec![[0.5, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 0.05]],
+        tag: SampleTag::Scan,
+        weight: 1.0,
+        force_mask: None,
+        use_energy: true,
+    };
+    let l = SampleLoo { energy: Some(-6e-3), forces: vec![Some([0.0, 0.03 * 3f64.sqrt(), 0.0]), Some([0.0, 0.0, 0.004 * 3f64.sqrt()]), None] };
+    // energy: 6e-3 / 3 atoms / 1e-3 = 2 (whole-energy fit), 6 per atom;
+    // atom 0: d 0.03 / 1e-2 = 3 (ρ), / 2e-3 = 15 (ρ_σ); atom 1: d 0.004 / 2e-3 = 2 both
+    let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12;
+    assert!(close(loo_ratio(&p, false, &s, Some(&l)), (3.0, 15.0)), "{:?}", loo_ratio(&p, false, &s, Some(&l)));
+    assert!(close(loo_ratio(&p, true, &s, Some(&l)), (6.0, 15.0)), "{:?}", loo_ratio(&p, true, &s, Some(&l)));
+    let no_energy = Sample { use_energy: false, ..s.clone() };
+    let l2 = SampleLoo { energy: None, ..l.clone() };
+    assert!(close(loo_ratio(&p, false, &no_energy, Some(&l2)), (3.0, 15.0)));
+    let small = SampleLoo { energy: Some(1e-4), forces: vec![Some([0.0; 3]), Some([0.0; 3]), None] };
+    assert!(close(loo_ratio(&p, true, &s, Some(&small)), (0.1, 0.1)));
+    assert_eq!(loo_ratio(&p, false, &s, None), (f64::INFINITY, f64::INFINITY), "undefined (ruling R1a)");
+    let nan = SampleLoo { energy: Some(f64::NAN), ..l.clone() };
+    assert_eq!(loo_ratio(&p, false, &s, Some(&nan)), (f64::INFINITY, f64::INFINITY), "not a number: the worst");
+}
+
+/// Ruling R1b and the plan's review focus 2: the class pass leaves its ratios cached for its own
+/// fit — the numbers a fresh computation gives, bit for bit. A code moved between fits (a hold, a
+/// release) does not change the fit, and the ratios stay that fit's: a sample held since is still
+/// listed, one released since never is (the model never saw it). A new fit makes the cache stale;
+/// it is recomputed over the new fit's members, never read; a restored fit takes back its own; a
+/// forget drops it.
+#[test]
+fn the_leave_one_out_ratios_are_cached_for_their_own_fit_only() {
+    let mut s = outlier_store();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[7] = Q_HELD; // held at the fit
+    s.fit_store().unwrap(); // with the class pass
+    let cached = s.fresh_loo_ratios().cloned().expect("the class pass left this fit's ratios");
+    assert_eq!(cached.gen, s.model_gen);
+    assert_eq!(cached.rows.len(), OUTLIER, "every fitted sample (#7 is held)");
+    assert!(cached.rows.iter().all(|r| r.0 != 7));
+    s.loo_ratios = None;
+    let fresh = s.ensure_loo_ratios().cloned().unwrap();
+    assert_eq!(fresh, cached, "the class pass's numbers are a fresh computation's, bit for bit");
+    // between fits: the outlier held, #7 released — the fit that stands is unchanged
+    let saved = s.save_state();
+    s.quarantine[OUTLIER] = Q_HELD;
+    s.quarantine[7] = Q_NONE;
+    assert_eq!(s.fresh_loo_ratios(), Some(&cached), "still the standing fit's");
+    s.loo_ratios = None;
+    assert_eq!(s.loo_ratios().unwrap(), &cached.rows[..], "recomputed over the fit's own members: the released #7 is no member");
+    // the next fit (without the outlier, with #7): a new generation, its own ratios
+    s.species_dirty = true;
+    s.fit_store_deferred().unwrap();
+    assert!(s.fresh_loo_ratios().is_none(), "a deferred fit has no class pass: the cache is an earlier fit's");
+    let refit = s.loo_ratios().unwrap().to_vec();
+    assert_eq!(s.loo_ratios.as_ref().unwrap().gen, s.model_gen);
+    assert!(refit.iter().any(|r| r.0 == 7) && refit.iter().all(|r| r.0 != OUTLIER), "the new fit's members");
+    // the restored fit takes back its own (the caller restores the codes)
+    s.restore_state(saved);
+    s.quarantine[OUTLIER] = Q_NONE;
+    s.quarantine[7] = Q_HELD;
+    let back = s.fresh_loo_ratios().cloned().expect("the saved fit's ratios, re-keyed to the restored generation");
+    assert_eq!((back.rows, back.tier), (cached.rows.clone(), cached.tier.clone()));
+    assert_eq!(back.gen, s.model_gen);
+    // a forget: nothing
+    s.forget();
+    assert!(s.loo_ratios.is_none() && s.loo_ratios().is_none());
+}
+
+/// Ruling R1a and the plan's review focus 1: a sample whose leave-one-out is undefined ranks
+/// first — while one exists only those are taken — and when more of them than the 10 % cap
+/// allows are named, the round holds none of them (the cap is checked before holding); the trust
+/// rule then judges the fit that stands (untrusted, honestly).
+#[test]
+fn undefined_leave_one_out_ranks_first_and_never_crosses_the_cap() {
+    let mut s = outlier_store();
+    s.fit_store().unwrap();
+    assert!(s.residuals_fail());
+    let gen = s.model_gen;
+    let rows = s.loo_ratios().unwrap().to_vec();
+    // as if these samples alone spanned a direction of the fit
+    let inject = |s: &mut SurrogateKs, undefined: &[usize]| {
+        let rows: Vec<(usize, f64)> = rows.iter().map(|&(i, r)| (i, if undefined.contains(&i) { f64::INFINITY } else { r })).collect();
+        let tier = rows.iter().map(|r| r.1).collect();
+        s.loo_ratios = Some(LooRatios { gen, rows, tier });
+    };
+    inject(&mut s, &[3, 40]);
+    assert_eq!(s.worst_offenders(), (vec![3, 40], f64::INFINITY), "only the undefined ones, ahead of the outlier");
+    // more undefined than the cap allows (10 % of 131 = 13.1): nothing is held
+    let many: Vec<usize> = (0..20).collect();
+    inject(&mut s, &many);
+    let report = s.report().unwrap().clone();
+    let (_, worst) = s.quarantine_rounds(report);
+    println!("20 undefined: held {}, trusted {} {:?}", s.quarantined(), s.trusted(), s.untrusted_reason());
+    assert_eq!((s.quarantined(), worst), (0, 0.0), "the cap is checked before holding");
+    assert!(!s.trusted(), "the trust rule judges what stands");
+}
+
+/// A background refit's install takes the copy's ratios with its fit: fresh for the installed
+/// model, the numbers of a fresh computation.
+#[test]
+fn a_background_refit_installs_its_leave_one_out_ratios() {
+    let mut s = outlier_store();
+    s.refit().unwrap();
+    let sc = in_cell_65(dimer(1.5, [0.0, 1.0, 0.0], [0.0; 3], 1, 1));
+    s.add_sample(h_sample(&sc), &sc).unwrap();
+    assert!(s.begin_background_refit());
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    let installed = s.fresh_loo_ratios().cloned().expect("the copy's ratios, fresh for the installed fit");
+    assert_eq!(installed.rows.len(), OUTLIER + 1, "the members: all but the held outlier, and the new sample");
+    s.loo_ratios = None;
+    assert_eq!(s.ensure_loo_ratios().cloned().unwrap(), installed);
+}
+
+/// A fresh copy of the collection folder `SURROGATE_RECOVERY_SNAPSHOT` names, opened (the copy's
+/// temp root is `tag`'s).
+fn snapshot_copy(tag: &str) -> surrogate::Collection {
+    let src = std::path::PathBuf::from(std::env::var("SURROGATE_RECOVERY_SNAPSHOT").expect("SURROGATE_RECOVERY_SNAPSHOT names a collection folder copy"));
+    let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(src.join("key.txt")).unwrap()).unwrap();
+    let root = collection_root(tag);
+    let dst = root.join(key.slug());
+    std::fs::create_dir_all(&dst).unwrap();
+    for f in ["key.txt", "references.txt", "samples.bin", "history.bin"] {
+        if src.join(f).exists() {
+            std::fs::copy(src.join(f), dst.join(f)).unwrap();
+        }
+    }
+    surrogate::Collection::open(&root, &key).unwrap().0
+}
+
+/// The worst training ratio of the fit that stands and the samples above `floor`, worst first.
+fn training_ratios(s: &SurrogateKs, floor: f64) -> (f64, Vec<(usize, f64)>) {
+    let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
+    let mut out: Vec<(usize, f64)> = Vec::new();
+    for (i, smp) in store.samples[..s.accumulated.min(store.len())].iter().enumerate() {
+        if s.excluded(i) {
+            continue;
+        }
+        let Ok(pr) = model.predict(&smp.pos, &smp.z, false) else { continue };
+        let n = smp.pos.len().max(1) as f64;
+        let mut r = if smp.use_energy { (pr.energy - smp.energy).abs() / n / s.policy.energy_std_per_atom } else { 0.0 };
+        for (j, (fm, fs)) in pr.forces.iter().zip(&smp.forces).enumerate() {
+            if smp.trains_atom(j) {
+                let (d, b) = s.policy.force_residual(fm, fs);
+                r = r.max(d / b);
+            }
+        }
+        out.push((i, r));
+    }
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let worst = out.first().map_or(0.0, |x| x.1);
+    (worst, out.into_iter().filter(|x| x.1 > floor).collect())
+}
+
+/// The steps behind [`recovery_on_a_collection_snapshot`]'s result, one fit at a time (a
+/// diagnostic; same copy rule): the entry fit from the file's codes, the release, the
+/// recovery's rounds as `quarantine_rounds` takes them — and, for comparison, #1804 held before
+/// the entry fit (the collection debug's "#1804 only" measurement, which has no release step).
+///
+/// `SURROGATE_RECOVERY_SNAPSHOT=<copy>/<slug> cargo test -p providers --release --lib recovery_snapshot_steps -- --ignored --nocapture`
+#[test]
+#[ignore = "diagnostic on a copy of a collection snapshot (SURROGATE_RECOVERY_SNAPSHOT)"]
+fn recovery_snapshot_steps() {
+    let c = snapshot_copy("recovery-steps");
+    let disk = c.quarantine.clone();
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.attach(c).unwrap();
+    let lone: Vec<usize> = (0..s.quarantine.len()).filter(|&i| s.quarantine[i] == Q_LONE).collect();
+    let set_codes = |s: &mut SurrogateKs, codes: &[u8]| {
+        s.quarantine = codes.to_vec();
+        s.quarantine.resize(s.samples(), Q_NONE);
+        for &i in &lone {
+            s.quarantine[i] = Q_LONE;
+        }
+        s.degree_cap = None;
+        s.species_dirty = true;
+        s.fit_store_deferred().unwrap();
+    };
+    let show = |s: &mut SurrogateKs, label: &str| {
+        let (worst, over) = training_ratios(s, 1.0);
+        let (loo, lw) = s.worst_offenders();
+        println!(
+            "{label}: n {}, held {}, worst training ratio {worst:.4}, {} samples > 1 {:?}; residuals pass {}; LOO offenders {} (worst {lw:.2}) {:?}",
+            s.report().unwrap().n_samples,
+            s.quarantined(),
+            over.len(),
+            &over[..over.len().min(6)],
+            !s.recoverable_fail(),
+            loo.len(),
+            &loo[..loo.len().min(12)]
+        );
+    };
+    // (a) the collection debug's measurement: #1804 out before the entry fit, no release
+    let mut codes = disk.clone();
+    codes[1804] = Q_HELD;
+    set_codes(&mut s, &codes);
+    show(&mut s, "(a) #1804 held before the entry fit, nothing released");
+    // (b) the refit's own order: the entry fit, the release, then the rounds
+    set_codes(&mut s, &disk);
+    show(&mut s, "(b) entry fit (the file's codes)");
+    let before: Vec<u8> = s.quarantine.clone();
+    let released = s.release_reproduced();
+    let which: Vec<usize> = (0..before.len()).filter(|&i| before[i] == Q_HELD && s.quarantine[i] != Q_HELD).collect();
+    s.species_dirty = true;
+    s.fit_store_deferred().unwrap();
+    show(&mut s, &format!("    released {released} {which:?} (by the fit with #1804), refitted"));
+    let n_store = s.samples();
+    for round in 1..=QUARANTINE_ROUNDS {
+        if !s.recoverable_fail() {
+            break;
+        }
+        let (worst, _) = s.worst_offenders();
+        if round == 1 && n_store == 1805 {
+            assert_eq!(worst, vec![1804], "round 1 holds #1804 alone");
+        }
+        if worst.is_empty() || (s.quarantined() + worst.len()) as f64 > QUARANTINE_MAX_FRACTION * n_store as f64 {
+            println!("    round {round}: stops ({} offenders)", worst.len());
+            break;
+        }
+        s.quarantine.resize(n_store, Q_NONE);
+        for &i in &worst {
+            s.quarantine[i] = Q_HELD;
+        }
+        s.species_dirty = true;
+        s.fit_store_deferred().unwrap();
+        show(&mut s, &format!("    round {round}: held {} ({:?})", worst.len(), &worst[..worst.len().min(12)]));
+    }
+    // (c) #1804 held and the released sample(s) back in the fit, nothing else
+    let mut codes = disk.clone();
+    codes[1804] = Q_HELD;
+    for &i in &which {
+        codes[i] = Q_NONE;
+    }
+    set_codes(&mut s, &codes);
+    show(&mut s, &format!("(c) #1804 held and {which:?} released"));
+}
+
+/// One line of the measurement: the standing fit's held set, #1804, the worst training ratios, the
+/// verdict.
+fn report_line(s: &SurrogateKs, label: &str, wall: f64) {
+    let t = s.training_residuals().unwrap();
+    let r = s.report().unwrap();
+    println!(
+        "{label}: {wall:.1} s, {} fits so far; Q′ {}, n {}; held {} (cap {:.1}), #1804 held {}; worst training E/atom {:.2e} (ratio {:.3}), F {:.2e} / {:.2e} (ratio {:.4}); trusted {} {:?}\n    recovery: {:?}",
+        s.fits,
+        r.q_prime,
+        r.n_samples,
+        s.quarantined(),
+        QUARANTINE_MAX_FRACTION * s.samples() as f64,
+        s.is_quarantined(1804),
+        t.energy_per_atom,
+        t.energy_per_atom / s.policy.energy_std_per_atom,
+        t.force,
+        t.force_bound,
+        t.force / t.force_bound,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+}
+
+/// The spec's measurement (R1, "Pinned behaviour"; `references.md` "Leave-one-out recovery
+/// ranking"): a **copy** of a collection snapshot is attached and refitted as the app does, then
+/// refitted once more (the app's next refit, nothing new). The folder (a collection directory:
+/// `key.txt`, `samples.bin`, …) comes from `SURROGATE_RECOVERY_SNAPSHOT` and is copied again into
+/// a fresh temp root here, so neither it nor any user folder is written. Prints the held set's
+/// size, whether #1804 is held, the worst training ratios, the trust verdict and the wall time.
+///
+/// On the user's pre-1805 snapshot it asserts what the ranking itself decides: #1804 is held.
+/// The spec expected the refit to end trusted with fewer than 110 held; measured 2026-11-12 it
+/// does not (untrusted at 1.0185× the force bound, 128 held — `references.md` has the numbers and
+/// [`recovery_snapshot_steps`] the reason: the refit's release step, which runs before the
+/// recovery against the fit #1804 still bends, puts #1455 back, and the fit without #1804 but
+/// with #1455 is at 1.0070×, against 0.9991× without both). Not asserted: it is a finding about
+/// the release order and this collection's 0.1 % margin, not about the ranking.
+///
+/// `SURROGATE_RECOVERY_SNAPSHOT=<copy>/<slug> cargo test -p providers --release --lib recovery_on_a_collection_snapshot -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement on a copy of a collection snapshot (SURROGATE_RECOVERY_SNAPSHOT)"]
+fn recovery_on_a_collection_snapshot() {
+    let c = snapshot_copy("recovery-snapshot");
+    let disk_held = c.quarantine.iter().filter(|&&q| q == Q_HELD).count();
+    println!("snapshot: {} samples, {disk_held} held on disk", c.samples.len());
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let t0 = std::time::Instant::now();
+    s.attach(c).unwrap();
+    if s.report().is_none() {
+        SurrogateKs::refit(&mut s).unwrap();
+    }
+    report_line(&s, "attach + refit", t0.elapsed().as_secs_f64());
+    let mut top = s.loo_ratios().unwrap().to_vec();
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!("    leave-one-out ranking of the fit that stands, top 5: {:?}", &top[..top.len().min(5)]);
+    let held_1804 = s.is_quarantined(1804);
+    let (fits, t1) = (s.fits, std::time::Instant::now());
+    SurrogateKs::refit(&mut s).unwrap();
+    report_line(&s, &format!("the next refit ({} fits)", s.fits - fits), t1.elapsed().as_secs_f64());
+    if s.samples() == 1805 {
+        assert!(held_1804, "#1804 is held");
+    }
+}
+
+/// A diagnostic (no assertion; in-repo data, < 1 s): the stuck-H collection's recovery
+/// (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`; `references.md`
+/// "M8a stuck collection") round by round under both rankings, on the capped basis (step 2) and on
+/// the default basis from the entry codes (step 3) — the rounds as `quarantine_rounds` takes them.
+/// Measured 2026-11-12: the training ranking's step 3 holds #575 first (in-sample 21.8×) and ends
+/// trusted at 38 held (0.961); the leave-one-out ranking's holds #561 and #575 (22.4×), then #560,
+/// then high-leverage samples whose in-sample residuals pass (26 in round 4, worst 3.3×), and ends
+/// untrusted at 47 held (1.597) — the regression `references.md` "Leave-one-out recovery ranking"
+/// reports.
+///
+/// `cargo test -p providers --release --lib stuck_collection_rounds_under_both_rankings -- --ignored --nocapture`
+#[test]
+#[ignore = "diagnostic: prints the stuck collection's rounds under both rankings"]
+fn stuck_collection_rounds_under_both_rankings() {
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/stuck-h-collection").join(SLUG);
+    for training in [true, false] {
+        let dir = collection_root(if training { "stuck-rounds-t" } else { "stuck-rounds-l" });
+        std::fs::create_dir_all(dir.join(SLUG)).unwrap();
+        for f in ["key.txt", "references.txt", "samples.bin", "history.bin"] {
+            std::fs::copy(src.join(f), dir.join(SLUG).join(f)).unwrap();
+        }
+        let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(src.join("key.txt")).unwrap()).unwrap();
+        let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+        let live = c.quarantine.clone();
+        let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.body4_off = true;
+        s.attach(c).unwrap();
+        for cap in [Some(RECOVERY_DEGREE_CAP), None] {
+            s.quarantine = live.clone();
+            s.degree_cap = cap;
+            s.species_dirty = true;
+            s.fit_store_deferred().unwrap();
+            println!("== {} ranking, cap {cap:?}", if training { "training" } else { "loo" });
+            for round in 1..=QUARANTINE_ROUNDS {
+                let (w, ratio) = if training { s.training_offenders() } else { s.worst_offenders() };
+                let (tw, tover) = training_ratios(&s, 1.0);
+                println!("  round {round}: worst training {tw:.2} ({} > 1), held {}, offenders {} (worst {ratio:.2}) {:?}", tover.len(), s.quarantined(), w.len(), &w[..w.len().min(10)]);
+                if !s.recoverable_fail() || w.is_empty() || (s.quarantined() + w.len()) as f64 > 0.1 * 578.0 {
+                    println!("  stop: recoverable_fail {}", s.recoverable_fail());
+                    break;
+                }
+                for &i in &w {
+                    s.quarantine[i] = Q_HELD;
+                }
+                s.species_dirty = true;
+                s.fit_store_deferred().unwrap();
+            }
+            let (tw, _) = training_ratios(&s, 1.0);
+            println!("  end: worst training {tw:.3}, held {}, trusted-by-residuals {}", s.quarantined(), !s.recoverable_fail());
+            if !training {
+                let mut r = s.loo_ratios().unwrap().to_vec();
+                r.sort_by(|a, b| b.1.total_cmp(&a.1));
+                println!("  LOO top 8: {:?}", &r[..8]);
+                println!("  #575 LOO: {:?}", r.iter().find(|x| x.0 == 575));
+            }
+        }
+    }
+}

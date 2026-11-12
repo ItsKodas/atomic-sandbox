@@ -118,6 +118,82 @@ pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) ->
     }
 }
 
+/// One fitted sample's **leave-one-out ratio** (spec `2026-11-12-sample-recovery-design.md` R1;
+/// the recovery's offender ranking since then, `worst_offenders`; the Model tab's "worst-fitting
+/// samples"). Atomic units throughout (Hartree, Bohr).
+///
+/// `surrogate::loo` gives the sample's residual under the fit **without it**, at the fit's own
+/// hyperparameters: r = y − ŷ₋ (target minus the prediction of the fit that never saw the
+/// sample) — the energy part r_E (Hartree per atom when the fit is per atom, else Hartree) when
+/// its energy was fitted, and per fitted atom j the force part r_j (Ha/Bohr). The fit without the
+/// sample therefore predicts F_j − r_j at atom j, and with N the sample's atom count:
+///
+/// ```text
+///   ρ_E = |r_E| / energy_std_per_atom            per-atom fit
+///   ρ_E = |r_E| / N / energy_std_per_atom        whole-energy fit   (0 when the energy was not fitted)
+///   d_j = force_residual(F_j − r_j, F_j).0 = ‖r_j‖/√3,   b_j = force_bound(|F_j|) = force_residual(…).1
+///   ρ   = max(ρ_E, max_j d_j / b_j)              each atom against its own bound (the class rule's reading)
+///   ρ_σ = max(ρ_E, max_j d_j / force_std_abs)    the absolute tier (the recovery when only σ_f fails)
+/// ```
+///
+/// exactly the numbers the class pass reads (`trust::compute_class_loo_full`: `e_ratio` and
+/// `force_residual(&[f − r], f)`), over the same fitted rows (a masked sample's interior atoms;
+/// `r_j` is `None` for the others). **Ruling R1a:** an undefined residual (`l` is `None`: the
+/// sample's block I − H_ss is singular — it alone spans a direction of the fit — as the class
+/// rule's `a.3 = ∞`) and a ratio that is not a number are ∞: such a sample ranks first. Returns
+/// (ρ, ρ_σ).
+pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64) {
+    let Some(l) = l else { return (f64::INFINITY, f64::INFINITY) };
+    let n = s.pos.len().max(1) as f64;
+    let e = if s.use_energy { l.energy.map_or(f64::INFINITY, |e| (if per_atom { e.abs() } else { e.abs() / n }) / p.energy_std_per_atom) } else { 0.0 };
+    let (mut own, mut tier) = (e, e);
+    for (r, f) in l.forces.iter().zip(&s.forces) {
+        let Some(r) = r else { continue };
+        let (d, b) = p.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+        own = super::trust::max_nan(own, d / b);
+        tier = super::trust::max_nan(tier, d / p.force_std_abs);
+    }
+    let undefined_is_worst = |x: f64| if x.is_nan() { f64::INFINITY } else { x };
+    (undefined_is_worst(own), undefined_is_worst(tier))
+}
+
+/// The per-sample leave-one-out ratios ([`loo_ratio`]) of one fit (spec ruling R1b): filled by
+/// the class pass (`refresh_class_loo`), which computes every fitted sample's leave-one-out
+/// anyway, or by [`SurrogateKs::ensure_loo_ratios`] for a fit whose class pass was deferred.
+/// **Keyed to the fit**: valid only while the provider's `model_gen` is still `gen` (bumped by
+/// every fit, restored state, install, attach, forget and policy change) **and** the `rows`' indices
+/// are the standing fit's own members (`fit_members`: the samples that fit was built from). A stale
+/// cache is never read: it is recomputed, over those members. A hold, a release or a forget between
+/// fits changes the quarantine codes but not the fit: the ratios stay the standing fit's — a sample
+/// held since is still listed (the model still holds it), a sample released since is not (the
+/// model never saw it: a leave-one-out "as if fitted" would downdate rows the fit does not hold).
+/// The next fit replaces them.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LooRatios {
+    /// The `model_gen` of the fit they were computed for.
+    pub(super) gen: u64,
+    /// Per fitted sample in store order: (store index, ρ — each atom against its own bound).
+    pub(super) rows: Vec<(usize, f64)>,
+    /// Per row: ρ_σ — the forces against `force_std_abs`.
+    pub(super) tier: Vec<f64>,
+}
+
+/// The recovery note's words for quarantine rounds (spec R1, "The recovery note says what was
+/// done"): `held` samples quarantined in all, `added` of them by this refit, `worst` the largest
+/// leave-one-out ratio among the ones the rounds held — ∞ when one of them has no leave-one-out
+/// prediction (ruling R1a). Rounded: a whole number from 10×, one decimal below.
+pub(super) fn quarantine_words(held: usize, added: usize, worst: f64) -> String {
+    let why = if worst.is_finite() {
+        let r = if worst >= 10.0 { format!("{worst:.0}") } else { format!("{worst:.1}") };
+        format!("the fit without each predicts it at up to {r}× its bound")
+    } else {
+        "the fit without one of them cannot predict it at all (it alone spans a direction of the fit)".to_string()
+    };
+    format!(
+        "{held} samples quarantined — {why}, and keeping them breaks the fit of their neighbours ({added} this refit; kept, excluded from the fit; geometries near them fall back)"
+    )
+}
+
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
 /// (a feature the training never varied counts as infinitely far once the two differ).
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
@@ -343,7 +419,7 @@ impl SurrogateKs {
         }
         // 2. quarantine the worst offenders on the standing basis, round by round
         let before = self.quarantined();
-        let report = self.quarantine_rounds(report);
+        let (report, worst) = self.quarantine_rounds(report);
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
@@ -357,12 +433,11 @@ impl SurrogateKs {
             self.degree_cap = None;
             self.species_dirty = true;
             if let Ok(r) = self.fit_store_deferred() {
-                let r = self.quarantine_rounds(r);
+                let (r, worst) = self.quarantine_rounds(r);
                 if !self.recoverable_fail() && !self.trust_needs_samples() {
                     self.recovery = Some(format!(
-                        "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {} samples quarantined — the model cannot represent them ({} this refit; kept, excluded from the fit; geometries near them fall back)",
-                        self.quarantined(),
-                        self.quarantined() - entry_held
+                        "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {}",
+                        quarantine_words(self.quarantined(), self.quarantined() - entry_held, worst)
                     ));
                     return r;
                 }
@@ -372,22 +447,27 @@ impl SurrogateKs {
             self.quarantine = q;
             self.species_dirty = d;
             self.recovery = note;
-            return self.note_quarantined(before, rep);
+            return self.note_quarantined(before, rep, worst);
         }
-        self.note_quarantined(before, report)
+        self.note_quarantined(before, report, worst)
     }
 
-    /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits
-    /// without them, up to [`QUARANTINE_ROUNDS`] rounds, never past [`QUARANTINE_MAX_FRACTION`] of
-    /// the store; a failed fit restores the previous one and stops.
-    fn quarantine_rounds(&mut self, report: FitReport) -> FitReport {
+    /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders by their
+    /// leave-one-out ratio ([`worst_offenders`](Self::worst_offenders)) and refits without them, up
+    /// to [`QUARANTINE_ROUNDS`] rounds, never past [`QUARANTINE_MAX_FRACTION`] of the store — the
+    /// cap is checked before a round holds anything, so a round whose offenders would cross it
+    /// (many undefined leave-one-out residuals, all ranked ∞, among them) holds none of them and
+    /// ends the rounds; a failed fit restores the previous one and stops. Returns the report that
+    /// stands and the largest leave-one-out ratio among the samples it held (0 when none).
+    pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, f64) {
         let mut report = report;
+        let mut held_worst = 0.0f64;
         let n_store = self.samples();
         for _ in 0..QUARANTINE_ROUNDS {
             if !self.recoverable_fail() {
                 break;
             }
-            let worst = self.worst_offenders();
+            let (worst, ratio) = self.worst_offenders();
             let total = self.quarantined() + worst.len();
             if worst.is_empty() || total as f64 > QUARANTINE_MAX_FRACTION * n_store as f64 {
                 break;
@@ -400,7 +480,10 @@ impl SurrogateKs {
             }
             self.species_dirty = true; // rebuild without them
             match self.fit_store_deferred() {
-                Ok(r) => report = r,
+                Ok(r) => {
+                    report = r;
+                    held_worst = held_worst.max(ratio);
+                }
                 Err(_) => {
                     self.restore_state(saved);
                     self.quarantine = flags;
@@ -408,17 +491,15 @@ impl SurrogateKs {
                 }
             }
         }
-        report
+        (report, held_worst)
     }
 
-    /// The recovery note of quarantine rounds that added samples since `before` held.
-    fn note_quarantined(&mut self, before: usize, report: FitReport) -> FitReport {
+    /// The recovery note of quarantine rounds that added samples since `before` held; `worst` is
+    /// the largest leave-one-out ratio among the samples they held.
+    fn note_quarantined(&mut self, before: usize, report: FitReport, worst: f64) -> FitReport {
         let added = self.quarantined().saturating_sub(before);
         if added > 0 {
-            self.recovery = Some(format!(
-                "{} samples quarantined — the model cannot represent them ({added} this refit; kept, excluded from the fit; geometries near them fall back)",
-                self.quarantined()
-            ));
+            self.recovery = Some(quarantine_words(self.quarantined(), added, worst));
         }
         report
     }
@@ -558,14 +639,102 @@ impl SurrogateKs {
         self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
-    /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
-    /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
-    /// factor 2 of the worst ratio. The force bound is the policy's per-atom bound while the
-    /// training residuals fail; when only the force noise does (σ_f above `force_std_abs`, the
-    /// trust rule's noise condition) it is the absolute `force_std_abs`: the samples whose force
-    /// residuals put σ_f above the tier are the ones the recovery takes out.
-    pub(super) fn worst_offenders(&self) -> Vec<usize> {
-        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return Vec::new() };
+    /// The recovery's offenders (spec R1, since 2026-11-12): the fitted samples (not excluded, not
+    /// box-affected) whose **leave-one-out ratio** ([`loo_ratio`]: how far the fit *without* the
+    /// sample misses it — the per-atom energy over its threshold or the worst atom's force over
+    /// its bound) exceeds 1 and is within a factor 2 of the worst such ratio; and that worst ratio
+    /// (0 without a fit). The force bound is the policy's per-atom bound while the training
+    /// residuals fail; when only the force noise does (σ_f above `force_std_abs`, the trust rule's
+    /// noise condition) it is the absolute `force_std_abs` (ρ_σ). An undefined leave-one-out is ∞
+    /// (ruling R1a): such samples rank first, and only they are taken while one exists.
+    ///
+    /// Why not the training residual (the ranking before; [`training_offenders`](Self::training_offenders)
+    /// keeps it for the tests' premises): a high-leverage sample is reproduced at its neighbours'
+    /// expense and sits inside its own bound. The user's collection (2026-11-12): a compressed OH
+    /// at 0.72 Ha/Bohr, inside its 1e-2 cap, bent the shared O–H pair term and 34 H₂O/H₃O samples
+    /// failed; ranked by their own residuals the rounds held those victims, round after round, and
+    /// never the sample. Its leave-one-out ratio (38.5× in force, 962× in energy) is rank 1.
+    ///
+    /// The ratios are the class pass's for the fit that stands when it ran (ruling R1b), else
+    /// computed here once for this fit ([`ensure_loo_ratios`](Self::ensure_loo_ratios); the fits
+    /// inside a refit defer the class pass).
+    pub(super) fn worst_offenders(&mut self) -> (Vec<usize>, f64) {
+        #[cfg(test)]
+        if self.training_ranking {
+            return self.training_offenders();
+        }
+        let absolute = !self.residuals_fail();
+        let Some(c) = self.ensure_loo_ratios() else { return (Vec::new(), 0.0) };
+        let ratios: Vec<(usize, f64)> = c.rows.iter().zip(&c.tier).map(|(&(i, own), &tier)| (i, if absolute { tier } else { own })).collect();
+        let ratios: Vec<(usize, f64)> = ratios.into_iter().filter(|&(i, _)| !self.is_box(i)).collect();
+        let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
+        if worst <= 1.0 {
+            return (Vec::new(), worst);
+        }
+        (ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect(), worst)
+    }
+
+    /// The standing fit's members in store order (`fit_members`: the accumulated prefix and the
+    /// quarantine codes when it was installed, the samples with no code). Right after a fit they are
+    /// the class pass's and the training residuals' members; between fits a code may move without
+    /// the fit (a hold, a release, a forget), and these stay the fit's.
+    fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        let (n, codes) = (&self.fit_members.0, &self.fit_members.1);
+        let n = self.store.as_ref().map_or(0, |st| (*n).min(st.len()));
+        (0..n).filter(move |&i| codes.get(i).is_none_or(|&q| q == Q_NONE))
+    }
+
+    /// The per-sample leave-one-out ratios of the fit that stands, when the cache holds this fit's
+    /// ([`LooRatios`]: the same model generation and the fit's own members); `None` when stale or
+    /// without a model. Read-only, for a caller that cannot compute (`&self`): every refit leaves
+    /// the cache fresh (`refit_inner`), and it stays fresh until the next fit.
+    pub(super) fn fresh_loo_ratios(&self) -> Option<&LooRatios> {
+        let c = self.loo_ratios.as_ref()?;
+        (self.model.is_some() && c.gen == self.model_gen && c.rows.iter().map(|r| r.0).eq(self.fit_member_indices())).then_some(c)
+    }
+
+    /// [`fresh_loo_ratios`](Self::fresh_loo_ratios), computing them for the fit that stands when the
+    /// cache is stale (`surrogate::loo::leave_one_out_many` over the members, then [`loo_ratio`] —
+    /// the class pass's numbers, bit for bit). `None` without a model or a store.
+    pub(super) fn ensure_loo_ratios(&mut self) -> Option<&LooRatios> {
+        if self.fresh_loo_ratios().is_none() {
+            let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
+            let members: Vec<usize> = self.fit_member_indices().collect();
+            let samples: Vec<&Sample> = members.iter().map(|&i| &store.samples[i]).collect();
+            let loos = surrogate::loo::leave_one_out_many(model, &samples);
+            let (mut rows, mut tier) = (Vec::with_capacity(members.len()), Vec::with_capacity(members.len()));
+            for ((&i, s), l) in members.iter().zip(&samples).zip(&loos) {
+                let (own, t) = loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+                rows.push((i, own));
+                tier.push(t);
+            }
+            self.loo_ratios = Some(LooRatios { gen: self.model_gen, rows, tier });
+        }
+        self.loo_ratios.as_ref()
+    }
+
+    /// **The per-sample leave-one-out ranking's accessor** (spec R1b; the Model tab's
+    /// "Worst-fitting samples", plan Task 2): per fitted sample of the fit that stands, in store
+    /// order, (store index, leave-one-out ratio ρ). ρ is [`loo_ratio`]'s first number: the larger
+    /// of the per-atom energy residual over `energy_std_per_atom` and the worst atom's force
+    /// residual over that atom's own bound `force_bound(|F|)`, both of the fit without the sample.
+    /// `f64::INFINITY` stands for an undefined residual (the sample alone spans a direction of the
+    /// fit, ruling R1a). The rows are the standing fit's members: a sample held or forgotten since
+    /// that fit is still listed until the next fit (filter by its current code), one released since
+    /// is not. Computed when the cache is stale (another fit since); `None` without a model or a
+    /// store. Not sorted: rank by the ratio. ([`fresh_loo_ratios`](Self::fresh_loo_ratios) is the
+    /// read-only form.)
+    pub fn loo_ratios(&mut self) -> Option<&[(usize, f64)]> {
+        self.ensure_loo_ratios().map(|c| &c.rows[..])
+    }
+
+    /// The offender ranking before 2026-11-12 (spec R1): the training samples whose **in-sample**
+    /// residual ratio exceeds 1 and is within a factor 2 of the worst, and that worst — the tests'
+    /// premise that a high-leverage sample hides from it. The recovery uses it only under the
+    /// test-only `training_ranking`.
+    #[cfg(test)]
+    pub(super) fn training_offenders(&self) -> (Vec<usize>, f64) {
+        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return (Vec::new(), 0.0) };
         let p = &self.policy;
         let absolute = !self.residuals_fail();
         let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
@@ -586,9 +755,9 @@ impl SurrogateKs {
             .collect();
         let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
         if worst <= 1.0 {
-            return Vec::new();
+            return (Vec::new(), worst);
         }
-        ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect()
+        (ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect(), worst)
     }
 
     /// The extrapolation grade's active sets (rule 5e) over the atoms of the samples the current

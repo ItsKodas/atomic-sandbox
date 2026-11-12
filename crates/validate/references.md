@@ -4090,7 +4090,55 @@ The leave-one-out pass is linear in the samples and quadratic in Q′ (3N + 1 ro
 
 **Before / after on the user's collection** (the test; the live state = the collection's 8 held + cap 6): before, Q′ 51, n 570, worst 2.6e-2 Ha/atom, untrusted, and the old refit left it unchanged; after one refit, default basis Q′ 29, n 540, worst **6.8e-4** Ha/atom (allowed 1.0e-3), trusted, **38 held** (8 before, 30 this refit): the stretched H₂ #293/#294/#575 (5.2–5.6 Bohr), the compressed H₂ #360/#361 (0.82–0.88 Bohr, 81³) and #573/#574 (0.69 Bohr, 101³), the H₃ scan points #431–#435 (0.195–1.09 Bohr), and H₂/H₃ fallbacks among #288–#392 and #541–#564 (the H₃ ones at 1.3–2.6 Bohr with residuals up to 5.8e-2 Ha/atom).
 
+**Open since 2026-11-12 (the leave-one-out recovery ranking, section "Leave-one-out recovery ranking" below):** under that ranking step 3's rounds end untrusted (47 held, 1.597×) and the test fails; the numbers above are the training-residual ranking's.
+
 **What stays approximate (rule 7).** The capped basis with only #575 held would be trusted with 1 sample held; the recovery cannot find that one sample under the cap (the spread misfit names none) and takes the default basis with 38 held instead. Geometries within `QUARANTINE_FRACTION` of a held one fall back; a later refit releases any held sample the model then reproduces. The stretched singlet labels themselves are the teacher's physics (lowest-spin automatic multiplicity, LSDA), not corrected.
+
+## Leave-one-out recovery ranking (2026-11-12; spec `2026-11-12-sample-recovery-design.md` R1; `providers::surrogate::quarantine` `worst_offenders`, `loo_ratio`; tests `surrogate::tests::recovery_loo`; release, Ryzen 7 9800X3D, CPU, the user's app open)
+
+**Change.** The trust recovery's quarantine rounds rank offenders by their **leave-one-out ratio** — the larger of the fit-without-the-sample's energy residual per atom over `energy_std_per_atom` (when its energy was fitted) and, over its fitted atoms, ‖r_j‖/√3 over the atom's bound (`force_bound(|F_j|)`, or `force_std_abs` when only the force noise fails) — instead of the in-sample training residual. Same rounds (5), cap (10 %), degree-cap steps, release and trust rule. An undefined leave-one-out is ∞ (ranks first). The ratios are the class pass's, cached per fit (model generation + members); the deferred fits inside a refit compute them once per round.
+
+**Analytic fixture** (`a_high_leverage_outlier_is_held_alone_and_trust_returns`; `SpeciesMorse` H surface, 100 H₃ with pairs 1.0–3.0 Bohr, 30 H₂ 1.2–2.6 Bohr, one force-only H₂ at 0.9 Bohr with forces 2.5× the surface's, |F| 0.83 Ha/Bohr, bound the 1e-2 cap; seed 1804):
+
+| | entry fit | training-residual ranking (before) | leave-one-out ranking (now) |
+|---|---|---|---|
+| worst training force | 2.6e-2 > 5.8e-3 Ha/Bohr (the H₂ at 1.2 Bohr) | 6.0e-3 > 5.4e-3, **untrusted** after 5 rounds | trusted |
+| the outlier's own ratio | 0.86 (inside its bound) | — | — |
+| round 1 names | — | #100, #101 (the H₂ at 1.2, 1.25 Bohr) | the outlier alone, **28.8×** (next sample 6.0×) |
+| held | — | 7 victims (#8, #100–105), outlier fitted | **1** (the outlier) |
+
+Nearby variants (0.85–1.0 Bohr, forces × 1.6–2.5, seeds 1804/1/2; outlier's own ratio 0.57–0.98): the training ranking holds 5–8 victims and never the outlier; the leave-one-out ranking holds the outlier alone, trusted. At × ≤ 1.8 and 0.85–0.95 Bohr step 1's degree-cap retry recovers first under either ranking. The outlier's energy row is left out (`use_energy: false`): with its (consistent) energy row the H-only basis (Q′ 29) cannot fit that row by a direction of its own as #1804's was, the outlier fails its own 1e-3 Ha/atom tier in-sample and both rankings name it (e.g. 1.4e-2 Ha/atom at 0.95 Bohr × 2).
+
+**The user's collection, pre-1805 snapshot** (`recovery_on_a_collection_snapshot` and `recovery_snapshot_steps`, `#[ignore]`d; `SURROGATE_RECOVERY_SNAPSHOT=<copy>/<slug> cargo test -p providers --release --lib recovery_ -- --ignored --nocapture --test-threads 1`, run on a copy of the collection debug's `pre1805` cut, itself copied again into a temp root by the test; 1 805 samples, 105 held + 1 superseded on disk, Q′ 1 032):
+
+| step (the refit's own order) | n fitted | held | worst training ratio | offenders named |
+|---|---|---|---|---|
+| entry fit (the file's codes) | 1 699 | 105 | 2.361 (#1400) | leave-one-out: #1804 alone, **972.7×** |
+| release (by the fit #1804 still bends): #1455 back | 1 700 | 104 | 2.358 | #1804 alone, 961.7× |
+| step 1, degree cap 6 retry | | | fails, restored | |
+| round 1: #1804 held | 1 699 | 105 | **1.0070** (#1133 H₂O, then #1400 1.0042) | 6: #224, #802, #1133, #1400, #1455, #1499 (worst 2.24×) |
+| round 2 | 1 693 | 111 | 1.131 (#1237) | 11 (worst 1.16×) |
+| rounds 3–5 | 1 682 → 1 676 | 122 → 128 | 1.031 → 1.022 → **1.0185** (#1378) | 3 each |
+| **the attach's refit ends** | 1 676 | **128** | 2.04e-3 > 2.00e-3 Ha/Bohr, **untrusted** | |
+| the next refit (nothing new; 3 fits, 17.0 s): release 6, step 1's cap 6 | 1 682 | **122** | **0.9950**, Q′ 1 590, **trusted** | |
+
+The attach's refit: 8 fits, **29.7 s** (the training-residual path took 8 fits too; 123 s before the refit speed-ups, 32 s after). #1804 is held in round 1, alone, at 961.7× (its energy; force 38.5×), every other sample ≤ 5.2×.
+
+**The spec's expectation is not met on this path** (spec R1: "the fit is trusted; fewer than 110 samples are held"). It came from the collection debug's measurement of #1804 held out *before* the entry fit: n 1 698, worst 0.9991, trusted, 105 held. The refit's release step runs before the recovery, against the fit #1804 still bends, and releases #1455 (an H₃O targeted sample that bent fit happens to reproduce); with #1455 in and #1804 out the fit is at 1.0070× (reproduced alone: #1804 held, #1455 released, 1.0070). The collection's margin is ≈ 0.1 % (every trusted fit measured sits at 0.96–1.00×), and the rounds are not monotone (1.007 → 1.131 → 1.0185 with 23 more held). Compared with the training-residual ranking from the same state (165 held, untrusted at 1.46×, 3.69e-3 > 2.53e-3): 37 fewer held and the miss is 1.9 % instead of 46 %, and the next refit trusts it (122 held). Release order and keeping the best round are outside R1 ("unchanged"); not changed here, reported to the controller.
+
+**Regression: the stuck-H collection** (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`, section "M8a stuck collection" above; diagnostic `stuck_collection_rounds_under_both_rankings`). **Fails under R1; not re-pinned.** On the capped basis (step 2) both rankings name 379 samples, past the cap (57.8): nothing held, as before. On the default basis from the entry codes (step 3):
+
+| round | training ranking (before): held, worst training ratio after | leave-one-out ranking (now) |
+|---|---|---|
+| 1 | #575 (in-sample 21.8×) → 10.15 | #561, #575 (LOO 22.4×) → 6.38 |
+| 2 | 5 → 5.46 | #560 (18.5×) → 4.46 |
+| 3 | 13 → 2.36 | 7 → 3.59 |
+| 4 | 8 → 1.55 | 26, worst LOO 3.3× (H₂ #71–72, #273–275 … whose in-sample residuals pass) → 2.50 |
+| 5 | 3 → **0.961, trusted, 38 held** | 3 → **1.597, untrusted, 47 held** |
+
+Step 3 stands only if trusted, so the refit falls back to step 2's state: cap 6, 8 held, 2.6e-2 Ha/atom, untrusted (the user's symptom of 2026-10-21). The mechanism: once the label error is out, the leave-one-out ratio still names samples of high leverage in sparse regions (the compressed and stretched H₂, the H₃ scan points) whose own fit is fine — holding them removes the only data there and the misfit moves; the training ranking named the samples that fail. Both effects are the leverage the ranking is meant to see, read in opposite situations.
+
+**Re-pinned (explained).** `a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery`: the training ranking still ends untrusted with the true reason (1.8e-3 > 1.0e-3 Ha/atom, nothing held: the spread misfit names more than the cap); the leave-one-out ranking names the tight H₃ alone (718×), holds it, and the cap-4 fit is trusted — both pinned. `a_scripted_session_decides_exactly_as_before` / `views_and_verdicts_between_the_steps_change_no_decision`: one trace line differs, the recovery note's words (the same one sample held); with the old words substituted back the trace hashes to the old pin.
 
 ## M8a body-4 (Task 5, 2026-10-22; `surrogate::descriptor` "Body-4 features", `surrogate::fit` "The large-basis path"; release, Ryzen 7 9800X3D, CPU; the user's app open)
 

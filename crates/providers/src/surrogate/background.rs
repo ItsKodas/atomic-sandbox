@@ -148,6 +148,7 @@ impl SurrogateKs {
         f.class_memory = self.class_memory.clone();
         f.class_judge = self.class_judge.clone();
         f.deferred_trust = self.deferred_trust;
+        f.loo_ratios = self.loo_ratios.clone();
         f.audit_failed = self.audit_failed;
         f.audit_force = self.audit_force;
         f.failed_audits = self.failed_audits.clone();
@@ -353,6 +354,9 @@ impl SurrogateKs {
         self.class_worst = std::mem::take(&mut f.class_worst);
         self.class_blockers = std::mem::take(&mut f.class_blockers);
         self.deferred_trust = f.deferred_trust;
+        // the copy's leave-one-out ratios, keyed to its fit (`model_gen` below is the copy's: the
+        // conflict test saw no live change of it), re-checked against the members at every read
+        self.loo_ratios = f.loo_ratios.take();
         self.degree_cap = f.degree_cap;
         self.fit_members = std::mem::take(&mut f.fit_members);
         self.fits = f.fits;

@@ -300,6 +300,10 @@ pub(super) struct FitState {
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
     pub(super) deferred_trust: Option<usize>,
+    /// The leave-one-out ratios' cache and the `model_gen` of the saved fit: a restore keeps them
+    /// only when they were that fit's (`restore_state`).
+    pub(super) loo_ratios: Option<LooRatios>,
+    pub(super) model_gen: u64,
 }
 
 impl SurrogateKs {
@@ -470,7 +474,13 @@ impl SurrogateKs {
     /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
-        let (loo, worst, blockers) = self.compute_class_loo_full();
+        let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
+        // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
+        self.loo_ratios = loo.is_some().then(|| LooRatios {
+            gen: self.model_gen,
+            rows: ratios.iter().map(|&(i, own, _)| (i, own)).collect(),
+            tier: ratios.iter().map(|&(_, _, t)| t).collect(),
+        });
         self.class_judge = loo.as_ref().map(|l| l.1.clone());
         self.class_loo = loo.map(|l| l.0).unwrap_or_default();
         // the class verdicts carry rule 6/7's variance inflation (M8a Task 2 fix round 3): a cached
@@ -632,10 +642,14 @@ impl SurrogateKs {
     /// or energy) — the readiness readout's worst sample, deciding nothing. Held-out draft guesses
     /// (`Q_DRAFT`) are excluded like every other excluded sample (`surrogate` module doc, "Draft
     /// mode"). Empty without a model.
+    ///
+    /// The fourth part is every member's leave-one-out ratios in store order (store index, ρ, ρ_σ;
+    /// `quarantine::loo_ratio`, spec R1/R1b): what the recovery ranks by and the Model tab lists,
+    /// from the same leave-one-out.
     #[allow(clippy::type_complexity)]
-    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
+    pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<(usize, f64, f64)>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return (None, Vec::new(), Vec::new());
+            return (None, Vec::new(), Vec::new(), Vec::new());
         };
         // the environment keys of the fitted atoms (`calibrate`, "Per environment species") and
         // their leave-one-out sums (as `acc`, per key)
@@ -656,7 +670,10 @@ impl SurrogateKs {
         // the same numbers as one at a time), then the sums below in sample order, as before
         let members: Vec<(usize, &Sample)> = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).collect();
         let loos = surrogate::loo::leave_one_out_many(model, &members.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+        let mut sample_ratios: Vec<(usize, f64, f64)> = Vec::with_capacity(members.len());
         for ((i, s), l) in members.into_iter().zip(loos) {
+            let (own, tier) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+            sample_ratios.push((i, own, tier));
             // only the fitted (interior) atoms of a masked sample describe a class or a key
             let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().enumerate().map(|(j, c)| atom_class(c).filter(|_| s.trains_atom(j))).collect();
             let atom_keys = if s.z.len() == s.pos.len() { trained_keys(s, env_keys(&s.pos, &s.z, rc2)) } else { Vec::new() };
@@ -787,7 +804,7 @@ impl SurrogateKs {
         for b in &mut blockers {
             b.sort_by(|x, y| y.1.total_cmp(&x.1));
         }
-        (Some((loo, judge)), worst, blockers)
+        (Some((loo, judge)), worst, blockers, sample_ratios)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
@@ -985,6 +1002,9 @@ impl SurrogateKs {
         // the standing fit's trust passes, whatever the outcome (an error leaves the last fit
         // that succeeded in place, with its own verdicts — as before)
         self.ensure_trust_passes();
+        // and its per-sample leave-one-out ratios (the Model tab reads them between refits): the
+        // class pass's just now, unless the standing fit's passes were not re-run (a restored fit)
+        self.ensure_loo_ratios();
         let report = fitted?;
         self.rejudge_failed_audits(true);
         // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
@@ -1395,6 +1415,8 @@ impl SurrogateKs {
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
             deferred_trust: self.deferred_trust,
+            loo_ratios: self.loo_ratios.clone(),
+            model_gen: self.model_gen,
         }
     }
 
@@ -1416,6 +1438,10 @@ impl SurrogateKs {
         self.fit_members = s.fit_members;
         self.deferred_trust = s.deferred_trust;
         self.model_gen += 1; // a view cache key: the model moved back
+        // the restored model is the saved one: its leave-one-out ratios, when the cache held that
+        // fit's, are this generation's (`fit_members` is restored with it; re-checked at every read)
+        let gen = self.model_gen;
+        self.loo_ratios = s.loo_ratios.filter(|c| c.gen == s.model_gen).map(|c| LooRatios { gen, ..c });
     }
 
     /// The fit itself (`surrogate` module doc): incremental, or a rebuild from the store skipping the
