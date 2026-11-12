@@ -487,8 +487,8 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
     let r = slot(ui, solver, |ui| {
         let estimated = solver_segments(ui, st, true, acts);
         // ⚠ Model only where the slot has its room (a window at least about 1090 pt wide); narrower,
-        // it is not drawn (Ctrl K points at Estimated, the status chip still says when it is on,
-        // and a hand change of draft or the audits in the Model tab turns it off)
+        // it is not drawn (Ctrl K points at Estimated; while it is on, the status chip's pill says
+        // so and a click on it turns it off)
         let mut used = w.c_solver_row;
         if solver >= used + w.model_only {
             model_only_toggle(ui, st, estimated, acts);

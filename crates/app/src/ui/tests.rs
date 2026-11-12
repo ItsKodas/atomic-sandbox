@@ -1454,6 +1454,17 @@ fn clicking_model_only_toggles_restores_and_hides_off_estimated() {
     let outs = click_widget(&ctx, &mut st, &inp, "audits-on");
     assert_eq!(draft_and_audit(&outs), ["SetAudit(500)"]);
     assert!(st.model_only.is_none() && st.draft && st.audit_every == 500);
+    // the status chip's pill turns it off (the way off at 1000 pt, where the toggle is not drawn)
+    st.draft = false;
+    click_widget(&ctx, &mut st, &inp, "model-only");
+    assert!(st.model_only.is_some());
+    PROBES.with(|p| p.borrow_mut().clear());
+    let outs = press_widget_w(&ctx, &mut st, &inp, 1000.0, "model-only-chip", 0.0);
+    assert!(!PROBES.with(|p| p.borrow().contains_key("model-only")), "1000: the toggle is not drawn");
+    let recorded: Vec<_> = outs.iter().flat_map(|o| &o.actions).filter(|a| matches!(a, Action::ModelOnly(_))).collect();
+    assert_eq!(recorded, [&Action::ModelOnly(false)], "the pill sends Model only off");
+    assert_eq!(draft_and_audit(&outs), ["SetDraft(false)", "SetAudit(500)"]);
+    assert!(st.model_only.is_none() && !st.draft && st.audit_every == 500);
 }
 
 // ---- the drag pull (user request 2026-10-14: the wheel while dragging) ----
