@@ -19,7 +19,9 @@
 //! | `Audit` | an audit failed since the refit, on the energy (\|gap\|/N > the tier) | \|gap\|/N / the tier (Ha/atom) |
 //! | `AuditForces` | an audit failed since the refit, on the forces (`audit_force` set) | the worst atom's residual / its bound (Ha/Bohr) |
 //!
-//! The two residual rows exist only when training residuals were computed. The audit row is met
+//! The two residual rows exist only when training residuals were computed; in `trust_checks` they
+//! also name where their value sits (`TrustCheck::worst`: the sample, and for the forces the atom,
+//! recorded by the residual pass; display only, no condition reads it). The audit row is met
 //! at value 0 when no audit failed since the refit, which says nothing about whether one ran
 //! (plan review M1). Every comparison is its predicate's own, so a NaN or a value at the limit
 //! lands on the same side for the checklist, the refusal and `trusted`. A value at its limit
@@ -130,6 +132,13 @@ pub struct TrainingResiduals {
     pub force: f64,
     /// … and the policy's force bound for that atom (its teacher force magnitude).
     pub force_bound: f64,
+    /// The sample that holds `energy_per_atom` (display only, 2026-11-13: the trust line names
+    /// it): its identity when the pass recorded it; `None` when every residual was 0 or no fitted
+    /// sample has an energy row.
+    pub energy_at: Option<sim::SampleId>,
+    /// The sample and the atom within it that hold `force` (display only); `None` when no
+    /// fitted atom was compared.
+    pub force_at: Option<(sim::SampleId, usize)>,
 }
 
 /// The environment classes of the class-wise trust rule (module doc, "Class-wise trust"), by
@@ -341,8 +350,42 @@ impl SurrogateKs {
     /// ran, so the UI words that line from `last_audit` and `last_audit_this_fit` (none yet /
     /// none since the refit / passed / box-affected), never as "passed" (plan review M1, Task 3
     /// review I1).
+    /// The two training-residual entries carry where their worst value sits
+    /// ([`TrustCheck::worst`], display only: the sample, and for the forces the atom), when the
+    /// residual pass recorded it and that store index still holds the same sample.
     pub fn trust_checks(&self) -> Vec<TrustCheck> {
-        self.checks().collect()
+        let t = self.training_residuals.as_ref();
+        self.checks()
+            .map(|mut c| {
+                c.worst = match c.key {
+                    TrustKey::EnergyResidual => t.and_then(|t| t.energy_at).and_then(|id| self.trust_worst(id, None)),
+                    TrustKey::ForceResidual => t.and_then(|t| t.force_at).and_then(|(id, j)| self.trust_worst(id, Some(j))),
+                    _ => None,
+                };
+                c
+            })
+            .collect()
+    }
+
+    /// Stored sample `id` as a residual check's location ([`TrustCheck::worst`]); `None` when the
+    /// index now holds another sample (the same check value Forget refuses on) or the atom is not
+    /// in it.
+    fn trust_worst(&self, id: sim::SampleId, atom: Option<usize>) -> Option<sim::activity::TrustWorst> {
+        if self.sample_id(id.index) != Some(id) {
+            return None;
+        }
+        let s = self.store.as_ref()?.samples.get(id.index)?;
+        let atom = match atom {
+            Some(j) => Some((j, *s.z.get(j)?)),
+            None => None,
+        };
+        Some(sim::activity::TrustWorst {
+            id,
+            formula: shared::formula(&s.z),
+            origin: super::quarantine::origin_word(s.tag).to_string(),
+            atom,
+            forgettable: self.quarantine.get(id.index).is_none_or(|&q| q == Q_NONE),
+        })
     }
 
     /// The whole-model sample floor (`TrustKey::Samples`; M8a user-fix 3 review, ruling 2): the
@@ -369,9 +412,10 @@ impl SurrogateKs {
 
     /// [`trust_checks`](Self::trust_checks) without the allocation: the one sequence that
     /// `trusted`, `untrusted_check` and the checklist read.
-    fn checks(&self) -> impl Iterator<Item = TrustCheck> + use<> {
+    pub(super) fn checks(&self) -> impl Iterator<Item = TrustCheck> + use<> {
         let p = &self.policy;
-        let check = |key, fails: bool, value: f64, limit: f64| TrustCheck { key, met: !fails, value, limit };
+        // no location here: `trust_checks` adds it (the rule's hot path builds no strings)
+        let check = |key, fails: bool, value: f64, limit: f64| TrustCheck { key, met: !fails, value, limit, worst: None };
         let r = self.report.as_ref();
         let t = r.and(self.training_residuals.as_ref());
         let fails = audit_fails(self.audit_failed);
@@ -445,8 +489,10 @@ impl SurrogateKs {
     /// "Trust rule").
     pub(super) fn compute_training_residuals(&self) -> Option<TrainingResiduals> {
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
-        let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
+        let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY, energy_at: None, force_at: None };
         let mut worst_ratio = 0.0f64;
+        // the argmaxes (display only): store indices, turned into checked identities at the end
+        let (mut energy_at, mut force_at) = (None, None);
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
@@ -455,9 +501,14 @@ impl SurrogateKs {
             let n = s.pos.len().max(1) as f64;
             // the fitted rows only (a masked sample: no energy, the interior atoms' forces)
             if s.use_energy {
-                worst.energy_per_atom = max_nan(worst.energy_per_atom, (p.energy - s.energy).abs() / n);
+                let before = worst.energy_per_atom;
+                worst.energy_per_atom = max_nan(before, (p.energy - s.energy).abs() / n);
+                // the sample that moved the max holds it (a NaN sticks with its first sample)
+                if worst.energy_per_atom.to_bits() != before.to_bits() {
+                    energy_at = Some(i);
+                }
             }
-            for (_, (fm, fs)) in p.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
+            for (j, (fm, fs)) in p.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
                 let (d, bound) = self.policy.force_residual(fm, fs);
                 // a NaN ratio is the worst and stays so (activity Task 3b)
                 let ratio = d / bound;
@@ -465,9 +516,12 @@ impl SurrogateKs {
                     worst_ratio = ratio;
                     worst.force = d;
                     worst.force_bound = bound;
+                    force_at = Some((i, j));
                 }
             }
         }
+        worst.energy_at = energy_at.and_then(|i| self.sample_id(i));
+        worst.force_at = force_at.and_then(|(i, j)| self.sample_id(i).map(|id| (id, j)));
         Some(worst)
     }
 

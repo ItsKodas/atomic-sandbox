@@ -33,7 +33,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, &scene_z, acts));
     super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
-            readouts(ui, d, m, input.scene, st);
+            readouts(ui, d, m, input.scene, st, acts);
         }
     });
     if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
@@ -728,7 +728,7 @@ mod tests {
 /// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
-fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
+fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState, acts: &mut Vec<Action>) {
     super::wide_grid(ui, "model", 2).striped(true).show(ui, |ui| {
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -754,7 +754,24 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         ui.end_row();
         ui.label("trusted");
         let t = trust(Some(m), scene, st);
-        let r = ui.colored_label(t.colour, t.text);
+        let forget = t.forget;
+        let r = match forget {
+            None => ui.colored_label(t.colour, t.text),
+            // the failed residual check's worst sample, with the Worst-fitting rows' Forget
+            Some(id) => {
+                ui.vertical(|ui| {
+                    let r = ui.colored_label(t.colour, t.text);
+                    if super::super::probed(&format!("model-trust-forget-{}", id.index), ui.small_button("Forget"))
+                        .on_hover_text(crate::ui::activity::trust::FORGET_WORST_TIP)
+                        .clicked()
+                    {
+                        acts.push(Action::ForgetSample(id));
+                    }
+                    r
+                })
+                .inner
+            }
+        };
         // the plain line; then what it means, then the provider's own text
         let hover = [t.tip.map(str::to_string), t.detail.map(|d| format!("the fit's own words: {d}"))].into_iter().flatten().collect::<Vec<_>>().join("
 
