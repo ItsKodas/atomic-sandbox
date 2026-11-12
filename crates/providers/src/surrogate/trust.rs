@@ -1471,22 +1471,20 @@ impl SurrogateKs {
             (self.accumulator.take().expect("checked"), self.accumulated)
         };
         let store = self.store.as_ref().expect("checked");
-        for (i, s) in store.samples.iter().enumerate().skip(accumulated) {
-            if self.quarantine.get(i).is_some_and(|&q| q != Q_NONE) {
-                accumulated += 1; // held, not fitted (`surrogate` module doc, "Trust recovery")
-                continue;
+        // the members past the accumulated prefix, in order — held samples are not fitted
+        // (`surrogate` module doc, "Trust recovery"); `add_many` is a loop of `add`, bit for bit,
+        // its descriptors on threads (a collection's rebuild: `references.md` "Refit cost at scale")
+        let to_add: Vec<&Sample> = store.samples.iter().enumerate().skip(accumulated).filter(|(i, _)| self.quarantine.get(*i).is_none_or(|&q| q == Q_NONE)).map(|(_, s)| s).collect();
+        if let Err(e) = acc.add_many(&to_add, &basis, &refs, &opts) {
+            // cannot happen after a rebuild (the basis covers the store); keep the old
+            // accumulator state consistent on the incremental path by rebuilding next time
+            self.species_dirty = true;
+            if !rebuild {
+                self.accumulator = Some(acc);
             }
-            if let Err(e) = acc.add(s, &basis, &refs, &opts) {
-                // cannot happen after a rebuild (the basis covers the store); keep the old
-                // accumulator state consistent on the incremental path by rebuilding next time
-                self.species_dirty = true;
-                if !rebuild {
-                    self.accumulator = Some(acc);
-                }
-                return Err(e.into());
-            }
-            accumulated += 1;
+            return Err(e.into());
         }
+        accumulated = store.len();
         // `refit` = `solve` for a basis without body-4, bit for bit; the warm or spectral path for a
         // collection's body-4 basis (`surrogate::fit`, "The large-basis path")
         let solved = acc.refit(&opts, &provenance, &refs);
