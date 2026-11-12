@@ -141,6 +141,14 @@ mod tests {
         assert!(e.contains("isn't signed"), "{e}");
     }
 
+    /// While `crates/app/release-key.pub` is the placeholder, nothing verifies and the refusal says
+    /// "this build has no release key".
+    ///
+    /// **Whoever commits the real public key into `release-key.pub` replaces this test** (it then
+    /// fails on its first assertion, on purpose) with one that checks the real key parses:
+    /// `has_key(RELEASE_KEY)`, `minisign_verify::PublicKey::from_base64(key_line(RELEASE_KEY).unwrap())`
+    /// is `Ok`, and the TEST-ONLY fixture signature is refused under it ("isn't signed"). Keep the
+    /// `verify(.., "")` → [`NO_RELEASE_KEY`] check. Releasing: `docs/dev-reference.md` "Releasing".
     #[test]
     fn placeholder_key_installs_nothing() {
         assert_eq!(RELEASE_KEY.trim(), "# no release key yet", "Task 6 replaces the placeholder");

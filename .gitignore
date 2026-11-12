@@ -20,6 +20,11 @@ target-shot/
 .superpowers/
 # build.bat output: the runnable folder and its zip
 /dist
+# the release signing key pair as `minisign -G` writes it at the root (docs/dev-reference.md
+# "Releasing"): the secret key never enters the repo; the public key is committed only as
+# crates/app/release-key.pub
+release-key.sec
+/release-key.pub
 # viewer capture output (screenshots, recordings)
 /captures
 

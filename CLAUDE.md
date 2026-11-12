@@ -37,6 +37,7 @@ Tag every plan task and dispatch subagents accordingly: **Fable 5.1** (`claude-f
 - `Scene::preset`, a `Scene` literal and a scene file without an `ionic` line keep the file's own grid (49³/57³ × 0.25) and `ionic none`, which the tests rely on. Replay scripts (`crates/app/replays`) must pin `action quality`, `action walls` and `action ionic`.
 - Every control that reaches the worker or changes the scene goes through `ui::Action` (so `--record` sees it); display-only settings write `UiState` directly and are not recorded.
 - Docs screenshots: hidden `--screenshot <png> [--ui "<k=v;…>"]` — keys in `docs/dev-reference.md` "Build, run and the app's defaults".
+- Releases (tags, the workflow, the signing key, the checklist; ask before any tag push or publish): `docs/dev-reference.md` "Releasing".
 
 ## Which suite gates which change
 
