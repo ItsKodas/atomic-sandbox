@@ -2472,10 +2472,14 @@ impl SurrogateKs {
 
     /// The body-4 degree a fit of these species is built at (spec 2026-11-13 §4.1, "grown with the
     /// store"): the highest D₄ from [`surrogate::BODY4_DEGREE_CAP`] down to
-    /// [`surrogate::BODY4_DEGREE_START`] whose `Samples` floor — [`fit_floor`](Self::fit_floor) of
-    /// [`fit_basis`](Self::fit_basis) at that degree, the columns the fitted atoms touch — the
-    /// samples a fit would use meet (`FitReport::n_samples`, the count the `Samples` row compares).
-    /// It steps down only when samples are forgotten or held below the floor. Without the body-4
+    /// [`surrogate::BODY4_DEGREE_START`] at which the samples a fit would use
+    /// (`FitReport::n_samples`, the count the `Samples` row compares) meet the trust floor — the
+    /// `Samples` floor ([`fit_floor`](Self::fit_floor) of [`fit_basis`](Self::fit_basis) at that
+    /// degree, the columns the fitted atoms touch) plus [`MIN_RESIDUAL_DOF`], the convention of
+    /// `trust_floor` (controller ruling 4: at the bare floor the residual degrees of freedom are
+    /// short, and a collection trusted at 2 would step up into an untrusted fit). The same test
+    /// at every fit: it steps down when samples are forgotten or held below that floor, or when
+    /// appended samples touch new columns and raise the floor above the count. Without the body-4
     /// block (per scene) the start, which such a basis carries unused.
     pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
         let start = surrogate::BODY4_DEGREE_START;
@@ -2494,7 +2498,7 @@ impl SurrogateKs {
             .find(|&d| {
                 let mut at = basis.clone();
                 at.body4_degree = d;
-                fitted >= self.fit_floor(&at)
+                fitted >= self.fit_floor(&at) + MIN_RESIDUAL_DOF as usize
             })
             .unwrap_or(start)
     }

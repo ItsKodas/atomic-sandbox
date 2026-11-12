@@ -8818,9 +8818,11 @@ fn basis_at(s: &SurrogateKs, d: usize) -> Basis {
 /// 284 and 468 columns — room for f₂ + 30 ≤ n < f₃ (H alone: 38 and 52, none).
 const D4_KINDS: [&[u8]; 5] = [&[1, 1], &[1, 1, 1], &[1, 1, 2], &[1, 2], &[1, 1, 2, 2]];
 
-/// Spec 2026-11-13 §4.1: a collection's refit picks the highest body-4 degree whose `Samples`
-/// floor (the columns the fitted atoms touch at that degree) its fitted samples meet — 2 below
-/// f₃, 3 once the store meets it, and 2 again when samples are held back below it.
+/// Spec 2026-11-13 §4.1 with controller ruling 4: a collection's refit picks the highest body-4
+/// degree whose trust floor — the `Samples` floor f_d (the columns the fitted atoms touch at that
+/// degree) plus `MIN_RESIDUAL_DOF` — its fitted samples meet: 2 below f₃ + 30, also between f₃ and
+/// f₃ + 30 (where a D₄ = 3 fit would be short of residual degrees of freedom; the D₄ = 2 fit there
+/// is trusted), 3 from f₃ + 30, and 2 again when one sample is held back below it.
 #[test]
 fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
     let dir = collection_root("d4-grow");
@@ -8840,6 +8842,14 @@ fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
     assert_eq!(s.model().unwrap().basis.body4_degree, 2);
     assert_eq!(s.basis().unwrap().body4_degree, 2, "the accumulator's basis too");
     assert_eq!(rep.q_prime, basis_at(&s, 2).n_independent_columns());
+    // f₃ ≤ n < f₃ + 30: still degree 2, and trusted there
+    d4_keep(&mut s, &D4_KINDS, f3 + 15, &mut rng);
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(rep.n_samples, f3 + 15);
+    assert_eq!(s.body4_degree(), Some(2), "f₃ met, f₃ + MIN_RESIDUAL_DOF not");
+    assert_eq!(rep.q_prime, basis_at(&s, 2).n_independent_columns());
+    assert!(s.trusted(), "the D₄ = 2 fit between the floors stands trusted: {:?}", s.untrusted_reason());
     // n ≥ f₃ + 30: degree 3
     d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
     let rep = s.refit().unwrap();
@@ -8847,9 +8857,9 @@ fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
     assert_eq!(s.body4_degree(), Some(3));
     assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (3, 3));
     assert_eq!(rep.q_prime, basis_at(&s, 3).n_independent_columns());
-    // held back below f₃ (superseded codes, written to the collection): degree 2 again
+    // one sample held back below f₃ + 30 (a superseded code, written to the collection): degree 2 again
     let n = s.samples();
-    let hold = n - (f3 - 1);
+    let hold = n - (f3 + 29);
     s.quarantine.resize(n, Q_NONE);
     for q in &mut s.quarantine[n - hold..] {
         *q = Q_SUPERSEDED;
@@ -8857,9 +8867,30 @@ fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
     s.sync_collection_status();
     let rep = s.refit().unwrap();
     println!("{hold} held: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
-    assert!(rep.n_samples < f3, "{} fitted", rep.n_samples);
+    assert!(rep.n_samples < f3 + 30, "{} fitted", rep.n_samples);
     assert_eq!(s.body4_degree(), Some(2));
     assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (2, 2));
+}
+
+/// Spec 2026-11-13 §4.1 (task review fix 1): the trust recovery's richer basis the teach-around
+/// readout counts its per-key floors in (`richer_basis_floor`) keeps the standing body-4 degree —
+/// D₄ = min(6, 3) = 3 for a collection standing at 3, not the start's 2.
+#[test]
+fn the_richer_basis_keeps_the_standing_body4_degree() {
+    let dir = collection_root("d4-richer");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(7);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(3);
+    s.refit().unwrap();
+    assert_eq!(s.body4_degree(), Some(3), "the premise");
+    let rich = s.richer_basis().expect("the standing body-3 basis is below the recovery's degree");
+    assert_eq!((rich.degree_cap, rich.body4, rich.body4_degree, rich.body4_cap()), (RECOVERY_DEGREE_CAP, true, 3, 3));
+    let mut want = basis_at(&s, 3);
+    want.degree_cap = RECOVERY_DEGREE_CAP;
+    assert_eq!(rich, want, "the cap-6 basis at the standing degree");
 }
 
 /// Spec 2026-11-13 §4.1: a per-scene model's basis is `Basis::new`'s as before (no body-4, the
