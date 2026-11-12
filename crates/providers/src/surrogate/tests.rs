@@ -10151,6 +10151,7 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
 mod refit_cost;
+mod residual_diag;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

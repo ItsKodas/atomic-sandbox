@@ -4317,3 +4317,43 @@ What the user waits for at 50 000 samples (Q′ 1 032, 2.7 atoms per sample), ex
 - Paused (or before the first fit), it is still a wait of that length.
 
 What is left: the active set's MaxVol scan on threads, and the recovery's repeated searches.
+
+## Why the collection fails its residuals at every refit (2026-11-12; `providers` `surrogate::tests::residual_diag::residual_failures_on_a_collection`, `#[ignore]`d diagnosis; release, CPU; a copy of the user's collection: surface lsda, h = σ = 0.15, tol 1e-6, GPU teacher, ionic `all`; 1 805 samples, 106 held on disk; body-4 basis, H/N/O, Q′ 1 032)
+
+**Symptom.** Every refit runs trust recovery and quarantines more samples. The copy's attach refit took 106 → 165 held and stayed untrusted: "max training force residual 3.7e-3 > 2.5e-3 Ha/Bohr". The live collection went from 106 held (13:43) to 170 held + 2 superseded of 1 825 (14:23). The recovery stops at 10 % of the store (`QUARANTINE_MAX_FRACTION`, 182 here). From then on it can hold nothing more and the model stays untrusted.
+
+**It is the forces, not the energies.** After the attach's refit, no fitted sample's energy exceeds 1e-3 Ha/atom. Every fitted sample over its force bound is in the H₃O scene: neutral H₃O, the doublet radical, at 105³. The worst force residuals per scene, as rms |ΔF|/√3 and the worst ratio to the bound:
+
+| scene (multiplicity) | atoms | rms (Ha/Bohr) | p99.9 | worst ratio |
+|---|---|---|---|---|
+| H₂ (1) | 944 | 8.8e-4 | 8.0e-3 | 0.80 |
+| H₂O (1) | 1 203 | 6.0e-4 | 3.8e-3 | 0.56 |
+| H₃ (2) | 951 | 7.8e-4 | 8.8e-3 | 0.94 |
+| **H₃O (2)** | 748 | **1.3e-3** | 5.0e-3 | **1.46** |
+| N₂ (1) | 522 | 1.4e-5 | 6.4e-5 | 0.02 |
+
+**The labels are smooth, and the misfit is smooth.** Samples #1340–#1409 are one hot-burst trajectory: H₃O losing an H, one O–H going from 1.9 to 3.6 Bohr. Along it the teacher's energy and forces change smoothly, with no jump that would mean a change of SCF branch. The model's error also changes smoothly. It peaks on the O atom at about 1e-2 Ha/Bohr against teacher forces of 0.01–0.07 Ha/Bohr, around O–H ≈ 2.4–3.0 Bohr. The recovery takes the samples within a factor 2 of the worst. Their neighbours on the same trajectory then become the worst, and they fit no better without them. So each round peels one band: 5 rounds per refit, then again at the next refit, until the cap.
+
+**Hold-out fits (no recovery, the disk's codes plus the hold named):**
+
+| fit | basis (Q′) | trusted | failing condition |
+|---|---|---|---|
+| all, codes on disk | default (1 032) | no | force 5.6e-3 > 2.4e-3 (H₃O) |
+| all | cap 6 (1 590) | no | force 4.1e-3 > 2.9e-3 (H₃O, 1.42) |
+| every H₃O held | default | no | force 4.0e-3 > 2.0e-3 (one H₃ scan point, 1.99) |
+| every H₃O held | cap 6 | no | energy 1.14e-3 > 1.0e-3 Ha/atom (H₂ fallbacks #143/#144 at 103³, #1499 at 101³) |
+| **H₃O alone** (245 samples) | default | **yes** | — (worst force 0.94 of its bound) |
+| **doublets alone** (H₃, H₃O, HO) | cap 6 | **yes** | — (worst 0.87) |
+| doublets alone | default | no | force 1.28 (H₃O) |
+| singlets alone (H₂, H₂O, N₂) | default | no | energy 1.09e-3 (the same H₂ fallbacks) |
+
+**Root cause.** The H₃O labels are self-consistent: alone, the model fits them and trusts them. What it cannot do is fit H₃O and H₂O together. Holding the H₃O samples out cuts H₂O's force rms from 6.0e-4 to 1.6e-4 (default basis) or 8.8e-5 Ha/Bohr (cap 6). The two scenes share their O–H pair and H–O–H three-body environments, and their forces there disagree. The difference would have to come from the body-4 terms, whose degree is at most 2. The physical reason is the extra electron. Neutral H₃O has 11 electrons, H₂O's 10 plus one unpaired one, and that electron changes the O–H bonding across the whole molecule. A local descriptor sees that only through the four-body geometry. This explanation is consistent with the hold-outs; it is not proven. Neither more data nor quarantine fixes it: the model has to compromise between the two scenes, and the samples it quarantines are good labels.
+
+**Why it repeats.** A recovery that does not restore trust still keeps its holds: `recover_trust` step 2 returns the last round's state, and the codes go to the collection as status records. Each refit therefore throws away more valid H₃O labels (61 at the copy's attach, by its recovery note) while the model stays untrusted. The recovery note says "the model cannot represent them", but the H₃O-alone fit shows it can.
+
+**Second, smaller blocker.** Without H₃O, the singlets fail by 4–14 % on the energies of a few H₂ fallbacks at 101³/103³. The H₂ energy residual has a mean offset that varies with the box size even after each sample is rebased to its box's atom references: +1.6e-4 Ha/atom at 81³, −8e-5 at 101³, −3.0e-4 at 103³, −5e-5 at 105³. Not investigated further here.
+
+Nothing was changed: the trust rule and the recovery are safety rules. Options for the user:
+1. **A failed recovery keeps nothing.** When the rounds do not restore trust, restore the state the refit started from. The model is untrusted either way, so this never trusts more; it stops the ratchet and keeps the labels.
+2. **Separate models by spin multiplicity.** The fits above trust the doublets alone, and the singlets come close. This is a design change to how collections are split (spec §4.2 already keeps each sample's multiplicity); it needs its own spec.
+3. **A larger body-4 basis** (D₄ = 3). Not measured; Q′ grows to about 5 300 at S = 4, so the refit cost grows with it.
