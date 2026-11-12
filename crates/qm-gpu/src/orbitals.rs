@@ -99,6 +99,44 @@
 //! iteration (`eigen::lobpcg`'s callback, which the SCF never passes); an abort returns `None` and
 //! leaves the previous vectors and result as they were.
 //!
+//! # Orbital shares ([`OrbitalView::shares`]; orbital-atom-shares spec, plan Task 3)
+//! The Hirshfeld split of each displayed ψ̃ between the nuclei, display only — the f64 reference
+//! is `sim::charges::{Weights::at, orbital_shares_many}` (whose module doc carries the physics):
+//!
+//! ```text
+//! s_iA = h³ Σ_nodes w_A(r_n) ψ̃_i(r_n)²,   w_A = ρ_A⁰(|r − R_A|) / Σ_B ρ_B⁰(|r − R_B|),
+//! ```
+//!
+//! not renormalised (Σ_A s_iA = h³ Σ ψ̃_i², which the provider checks against 1). One
+//! `orbital_shares` dispatch (`shaders/orbital_shares.wgsl`) per 4 shown rows, its workgroup rows
+//! the blocks of 8 nuclei; one submission after the update's display lincombs, one readback.
+//! - **The same weights.** [`ShareTablesGpu`] holds the CPU's own lookups (ρ⁰ at r = k·h/16 out
+//!   to the cell's diagonal + h, `Weights::lookups`), so the kernel evaluates them with the same
+//!   rule: i = ⌊r/dr⌋, linear in ρ between entries i and i + 1, the last entry where i + 1 ≥ the
+//!   length, and the nearest nucleus (lower index on a tie) where every ρ_A⁰ is exactly 0. Only
+//!   the representation differs: f32 cannot hold the tails (ρ⁰ < 1e-38 inside the cell; the
+//!   CPU's reach 1e-300), so the table stores ln ρ_k and the kernel forms the linear-in-ρ value
+//!   as m + ln((1 − f)e^{L_i − m} + f e^{L_{i+1} − m}), m = max(L_i, L_{i+1}), and the weight as
+//!   exp(L_A − L_max)/Σ_B exp(L_B − L_max) — the ratio of the same two numbers, without
+//!   underflow. An exact ρ_k = 0 (the CPU's own underflow, a table cut to 0) is a sentinel, so
+//!   "every ρ_A⁰ = 0" means what it means on the CPU. Where every table is 0, the nearest nucleus
+//!   is judged on f32 r² in grid units here and on f64 r² in Bohr on the CPU, so a node at a
+//!   near-tie may go to the other nucleus on one side than on the other; that is negligible,
+//!   since ψ² ≈ 0 wherever every free atom's density is 0 (Task 3 review Minor 3).
+//! - **Precision.** Per node, w_A carries the f32 rounding of L (|L|·2⁻²⁴ absolute: ≤ 2e-6
+//!   relative where |L| ≤ 30, i.e. where ρ⁰ ≳ 1e-13 and the bound orbitals live) and of the
+//!   distance (relative 2⁻²⁴ on (i − cell) − frac); ψ̃² is the displayed f32 field. Each thread
+//!   sums its ⌈n³/(256·wgs)⌉ grid-stride nodes in f32 (13 at 95³), the workgroup tree adds 8
+//!   levels, and the CPU finishes the ≤ 256 partials in f64 (Neumaier): |Δs| ≲ (13 + 8)·2⁻²⁴·s
+//!   ≈ 1e-6 s from the sums (rule 4: no float atomics, no serial GPU sum). Measured against the
+//!   CPU reference on the same ψ̃ and against `CpuKs` on the same scene:
+//!   `providers::ks::tests::gpu_shares_match_cpu`.
+//! - **Cost** (`providers::ks::tests::gpu_shares_cost_is_reported`, H₂O 95³ × 0.15, 10 rows × 3
+//!   nuclei, 3 dispatches): the pass 0.45 ms min, 0.50 ms median of 20 (submission and map
+//!   included); the payload +0.5 ms. Measured: |s_gpu − s_cpu| ≤ 2.4e-8 on the same ψ̃ there,
+//!   ≤ 1.2e-8 at 49³ (four H₂/HeH⁺ cases and HeH⁺ with two unoccupied rows,
+//!   `gpu_shares_match_cpu`); both tests assert the derived 5e-6.
+//!
 //! # Display fields and VRAM (spec §4.4)
 //! The view owns its fields (its own pool, never the solver's): the previous displayed set
 //! (K + m padded fields; m = 0 until the unoccupied orbitals of plan Task 4, which add m more
@@ -220,6 +258,75 @@ struct LevelParams { count: u32, share: f32, pad: [u32; 2] }
 /// Histogram bins per orbital (`shaders/enclosure.wgsl`'s BINS).
 const ENCLOSURE_BINS: usize = 256;
 
+/// Upper bound on the `orbital_shares` workgroups per dispatch row (= f32 partials per lane).
+pub const SHARE_WORKGROUPS: u32 = 256;
+/// Orbitals bound per `orbital_shares` dispatch (bindings 4..7: 4 + tables, atoms, out = 7 storage
+/// buffers, within WebGPU's default 8) and nuclei per workgroup row (two vec4 lanes per orbital).
+const SHARE_ROWS: usize = 4;
+const SHARE_ATOMS: usize = 8;
+/// ln 0 in the packed tables (`shaders/orbital_shares.wgsl`'s ZERO).
+const SHARE_LN_ZERO: f32 = -1.0e30;
+
+/// Uniform of `orbital_shares`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShareParams { n: u32, p: u32, wgs: u32, rows: u32, atoms: u32, scale: f32, pad: [u32; 2] }
+
+/// A nucleus of `orbital_shares`: cell and fraction (`NucleusRecord`'s split), its table's
+/// (offset, length) in the packed buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShareAtomRecord { cell: [i32; 4], frac: [f32; 4], table: [u32; 4] }
+
+/// The orbital shares' free-atom tables on the device (module doc, "Orbital shares"): ln ρ⁰ of
+/// each distinct lookup packed into one storage buffer, and per nucleus its table's (offset,
+/// length). Built from plain data — `sim::charges::Weights::lookups` in the provider (this crate
+/// knows no `sim`) — for one grid spacing; the provider rebuilds it only when its tables change.
+pub struct ShareTablesGpu {
+    buffer: wgpu::Buffer,
+    /// (offset, length) in `buffer` of nucleus a's table.
+    atoms: Vec<[u32; 2]>,
+    /// Lookup steps per grid unit: h/dr.
+    scale: f32,
+    /// The grid spacing the lookups were made for (Bohr).
+    h: f64,
+}
+
+impl ShareTablesGpu {
+    /// `lookups[t]` = ρ⁰(k·dr) for k = 0.. of distinct table t (f64, ≥ 0), `which[a]` nucleus a's
+    /// table, `inv_dr` = 1/dr, for a grid of spacing `h`. Each value is stored as ln ρ in f32
+    /// (`SHARE_LN_ZERO` for an exact 0): the kernel interpolates linearly in ρ through the logs.
+    pub fn new(ctx: &GpuContext, h: f64, inv_dr: f64, lookups: &[&[f64]], which: &[usize]) -> ShareTablesGpu {
+        assert!(h > 0.0 && inv_dr > 0.0, "ShareTablesGpu: h = {h}, 1/dr = {inv_dr}");
+        let mut data: Vec<f32> = Vec::new();
+        let mut at: Vec<[u32; 2]> = Vec::with_capacity(lookups.len());
+        for t in lookups {
+            assert!(!t.is_empty(), "ShareTablesGpu: an empty lookup");
+            at.push([data.len() as u32, t.len() as u32]);
+            data.extend(t.iter().map(|&r| if r > 0.0 { r.ln() as f32 } else { SHARE_LN_ZERO }));
+        }
+        let atoms = which.iter().map(|&w| at[w]).collect();
+        if data.is_empty() { data.push(SHARE_LN_ZERO); } // bindings cannot be empty
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(&ctx.device, &wgpu::util::BufferInitDescriptor {
+            label: Some("orbital share tables"), contents: bytemuck::cast_slice(&data), usage: wgpu::BufferUsages::STORAGE,
+        });
+        ShareTablesGpu { buffer, atoms, scale: (h * inv_dr) as f32, h }
+    }
+
+    /// The number of nuclei.
+    pub fn atoms(&self) -> usize {
+        self.atoms.len()
+    }
+
+    /// The packed buffer (its identity tells an upload from a reuse: the provider's tests).
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
+/// The share pass's buffers: the nuclei, the partials and their staging copy (grow-only; bytes).
+struct ShareBuffers { atoms: wgpu::Buffer, out: wgpu::Buffer, staging: wgpu::Buffer, cap: u64 }
+
 /// The boundary pass's buffers for up to `cap` orbitals: the histograms, the levels and the wall
 /// maxima (ψ̃²/peak in the outer L/6 of the box), and the staging copy of (levels, wall maxima).
 struct Enclosure { hist: wgpu::Buffer, levels: wgpu::Buffer, face: wgpu::Buffer, staging: wgpu::Buffer, cap: usize }
@@ -298,6 +405,8 @@ pub struct OrbitalView {
     unocc_info: Option<Unoccupied>,
     /// The box rule's face-density limit handed to the tracker (`qm::orbitals` §8; ∞ = off).
     face_limit: f64,
+    /// The orbital share pass's buffers ([`OrbitalView::shares`]; made by its first call).
+    share_bufs: Option<ShareBuffers>,
 }
 
 impl OrbitalView {
@@ -321,7 +430,7 @@ impl OrbitalView {
             reducer: Reducer::new(&ctx, &solver.k, &g), grid: solver.grid().clone(), g, tracker: Tracker::new(),
             prev: [Vec::new(), Vec::new()], pool: Vec::new(), scratch: None, rows, row_stride, nuclei,
             moments_out: None, colour_acc: None, dummy, dummy_levels, enclosure: None, ctx,
-            unocc: [Vec::new(), Vec::new()], unocc_info: None, face_limit: f64::INFINITY,
+            unocc: [Vec::new(), Vec::new()], unocc_info: None, face_limit: f64::INFINITY, share_bufs: None,
         }
     }
 
@@ -330,6 +439,13 @@ impl OrbitalView {
     /// that criterion off.
     pub fn set_face_limit(&mut self, limit: f64) {
         self.face_limit = limit;
+    }
+
+    /// The last update's displayed ψ̃ of row `index` of channel `ch` (0 ↑, 1 ↓), if it had one.
+    /// For tests and diagnostics that compare against a CPU reference on the same field: reading
+    /// it back is a field crossing to the CPU, which the display path itself never does.
+    pub fn shown_field(&self, ch: usize, index: usize) -> Option<&Field> {
+        self.prev.get(ch)?.get(index)
     }
 
     /// The last display eigensolve's result (`None` before one, or after `clear_unoccupied`).
@@ -762,6 +878,78 @@ impl OrbitalView {
             touching = (0..n).filter(|&t| v[t] > 0.0 && v[n + t] >= v[t]).map(|t| boundary_terms[t]).collect();
         }
         ViewUpdate { out, spin: sc.spin, scale, readbacks: readbacks_on_this_thread() - maps, touching }
+    }
+
+    /// The Hirshfeld shares (module doc, "Orbital shares") of the orbitals the last update
+    /// displayed: `[ch][row index][nucleus]` = h³ Σ_nodes w_A ψ̃² for every shown row of each
+    /// channel (`UpdateOutput::rows`' `index`), with `tables`' free atoms at `positions` (Bohr,
+    /// the geometry the orbitals were solved at). **Not renormalised** (`sim::charges::orbital_shares`:
+    /// the caller checks Σ_A s against 1). One submission after the update's (queue order: the
+    /// display fields are written), **one readback** of N_rows × N_atoms × the workgroup partials;
+    /// no field crosses to the CPU. A failed readback is latched (`grid::take_readback_fault`) and
+    /// gives zeros, which no Σ check passes. No rows or no nuclei: nothing is dispatched.
+    pub fn shares(&mut self, solver: &GpuSolver, tables: &ShareTablesGpu, positions: &[[f64; 3]]) -> [Vec<Vec<f64>>; 2] {
+        assert!(self.grid == *solver.grid(), "OrbitalView::shares: the view is for another grid than the solver's");
+        assert_eq!(positions.len(), tables.atoms(), "OrbitalView::shares: {} positions for {} tables", positions.len(), tables.atoms());
+        assert!(positions.len() <= MAX_NUCLEI, "OrbitalView::shares: {} nuclei > MAX_NUCLEI", positions.len());
+        assert!((tables.h - self.g.h).abs() <= 1e-12 * self.g.h, "OrbitalView::shares: tables for h = {}, grid h = {}", tables.h, self.g.h);
+        let atoms = positions.len();
+        let counts = [self.prev[0].len(), self.prev[1].len()];
+        let rows: Vec<&Field> = self.prev[0].iter().chain(&self.prev[1]).collect();
+        if rows.is_empty() || atoms == 0 {
+            return counts.map(|c| vec![Vec::new(); c]);
+        }
+        let (g, ctx, k) = (self.g, &self.ctx, &solver.k);
+        let wgs = (g.interior_len().div_ceil(WORKGROUP as usize) as u32).clamp(1, SHARE_WORKGROUPS) as usize;
+        let blocks = atoms.div_ceil(SHARE_ATOMS);
+        let dispatches = rows.len().div_ceil(SHARE_ROWS);
+        // floats per dispatch: its partials, 256-byte aligned for the binding offsets
+        let block = (blocks * SHARE_ROWS * SHARE_ATOMS * wgs).div_ceil(64) * 64;
+        let bytes = (dispatches * block * 4) as u64;
+        if self.share_bufs.as_ref().is_none_or(|s| s.cap < bytes) {
+            let make = |label: &str, size: u64, usage: wgpu::BufferUsages| ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label), size, usage, mapped_at_creation: false,
+            });
+            use wgpu::BufferUsages as B;
+            self.share_bufs = Some(ShareBuffers {
+                atoms: make("orbital share nuclei", (MAX_NUCLEI * std::mem::size_of::<ShareAtomRecord>()) as u64, B::STORAGE | B::COPY_DST),
+                out: make("orbital share partials", bytes, B::STORAGE | B::COPY_SRC),
+                staging: make("orbital share staging", bytes, B::MAP_READ | B::COPY_DST),
+                cap: bytes,
+            });
+        }
+        let bufs = self.share_bufs.as_ref().expect("made above");
+        let records: Vec<ShareAtomRecord> = positions.iter().zip(&tables.atoms).map(|(p, t)| {
+            let r = NucleusRecord::new(&g, &qm::Nucleus { pos: *p, z: 0 });
+            ShareAtomRecord { cell: r.cell, frac: [r.frac[0], r.frac[1], r.frac[2], 0.0], table: [t[0], t[1], 0, 0] }
+        }).collect();
+        ctx.queue.write_buffer(&bufs.atoms, 0, bytemuck::cast_slice(&records));
+        let mut b = Batch::new(ctx, "orbital shares");
+        for (d, chunk) in rows.chunks(SHARE_ROWS).enumerate() {
+            let params = ShareParams { n: g.n as u32, p: g.p as u32, wgs: wgs as u32, rows: chunk.len() as u32, atoms: atoms as u32, scale: tables.scale, pad: [0; 2] };
+            let u = b.uniform(ctx, k, "orbital_shares", &params);
+            let out = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &bufs.out, offset: (d * block * 4) as u64, size: wgpu::BufferSize::new((block * 4) as u64),
+            });
+            let mut res = vec![u.binding(), tables.buffer.as_entire_binding(), bufs.atoms.as_entire_binding(), out];
+            // unused slots re-bind the chunk's first orbital (read-only; `rows` zeroes them)
+            res.extend((0..SHARE_ROWS).map(|s| chunk.get(s).unwrap_or(&chunk[0]).buffer.as_entire_binding()));
+            let bg = k.bind_group(ctx, "orbital_shares", &res);
+            b.dispatch(k, "orbital_shares", &bg, [wgs as u32, blocks as u32, 1]);
+        }
+        b.encoder().copy_buffer_to_buffer(&bufs.out, 0, &bufs.staging, 0, Some(bytes));
+        b.submit();
+        let raw = map_read_f32(ctx, &bufs.staging, (bytes / 4) as usize);
+        // the f64 finish: Neumaier over each lane's workgroup partials, × h³
+        let dv = g.dv();
+        let share = |row: usize, a: usize| -> f64 {
+            let (d, r) = (row / SHARE_ROWS, row % SHARE_ROWS);
+            let (yb, lane) = (a / SHARE_ATOMS, a % SHARE_ATOMS);
+            let at = d * block + ((yb * SHARE_ROWS + r) * SHARE_ATOMS + lane) * wgs;
+            neumaier(raw[at..at + wgs].iter().map(|v| *v as f64)) * dv
+        };
+        [(0..counts[0]).map(|i| (0..atoms).map(|a| share(i, a)).collect()).collect(),
+         (0..counts[1]).map(|i| (0..atoms).map(|a| share(counts[0] + i, a)).collect()).collect()]
     }
 
     /// The display eigensolve for m unoccupied orbitals per channel (module doc, "Unoccupied

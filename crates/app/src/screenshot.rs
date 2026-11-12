@@ -24,10 +24,18 @@ const H: u32 = 900;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
-/// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// knowledge|activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
-/// others on the right; the left dock starts open on Readouts, the right one collapsed), `dock=closed`
-/// collapses both, `select=<i>` selects a nucleus,
+/// of the mockup): `menu=file|scene|physics|window|help` opens a menu (`menu=view`, the old View
+/// menu, shows the View panel), `tab=<panel>` shows that
+/// panel (its name, any case: `readouts|graph|model|knowledge|activity|orbitals|selection|log|view`;
+/// `UiState::open_tab`: the active tab of its leaf in the default layout, `ui::workspace`),
+/// `layout=one|two|training|presenting` arranges the workspace as that built-in layout first
+/// (Window ▸ Layouts, docking spec D-11, `ui::workspace::presets`), `dock=closed` is
+/// `layout=presenting` (the 3D view fills the window, every panel auto-hidden; spec D-13),
+/// `hide=<panel>[,<panel>…]` auto-hides those panels (docking spec D-10: each to
+/// the strip of its side of the 3D view; with `tab=` naming one, its flyout is out),
+/// `detach=<panel>[,<panel>…]` pops those panels out into one detached window (docking spec D-12:
+/// headless there is no OS window, so the shot is the main window without them — the windowed
+/// app's `--detach` opens the real one), `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -55,7 +63,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// simulated femtoseconds, 5–10 000; 100 by default) and `trail_opacity=<0-100>` (percent; 70 by
 /// default). They are set before the play, so the history is collected while it runs.
 ///
-/// The knowledge map (M8a Task 9): `tab=knowledge` opens its tab (right dock), `knowledge=on|off`
+/// The knowledge map (M8a Task 9): `tab=knowledge` shows its panel, `knowledge=on|off`
 /// switches View ▸ Display aids ▸ knowledge overlay (the atoms' tint and its legend; off by
 /// default). Both need the estimated solver's map to show more than their empty state.
 ///
@@ -73,7 +81,11 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub struct ShotUi {
     pub menu: Option<String>,
     pub tab: Option<String>,
-    pub dock_closed: bool,
+    /// `layout=<preset>` (and `dock=closed`, Presenting): applied before `hide=` and `tab=`.
+    pub layout: Option<crate::ui::LayoutPreset>,
+    pub hide: Vec<String>,
+    /// `detach=<panel>[,<panel>…]`: into one detached window, after `hide=`.
+    pub detach: Vec<String>,
     pub select: Option<usize>,
     pub tool: Option<String>,
     pub element: Option<u8>,
@@ -141,7 +153,15 @@ impl ShotUi {
             match k.trim() {
                 "menu" => s.menu = Some(v.to_string()),
                 "tab" => s.tab = Some(v.to_string()),
-                "dock" => s.dock_closed = v == "closed",
+                "layout" => s.layout = Some(crate::ui::LayoutPreset::from_word(v).ok_or_else(|| format!("--ui: layout=one|two|training|presenting, got {v}"))?),
+                // the docks' old key (docking spec D-13): `dock=closed` is the Presenting layout
+                "dock" => {
+                    if v == "closed" {
+                        s.layout = Some(crate::ui::LayoutPreset::Presenting);
+                    }
+                }
+                "hide" => s.hide = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
+                "detach" => s.detach = v.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect(),
                 "select" => s.select = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "tool" => s.tool = Some(v.to_string()),
                 "element" => s.element = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -359,24 +379,21 @@ impl ShotUi {
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
-        if let Some(t) = &self.tab {
-            let tab = match t.as_str() {
-                "readouts" => DockTab::Readouts,
-                "graph" => DockTab::Graph,
-                "model" => DockTab::Model,
-                "knowledge" => DockTab::Knowledge,
-                "activity" => DockTab::Activity,
-                "orbitals" => DockTab::Orbitals,
-                "selection" => DockTab::Selection,
-                "log" => DockTab::Log,
-                other => return Err(format!("--ui: unknown tab {other}")),
-            };
-            // each tab opens its own dock (activity, readouts, graph: the left one)
-            viewer.ui.open_tab(tab);
+        if let Some(p) = self.layout {
+            viewer.ui.apply_layout(p);
         }
-        if self.dock_closed {
-            viewer.ui.dock_open = false;
-            viewer.ui.left_open = false;
+        for t in &self.hide {
+            let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown panel {t}"))?;
+            viewer.ui.workspace.pin(tab, false);
+        }
+        if !self.detach.is_empty() {
+            let tabs = crate::ui::panels_named(&self.detach.join(","))?;
+            let id = viewer.ui.workspace.pop_out(&tabs, tabs[0]);
+            eprintln!("--ui detach: {} in detached window {} (headless: no OS window; the shot is the main window without them)", self.detach.join(", "), id.map_or("-".into(), |i| i.to_string()));
+        }
+        if let Some(t) = &self.tab {
+            let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
+            viewer.ui.open_tab(tab);
         }
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
@@ -434,7 +451,7 @@ impl ShotUi {
             viewer.ui.search.query = q.clone();
         }
         if let Some(m) = &self.menu {
-            crate::ui::open_menu(&viewer.egui_ctx, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
+            crate::ui::open_menu(&viewer.egui_ctx, &mut viewer.ui, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
         }
         if let Some(n) = self.names {
             viewer.ui.name_style = n;
@@ -991,6 +1008,8 @@ mod tests {
         assert_eq!((off.trails, off.trail_fs, off.trail_opacity), (Some(false), None, None));
         let none = ShotUi::parse("tab=graph").unwrap();
         assert_eq!((none.trails, none.trail_fs, none.trail_opacity), (None, None, None));
+        assert!(none.hide.is_empty());
+        assert_eq!(ShotUi::parse("hide=graph, Log;tab=graph").unwrap().hide, vec!["graph".to_string(), "Log".to_string()]);
         // the ends of both ranges are accepted, outside them and nonsense are refused
         assert!(ShotUi::parse("trail_fs=5;trail_opacity=0").is_ok());
         assert!(ShotUi::parse("trail_fs=10000;trail_opacity=100").is_ok());
@@ -1005,5 +1024,23 @@ mod tests {
         assert_eq!(ShotUi::parse("angles=on;select=0").unwrap().angles, Some(true));
         assert_eq!(ShotUi::parse("select=0").unwrap().angles, None);
         assert!(ShotUi::parse("angles=maybe").is_err());
+    }
+
+    /// `layout=<preset>` names a built-in layout (docking spec D-13); `dock=closed`, the docks'
+    /// old key, still parses and is Presenting.
+    #[test]
+    fn layout_names_a_preset_and_dock_closed_is_presenting() {
+        use crate::ui::LayoutPreset as Preset;
+        for (v, p) in [("one", Preset::OneMonitor), ("two", Preset::TwoMonitors), ("training", Preset::Training), ("Presenting", Preset::Presenting)] {
+            assert_eq!(ShotUi::parse(&format!("layout={v};tab=graph")).unwrap().layout, Some(p), "{v}");
+        }
+        assert_eq!(ShotUi::parse("dock=closed").unwrap().layout, Some(Preset::Presenting));
+        // detach=: the panels to pop out (docking spec D-12), read as the window's --detach
+        assert_eq!(ShotUi::parse("detach=activity, Graph").unwrap().detach, ["activity", "Graph"]);
+        assert_eq!(crate::ui::panels_named("activity, Graph"), Ok(vec![crate::ui::DockTab::Activity, crate::ui::DockTab::Graph]));
+        assert!(crate::ui::panels_named("activity,bogus").is_err() && crate::ui::panels_named(" , ").is_err());
+        assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
+        assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");
+        assert!(ShotUi::parse("layout=three").err().is_some_and(|e| e.contains("training")));
     }
 }

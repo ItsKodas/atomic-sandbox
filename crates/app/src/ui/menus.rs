@@ -1,10 +1,11 @@
-//! The top bar: brand, the File / Scene / View / Physics / Help menus (what is set once and left
-//! alone), the scene chip (preset, grid, nuclei, electrons, charge, multiplicity; click for the
-//! preset picker and Reset) and the Ctrl K search button. In the compact layout the five menus
-//! fold into one "☰ Menu". Also the Help windows ("Physics, honestly").
-use super::dock::orbitals;
+//! The top bar: brand, the File / Scene / Physics / Window / Help menus (what is set once and left
+//! alone; the View menu's settings became the View panel, docking spec D-6/D-7), the scene chip
+//! (preset, grid, nuclei, electrons, charge, multiplicity; click for the preset picker and Reset)
+//! and the Ctrl K search button. In the compact layout the five menus fold into one "☰ Menu".
+//! Also the Help windows ("Physics, honestly").
 use super::search;
-use super::{gravity_au, icons, probed, theme, Action, HelpTopic, PanelInput, ShowMode, UiState, VOLUME_DOTS, VOLUME_ISO, VOLUME_VOLUME};
+use super::workspace::presets::Preset;
+use super::{gravity_au, icons, probe, probed, theme, Action, DockTab, HelpTopic, PanelInput, UiState};
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
@@ -14,20 +15,21 @@ use sim::dynamics::{DT_WARN_FS, F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
 pub enum MenuId {
     File,
     Scene,
-    View,
     Physics,
+    /// The panels and the layouts (docking spec D-7; the View menu's place before it).
+    Window,
     Help,
 }
 
 impl MenuId {
-    pub const ALL: [MenuId; 5] = [MenuId::File, MenuId::Scene, MenuId::View, MenuId::Physics, MenuId::Help];
+    pub const ALL: [MenuId; 5] = [MenuId::File, MenuId::Scene, MenuId::Physics, MenuId::Window, MenuId::Help];
 
     pub fn title(self) -> &'static str {
         match self {
             MenuId::File => "File",
             MenuId::Scene => "Scene",
-            MenuId::View => "View",
             MenuId::Physics => "Physics",
+            MenuId::Window => "Window",
             MenuId::Help => "Help",
         }
     }
@@ -57,11 +59,12 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
             ui.horizontal_centered(|ui| {
                 brand(ui, compact);
                 if compact {
-                    let r = ui.add(Button::new("☰ Menu").frame_when_inactive(false));
+                    let r = probed("menu-all", ui.add(Button::new("☰ Menu").frame_when_inactive(false)));
                     hot.push(r.rect);
                     menu_popup(&r, egui::Id::new("menu-all")).show(|ui| {
                         for m in MenuId::ALL {
-                            egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| scrolled(ui, 340.0, |ui| contents(ui, st, input, m, acts)));
+                            let (r, _) = egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| scrolled(ui, 340.0, |ui| contents(ui, st, input, m, acts)));
+                            probe(&format!("menu-{}", m.title()), &r);
                         }
                     });
                 } else {
@@ -69,12 +72,12 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                         let open = Popup::is_id_open(ui.ctx(), popup_id(m));
                         if m == MenuId::File {
                             // File: Open… (the File window) and Save… (the Save window), `files`
-                            let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
+                            let r = probed("menu-File", ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
                             hot.push(r.rect);
                             menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 200.0, |ui| file_items(ui, st)));
                             continue;
                         }
-                        let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
+                        let r = probed(&format!("menu-{}", m.title()), ui.add(Button::selectable(open, m.title()).frame_when_inactive(false)));
                         hot.push(r.rect);
                         menu_popup(&r, popup_id(m)).show(|ui| scrolled(ui, 350.0, |ui| contents(ui, st, input, m, acts)));
                     }
@@ -187,7 +190,7 @@ const POPUP_FOOT: f32 = 12.0;
 
 /// A menu popup's contents, at least `min_width` wide, in a vertical scroll area capped at the
 /// window's height left below the popup's top: past that the menu scrolls instead of running off
-/// the window (the View menu measured 1011 pt in a 900 pt window, 2026-10-20). A Ctrl K reveal
+/// the window (the old View menu measured 1011 pt in a 900 pt window, 2026-10-20). A Ctrl K reveal
 /// scrolls it to the marked group (`search::mark`).
 fn scrolled<R>(ui: &mut Ui, min_width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let max_h = (ui.ctx().content_rect().bottom() - ui.next_widget_position().y - POPUP_FOOT).max(120.0);
@@ -296,8 +299,8 @@ fn contents(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: MenuId, ac
     match m {
         MenuId::File => file_menu(ui, st, input, acts),
         MenuId::Scene => scene_menu(ui, st, input, acts),
-        MenuId::View => view_menu(ui, st, acts),
         MenuId::Physics => physics_menu(ui, st, input, acts),
+        MenuId::Window => window_menu(ui, st),
         MenuId::Help => help_menu(ui, st),
     }
 }
@@ -623,72 +626,6 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
     }
 }
 
-/// The estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud"): atomic
-/// superposition between DFT clouds, and the display refresh.
-/// View ▸ Display aids ▸ Trails (`crate::trails`, user request 2026-10-17): a fading line behind
-/// each atom. Display only: written straight to `UiState`, never sent to the worker.
-fn trail_controls(ui: &mut Ui, st: &mut UiState) {
-    use crate::trails;
-    ui.checkbox(&mut st.show_trails, "trails").on_hover_text(
-        "a thin fading line behind each atom, in its element colour, showing where it has been (display only; turning it on starts from now). Teleporting an atom, changing the nucleus count, loading a scene or a rewind starts a fresh trail; dragging keeps it",
-    );
-    if !st.show_trails {
-        return;
-    }
-    let mut x = trails::length_to_slider(st.trail_fs);
-    let length = egui::Slider::new(&mut x, 0.0..=1.0)
-        .text("trail length")
-        .custom_formatter(|v, _| trails::length_text(trails::slider_to_length(v)))
-        .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
-    if ui
-        .add(length)
-        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 10 000 steps per tick. Type a value like 250 or 2 ps")
-        .changed()
-    {
-        st.trail_fs = trails::slider_to_length(x);
-    }
-    let mut pct = (st.trail_opacity * 100.0).round();
-    if ui
-        .add(egui::Slider::new(&mut pct, 0.0..=100.0).text("trail opacity").suffix(" %").fixed_decimals(0))
-        .on_hover_text("the newest end's opacity; the trail fades linearly to fully transparent at the chosen length")
-        .changed()
-    {
-        st.trail_opacity = pct / 100.0;
-    }
-}
-
-fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
-    let estimated = st.backend == Backend::Estimated;
-    let mut warp = st.warp_fields;
-    if ui
-        .checkbox(&mut warp, "fields follow the atoms")
-        .on_hover_text("the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)")
-        .changed()
-    {
-        acts.push(Action::WarpFields(warp));
-    }
-    let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
-    let mut changed = false;
-    ui.add_enabled_ui(estimated, |ui| {
-        changed |= ui
-            .checkbox(&mut sup, "atomic superposition between DFT clouds")
-            .on_hover_text("estimated solver: the model has no electrons, so between real densities the cloud is the teacher's own isolated atoms placed at the current nuclei — where the atoms are, not their bonds — blended with the last real density as the atoms move away from it. Labelled \"atomic superposition — not solved\". Needs the GPU teacher (its background solver computes the atoms once per species and grid)")
-            .changed();
-        ui.horizontal(|ui| {
-            changed |= probed("cloud-refresh", ui.checkbox(&mut refresh, "refresh cloud every"))
-                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs, and goes before the next one — at full speed, where audits run back to back, it costs ≈ solve time / N of them), labelled with its time. Not a training sample. Needs the GPU teacher")
-                .changed();
-            changed |= ui.add_enabled(refresh, egui::Slider::new(&mut every, 1.0..=10.0).suffix(" s").fixed_decimals(0)).changed();
-        });
-    });
-    if !estimated {
-        theme::note(ui, "(cloud options apply to the estimated solver; DFT steps show their own density)");
-    }
-    if changed {
-        acts.push(Action::Cloud { superposition: sup, refresh, refresh_s: every });
-    }
-}
-
 /// Draft mode (`providers::surrogate`, "Draft mode"): Physics ▸ Estimated solver and Dock ▸ Model.
 pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let mut draft = st.draft;
@@ -704,232 +641,70 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     }
 }
 
-fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
-    anchored(ui, st, "m-density", |ui, st| {
-        theme::section(ui, "Density");
-        // orbital-viewer spec §3: what the view shows; the Orbitals dock tab holds the list and the per-mode controls
-        ui.horizontal_wrapped(|ui| {
-            ui.label("show");
-            theme::info(ui, format!("{} {}", orbitals::KS_NOTE, orbitals::SPIN_NOTE));
-        });
-        if let Some(m) = orbitals::show_selector(ui, st.show, &mut st.hide_cloud, "menu-show") {
-            acts.push(Action::Show(m));
-        }
-        ui.horizontal(|ui| {
-            ui.label("render as");
-            let ori = "volume / isosurface: for an orbital or the spin density, a glowing volume with the sign's colour, or the ± isosurface. Dots: random samples of the field";
-            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(VOLUME_VOLUME, "volume", ori), (VOLUME_ISO, "isosurface", ori), (VOLUME_DOTS, "dots", "random samples of the field, ∝ ρ (or |ψ|², or |m|) per cell: dots are samples of where an electron is likely to be — not electrons")]) {
-                acts.push(Action::VolumeMode(m));
-            }
-        });
-        let volume = st.volume_mode == super::VOLUME_VOLUME;
-        ui.add_enabled(volume, egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"));
-        ui.add_enabled(volume, egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"));
-        ui.add_enabled(st.volume_mode == super::VOLUME_ISO, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
-        // the dots' look, shown only while rendering as dots (like the trails' rows; the menu
-        // outgrew a 900 pt window, 2026-10-20): floating (each dot wanders by a Metropolis walk on
-        // the field, so the cloud stays a true sample of it) and glowing (soft sprites added:
-        // dense regions burn to white)
-        if st.volume_mode == super::VOLUME_DOTS {
-            ui.checkbox(&mut st.shimmer, "shimmer (new dots every frame)");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut st.dots_float, "floating").on_hover_text("each dot wanders: a random step each frame, kept or refused by the density there (a Metropolis walk) — the cloud stays a true sample of the field while the dots drift");
-                ui.checkbox(&mut st.dots_glow, "glow").on_hover_text("soft dots whose light adds up: dense regions burn toward white");
-            });
-            if st.dots_float {
-                ui.add(egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).text("drift (grid cells per frame)"));
-            }
-            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount (× the default)"));
-            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size"));
-            ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).text("blur (0 crisp … 1 soft)"));
-            if st.dots_glow {
-                ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness"));
+/// Window (docking spec D-7): one row per panel — its icon and name, a check while it is in the
+/// workspace (shown, behind another tab, in a detached window or auto-hidden; none when closed); a click shows
+/// it where it is (a closed one comes back beside the 3D view) — then Layouts ▸ (the four built-in
+/// layouts, spec D-11: `workspace::presets`) and Reset layout (One monitor; Two monitors when a
+/// second monitor is connected). A panel in a detached window is brought to the front there (spec
+/// D-12). Display state: none of it is an `Action`.
+fn window_menu(ui: &mut Ui, st: &mut UiState) {
+    anchored(ui, st, "m-panels", |ui, st| {
+        theme::section(ui, "Panels");
+        for t in DockTab::PANELS {
+            if panel_row(ui, t, st.workspace.present(t)).clicked() {
+                st.open_tab(t);
+                ui.close();
             }
         }
-        // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
-        let mut core = st.show_partial_core;
-        if probed("show-partial-core", ui.checkbox(&mut core, "with partial core")).on_hover_text(super::pseudo::PARTIAL_CORE_TIP).changed() {
-            acts.push(Action::ShowPartialCore(core));
-        }
-        ui.horizontal(|ui| {
-            ui.label("colour dots by");
-            ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS && st.show == ShowMode::Coloured, |ui| {
-                if let Some(by_orbital) = theme::segmented(ui, st.dots_by_orbital, &[(false, "density", "the density ramp at the dot"), (true, "orbital", "each dot in its orbital's own colour (All orbitals coloured)")]) {
-                    st.dots_by_orbital = by_orbital;
-                }
-            });
-        });
-        // Q5 of Appendix B (M5b): the estimated solver's cloud
-        theme::section(ui, "Estimated solver's cloud");
-        cloud_controls(ui, st, acts);
     });
     ui.separator();
-    anchored(ui, st, "m-display", |ui, st| {
-        theme::section(ui, "Display aids");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut st.show_cell, "cell").on_hover_text("the simulation box: nuclei must stay inside it");
-            ui.checkbox(&mut st.show_floor, "floor grid");
-            ui.checkbox(&mut st.show_axes, "axes");
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut st.show_place_grid, "placement plane").on_hover_text("Place tool: the plane the next click lands on");
-            ui.label("spacing");
-            ui.radio_value(&mut st.grid_in_angstrom, false, "1 Bohr");
-            ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
-        });
-        probed("show-ghost", ui.checkbox(&mut st.show_ghost, "show what training is solving"))
-            .on_hover_text("while a sampling pass runs, the view shows the geometry the teacher is solving right now as a wireframe ghost (a lone reference atom, a random nudge with arrows, the scanned pair, the hot burst with a trail) instead of your scene, flashing green / red / grey as each sample is kept / fails / is skipped; your scene returns when the pass ends or is cancelled. Display only"
-            );
-        super::knowledge::overlay_toggle(ui, st);
-        let mut smooth = st.smooth_motion;
-        if ui
-            .checkbox(&mut smooth, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density")
-            .changed()
-        {
-            acts.push(Action::SmoothMotion(smooth));
-        }
-        trail_controls(ui, st);
-        // the 3D view's background: an inline picker (a popup picker would close the menu), presets,
-        // and a reset to the default dark blue
-        egui::CollapsingHeader::new("background colour").id_salt("bg-colour").show(ui, |ui| {
-            let [r, g, b] = st.background.unwrap_or([29, 31, 41]);
-            let mut c = egui::Color32::from_rgb(r, g, b);
-            if egui::widgets::color_picker::color_picker_color32(ui, &mut c, egui::widgets::color_picker::Alpha::Opaque) {
-                st.background = Some([c.r(), c.g(), c.b()]);
-            }
-            ui.horizontal(|ui| {
-                for (name, rgb) in [("black", [0, 0, 0]), ("charcoal", [24, 24, 28]), ("slate", [46, 52, 64]), ("grey", [128, 128, 132]), ("white", [245, 245, 245])] {
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                    ui.painter().rect(rect, 4.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]), egui::Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
-                    if resp.on_hover_text(name).clicked() {
-                        st.background = Some(rgb);
-                    }
+    anchored(ui, st, "m-layout", |ui, st| {
+        let (r, _) = egui::containers::menu::SubMenuButton::new("Layouts").ui(ui, |ui| {
+            for p in Preset::ALL {
+                if probed(&format!("layout-{}", p.word()), ui.button(p.title())).on_hover_text(p.tip()).clicked() {
+                    st.apply_layout(p);
+                    ui.close();
                 }
-                ui.add_space(8.0);
-                if ui.add_enabled(st.background.is_some(), egui::Button::new("Reset")).on_hover_text("the default dark blue").clicked() {
-                    st.background = None;
-                }
-            });
+            }
         });
-        // bloom: the bright parts glow (display only)
-        ui.horizontal(|ui| {
-            ui.label("bloom");
-            ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2))
-                .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
-        });
-        ui.add_enabled_ui(st.bloom > 0.0, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("bloom from");
-                ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2))
-                    .on_hover_text("how bright a part must be to glow (1 = only full white)");
-            });
-        });
-        // the Camera view's settings (it is picked in the view's bottom-left switch)
-        ui.separator();
-        theme::section(ui, "Camera");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut st.camera_view, "camera view").on_hover_text("the atoms as they look rather than as markers: from a soft electron glow to solid balls, blurred over the shutter (also the view switch, bottom left)");
-        });
-        // its sliders only while it is on (as the dots' look above)
-        if st.camera_view {
-            let row = |ui: &mut Ui, name: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: String, tip: &str| {
-                ui.horizontal(|ui| {
-                    ui.add_sized([72.0, 18.0], egui::Label::new(name));
-                    ui.add(egui::Slider::new(v, range).show_value(false)).on_hover_text(tip);
-                    ui.label(text);
-                });
-            };
-            let t = format!("{:+.1} EV", st.exposure_ev);
-            row(ui, "exposure", &mut st.exposure_ev, -3.0..=3.0, t, "brightness, in stops (EV)");
-            let t = format!("{:.0} %", st.shutter * 100.0);
-            row(ui, "shutter", &mut st.shutter, 0.0..=1.0, t, "how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
-            let t = format!("{:.0}°", st.fov_deg);
-            row(ui, "field of view", &mut st.fov_deg, 15.0..=100.0, t, "the lens: narrow (telephoto, flat) to wide (close, strong perspective)");
-            let t = if st.camera_solidity <= 0.0 { "glow".into() } else if st.camera_solidity >= 1.0 { "solid".into() } else { format!("{:.0} %", st.camera_solidity * 100.0) };
-            row(ui, "solidity", &mut st.camera_solidity, 0.0..=1.0, t, "how the atoms look: a soft electron glow (left, closest to what an atom is) to solid shaded balls (right, like a space-filling model)");
-            let t = format!("{:.1}×", st.camera_size);
-            row(ui, "size", &mut st.camera_size, 0.6..=4.0, t, "the atoms' size, × the diagram's radius: about 1× is the diagram's small balls, about 3–4× is space-filling");
-            let t = if st.camera_smooth <= 0.0 { "balls".into() } else { format!("{:.2} Bohr", st.camera_smooth) };
-            row(ui, "smooth", &mut st.camera_smooth, 0.0..=2.0, t, "with any solidity: one smooth surface instead of separate balls — atoms close together flow into each other through a soft neck this wide (0 = separate balls, the hard crease)");
+        probe("layouts-submenu", &r);
+        if probed("reset-layout", ui.button("Reset layout")).on_hover_text("every panel back where it starts: the One monitor layout (Two monitors when a second monitor is connected)").clicked() {
+            st.reset_layout();
+            ui.close();
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("motion blur");
-            ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false))
-                .on_hover_text("while playing, faint copies of each atom along the path its last steps took — a fast vibration smears instead of jittering. Shows when many steps run per frame (the estimated solver); 0 turns it off. Display only");
-            ui.label(format!("{:.0} %", st.motion_blur * 100.0));
-        });
-    });
-    ui.separator();
-    // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge
-    anchored(ui, st, "m-bonds", |ui, st| {
-        ui.horizontal(|ui| {
-            theme::section(ui, "Bonds and molecules");
-            theme::info(ui, super::rich(BONDS_TIP, 12.5, theme::INK));
-        });
-        ui.horizontal(|ui| {
-            let (mut b, mut l, mut g) = (st.show_bonds, st.show_labels, st.show_badge);
-            if probed("show-bonds", ui.checkbox(&mut b, "bonds")).on_hover_text(super::rich(BONDS_TIP, 12.5, theme::INK)).changed() {
-                acts.push(Action::ShowBonds(b));
-            }
-            if probed("show-labels", ui.checkbox(&mut l, "molecule names"))
-                .on_hover_text("each molecule's formula and name next to it in the view (also listed in Dock ▸ Selection): a molecule is a connected piece of the bond graph; names come from a small table of trivial names or the IUPAC rules for binary compounds, marked \"(systematic)\"")
-                .changed()
-            {
-                acts.push(Action::ShowLabels(l));
-            }
-            if probed("show-badge", ui.checkbox(&mut g, "composition badge"))
-                .on_hover_text("hovering a nucleus with the Select tool (or selecting one) shows its isotope, protons, neutrons and the force on it: \"¹⁶O · 8 p · 8 n · |F| 0.012 Ha/Bohr\"")
-                .changed()
-            {
-                acts.push(Action::ShowBadge(g));
-            }
-        });
-        ui.horizontal(|ui| {
-            let mut a = st.show_angles;
-            if probed("show-angles", ui.checkbox(&mut a, "bond angles")).on_hover_text(ANGLES_TIP).changed() {
-                acts.push(Action::ShowAngles(a));
-            }
-        });
-        ui.horizontal(|ui| {
-            probed("show-bond-lengths", ui.checkbox(&mut st.show_bond_lengths, "bond lengths")).on_hover_text(
-                "each drawn bond's length in Å at its middle (the nuclei's distance as drawn now; Bohr in the hover of the Selection tab).                  With more than 12 bonds only those of the selected or hovered atom are labelled. Display only",
-            );
-        });
-        ui.horizontal(|ui| {
-            probed("show-charges", ui.checkbox(&mut st.show_charges, "partial charges")).on_hover_text(super::CHARGES_TIP);
-        });
-        ui.horizontal(|ui| {
-            ui.label("label opacity");
-            ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
-                .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths, angles and partial charges (display only)");
-            ui.label(format!("{:.0} %", st.label_opacity * 100.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("name style").on_hover_text(NAME_STYLE_TIP);
-            let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
-            if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
-                acts.push(Action::NameStyle(s));
-            }
-        });
-        ui.label(super::rich(HONEST_BONDS, 11.0, theme::INK_DIM));
     });
 }
 
-/// The name-style tooltip (View ▸ Bonds and molecules).
+/// A Window menu row: the panel's icon, its title and, while it is in the workspace, a check.
+fn panel_row(ui: &mut Ui, t: DockTab, present: bool) -> egui::Response {
+    let r = probed(
+        &format!("window-{}", t.name()),
+        ui.add(Button::new(format!("      {}", t.title())).frame_when_inactive(false).min_size(Vec2::new(ui.available_width(), 24.0))),
+    )
+    .on_hover_text(if present { "in the workspace: click to bring it to the front" } else { "closed: click to show it" });
+    let ink = if present || r.hovered() { theme::INK } else { theme::INK_DIM };
+    let p = ui.painter();
+    icons::paint(p, egui::Rect::from_center_size(egui::pos2(r.rect.left() + 14.0, r.rect.center().y), Vec2::splat(14.0)), super::dock::icon(t), ink);
+    if present {
+        let c = egui::pos2(r.rect.right() - 14.0, r.rect.center().y);
+        p.add(egui::Shape::line(vec![c + Vec2::new(-4.5, 0.5), c + Vec2::new(-1.5, 3.5), c + Vec2::new(4.5, -3.5)], Stroke::new(1.8, theme::ACCENT)));
+    }
+    r
+}
+
+/// The name-style tooltip (View ▸ Bonds & labels, `dock::view`).
 pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always shows): common — water, ammonia (trivial names, else IUPAC binary names marked \"(systematic)\"); systematic (stoichiometric) — the IUPAC Red Book IR-5 name from the composition: dihydrogen monoxide, nitrogen trihydride, trihydrogen(1+) (a heteronuclear ion or a compound of three elements has none: formula only); IUPAC hydride — oxidane, azane, methane, borane where a parent hydride exists, else the stoichiometric name; formula only";
 
-/// The bonds' tooltip (View ▸ Bonds and molecules).
+/// The bonds' tooltip (View ▸ Bonds & labels).
 pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms are smeared (at the Balanced 0.25 Bohr spacing, and still at the default Accurate 0.15): the topology is expected right, the bond-point numbers are not physical";
 
-/// The bond-angle toggle's tooltip (View ▸ Bonds and molecules; M7 Task 13).
+/// The bond-angle toggle's tooltip (View ▸ Bonds & labels; M7 Task 13).
 // Task 11: once the `All` water gate is measured, append "; with every species pseudised it relaxes
 // to {θ}°" with the value recorded in `references.md` "M7 oracles" (plan review NOTE: the tooltip
 // quotes the measurement, not an expectation written before it).
-pub const ANGLES_TIP: &str = "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. An angle is drawn in the style of its weaker bond: dashed and faint at a closed-shell contact, dotted where the bond's kind is not resolved. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there. Under pseudopotentials a bond's kind is a valence-density kind where its bond point lies inside a core radius r_c (Dock ▸ Selection says so)";
+pub const ANGLES_TIP: &str = "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. An angle is drawn in the style of its weaker bond: dashed and faint at a closed-shell contact, dotted where the bond's kind is not resolved. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there. Under pseudopotentials a bond's kind is a valence-density kind where its bond point lies inside a core radius r_c (the Selection panel says so; Window ▸ Selection)";
 
-/// The honesty lines of spec §3.5 (View menu, Selection tab).
+/// The honesty lines of spec §3.5 (the View panel, the Selection tab).
 pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
 
 /// The dt field (toolbar and Physics menu): amber when above `DT_WARN_FS`.
@@ -1214,8 +989,8 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind goes back to when you last pressed Play (each Play keeps a snapshot of the scene, velocities and settings; right-click or ▾ for the last five; the estimated model is not rolled back); Physics ▸ Reverse velocities flips every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
-    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–18 can be placed (Z > 10 run on a generated pseudopotential, or are refused with a reason), heavier elements need the next pseudopotential stage (ONCV, semicore); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
-    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force. Bond angles: an arc and a degree label between each pair of drawn bonds at an atom (more than three bonds at an atom: select or hover it)"),
+    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–18 can be placed (Z > 10 run on a generated pseudopotential, or are refused with a reason), heavier elements need the next pseudopotential stage (ONCV, semicore); the isotope row under the table picks the mass number. A selected nucleus's isotope: the Selection panel (Window ▸ Selection)"),
+    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds & labels); hover a nucleus with the Select tool for its isotope, protons, neutrons and force. Bond angles: an arc and a degree label between each pair of drawn bonds at an atom (more than three bonds at an atom: select or hover it)"),
     ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];
 
@@ -1250,7 +1025,7 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         ),
         HelpTopic::Charges => (
             "Partial charges are one partition of many",
-            "The small +/− labels on the atoms (View ▸ Bonds and molecules ▸ partial charges; also Dock ▸ Selection and the hover badge) are Hirshfeld charges: q_A = Z_A − ∫ w_A ρ, where ρ is the solved electron density and w_A = ρ_A⁰ / Σ_B ρ_B⁰ shares every point between the atoms in proportion to their free-atom densities — this solver's own isolated neutral atoms, the same ones the bond detector compares with. Z_A is the nuclear charge, or the valence charge for a pseudopotential atom (its density is the valence density). Because the weights add up to one everywhere, the charges add up exactly to the scene's charge (Scene ▸ Charge); the viewer checks that and hides charges that do not.\n\n\
+            "The small +/− labels on the atoms (View ▸ Bonds & labels ▸ partial charges; also the Selection panel — Window ▸ Selection — and the hover badge) are Hirshfeld charges: q_A = Z_A − ∫ w_A ρ, where ρ is the solved electron density and w_A = ρ_A⁰ / Σ_B ρ_B⁰ shares every point between the atoms in proportion to their free-atom densities — this solver's own isolated neutral atoms, the same ones the bond detector compares with. Z_A is the nuclear charge, or the valence charge for a pseudopotential atom (its density is the valence density). Because the weights add up to one everywhere, the charges add up exactly to the scene's charge (Scene ▸ Charge); the viewer checks that and hides charges that do not.\n\n\
              An atom's charge in a molecule is not an observable: it depends on how space is divided between the atoms. Hirshfeld is one parameter-free choice among several (Mulliken, Bader's QTAIM basins, fits to the electrostatic potential, iterative Hirshfeld-I) and is known to give small magnitudes — the free-atom weights pull the partition toward neutral atoms — so read the sign and the trend, not the size. They are measured from this LSDA density at this grid and smearing, so they carry its approximations too.\n\n\
              Display only: computed after a converged DFT density and never fed back into the forces. Under the estimated solver a model step has no electrons, so the charges are the last DFT density's (a fallback, an audit or a display refresh), drawn faded with their time.".into(),
         ),

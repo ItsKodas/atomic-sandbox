@@ -320,11 +320,25 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
         let rows = jobs::rows(input, input.probe.as_ref());
-        if rows.is_empty() && loading.is_none() {
-            theme::note(ui, "nothing running");
-        } else {
-            jobs::show(ui, &rows, acts);
-        }
+        // while playing, the solve row comes and goes between steps: the list keeps the tallest
+        // height it reached until the run stops, so the groups below never jump (user request
+        // 2026-11-11); paused and idle it shrinks back to "nothing running"
+        let id = ui.id().with("jobs-height");
+        let keep = input.playing || !rows.is_empty();
+        let reserved = if keep { ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0) } else { 0.0 };
+        let used = ui
+            .scope(|ui| {
+                ui.set_min_height(reserved);
+                if rows.is_empty() && loading.is_none() {
+                    theme::note(ui, "nothing running");
+                } else {
+                    jobs::show(ui, &rows, acts);
+                }
+            })
+            .response
+            .rect
+            .height();
+        ui.data_mut(|d| d.insert_temp(id, if keep { used.max(reserved) } else { 0.0 }));
     });
     dock::group(ui, st, "d-counters", |ui, st| {
         theme::section(ui, "Counters");

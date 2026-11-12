@@ -9,6 +9,13 @@ use crate::tools;
 use egui::{RichText, Ui};
 use render::elements;
 
+/// An atom's name in the panels: its element symbol and its 0-based index in the scene ("O #0",
+/// "H #1") — the Selection tab's charges and guides and the Orbitals tab's groups (orbital-atom-shares
+/// spec, goal 2: the same names in both).
+pub(crate) fn atom_name(z: u8, k: usize) -> String {
+    format!("{} #{k}", elements::symbol(z))
+}
+
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let Some((i, n)) = input.selection() else {
         theme::note(ui, "no selection (Inspect or Edit: click a nucleus)");
@@ -23,7 +30,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         let atoms: Vec<String> = st
             .edit_group
             .iter()
-            .filter_map(|&j| input.scene.nuclei.get(j).map(|m| format!("{} #{j}", elements::symbol(m.z))))
+            .filter_map(|&j| input.scene.nuclei.get(j).map(|m| atom_name(m.z, j)))
             .collect();
         ui.label(RichText::new(format!("{} atoms selected", atoms.len())).strong().size(14.0));
         ui.label(RichText::new(atoms.join(" · ")).monospace().color(theme::INK_DIM));
@@ -92,7 +99,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             for g in guides {
                 let other = &input.scene.nuclei[g.index];
                 let pin = if input.pinned(g.index) == Some(true) { " (pinned)" } else { "" };
-                ui.label(format!("to {} #{}{pin}", elements::symbol(other.z), g.index));
+                ui.label(format!("to {}{pin}", atom_name(other.z, g.index)));
                 ui.monospace(format!("{:.2} Bohr", g.distance));
                 ui.label(RichText::new(format!("{:.3} Å", units::bohr_to_angstrom(g.distance))).monospace().color(theme::INK_DIM));
                 ui.end_row();
@@ -163,7 +170,7 @@ fn charges(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, selected: Opti
         let alpha = if current { 255 } else { 140 };
         super::wide_grid(ui, "charges", 3).striped(true).show(ui, |ui| {
             for (k, (z, q)) in c.z.iter().zip(&c.q).enumerate() {
-                let who = format!("{} #{k}", elements::symbol(*z));
+                let who = atom_name(*z, k);
                 ui.label(if selected == Some(k) { RichText::new(who).strong() } else { RichText::new(who) });
                 ui.label(RichText::new(super::super::charge_text(*q)).monospace().color(super::super::charge_colour(*q, alpha)));
                 ui.label(RichText::new(format!("Z {}", c.counted[k])).size(10.5).color(theme::INK_FAINT))
@@ -231,7 +238,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
         if bonded.is_empty() {
             theme::note(ui, "not bonded to anything");
         } else {
-            let names: Vec<String> = bonded.iter().map(|&j| format!("{} #{j}", input.scene.nuclei.get(j).map_or("?", |n| elements::symbol(n.z)))).collect();
+            let names: Vec<String> = bonded.iter().map(|&j| input.scene.nuclei.get(j).map_or(format!("? #{j}"), |n| atom_name(n.z, j))).collect();
             ui.label(format!("bonded to {}", names.join(", ")));
         }
         let pos: Vec<[f64; 3]> = input.scene.nuclei.iter().map(|n| n.pos).collect();

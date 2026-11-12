@@ -241,6 +241,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
     fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).set_display_interrupt(interrupt)
     }
+
+    fn set_share_tables(&mut self, tables: Option<Arc<crate::provider::ShareTables>>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).set_share_tables(tables)
+    }
 }
 
 /// A [`Trainable`] provider behind an `Arc<Mutex<_>>` — [`Shared`] for the surrogate: the test
@@ -335,6 +339,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
         self.lock().set_display_interrupt(interrupt)
+    }
+
+    fn set_share_tables(&mut self, tables: Option<Arc<crate::provider::ShareTables>>) {
+        self.lock().set_share_tables(tables)
     }
 }
 
@@ -534,5 +542,9 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
         self.with(|t| t.set_display_interrupt(interrupt))
+    }
+
+    fn set_share_tables(&mut self, tables: Option<Arc<crate::provider::ShareTables>>) {
+        self.with(|t| t.set_share_tables(tables))
     }
 }

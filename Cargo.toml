@@ -19,6 +19,8 @@ winit = "0.30"
 egui = "0.36"
 egui-wgpu = "0.36"
 egui-winit = "0.36"
+# the workspace's dock tree (docking UI redesign; UI plumbing, rule 2)
+egui_dock = "0.21.1"
 glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
