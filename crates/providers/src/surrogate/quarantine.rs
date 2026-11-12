@@ -1246,7 +1246,7 @@ impl SurrogateKs {
             // answers, `evaluate`'s `by_fence`), instead of a new sample at every step
             if movable.is_empty() {
                 notes.push(format!(
-                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); the answer is thinned and copy-checked like any other"
+                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); the answer goes to its rule's thinning and copy checks"
                 ));
             } else {
                 for i in movable {

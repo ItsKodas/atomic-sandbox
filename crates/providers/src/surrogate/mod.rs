@@ -785,7 +785,7 @@
 //! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
 //! as before (rule 8, Task 2 fix round 1 I1). Its fence is therefore permanent while it stays
 //! forgotten, so an agreeing teacher answer next to it — where nothing is released or superseded —
-//! is an ordinary one: thinned and copy-checked like a variance fallback's (`admit`; final review
+//! is an ordinary one: thinned and copy-checked like an envelope (rule 5) fallback's (`admit`; final review
 //! I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`), not a new sample at every step.
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
@@ -865,8 +865,8 @@
 //! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
 //! Thinned: the envelope rule (5), an untrusted model (rule 4) whose trust does not wait for
 //! samples, and an untrusted class that already holds Q′ samples (4b; short of them its fallbacks
-//! are exempt). **Copies** (round 1 of the 2026-10-18 trust review, MUST-2): a fallback under rules
-//! 4, 4b or 5, exempt or not, whose labels repeat a stored sample's within the fit's own noise (the
+//! are exempt); and a refusal by the fence alone next to forgotten samples (final review I1). **Copies** (round 1 of the 2026-10-18 trust review, MUST-2): a fallback under rules
+//! 4, 4b or 5 or the forgotten-sample fence, exempt or not, whose labels repeat a stored sample's within the fit's own noise (the
 //! nearest one of the same atom sequence inside the thinning radius: |ΔE| ≤ N·s_E, every atom's
 //! |F| within s_F — `is_label_copy`) is never kept: copies satisfy the count conditions by
 //! repetition and, fitted, shrink the two-noise evidence's s_F and with it rule 6's bound
@@ -2220,8 +2220,8 @@ impl ForceProvider for SurrogateKs {
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)
         let near = self.near_quarantined(&pos, &z);
-        // refused by the fence alone (final review I1): its answer is thinned and copy-checked as a
-        // variance fallback's is — which reaches `admit`'s checks only where forgotten samples
+        // refused by the fence alone (final review I1): its answer is thinned and copy-checked as an
+        // envelope (rule 5) fallback's is — which reaches `admit`'s checks only where forgotten samples
         // alone fence (a held one is released or superseded by an agreeing answer, and a
         // disagreeing one is never kept but by a fence vote)
         let by_fence = reason.is_none() && !near.is_empty();
