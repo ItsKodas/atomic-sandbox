@@ -2303,6 +2303,17 @@ fn the_guess_from_experience_persists_in_the_profile() {
     profile::apply(&mut back, "guess_bonds = maybe\n");
     assert!(back.guess_bonds, "unreadable: the default");
     assert!(search::ENTRIES.iter().any(|e| e.name == "Guess bonds from experience" && e.anchor == "m-bonds"), "a Ctrl K entry");
+    // Reset view settings puts it back on (display state: written directly, no action)
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    view_panel(&mut st, &[]);
+    st.guess_bonds = false;
+    let outs = click_widget(&ctx, &mut st, &inp, "view-reset");
+    assert!(st.guess_bonds, "Reset view settings: on again");
+    assert!(outs.iter().all(|o| o.actions.is_empty()), "no action for a display setting");
 }
 
 /// User request 2026-11-13: while experience draws over the stale bonds, the quiet line over Solve

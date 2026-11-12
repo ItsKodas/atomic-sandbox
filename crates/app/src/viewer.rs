@@ -1553,8 +1553,9 @@ impl Viewer {
                 let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
                 self.ghost.follow(ghost, Instant::now());
                 // bonds from experience: a fresh graph is recorded, a stale one guessed over
+                // (only drawn, so only computed, when wanted: `guess_wanted`)
                 let place = crate::bond_experience::place_for(self.collections_dir.as_deref(), &s);
-                self.bond_exp.on_snapshot(&s.dynamics, place);
+                self.bond_exp.on_snapshot(&s.dynamics, place, guess_wanted(&self.ui, s.backend));
                 if let Some(note) = self.bond_exp.note.take() {
                     self.ui.log.push(ui::logbook::LogKind::Warning, note);
                 }
@@ -2204,8 +2205,8 @@ impl Viewer {
         }
         if let Some(marks) = self.angle_marks(shown).filter(|_| arcs) {
             let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
-            for (m, stale) in &marks {
-                lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), *stale));
+            for (m, look) in &marks {
+                lines.extend(crate::overlay::angle_arc_lines_drawn(&pos, m, self.drawn_radius(shown, m.vertex), *look));
             }
         }
         lines
@@ -2213,10 +2214,12 @@ impl Viewer {
 
     /// The drawing of experience over a stale graph (`crate::bond_experience`): only with View ▸
     /// Bonds & labels ▸ guess bonds from experience on, the snapshot's graph stale, and the drawing
-    /// made for this very snapshot.
+    /// made for this very snapshot (under the estimated solver: the setting's checkbox is shown only
+    /// there, so a stale graph under a DFT backend is never guessed over).
     pub fn experience_shown(&self) -> Option<&crate::bond_experience::Shown> {
-        let d = &self.snapshot.as_ref()?.dynamics;
-        self.bond_exp.shown().filter(|x| self.ui.guess_bonds && d.bonds_stale && x.is_for(d))
+        let s = self.snapshot.as_ref()?;
+        let d = &s.dynamics;
+        self.bond_exp.shown().filter(|x| guess_wanted(&self.ui, s.backend) && d.bonds_stale && x.is_for(d))
     }
 
     /// The bonds drawn for `n` nuclei with each one's look: experience's drawing over a stale graph
@@ -2271,12 +2274,13 @@ impl Viewer {
     }
 
     /// The bond angles to draw between the nuclei as drawn now (M7 Task 13) between the drawn bonds
-    /// ([`Viewer::drawn_bonds`]), each with its stale flag (either of its two bonds an earlier DFT
-    /// step's, drawn stale: faded): every angle at an atom with at most `ANGLE_DECLUTTER_BONDS`
+    /// ([`Viewer::drawn_bonds`]), each with its look ([`angle_look`]: stale when either of its two
+    /// bonds is an earlier DFT step's drawn stale, else from experience when either is guessed):
+    /// every angle at an atom with at most `ANGLE_DECLUTTER_BONDS`
     /// bonds, those of a busier atom only while it is selected or hovered (any tool but Place,
     /// [`Self::hovered_nucleus`]). `None` when View ▸ bonds or ▸ bond angles is off, there is no
     /// graph, or it belongs to another nucleus count.
-    fn angle_marks(&self, shown: &Scene) -> Option<Vec<(crate::overlay::AngleMark, bool)>> {
+    fn angle_marks(&self, shown: &Scene) -> Option<Vec<(crate::overlay::AngleMark, crate::overlay::BondLook)>> {
         if !(self.ui.show_bonds && self.ui.show_angles) {
             return None;
         }
@@ -2284,25 +2288,33 @@ impl Viewer {
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         let all = crate::overlay::bond_angles(&pos, g);
         let selected = self.tool.selected.filter(|&i| i < pos.len());
-        let stale = |v: usize, o: usize| g.bonds.iter().zip(&looks).any(|(b, &l)| ((b.i, b.j) == (v, o) || (b.i, b.j) == (o, v)) && l == crate::overlay::BondLook::Stale);
-        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().map(|m| (m.clone(), stale(m.vertex, m.a) || stale(m.vertex, m.b))).collect();
+        let look_of = |v: usize, o: usize| g.bonds.iter().zip(&looks).find(|(b, _)| (b.i, b.j) == (v, o) || (b.i, b.j) == (o, v)).map(|(_, &l)| l);
+        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown))
+            .into_iter()
+            .map(|m| {
+                let ends = [look_of(m.vertex, m.a), look_of(m.vertex, m.b)];
+                (m.clone(), angle_look(ends))
+            })
+            .collect();
         Some(marks)
     }
 
     /// The angle labels of this frame (M7 Task 13): the degree text, its anchor in the world and the
     /// pill's text and background alpha — those of the molecule labels, fading with the bonds when
-    /// either bond is an earlier step's. Empty whenever [`Viewer::angle_marks`] is `None`.
+    /// either bond is an earlier step's, tinted and half-faded like them when the angle spans a
+    /// guessed bond ([`label_look`]). Empty whenever [`Viewer::angle_marks`] is `None`.
     pub fn angle_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
         let Some(marks) = self.angle_marks(shown) else { return Vec::new() };
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         marks
             .iter()
-            .map(|(m, stale)| (m, if *stale { (110, 70) } else { (235, 150) }))
-            .map(|(m, (alpha, bg))| AngleLabel {
+            .map(|(m, look)| (m, look, label_look(*look)))
+            .map(|(m, look, (alpha, bg))| AngleLabel {
                 text: crate::overlay::angle_label(m),
                 anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)),
                 alpha,
                 bg,
+                guessed: *look == crate::overlay::BondLook::Experience,
                 key: (0, m.vertex, m.a, m.b),
                 value: m.radians,
                 ends: None,
@@ -2336,7 +2348,8 @@ impl Viewer {
 
     /// The bond-length labels of this frame (user request 2026-10-18): each drawn bond's length in Å at
     /// its midpoint, from the nuclei as drawn now, faded with the bonds when the graph is an earlier
-    /// step's. With more than [`BOND_LENGTH_DECLUTTER`] bonds only the selected or hovered atom's.
+    /// step's, tinted and half-faded on a guessed bond ([`label_look`]). With more than
+    /// [`BOND_LENGTH_DECLUTTER`] bonds only the selected or hovered atom's.
     pub fn bond_length_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
         if !(self.ui.show_bonds && self.ui.show_bond_lengths) {
             return Vec::new();
@@ -2350,10 +2363,10 @@ impl Viewer {
             .filter(|(b, _)| all || focus.contains(&b.i) || focus.contains(&b.j))
             .filter(|(b, _)| b.i < shown.nuclei.len() && b.j < shown.nuclei.len())
             .map(|(b, look)| {
-                let (alpha, bg) = if look == crate::overlay::BondLook::Stale { (110, 70) } else { (235, 150) };
+                let (alpha, bg) = label_look(look);
                 let (p, q) = (shown.nuclei[b.i].pos, shown.nuclei[b.j].pos);
                 let r = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
-                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg, key: (1, b.i, b.j, 0), value: r, ends: Some((p, q)) }
+                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg, guessed: look == crate::overlay::BondLook::Experience, key: (1, b.i, b.j, 0), value: r, ends: Some((p, q)) }
             })
             .collect()
     }
@@ -2574,13 +2587,15 @@ impl Viewer {
                         }
                     }
                 }
-                pill(at, egui::Align2::CENTER_CENTER, &bond_length_text(r), egui::Color32::from_rgba_unmultiplied(205, 225, 245, l.alpha), l.bg);
+                let [cr, cg, cb] = label_rgb([205, 225, 245], l.guessed);
+                pill(at, egui::Align2::CENTER_CENTER, &bond_length_text(r), egui::Color32::from_rgba_unmultiplied(cr, cg, cb, l.alpha), l.bg);
             }
         }
         for l in self.angle_labels(shown) {
             let (anchor, rad) = smooth.update(l.key, l.anchor, l.value);
             if let Some(px) = tools::project(lv.camera, tools::v3(anchor), vp) {
-                pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
+                let [cr, cg, cb] = label_rgb([235, 225, 190], l.guessed);
+                pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(cr, cg, cb, l.alpha), l.bg);
             }
         }
         // the partial charges, just below each atom's sphere (the camera's down), the value averaged
@@ -2643,9 +2658,14 @@ impl Viewer {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         let draft_banner = self.draft_banner();
+        // the guess from experience follows the setting between snapshots (switched on while
+        // paused); reused as it is while nothing changed (`bond_experience::Experience::refresh`)
+        if let Some(s) = self.snapshot.as_ref() {
+            self.bond_exp.refresh(&s.dynamics, guess_wanted(&self.ui, s.backend));
+        }
         let bonds_label = self.bonds_label();
         let stale_bonds_line = self.stale_bonds_line();
-        self.ui.edit_group =if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
+        self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
         let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;
@@ -2753,6 +2773,41 @@ pub const BOND_LENGTH_DECLUTTER: usize = 12;
 /// partial-charge label.
 pub const CHARGE_DECLUTTER: usize = 12;
 
+/// Is the guess from experience wanted (`crate::bond_experience`)? View ▸ Bonds & labels ▸ guess
+/// bonds from experience on, bonds shown, and the estimated solver (the checkbox is shown only
+/// there). When not, nothing is computed.
+pub fn guess_wanted(ui: &UiState, backend: Backend) -> bool {
+    ui.guess_bonds && ui.show_bonds && backend == Backend::Estimated
+}
+
+/// An angle's look from its two bonds' (`None`: not drawn): stale when either is stale, else from
+/// experience when either is guessed, else fresh.
+pub fn angle_look(ends: [Option<crate::overlay::BondLook>; 2]) -> crate::overlay::BondLook {
+    use crate::overlay::BondLook;
+    if ends.contains(&Some(BondLook::Stale)) {
+        BondLook::Stale
+    } else if ends.contains(&Some(BondLook::Experience)) {
+        BondLook::Experience
+    } else {
+        BondLook::Fresh
+    }
+}
+
+/// A measurement label's text and background alpha on a bond (or between bonds) of this look:
+/// fresh (235, 150), stale (110, 70), guessed `overlay::EXPERIENCE_LABEL_ALPHA` between them.
+pub fn label_look(look: crate::overlay::BondLook) -> (u8, u8) {
+    match look {
+        crate::overlay::BondLook::Fresh => (235, 150),
+        crate::overlay::BondLook::Stale => (110, 70),
+        crate::overlay::BondLook::Experience => crate::overlay::EXPERIENCE_LABEL_ALPHA,
+    }
+}
+
+/// A label's text colour: its own, or the experience tint's on a guessed bond.
+fn label_rgb(rgb: [u8; 3], guessed: bool) -> [u8; 3] {
+    if guessed { crate::overlay::experience_tinted(rgb) } else { rgb }
+}
+
 /// "0.97 Å" for a length in Bohr (display; `units` converts).
 pub fn bond_length_text(r_bohr: f64) -> String {
     format!("{:.2} Å", units::bohr_to_angstrom(r_bohr))
@@ -2766,6 +2821,9 @@ pub struct AngleLabel {
     pub anchor: [f64; 3],
     pub alpha: u8,
     pub bg: u8,
+    /// On a guessed bond (`crate::bond_experience`): the text in the experience tint
+    /// (`overlay::experience_tinted`).
+    pub guessed: bool,
     /// Which measurement this is ((0, vertex, a, b) for an angle, (1, i, j, 0) for a bond): the
     /// smoothing's key.
     pub key: (u8, usize, usize, usize),
@@ -3036,8 +3094,8 @@ mod tests {
         // the lines: the experience bond solid (one segment per strand), the unknown one in stale pieces
         let lines = v.overlay_lines(&now);
         let alpha = |base: f32, rho: f64| base * (overlay::MIN_ALPHA + (1.0 - overlay::MIN_ALPHA) * overlay::strength_fraction(rho));
-        // 1–2 is new from experience: a plain bond at the weakest style
-        let exp = lines.iter().filter(|p| (p.colour[3] - alpha(overlay::EXPERIENCE_BOND_ALPHA, sim::bonds::RHO_FLOOR)).abs() < 1e-5).count();
+        // 1–2 is new from experience: a plain bond at the middle of the strength scale
+        let exp = lines.iter().filter(|p| (p.colour[3] - alpha(overlay::EXPERIENCE_BOND_ALPHA, crate::bond_experience::plain_bond(1, 2).rho_bcp)).abs() < 1e-5).count();
         assert_eq!(exp, 2 * overlay::BOND_STRANDS, "solid: one segment per strand");
         let stale = lines.iter().filter(|p| (p.colour[3] - alpha(overlay::STALE_BOND_ALPHA, 0.2)).abs() < 1e-5).count();
         assert!(stale > 2 * overlay::BOND_STRANDS, "the unknown bond dashed and faded ({stale})");
@@ -3056,6 +3114,74 @@ mod tests {
         let (_, looks) = v.drawn_bonds(3).unwrap();
         assert_eq!(looks, vec![BondLook::Fresh]);
         assert!(v.stale_bonds_line().is_none());
+    }
+
+    /// Review of the bonds from experience: an angle between two guessed bonds, its label and a
+    /// guessed bond's length label are marked like the bond (tinted arc, tinted text, the alpha
+    /// between stale and fresh); and nothing is computed while the guess is not wanted — the
+    /// setting off, bonds hidden, or another solver (where a stale graph is drawn stale as before).
+    #[test]
+    fn guessed_annotations_are_marked_and_the_guess_is_computed_only_when_wanted() {
+        use crate::overlay::{self, BondLook};
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.show_angles = true;
+        v.ui.show_bond_lengths = true;
+        let mut scene = v.scene.clone();
+        scene.nuclei.push(SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] });
+        // an equilateral H₃ of side r
+        let tri = |r: f64| {
+            let mut s = scene.clone();
+            for (n, q) in s.nuclei.iter_mut().zip([[0.0; 3], [r, 0.0, 0.0], [0.5 * r, 0.75f64.sqrt() * r, 0.0]]) {
+                n.pos = q;
+            }
+            s
+        };
+        let bond = |i, j| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.4, s: 0.5, route: sim::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 };
+        let graph = |pairs: &[(usize, usize)]| sim::BondGraph { bonds: pairs.iter().map(|&(i, j)| bond(i, j)).collect(), components: vec![vec![0, 1, 2]], step: 1, sim_time: 10.0, n_nuclei: 3 };
+        let mut seq = 0;
+        let mut feed = |v: &mut Viewer, s: &Scene, g: sim::BondGraph, stale: bool, backend: Backend| {
+            let mut snap = snapshot_with_bonds(s, g, stale);
+            snap.dynamics.scene = s.to_sim().unwrap();
+            snap.dynamics.forces_stale = false;
+            seq += 1;
+            snap.dynamics.seq = seq;
+            snap.backend = backend;
+            v.on_event_bare(SimEvent::Snapshot(Box::new(snap)));
+        };
+        for k in 0..3 {
+            feed(&mut v, &tri(1.5 + 0.02 * k as f64), graph(&[(0, 1), (1, 2), (0, 2)]), false, Backend::Estimated);
+        }
+        assert_eq!(v.bond_exp.composed, 0, "fresh graphs: nothing to guess over");
+        let now = tri(1.52);
+        // not wanted: nothing computed, the stale graph drawn stale
+        v.ui.guess_bonds = false;
+        feed(&mut v, &now, graph(&[(0, 1)]), true, Backend::Estimated);
+        v.ui.guess_bonds = true;
+        v.ui.show_bonds = false;
+        feed(&mut v, &now, graph(&[(0, 1)]), true, Backend::Estimated);
+        v.ui.show_bonds = true;
+        feed(&mut v, &now, graph(&[(0, 1)]), true, Backend::Gpu);
+        assert_eq!(v.bond_exp.composed, 0, "the setting off, bonds hidden, another solver: nothing computed");
+        assert_eq!(v.drawn_bonds(3).unwrap().1, vec![BondLook::Stale], "another solver: the stale graph as before");
+        // wanted: every pair of the triangle bonded from experience
+        feed(&mut v, &now, graph(&[(0, 1)]), true, Backend::Estimated);
+        assert_eq!(v.bond_exp.composed, 1);
+        assert_eq!(v.drawn_bonds(3).unwrap().1, vec![BondLook::Experience; 3]);
+        // the arcs: the experience tint at the bonds' alpha, solid
+        let tinted: [f32; 3] = std::array::from_fn(|i| overlay::BOND[i] + (overlay::EXPERIENCE_TINT[i] - overlay::BOND[i]) * overlay::EXPERIENCE_TINT_MIX);
+        let arcs: Vec<_> = v.scene_lines(&now, false, true).into_iter().filter(|p| p.colour == [tinted[0], tinted[1], tinted[2], overlay::EXPERIENCE_BOND_ALPHA]).collect();
+        assert_eq!(arcs.len(), 3 * 2 * overlay::ANGLE_ARC_SEGMENTS * overlay::ANGLE_STRANDS, "three tinted solid arcs");
+        // the labels: guessed, at the alpha between stale and fresh
+        let angles = v.angle_labels(&now);
+        assert_eq!(angles.len(), 3);
+        assert!(angles.iter().all(|l| l.guessed && (l.alpha, l.bg) == overlay::EXPERIENCE_LABEL_ALPHA), "{angles:?}");
+        let lengths = v.bond_length_labels(&now);
+        assert_eq!(lengths.len(), 3);
+        assert!(lengths.iter().all(|l| l.guessed && (l.alpha, l.bg) == overlay::EXPERIENCE_LABEL_ALPHA), "{lengths:?}");
+        // the angle look: stale wins, then experience
+        assert_eq!(angle_look([Some(BondLook::Experience), Some(BondLook::Stale)]), BondLook::Stale);
+        assert_eq!(angle_look([Some(BondLook::Experience), Some(BondLook::Fresh)]), BondLook::Experience);
+        assert_eq!(angle_look([Some(BondLook::Fresh), Some(BondLook::Fresh)]), BondLook::Fresh);
     }
 
     /// Review R1: the spheres are drawn at the orbital scale only while the newest payload is the one
