@@ -181,7 +181,7 @@ pub(crate) fn model() -> ModelStatus {
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -1258,7 +1258,8 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
         full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
         out
     }
-    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { index, formula: formula.into(), origin: origin.into(), loo_ratio };
+    // the id carries a check value (fix round 1, M8): the buttons send it as given
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let m = ModelStatus {
@@ -1289,13 +1290,14 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
     assert!(t.contains("forgotten (1): held out of the fit until restored") && t.contains("#40 · H2 · audit · not in the fit"), "{t}");
     let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
     let c = sent(&click_widget(&ctx, &mut st, &inp, "forget-sample-1804"));
-    assert!(matches!(c.as_slice(), [Command::ForgetSample(1804)]), "{c:?}");
+    assert!(matches!(c.as_slice(), [Command::ForgetSample(sim::SampleId { index: 1804, key })] if *key == 0xabc0 + 1804), "{c:?}");
     let c = sent(&click_widget(&ctx, &mut st, &inp, "restore-sample-40"));
-    assert!(matches!(c.as_slice(), [Command::RestoreSample(40)]), "{c:?}");
-    assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(1804)), Some("forget-sample"));
-    assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(40)), Some("restore-sample"));
+    assert!(matches!(c.as_slice(), [Command::RestoreSample(sim::SampleId { index: 40, key })] if *key == 0xabc0 + 40), "{c:?}");
+    let id = sim::SampleId { index: 1804, key: 1 };
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(id)), Some("forget-sample"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(id)), Some("restore-sample"));
     // the forgotten count beside the held one
-    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
+    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
     // no ranking yet (a model, no list), and no model: the section says why
     for (m, why) in [
         (ModelStatus { suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_RANKING),

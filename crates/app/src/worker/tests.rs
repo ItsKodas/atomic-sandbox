@@ -1090,21 +1090,22 @@ fn forget_and_restore_a_sample_refit_the_model() {
     let Some(ctx) = gpu_ctx() else { return };
     let (w, trained, _) = taught(h2_49(), ctx, None);
     let m0 = model(&trained).clone();
-    let k = m0.suspects.first().map(|x| x.index).expect("a trained model ranks its samples");
+    let id = m0.suspects.first().map(|x| x.id).expect("a trained model ranks its samples");
+    let k = id.index;
     assert!(m0.suspects.len() <= 8 && m0.forgotten == 0 && m0.forgotten_samples.is_empty(), "{:?}", m0.suspects);
-    w.send(Command::ForgetSample(k));
+    w.send(Command::ForgetSample(id));
     let s = snapshot_until(&w, "the refit after the forget", |s| model(s).forgotten == 1 && model(s).refits > m0.refits && !model(s).pending_refit);
     let m = model(&s);
     eprintln!("forgot #{k}: refits {} → {}, fit {:?} → {:?}; {:?}", m0.refits, m.refits, m0.fit, m.fit, m.fit_vs_held);
-    assert!(!m.suspects.iter().any(|x| x.index == k), "{:?}", m.suspects);
-    assert_eq!(m.forgotten_samples.iter().map(|x| x.index).collect::<Vec<_>>(), vec![k]);
+    assert!(!m.suspects.iter().any(|x| x.id.index == k), "{:?}", m.suspects);
+    assert_eq!(m.forgotten_samples.iter().map(|x| x.id).collect::<Vec<_>>(), vec![id]);
     assert_eq!(m.fit.map(|f| f.0), m0.fit.map(|f| f.0 - 1), "fitted without it");
     assert!(m.fit_vs_held.as_deref().is_some_and(|t| t.contains("1 forgotten")), "{:?}", m.fit_vs_held);
     assert!(s.dynamics.notes.iter().any(|n| n.contains(&format!("sample #{k} forgotten"))), "{:?}", s.dynamics.notes);
-    w.send(Command::RestoreSample(k));
+    w.send(Command::RestoreSample(id));
     let s = snapshot_until(&w, "the refit after the restore", |s| model(s).forgotten == 0 && model(s).refits > m.refits && !model(s).pending_refit);
     assert_eq!(model(&s).fit.map(|f| f.0), m0.fit.map(|f| f.0), "fitted with it again");
-    w.send(Command::RestoreSample(k));
+    w.send(Command::RestoreSample(id));
     let deadline = Instant::now() + WAIT;
     let error = loop {
         assert!(Instant::now() < deadline, "no error line for a restore of a sample that is not forgotten");

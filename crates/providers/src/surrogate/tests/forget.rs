@@ -3,7 +3,9 @@
 //! Model tab's "Worst-fitting samples" ([`SurrogateKs::sample_suspects`]). A forgotten sample is
 //! not fitted, never released or superseded, fences like a held one, counts against the 10 %
 //! recovery cap, survives a collection reopen and a sidecar round trip, and a background refit
-//! that lands after the forget never brings it back. Atomic units throughout.
+//! that lands after the forget never brings it back. Fix round 1: only a fitted sample (code 0)
+//! can be forgotten, the buttons carry a checked sample identity (`sim::SampleId`), and a forget
+//! never lifts rule 8's global untrust. Atomic units throughout.
 
 use super::*;
 
@@ -19,25 +21,41 @@ fn fitted(s: &SurrogateKs, i: usize) -> bool {
     i < s.fit_members.0 && s.fit_members.1.get(i).is_none_or(|&q| q == Q_NONE)
 }
 
+/// Forget stored sample `i` by the id the Model tab would send (an unchecked one past the store).
+fn forget(s: &mut SurrogateKs, i: usize) -> Result<(), String> {
+    let id = s.sample_id(i).unwrap_or(sim::SampleId { index: i, key: 0 });
+    s.forget_sample(id)
+}
+
+/// Restore stored sample `i` by its id.
+fn restore(s: &mut SurrogateKs, i: usize) -> Result<(), String> {
+    let id = s.sample_id(i).unwrap_or(sim::SampleId { index: i, key: 0 });
+    s.restore_sample(id)
+}
+
 /// Forget: written at once (the store's code), a refit due, not fitted by it, and never released
 /// by a refit whose model reproduces it — where a held sample at the same place is (the control).
 /// It fences like a held sample: its geometry falls back; a fresh answer there that agrees with
-/// the model is kept, and the forgotten sample stays forgotten (never released or superseded).
+/// the model is kept, and the forgotten sample stays forgotten (never released or superseded);
+/// the note calls it forgotten, not quarantined (fix round 1, M4).
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_forgotten_sample_is_not_fitted_and_never_released() {
     let mut s = window();
     let k = 17;
     assert!(fitted(&s, k));
-    s.forget_sample(k).unwrap();
+    forget(&mut s, k).unwrap();
     assert_eq!((s.quarantine[k], s.forgotten(), s.quarantined()), (Q_FORGOTTEN, 1, 0));
+    assert_eq!(s.forgotten_in_fit(), 1, "the standing fit still holds it until the refit");
     assert!(s.pending_refit(), "a refit is due");
     assert!(s.user_notes.iter().any(|n| n.contains("sample #17 forgotten") && n.contains("saved with the model file")), "{:?}", s.user_notes);
-    assert!(s.forget_sample(k).is_err(), "forgotten already");
-    assert!(s.forget_sample(s.samples()).is_err(), "no such sample");
+    assert!(forget(&mut s, k).is_err(), "forgotten already");
+    let n = s.samples();
+    assert!(forget(&mut s, n).is_err(), "no such sample");
     let rep = s.refit().unwrap();
     assert_eq!(rep.n_samples, 39, "the refit fits without it");
     assert!(!fitted(&s, k));
+    assert_eq!(s.forgotten_in_fit(), 0);
     assert!(s.reproduces_sample(&s.store.as_ref().unwrap().samples[k].clone()), "the premise: the model reproduces it");
     assert_eq!(s.quarantine[k], Q_FORGOTTEN, "and does not release it");
     s.refit().unwrap();
@@ -65,20 +83,22 @@ fn a_forgotten_sample_is_not_fitted_and_never_released() {
     s.discontinuity();
     let r = s.evaluate(&sc, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
-    assert!(r.stats.notes.iter().any(|n| n.contains("forgotten kept")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("near forgotten samples agrees with the model") && n.contains("forgotten kept")), "{:?}", r.stats.notes);
+    assert!(!r.stats.notes.iter().any(|n| n.contains("near quarantined samples")), "{:?}", r.stats.notes);
     assert_eq!((s.quarantine[k], s.superseded(), s.samples()), (Q_FORGOTTEN, 0, before + 1));
 }
 
-/// Restore: back in the fit at the refit; a sample that is not forgotten is refused.
+/// Restore: back in the fit at the refit (code 0, what it had); a sample that is not forgotten is
+/// refused.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_restored_sample_is_fitted_again() {
     let mut s = window();
-    assert!(s.restore_sample(3).is_err(), "not forgotten");
-    s.forget_sample(3).unwrap();
+    assert!(restore(&mut s, 3).is_err(), "not forgotten");
+    forget(&mut s, 3).unwrap();
     s.refit().unwrap();
     assert!(!fitted(&s, 3));
-    s.restore_sample(3).unwrap();
+    restore(&mut s, 3).unwrap();
     assert_eq!((s.quarantine[3], s.forgotten()), (Q_NONE, 0));
     assert!(s.pending_refit());
     let rep = s.refit().unwrap();
@@ -87,15 +107,102 @@ fn a_restored_sample_is_fitted_again() {
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
 }
 
+/// Fix round 1, M3: only a sample in the fit (code 0) can be forgotten — a quarantined,
+/// superseded, box-excluded, draft, waiting or lone one is refused by name, nothing changed, so
+/// Restore (back to 0) always restores what it was.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn only_a_fitted_sample_can_be_forgotten() {
+    let mut s = window();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    for (i, q, words) in [
+        (1, Q_HELD, "quarantined by the trust recovery"),
+        (2, Q_SUPERSEDED, "superseded by a fresh answer"),
+        (3, Q_BOX, "box-excluded"),
+        (4, Q_DRAFT, "a draft guess held out of the strict fit"),
+        (5, Q_REF_WAIT, "waiting for its box's isolated-atom reference"),
+        (6, Q_LONE, "lone atoms"),
+    ] {
+        s.quarantine[i] = q;
+        let e = forget(&mut s, i).unwrap_err();
+        assert!(e.contains(&format!("sample #{i} is not in the fit")) && e.contains(words), "{e}");
+        assert_eq!(s.quarantine[i], q, "nothing changed");
+    }
+    assert_eq!(s.forgotten(), 0);
+}
+
+/// Fix round 1, M8: the buttons carry the sample's identity; an id whose index now holds another
+/// sample (the store changed between the list and the click) or no sample is refused with "the
+/// sample list changed — pick it again", nothing changed — for Forget and Restore alike.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_stale_sample_id_is_refused() {
+    let mut s = window();
+    let id = s.sample_id(5).unwrap();
+    assert_eq!(id.index, 5);
+    assert_ne!(id.key, s.sample_id(6).unwrap().key, "two samples, two keys");
+    let stale = sim::SampleId { index: 5, key: s.sample_id(6).unwrap().key };
+    let e = s.forget_sample(stale).unwrap_err();
+    assert!(e.contains("the sample list changed — pick it again"), "{e}");
+    let e = s.forget_sample(sim::SampleId { index: 999, key: id.key }).unwrap_err();
+    assert!(e.contains("the sample list changed — pick it again"), "{e}");
+    assert_eq!(s.forgotten(), 0, "nothing changed");
+    s.forget_sample(id).unwrap();
+    let e = s.restore_sample(stale).unwrap_err();
+    assert!(e.contains("the sample list changed — pick it again"), "{e}");
+    assert!(s.is_forgotten(5));
+    s.restore_sample(id).unwrap();
+    assert_eq!(s.forgotten(), 0);
+    // the list's rows carry the same id
+    s.ensure_loo_ratios();
+    assert!(s.sample_suspects().iter().all(|x| s.sample_id(x.id.index) == Some(x.id)));
+}
+
+/// Fix round 1, I1: forgetting the sample a failed audit kept does not lift rule 8 — the case is
+/// re-judged at the refit as before (here it still fails: the fit without the audited sample
+/// extrapolates wrongly there), so the model stays untrusted with the failed-audit reason. The
+/// fixture is `a_failed_audit_stays_failed_until_a_refit_predicts_it_without_its_sample`'s.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn forgetting_a_failed_audits_sample_keeps_rule_8() {
+    let (mut s, h) = trained_with_auditor(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let teacher = |sc: &Scene| h.lock().unwrap().clone().evaluate(sc, &mut never()).unwrap();
+    let sc = [2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
+        .iter()
+        .map(|&r| dimer(r, [0.6, 0.8, 0.0], [0.0; 3], 1, 1))
+        .find(|sc| {
+            let (pos, z) = pos_z(sc);
+            let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+            (teacher(sc).energy - p.energy).abs() / 2.0 > 1e-3
+        })
+        .expect("an extrapolation beyond the energy tier");
+    let t = teacher(&sc);
+    let prov = s.provenance_for(&sc);
+    s.handle_answer(audit_answer(&s, &sc, prov, Ok((t.energy, t.forces.clone(), Some(0.0), None))));
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
+    s.refit().unwrap();
+    assert!(!s.trusted() && s.audit_failed().is_some(), "the premise: rule 8 holds after the refit");
+    let k = s.failed_audits.iter().find_map(|c| c.index).expect("the failed audit kept its sample");
+    assert_eq!(s.quarantine.get(k).copied().unwrap_or(Q_NONE), Q_NONE, "the premise: the audited sample is fitted");
+    forget(&mut s, k).unwrap();
+    s.refit().unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    println!("after forgetting the audited sample #{k}: trusted {}, {:?}, notes {notes:?}", s.trusted(), s.untrusted_reason());
+    assert!(!fitted(&s, k) && s.is_forgotten(k));
+    assert!(!s.trusted() && s.audit_failed().is_some(), "forgetting never lifts rule 8: {:?}", s.untrusted_reason());
+    assert!(s.failed_audits.iter().any(|c| c.index == Some(k)), "the case is kept and re-judged");
+    assert!(!notes.iter().any(|n| n.contains("quarantined by the refit")), "{notes:?}");
+}
+
 /// A model file keeps the code: the sidecar writes 7 and a load restores it (forgotten, excluded,
 /// fencing); a forget between the fit and the save is caught by the load's membership check.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_forgotten_sample_survives_a_sidecar_round_trip() {
     let mut s = window();
-    s.forget_sample(5).unwrap();
+    forget(&mut s, 5).unwrap();
     s.refit().unwrap();
-    s.forget_sample(9).unwrap(); // forgotten since the fit: the file's prefix is not the fit's
+    forget(&mut s, 9).unwrap(); // forgotten since the fit: the file's prefix is not the fit's
     let path = std::env::temp_dir().join(format!("forget-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let file = surrogate::sidecar::read(&path).unwrap();
@@ -116,7 +223,7 @@ fn a_forgotten_sample_survives_a_sidecar_round_trip() {
 fn a_forgotten_sample_survives_a_collection_reopen() {
     let dir = collection_root("forget-reopen");
     let (mut s, key) = small_collection(&dir);
-    s.forget_sample(4).unwrap();
+    forget(&mut s, 4).unwrap();
     assert_eq!(s.collection().unwrap().quarantine[4], Q_FORGOTTEN, "written at once");
     assert!(s.user_notes.iter().any(|n| n.contains("written to the shared collection")), "{:?}", s.user_notes);
     drop(s);
@@ -127,11 +234,35 @@ fn a_forgotten_sample_survives_a_collection_reopen() {
     assert_eq!((again.forgotten(), again.is_forgotten(4)), (1, true));
     assert!(again.model.is_some(), "the attach refitted");
     assert!(!fitted(&again, 4), "not fitted after the reopen");
-    again.restore_sample(4).unwrap();
+    restore(&mut again, 4).unwrap();
     assert_eq!(again.collection().unwrap().quarantine[4], Q_NONE, "the restore is written at once");
     drop(again);
     let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
     assert_eq!(c.quarantine[4], Q_NONE);
+}
+
+/// Fix round 1, M2: on a read-only collection (another process holds its lock) Forget and the
+/// Restore after it are this session's only, and both notes say so — the Restore is not reported
+/// as written because the collection still reads its old code.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn forget_and_restore_on_a_read_only_collection_say_this_session_only() {
+    let dir = collection_root("forget-read-only");
+    let (mut s, key) = small_collection(&dir);
+    // a second handle while the first holds the lock is read-only
+    let (ro, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert!(ro.read_only, "the premise: the second open is read-only");
+    let (mut other, _) = pair_student();
+    other.attach(ro).unwrap();
+    s.user_notes.clear();
+    forget(&mut other, 4).unwrap();
+    restore(&mut other, 4).unwrap();
+    let notes = Trainable::take_notes(&mut other);
+    let forgot = notes.iter().find(|n| n.contains("sample #4 forgotten")).expect("the forget's note");
+    let restored = notes.iter().find(|n| n.contains("sample #4 restored")).expect("the restore's note");
+    assert!(forgot.contains("this session only"), "{forgot}");
+    assert!(restored.contains("this session only") && !restored.contains("(written to the shared collection)"), "{restored}");
+    assert_eq!(s.collection().unwrap().quarantine[4], Q_NONE, "the writable handle's collection is untouched");
 }
 
 /// A model over a fresh shared collection in `dir`: 40 H₂ samples and the H reference, fitted.
@@ -156,7 +287,8 @@ fn small_collection(dir: &std::path::Path) -> (SurrogateKs, surrogate::SurfaceKe
 /// at once, does **not** discard the refit (the user's codes are not a conflict), and the install
 /// re-applies it over the copy's code — the refit that lands never brings the sample back, the
 /// collection keeps 7, and a rebuild is due; the next refit fits without it. A Restore in flight
-/// lands the same way.
+/// lands the same way. Fix round 1, M5: while the installed fit still holds the sample it is
+/// counted in the fit (`forgotten_in_fit`), not twice.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_forget_during_a_background_refit_survives_its_install() {
@@ -168,7 +300,7 @@ fn a_forget_during_a_background_refit_survives_its_install() {
     let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
     s.add_sample_answer(Sample { pos, z: vec![1, 1], energy: e, forces: f, tag: SampleTag::Fallback, weight: 1.0, force_mask: None, use_energy: true }, &sc, Some(0.0), Some(1)).unwrap();
     assert!(s.begin_background_refit());
-    s.forget_sample(7).unwrap();
+    forget(&mut s, 7).unwrap();
     assert_eq!(s.collection().unwrap().quarantine[7], Q_FORGOTTEN, "written while the refit runs");
     match s.finish_background_refit() {
         BackgroundPoll::Installed(r) => {
@@ -180,14 +312,15 @@ fn a_forget_during_a_background_refit_survives_its_install() {
     assert_eq!(s.quarantine[7], Q_FORGOTTEN, "the install re-applies the user's code");
     assert_eq!(s.collection().unwrap().quarantine[7], Q_FORGOTTEN, "and syncs it, not the copy's");
     assert!(fitted(&s, 7), "the installed fit is the copy's, started before the forget");
+    assert_eq!((s.forgotten(), s.forgotten_in_fit()), (1, 1), "counted in the fit, not beside it");
     assert!(s.pending_refit(), "a rebuild is due");
-    assert!(!s.sample_suspects().iter().any(|x| x.index == 7), "not listed among the fitted samples");
+    assert!(!s.sample_suspects().iter().any(|x| x.id.index == 7), "not listed among the fitted samples");
     s.refit().unwrap();
     assert!(!fitted(&s, 7), "the next refit fits without it");
-    assert_eq!(s.quarantine[7], Q_FORGOTTEN);
+    assert_eq!((s.quarantine[7], s.forgotten_in_fit()), (Q_FORGOTTEN, 0));
     // a Restore in flight lands the same way
     assert!(s.begin_background_refit());
-    s.restore_sample(7).unwrap();
+    restore(&mut s, 7).unwrap();
     assert_eq!(s.collection().unwrap().quarantine[7], Q_NONE);
     assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
     assert_eq!(s.quarantine[7], Q_NONE, "the copy's 7 is not put back");
@@ -212,7 +345,7 @@ fn the_recovery_cap_counts_forgotten_samples() {
     for (forgotten, held) in [(12usize, 1usize), (13, 0)] {
         let mut s = super::recovery_loo::outlier_store();
         for i in 0..forgotten {
-            s.forget_sample(i).unwrap();
+            forget(&mut s, i).unwrap();
         }
         s.fit_store().unwrap();
         assert!(s.residuals_fail(), "the premise: the outlier still breaks the fit");
@@ -240,18 +373,18 @@ fn the_worst_fitting_samples_are_the_fits_own_ranking() {
     let list = s.sample_suspects();
     assert_eq!(list.len(), SUSPECTS_SHOWN);
     let out = super::recovery_loo::OUTLIER;
-    assert_eq!((list[0].index, list[0].formula.as_str(), list[0].origin.as_str()), (out, "H2", "pass scan"));
+    assert_eq!((list[0].id, list[0].formula.as_str(), list[0].origin.as_str()), (s.sample_id(out).unwrap(), "H2", "pass scan"));
     let ratios: Vec<f64> = list.iter().map(|x| x.loo_ratio.unwrap()).collect();
     assert!(ratios.windows(2).all(|w| w[0] >= w[1]), "worst first: {ratios:?}");
     let all = s.loo_ratios().unwrap().to_vec();
     assert_eq!(ratios[0], all.iter().map(|x| x.1).fold(0.0, f64::max), "the worst of the fit");
-    s.forget_sample(out).unwrap();
+    forget(&mut s, out).unwrap();
     let after = s.sample_suspects();
-    assert!(!after.iter().any(|x| x.index == out), "forgotten since the fit: not listed");
+    assert!(!after.iter().any(|x| x.id.index == out), "forgotten since the fit: not listed");
     assert_eq!(after[0], list[1], "the rest move up, the same numbers (no recompute)");
     let gone = s.forgotten_samples();
     assert_eq!(gone.len(), 1);
-    assert_eq!((gone[0].index, gone[0].loo_ratio), (out, Some(ratios[0])));
+    assert_eq!((gone[0].id.index, gone[0].loo_ratio), (out, Some(ratios[0])));
     s.refit().unwrap();
     assert_eq!(s.forgotten_samples()[0].loo_ratio, None, "not in the new fit");
 }
@@ -280,7 +413,7 @@ fn forgetting_the_only_sample_of_a_species_is_honest() {
     s.add_sample(Sample { pos, z, energy: e, forces: f, tag: SampleTag::Fallback, weight: 1.0, force_mask: None, use_energy: true }, &sc).unwrap();
     let he = s.samples() - 1;
     let _ = s.refit();
-    s.forget_sample(he).unwrap();
+    forget(&mut s, he).unwrap();
     assert!(s.user_notes.iter().any(|n| n.contains("the only sample of its kind") && n.contains("sample counts may refuse")), "{:?}", s.user_notes);
     let r = s.refit();
     println!("after forgetting the only He sample: {:?}; trusted {} {:?}", r.as_ref().map(|r| r.n_samples), s.trusted(), s.untrusted_reason());

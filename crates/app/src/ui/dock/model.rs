@@ -285,7 +285,7 @@ pub fn suspect_line(s: &sim::SampleSuspect) -> String {
         Some(r) => format!("{}× its bound", ratio_words(r)),
         None => "not in the fit".to_string(),
     };
-    format!("#{} · {} · {} · {ratio}", s.index, s.formula, s.origin)
+    format!("#{} · {} · {} · {ratio}", s.id.index, s.formula, s.origin)
 }
 
 /// Below the list (spec R2).
@@ -317,8 +317,8 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
                 ui.horizontal(|ui| {
                     let worst = s.loo_ratio.is_some_and(|r| !(r <= 1.0));
                     ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(if worst { AMBER } else { theme::INK }));
-                    if super::super::probed(&format!("forget-sample-{}", s.index), ui.small_button("Forget")).on_hover_text(FORGET_SAMPLE_TIP).clicked() {
-                        acts.push(Action::ForgetSample(s.index));
+                    if super::super::probed(&format!("forget-sample-{}", s.id.index), ui.small_button("Forget")).on_hover_text(FORGET_SAMPLE_TIP).clicked() {
+                        acts.push(Action::ForgetSample(s.id));
                     }
                 });
             }
@@ -331,11 +331,11 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
     for s in &m.forgotten_samples {
         ui.horizontal(|ui| {
             ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));
-            if super::super::probed(&format!("restore-sample-{}", s.index), ui.small_button("Restore"))
+            if super::super::probed(&format!("restore-sample-{}", s.id.index), ui.small_button("Restore"))
                 .on_hover_text("put this sample back into the fit (written at once; the model refits with it)")
                 .clicked()
             {
-                acts.push(Action::RestoreSample(s.index));
+                acts.push(Action::RestoreSample(s.id));
             }
         });
     }
@@ -716,7 +716,7 @@ mod tests {
     /// below 10 (one decimal), an undefined one (∞), and a forgotten sample the fit does not hold.
     #[test]
     fn a_worst_fitting_row_names_the_sample_and_its_left_out_ratio() {
-        let s = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { index, formula: formula.into(), origin: origin.into(), loo_ratio };
+        let s = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0 }, formula: formula.into(), origin: origin.into(), loo_ratio };
         assert_eq!(super::suspect_line(&s(1804, "HO", "fallback", Some(38.46))), "#1804 · HO · fallback · 38× its bound");
         assert_eq!(super::suspect_line(&s(1133, "H2O", "pass perturbation", Some(5.23))), "#1133 · H2O · pass perturbation · 5.2× its bound");
         assert_eq!(super::suspect_line(&s(7, "H3", "pass scan", Some(f64::INFINITY))), "#7 · H3 · pass scan · ∞× its bound");

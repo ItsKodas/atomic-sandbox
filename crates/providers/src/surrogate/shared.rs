@@ -585,11 +585,17 @@ impl SurrogateKs {
     /// Forget and Restore, spec R2), when the collection holds it and its status differs: `Ok(true)`
     /// when the collection holds it (written, or already that code), `Ok(false)` when there is no
     /// collection or it does not hold the sample (a session-only one: the code lives in the store,
-    /// and the session autosave), `Err` when the write failed (a read-only collection).
+    /// and the session autosave), `Err` when the write failed or cannot be made: a read-only
+    /// collection is refused **before** the comparison (Task 2 fix round 1, M2: a failed Forget
+    /// leaves the collection at the old code, so a later Restore would otherwise "match" it and
+    /// read as written).
     pub(super) fn write_status_now(&mut self, i: usize) -> Result<bool, String> {
         let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
         let Some(sh) = self.shared.as_mut() else { return Ok(false) };
         let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
+        if sh.coll.read_only {
+            return Err("the collection is read-only (another process holds its lock)".into());
+        }
         if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
             sh.coll.set_status(k, code)?;
         }

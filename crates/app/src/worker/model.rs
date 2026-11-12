@@ -254,7 +254,8 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
     use sim::activity::TrustKey;
     let in_fit = m.box_affected.saturating_sub(m.box_excluded);
     let floor = m.trust_floor?;
-    let clean = m.samples.saturating_sub(m.box_affected + m.quarantined + m.superseded);
+    // the forgotten samples are out of the fit too (Task 2 fix round 1, M5)
+    let clean = m.samples.saturating_sub(m.box_affected + m.quarantined + m.superseded + m.forgotten);
     let fit_condition = m
         .trust_checks
         .iter()
@@ -269,8 +270,23 @@ pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the mode
 /// "fit N of S held: B box-excluded, Q quarantined, X superseded, F forgotten, P newer than the
 /// fit" — every sample the store holds beyond the fit, by reason (exact right after a refit, M6
 /// Task 11: the user's unexplained "230 vs 250"; the forgotten ones beside the held, spec R2).
+/// `forgotten` counts every forgotten sample; the `forgotten_in_fit` of them the fit still holds
+/// (forgotten since it, or during the background refit that installed it) are in `fit`, so they
+/// are named apart — "N forgotten since this fit (out at the next refit)" — never counted twice
+/// (Task 2 fix round 1, M5).
 #[allow(clippy::too_many_arguments)]
-pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, forgotten_in_fit: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+    let in_fit = forgotten_in_fit.min(forgotten);
+    let line = fit_vs_held_parts(fit, held, box_excluded, quarantined, superseded, forgotten - in_fit, held_out, lone, unfitted);
+    if in_fit > 0 {
+        format!("{line}; {in_fit} forgotten since this fit (out at the next refit)")
+    } else {
+        line
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_vs_held_parts(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
     let parts: Vec<String> = [
         (box_excluded, "box-excluded"),
         (quarantined, "quarantined"),
@@ -694,12 +710,13 @@ impl Worker {
     /// at the next tick, unthrottled, in the background while playing as every refit is
     /// (`refit_if_pending`; a background refit already running lands first and keeps the user's
     /// code, then this one starts). A refusal is the error line.
-    pub(super) fn user_sample(&mut self, index: usize, forget: bool) {
+    pub(super) fn user_sample(&mut self, id: sim::SampleId, forget: bool) {
+        let index = id.index;
         let Some(s) = trainable(&mut self.dy) else {
             self.error(format!("{} sample #{index}: the estimated solver is not running", if forget { "forget" } else { "restore" }));
             return;
         };
-        let r = if forget { s.forget_sample(index) } else { s.restore_sample(index) };
+        let r = if forget { s.forget_sample(id) } else { s.restore_sample(id) };
         // the provider's words on it (where the status was written) now, not at the next step
         let notes = s.take_notes();
         for n in notes {
@@ -788,7 +805,7 @@ impl Worker {
             unfitted: st.unfitted,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
-            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.forgotten, st.held_out, st.lone, st.unfitted)),
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.forgotten, st.forgotten_in_fit, st.held_out, st.lone, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
@@ -858,11 +875,17 @@ mod fit_vs_held_tests {
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
     fn the_fit_vs_held_line_names_what_the_fit_left_out() {
-        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0, 0), "250 of 250 held");
-        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
-        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
-        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 0, 3, 0, 0), "70 of 73 held: 3 draft guesses held out");
-        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 0, 5, 0), "40 of 45 held: 5 lone atoms held out");
-        assert_eq!(fit_vs_held(1697, 1805, 0, 105, 1, 2, 0, 0, 0), "1697 of 1805 held: 105 quarantined, 1 superseded, 2 forgotten");
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 0, 0, 3, 0, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 0, 0, 5, 0), "40 of 45 held: 5 lone atoms held out");
+        assert_eq!(fit_vs_held(1697, 1805, 0, 105, 1, 2, 0, 0, 0, 0), "1697 of 1805 held: 105 quarantined, 1 superseded, 2 forgotten");
+        // fix round 1, M5: a sample forgotten during the background refit that installed this fit
+        // is still in it — named apart, never counted twice (1698 + 105 + 1 + 1 = 1805)
+        assert_eq!(
+            fit_vs_held(1698, 1805, 0, 105, 1, 2, 1, 0, 0, 0),
+            "1698 of 1805 held: 105 quarantined, 1 superseded, 1 forgotten; 1 forgotten since this fit (out at the next refit)"
+        );
     }
 }

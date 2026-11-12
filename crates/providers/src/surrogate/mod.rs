@@ -774,7 +774,11 @@
 //! released by a refit nor superseded by a fresh answer — only `restore_sample` clears it — and
 //! counted with the held samples against [`QUARANTINE_MAX_FRACTION`]. The status is written at
 //! once (a collection status record, else the store's code for the model file); a background
-//! refit that lands after it re-applies it (`background` module doc, "The user's codes").
+//! refit that lands after it re-applies it (`background` module doc, "The user's codes"). Only a
+//! sample in the fit (code 0) can be forgotten, so Restore returns it to exactly that; the buttons
+//! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
+//! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
+//! as before (rule 8, Task 2 fix round 1 I1).
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
@@ -2567,6 +2571,7 @@ impl SurrogateKs {
             match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
                 Q_BOX => c.box_excluded += 1,
                 Q_HELD | Q_SUPERSEDED => c.quarantined += 1,
+                Q_FORGOTTEN => c.forgotten += 1,
                 Q_NONE if i < self.accumulated => c.fitted += 1,
                 _ => c.other += 1,
             }
@@ -3048,6 +3053,7 @@ impl Trainable for SurrogateKs {
             quarantined: self.quarantined(),
             superseded: self.superseded(),
             forgotten: self.forgotten(),
+            forgotten_in_fit: self.forgotten_in_fit(),
             box_excluded: self.box_excluded(),
             held_out: self.held_out(),
             lone: self.lone_held_out(),
@@ -3087,12 +3093,12 @@ impl Trainable for SurrogateKs {
         SurrogateKs::pending_refit(self)
     }
 
-    fn forget_sample(&mut self, index: usize) -> Result<(), String> {
-        SurrogateKs::forget_sample(self, index)
+    fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        SurrogateKs::forget_sample(self, id)
     }
 
-    fn restore_sample(&mut self, index: usize) -> Result<(), String> {
-        SurrogateKs::restore_sample(self, index)
+    fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        SurrogateKs::restore_sample(self, id)
     }
 
     fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {
@@ -3366,6 +3372,8 @@ pub(crate) struct PassCoverage {
     pub(crate) fitted: usize,
     pub(crate) box_excluded: usize,
     pub(crate) quarantined: usize,
+    /// Forgotten by the user (`Q_FORGOTTEN`, Task 2 fix round 1 M5).
+    pub(crate) forgotten: usize,
     /// Kept since the refit, or held out otherwise.
     pub(crate) other: usize,
     /// Box-affected, fitted or not (below the trust floor they are fitted).
@@ -3388,6 +3396,9 @@ impl PassCoverage {
         }
         if self.quarantined > 0 {
             why.push(format!("{} are quarantined (held out by the trust recovery: the rest of the data could not predict it, or the fit could not reproduce it)", self.quarantined));
+        }
+        if self.forgotten > 0 {
+            why.push(format!("{} were forgotten by you (Model tab, Worst-fitting samples — Restore puts them back)", self.forgotten));
         }
         if self.other > 0 {
             why.push(format!("{} are otherwise left out", self.other));

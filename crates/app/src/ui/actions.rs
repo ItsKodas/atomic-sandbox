@@ -127,11 +127,13 @@ pub enum Action {
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
     /// The Model tab's "Worst-fitting samples" › Forget (spec 2026-11-12 R2): the stored sample
-    /// with this index leaves the fit until Restore (`Command::ForgetSample`). Recorded, not
-    /// replayable (it writes the shared collection's status record).
-    ForgetSample(usize),
+    /// this id names (its index and check value — fix round 1, M8: a sample list that changed
+    /// before the click is refused, never another sample forgotten) leaves the fit until Restore
+    /// (`Command::ForgetSample`). Recorded, not replayable (it writes the shared collection's
+    /// status record).
+    ForgetSample(sim::SampleId),
     /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
-    RestoreSample(usize),
+    RestoreSample(sim::SampleId),
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -600,13 +602,13 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
             st.plan.seed += 1;
         }
-        Action::ForgetSample(i) => {
-            st.set_status(format!("forgetting sample #{i}: held out of the fit until Restore; refitting"));
-            out.commands.push(Command::ForgetSample(i));
+        Action::ForgetSample(id) => {
+            st.set_status(format!("forgetting sample #{}: held out of the fit until Restore; refitting", id.index));
+            out.commands.push(Command::ForgetSample(id));
         }
-        Action::RestoreSample(i) => {
-            st.set_status(format!("restoring sample #{i}; refitting"));
-            out.commands.push(Command::RestoreSample(i));
+        Action::RestoreSample(id) => {
+            st.set_status(format!("restoring sample #{}; refitting", id.index));
+            out.commands.push(Command::RestoreSample(id));
         }
         Action::SetAudit(n) => {
             model_only_by_hand(st, "the audit cadence");

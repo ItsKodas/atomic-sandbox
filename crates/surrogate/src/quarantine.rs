@@ -40,16 +40,19 @@ pub const Q_DRAFT: u8 = 4;
 /// **An older build meeting code 7** (checked against the code before 2026-11-12, `b6bc3ab`):
 /// - **a model file** (`sample_quarantine` with a 7): refused as a whole with
 ///   "sample_quarantine[i] = 7 is not 0, 1, 2 or 3" (its reader accepts 0–3 only) — a clear
-///   error, nothing installed; the file is untouched.
+///   error, nothing installed; the file is untouched. The same holds for a **session-only file**
+///   (the session autosave of collection mode, the same sidecar format) holding a forgotten
+///   session-only sample: the older build's restore of it is refused whole.
 /// - **a shared collection** (a status record with code 7): read as is (the collection reader
 ///   keeps any code). The provider then treats the sample as **excluded** (`excluded` is "code ≠
 ///   0") and **not fencing** (its fence reads code 1 only); it never releases or supersedes it
 ///   (those touch code 1 only) and never rewrites its status (the code it loaded is the code it
-///   holds, so no status record differs). The Activity view shows it as "superseded" (the
-///   catch-all for a code it does not know) and its README does not count it. Its "Save a
-///   specialised model…" refuses to write a file holding it ("sidecar: quarantine code 7"). So an
-///   older build never fits a forgotten sample and never brings it back; it only lets the model
-///   answer near it (no fence).
+///   holds, so no status record differs). Its trust recovery's 10 % cap does **not** count it (that
+///   build counts code 1 only). The Activity view shows it as "superseded" (the catch-all for a
+///   code it does not know) and its README does not count it. Its "Save a specialised model…"
+///   leaves it out (that writer keeps code-0 samples only and writes no quarantine array). No
+///   path of that build writes a 7. So an older build never fits a forgotten sample and never
+///   brings it back; it only lets the model answer near it (no fence).
 /// - A newer build reads every older file and collection as before: code 7 never appears in them.
 pub const Q_FORGOTTEN: u8 = 7;
 

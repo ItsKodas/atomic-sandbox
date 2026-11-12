@@ -187,7 +187,12 @@ fn refuse_charge(q: i32) -> String {
 }
 
 fn refuse_quarantined(code: u8) -> String {
-    format!("quarantined sample (code {code})")
+    if code == crate::quarantine::Q_FORGOTTEN {
+        // the user forgot it (Model tab): not a quarantine (Task 2 fix round 1, M4)
+        format!("forgotten sample (code {code})")
+    } else {
+        format!("quarantined sample (code {code})")
+    }
 }
 
 fn refuse_forced(m: u32) -> String {
@@ -1495,6 +1500,7 @@ mod tests {
         assert_eq!(c.admit(&s, &prov(), Q_BOX), Err("box-affected sample".to_string()));
         assert_eq!(c.admit(&s, &prov(), Q_HELD), Err("quarantined sample (code 1)".to_string()));
         assert_eq!(c.admit(&s, &prov(), Q_SUPERSEDED), Err("quarantined sample (code 2)".to_string()));
+        assert_eq!(c.admit(&s, &prov(), crate::quarantine::Q_FORGOTTEN), Err("forgotten sample (code 7)".to_string()));
         let mut forced = prov();
         forced.multiplicity = Some(3);
         assert_eq!(c.admit(&s, &forced, Q_NONE), Err("the scene forced multiplicity 3".to_string()));

@@ -139,7 +139,7 @@ fn a_high_leverage_outlier_is_held_alone_and_trust_returns() {
     assert_eq!(s.degree_cap, None, "step 2 recovered it on the default basis (step 1's cap retry did not)");
     assert_eq!(
         s.recovery_note(),
-        Some("1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 29× its bound, and keeping them breaks the fit of their neighbours (kept, excluded from the fit; geometries near them fall back)")
+        Some("1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 29× its bound, and the fit without them recovers (kept, excluded from the fit; geometries near them fall back)")
     );
     assert_eq!(s.samples(), OUTLIER + 1, "never dropped");
 }
@@ -185,26 +185,45 @@ fn the_leave_one_out_ratio_is_the_class_rules_reading() {
     assert_eq!((own, tier), (f64::INFINITY, f64::INFINITY), "not a number: the worst");
 }
 
-/// Re-review N1 and N2: the note's words. In the noise-only mode it names the tier of the channel
-/// that attained the worst ratio (an energy outlier's against its 1e-3 Ha/atom energy tier, not the
-/// force tier); "keeping them breaks the fit of their neighbours" only when the result recovered
-/// (a ratio above 1 says only that the rest of the data could not predict the sample).
+/// Re-review N1 and N2, Task 2 fix round 1 (M6 and the ruling on concern 1): the note's words. In
+/// the noise-only mode it names the tier of the channel that attained a sample's ratio (an energy
+/// outlier's against its 1e-3 Ha/atom energy tier, not the force tier); rounds held under
+/// different bounds state each bound's own maximum (no understatement); the last clause is the
+/// measured fact only — ", and the fit without them recovers" (residuals, noise and counts),
+/// "… passes" (residuals and noise, not the counts), nothing when it still fails; it never claims
+/// the held samples broke their neighbours (a ratio above 1 says only that the rest of the data
+/// could not predict the sample).
 #[test]
 fn the_recovery_note_names_the_channel_and_claims_no_repair_it_did_not_see() {
-    let loo = |worst, bound| Held { worst, bound };
+    let held = |pairs: &[(f64, Bound)]| {
+        let mut h = Held::NONE;
+        for &(r, b) in pairs {
+            h.add(r, b);
+        }
+        h
+    };
     assert_eq!(
-        quarantine_words(1, 1, loo(962.0, Bound::EnergyTier(1e-3)), Ranking::LeaveOneOut, true),
-        "1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 962× its 1e-3 Ha/atom energy tier, and keeping them breaks the fit of their neighbours (kept, excluded from the fit; geometries near them fall back)"
+        quarantine_words(1, 1, held(&[(962.0, Bound::EnergyTier(1e-3))]), Ranking::LeaveOneOut, Outcome::Recovers),
+        "1 samples quarantined this refit (1 held in all) — the fit without each of them predicts it at up to 962× its 1e-3 Ha/atom energy tier, and the fit without them recovers (kept, excluded from the fit; geometries near them fall back)"
     );
     assert_eq!(
-        quarantine_words(3, 2, loo(4.24, Bound::ForceTier(2e-3)), Ranking::LeaveOneOut, false),
+        quarantine_words(3, 2, held(&[(4.24, Bound::ForceTier(2e-3)), (2.1, Bound::ForceTier(2e-3))]), Ranking::LeaveOneOut, Outcome::Fails),
         "2 samples quarantined this refit (3 held in all) — the fit without each of them predicts it at up to 4.2× the 2e-3 Ha/Bohr force-noise tier (kept, excluded from the fit; geometries near them fall back)"
     );
     assert_eq!(
-        quarantine_words(1, 1, loo(f64::INFINITY, Bound::Own), Ranking::LeaveOneOut, false),
+        quarantine_words(1, 1, held(&[(f64::INFINITY, Bound::Own)]), Ranking::LeaveOneOut, Outcome::Fails),
         "1 samples quarantined this refit (1 held in all) — the fit without one of them cannot predict it at all (it alone spans a direction of the fit) (kept, excluded from the fit; geometries near them fall back)"
     );
-    assert!(!quarantine_words(128, 23, loo(2.2, Bound::Own), Ranking::LeaveOneOut, false).contains("neighbours"), "an unrecovered result claims no repair");
+    // M6: an own-bound round's 29× and a later noise-only round's 6× and 3× (energy): each bound
+    // with its own maximum, never "up to 6× the tier" for the 29× sample
+    assert_eq!(
+        quarantine_words(4, 3, held(&[(29.0, Bound::Own), (6.0, Bound::ForceTier(2e-3)), (3.0, Bound::EnergyTier(1e-3))]), Ranking::LeaveOneOut, Outcome::Passes),
+        "3 samples quarantined this refit (4 held in all) — the fit without each of them predicts it at up to 29× its bound and 6.0× the 2e-3 Ha/Bohr force-noise tier and 3.0× its 1e-3 Ha/atom energy tier, and the fit without them passes (kept, excluded from the fit; geometries near them fall back)"
+    );
+    assert_eq!(held(&[(29.0, Bound::Own), (31.0, Bound::ForceTier(2e-3))]).worst(), 31.0);
+    for o in [Outcome::Fails, Outcome::Passes, Outcome::Recovers] {
+        assert!(!quarantine_words(128, 23, held(&[(2.2, Bound::Own)]), Ranking::LeaveOneOut, o).contains("neighbours"), "no claim about the neighbours ({o:?})");
+    }
     assert_eq!((ratio_words(38.4), ratio_words(9.96), ratio_words(f64::INFINITY)), ("38".to_string(), "10.0".to_string(), "∞".to_string()));
 }
 
@@ -278,7 +297,7 @@ fn undefined_leave_one_out_ranks_first_and_never_crosses_the_cap() {
     inject(&mut s, &many);
     let report = s.report().unwrap().clone();
     let (_, held, ranking) = s.quarantine_rounds(report);
-    let worst = held.worst;
+    let worst = held.worst();
     println!("20 undefined: held {}, trusted {} {:?}; {ranking:?}", s.quarantined(), s.trusted(), s.untrusted_reason());
     // the leave-one-out rounds hold none; the training ranking's fallback (7 victims, untrusted on
     // this fixture) does not recover either, so the leave-one-out result stands

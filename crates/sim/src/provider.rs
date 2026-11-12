@@ -924,9 +924,8 @@ pub enum RefitPoll {
 /// `2026-11-12-sample-recovery-design.md` R2).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleSuspect {
-    /// The sample's index in the provider's store (a shared collection's sample index for the
-    /// samples it holds): what `forget_sample` / `restore_sample` take.
-    pub index: usize,
+    /// Which stored sample: what `forget_sample` / `restore_sample` take.
+    pub id: SampleId,
     /// Its formula from Z in Hill order ("HO", "H2O").
     pub formula: String,
     /// Where it came from, in a word or two ("fallback", "pass perturbation", "audit").
@@ -935,6 +934,21 @@ pub struct SampleSuspect {
     /// over its own bound (∞ when undefined: it alone spans a direction of the fit). `None` when
     /// it is not in that fit.
     pub loo_ratio: Option<f64>,
+}
+
+/// A stored sample's identity as the Model tab's Forget / Restore carry it (Task 2 fix round 1,
+/// M8): its index in the provider's store and a check value of the sample itself (the surrogate's
+/// hash of its Z and positions). The provider refuses an id whose index now holds another sample
+/// (a model switch, attach or load queued before the click) with "the sample list changed — pick
+/// it again".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleId {
+    /// The index in the provider's store — the "#N" the Model tab shows. With a shared collection
+    /// attached it is the collection's own sample index only for the samples loaded at attach:
+    /// session-only samples interleave after them (M9).
+    pub index: usize,
+    /// The check value of the sample at `index`.
+    pub key: u64,
 }
 
 pub trait Trainable {
@@ -1095,18 +1109,19 @@ pub trait Trainable {
     fn pending_refit(&self) -> bool;
     /// The audit cadence (answered steps per audit; 0 disables).
     fn set_audit_every(&mut self, n: usize);
-    /// **Forgets** stored sample `index` (the Model tab's "Worst-fitting samples" › Forget; spec
+    /// **Forgets** stored sample `id` (the Model tab's "Worst-fitting samples" › Forget; spec
     /// R2): held out of the fit for good — and fencing — until [`restore_sample`](Self::restore_sample),
-    /// never released by a refit. The status is written at once (the shared collection's status
-    /// record when the sample is in one; else the model's store, saved with the model file) and a
-    /// refit is due (`pending_refit`); the caller starts it. `Err` with the reason, nothing
-    /// changed. The default: unsupported.
-    fn forget_sample(&mut self, _index: usize) -> Result<(), String> {
+    /// never released by a refit. Only a sample in the fit can be forgotten. The status is written
+    /// at once (the shared collection's status record when the sample is in one; else the model's
+    /// store, saved with the model file) and a refit is due (`pending_refit`); the caller starts
+    /// it. `Err` with the reason, nothing changed — also when `id` no longer names the sample. The
+    /// default: unsupported.
+    fn forget_sample(&mut self, _id: SampleId) -> Result<(), String> {
         Err("this provider does not learn".into())
     }
     /// Puts a [`forget_sample`](Self::forget_sample)'d sample back into the fit (written at once,
     /// a refit due). `Err` with the reason, nothing changed. The default: unsupported.
-    fn restore_sample(&mut self, _index: usize) -> Result<(), String> {
+    fn restore_sample(&mut self, _id: SampleId) -> Result<(), String> {
         Err("this provider does not learn".into())
     }
     /// The worst-fitting samples of the fit that stands, worst first (at most 8): ranked by their
@@ -1236,6 +1251,9 @@ pub struct TrainableStatus {
     pub superseded: usize,
     /// Samples the user forgot ([`Trainable::forget_sample`]): excluded, fencing, never released.
     pub forgotten: usize,
+    /// Of `forgotten`, those the last fit still holds (forgotten since it, or during the background
+    /// refit that installed it): counted in the fit until the next refit, not beside it.
+    pub forgotten_in_fit: usize,
     /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
     pub box_excluded: usize,
     /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit

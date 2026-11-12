@@ -1130,7 +1130,10 @@ impl SurrogateKs {
             self.audit_failed = None;
             self.audit_force = None;
         }
-        let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED) | Some(&Q_FORGOTTEN)));
+        // a refit's quarantine only — never the user's Forget (`Q_FORGOTTEN`): a failed audit whose
+        // sample was forgotten is re-judged as before and fences only after the usual limit, so
+        // forgetting never lifts rule 8's global untrust (Task 2 fix round 1, I1)
+        let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
         let cases = std::mem::take(&mut self.failed_audits);
         for mut case in cases {
             if quarantined(self, &case) {

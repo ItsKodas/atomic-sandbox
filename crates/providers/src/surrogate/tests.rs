@@ -3594,9 +3594,14 @@ fn fnv1a(text: &str) -> u64 {
 /// "of a quarantined geometry the model cannot represent" → "of a sample held out of the fit
 /// (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or
 /// forgotten by the user)"; with the old words substituted back the trace hashes to the old pin
-/// exactly (checked on the GOLDEN_TRACE output). The recovery note's words are unchanged (that
-/// refit recovers, so "keeping them breaks the fit of their neighbours" stays).
-const SCRIPTED_SESSION_DIGEST: u64 = 0xfcf7_5e47_a07c_7000;
+/// exactly (checked on the GOLDEN_TRACE output).
+/// **Re-pinned for the recovered note's last clause** (Task 2 fix round 1, the coordinator's ruling
+/// on concern 1; 0xfcf7_5e47_a07c_7000 → below): one string in one line (line 644, the refit after
+/// step 85's glitched label, a recovered result), ", and keeping them breaks the fit of their
+/// neighbours" → ", and the fit without them recovers"; the 907 lines are otherwise identical
+/// (diffed against the previous GOLDEN_TRACE), and with the old clause substituted back the trace
+/// hashes to the previous pin exactly.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xfeaa_fe54_5608_3db3;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
