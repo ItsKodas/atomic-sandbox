@@ -62,13 +62,9 @@ pub fn updates_dir() -> Option<PathBuf> {
     paths::user_root().map(|r| r.join("updates"))
 }
 
-/// The session file's name in [`updates_dir`].
+/// The session file's name in [`updates_dir`] (`Viewer::hand_off_update` writes
+/// `<user root>\updates\session.scene`).
 pub const SESSION_FILE: &str = "session.scene";
-
-/// `<user root>\updates\session.scene`.
-pub fn session_path() -> Option<PathBuf> {
-    updates_dir().map(|d| d.join(SESSION_FILE))
-}
 
 /// A `.part` this old is no live download's: a running job writes to its own at least every read
 /// timeout (30 s) or fails. Younger ones may be another window's download, and are left.
@@ -159,25 +155,16 @@ pub struct Download {
     rx: Receiver<DownloadState>,
     state: Mutex<DownloadState>,
     cancel: Arc<AtomicBool>,
+    /// The job's thread: only the tests join it (`Download::finish`); the app lets it run out.
+    #[cfg_attr(not(test), allow(dead_code))]
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Download {
-    /// Starts downloading `release`'s installer into [`updates_dir`] over HTTPS, to be checked
-    /// against the compiled-in release key. Refused at once — nothing fetched — for a release that
-    /// can't be installed from the app ([`installable`]), a build without a release key, or no
-    /// per-user folder.
-    pub fn start(release: &Release) -> Result<Download, String> {
-        let dir = updates_dir().ok_or("there is no per-user folder to download into (LOCALAPPDATA isn't set)")?;
-        let source = Box::new(super::net::Http::new());
-        #[cfg(not(test))]
-        return Download::start_with(release, dir, source);
-        #[cfg(test)]
-        return Download::start_with(release, dir, source, RELEASE_KEY);
-    }
-
-    /// [`Download::start`] into `dir`, from `source`. Outside the tests the key is always the
-    /// compiled-in [`RELEASE_KEY`]; the tests pass theirs (the TEST-ONLY fixture key).
+    /// Starts downloading `release`'s installer into `dir` (`<user root>\updates`, [`updates_dir`])
+    /// from `source` (the app's: `update::net::Http`, through `ui::version::GitHub`), to be checked
+    /// against the release key. Outside the tests the key is always the compiled-in
+    /// [`RELEASE_KEY`]; the tests pass theirs (the TEST-ONLY fixture key).
     ///
     /// Refused before anything is fetched: [`installable`]'s refusals, no key, an installer listed
     /// at 0 bytes (the size bounds what is written to disk), and any of the three assets whose URL
@@ -617,7 +604,7 @@ pub fn hand_off(installer: &Verified, session: &Path) -> Result<CloseForUpdate, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update::parse_releases;
+    use crate::update::release::parse_releases;
 
     const RELEASES: &str = include_str!("fixtures/releases.json");
     const SUMS: &[u8] = include_bytes!("fixtures/SHA256SUMS.txt");
@@ -873,7 +860,7 @@ mod tests {
         let placeholder = "# no release key yet\n";
         assert_eq!(Download::start_with(&release(), dir.clone(), count(fetched.clone()), placeholder).err().unwrap(), NO_RELEASE_KEY);
         if !has_key(RELEASE_KEY) {
-            assert_eq!(Download::start(&release()).err().unwrap(), NO_RELEASE_KEY, "this build has no key yet");
+            assert_eq!(Download::start_with(&release(), dir.clone(), count(fetched.clone()), RELEASE_KEY).err().unwrap(), NO_RELEASE_KEY, "this build has no key yet");
         }
         let unsigned = parse_releases(RELEASES).unwrap().into_iter().find(|r| r.tag == "v0.1.0").unwrap();
         assert!(Download::start_with(&unsigned, dir.clone(), count(fetched.clone()), TEST_KEY).err().unwrap().contains("no signature"));

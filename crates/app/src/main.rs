@@ -32,7 +32,6 @@ mod trails;
 mod ui;
 // the in-app updater: release logic (installer Task 2), the fetch, download, session and hand-off
 // (Task 3; `--resume-session` uses the session); the Version panel (Task 4) uses the rest
-#[allow(dead_code, unused_imports)]
 mod update;
 mod viewer;
 mod worker;

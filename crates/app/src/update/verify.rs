@@ -13,8 +13,6 @@
 //! comment until installer Task 6; a build carrying it installs nothing ([`NO_RELEASE_KEY`]). The
 //! tests sign with the committed `fixtures/TEST-ONLY.*` pair, which signs nothing real.
 
-use sha2::{Digest, Sha256};
-
 /// The public key releases are signed with: the text of `crates/app/release-key.pub` (minisign's
 /// two-line `.pub` form, or `#` comment lines only while there is no key yet).
 pub const RELEASE_KEY: &str = include_str!("../../release-key.pub");
@@ -22,9 +20,11 @@ pub const RELEASE_KEY: &str = include_str!("../../release-key.pub");
 /// [`verify`]'s refusal when the key holds no key (the placeholder).
 pub const NO_RELEASE_KEY: &str = "this build has no release key";
 
-/// SHA-256 of `bytes`.
+/// SHA-256 of `bytes` (the tests' fixtures; the download hashes as it streams).
+#[cfg(test)]
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
 }
 
 /// Lower-case hex of a digest.

@@ -28,6 +28,8 @@ use std::time::Duration;
 
 /// GitHub's releases list for this repository (unauthenticated: 60 requests an hour is plenty for
 /// a check at launch and every 6 hours). `per_page=100`: every release in one answer.
+// (the app's network, reached through `ui::version::GitHub`, which a test build never uses)
+#[cfg_attr(test, allow(dead_code))]
 pub const RELEASES_URL: &str = "https://api.github.com/repos/ItsKodas/atomic-sandbox/releases?per_page=100";
 
 /// Every release asset of this repository is `<ASSET_PREFIX><tag>/<name>` ([`asset_url`]).
@@ -124,6 +126,8 @@ fn redirect_of(r: &ureq::Response) -> Option<String> {
 }
 
 /// The releases list, newest first ([`check_response`]). Blocking: call it from a worker thread.
+// (the app's network, reached through `ui::version::GitHub`, which a test build never uses)
+#[cfg_attr(test, allow(dead_code))]
 pub fn fetch_releases() -> Result<Vec<Release>, CheckError> {
     releases_from(&agent(), RELEASES_URL)
 }
@@ -185,6 +189,8 @@ const MANIFEST_MAX: u64 = 1 << 20;
 /// through the same rules as every download (the asset's URL tied to its release, the redirects
 /// to GitHub's hosts only). `None` when the release carries none (`v0.1.0`). Blocking: call it from
 /// a worker thread.
+// (the app's network, reached through `ui::version::GitHub`, which a test build never uses)
+#[cfg_attr(test, allow(dead_code))]
 pub fn fetch_manifest(release: &Release) -> Result<Option<Manifest>, String> {
     manifest_from(release, &mut Http::new())
 }
@@ -209,7 +215,8 @@ pub fn release_page(tag: &str) -> Option<String> {
     plain_segment(tag).then(|| format!("https://github.com/ItsKodas/atomic-sandbox/releases/tag/{tag}"))
 }
 
-/// The download job's source over HTTPS ([`super::apply::Download::start`]).
+/// The download job's source over HTTPS ([`super::apply::Download::start_with`], from
+/// `ui::version::GitHub`).
 pub struct Http {
     agent: ureq::Agent,
 }
@@ -423,7 +430,7 @@ mod tests {
     /// release page is built from a plain tag only.
     #[test]
     fn a_release_manifest_is_read_through_the_asset_rules() {
-        use crate::update::parse_releases;
+        use crate::update::release::parse_releases;
         const MANIFEST: &str = include_str!("fixtures/manifest_v0.2.0.json");
         let releases = parse_releases(include_str!("fixtures/releases.json")).unwrap();
         let by = |t: &str| releases.iter().find(|r| r.tag == t).unwrap().clone();

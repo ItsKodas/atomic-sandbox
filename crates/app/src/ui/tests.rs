@@ -8162,7 +8162,7 @@ mod updates {
     const FIXTURE_SETUP: &[u8] = b"AtomicSandbox-Setup-0.2.0.exe: a stand-in for the installer, test only\n";
 
     pub(super) fn releases() -> Vec<Release> {
-        crate::update::parse_releases(RELEASES).unwrap()
+        crate::update::release::parse_releases(RELEASES).unwrap()
     }
 
     pub(super) fn ver(s: &str) -> semver::Version {

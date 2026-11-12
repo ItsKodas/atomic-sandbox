@@ -32,12 +32,11 @@ pub mod net;
 pub mod release;
 pub mod verify;
 
-pub use apply::{clean_updates, hand_off, installer_command, load_session, save_session, session_path, CloseForUpdate, Download, DownloadState, Session, Verified};
+pub use apply::{clean_updates, hand_off, load_session, save_session, CloseForUpdate, Download, DownloadState, Verified};
 pub use formats::{current_formats, downgrade_warnings, Formats};
 pub use net::{fetch_manifest, fetch_releases};
-pub use manifest::{Manifest, ManifestAsset};
-pub use release::{check_response, installable, newer, parse_releases, visible, Asset, Channel, CheckError, Release};
-pub use verify::verify;
+pub use manifest::Manifest;
+pub use release::{installable, newer, visible, Channel, CheckError, Release};
 
 use std::path::Path;
 
