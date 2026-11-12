@@ -543,7 +543,9 @@ pub fn load_session(path: &Path) -> Result<Session, String> {
 /// `/WAITPID=<pid>` (for the Task 5 script, review M6): the process id of the app handing off. The
 /// script waits for that process to exit (e.g. `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject`;
 /// a pid that is already gone means go on) before it replaces any file, so the installer never
-/// races the app's own exit; `CloseApplications` still deals with any other copy.
+/// races the app's own exit (`installer/AtomicSandbox.iss`, `WaitForPid`: 120 s at most, then the
+/// install is called off). The script has `CloseApplications=no`: another copy is never closed —
+/// `Viewer::restart_for_update` refuses the hand-off while one runs (`crate::instance`).
 pub fn installer_command(installer: &Path, exe_after: &Path, session: &Path, wait_pid: u32) -> Command {
     let mut c = Command::new(installer);
     c.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
@@ -574,7 +576,8 @@ pub fn relaunch_arg(exe_after: &Path, session: &Path) -> OsString {
 
 /// The installer is running: close the app now, through its own clean-exit path (the profile
 /// flushed, the window gone; `main`'s close). The installer waits for this process to exit
-/// (`/WAITPID`); its `CloseApplications` deals with another copy still holding the exe.
+/// (`/WAITPID`) and never closes another copy (`CloseApplications=no`; the hand-off is refused
+/// while one runs, `crate::instance`).
 #[must_use = "the app must now close through its own exit path: the installer is waiting to replace it"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct CloseForUpdate;

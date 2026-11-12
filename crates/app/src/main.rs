@@ -386,6 +386,19 @@ fn main() {
         }
         return;
     }
+    // hidden, for packaging (installer Task 5, `scripts/package.ps1`): `--write-icon <path>` writes
+    // the app's `.ico` (the one `build.rs` embeds in the exe) for the installer's own icon, and exits
+    if let Some(i) = argv.iter().position(|a| a == "--write-icon") {
+        let Some(path) = argv.get(i + 1) else {
+            eprintln!("--write-icon needs a path");
+            std::process::exit(2);
+        };
+        if let Err(e) = std::fs::write(path, icon::ico(&icon::ICO_SIZES)) {
+            eprintln!("--write-icon {path}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // our own taskbar identity: Windows then takes the button's icon from the window (`frame::exe_icon`)
     // instead of resolving one for the exe path (it showed the generic icon)
     #[cfg(windows)]

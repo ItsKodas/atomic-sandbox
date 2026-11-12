@@ -61,7 +61,7 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 1. **GitHub refuses or limits the request** (HTTP 403 or 429, or a non-JSON body). The panel shows "couldn't check (GitHub said: rate limited, try later)" and keeps the last list; nothing crashes. → Task 2 test `a_rate_limited_response_is_a_quiet_message`.
 2. **A download that stops part-way, or a full disk.** The partial file is never used: download to `*.part`, verify, then rename. A retry starts clean. → Task 3 test `a_truncated_download_is_rejected_and_removed`.
 3. **A Windows user name with spaces or non-ASCII letters** in `%LOCALAPPDATA%`. Paths are handled as `PathBuf` throughout, and the installer's command line is quoted. → Task 1 test `data_root_handles_spaces_and_non_ascii`, and Task 3 test `installer_command_line_quotes_paths`.
-4. **A second running copy of the app at restart-to-update.** The installer must not overwrite a locked exe. The hand-off waits for the app's own exit only; Inno's `CloseApplications=yes` closes or reports the other copy, and the panel says that another window may need closing. → Task 5 script setting, and Task 4 note text test.
+4. **A second running copy of the app at restart-to-update.** The installer must not overwrite a locked exe. The hand-off waits for the app's own exit only; Inno's `CloseApplications=yes` closes or reports the other copy, and the panel says that another window may need closing. → Task 5 script setting, and Task 4 note text test. **Amended (Task 4 fix round, controller ruling):** Restart now refuses while another copy of the install runs (`app::instance`), and the script has `CloseApplications=no`, so the installer never closes an app; it waits for `/WAITPID` up to 120 s, then calls the install off.
 5. **Old releases with no `SHA256SUMS.txt` or manifest** (`v0.1.0`). They are listed with "can't be installed from the app (no signature) — download it from GitHub", plus a link. They never install unverified. → Task 2 test `an_unsigned_release_is_listed_but_not_installable`.
 
 ---
@@ -282,7 +282,7 @@ Inno Setup 6. GitHub Actions `windows-latest`.
 **Files:**
 - Create `installer/AtomicSandbox.iss`, with:
   - `PrivilegesRequired=lowest`, `DefaultDirName={localappdata}\Programs\Atomic Sandbox`, `DisableDirPage=yes`, `DisableProgramGroupPage=yes`;
-  - `CloseApplications=yes`;
+  - ~~`CloseApplications=yes`~~ **`CloseApplications=no`** (controller ruling, Task 4 fix round: the app refuses the hand-off while another copy runs, so the installer never closes an app);
   - `AppId` set to a fixed GUID, generated once and written in the script;
   - `SetupIconFile` from the generated `.ico` (copy `crates/app/build.rs`'s output, or write it with a tiny `--write-icon <path>` hidden flag);
   - files: `AtomicSandbox.exe`, `README.md`, `docs\images\`, `bundled\models\*.model` (committed models only), `bundled\scenes\*.scene`, and `installed.txt` (contents: `installed by AtomicSandbox-Setup-<ver>`);
