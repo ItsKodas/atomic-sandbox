@@ -9435,7 +9435,10 @@ impl ForceProvider for StubKsGpu {
 /// nothing — untrusted at every refit, and (every fallback a copy of a stored sample) no refit
 /// changed it. The recovery now re-judges the cap against the default basis (steps 1b/3): the
 /// refit ends trusted, every held sample is written to the collection as a status record, and a
-/// reopened collection holds the same codes.
+/// reopened collection holds the same codes. Since spec 2026-11-12 R1 (fix round 1, option A) step
+/// 3 gets there through the **fallback**: its leave-one-out rounds do not recover (47 held, 1.60×)
+/// and the training-residual rounds from the same state do — this test exercises that path
+/// (`recovery_loo::the_stuck_collection_recovers_through_the_training_fallback` pins the note).
 #[test]
 fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() {
     const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";

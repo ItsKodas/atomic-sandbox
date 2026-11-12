@@ -717,14 +717,22 @@
 //!    the training ranking holds 7 victims and ends untrusted, the leave-one-out ranking holds the
 //!    outlier alone and trusts. The recovery note names the worst ratio held ("3 samples
 //!    quarantined — the fit without each predicts it at up to 38× its bound, and keeping them
-//!    breaks the fit of their neighbours (…)"). Not changed: the rounds, the cap, the degree-cap
-//!    steps, release and supersede, and the trust rule that judges every fit. **Open (2026-11-12,
-//!    `references.md` "Leave-one-out recovery ranking"):** on the stuck-H collection (step 3 below)
-//!    the ranking, once the label error is held, goes on to name high-leverage samples whose own fit
-//!    is fine, and the rounds end untrusted (47 held) where the training ranking trusted (38 held);
-//!    on the user's pre-1805 snapshot #1804 is held in round 1 but the refit's release step (run
-//!    first, against the fit #1804 bends) puts #1455 back, and the attach's refit ends at 1.0185×
-//!    (128 held) — the next refit trusts it (122 held);
+//!    breaks the fit of their neighbours (…)"). **The fallback** (fix round 1, the coordinator's
+//!    option A; `quarantine_rounds`): when the leave-one-out rounds do not recover the fit (the
+//!    residuals, the noise and the trust rule's counts), the state the rounds started from is
+//!    restored (the fit, the codes, `species_dirty`, the note) and the rounds run again ranked by the
+//!    in-sample training residual (`training_offenders`, the ranking before); that result stands only
+//!    if it recovers, else the leave-one-out one does, and the note names the ranking that stood
+//!    ("ranked by their own training residual (the leave-one-out ranking did not recover the fit)").
+//!    The recovery is thus never worse than before, for up to [`QUARANTINE_ROUNDS`] more fits on a
+//!    refit that is failing anyway. Why both: once a label error is held, the leave-one-out ratio
+//!    can go on naming high-leverage samples whose own fit is fine — the stuck-H collection's step 3
+//!    (below) ends untrusted at 47 held by it, trusted at 38 held by the fallback. On the user's
+//!    pre-1805 snapshot #1804 is held in round 1, but the refit's release step (run first, against
+//!    the fit #1804 bends) puts #1455 back: the first refit ends untrusted at 1.0185× (128 held,
+//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). Not changed: the
+//!    rounds, the cap, the degree-cap steps, release and supersede, and the trust rule that judges
+//!    every fit;
 //! 3. (M8a user-test fix) a `degree_cap` an earlier recovery set is **not kept for good**: when the
 //!    capped fit fails, the default basis is tried first exactly as step 1 tries the cap (kept if
 //!    it alone passes, counts included), and when the quarantine on the capped basis cannot
@@ -1432,8 +1440,8 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
-    /// Tests only: the recovery ranks its offenders by their training residual, as before spec R1
-    /// (`training_offenders`) — the premise a test compares the leave-one-out ranking with.
+    /// Tests only: the recovery's rounds rank by the training residual alone, as before spec R1
+    /// (`training_offenders`, no leave-one-out rounds first) — the premise a test compares with.
     #[cfg(test)]
     training_ranking: bool,
     /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach

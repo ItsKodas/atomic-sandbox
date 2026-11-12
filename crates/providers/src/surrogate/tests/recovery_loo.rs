@@ -1,6 +1,7 @@
 //! Spec `2026-11-12-sample-recovery-design.md` R1: the trust recovery ranks its offenders by their
-//! **leave-one-out ratio** (`quarantine::loo_ratio`), not by their training residual; the ratios
-//! are the class pass's, cached per fit (ruling R1b); an undefined one ranks first (R1a).
+//! **leave-one-out ratio** (`quarantine::loo_ratio`) first, and — fix round 1, option A — falls back
+//! to the training-residual ranking from the same entry state when those rounds do not recover;
+//! the ratios are the class pass's, cached per fit (ruling R1b); an undefined one ranks first (R1a).
 //!
 //! The fixture (`outlier_store`): [`SpeciesMorse`]'s exact, pair-additive H surface — 100 H₃
 //! triangles (every pair 1.0–3.0 Bohr) and 30 H₂ (1.2–2.6 Bohr) — and one **high-leverage outlier**,
@@ -244,9 +245,11 @@ fn undefined_leave_one_out_ranks_first_and_never_crosses_the_cap() {
     let many: Vec<usize> = (0..20).collect();
     inject(&mut s, &many);
     let report = s.report().unwrap().clone();
-    let (_, worst) = s.quarantine_rounds(report);
-    println!("20 undefined: held {}, trusted {} {:?}", s.quarantined(), s.trusted(), s.untrusted_reason());
-    assert_eq!((s.quarantined(), worst), (0, 0.0), "the cap is checked before holding");
+    let (_, worst, ranking) = s.quarantine_rounds(report);
+    println!("20 undefined: held {}, trusted {} {:?}; {ranking:?}", s.quarantined(), s.trusted(), s.untrusted_reason());
+    // the leave-one-out rounds hold none; the training ranking's fallback (7 victims, untrusted on
+    // this fixture) does not recover either, so the leave-one-out result stands
+    assert_eq!((s.quarantined(), worst, ranking), (0, 0.0, Ranking::LeaveOneOut), "the cap is checked before holding");
     assert!(!s.trusted(), "the trust rule judges what stands");
 }
 
@@ -421,12 +424,12 @@ fn report_line(s: &SurrogateKs, label: &str, wall: f64) {
 /// size, whether #1804 is held, the worst training ratios, the trust verdict and the wall time.
 ///
 /// On the user's pre-1805 snapshot it asserts what the ranking itself decides: #1804 is held.
-/// The spec expected the refit to end trusted with fewer than 110 held; measured 2026-11-12 it
-/// does not (untrusted at 1.0185× the force bound, 128 held — `references.md` has the numbers and
-/// [`recovery_snapshot_steps`] the reason: the refit's release step, which runs before the
-/// recovery against the fit #1804 still bends, puts #1455 back, and the fit without #1804 but
-/// with #1455 is at 1.0070×, against 0.9991× without both). Not asserted: it is a finding about
-/// the release order and this collection's 0.1 % margin, not about the ranking.
+/// Measured 2026-11-12 (fix round 1, pinned in `references.md`): the first refit, 13 fits (the 5
+/// fallback rounds do not recover either), ends untrusted at 1.0185× the force bound with 128
+/// held; the next trusted at 0.9950× with 122. The spec's "trusted, fewer than 110 held" was wrong
+/// ([`recovery_snapshot_steps`]: the refit's release step, which runs before the recovery against
+/// the fit #1804 still bends, puts #1455 back, and the fit without #1804 but with #1455 is at
+/// 1.0070×, against 0.9991× without both — the collection debug measured the latter).
 ///
 /// `SURROGATE_RECOVERY_SNAPSHOT=<copy>/<slug> cargo test -p providers --release --lib recovery_on_a_collection_snapshot -- --ignored --nocapture`
 #[test]
@@ -454,6 +457,41 @@ fn recovery_on_a_collection_snapshot() {
     }
 }
 
+/// Fix round 1 (option A): where the leave-one-out rounds do not recover, the training-residual
+/// rounds from the same entry state do, and their result stands — the user's stuck-H collection
+/// (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`, the same live
+/// state; it passes unchanged through this path). Step 3's leave-one-out rounds end at 47 held,
+/// 1.60× (`stuck_collection_rounds_under_both_rankings`); the fallback's at 38 held, trusted, and the
+/// note names it.
+#[test]
+fn the_stuck_collection_recovers_through_the_training_fallback() {
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/stuck-h-collection").join(SLUG);
+    let dir = collection_root("stuck-fallback");
+    std::fs::create_dir_all(dir.join(SLUG)).unwrap();
+    for f in ["key.txt", "references.txt", "samples.bin", "history.bin"] {
+        std::fs::copy(src.join(f), dir.join(SLUG).join(f)).unwrap();
+    }
+    let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(src.join("key.txt")).unwrap()).unwrap();
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    let live = c.quarantine.clone();
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.body4_off = true;
+    s.attach(c).unwrap();
+    s.quarantine = live;
+    s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+    s.species_dirty = true;
+    s.fit_store().unwrap();
+    assert!(!s.trusted());
+    s.refit().unwrap();
+    let note = s.recovery_note().unwrap_or_default().to_string();
+    println!("after the refit: cap {:?}, held {}, trusted {} {:?}; {note}", s.degree_cap, s.quarantined(), s.trusted(), s.untrusted_reason());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert_eq!((s.degree_cap, s.quarantined()), (None, 38), "step 3 on the default basis, the training ranking's 38");
+    assert!(s.is_quarantined(575));
+    assert!(note.starts_with("back to the default basis") && note.contains("ranked by their own training residual (the leave-one-out ranking did not recover the fit)"), "{note}");
+}
+
 /// A diagnostic (no assertion; in-repo data, < 1 s): the stuck-H collection's recovery
 /// (`a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck`; `references.md`
 /// "M8a stuck collection") round by round under both rankings, on the capped basis (step 2) and on
@@ -461,8 +499,8 @@ fn recovery_on_a_collection_snapshot() {
 /// Measured 2026-11-12: the training ranking's step 3 holds #575 first (in-sample 21.8×) and ends
 /// trusted at 38 held (0.961); the leave-one-out ranking's holds #561 and #575 (22.4×), then #560,
 /// then high-leverage samples whose in-sample residuals pass (26 in round 4, worst 3.3×), and ends
-/// untrusted at 47 held (1.597) — the regression `references.md` "Leave-one-out recovery ranking"
-/// reports.
+/// untrusted at 47 held (1.597) — why fix round 1 falls back to the training ranking
+/// (`the_stuck_collection_recovers_through_the_training_fallback`).
 ///
 /// `cargo test -p providers --release --lib stuck_collection_rounds_under_both_rankings -- --ignored --nocapture`
 #[test]
