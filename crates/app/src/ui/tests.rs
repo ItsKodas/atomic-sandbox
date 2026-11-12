@@ -2427,7 +2427,7 @@ fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
     [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
         .into_iter()
-        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0 })
+        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0, worst: None })
         .collect()
 }
 
@@ -4761,7 +4761,7 @@ mod activity_trust {
         use activity::words::{trust_line, AuditSeen};
         use sim::activity::{TrustCheck, TrustKey as K};
         use sim::AuditVerdict as V;
-        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3 };
+        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3, worst: None };
         let rec = |verdict| sim::AuditRecord { gap: 2e-4, verdict, face_density: None, unaudited_steps: 0, asynchronous: true, teacher_ms: 90.0 };
         let head = "Last check against DFT — no failed check since the last refit";
         assert_eq!(trust_line(&met, AuditSeen::Never, 20), format!("{head} (last check: none yet, one every 20 answered steps)"));
@@ -4774,15 +4774,65 @@ mod activity_trust {
             format!("{head} (last check: none since the last refit — the fit before it was last checked: passed)")
         );
         assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
-        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
+        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3, worst: None };
         assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (until a refit predicts it without that sample)");
-        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
+        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3, worst: None };
         assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (until a refit predicts it without that sample)");
         // the three states come from the status
         let m = model();
         assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
         assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit_this_fit: false, ..model() }), AuditSeen::EarlierFit(_)));
         assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit: None, last_audit_this_fit: false, ..model() }), AuditSeen::Never));
+    }
+
+    /// 2026-11-13: the training-residual lines name the sample (and for the forces the atom) that
+    /// holds the worst value — store index and formula as the Worst-fitting rows show them, the
+    /// origin on hover — and a failed one whose sample Forget would take carries the Forget link
+    /// (the Model tab's line too). Without a location the lines read exactly as before.
+    #[test]
+    fn the_residual_lines_name_the_worst_sample_and_atom() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K, TrustWorst};
+        let id = sim::SampleId { index: 1234, key: 0xabc };
+        let at = |atom, forgettable| Some(TrustWorst { id, formula: "H3O".into(), origin: "fallback".into(), atom, forgettable });
+        let force = TrustCheck { key: K::ForceResidual, met: false, value: 3.4e-3, limit: 2e-3, worst: at(Some((2, 8)), true) };
+        assert_eq!(trust_line(&force, AuditSeen::Never, 20), "Reproduces its own training forces — worst 3.4 in #1234 · H3O (atom 2, O), allowed 2 mHa/Bohr for that atom");
+        let energy = TrustCheck { key: K::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3, worst: at(None, true) };
+        assert_eq!(trust_line(&energy, AuditSeen::Never, 20), "Reproduces its own training energies to the accuracy it claims — worst 2.2 mHa/atom in #1234 · H3O, allowed 1 mHa/atom");
+        // the fallback: no location (an old status, no model, a changed sample) — today's text
+        let old_f = TrustCheck { worst: None, ..force.clone() };
+        assert_eq!(trust_line(&old_f, AuditSeen::Never, 20), "Reproduces its own training forces — worst 3.4, allowed 2 mHa/Bohr for that atom");
+        let old_e = TrustCheck { worst: None, ..energy.clone() };
+        assert_eq!(trust_line(&old_e, AuditSeen::Never, 20), "Reproduces its own training energies to the accuracy it claims — worst 2.2 mHa/atom, allowed 1 mHa/atom");
+        // the Forget link: a failed check whose sample is code 0 only
+        assert_eq!(activity::trust::forget_target(&force), Some(id));
+        assert_eq!(activity::trust::forget_target(&TrustCheck { worst: at(Some((2, 8)), false), ..force.clone() }), None, "held out: Forget would refuse it");
+        assert_eq!(activity::trust::forget_target(&TrustCheck { met: true, ..force.clone() }), None, "a met check blocks nothing");
+        assert_eq!(activity::trust::forget_target(&old_f), None);
+        // the checklist and the Model tab's refusal line
+        let checks = |f: TrustCheck| {
+            let mut v = checks_failing(K::ForceResidual);
+            let k = v.iter().position(|c| c.key == K::ForceResidual).unwrap();
+            v[k] = f;
+            v
+        };
+        let m = ModelStatus { trusted: false, untrusted_reason: Some("max training force residual 3.4e-3 > 2.0e-3 Ha/Bohr".into()), quarantined: 0, box_affected: 0, readiness: None, trust_checks: checks(force.clone()), ..model() };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        let l = lines.iter().find(|l| l.why).expect("this is why");
+        assert_eq!(l.text, trust_line(&force, AuditSeen::Never, 20));
+        assert!(l.hover.ends_with("; worst in #1234 · H3O · fallback"), "{}", l.hover);
+        assert_eq!(l.forget, Some(id));
+        let t = trust(Some(&m), &scene, &st);
+        assert_eq!(t.text, format!("no — {}", l.text));
+        assert_eq!(t.forget, Some(id));
+        // without a location: today's line, no link
+        let m = ModelStatus { trust_checks: checks(old_f.clone()), ..m };
+        let t = trust(Some(&m), &scene, &st);
+        assert_eq!(t.text, "no — Reproduces its own training forces — worst 3.4, allowed 2 mHa/Bohr for that atom");
+        assert_eq!(t.forget, None);
+        assert!(activity::trust::lines(&m, &scene, &st).iter().all(|l| l.forget.is_none()));
     }
 
     /// Plan review M3: the class line words the class's own verdict, so an energy-only failure
@@ -4821,7 +4871,7 @@ mod activity_trust {
         let scene = Scene::preset("h2").unwrap();
         let st = UiState::new("h2", &scene);
         let mut m = model();
-        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 }];
+        m.trust_checks = vec![sim::activity::TrustCheck { key: sim::activity::TrustKey::Audit, met: true, value: 0.0, limit: 1e-3, worst: None }];
         let plain = lines(&m, &scene, &st);
         assert!(!plain.iter().any(|l| l.text.contains("near the cell faces")), "{plain:?}");
         m.audits_box_unjudged = 3;
@@ -4847,13 +4897,13 @@ mod activity_trust {
             box_excluded: 0,
             trust_floor: Some(59),
             trust_checks: vec![
-                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0 },
-                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0 },
-                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0 },
-                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3 },
-                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3 },
-                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3 },
-                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 },
+                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0, worst: None },
+                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0, worst: None },
+                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0, worst: None },
+                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3, worst: None },
+                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3, worst: None },
+                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3, worst: None },
+                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3, worst: None },
             ],
             ..model()
         };
@@ -4893,7 +4943,7 @@ mod activity_trust {
         let m = ModelStatus {
             trusted: false,
             untrusted_reason: Some("n_samples 12 < q_prime 16".into()),
-            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0 }],
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0, worst: None }],
             ..model()
         };
         let scene = Scene::preset("h2").unwrap();
@@ -4902,7 +4952,7 @@ mod activity_trust {
         assert!(lines[0].why && lines[0].text == "Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
         assert_eq!(trust(Some(&m), &scene, &st).text, "no — Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
         // met: every line ✓, none "this is why", the box line ✓, the class lines after
-        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }], ..model() };
+        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0, worst: None }], ..model() };
         let lines = activity::trust::lines(&ok, &scene, &st);
         assert!(lines.iter().all(|l| l.met && !l.why), "{lines:?}");
         assert!(lines.last().unwrap().text.starts_with("Two-atom arrangements"));
@@ -5170,7 +5220,7 @@ mod activity_final {
             untrusted_reason: None,
             box_affected,
             box_excluded: 0,
-            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }],
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0, worst: None }],
             ..model()
         };
         let text = |m: &ModelStatus| activity::trust::lines(m, &scene, &st).into_iter().map(|l| l.text).find(|t| t.to_lowercase().contains("box walls")).unwrap();

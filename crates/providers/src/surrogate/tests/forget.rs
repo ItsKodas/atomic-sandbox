@@ -471,3 +471,87 @@ fn forgetting_the_only_sample_of_a_species_is_honest() {
     assert!(s.trusted() || s.untrusted_reason().is_some_and(|w| !w.is_empty()), "an untrusted model says why");
     assert!(s.is_forgotten(he));
 }
+
+/// 2026-11-13 (display only): the two training-residual checks carry where their worst value
+/// sits ([`TrustCheck::worst`](sim::activity::TrustCheck)) — the true argmax over the fitted
+/// samples and their trained atoms, found here by a brute-force pass of its own over the fit's
+/// members — with the formula and the atom's Z of that stored sample (H₂ and H₂·He samples: two
+/// species). The location never moves a number: value and limit are the residual pass's. A sample
+/// held since reads not forgettable; a changed sample at that index drops the location (the same
+/// identity check Forget makes).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_residual_checks_name_their_true_argmax() {
+    use sim::activity::TrustKey as K;
+    let (mut s, _) = pair_student();
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    let mut rng = StdRng::seed_from_u64(31);
+    let add = |s: &mut SurrogateKs, sc: &Scene, tag| {
+        let (pos, z): (Vec<[f64; 3]>, Vec<u8>) = (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect());
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        s.add_sample(Sample { pos, z, energy: e, forces: f, tag, weight: 1.0, force_mask: None, use_energy: true }, sc).unwrap();
+    };
+    for i in 0..60 {
+        let sc = h2_at(1.1 + 1.2 * i as f64 / 59.0, &mut rng);
+        add(&mut s, &sc, SampleTag::Scan);
+    }
+    for i in 0..8 {
+        let mut sc = h2_at(1.3 + 0.05 * i as f64, &mut rng);
+        sc.nuclei.push(Nucleus::new(2, [0.0, 2.2 + 0.1 * i as f64, 0.0]));
+        add(&mut s, &sc, SampleTag::Fallback);
+    }
+    s.refit().unwrap();
+    let t = s.training_residuals().expect("a fit with residuals");
+    // the brute-force argmaxes over the fit's members: the largest |ΔE|/N, and the largest
+    // force-residual ratio (first wins a tie, as the residual pass's strict `>` does)
+    let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
+    let (mut e_best, mut f_best): (Option<(f64, usize)>, Option<(f64, usize, usize, f64)>) = (None, None);
+    for (i, smp) in store.samples[..s.accumulated].iter().enumerate().filter(|(i, _)| !s.excluded(*i)) {
+        let p = model.predict(&smp.pos, &smp.z, false).unwrap();
+        let e = (p.energy - smp.energy).abs() / smp.pos.len() as f64;
+        if smp.use_energy && e_best.is_none_or(|(b, _)| e > b) {
+            e_best = Some((e, i));
+        }
+        for (j, (fm, fs)) in p.forces.iter().zip(&smp.forces).enumerate().filter(|(j, _)| smp.trains_atom(*j)) {
+            let (d, bound) = s.policy.force_residual(fm, fs);
+            if f_best.is_none_or(|(b, ..)| d / bound > b) {
+                f_best = Some((d / bound, i, j, d));
+            }
+        }
+    }
+    let ((e_max, e_i), (_, f_i, f_j, f_d)) = (e_best.unwrap(), f_best.unwrap());
+    println!("worst energy residual {e_max:.3e} at #{e_i}, worst force residual {f_d:.3e} at #{f_i} atom {f_j}");
+    assert!(e_max > 0.0 && f_d > 0.0, "the premise: nonzero residuals");
+    assert_eq!((t.energy_per_atom, t.force), (e_max, f_d), "the location rides with the same numbers");
+    let checks = s.trust_checks();
+    let get = |k| checks.iter().find(|c| c.key == k).unwrap().clone();
+    let (ce, cf) = (get(K::EnergyResidual), get(K::ForceResidual));
+    let we = ce.worst.clone().expect("the energy check names its sample");
+    let wf = cf.worst.clone().expect("the force check names its sample and atom");
+    assert_eq!(we.id, s.sample_id(e_i).unwrap());
+    assert_eq!((wf.id, wf.atom.map(|a| a.0)), (s.sample_id(f_i).unwrap(), Some(f_j)));
+    assert_eq!(we.atom, None, "an energy is per sample");
+    for (w, i) in [(&we, e_i), (&wf, f_i)] {
+        let smp = &store.samples[i];
+        assert_eq!(w.formula, shared::formula(&smp.z));
+        assert_eq!(w.origin, super::super::quarantine::origin_word(smp.tag));
+        assert!(w.forgettable, "a fitted sample: code 0");
+    }
+    assert_eq!(wf.atom.unwrap().1, store.samples[f_i].z[f_j]);
+    // display only: the rest of every check is what the rule's own sequence gives
+    for (c, plain) in checks.iter().zip(s.checks()) {
+        assert_eq!((c.key, c.met, c.value.to_bits(), c.limit.to_bits()), (plain.key, plain.met, plain.value.to_bits(), plain.limit.to_bits()));
+        assert!(plain.worst.is_none());
+        assert!(c.worst.is_none() || matches!(c.key, K::EnergyResidual | K::ForceResidual));
+    }
+    // held since the fit: named, not forgettable (Forget would refuse a non-zero code)
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[f_i] = Q_HELD;
+    let held = s.trust_checks().into_iter().find(|c| c.key == K::ForceResidual).unwrap().worst.unwrap();
+    assert!(!held.forgettable);
+    s.quarantine[f_i] = Q_NONE;
+    // another sample at that index (a model switch, attach or load): no location, today's line
+    s.store.as_mut().unwrap().samples[f_i].energy += 1e-9;
+    assert_eq!(s.trust_checks().into_iter().find(|c| c.key == K::ForceResidual).unwrap().worst, None);
+}
