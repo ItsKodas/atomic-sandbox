@@ -4357,3 +4357,45 @@ Nothing was changed: the trust rule and the recovery are safety rules. Options f
 1. **A failed recovery keeps nothing.** When the rounds do not restore trust, restore the state the refit started from. The model is untrusted either way, so this never trusts more; it stops the ratchet and keeps the labels.
 2. **Separate models by spin multiplicity.** The fits above trust the doublets alone, and the singlets come close. This is a design change to how collections are split (spec §4.2 already keeps each sample's multiplicity); it needs its own spec.
 3. **A larger body-4 basis** (D₄ = 3). Not measured; Q′ grows to about 5 300 at S = 4, so the refit cost grows with it.
+
+## Raising the body-4 degree (2026-11-12; a measurement, nothing changed in the build)
+
+Follow-up to the section above, after the user's goal for the estimated model was restated: "place a
+heap of atoms down in the estimated model and watch them all form bonds" — Sandbox-scale scenes, far
+beyond what one DFT box holds. Splitting collections by whole-box spin multiplicity (option 2 above) does
+not fit that goal: in a large box the total multiplicity says nothing about any one atom's surroundings,
+and Sandbox has no teacher to read it from. A heap of loose atoms is all open-shell fragments at the start,
+so radicals have to be fitted by the same local model as closed shells. This measures option 3.
+
+Run: `residual_diag` with `DIAG_SPIKE=1` on a copy of the user's H/N/O collection (1 805 samples, 181 held
+on disk), the build's `body4_cap` patched to return D₄ = 2 (the shipped value), 3 and 4 in turn (a
+throwaway patch, reverted). Release, Ryzen 7 9800X3D, CPU, BelowNormal; other sessions' suites waited for.
+
+Same samples, same codes (the 180 holds on disk, default body-3 cap 4, no recovery):
+
+| D₄ | Q′ | fit | trusted | max F residual / bound | rms \|ΔF\|/√3 H₃O · H₂O · H₂ · H₃ (Ha/Bohr) | H₃O max ratio |
+|---|---|---|---|---|---|---|
+| 2 (shipped) | 1 032 | 4.8 s | **no** | 3.0e-3 / 2.6e-3 | 1.21e-3 · 5.56e-4 · 8.69e-4 · 7.77e-4 | 1.15 |
+| 3 | 1 902 | 21.8 s | **yes** | 1.77e-3 / 2.0e-3 | 4.69e-4 · 2.71e-4 · 5.38e-4 · 3.85e-4 | 0.48 |
+| 4 | 3 603 | 222 s | no (energy 1.5e-3 > 1e-3 Ha/atom) | 1.97e-3 / 2.0e-3 | — | — |
+
+The attach's refit with its recovery (what the app does):
+
+| D₄ | trusted | held after | held by scene | recovery |
+|---|---|---|---|---|
+| 2 | yes | 170 | H₃O 139, H₃ 29, H₂ 3 | 1 more quarantined |
+| 3 | yes | 112 | H₃O 90, H₃ 21, H₂ 2 | **68 released** ("the model now reproduces them") |
+| 4 | yes | 99 | — | 1 more quarantined |
+
+Findings:
+1. **The H₃O / H₂O conflict is mostly a capacity limit of the body-4 block, not spin.** At D₄ = 3 the same
+   fit cuts H₃O's force rms 2.6× and H₂O's 2.1×, and every scene's improves. The recovery then releases
+   held samples instead of holding more: the ratchet runs backwards.
+2. **Not everything is fitted.** 90 H₃O samples (the hot-burst H-loss trajectory, #1394–1402 still at F
+   ratio 5–8 at D₄ = 3) and 21 compressed H₃ geometries (energy up to 21× the bound) stay held. With every
+   hold cleared (S2) or every H₃O held and the rest cleared (S3), no D₄ is trusted (energy 7.8–8.1e-3 Ha/atom,
+   from those H₃ geometries) — so the hold-out fits S2–S4 do not separate H₃O from the other held samples.
+3. **Cost.** D₄ = 3 makes one fit ≈ 4.5× slower at S = 3 (Q′ 1 032 → 1 902); the module doc's estimate at
+   S = 4 is Q′ 2 688 → 5 344 (a 0.2 GB Gram per matrix). D₄ = 4 is 46× slower (222 s a fit) and not better.
+   The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
+4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.

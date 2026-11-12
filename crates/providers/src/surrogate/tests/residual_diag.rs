@@ -7,7 +7,7 @@
 //! (a **copy**: the attach's refit writes its quarantine codes to it). Runs the attach's refit,
 //! then fits without recovery from the codes on disk and from the attach's. `DIAG_TESTS=1` adds
 //! the hold-out fits (H₃O held, by multiplicity, H₃O alone, each on the default and the cap-6
-//! basis); `DIAG_RANGES=a-b,c-d` dumps those samples in store order (distances, per-atom forces).
+//! basis); `DIAG_SPIKE=1` runs the body-4 measurement's five fits instead; `DIAG_RANGES=a-b,c-d` dumps those samples in store order (distances, per-atom forces).
 use super::*;
 use std::collections::BTreeMap;
 use surrogate::SampleTag;
@@ -74,6 +74,13 @@ fn report(s: &SurrogateKs, meta: &[Meta], label: &str) {
         "report: n {} Q′ {} σ_E {:.2e} σ_F {:.2e} rmse_E/atom {:.2e} rmse_F {:.2e} dof_e {:.1} dof_f {:.1}; training residuals {:?}",
         r.n_samples, r.q_prime, r.sigma_e, r.sigma_f, r.rmse_energy_per_atom, r.rmse_force, r.residual_dof_e, r.residual_dof_f, s.training_residuals()
     );
+    let mut held: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, m) in meta.iter().enumerate() {
+        if s.quarantine.get(i).copied().unwrap_or(0) != 0 {
+            *held.entry(format!("{} q{}", m.scene, s.quarantine[i])).or_default() += 1;
+        }
+    }
+    println!("held by scene: {held:?}");
     let rs = ratios(s);
     let fitted = |i: usize| i < s.accumulated && !s.excluded(i);
     let mut order: Vec<usize> = (0..rs.len()).filter(|&i| rs[i].is_some()).collect();
@@ -219,6 +226,54 @@ fn residual_failures_on_a_collection() {
     s.species_dirty = true;
     s.fit_store().unwrap();
     report(&s, &meta, "the attach's codes, default basis, no recovery");
+    if std::env::var("DIAG_SPIKE").is_ok() {
+        // The body-4 measurement (references.md "Raising the body-4 degree"): the same fits, timed, at the build's D₄ — reproduced with `body4_cap` returning the cap under test.
+        let cap6 = Some(super::super::quarantine::RECOVERY_DEGREE_CAP);
+        let with = |keep: &dyn Fn(usize, &Meta) -> bool| {
+            let mut q = q0.clone();
+            q.resize(meta.len(), 0);
+            for (i, m) in meta.iter().enumerate() {
+                if !keep(i, m) {
+                    q[i] = surrogate::quarantine::Q_HELD;
+                } else if q[i] == surrogate::quarantine::Q_HELD {
+                    q[i] = 0;
+                }
+            }
+            q
+        };
+        let unheld = |q: &[u8]| {
+            let mut q = q.to_vec();
+            q.resize(meta.len(), 0);
+            for c in q.iter_mut() {
+                if *c == surrogate::quarantine::Q_HELD {
+                    *c = 0;
+                }
+            }
+            q
+        };
+        let fits: Vec<(&str, Option<usize>, Vec<u8>)> = vec![
+            ("S0: the disk's codes, default body-3 (cap 4), the build's D4", None, q0.clone()),
+            ("S1: the disk's codes, cap 6, the build's D4", cap6, q0.clone()),
+            ("S2: no residual holds at all (every held sample back), cap 6, the build's D4", cap6, unheld(&q0)),
+            ("S3: every H3O held, everything else back, cap 6, the build's D4", cap6, with(&|_, m: &Meta| m.scene != "H3O")),
+            ("S4: H3O only, cap 6, the build's D4", cap6, with(&|_, m: &Meta| m.scene == "H3O")),
+        ];
+        for (label, cap, q) in fits {
+            s.quarantine = q;
+            s.degree_cap = cap;
+            s.species_dirty = true;
+            let t = std::time::Instant::now();
+            match s.fit_store() {
+                Ok(_) => {
+                    println!("\n[{label}] fit took {:.1} s", t.elapsed().as_secs_f64());
+                    report(&s, &meta, label)
+                }
+                Err(e) => println!("\n=== {label}: fit failed {e}"),
+            }
+        }
+        s.degree_cap = None;
+        return;
+    }
     if std::env::var("DIAG_TESTS").is_ok() {
         // T1: every H3O sample held, the rest as on disk
         let mut q = q0.clone();
