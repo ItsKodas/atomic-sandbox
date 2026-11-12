@@ -631,7 +631,9 @@ pub fn default_disk_cache_dir() -> Option<std::path::PathBuf> {
 /// One recorded answer: the ladder entry (f, local) and what the gate said.
 type Answer = (f64, LocalCandidate, Result<DimerPair, DimerError>);
 
-const DISK_MAGIC: &str = "atomic-sandbox dimer gate v1";
+/// The first line of a disk-cache file: its format, bumped when the layout changes (public for the
+/// app's release manifest, `app::update::formats`).
+pub const DISK_MAGIC: &str = "atomic-sandbox dimer gate v1";
 const CHECKSUM_KEY: &str = "checksum\t";
 
 /// `body` followed by its checksum line (FNV-1a 64 of the body, 16 hex digits).

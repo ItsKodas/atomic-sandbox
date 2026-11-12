@@ -25,6 +25,19 @@ glam = { workspace = true }
 png = { workspace = true }
 # native open/save dialogs for model files (plumbing; user request 2026-10-18)
 rfd = "0.15"
+# the updater's GitHub releases answer and release manifest, as JSON (plumbing; installer spec)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# release tags as versions: ordering, pre-releases (plumbing; installer spec)
+semver = "1"
+# SHA-256 of a downloaded release asset, checked against SHA256SUMS.txt (plumbing; installer spec)
+sha2 = "0.10"
+# the minisign signature over SHA256SUMS.txt, verified with the compiled-in key (plumbing; installer spec)
+minisign-verify = "0.2"
+
+# test only: signs the updater's fixtures with the committed TEST-ONLY key (an ignored helper, `update::verify`)
+[dev-dependencies]
+minisign = "0.7"
 
 # embeds the app icon (`build.rs`, drawn by `src/icon.rs`) in app.exe on Windows
 [build-dependencies]

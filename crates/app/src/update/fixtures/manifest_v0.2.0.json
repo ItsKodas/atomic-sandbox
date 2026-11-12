@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "channel": "stable",
+  "assets": [
+    {
+      "name": "AtomicSandbox-Setup-0.2.0.exe",
+      "size": 41234567,
+      "sha256": "4b1c2e8f0a9d7c6b5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d"
+    },
+    {
+      "name": "AtomicSandbox-0.2.0-windows-x64.zip",
+      "size": 43210987,
+      "sha256": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d"
+    }
+  ],
+  "formats": {
+    "checkpoint": 1,
+    "collection": 1,
+    "history": 1,
+    "profile": 1,
+    "pseudo_cache": 1,
+    "replay": 1,
+    "scene": 1,
+    "sidecar": 8
+  }
+}

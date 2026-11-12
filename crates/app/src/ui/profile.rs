@@ -45,6 +45,12 @@ fn tabs_of(v: &str) -> Vec<DockTab> {
 fn pick<T: Copy + std::fmt::Debug>(all: &[T], w: &str) -> Option<T> {
     all.iter().copied().find(|t| format!("{t:?}") == w)
 }
+/// The profile format this build reads and writes, recorded in a release's `manifest.json`
+/// (`update::formats`). A profile carries no version line: this number is code-only. Bump it when a
+/// profile this build writes would lose or change settings in the previous release — a renamed or
+/// re-meant key, a changed value grammar (`layout`, `hidden`, `window`). A new key alone does not
+/// bump it when older builds skip unknown keys.
+pub const PROFILE_FORMAT: u32 = 1;
 const NAME_STYLES: [NameStyle; 4] = [NameStyle::Common, NameStyle::Stoichiometric, NameStyle::Hydride, NameStyle::FormulaOnly];
 const ENERGY_UNITS: [EnergyUnits; 3] = [EnergyUnits::Ha, EnergyUnits::Ev, EnergyUnits::Both];
 const TEMP_UNITS: [TempUnits; 3] = [TempUnits::K, TempUnits::C, TempUnits::F];

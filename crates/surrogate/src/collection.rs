@@ -203,7 +203,7 @@ const REC_HEADER: u8 = 0;
 const REC_SAMPLE: u8 = 1;
 const REC_STATUS: u8 = 2;
 /// The version every record kind is written at (module doc).
-const RECORD_VERSION: u8 = 1;
+pub const RECORD_VERSION: u8 = 1;
 /// Sample flag bit 0: a force mask follows (module doc, M8a Task 10).
 const FLAG_FORCE_MASK: u16 = 1;
 /// Sample flag bit 1: the energy is not fitted.

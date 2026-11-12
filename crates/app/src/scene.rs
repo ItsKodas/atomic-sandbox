@@ -45,6 +45,13 @@ pub(crate) fn canonical_a(z: u8, a: u16) -> Option<u16> {
 /// ([`Scene::drop_deferred_train_mask`]).
 pub const TRAIN_MASK_IGNORED: &str = "train_mask ignored: Train this segment is deferred";
 
+/// The scene file format this build reads and writes, recorded in a release's `manifest.json`
+/// (`update::formats`). A scene file carries no version line (the parser refuses unknown lines, so
+/// a marker would itself break every older build): this number is code-only. Bump it when a scene
+/// file this build writes would not parse, or would mean something else, in the previous release:
+/// a new line or field, a changed meaning or unit. Adding a reader for an older form does not bump it.
+pub const SCENE_FORMAT: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub nuclei: Vec<SceneNucleus>,

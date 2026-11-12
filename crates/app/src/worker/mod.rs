@@ -181,7 +181,8 @@
 //! panic the driver is rebuilt from the last snapshot (time restarts, the settings are kept).
 mod activity;
 mod autosave;
-mod checkpoint;
+// crate-visible for its file names (`update::formats` reads the checkpoint's header)
+pub(crate) mod checkpoint;
 pub use checkpoint::{discard_interrupted_pass, interrupted_pass};
 use checkpoint::Checkpoints;
 mod commands;

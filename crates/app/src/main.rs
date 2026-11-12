@@ -29,6 +29,9 @@ mod sim;
 mod tools;
 mod trails;
 mod ui;
+// the in-app updater's release logic (installer Task 2); the fetch and the Version panel (Tasks 3, 4) use the rest
+#[allow(dead_code, unused_imports)]
+mod update;
 mod viewer;
 mod worker;
 
@@ -366,6 +369,21 @@ fn attach_console() {
 fn main() {
     #[cfg(windows)]
     attach_console();
+    // hidden, for CI (installer Task 6): `--write-manifest <path>` writes this build's release
+    // manifest (version, channel, data formats; no asset entries, `update::manifest`) and exits
+    // before anything else starts
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--write-manifest") {
+        let Some(path) = argv.get(i + 1) else {
+            eprintln!("--write-manifest needs a path");
+            std::process::exit(2);
+        };
+        if let Err(e) = update::write_manifest(std::path::Path::new(path)) {
+            eprintln!("--write-manifest {path}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // our own taskbar identity: Windows then takes the button's icon from the window (`frame::exe_icon`)
     // instead of resolving one for the exe path (it showed the generic icon)
     #[cfg(windows)]

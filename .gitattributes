@@ -3,3 +3,5 @@
 
 # test fixtures read byte for byte (a collection folder: binary records, LF text)
 crates/providers/testdata/** -text
+# the updater's fixtures: signed bytes (SHA256SUMS.txt and its .minisig) must not change at checkout
+crates/app/src/update/fixtures/** -text
