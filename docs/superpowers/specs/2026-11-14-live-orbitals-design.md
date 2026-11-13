@@ -187,6 +187,19 @@ Display-only work, but rule 7 needs measured numbers. These are recorded in `cra
   - Recorded: the occupied-subspace overlap with SCF, the ε error per level, and ∫|ρ_out − ρ_SCF|/N.
   - Gate: overlap ≥ 0.95 for each case. If one fails, investigate; do not loosen it.
 - **V-A3 (cost, record).** A warm Harris refresh at 81³ for H₂ and for the neutral H₂ + H, and at 97³ for H₂O, timed. **Target:** ≤ 0.3 s for H₂ and H₂ + H at 81³. If it isn't met, record it, and the cadence keeps the 15 % budget.
+- **V-A4 (record only; added at the user's request 2026-11-14).** Measures whether bonds from the Harris density would beat bond experience, to inform §9 Q2. Nothing in the app changes.
+  - **Geometries:** held-out frames that the model and bond experience did not train on. These are a sampling pass's later samples against bond experience built from its earlier ones, plus an H₂ dissociation scan (0.8–6 Bohr) and the H₂ + H approach.
+  - **Per frame:** run the app's existing density bond detection (unchanged thresholds) on the Harris ρ_out and on the SCF density.
+  - **Score, per pair:**
+    - the agreement of bonded / not bonded with SCF;
+    - the bond-kind agreement;
+    - the error in the bond-point density and the pile-up value;
+    - the partial-charge error.
+  - **Bond experience on the same pairs:**
+    - its coverage, meaning how often it answers at all (≥ 3 agreeing examples);
+    - its agreement with SCF where it does answer.
+  - **Report:** results split into "near the bond length" and "stretched/borderline", by the SCF's own bond-point density band.
+  - **Where it goes:** a table in `references.md` and a short README note. It becomes a gate only if Q2 is later approved.
 - **V-B1 (gate).** Experience round trip, testing the projection, not the thresholds. Store a solve's deformation, then rebuild ρ_in at the same geometry with the count and weight thresholds bypassed by a test-only switch. ∫|ρ_in − ρ_SCF|/N must fall by ≥ 80 % against plain superposition (the basis's truncation error is what is left).
 - **V-B2 (record + gate).** Held-out. Train experience on one sampling pass of H₂O, then evaluate at held-out perturbed geometries of the same pass. Recorded: the L1 density error of superposition vs experience. Gate: experience is lower on average, and the occupied overlap improves.
 - **V-B3 (gate).** A mismatched environment (a different neighbour species, or RMSD > 0.1) applies no deformation, and the spread check refuses disagreeing candidates.
