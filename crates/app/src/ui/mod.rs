@@ -782,6 +782,9 @@ pub struct UiState {
     /// The View panel's folding sections that are open (`dock::view`; the profile's
     /// `view_sections`). Display state: not recorded.
     pub view_sections: dock::view::Sections,
+    /// The Model panel's folds that are open (`dock::model`; the profile's `model_sections`):
+    /// Teach next and Health by default. Display state: not recorded.
+    pub model_sections: dock::model::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -1017,6 +1020,7 @@ impl UiState {
             cloud_refresh_s: 2.0,
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
+            model_sections: dock::model::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
@@ -1835,7 +1839,7 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String, usize)> {
 
 /// Which of the trust readout's five variants applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TrustKind {
+pub(in crate::ui) enum TrustKind {
     NoModel,
     /// Trusted, but it has not answered at this geometry for a while.
     Stuck,

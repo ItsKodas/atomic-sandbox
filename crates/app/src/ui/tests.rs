@@ -932,6 +932,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     st.activity.absorb(&rich);
     st.show_knowledge = true; // the overlay's legend over every layout
     st.view_sections = super::dock::view::Sections::all(true); // every View-panel anchor drawn
+    st.model_sections = super::dock::model::Sections::all(true); // every Model-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -1342,6 +1343,8 @@ fn the_model_tab_says_where_the_model_learns() {
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
     st.open_tab(DockTab::Model);
+    // the source switch, Import and Save a specialised model… live in the Model file fold (2026-11-14)
+    st.model_sections.set(super::dock::model::Section::File, true);
     for _ in 0..3 {
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
     }
@@ -9152,5 +9155,307 @@ mod updates {
         let defaults = profile::defaults(&old);
         profile::apply(&mut old, &defaults);
         assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
+    }
+}
+
+/// The Model panel's restructuring (user request 2026-11-14, the approved mockup): the verdict card,
+/// Teach next, Health, then the folds — order, default folds, the verdict's words, the gaps, the
+/// Details rows, the profile, the narrow panel.
+mod model_panel {
+    use super::super::dock::model::{gaps, surface_chip, verdict, Section, Sections, Tone};
+    use super::*;
+
+    /// The text of every text shape the chrome draws in one frame (after two settling frames).
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns }
+    }
+
+    /// H₂S with an unlearned S–H pair key (12 of 60 samples), an unlearned O–S one (no O in the
+    /// scene) and a learned H–H one; strict mode refuses here by the pair class.
+    fn gappy() -> ModelStatus {
+        let sh = key(16, vec![1], Some((sim::ClassKey::Samples, 12.0, 60.0)), 12, 60);
+        let os = key(8, vec![16], Some((sim::ClassKey::Samples, 5.0, 29.0)), 5, 29);
+        let hh = key(1, vec![1], None, 400, 29);
+        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![sh, os, hh] };
+        let readiness = sim::Readiness {
+            answers: false,
+            rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair)),
+            atom: Some(1),
+            text: "rule 4b: pair environment around S, with H not learned well enough yet (12 of 60 samples)".into(),
+            unlearned: None,
+        };
+        ModelStatus { class_loo: vec![pair], readiness: Some(readiness), ..model() }
+    }
+
+    fn est(scene: &Scene, m: ModelStatus, source: sim::Source) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Estimated, Some(m));
+        s.dynamics.source = source;
+        s.dynamics.uncertainty = Some(1.1e-4);
+        s.dynamics.fallback_fraction_100 = 0.12;
+        s
+    }
+
+    fn state(name: &str, scene: &Scene) -> UiState {
+        let mut st = UiState::new(name, scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        st
+    }
+
+    /// Verdict → Teach next → Health → Learned → Worst-fitting → Details → Model file; Teach next
+    /// and Health open by default, the rest folded (their contents not drawn).
+    #[test]
+    fn the_sections_come_in_order_with_teach_and_health_open() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = est(&scene, model(), sim::Source::Surrogate);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &scene);
+        assert_eq!(st.model_sections, Sections::default());
+        assert!(st.model_sections.is_open(Section::Teach) && st.model_sections.is_open(Section::Health));
+        for s in [Section::Gaps, Section::Plan, Section::Audits, Section::Learned, Section::Suspects, Section::Details, Section::File] {
+            assert!(!st.model_sections.is_open(s), "{s:?}");
+        }
+        let t = texts(&ctx, &mut st, &inp);
+        let order = ["model-verdict", "model-teach", "model-health", "model-fold-learned", "model-fold-suspects", "model-fold-details", "model-fold-file"];
+        let ys: Vec<f32> = order.iter().map(|p| probed_rect(p).top()).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?}: {ys:?}");
+        assert!(t.contains("Teach next") && t.contains("Health") && t.contains("Learned (1 class)") && t.contains("Worst-fitting samples") && t.contains("Details") && t.contains("Model file"), "{t}");
+        // Health's rows drawn, Details' not
+        assert!(t.contains("uncertainty") && t.contains("last audit") && t.contains("rmse 1.6e-5 Ha/Bohr"), "{t}");
+        assert!(!t.contains("model epoch") && !t.contains("mismatch work") && !t.contains("Save model…"), "{t}");
+    }
+
+    /// The verdict's headline and reason: trusted and answering; falling back for an unlearned pair
+    /// (the reason names it, the long explanation only on the "why?" hover); no model yet; Model
+    /// only where strict mode would refuse; another solver.
+    #[test]
+    fn the_verdict_says_what_answers_here_and_why() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let st = state("h2", &h2);
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let v = verdict(&st, &input(&h2, Some(&snap), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Good, "Model answering · trusted here"));
+        assert!(v.reason.starts_with("Everything this scene needs is learned."), "{}", v.reason);
+
+        let h2s = Scene::preset("h2s").unwrap();
+        let mut st = state("h2s", &h2s);
+        let snap = est(&h2s, gappy(), sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let v = verdict(&st, &inp);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here"));
+        assert_eq!(v.reason, "This scene has S–H pairs the model hasn't learned yet. Everything else here is trusted.");
+        assert!(!v.reason.contains("O–S"), "the O–S key is not this scene's");
+        // the long explanation (the old trusted / strict-here paragraphs) is the hover's, not the body's
+        let long = "rule 4b: pair environment around S, with H not learned well enough yet";
+        assert!(v.tip.contains(long) && v.tip.contains("strict mode here: refuses"), "{}", v.tip);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Falling back to DFT here") && t.contains("why?") && t.contains("12 % DFT"), "{t}");
+        assert!(t.replace('\n', " ").contains("S–H pairs the model"), "{t}");
+        assert!(!t.contains(long), "the long text stays in the tooltip: {t}");
+        probed_rect("model-why");
+
+        let none = est(&h2, ModelStatus { fitted: false, trusted: false, fit: None, ..model() }, sim::Source::Dft);
+        let v = verdict(&state("h2", &h2), &input(&h2, Some(&none), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Neutral, "No model yet"));
+
+        let mut st = state("h2s", &h2s);
+        st.draft = true;
+        st.audit_every = 0;
+        st.model_only = Some(ModelOnlySaved { draft: false, audit_every: 2000 });
+        let snap = est(&h2s, gappy(), sim::Source::Surrogate);
+        let v = verdict(&st, &input(&h2s, Some(&snap), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Model only · guessing here"));
+        assert!(v.reason.contains("would refuse here") && v.reason.contains("S–H pairs") && v.reason.contains("nothing checks it"), "{}", v.reason);
+
+        let mut st = state("h2", &h2);
+        st.backend = Backend::Gpu;
+        assert_eq!(verdict(&st, &input(&h2, None, &cam)).headline, "Estimated solver off");
+    }
+
+    /// Teach next lists exactly the keys not learned yet — the scene's first, with k / N; the others
+    /// under "other gaps (n)", drawn when that fold opens — and "Everything this scene needs is
+    /// learned" when nothing is missing.
+    #[test]
+    fn teach_next_lists_the_unlearned_keys_scene_first() {
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let g = gaps(&gappy(), &[1, 1, 16]);
+        let rows: Vec<(&str, bool, &str, usize, usize)> = g.iter().map(|g| (g.label.as_str(), g.in_scene, g.right.as_str(), g.have, g.need)).collect();
+        assert_eq!(rows, vec![("pair S–H", true, "12 / 60", 12, 60), ("pair O–S", false, "5 / 29", 5, 29)]);
+        let snap = est(&h2s, gappy(), sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair S–H") && t.contains("12 / 60") && t.contains("other gaps (1)"), "{t}");
+        assert!(!t.contains("pair O–S") && !t.contains("Everything this scene needs is learned"), "{t}");
+        click_widget(&ctx, &mut st, &inp, "model-fold-gaps");
+        assert!(st.model_sections.is_open(Section::Gaps));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair O–S") && t.contains("5 / 29"), "{t}");
+        // all learned
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let mut st = state("h2", &h2);
+        let t = texts(&ctx, &mut st, &input(&h2, Some(&snap), &cam));
+        assert!(t.contains("Everything this scene needs is learned") && !t.contains("other gaps"), "{t}");
+    }
+
+    /// Sample more (moved up into Teach next) emits the same `Action::Sample` as before; the audits
+    /// line's switch still emits `SetAudit`.
+    #[test]
+    fn the_moved_controls_emit_their_actions() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        let outs = click_widget(&ctx, &mut st, &inp, "sample");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| matches!(a, Action::Sample { .. })), "Sample more emits Action::Sample");
+        st.audit_every = 2000;
+        let outs = click_widget(&ctx, &mut st, &inp, "audits-on");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::SetAudit(0)), "the audits line turns them off");
+    }
+
+    /// With Details open every former readout row is there (a few pinned), and Ctrl K's "Teacher
+    /// gap" unfolds Details.
+    #[test]
+    fn details_hold_every_former_row() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let m = ModelStatus { last_refit: Some(crate::sim::RefitLog { ms: 85.0, at_step: 1200, result: Ok(271) }), ..model() };
+        let snap = est(&h2, m, sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        search::pick(&ctx, &mut st, search::results("teacher gap", 1)[0]);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(st.model_sections.is_open(Section::Details), "the reveal unfolds Details");
+        for row in ["this step", "trusted", "samples", "model epoch", "last fit", "strict here", "fit vs held", "learned classes", "last refit", "fallbacks", "teacher gap", "last audit", "mismatch work", "taught at", "model: this session only", "What this model is (and is not)"] {
+            assert!(t.contains(row), "{row}: {t}");
+        }
+        let flat = t.replace('\n', " ");
+        assert!(flat.contains("271 samples, 85 ms, at step 1200") && flat.contains("271 of 273 held: 2 quarantined") && flat.contains("pair: trusted · 273 samples"), "{t}");
+    }
+
+    /// The folds' open state is display state kept in the profile (`model_sections`): a header click
+    /// sends nothing, the line round-trips, absent means the default two, empty means all folded.
+    #[test]
+    fn the_folds_are_kept_in_the_profile() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        assert!(profile::capture(&st).contains("\nmodel_sections = teach,health\n"));
+        let outs = click_widget(&ctx, &mut st, &inp, "model-fold-details");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        click_widget(&ctx, &mut st, &inp, "model-fold-health");
+        assert_eq!(st.model_sections.encode(), "teach,details");
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &h2);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.model_sections.encode(), "teach,details");
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.model_sections, Sections::default(), "absent: Teach next and Health");
+        profile::apply(&mut fresh, "model_sections = \n");
+        assert_eq!(fresh.model_sections, Sections::all(false), "empty: every fold closed");
+    }
+
+    /// At 320 pt with every fold open the sections do not overlap and no text runs past the
+    /// panel's right edge (long text wraps; summaries are cut).
+    #[test]
+    fn a_narrow_panel_wraps_without_overlap() {
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let m = ModelStatus {
+            source: sim::ModelSource::Collection { slug: "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_accepted-0123456789ab".into(), samples: 1589, read_only: false },
+            collections: true,
+            suspects: vec![sim::SampleSuspect { id: sim::SampleId { index: 350, key: 1 }, formula: "H2".into(), origin: "pass perturbation".into(), loo_ratio: Some(5.08) }],
+            ..gappy()
+        };
+        assert_eq!(surface_chip(&m, &h2s), "Shared · LSDA · h 0.15 · pseudo");
+        let snap = est(&h2s, m, sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Model*])").unwrap());
+        st.model_sections = Sections::all(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 4000.0));
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let panel = probed_rect("model-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "the panel is about 320 pt wide: {panel:?}");
+        let order = ["model-verdict", "model-teach", "model-health", "model-fold-learned", "model-fold-suspects", "model-fold-details", "model-fold-file"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        // every text the panel draws ends inside it (nothing clipped at the right edge)
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 0.5) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 40, "{checked} texts checked");
     }
 }

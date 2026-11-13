@@ -1,103 +1,736 @@
-//! The Model tab (the estimated solver, spec §6; rows 10–45 of the mapping): the honesty line,
-//! the model's state per snapshot (who answered, uncertainty against its bound, trust, samples,
-//! epoch, fits, fallbacks, teacher gap, last audit, mismatch work), the warning slots, the
-//! sampling pass (progress, last pass, the long first-pass offer), the audit cadence, the
-//! sampling plan, Start / Sample more / Cancel, and the model file.
+//! The Model tab (the estimated solver, spec §6; rows 10–45 of the mapping; restructured
+//! 2026-11-14 from the user's approved mockup — the old one was "information overload and it hides
+//! all the helpful training stuff away below"). Top to bottom:
+//!
+//! 1. **The verdict card** ([`verdict`]): one headline — "Model answering · trusted here",
+//!    "Falling back to DFT here", "No model yet", "Model only · guessing here" … — derived from the
+//!    trust view, the strict policy's verdict here, draft / Model only and the step's source; one
+//!    short sentence naming the reason (an unlearned pair is named); the long explanation (the old
+//!    "trusted" and "strict here" paragraphs, the fit's own words) on the "why?" hover; the "N % DFT"
+//!    chip (fallbacks over the last 100 steps). Its second line is the surface chip ([`surface_chip`]:
+//!    "Shared · LSDA · h 0.15 · pseudo"; the old source line, provenance and folder key on hover)
+//!    and the sample count.
+//! 2. **Teach next** (open): what blocks or helps teaching — the refused autoload, the box advice,
+//!    "no model yet" with Retry, Teach around blockers, the running pass's progress, the first-pass
+//!    offer — then the environment keys not learned yet ([`gaps`]: the scene's first, the others
+//!    under "other gaps (n)"), or "Everything this scene needs is learned"; the preset, Sample more
+//!    with its cost, Cancel while a pass runs; the "Plan settings" fold; the audits line ("audits on
+//!    · every N steps" / "audits off (unsafe)") and the "Audits" fold (cadence, auto, draft mode).
+//! 3. **Health** (open): uncertainty against its bound, the last fit, the last audit — short.
+//! 4. Folds, closed: **Learned (k classes)**, **Worst-fitting samples** (spec 2026-11-12 R2),
+//!    **Details** (every readout row of the old grid, the provenance, the last pass, "What this
+//!    model is (and is not)") and **Model file** (the shared collection / a model file switch,
+//!    Import, Save a specialised model…, Save / Load / Forget model).
+//!
+//! Display-only restructuring: every control emits the `Action` it did before. Which folds are open
+//! is display state ([`Sections`], `UiState::model_sections`, the profile's `model_sections`), not
+//! recorded; a Ctrl K reveal unfolds the fold holding its anchor (it stays open).
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
 use super::super::sampling_presets as presets;
 use super::super::{
-    duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, source_tip,
+    duration_label, probe_rect, search, source_colour, source_label, theme, trust, Action, PanelInput, TrustKind, UiState, AMBER, GREEN, RED, source_tip,
 };
 use crate::scene::model_path;
 use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
-use egui::{Color32, RichText, Ui};
-use sim::SamplingPlan;
+use egui::{pos2, vec2, Color32, RichText, Sense, Shape, Stroke, Ui};
+use sim::{SamplingPlan, Source};
 
-pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    expire_arming(st);
-    ui.horizontal_wrapped(|ui| {
-        theme::note(ui, "estimated = a model fitted to this scene's DFT; valid only where it has been taught — it falls back to DFT when unsure");
-        theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
-    });
-    resume_row(ui, st, input, acts);
-    super::selection::segment_row(ui, st, input, "d-model-segment", acts);
+/// One of the tab's folds (`UiState::model_sections`). Teach next and Health start open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Teach,
+    /// "other gaps (n)" under Teach next: keys not learned whose species the scene does not hold.
+    Gaps,
+    /// "Plan settings" under Teach next: the sampling plan's fields.
+    Plan,
+    /// "Audits" under Teach next: the cadence, auto, draft mode.
+    Audits,
+    Health,
+    Learned,
+    Suspects,
+    Details,
+    File,
+}
+
+impl Section {
+    pub const ALL: [Section; 9] =
+        [Section::Teach, Section::Gaps, Section::Plan, Section::Audits, Section::Health, Section::Learned, Section::Suspects, Section::Details, Section::File];
+
+    /// Its word in the profile's `model_sections` line (its header's probe: `model-fold-<id>`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Section::Teach => "teach",
+            Section::Gaps => "gaps",
+            Section::Plan => "plan",
+            Section::Audits => "audits",
+            Section::Health => "health",
+            Section::Learned => "learned",
+            Section::Suspects => "suspects",
+            Section::Details => "details",
+            Section::File => "file",
+        }
+    }
+
+    /// A fold inside Teach next (a smaller header).
+    fn sub(self) -> bool {
+        matches!(self, Section::Gaps | Section::Plan | Section::Audits)
+    }
+
+    /// The search anchors its contents mark (`search::ENTRIES`): a reveal of one unfolds it.
+    pub fn anchors(self) -> &'static [&'static str] {
+        match self {
+            Section::Teach => &["d-teach", "d-sample", "d-plan", "d-audits", "d-draft"],
+            Section::Gaps => &[],
+            Section::Plan => &["d-plan"],
+            Section::Audits => &["d-audits", "d-draft"],
+            Section::Health => &["d-model-health"],
+            Section::Learned => &["d-model-learned"],
+            Section::Suspects => &["d-suspects"],
+            Section::Details => &["d-model-details", "d-model-about"],
+            Section::File => &["d-model-file", "d-model-source"],
+        }
+    }
+}
+
+/// Which folds are open (`UiState::model_sections`): Teach next and Health by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sections([bool; 9]);
+
+impl Default for Sections {
+    fn default() -> Self {
+        let mut s = Sections([false; 9]);
+        s.set(Section::Teach, true);
+        s.set(Section::Health, true);
+        s
+    }
+}
+
+impl Sections {
+    pub fn is_open(&self, s: Section) -> bool {
+        self.0[s as usize]
+    }
+
+    pub fn set(&mut self, s: Section, open: bool) {
+        self.0[s as usize] = open;
+    }
+
+    /// Every fold open (or none).
+    #[cfg(test)]
+    pub fn all(open: bool) -> Sections {
+        Sections([open; 9])
+    }
+
+    /// The profile's value: the open folds' ids, comma separated, in panel order.
+    pub fn encode(&self) -> String {
+        Section::ALL.into_iter().filter(|&s| self.is_open(s)).map(Section::id).collect::<Vec<_>>().join(",")
+    }
+
+    /// The profile's value read back: the ids named are open, the rest closed; unknown words are
+    /// dropped, case and spaces ignored.
+    pub fn parse(v: &str) -> Sections {
+        let mut s = Sections([false; 9]);
+        for w in v.split(',').map(str::trim) {
+            if let Some(x) = Section::ALL.into_iter().find(|x| x.id().eq_ignore_ascii_case(w)) {
+                s.set(x, true);
+            }
+        }
+        s
+    }
+}
+
+/// The verdict card's tone: its border and light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    /// The model answers here.
+    Good,
+    /// Not answering here (or answering unchecked): the warning colour.
+    Warn,
+    /// Nothing to judge yet (no model, a pass running, another solver).
+    Neutral,
+}
+
+impl Tone {
+    fn colour(self) -> Color32 {
+        match self {
+            Tone::Good => GREEN,
+            Tone::Warn => AMBER,
+            Tone::Neutral => theme::INK_DIM,
+        }
+    }
+}
+
+/// The verdict card's words ([`verdict`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Verdict {
+    pub tone: Tone,
+    /// One line: "Model answering · trusted here", "Falling back to DFT here" …
+    pub headline: String,
+    /// One short plain sentence naming the reason.
+    pub reason: String,
+    /// The long explanation (the "why?" hover): the old trusted / strict-here paragraphs.
+    pub tip: String,
+}
+
+/// The verdict at the current geometry, from the trust view (`ui::trust`), the strict policy's
+/// verdict here (`ModelStatus::readiness`), draft mode / Model only and the step's source.
+pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
+    let v = |tone, headline: &str, reason: &str, tip: String| Verdict { tone, headline: headline.to_string(), reason: reason.to_string(), tip };
     if st.backend != Backend::Estimated {
-        theme::note(ui, "The estimated solver is not running: pick Estimated in the toolbar's Solver group. Its model, sampling pass and audits show here.");
-        return;
+        return v(Tone::Neutral, "Estimated solver off", "Pick Estimated in the toolbar's Solver group: its model, sampling pass and audits show here.", String::new());
     }
-    let snap = input.snapshot.filter(|s| s.backend == Backend::Estimated);
-    let d = snap.map(|s| &s.dynamics);
-    let m: Option<&ModelStatus> = input.model();
-    let sampling = input.sampling();
+    let m = input.model();
+    let d = input.snapshot.filter(|s| s.backend == Backend::Estimated).map(|s| &s.dynamics);
+    if input.sampling() {
+        let tip = d.and_then(|d| d.sampling.as_ref()).map_or(String::new(), |p| {
+            format!("{} — {}/{}, skipped {}, failed {}. The dynamics are paused; edits are allowed.", crate::ui::activity::words::pass_stage(p), p.done, p.total, p.skipped, p.failed)
+        });
+        return v(Tone::Neutral, "Sampling pass running", "DFT is teaching the model; it refits when the pass ends.", tip);
+    }
+    let Some(m) = m.filter(|m| m.fitted) else {
+        let (reason, tip) = match m.and_then(|m| m.no_model.as_deref()) {
+            Some(why) => ("Samples are held but no fit formed yet: see Teach next.", why.to_string()),
+            None if input.scene.nuclei.is_empty() => ("Place atoms, then Start sampling below.", String::new()),
+            None => ("Every step is DFT until a sampling pass fits one: Start sampling below.", ABOUT_UNTRUSTED.to_string()),
+        };
+        return v(Tone::Neutral, "No model yet", reason, tip);
+    };
+    if let Some(why) = &m.provenance_mismatch {
+        return v(
+            Tone::Warn,
+            "Falling back to DFT · other settings",
+            "This model was taught at other settings: restore them, or forget it and sample this scene.",
+            format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"),
+        );
+    }
+    let t = trust(Some(m), input.scene, st);
+    let tip = [Some(t.text.clone()), t.tip.map(str::to_string), t.detail.clone().map(|d| format!("the fit's own words: {d}")), m.readiness.as_ref().map(|r| format!("strict mode here: {}", if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) }))]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
-    super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, &scene_z, acts));
-    super::group(ui, st, "d-model", |ui, st| {
-        if let (Some(d), Some(m)) = (d, m) {
-            readouts(ui, d, m, input.scene, st, acts);
-        }
-    });
-    if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
-        warnbox(ui, &super::super::box_advice(input.scene, st));
+    let here: Vec<Gap> = gaps(m, &scene_z).into_iter().filter(|g| g.in_scene).collect();
+    let refuses = m.readiness.as_ref().is_some_and(|r| !r.answers);
+    if st.draft {
+        let name = if st.model_only.is_some() { "Model only" } else { "Draft mode" };
+        let unchecked = st.audit_every == 0;
+        let tail = if unchecked { " and nothing checks it (audits off)" } else { "" };
+        return if refuses {
+            let what = if here.is_empty() { String::new() } else { format!(": {} not learned yet", gap_list(&here)) };
+            Verdict { tone: Tone::Warn, headline: format!("{name} · guessing here"), reason: format!("Strict mode would refuse here{what}; the model answers anyway{tail}."), tip }
+        } else {
+            let reason = if unchecked { "Strict mode would answer here too, but audits are off: nothing checks the model." } else { "Strict mode would answer here too; elsewhere draft mode guesses." };
+            Verdict { tone: Tone::Warn, headline: format!("{name} · model answering"), reason: reason.into(), tip }
+        };
     }
-    if let Some(m) = m {
-        no_model_row(ui, m, sampling, acts);
-        teach_row(ui, m, sampling, acts);
+    if d.map(|d| d.source) == Some(Source::Reference) {
+        return v(Tone::Good, "Atom references answering", "No atom has a neighbour within the model's cutoff: the isolated-atom references answer.", source_tip(Source::Reference).to_string());
     }
-    // spec 2026-11-12 R2: the fit's worst-fitting samples, each with Forget; the forgotten ones
-    // with Restore
-    let r = egui::CollapsingHeader::new("Worst-fitting samples")
-        .id_salt("suspects")
-        .default_open(false)
-        .open(search::opens(st, "d-suspects"))
-        .show(ui, |ui| suspects(ui, m, acts));
-    search::mark(ui, st, "d-suspects", r.header_response.rect);
-    if let Some(m) = m {
-        // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
-        // set recorded with it — recorded, never compared (ruling P2)
-        if let Some(p) = &m.provenance {
-            theme::note(ui, format!("taught at {p}"))
-                .on_hover_text("the settings a model is valid at (grid, h, σ, charge, multiplicity, teacher and its tolerance — a scene at others falls back to DFT), and the isotopes its samples were taken with: recorded, not compared, because the Born-Oppenheimer surface does not depend on the nuclear masses");
+    match t.kind {
+        TrustKind::Untrusted => {
+            let reason = if crate::sim::box_blocks_trust(m).is_some() {
+                "Box-affected samples keep the model untrusted: a bigger cell is the cure (see Teach next).".to_string()
+            } else {
+                sentence(t.text.strip_prefix("no — ").unwrap_or(&t.text))
+            };
+            Verdict { tone: Tone::Warn, headline: "Falling back to DFT · model untrusted".into(), reason, tip }
         }
-        if let Some(why) = &m.provenance_mismatch {
-            warnbox(ui, &format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"));
+        TrustKind::Stuck => v(Tone::Warn, "Falling back to DFT here", "Trusted, but it has not answered at this geometry for a while.", tip),
+        TrustKind::NotHere | TrustKind::ClassUntrusted => {
+            let reason = if !here.is_empty() {
+                format!("This scene has {} the model hasn't learned yet. Everything else here is trusted.", gap_list(&here))
+            } else if m.readiness.as_ref().is_some_and(|r| r.unlearned.is_some()) {
+                "This scene's own samples are not in the fit yet: Sample more here.".to_string()
+            } else {
+                "Strict mode refuses at this geometry: move on, or Sample more here.".to_string()
+            };
+            Verdict { tone: Tone::Warn, headline: "Falling back to DFT here".into(), reason, tip }
         }
-        if let Some(r) = &m.autoload_refused {
-            warnbox(ui, &format!("this session's model was not restored: {r}"));
-            if ui.button(RichText::new("Forget it and sample this scene").color(AMBER)).clicked() {
-                acts.push(Action::SampleAfterRefusal);
+        TrustKind::NoModel => v(Tone::Neutral, "No model yet", "Every step is DFT until a sampling pass fits one.", tip),
+        TrustKind::Trusted | TrustKind::Quarantined => {
+            let held = if m.quarantined > 0 { format!(" {} samples are held out of the fit.", m.quarantined) } else { String::new() };
+            match d.map(|d| d.source) {
+                Some(Source::Fallback | Source::Dft) => Verdict {
+                    tone: Tone::Neutral,
+                    headline: "Trusted here · this step DFT".into(),
+                    reason: format!("The model was unsure at this geometry, or an audit ran: the DFT answer becomes a sample.{held}"),
+                    tip,
+                },
+                _ => Verdict { tone: Tone::Good, headline: "Model answering · trusted here".into(), reason: format!("Everything this scene needs is learned.{held}"), tip },
             }
         }
     }
-    // the sampling pass
-    if let Some(p) = d.and_then(|d| d.sampling.as_ref()) {
-        if sampling {
-            progress(ui, p, m);
-        } else {
-            theme::note(
-                ui,
-                format!(
-                    "last pass {}: {}/{} jobs, skipped {}, failed {}",
-                    if p.cancelled { "cancelled" } else { "finished" },
-                    p.done,
-                    p.total,
-                    p.skipped,
-                    p.failed
-                ),
-            );
+}
+
+/// The untrusted model's rule, for the "no model yet" verdict's hover.
+const ABOUT_UNTRUSTED: &str = "An untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust.";
+
+/// `text` as a sentence: its first letter capitalised, a full stop at the end.
+fn sentence(text: &str) -> String {
+    let mut c = text.chars();
+    let mut s = match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+        None => String::new(),
+    };
+    if !s.ends_with('.') {
+        s.push('.');
+    }
+    s
+}
+
+/// One environment key not learned yet (Teach next): its short label ("pair O–S", "many-body H with
+/// H, S"), its progress (`have` of `need`, for a sample or evidence floor), the short words on the
+/// row's right, the full verdict line on hover, and whether the scene holds every species it names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gap {
+    pub label: String,
+    /// Words for the verdict sentence: "O–S pairs", "H with H, S (many-body)".
+    pub phrase: String,
+    pub have: usize,
+    pub need: usize,
+    /// "12 / 60", or a short fit-error word ("fit 2.5×") when the floor is met.
+    pub right: String,
+    pub words: String,
+    pub in_scene: bool,
+}
+
+/// "pair O–S" / "many-body H with H, S" (symbols only: Z is a key).
+pub fn gap_label(class: &str, z: u8, neighbours: &[u8]) -> String {
+    let sym = |z: u8| units::elements::symbol(z).to_string();
+    let nb: Vec<String> = neighbours.iter().map(|&z| sym(z)).collect();
+    match (class, nb.len()) {
+        ("pair", 1) => format!("pair {}–{}", sym(z), nb[0]),
+        (_, 0) => format!("{class} {}", sym(z)),
+        _ => format!("{class} {} with {}", sym(z), nb.join(", ")),
+    }
+}
+
+fn gap_phrase(class: &str, z: u8, neighbours: &[u8]) -> String {
+    let sym = |z: u8| units::elements::symbol(z).to_string();
+    let nb: Vec<String> = neighbours.iter().map(|&z| sym(z)).collect();
+    match (class, nb.len()) {
+        ("pair", 1) => format!("{}–{} pairs", sym(z), nb[0]),
+        (_, 0) => format!("lone {}", sym(z)),
+        _ => format!("{} with {} ({class})", sym(z), nb.join(", ")),
+    }
+}
+
+/// "O–S pairs", "O–S pairs and H with H, S (many-body)", "a, b and c".
+fn gap_list(g: &[Gap]) -> String {
+    let p: Vec<&str> = g.iter().map(|g| g.phrase.as_str()).collect();
+    match p.len() {
+        0 => String::new(),
+        1 => p[0].to_string(),
+        n => format!("{} and {}", p[..n - 1].join(", "), p[n - 1]),
+    }
+}
+
+/// The progress and the short words of a refusal: `(have, need, right)`.
+fn refusal_words(refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> (usize, usize, String) {
+    use sim::ClassKey as K;
+    match refusal {
+        Some((K::Samples, n, q)) => (n as usize, q as usize, format!("{n:.0} / {q:.0}")),
+        Some((K::Window, n, w)) => (n as usize, w as usize, format!("{n:.0} / {w:.0} checks")),
+        Some((K::Force, x, _)) => (samples, columns, format!("fit {x:.1}×")),
+        Some((K::Energy, x, _)) => (samples, columns, format!("energy {x:.1}×")),
+        Some((K::WorstAtom, x, _)) => (samples, columns, format!("DFT check {x:.1}×")),
+        Some((K::Calibrated, x, _)) => (samples, columns, format!("DFT checks {x:.2}×")),
+        Some((K::LooFloor, x, _)) => (samples, columns, format!("left-out {x:.2}×")),
+        Some((K::MeasuredEnergy, x, _)) => (samples, columns, format!("DFT energy {x:.2}×")),
+        None => (samples, columns, format!("{samples} / {columns}")),
+    }
+}
+
+/// The environment keys not learned yet (`ModelStatus::class_loo`, per key; a class with no keys
+/// counts as one), those whose species the scene all holds first — each group in the order the
+/// model lists them.
+pub fn gaps(m: &ModelStatus, scene_z: &[u8]) -> Vec<Gap> {
+    let mut out = Vec::new();
+    for c in &m.class_loo {
+        if c.species.is_empty() {
+            if !c.trusted {
+                let (have, need, right) = refusal_words(c.refusal, c.samples, c.samples);
+                out.push(Gap { label: c.class.to_string(), phrase: format!("{} environments", c.class), have, need, right, words: crate::ui::activity::words::class_line(c), in_scene: true });
+            }
+            continue;
+        }
+        for s in c.species.iter().filter(|s| !s.trusted) {
+            let (have, need, right) = refusal_words(s.refusal, s.samples, s.columns);
+            let in_scene = std::iter::once(&s.z).chain(&s.neighbours).all(|z| scene_z.contains(z));
+            out.push(Gap {
+                label: gap_label(c.class, s.z, &s.neighbours),
+                phrase: gap_phrase(c.class, s.z, &s.neighbours),
+                have,
+                need,
+                right,
+                words: crate::ui::activity::words::species_line(c.class, s),
+                in_scene,
+            });
         }
     }
-    if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
-        offer(ui, o, acts);
-        lone_note(ui, input, "lone-note-offer");
+    out.sort_by_key(|g| !g.in_scene);
+    out
+}
+
+/// The learned environment keys (the Learned fold): (label, samples, the full verdict line).
+fn learned(m: &ModelStatus) -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    for c in &m.class_loo {
+        if c.species.is_empty() {
+            if c.trusted {
+                out.push((c.class.to_string(), c.samples, class_line(c)));
+            }
+            continue;
+        }
+        for s in c.species.iter().filter(|s| s.trusted) {
+            out.push((gap_label(c.class, s.z, &s.neighbours), s.samples, species_line(c.class, s).trim().to_string()));
+        }
     }
+    out
+}
+
+/// The surface chip's words: "Shared · LSDA · h 0.15 · pseudo" — where the model comes from (the
+/// shared collection, a model file, this scene or session only), the functional, h, and the ionic
+/// potential (none / cores / pseudo). A shared collection's from its folder key
+/// (`surrogate::SurfaceKey::slug`), else the scene's (a model taught elsewhere says so in the
+/// verdict).
+pub fn surface_chip(m: &ModelStatus, scene: &crate::scene::Scene) -> String {
+    let ionic_word = |w: &str| match w {
+        "none" => "none",
+        "cores" => "cores",
+        _ => "pseudo",
+    };
+    let from_scene = || {
+        let w = match scene.ionic {
+            sim::IonicPolicy::None => "none",
+            sim::IonicPolicy::CoresOnly => "cores",
+            _ => "pseudo",
+        };
+        ("LSDA".to_string(), format!("{}", scene.grid_h), w.to_string())
+    };
+    let (who, (f, h, ionic)) = match &m.source {
+        sim::ModelSource::Collection { slug, read_only, .. } => {
+            let parts: Vec<&str> = slug.split('_').collect();
+            let parsed = (parts.len() >= 6).then(|| {
+                let h = parts[1].strip_prefix('h').unwrap_or(parts[1]).to_string();
+                let ionic = parts[parts.len() - 1].split('-').next().unwrap_or("none");
+                (parts[0].to_uppercase(), h, ionic_word(ionic).to_string())
+            });
+            (if *read_only { "Shared (read-only)" } else { "Shared" }, parsed.unwrap_or_else(from_scene))
+        }
+        sim::ModelSource::File(_) => ("Model file", from_scene()),
+        sim::ModelSource::None if m.collections => ("This scene", from_scene()),
+        sim::ModelSource::None => ("This session", from_scene()),
+    };
+    format!("{who} · {f} · h {h} · {ionic}")
+}
+
+pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    expire_arming(st);
+    // the visible part of the panel (the tests' width checks)
+    probe_rect("model-panel", ui.clip_rect());
+    // a Ctrl K reveal unfolds the folds holding its anchor until it has scrolled into view; they stay open
+    if let Some(a) = st.search.unrevealed() {
+        for s in Section::ALL.into_iter().filter(|s| s.anchors().contains(&a)) {
+            st.model_sections.set(s, true);
+        }
+    }
+    resume_row(ui, st, input, acts);
+    super::selection::segment_row(ui, st, input, "d-model-segment", acts);
+    let m: Option<&ModelStatus> = input.model();
+    let snap = input.snapshot.filter(|s| s.backend == Backend::Estimated);
+    let d = snap.map(|s| &s.dynamics);
+    super::group(ui, st, "d-model", |ui, st| verdict_card(ui, st, input, m, d, acts));
+    if st.backend != Backend::Estimated {
+        return;
+    }
+    let sampling = input.sampling();
+    ui.add_space(2.0);
+    // 2. Teach next
+    let gs = m.map(|m| gaps(m, &input.scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>())).unwrap_or_default();
+    let fitted = m.is_some_and(|m| m.fitted);
+    let teach_summary = if !fitted {
+        None
+    } else if gs.iter().any(|g| g.in_scene) {
+        let n = gs.iter().filter(|g| g.in_scene).count();
+        Some((format!("{n} to learn here"), AMBER))
+    } else {
+        Some(("all learned here".to_string(), GREEN))
+    };
+    fold(ui, st, Section::Teach, "Teach next", teach_summary, Some("model-teach"), |ui, st| teach(ui, st, input, m, d, &gs, sampling, acts));
+    // 3. Health
+    let health_summary = d.and_then(|d| d.uncertainty).zip(m).map(|(u, m)| if u <= m.force_bound { ("within bound".to_string(), GREEN) } else { ("above bound".to_string(), AMBER) });
+    fold(ui, st, Section::Health, "Health", health_summary, Some("model-health"), |ui, st| {
+        super::group(ui, st, "d-model-health", |ui, _| health(ui, m, d));
+    });
+    // 4. the folds
+    let learned_rows = m.map(learned).unwrap_or_default();
+    let learned_summary = (!learned_rows.is_empty()).then(|| (format!("✓ {} learned", learned_rows.len()), GREEN));
+    let title = format!("Learned ({} {})", learned_rows.len(), if learned_rows.len() == 1 { "class" } else { "classes" });
+    fold(ui, st, Section::Learned, &title, learned_summary, None, |ui, st| {
+        super::group(ui, st, "d-model-learned", |ui, _| learned_fold(ui, &learned_rows));
+    });
+    let worst = m.and_then(|m| m.suspects.first()).map(|s| {
+        let r = s.loo_ratio.map_or("not in the fit".to_string(), |r| format!("{}×", ratio_words(r)));
+        (format!("#{} {} {r}", s.id.index, s.formula), if s.loo_ratio.is_some_and(|r| !(r <= 1.0)) { AMBER } else { theme::INK_DIM })
+    });
+    // spec 2026-11-12 R2: the fit's worst-fitting samples, each with Forget; the forgotten ones with Restore
+    fold(ui, st, Section::Suspects, "Worst-fitting samples", worst, None, |ui, st| {
+        super::group(ui, st, "d-suspects", |ui, _| suspects(ui, m, acts));
+    });
+    let details_summary = m.map(|m| (format!("epoch {} · {} samples", m.epoch, m.samples), theme::INK_DIM));
+    fold(ui, st, Section::Details, "Details", details_summary, None, |ui, st| details(ui, st, input, m, d, sampling));
+    let file_summary = m.map(|m| {
+        let w = match &m.source {
+            sim::ModelSource::Collection { read_only: true, .. } => "shared · read-only".to_string(),
+            sim::ModelSource::Collection { .. } => "shared".to_string(),
+            sim::ModelSource::File(p) => source_line_with(m, st.model_file.as_deref()).strip_prefix("file: ").map_or_else(|| p.display().to_string(), str::to_string),
+            sim::ModelSource::None => "not saved".to_string(),
+        };
+        (w, theme::INK_DIM)
+    });
+    fold(ui, st, Section::File, "Model file", file_summary, None, |ui, st| {
+        let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+        super::group(ui, st, "d-model-source", |ui, st| source_row(ui, st, m, sampling, &scene_z, acts));
+        super::group(ui, st, "d-model-file", |ui, st| {
+            model_file_buttons(ui, st, input, acts);
+            ui.label(RichText::new(model_path(&st.scene_path).display().to_string()).monospace().size(11.0).color(theme::INK_DIM));
+        });
+    });
+}
+
+/// A fold's header row (the View panel's: a caret, its title; a click folds or unfolds it) with a
+/// one-line summary on its right, cut with "…" when the panel is narrow. Returns whether it is open.
+fn header(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<(String, Color32)>) -> bool {
+    let (h, size) = if s.sub() { (22.0, 12.5) } else { (26.0, 13.5) };
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    probe_rect(&format!("model-fold-{}", s.id()), rect);
+    if r.clicked() {
+        let open = st.model_sections.is_open(s);
+        st.model_sections.set(s, !open);
+    }
+    let open = st.model_sections.is_open(s);
+    let p = ui.painter();
+    if r.hovered() {
+        p.rect_filled(rect, 5.0, theme::PANEL_2);
+    }
+    let ink = if r.hovered() { theme::INK } else { theme::INK_DIM };
+    let c = pos2(rect.left() + 10.0, rect.center().y);
+    let tri = if open { vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)] };
+    p.add(Shape::convex_polygon(tri, ink, Stroke::NONE));
+    let title_ink = if s.sub() { theme::INK_DIM } else { theme::INK };
+    let g = p.layout_no_wrap(title.to_string(), egui::FontId::proportional(size), title_ink);
+    let tw = g.size().x;
+    p.galley(pos2(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, title_ink);
+    if let Some((text, colour)) = summary {
+        let room = rect.right() - 6.0 - (rect.left() + 22.0 + tw + 12.0);
+        if room > 24.0 {
+            let mut job = egui::text::LayoutJob::single_section(text, egui::TextFormat { font_id: egui::FontId::proportional(11.5), color: colour, ..Default::default() });
+            job.wrap = egui::text::TextWrapping { max_width: room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = p.layout_job(job);
+            p.galley(pos2(rect.right() - 6.0 - g.size().x, rect.center().y - g.size().y / 2.0), g, colour);
+        }
+    }
+    r.on_hover_text(if open { "fold this section" } else { "unfold this section" });
+    open
+}
+
+/// A fold: its header and, while open, its body (indented); `probe` records the whole fold's rect.
+fn fold(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<(String, Color32)>, probe: Option<&str>, body: impl FnOnce(&mut Ui, &mut UiState)) {
+    let r = ui.scope(|ui| {
+        if header(ui, st, s, title, summary) {
+            ui.indent(("model-fold", s.id()), |ui| body(ui, st));
+            ui.add_space(4.0);
+        }
+    });
+    if let Some(p) = probe {
+        probe_rect(p, r.response.rect);
+    }
+}
+
+/// A small rounded chip (the surface chip, the "N % DFT" chip).
+fn chip(ui: &mut Ui, text: &str, colour: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(colour.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0, colour.gamma_multiply(0.6)))
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(7, 1))
+        .show(ui, |ui| ui.add(egui::Label::new(RichText::new(text).size(11.0).color(colour)).wrap()))
+        .response
+}
+
+/// The text's width at a chip's font, with the chip's margins.
+fn chip_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), theme::INK).size().x + 16.0
+}
+
+/// 1. The verdict card ([`verdict`]): the headline with its light and the "N % DFT" chip, the reason
+/// with "why?" (the long explanation on hover), the residual check's Forget, the surface chip and the
+/// sample count.
+fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>, acts: &mut Vec<Action>) {
+    let v = verdict(st, input);
+    let c = v.tone.colour();
+    let (fill, stroke) = match v.tone {
+        Tone::Neutral => (theme::PANEL_2, theme::LINE),
+        _ => (c.gamma_multiply(0.06), c.gamma_multiply(0.55)),
+    };
+    let r = egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, stroke)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let pct = d.filter(|_| st.backend == Backend::Estimated && m.is_some()).map(|d| format!("{:.0} % DFT", 100.0 * d.fallback_fraction_100));
+        ui.horizontal_top(|ui| {
+            theme::light(ui, c);
+            let cw = pct.as_deref().map_or(0.0, |p| chip_width(ui, p) + ui.spacing().item_spacing.x);
+            let w = (ui.available_width() - cw).max(80.0);
+            ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(w);
+                super::super::probed("model-headline", ui.add(egui::Label::new(RichText::new(&v.headline).strong().size(13.5).color(theme::INK)).wrap()));
+            });
+            if let (Some(p), Some(d)) = (&pct, d) {
+                let pc = if d.fallback_fraction_100 > 0.0 { AMBER } else { theme::INK_DIM };
+                super::super::probed("model-dft-chip", chip(ui, p, pc)).on_hover_text("fallbacks over the last 100 steps: the share of steps DFT answered");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(RichText::new(&v.reason).size(12.0).color(theme::INK_DIM)).wrap());
+            if !v.tip.is_empty() {
+                super::super::probed("model-why", ui.label(RichText::new("why?").size(11.5).underline().color(theme::ACCENT_INK))).on_hover_text(&v.tip);
+            }
+        });
+        // the failed residual check's worst sample, with the Worst-fitting rows' Forget
+        if let Some(id) = m.filter(|m| m.fitted).and_then(|m| trust(Some(m), input.scene, st).forget) {
+            if super::super::probed(&format!("model-trust-forget-{}", id.index), ui.small_button(format!("Forget #{}", id.index)))
+                .on_hover_text(crate::ui::activity::trust::FORGET_WORST_TIP)
+                .clicked()
+            {
+                acts.push(Action::ForgetSample(id));
+            }
+        }
+        if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
+            let words = surface_chip(m, input.scene);
+            let read_only = matches!(m.source, sim::ModelSource::Collection { read_only: true, .. });
+            let samples = format!("{} samples", m.samples);
+            let mut tip = format!("{}\n\n{SOURCE_LINE_TIP}", source_line_with(m, st.model_file.as_deref()));
+            if let Some(p) = &m.provenance {
+                tip += &format!("\n\ntaught at {p}");
+            }
+            let fits = chip_width(ui, &words) + 70.0 < ui.available_width();
+            let draw = |ui: &mut Ui| {
+                super::super::probed("model-source", chip(ui, &words, if read_only { AMBER } else { theme::INK_DIM })).on_hover_text(&tip);
+            };
+            if fits {
+                ui.horizontal(|ui| {
+                    draw(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(&samples).size(11.5).color(theme::INK_DIM)));
+                });
+            } else {
+                draw(ui);
+                ui.label(RichText::new(&samples).size(11.5).color(theme::INK_DIM));
+            }
+        }
+    });
+    probe_rect("model-verdict", r.response.rect);
+}
+
+/// One gap row: its label (wrapping), a small progress bar of `have` / `need` and the short words.
+fn gap_row(ui: &mut Ui, g: &Gap) {
+    ui.horizontal_top(|ui| {
+        let rw = ui.painter().layout_no_wrap(g.right.clone(), egui::FontId::monospace(11.0), theme::INK).size().x;
+        let bar = 52.0;
+        let w = (ui.available_width() - bar - rw - 2.0 * ui.spacing().item_spacing.x).max(60.0);
+        let r = ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(w);
+            ui.add(egui::Label::new(RichText::new(&g.label).size(12.0).color(theme::INK)).wrap())
+        });
+        r.inner.on_hover_text(&g.words);
+        let (rect, _) = ui.allocate_exact_size(vec2(bar, 14.0), Sense::hover());
+        let track = egui::Rect::from_center_size(rect.center(), vec2(bar, 5.0));
+        ui.painter().rect_filled(track, 2.5, theme::PANEL_3);
+        let f = if g.need > 0 { (g.have as f32 / g.need as f32).clamp(0.0, 1.0) } else { 1.0 };
+        let mut fill = track;
+        fill.set_width(track.width() * f);
+        ui.painter().rect_filled(fill, 2.5, AMBER);
+        ui.label(RichText::new(&g.right).monospace().size(11.0).color(theme::INK_DIM)).on_hover_text(&g.words);
+    });
+}
+
+/// 2. Teach next: what blocks teaching and its fixes, the keys not learned yet, the sampling
+/// controls (preset, Sample more, the cost, Cancel while a pass runs), the plan's fold, the audits
+/// line and its fold.
+#[allow(clippy::too_many_arguments)]
+fn teach(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>, gs: &[Gap], sampling: bool, acts: &mut Vec<Action>) {
+    super::group(ui, st, "d-teach", |ui, st| {
+        if let Some(m) = m {
+            if let Some(r) = &m.autoload_refused {
+                warnbox(ui, &format!("this session's model was not restored: {r}"));
+                if ui.button(RichText::new("Forget it and sample this scene").color(AMBER)).clicked() {
+                    acts.push(Action::SampleAfterRefusal);
+                }
+            }
+            if crate::sim::box_blocks_trust(m).is_some() {
+                warnbox(ui, &super::super::box_advice(input.scene, st));
+            }
+            no_model_row(ui, m, sampling, acts);
+            teach_row(ui, m, sampling, acts);
+        }
+        if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| sampling) {
+            progress(ui, p, m);
+        }
+        if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
+            offer(ui, o, acts);
+            lone_note(ui, input, "lone-note-offer");
+        }
+        if m.is_some_and(|m| m.fitted) {
+            let (here, other): (Vec<&Gap>, Vec<&Gap>) = gs.iter().partition(|g| g.in_scene);
+            if here.is_empty() {
+                super::super::probed("model-all-learned", ui.label(RichText::new("✓ Everything this scene needs is learned").size(12.0).color(GREEN)));
+            }
+            for g in &here {
+                gap_row(ui, g);
+            }
+            if !other.is_empty() {
+                let title = format!("other gaps ({})", other.len());
+                fold(ui, st, Section::Gaps, &title, None, None, |ui, _| {
+                    for g in &other {
+                        gap_row(ui, g);
+                    }
+                });
+            }
+        }
+    });
+    ui.add_space(2.0);
+    super::group(ui, st, "d-plan", |ui, st| preset_row(ui, &mut st.plan));
+    super::group(ui, st, "d-sample", |ui, st| sample_row(ui, st, input, acts));
+    super::group(ui, st, "d-plan", |ui, st| {
+        fold(ui, st, Section::Plan, "Plan settings", None, None, |ui, st| {
+            if let Some(i) = presets::matching(&st.plan) {
+                theme::note(ui, presets::PRESETS[i].description);
+            }
+            let tu = st.temp_units;
+            plan_fields(ui, &mut st.plan, tu);
+        });
+    });
     super::group(ui, st, "d-audits", |ui, st| {
-        theme::section(ui, "Audits");
-        // an on/off switch beside the cadence (user request 2026-10-18), with why they matter
+        audits_line(ui, st, m, acts);
+        fold(ui, st, Section::Audits, "Audits", None, None, |ui, st| {
+            audit_controls(ui, st, acts);
+            // Q1 of Appendix B (M5b): draft mode, also in Physics ▸ Estimated solver
+            super::group(ui, st, "d-draft", |ui, st| {
+                theme::section(ui, "Draft mode");
+                super::super::menus::draft_control(ui, st, acts);
+            });
+        });
+    });
+}
+
+/// The audits in one line: "audits on · every N steps" (the switch, with why they matter on hover),
+/// or the unsafe "audits off (unsafe)" whose switch turns them back on (the last cadence restored).
+fn audits_line(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
+    ui.horizontal_wrapped(|ui| {
         let mut on = st.audit_every > 0;
-        if super::super::probed("audits-on", ui.checkbox(&mut on, "audits on"))
-            .on_hover_text(AUDIT_WHY)
-            .changed()
-        {
+        let text = if on { RichText::new("audits on") } else { RichText::new("audits off (unsafe)").color(AMBER) };
+        // an on/off switch (user request 2026-10-18), with why they matter
+        let r = super::super::probed("audits-on", ui.checkbox(&mut on, text)).on_hover_text(if st.audit_every > 0 { AUDIT_WHY } else { AUDIT_OFF_NOTE });
+        if r.changed() {
             if on {
                 acts.push(Action::SetAudit(st.audit_every_on.max(1)));
             } else {
@@ -105,67 +738,182 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 acts.push(Action::SetAudit(0));
             }
         }
-        ui.horizontal(|ui| {
-            ui.label("DFT audit every");
-            let mut n = st.audit_every;
-            if ui
-                .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
-                .on_hover_text("every n-th step the model answers, the DFT teacher checks it at that geometry and the gap is recorded (a failed audit untrusts the model until a refit). 2000 by default. With a GPU teacher the audit runs on a second teacher in the background while the model keeps stepping (ruling S14), so the cadence costs no speed: the check simply arrives a few hundred steps later. With the CPU teacher it runs in the step and sets the speed. 0 = never (unsafe: nothing checks the model while it answers).")
-                .changed()
-            {
-                acts.push(Action::SetAudit(n));
-            }
-            ui.label("answered steps");
-            super::super::probed("audit-auto", ui.checkbox(&mut st.audit_auto, "auto"))
-                .on_hover_text(format!(
-                    "set the cadence from the play speed so an audit comes about every {:.0} s of wall time at any speed (e.g. ≈ 15 fs/s at dt 0.25 fs → every ≈ 600 steps, raised to the floor; ≈ 4000 fs/s → every ≈ 160 000). Faster play checks a smaller share of steps but keeps the same steady load on the GPU; the cadence stays between {} and {} steps",
-                    super::super::AUTO_AUDIT_WALL_S, super::super::AUTO_AUDIT_MIN, super::super::AUTO_AUDIT_MAX
-                ));
-            // what the worker runs (after a panic recovery it re-applies this value)
-            if let Some(m) = m.filter(|m| m.audit_every != st.audit_every) {
-                ui.colored_label(AMBER, format!("(solver: {})", m.audit_every));
-            }
-        });
-        if st.audit_every == 0 {
-            ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
-            ui.label(RichText::new(AUDIT_OFF_NOTE).size(11.0).color(theme::INK_DIM));
+        if st.audit_every > 0 {
+            ui.label(RichText::new(format!("· every {} steps{}", st.audit_every, if st.audit_auto { " (auto)" } else { "" })).size(12.0).color(theme::INK_DIM));
+        }
+        // what the worker runs (after a panic recovery it re-applies this value)
+        if let Some(m) = m.filter(|m| m.audit_every != st.audit_every) {
+            ui.colored_label(AMBER, format!("(solver: {})", m.audit_every));
         }
     });
-    let fitted = m.is_some_and(|m| m.fitted);
-    let r = egui::CollapsingHeader::new("Sampling plan")
-        .id_salt("sampling-plan")
-        .default_open(!fitted)
-        .open(search::opens(st, "d-plan"))
-        .show(ui, |ui| {
-            let tu = st.temp_units;
-            plan_fields(ui, &mut st.plan, tu)
+}
+
+/// The Audits fold: the cadence ("DFT audit every n answered steps") and auto; while off, the
+/// unsafe note.
+fn audit_controls(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("DFT audit every");
+        let mut n = st.audit_every;
+        if ui
+            .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
+            .on_hover_text("every n-th step the model answers, the DFT teacher checks it at that geometry and the gap is recorded (a failed audit untrusts the model until a refit). 2000 by default. With a GPU teacher the audit runs on a second teacher in the background while the model keeps stepping (ruling S14), so the cadence costs no speed: the check simply arrives a few hundred steps later. With the CPU teacher it runs in the step and sets the speed. 0 = never (unsafe: nothing checks the model while it answers).")
+            .changed()
+        {
+            acts.push(Action::SetAudit(n));
+        }
+        ui.label("answered steps");
+        super::super::probed("audit-auto", ui.checkbox(&mut st.audit_auto, "auto")).on_hover_text(format!(
+            "set the cadence from the play speed so an audit comes about every {:.0} s of wall time at any speed (e.g. ≈ 15 fs/s at dt 0.25 fs → every ≈ 600 steps, raised to the floor; ≈ 4000 fs/s → every ≈ 160 000). Faster play checks a smaller share of steps but keeps the same steady load on the GPU; the cadence stays between {} and {} steps",
+            super::super::AUTO_AUDIT_WALL_S, super::super::AUTO_AUDIT_MIN, super::super::AUTO_AUDIT_MAX
+        ));
+    });
+    if st.audit_every == 0 {
+        ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
+        ui.label(RichText::new(AUDIT_OFF_NOTE).size(11.0).color(theme::INK_DIM));
+    }
+}
+
+/// A label / value row of Health and Details: the label in a fixed dim column, the value wrapping
+/// in the rest of the width.
+fn row<R>(ui: &mut Ui, label: &str, value: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal_top(|ui| {
+        let w = 92.0f32.min(ui.available_width() * 0.36);
+        ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(w);
+            ui.add(egui::Label::new(RichText::new(label).size(12.0).color(theme::INK_DIM)).wrap());
         });
-    search::mark(ui, st, "d-plan", r.header_response.rect);
-    super::group(ui, st, "d-sample", |ui, st| sample_row(ui, st, input, acts));
-    super::group(ui, st, "d-model-file", |ui, st| {
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            value(ui)
+        })
+        .inner
+    })
+    .inner
+}
+
+/// The uncertainty row's hover.
+const UNCERTAINTY_TIP: &str = "the model's epistemic force std per component (max over atoms; the label noise σ_f is left out — a fallback on it would teach nothing, and a fit whose σ_f exceeds 2e-3 Ha/Bohr is untrusted instead) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.";
+
+/// The last audit's colour, its full line (Details) and its short form (Health).
+fn audit_words(m: &ModelStatus) -> (Color32, String, String) {
+    // the step it was judged at (the driver's stamp on its event; activity Task 5): for a
+    // background audit that is after its dispatch, by the lag in answered steps
+    let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
+    match (&m.last_audit, m.audit_in_flight) {
+        (None, true) => (Color32::GRAY, "in flight on the background teacher".into(), "in flight".into()),
+        (Some(a), in_flight) => {
+            let (c, verdict) = match a.verdict {
+                sim::AuditVerdict::Passed => (GREEN, "passed"),
+                sim::AuditVerdict::Failed => (AMBER, "failed"),
+                sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
+            };
+            let lag = if a.asynchronous { format!("; audit lag: {} answered steps", a.unaudited_steps) } else { String::new() };
+            let next = if in_flight { "; next in flight" } else { "" };
+            (c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms), format!("{verdict} · {:+.1e} Ha{at}", a.gap))
+        }
+        (None, false) => (Color32::GRAY, "— (none yet)".into(), "— (none yet)".into()),
+    }
+}
+
+fn audit_tip(m: &ModelStatus) -> &'static str {
+    if m.audits_background {
+        "E_DFT − E_model at the last audited geometry. The audit runs on a second GPU teacher in the background while the model keeps answering (ruling S14); a failed one untrusts the model when it arrives. Audit lag = answered steps between the audit's dispatch and its verdict: those steps were answered unaudited. At full speed the model outruns the background teacher, so audits run back to back — one per teacher solve, whatever the 2000-step cadence says — and the lag is tens of thousands of steps. A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (h / 0.25 Bohr)² e/Bohr³) carries the box's confinement and is not judged."
+    } else {
+        "E_DFT − E_model at the last audited geometry. With the CPU teacher the audit runs in the step (a second CPU solver would compete for the same cores). A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (h / 0.25 Bohr)² e/Bohr³) carries the box's confinement and is not judged."
+    }
+}
+
+/// 3. Health: the uncertainty against its bound (a bar with the bound marked, and the numbers), the
+/// last fit (rmse, the refit's time) and the last audit, short; the full rows are in Details.
+fn health(ui: &mut Ui, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>) {
+    let Some(m) = m else {
+        theme::note(ui, "no model status yet");
+        return;
+    };
+    row(ui, "uncertainty", |ui| match d.and_then(|d| d.uncertainty) {
+        Some(u) => {
+            let c = if u <= m.force_bound { GREEN } else { AMBER };
+            uncertainty_bar(ui, u, m.force_bound, c);
+            ui.colored_label(c, RichText::new(format!("{u:.1e} / {:.1e} Ha/Bohr", m.force_bound)).monospace().size(11.5)).on_hover_text(UNCERTAINTY_TIP);
+        }
+        None => {
+            ui.colored_label(Color32::GRAY, "— (model not consulted)").on_hover_text(UNCERTAINTY_TIP);
+        }
+    });
+    row(ui, "last fit", |ui| {
+        let refit = m.last_refit.as_ref().map_or(String::new(), |r| match &r.result {
+            Ok(_) => format!(" · refit {:.0} ms", r.ms),
+            Err(_) => " · last refit failed".to_string(),
+        });
+        match m.fit {
+            Some((_, _, e, f)) => ui.label(RichText::new(format!("rmse {f:.1e} Ha/Bohr{refit}")).monospace().size(11.5)).on_hover_text(format!("rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr per component")),
+            None => ui.colored_label(Color32::GRAY, "—"),
+        };
+    });
+    row(ui, "last audit", |ui| {
+        let (c, full, short) = audit_words(m);
+        ui.colored_label(c, RichText::new(short).size(11.5)).on_hover_text(format!("{full}\n\n{}", audit_tip(m)));
+    });
+}
+
+/// The Learned fold: one row per learned environment key (its samples on the right, its verdict
+/// line and the class rule on hover).
+fn learned_fold(ui: &mut Ui, rows: &[(String, usize, String)]) {
+    if rows.is_empty() {
+        theme::note(ui, "nothing learned yet: the classes are judged after the first fit");
+        return;
+    }
+    for (label, n, words) in rows {
         ui.horizontal(|ui| {
-            theme::section(ui, "Model file");
+            ui.label(RichText::new(format!("✓ {label}")).size(12.0).color(GREEN)).on_hover_text(format!("{words}\n\n{CLASS_LOO_HELP}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(format!("{n} samples")).size(11.5).color(theme::INK_DIM)));
         });
-        model_file_buttons(ui, st, input, acts);
-        ui.label(RichText::new(model_path(&st.scene_path).display().to_string()).monospace().size(11.0).color(theme::INK_DIM));
+    }
+}
+
+/// The Details fold: every readout row of the old grid ([`readouts`]), then where the model comes
+/// from, what it was taught at, the last pass, and "What this model is (and is not)".
+fn details(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>, sampling: bool) {
+    super::group(ui, st, "d-model-details", |ui, st| {
+        if let (Some(d), Some(m)) = (d, m) {
+            readouts(ui, d, m, input.scene, st);
+        }
+        if let Some(m) = m {
+            row(ui, "model", |ui| {
+                ui.label(RichText::new(source_line_with(m, st.model_file.as_deref())).size(11.5)).on_hover_text(SOURCE_LINE_TIP);
+            });
+            // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
+            // set recorded with it — recorded, never compared (ruling P2)
+            if let Some(p) = &m.provenance {
+                theme::note(ui, format!("taught at {p}"))
+                    .on_hover_text("the settings a model is valid at (grid, h, σ, charge, multiplicity, teacher and its tolerance — a scene at others falls back to DFT), and the isotopes its samples were taken with: recorded, not compared, because the Born-Oppenheimer surface does not depend on the nuclear masses");
+            }
+            if let Some(why) = &m.provenance_mismatch {
+                warnbox(ui, &format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"));
+            }
+        }
+        // the last sampling pass
+        if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| !sampling) {
+            theme::note(ui, format!("last pass {}: {}/{} jobs, skipped {}, failed {}", if p.cancelled { "cancelled" } else { "finished" }, p.done, p.total, p.skipped, p.failed));
+        }
     });
     let r = egui::CollapsingHeader::new("What this model is (and is not)")
         .id_salt("model-about")
         .default_open(false)
         .open(search::opens(st, "d-model-about"))
         .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                theme::note(ui, "estimated = a model fitted to this scene's DFT; valid only where it has been taught — it falls back to DFT when unsure");
+                theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
+            });
             theme::note(ui, "A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it. An untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust.");
             theme::note(ui, "Box-affected teacher answers (density on the outermost grid plane above 2e-5 × (h / 0.25 Bohr)² e/Bohr³) are used for that step but never trained on.");
         });
     search::mark(ui, st, "d-model-about", r.header_response.rect);
-    // Q1 of Appendix B (M5b): draft mode, also in Physics ▸ Estimated solver
-    super::group(ui, st, "d-draft", |ui, st| {
-        theme::section(ui, "Draft mode");
-        super::super::menus::draft_control(ui, st, acts);
-    });
 }
 
-/// Where the model learns (M8a Task 4b): the source line ([`source_line`]), the switch between the
+/// Where the model learns (M8a Task 4b; the Model file fold): the switch between the
 /// shared collection and a model file (offered when a collections folder is set), and "Import a
 /// model file…" with the last import's outcome.
 fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, scene_z: &[u8], acts: &mut Vec<Action>) {
@@ -175,8 +923,7 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
     let shared = m.use_collection;
     let attached = matches!(m.source, sim::ModelSource::Collection { .. });
     let read_only = matches!(m.source, sim::ModelSource::Collection { read_only: true, .. });
-    let line = RichText::new(source_line_with(m, st.model_file.as_deref())).size(12.5).color(if read_only { AMBER } else { theme::INK });
-    super::super::probed("model-source", ui.label(line)).on_hover_text(SOURCE_LINE_TIP);
+    // the source line itself is the verdict card's surface chip (its hover) and a Details row
     if !m.collections {
         return;
     }
@@ -314,7 +1061,8 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
         }
         Some(m) => {
             for s in &m.suspects {
-                ui.horizontal(|ui| {
+                // wrapped: a narrow panel puts Forget under the row instead of past the edge
+                ui.horizontal_wrapped(|ui| {
                     let worst = s.loo_ratio.is_some_and(|r| !(r <= 1.0));
                     ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(if worst { AMBER } else { theme::INK }));
                     if super::super::probed(&format!("forget-sample-{}", s.id.index), ui.small_button("Forget")).on_hover_text(FORGET_SAMPLE_TIP).clicked() {
@@ -329,7 +1077,7 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
     ui.add_space(4.0);
     ui.label(RichText::new(format!("forgotten ({}): held out of the fit until restored", m.forgotten_samples.len())).size(11.5));
     for s in &m.forgotten_samples {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));
             if super::super::probed(&format!("restore-sample-{}", s.id.index), ui.small_button("Restore"))
                 .on_hover_text("put this sample back into the fit (written at once; the model refits with it)")
@@ -496,7 +1244,8 @@ fn lone_note(ui: &mut Ui, input: &PanelInput<'_>, probe: &str) {
     }
 }
 
-/// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
+/// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel while a
+/// pass runs.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
     // an empty scene has no species to sample (`sim::sampling::EMPTY_SCENE`)
@@ -507,7 +1256,7 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         let b = if armed { egui::Button::new(text) } else { egui::Button::new(text.color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT) };
         if super::super::probed("sample", ui.add_enabled(!sampling && !empty, b))
             .on_disabled_hover_text(if empty { super::super::EMPTY_SAMPLE } else { "a pass is running" })
-            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click — estimated as solves × the last pass's measured rate, or × this scene's first solve before any pass (an estimate, not a bound: a pass's own solves differ; its time left is shown once it runs).")
+            .on_hover_text("one pass over the current scene with the preset above and Plan settings below: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click — estimated as solves × the last pass's measured rate, or × this scene's first solve before any pass (an estimate, not a bound: a pass's own solves differ; its time left is shown once it runs).")
             .clicked()
         {
             acts.push(Action::Sample { long });
@@ -518,8 +1267,10 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             ui.weak(c);
         }
         lone_note(ui, input, "lone-note");
-        if ui
-            .add_enabled(sampling, egui::Button::new("Cancel"))
+        // Cancel only while a pass runs (the mockup; before, it was drawn greyed)
+        if sampling
+            && ui
+            .add(egui::Button::new("Cancel"))
             .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")
             .clicked()
         {
@@ -613,7 +1364,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
 
 /// The preset row (`ui/sampling_presets.rs`): picking one sets the plan's fields and keeps its
 /// seed; the selection is read off the plan, so an edited field shows "Custom". The selected
-/// preset's description sits under the row.
+/// preset's description heads the Plan settings fold.
 fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
     let current = presets::matching(plan);
     ui.horizontal(|ui| {
@@ -630,15 +1381,11 @@ fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
             .response
             .on_hover_text(presets::RULE_OF_THUMB);
     });
-    if let Some(i) = presets::matching(plan) {
-        theme::note(ui, presets::PRESETS[i].description);
-    }
 }
 
-/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default), under the
-/// preset row.
+/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default): the Plan
+/// settings fold.
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
-    preset_row(ui, plan);
     super::wide_grid(ui, "plan", 2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
@@ -724,162 +1471,95 @@ mod tests {
     }
 }
 
-/// The model's state: who answered this step, its uncertainty against the threshold (a bar with
-/// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
-/// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
-/// the booked force-mismatch work.
-fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState, acts: &mut Vec<Action>) {
-    super::wide_grid(ui, "model", 2).striped(true).show(ui, |ui| {
-        // long values wrap in the dock instead of widening it
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.label("this step");
+/// The Details fold's readout rows (the old grid, row for row): who answered this step, its
+/// uncertainty against the threshold (a bar with the bound marked, and the numbers), trust (with
+/// the reason when not), samples, epoch, the last fit, the strict verdict here, fit vs held, the
+/// learned classes with their left-out ratios, the last refit, fallbacks over the last 100 steps
+/// (bar), the teacher gap, the last audit and the booked force-mismatch work.
+fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
+    let mono = |t: String| RichText::new(t).monospace().size(11.5);
+    row(ui, "this step", |ui| {
         ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong()).on_hover_text(source_tip(d.source));
-        ui.end_row();
-        ui.label("uncertainty");
-        let tip = "the model's epistemic force std per component (max over atoms; the label noise σ_f is left out — a fallback on it would teach nothing, and a fit whose σ_f exceeds 2e-3 Ha/Bohr is untrusted instead) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.";
-        match d.uncertainty {
-            Some(u) => {
-                let c = if u <= m.force_bound { GREEN } else { AMBER };
-                ui.vertical(|ui| {
-                    uncertainty_bar(ui, u, m.force_bound, c);
-                    ui.colored_label(c, RichText::new(format!("{u:.1e} / {:.1e} Ha/Bohr", m.force_bound)).monospace());
-                })
-                .response
-                .on_hover_text(tip);
-            }
-            None => {
-                ui.colored_label(Color32::GRAY, "— (model not consulted)").on_hover_text(tip);
-            }
+    });
+    row(ui, "uncertainty", |ui| match d.uncertainty {
+        Some(u) => {
+            let c = if u <= m.force_bound { GREEN } else { AMBER };
+            ui.colored_label(c, mono(format!("{u:.1e} / {:.1e} Ha/Bohr", m.force_bound))).on_hover_text(UNCERTAINTY_TIP);
         }
-        ui.end_row();
-        ui.label("trusted");
+        None => {
+            ui.colored_label(Color32::GRAY, "— (model not consulted)").on_hover_text(UNCERTAINTY_TIP);
+        }
+    });
+    row(ui, "trusted", |ui| {
         let t = trust(Some(m), scene, st);
-        let forget = t.forget;
-        let r = match forget {
-            None => ui.colored_label(t.colour, t.text),
-            // the failed residual check's worst sample, with the Worst-fitting rows' Forget
-            Some(id) => {
-                ui.vertical(|ui| {
-                    let r = ui.colored_label(t.colour, t.text);
-                    if super::super::probed(&format!("model-trust-forget-{}", id.index), ui.small_button("Forget"))
-                        .on_hover_text(crate::ui::activity::trust::FORGET_WORST_TIP)
-                        .clicked()
-                    {
-                        acts.push(Action::ForgetSample(id));
-                    }
-                    r
-                })
-                .inner
-            }
-        };
+        let r = ui.colored_label(t.colour, t.text);
         // the plain line; then what it means, then the provider's own text
-        let hover = [t.tip.map(str::to_string), t.detail.map(|d| format!("the fit's own words: {d}"))].into_iter().flatten().collect::<Vec<_>>().join("
-
-");
+        let hover = [t.tip.map(str::to_string), t.detail.map(|d| format!("the fit's own words: {d}"))].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
         if !hover.is_empty() {
             r.on_hover_text(hover);
         }
-        ui.end_row();
-        ui.label("samples");
-        ui.monospace(format!("{}{}", m.samples, if m.pending_refit { " (refit pending)" } else { "" }));
-        ui.end_row();
-        ui.label("model epoch");
-        ui.monospace(m.epoch.to_string()).on_hover_text("bumped whenever a refit moves the energy surface (the jump is booked into E conserved)");
-        ui.end_row();
-        ui.label("last fit");
-        match m.fit {
-            Some((n, q, e, f)) => ui.monospace(format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr")),
-            None => ui.colored_label(Color32::GRAY, "—"),
-        };
-        ui.end_row();
-        if let Some(r) = &m.readiness {
-            ui.label("strict here");
+    });
+    row(ui, "samples", |ui| ui.label(mono(format!("{}{}", m.samples, if m.pending_refit { " (refit pending)" } else { "" }))));
+    row(ui, "model epoch", |ui| ui.label(mono(m.epoch.to_string())).on_hover_text("bumped whenever a refit moves the energy surface (the jump is booked into E conserved)"));
+    row(ui, "last fit", |ui| match m.fit {
+        Some((n, q, e, f)) => ui.label(mono(format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr"))),
+        None => ui.colored_label(Color32::GRAY, "—"),
+    });
+    if let Some(r) = &m.readiness {
+        row(ui, "strict here", |ui| {
             let text = if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) };
             ui.colored_label(if r.answers { GREEN } else { AMBER }, text).on_hover_text("the fallback policy's verdict at this geometry with draft mode off: whether the model would answer a step here, else the rule that sends it to DFT");
-            ui.end_row();
-            if let Some(u) = &r.unlearned {
-                ui.label("this scene");
-                ui.colored_label(AMBER, u);
-                ui.end_row();
-            }
-        }
-        if let Some(text) = &m.fit_vs_held {
-            ui.label("fit vs held");
-            ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
-            ui.end_row();
-        }
-        if !m.class_loo.is_empty() {
-            // final review app M4: the class-wise trust behind "not learned well enough yet"
-            ui.label("learned classes");
-            ui.vertical(|ui| {
-                for c in &m.class_loo {
-                    ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
-                    // per environment species (M8a user-test fix 2): an atom answers by its own
-                    // … and always under a refused class, so the short key is named (M8a user-fix 3)
-                    for s in c.species.iter().filter(|_| c.species.len() > 1 || !c.trusted) {
-                        ui.colored_label(if s.trusted { GREEN } else { AMBER }, RichText::new(species_line(c.class, s)).monospace());
-                    }
-                }
-            })
-            .response
-            .on_hover_text(CLASS_LOO_HELP);
-            ui.end_row();
-        }
-        if let Some(r) = &m.last_refit {
-            ui.label("last refit");
-            match &r.result {
-                Ok(n) => ui.monospace(format!("{n} samples, {:.0} ms, at step {} ({} this run)", r.ms, r.at_step, m.refits)),
-                Err(e) => ui.colored_label(AMBER, format!("failed at step {}: {e}", r.at_step)),
-            };
-            ui.end_row();
-        }
-        ui.label("fallbacks");
-        ui.vertical(|ui| {
-            let f = d.fallback_fraction_100 as f32;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 3.0, theme::PANEL_3);
-            let mut fill = rect;
-            fill.set_width(rect.width() * f.clamp(0.0, 1.0));
-            ui.painter().rect_filled(fill, 3.0, AMBER);
-            ui.monospace(format!("{:.0} % of the last 100 steps", 100.0 * d.fallback_fraction_100));
         });
-        ui.end_row();
-        ui.label("teacher gap");
+        if let Some(u) = &r.unlearned {
+            row(ui, "this scene", |ui| ui.colored_label(AMBER, u));
+        }
+    }
+    if let Some(text) = &m.fit_vs_held {
+        row(ui, "fit vs held", |ui| ui.label(mono(text.clone())).on_hover_text(FIT_VS_HELD_HELP));
+    }
+    if !m.class_loo.is_empty() {
+        // final review app M4: the class-wise trust behind "not learned well enough yet"
+        row(ui, "learned classes", |ui| {
+            for c in &m.class_loo {
+                ui.colored_label(if c.trusted { GREEN } else { AMBER }, mono(class_line(c))).on_hover_text(CLASS_LOO_HELP);
+                // per environment species (M8a user-test fix 2): an atom answers by its own
+                // … and always under a refused class, so the short key is named (M8a user-fix 3)
+                for s in c.species.iter().filter(|_| c.species.len() > 1 || !c.trusted) {
+                    ui.colored_label(if s.trusted { GREEN } else { AMBER }, mono(species_line(c.class, s))).on_hover_text(CLASS_LOO_HELP);
+                }
+            }
+        });
+    }
+    if let Some(r) = &m.last_refit {
+        row(ui, "last refit", |ui| match &r.result {
+            Ok(n) => ui.label(mono(format!("{n} samples, {:.0} ms, at step {} ({} this run)", r.ms, r.at_step, m.refits))),
+            Err(e) => ui.colored_label(AMBER, format!("failed at step {}: {e}", r.at_step)),
+        });
+    }
+    row(ui, "fallbacks", |ui| {
+        let f = d.fallback_fraction_100 as f32;
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, theme::PANEL_3);
+        let mut fill = rect;
+        fill.set_width(rect.width() * f.clamp(0.0, 1.0));
+        ui.painter().rect_filled(fill, 3.0, AMBER);
+        ui.label(mono(format!("{:.0} % of the last 100 steps", 100.0 * d.fallback_fraction_100)));
+    });
+    row(ui, "teacher gap", |ui| {
         match (d.teacher_gap, m.last_gap) {
-            (Some(g), _) => ui.monospace(format!("{g:+.2e} Ha (this step)")),
-            (None, Some((g, step))) => ui.monospace(format!("{g:+.2e} Ha at step {step}")),
+            (Some(g), _) => ui.label(mono(format!("{g:+.2e} Ha (this step)"))),
+            (None, Some((g, step))) => ui.label(mono(format!("{g:+.2e} Ha at step {step}"))),
             (None, None) => ui.colored_label(Color32::GRAY, "— (no fallback on the model's surface yet)"),
         }
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
-        ui.end_row();
-        ui.label("last audit");
-        // the step it was judged at (the driver's stamp on its event; activity Task 5): for a
-        // background audit that is after its dispatch, by the lag in answered steps
-        let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
-        match (&m.last_audit, m.audit_in_flight) {
-            (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
-            (Some(a), in_flight) => {
-                let (c, verdict) = match a.verdict {
-                    sim::AuditVerdict::Passed => (GREEN, "passed"),
-                    sim::AuditVerdict::Failed => (AMBER, "failed"),
-                    sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
-                };
-                let lag = if a.asynchronous { format!("; audit lag: {} answered steps", a.unaudited_steps) } else { String::new() };
-                let next = if in_flight { "; next in flight" } else { "" };
-                ui.colored_label(c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
-            }
-            (None, false) => ui.colored_label(Color32::GRAY, "— (none yet)"),
-        }
-        .on_hover_text(if m.audits_background {
-            "E_DFT − E_model at the last audited geometry. The audit runs on a second GPU teacher in the background while the model keeps answering (ruling S14); a failed one untrusts the model when it arrives. Audit lag = answered steps between the audit's dispatch and its verdict: those steps were answered unaudited. At full speed the model outruns the background teacher, so audits run back to back — one per teacher solve, whatever the 2000-step cadence says — and the lag is tens of thousands of steps. A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (h / 0.25 Bohr)² e/Bohr³) carries the box's confinement and is not judged."
-        } else {
-            "E_DFT − E_model at the last audited geometry. With the CPU teacher the audit runs in the step (a second CPU solver would compete for the same cores). A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (h / 0.25 Bohr)² e/Bohr³) carries the box's confinement and is not judged."
-        });
-        ui.end_row();
-        ui.label("mismatch work");
-        ui.monospace(format!("{:+.2e} Ha", d.work_mismatch))
+    });
+    row(ui, "last audit", |ui| {
+        let (c, full, _) = audit_words(m);
+        ui.colored_label(c, full).on_hover_text(audit_tip(m));
+    });
+    row(ui, "mismatch work", |ui| {
+        ui.label(mono(format!("{:+.2e} Ha", d.work_mismatch)))
             .on_hover_text("work of (F_DFT − F_model) on fallback steps, booked into E conserved so the drift measures the integrator, not the model");
-        ui.end_row();
     });
 }
 
