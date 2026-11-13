@@ -29,10 +29,12 @@ const SAMPLING_TIP: &str = "a sampling pass is running: the dynamics stay paused
 const RELAXING_TIP: &str = "relaxing: the dynamics stay paused until the relax ends (or Stop it)";
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
-const ORBIT_TIP: &str = "Inspect: look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
-const PLACE_TIP: &str = "Place: click to drop a nucleus at rest (also while playing)";
-const EDIT_TIP: &str = "Edit: click an atom, Shift-click to add or remove, drag a box on empty space for a group (Esc clears); drag an arrow (X/Y/Z) or a square (a plane) to move the selection rigidly — velocities kept, the run pauses while you hold and resumes on release; middle-drag orbits";
-const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
+const ORBIT_TIP: &str = "Inspect (1): look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
+const PLACE_TIP: &str = "Place (2): click to drop a nucleus at rest (also while playing)";
+const EDIT_TIP: &str = "Edit (4): click an atom, Shift-click to add or remove, drag a box on empty space for a group (Esc clears); drag an arrow (X/Y/Z) or a square (a plane) to move the selection rigidly — velocities kept, the run pauses while you hold and resumes on release; middle-drag orbits";
+const SELECT_TIP: &str = "Grab (3): take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
+/// The Tool group's label: its keys (`ui::TOOL_KEYS`).
+const TOOL_LABEL: &str = "Tool · keys 1–4";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
 const THERMOSTAT_TIP: &str = "Bussi CSVR (canonical velocity rescaling): the box switches it on and off; the slider (0–5000 K, most of its travel below 1000 K) and the value set its target, in the scale chosen in Physics ▸ Thermostat (K / °C / °F) — typed, any value from absolute zero up, also above the slider's top. Moving the target never switches it on. The coupling time τ is in Physics ▸ Thermostat. Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.";
@@ -219,7 +221,7 @@ impl Widths {
             dt: max(&[caps("dt", false), dt_field, w("under-resolved", &sub), w(&format!("amber > {DT_WARN_FS}"), &sub)]) + PAD,
             thermostat: max(&[caps("Thermostat", true), thermostat_row(SLIDER_W), line_w(&["off · τ ", "1000", " fs"])]) + PAD,
             tool: max(&[
-                caps("Tool", false),
+                caps(TOOL_LABEL, false),
                 segs(&[btn("      Inspect"), 30.0, 30.0, 30.0]),
                 w("right-drag pans · wheel zooms", &sub),
                 line_w(&["drag + wheel: pull ", "0.0000", " Ha/Bohr"]),
@@ -456,7 +458,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, thermostat: b
                 .on_hover_text("the coupling time τ: smaller = tighter control, more disturbed dynamics (Physics ▸ Thermostat sets it)");
         });
     }
-    group(ui, st, "tb-tool", "Tool", None, w.tool, |ui, st| {
+    group(ui, st, "tb-tool", TOOL_LABEL, None, w.tool, |ui, st| {
         row(ui, |ui| tool_segments(ui, st, false, acts));
         if st.mode == ToolMode::Select {
             // the pull the wheel sets while dragging (Physics ▸ Drag pull)
@@ -711,7 +713,7 @@ fn tool_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action
                 // the active tool's name only (the others by icon, named in their tooltips): four
                 // named buttons no longer let the full layout fit 1400 pt
                 let text = if compact || st.mode != mode { "" } else { text };
-                if icons::seg_button(ui, icon, text, st.mode == mode).on_hover_text(tip).clicked() {
+                if probed(&format!("tool-{mode:?}"), icons::seg_button(ui, icon, text, st.mode == mode)).on_hover_text(tip).clicked() {
                     acts.push(Action::Tool(mode));
                 }
             }

@@ -2114,6 +2114,80 @@ fn the_toolbar_thermostat_box_shows_the_scale_and_keeps_any_target() {
     assert!(probed_rect("tb-thermostat-slider").width() > 70.0, "the full slider");
 }
 
+// ---- the tool keys (user request 2026-11-14) ----
+
+/// Keys 1–4 pick the Tool segments in the group's order through the segments' own
+/// `Action::Tool` (so `--record` writes them): Inspect, Place, Grab, Edit. The numpad's digits
+/// arrive as the same egui keys (egui-winit maps `Numpad1` and `Digit1` to `Key::Num1`; the
+/// logical "1" too). Nothing with Ctrl / Alt / Shift held, for an auto-repeat, while a text box
+/// has the keyboard (the digit goes into the box), or with Ctrl K's search open.
+#[test]
+fn keys_1_to_4_pick_the_tools() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let digit = |key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers, repeat: bool| {
+        egui::Event::Key { key, physical_key: physical, pressed: true, repeat, modifiers }
+    };
+    let press = |st: &mut UiState, key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers| {
+        let repeat = false;
+        let text = key.symbol_or_name().to_string();
+        let out = frame(&ctx, st, &inp, 1400.0, vec![digit(key, physical, modifiers, repeat), egui::Event::Text(text)]);
+        // released (egui marks a press of a key it holds down as a repeat)
+        let up = egui::Event::Key { key, physical_key: physical, pressed: false, repeat: false, modifiers };
+        frame(&ctx, st, &inp, 1400.0, vec![up]);
+        out.actions
+    };
+    use egui::Key::{Num1, Num2, Num3, Num4};
+    use egui::Modifiers as M;
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    assert_eq!(st.mode, ToolMode::Orbit);
+    // the top row (logical and physical key), in an order where each one changes the tool
+    for (key, mode) in [(Num4, ToolMode::Edit), (Num3, ToolMode::Select), (Num2, ToolMode::Place), (Num1, ToolMode::Orbit)] {
+        assert_eq!(press(&mut st, key, Some(key), M::NONE), vec![Action::Tool(mode)], "{key:?}");
+        assert_eq!(st.mode, mode, "{key:?}");
+    }
+    // the numpad as egui-winit hands it over, and a layout giving only the logical digit
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)]);
+    assert_eq!(press(&mut st, Num3, None, M::NONE), vec![Action::Tool(ToolMode::Select)]);
+    // the segments' own click sends the same action
+    assert_eq!(actions(&click_widget(&ctx, &mut st, &inp, "tool-Edit")), vec![Action::Tool(ToolMode::Edit)]);
+    // modifiers and auto-repeats: nothing
+    for m in [M::CTRL, M::COMMAND, M::ALT, M::SHIFT] {
+        assert!(press(&mut st, Num1, Some(Num1), m).is_empty(), "{m:?}+1");
+    }
+    assert_eq!(st.mode, ToolMode::Edit);
+    // held: egui marks the next press of a key still down an auto-repeat, which does nothing
+    let held = digit(Num1, Some(Num1), M::NONE, false);
+    assert_eq!(frame(&ctx, &mut st, &inp, 1400.0, vec![held.clone(), egui::Event::Text("1".into())]).actions, vec![Action::Tool(ToolMode::Orbit)]);
+    st.mode = ToolMode::Edit;
+    assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![held, egui::Event::Text("1".into())]).actions.is_empty(), "a repeat");
+    frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::Key { key: Num1, physical_key: Some(Num1), pressed: false, repeat: false, modifiers: M::NONE }]);
+    assert_eq!(st.mode, ToolMode::Edit);
+    // a text box with the keyboard (the speed box, clicked into its text): the digit is typed
+    click_widget(&ctx, &mut st, &inp, "speed");
+    assert!(ctx.egui_wants_keyboard_input(), "the speed box is being typed in");
+    let typed = press(&mut st, Num1, Some(Num1), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "typed, not a tool: {typed:?}");
+    assert_eq!(st.mode, ToolMode::Edit);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::Escape, M::NONE)]);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert!(!ctx.egui_wants_keyboard_input());
+    // Ctrl K's search open (its field has the keyboard; the gate holds without it too)
+    st.search.toggle();
+    let typed = press(&mut st, Num2, Some(Num2), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "the search is open: {typed:?}");
+    st.search.toggle();
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)], "and back");
+}
+
 // ---- M6 Task 10: bonds, molecules, badge, relax, isotopes, the periodic table ----
 
 /// The M6 actions emit exactly the driver commands of the engine features: Relax / StopRelax

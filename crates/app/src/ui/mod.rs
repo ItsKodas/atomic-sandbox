@@ -249,6 +249,11 @@ pub enum ToolMode {
     Edit,
 }
 
+/// The keys that pick the tools, in the Tool group's order (user request 2026-11-14): 1 Inspect,
+/// 2 Place, 3 Grab, 4 Edit.
+pub const TOOL_KEYS: [(egui::Key, ToolMode); 4] =
+    [(egui::Key::Num1, ToolMode::Orbit), (egui::Key::Num2, ToolMode::Place), (egui::Key::Num3, ToolMode::Select), (egui::Key::Num4, ToolMode::Edit)];
+
 /// The workspace's panels (docking spec D-2: "dock tab" now means "panel"); every one is in
 /// [`DockTab::PANELS`]. Where each sits is the workspace tree's (`UiState::workspace`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1759,10 +1764,27 @@ pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()
 }
 
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
-/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`).
+/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`); 1–4
+/// pick the Tool segments ([`TOOL_KEYS`]).
 fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
         st.search.toggle();
+    }
+    // the tool keys (user request 2026-11-14): the segments' own action (always enabled, like the
+    // segments), gated as Esc is on a text field, the search and the builder; the digit alone
+    // (Ctrl / Alt / Shift + digit stay free), not an auto-repeat. egui-winit gives the top row's
+    // digit and the numpad's (NumLock on) the same `Key::Num1`…
+    if !st.search.open && !st.builder.open && !ctx.egui_wants_keyboard_input() {
+        // the last one pressed this frame
+        let pressed = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } if modifiers.is_none() => TOOL_KEYS.iter().find(|(k, _)| k == key).map(|&(_, m)| m),
+                _ => None,
+            })
+        });
+        if let Some(mode) = pressed {
+            acts.push(Action::Tool(mode));
+        }
     }
     if !st.search.open
         && !st.builder.open
