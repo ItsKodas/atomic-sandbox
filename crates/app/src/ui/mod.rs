@@ -24,7 +24,6 @@
 //! (rule 8).
 pub mod actions;
 pub mod activity;
-pub mod auto_bonds;
 mod capture;
 mod dock;
 mod files;
@@ -540,13 +539,6 @@ pub struct UiState {
     /// as a small label on it, blue + / red −, also in Dock ▸ Selection and the badge. Display only,
     /// not recorded; on by default.
     pub show_charges: bool,
-    /// View ▸ Bonds & labels ▸ refresh bonds after a drag (user request 2026-11-13): under the
-    /// estimated solver, a drag that leaves the bonds stale sends one "Bonds now" a second after it
-    /// ends (`auto_bonds`). Display only, not recorded (the `RefreshBonds` it sends is); on by
-    /// default, and a profile without the key reads as on.
-    pub auto_refresh_bonds: bool,
-    /// That refresh's debounce (`auto_bonds::AutoBonds`).
-    pub auto_bonds: auto_bonds::AutoBonds,
     /// View ▸ Bonds & labels ▸ guess bonds from experience (user request 2026-11-13): while the
     /// bonds are stale (estimated solver), each pair is drawn as the app's own earlier DFT graphs
     /// called it at the same distance and surroundings (`crate::bond_experience`). Display only,
@@ -920,8 +912,6 @@ impl UiState {
             show_angles: true,
             show_bond_lengths: true,
             show_charges: true,
-            auto_refresh_bonds: true,
-            auto_bonds: Default::default(),
             guess_bonds: true,
             follow_selected: false,
             audit_every_on: 2000,

@@ -39,7 +39,7 @@
 //!    restarts the app.
 //! 3. A background job — a sampling pass, a refit, a relax, a background audit ([`running`]) — or,
 //!    with the run paused, a solve the worker is still busy with (the one after a scene load, an
-//!    Apply grid or a Step; Bonds now; `ui::auto_bonds`' refresh after a drag: [`waiting_for`])
+//!    Apply grid or a Step; Bonds now: [`waiting_for`])
 //!    gets "Waiting for the refit to finish…" with Cancel it and restart / Keep waiting; the restart
 //!    then goes ahead by itself when the job ends.
 //!
@@ -321,8 +321,8 @@ pub fn running(input: &PanelInput<'_>) -> Option<&'static str> {
 
 /// What the restart waits for (module doc): a background job ([`running`]), else — the run paused —
 /// a solve the worker is still busy with, "the solve" (the one after a scene load, an Apply grid or
-/// a Step; Bonds now; `ui::auto_bonds`' refresh after a drag). A playing run's step solves are not
-/// one: a playing run gets [`Guard::Playing`]. Bonds now, the drag refresh and the estimated
+/// a Step; Bonds now). A playing run's step solves are not
+/// one: a playing run gets [`Guard::Playing`]. Bonds now and the estimated
 /// solver's graph solve after a scene's references run with `busy` false (the worker's `has_work`
 /// doesn't count a bond request), so the probe's Main slot — set for every Kohn-Sham solve and
 /// cleared by its guard on error, cancel or panic — is checked as well.
