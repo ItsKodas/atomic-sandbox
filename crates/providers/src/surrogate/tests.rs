@@ -1144,16 +1144,81 @@ fn a_large_misfit_untrusts_the_model() {
     assert!(m.samples.len() >= 6 && (40..46).all(|i| m.samples.contains(&i)), "{:?}", m.samples);
 }
 
-/// §4.3: M is left out of the class rule's statistics — on the Task 5 store the pair class is
-/// trusted, and no sample of M is the class's worst or a blocker.
+/// The leave-one-out sums of the Task 5 store's pair class (every atom of its H₂ samples is a pair
+/// atom of the key H{H}), recomputed here over the fitted samples `which` selects: (Σ force ratio²,
+/// atoms, max force ratio, Σ energy ratio², energy samples, max energy ratio, Σ training force
+/// residual²/3) — the quantities `compute_class_loo_full` accumulates.
+fn pair_class_sums(s: &SurrogateKs, which: impl Fn(usize) -> bool) -> (f64, usize, f64, f64, usize, f64, f64) {
+    let model = s.model.as_ref().unwrap();
+    let mut out = (0.0, 0usize, 0.0f64, 0.0, 0usize, 0.0f64, 0.0);
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) || !which(i) {
+            continue;
+        }
+        let l = surrogate::loo::leave_one_out(model, smp).expect("a defined leave-one-out");
+        for (r, f) in l.forces.iter().zip(&smp.forces) {
+            let r = r.expect("every atom trained");
+            let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+            out.0 += (d / b) * (d / b);
+            out.1 += 1;
+            out.2 = out.2.max(d / b);
+        }
+        let n = smp.pos.len() as f64;
+        let e = l.energy.expect("the energy fitted");
+        let e = (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / s.policy.energy_std_per_atom;
+        out.3 += e * e;
+        out.4 += 1;
+        out.5 = out.5.max(e);
+        let (_, fm) = surrogate::energy_and_forces(model, &smp.pos, &smp.z).unwrap();
+        out.6 += fm.iter().zip(&smp.forces).map(|(a, b)| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)) / 3.0).sum::<f64>();
+    }
+    out
+}
+
+/// §4.3 as amended by the Task 7 physics review's C1 (the user's decision, 2026-11-13): M stays in
+/// the class rule's RMS terms and is left out of its max terms, its worst-sample and blocker
+/// readouts, n_k and ā_c. On the Task 5 store (three energy misfits) the pair class and its key
+/// H{H} carry the RMS over every fitted sample, M included — the energy RMS strictly above the one
+/// without M — and the maxima, sample counts and aleatoric level of the samples outside M; the
+/// class stays trusted (the uncalibrated rule reads the force RMS, which M's exact forces leave
+/// small, and the energy max outside M).
 #[test]
-fn the_class_rule_leaves_misfits_out() {
+fn the_class_rule_keeps_misfits_in_its_rms_only() {
     let s = task5_store();
     let m = s.misfit().unwrap().samples.clone();
     println!("M {m:?}; pair class {:?}; worst {:?}; blockers {:?}", s.class_loo()[0], s.class_worst, s.class_blockers);
     assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
     assert!(s.class_worst.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_worst);
     assert!(s.class_blockers.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_blockers);
+    let all = pair_class_sums(&s, |_| true);
+    let out = pair_class_sums(&s, |i| !m.contains(&i));
+    let rms = |ss: f64, n: usize| (ss / n as f64).sqrt();
+    println!(
+        "force RMS with M {:.4} / without {:.4}; energy RMS with M {:.4} / without {:.4}; energy max with M {:.3} / without {:.3}",
+        rms(all.0, all.1),
+        rms(out.0, out.1),
+        rms(all.3, all.4),
+        rms(out.3, out.4),
+        all.5,
+        out.5
+    );
+    assert!(all.5 > 1.0 && out.5 <= 1.0, "the premise: M's energy LOO is beyond the tier, the rest within");
+    assert!(rms(all.3, all.4) > rms(out.3, out.4), "the premise: M raises the energy RMS");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1e-300);
+    let j = s.class_judge.as_ref().unwrap();
+    let c = &s.class_loo()[0];
+    for (what, st) in [("the pair class", j.stats[0]), ("the key H{H}", j.key_stats[&hk_pair()])] {
+        assert!(close(st.force_rms, rms(all.0, all.1)), "{what}: force RMS over every fitted sample, M included: {} vs {}", st.force_rms, rms(all.0, all.1));
+        assert!(close(st.energy_rms, rms(all.3, all.4)), "{what}: energy RMS over every fitted sample, M included: {} vs {}", st.energy_rms, rms(all.3, all.4));
+        assert!(close(st.force_max, out.2), "{what}: force max outside M: {} vs {}", st.force_max, out.2);
+        assert!(close(st.energy_max, out.5), "{what}: energy max outside M: {} vs {}", st.energy_max, out.5);
+        assert_eq!(st.samples, 120, "{what}: the samples outside M");
+    }
+    assert_eq!((c.force_rms, c.energy_rms, c.force_max, c.energy_max, c.samples), (j.stats[0].force_rms, j.stats[0].energy_rms, j.stats[0].force_max, j.stats[0].energy_max, j.stats[0].samples));
+    let sigma_f = s.report().unwrap().sigma_f;
+    let aleatoric = sigma_f.min((out.6 / out.1 as f64).sqrt());
+    println!("ā: judged {:.3e}; outside M {aleatoric:.3e}; with M {:.3e}; σ_f {sigma_f:.3e}", j.aleatoric[0], sigma_f.min((all.6 / all.1 as f64).sqrt()));
+    assert!(close(j.aleatoric[0], aleatoric), "ā_c over the samples outside M: {} vs {aleatoric}", j.aleatoric[0]);
     // review fix 1: a key's sample count n_k leaves M out, its column floor q_k and the whole-model
     // union do not (M is in the fit: a column only M touched would otherwise look spanned by
     // data the fit cannot reproduce, and the floor would drop)
@@ -1174,8 +1239,135 @@ fn the_class_rule_leaves_misfits_out() {
     assert_eq!(j.fit_columns, all.union);
 }
 
+/// The key H{He} (the H of a HeH dimer, a pair atom).
+fn hk_h_he() -> surrogate::EnvKey {
+    surrogate::EnvKey { class: 1, z: 1, neighbours: vec![2] }
+}
+
+/// A store of two pair keys apart for C1 (open-shell Task 7b): 100 H₂ (the key H{H}) and
+/// `HEH_GOOD` HeH dimers (the keys H{He}, He{H}) on r ∈ [2.0, 3.4], all from the [`SpeciesMorse`]
+/// surface, plus `HEH_MISFITS` copies of one HeH geometry at r = 2.6 moved rigidly (the same
+/// descriptors) whose H force is off by ±`delta` Ha/Bohr along the bond, alternating — labels the
+/// fit cannot reproduce (it sits at their mean, the surface), so every copy is a force misfit while
+/// the fit elsewhere is untouched; the energies exact. Refitted without the trust recovery
+/// (`skip_recovery`), so M is the fit's own. Returns the store and, for the key H{He}: (the
+/// fraction f of its fitted atoms in M, the RMS r_M of their leave-one-out force ratios).
+fn heh_misfit_store(delta: f64) -> (SurrogateKs, f64, f64) {
+    let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    s.skip_recovery = true;
+    let add = |s: &mut SurrogateKs, sc: &Scene, df: f64| {
+        let (pos, z) = pos_z(sc);
+        let (e, mut f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let d: [f64; 3] = std::array::from_fn(|a| pos[1][a] - pos[0][a]);
+        let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        for a in 0..3 {
+            f[0][a] += df * d[a] / r;
+        }
+        s.add_sample(Sample { pos, z, energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, sc).unwrap();
+    };
+    let mut rng = StdRng::seed_from_u64(77);
+    for i in 0..100 {
+        add(&mut s, &h2_at(1.1 + 1.2 * i as f64 / 99.0, &mut rng), 0.0);
+    }
+    for i in 0..HEH_GOOD {
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        add(&mut s, &dimer(2.0 + 1.4 * i as f64 / (HEH_GOOD - 1) as f64, unit_vector(&mut rng), origin, 1, 2), 0.0);
+    }
+    for k in 0..HEH_MISFITS {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        add(&mut s, &dimer(2.6, [0.0, 0.0, 1.0], [0.1 * k as f64, 0.0, 0.0], 1, 2), sign * delta);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap().samples.clone();
+    let model = s.model.as_ref().unwrap();
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    let (mut atoms, mut in_m, mut ss) = (0usize, 0usize, 0.0f64);
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) {
+            continue;
+        }
+        let keys = env_keys(&smp.pos, &smp.z, rc2);
+        for (j, k) in keys.iter().enumerate() {
+            if k.as_ref() != Some(&hk_h_he()) {
+                continue;
+            }
+            atoms += 1;
+            if m.contains(&i) {
+                in_m += 1;
+                let l = surrogate::loo::leave_one_out(model, smp).expect("a defined leave-one-out");
+                let (r, f) = (l.forces[j].unwrap(), smp.forces[j]);
+                let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], &f);
+                ss += (d / b) * (d / b);
+            }
+        }
+    }
+    let (f, r_m) = (in_m as f64 / atoms as f64, (ss / in_m.max(1) as f64).sqrt());
+    (s, f, r_m)
+}
+
+/// The good HeH dimers and the misfit copies of [`heh_misfit_store`].
+const HEH_GOOD: usize = 30;
+const HEH_MISFITS: usize = 2;
+
+/// C1 (Task 7 physics review): a key whose atoms are a fraction f in M at leave-one-out RMS ratio
+/// r_M has a class-rule force RMS R ≥ √f·r_M, so the uncalibrated rule (rms ≤ 1) refuses it when
+/// f·r_M² > 1 — here the key H{He}, its misfit H force 0.03 Ha/Bohr off. The H₂ key, far from it,
+/// is still trusted and the model is trusted: the misfit is local, and the class rule refuses
+/// exactly its key. (Before C1, M left out of the class rule entirely, H{He} stayed trusted.)
+#[test]
+fn a_gross_misfit_refuses_its_key() {
+    use sim::ClassKey;
+    let (s, f, r_m) = heh_misfit_store(0.03);
+    let m = s.misfit().unwrap();
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} of {} fitted; trusted {} {:?}; H{{He}}: f {f:.3}, r_M {r_m:.2}, f·r_M² {:.2}; judged {kst:?}; q_k {:?}", m.samples, m.fitted, s.trusted(), s.untrusted_reason(), f * r_m * r_m, j.key_q.get(&hk_h_he()));
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "the premise: the model is trusted: {:?}", s.untrusted_reason());
+    assert!(f * r_m * r_m > 1.0, "the premise: f·r_M² > 1");
+    assert!(kst.force_max <= 1.0, "the premise: the key's atoms outside M are within their bounds");
+    assert!(kst.force_rms >= f.sqrt() * r_m, "R ≥ √f·r_M: {} vs {}", kst.force_rms, f.sqrt() * r_m);
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    println!("the verdict of H{{He}}: {v:?}");
+    assert!(matches!(v.refusal, Some((ClassKey::Force, x, _)) if x > 1.0), "refused on its force RMS: {:?}", v.refusal);
+    // the class rule alone (not `NearMisfit`) at a HeH geometry away from the misfit copies (r =
+    // 3.2): refused by its key's verdict, not on the sample floor
+    let far_heh = dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2);
+    let (pos, z) = pos_z(&far_heh);
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc * rc));
+    println!("the class rule at HeH r = 3.2: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, false))), "refused by the class rule, not its sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+    let (pos, z) = pos_z(&h2(1.5));
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc * rc)).is_none(), "the H₂ key still answers");
+}
+
+/// C1: a mild misfit keeps its key — the key H{He} with f·r_M² well below ½ (its misfit H force
+/// 0.005 Ha/Bohr off: in M, its in-sample ratio 1.44) stays trusted by the class rule.
+#[test]
+fn a_mild_misfit_keeps_its_key() {
+    let (s, f, r_m) = heh_misfit_store(0.005);
+    let m = s.misfit().unwrap();
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} of {} fitted; trusted {}; H{{He}}: f {f:.3}, r_M {r_m:.2}, f·r_M² {:.3}; judged {kst:?}", m.samples, m.fitted, s.trusted(), f * r_m * r_m);
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(f * r_m * r_m < 0.25, "the premise: f·r_M² well below ½");
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    assert!(v.trusted, "{v:?}");
+    let (pos, z) = pos_z(&dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2));
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc * rc)).is_none(), "the class rule answers a HeH geometry");
+}
+
 /// Review Focus 2: an environment key whose only samples are misfits has no samples of its own in
-/// the class statistics — the class rule refuses it on the sample floor. 120 good H₂ + three H₃
+/// the class statistics (n_k leaves M out; C1 keeps M in the RMS terms only) — the class rule
+/// refuses it on the sample floor. 120 good H₂ + three H₃
 /// samples the fit cannot reproduce (`skip_recovery`): one H₃ geometry, moved rigidly (the same
 /// descriptors), labelled +0.02, −0.02 and +0.02 Ha off — contradictory labels. (Three distinct
 /// H₃ geometries all +0.01 Ha off, the plan's store, are fitted: only they touch the many-body
@@ -7358,7 +7550,8 @@ fn kabsch_recovers_a_rotation() {
 /// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
 /// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
 /// follow offers nothing and starts nothing: since spec 2026-11-13 §4.3 its samples (in-sample
-/// beyond their bounds) are the misfit set, out of the class statistics, so they block no class.
+/// beyond their bounds) are the misfit set, never a class's blocker (C1: M is in the class RMS
+/// terms only), so they are offered to no teach-around.
 #[test]
 fn teach_diagnosis_separates_leverage_from_structure() {
     let (s, _h) = tail_blocked();
@@ -7375,8 +7568,8 @@ fn teach_diagnosis_separates_leverage_from_structure() {
         assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
     }
     // structure: the basis cannot follow 12 extrema on 1 Bohr. Every sample is beyond its bound
-    // in-sample, so it is in the misfit set and out of the class statistics (spec 2026-11-13
-    // §4.3): no blocker is offered (before §4.3 they were listed refused as "cannot represent")
+    // in-sample, so it is in the misfit set and never a blocker (spec 2026-11-13 §4.3, C1): no
+    // blocker is offered (before §4.3 they were listed refused as "cannot represent")
     let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
     let d = m.teach_diagnosis();
     println!("Morse + sinusoid: {} blockers; M {:?}", d.len(), m.misfit().map(|x| x.samples.len()));
@@ -7567,7 +7760,7 @@ fn a_cancelled_teach_round_is_not_spent() {
 /// held-out checks fail (failed audits of origin "teach check", kept with their samples' indices),
 /// the outcome and the reason say so, and no second round is offered. Since spec 2026-11-13 §4.3
 /// every sample is then in the misfit set (the reason: "N training samples the model cannot
-/// reproduce"), out of the class statistics, so no blocker is left to refuse as structural.
+/// reproduce"), never a class's blocker, so no blocker is left to refuse as structural.
 #[test]
 fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     let (mut s, _h) = tail_blocked();
@@ -7582,7 +7775,7 @@ fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     assert!(!s.trusted());
     assert!(s.failed_audits.iter().all(|c| c.origin == AuditOrigin::TeachCheck && c.index.is_some()), "failed checks keep their samples' indices");
     // every residual is beyond the tier: the whole store is the misfit set (spec 2026-11-13 §4.3),
-    // named as the first unmet condition, and left out of the class statistics — no blocker is
+    // named as the first unmet condition, and never a class's blocker — no blocker is
     // offered (before §4.3 the offer listed them refused as "cannot represent")
     assert!(outcome.contains("– the model as a whole: untrusted — ") && outcome.contains("training samples the model cannot reproduce"), "the first unmet trust condition, named: {outcome}");
     let o = s.teach_offer();

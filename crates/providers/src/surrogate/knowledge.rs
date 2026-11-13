@@ -9,7 +9,8 @@
 //! `Q_NONE` (held, superseded, box-excluded, draft, and the provider-local `Q_LONE` and
 //! `Q_REF_WAIT`) is held out of the fit and teaches nothing, so it is no knowledge — and without
 //! the misfit set M (spec 2026-11-13 §4.3: fitted, but not reproduced, and left out of the class
-//! statistics).
+//! rule's sample counts n_k — it stays in its leave-one-out RMS terms only, the Task 7 physics
+//! review's C1).
 //!
 //! **Capped segments** (M8a Task 10, `surrogate` module doc "Masked scenes"): only a masked
 //! sample's interior atoms are knowledge — an atom, its coordination, its angles and its keys are

@@ -115,7 +115,9 @@ quantities of `compute_training_residuals` — exceeds 1. M is recomputed at eve
   above 1 by construction and would refuse every atom sharing its environment key — H₂O's O and H₃O's O
   share one — so G3 could not work. This is the safety-relevant call of this spec and the physics review
   (§5.7) signs it off specifically: M's region is refused by `NearMisfit`, the class rule judges the
-  rest, audits keep calibrating it.
+  rest, audits keep calibrating it. Amended 2026-11-13 (Task 7 physics review C1, the user's decision):
+  M stays in the class rule's RMS terms and is left out of its max terms, n_k and ā_c — see
+  references.md 'Local misfit'.
 - **Near a misfit, per atom (my calls; builder check Q4).** A sample's *misfit atoms*: for a force misfit
   the trained atoms whose force ratio exceeds 1; for an energy misfit every trained atom of the sample (an
   energy error has no single atom to blame). A query atom is **near a misfit** when its environment is
