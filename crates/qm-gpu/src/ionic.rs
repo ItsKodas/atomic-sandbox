@@ -247,6 +247,9 @@ impl GpuIonic {
     /// V_NL, if any pseudised ion has a projector.
     pub fn nonlocal(&self) -> Option<&GpuNonlocal> { self.nl_active.then_some(&self.nl) }
 
+    /// The geometry these terms were last built for (`new`/`update`).
+    pub fn nuclei(&self) -> &[Nucleus] { &self.nuclei }
+
     /// Buffer (re)allocations so far (a reuse witness: constant across geometries of one scene).
     pub fn buffer_allocations(&self) -> usize {
         self.centres.allocations + self.ions.allocations + self.tables.allocations + self.nl.allocations() + self.forces.borrow().allocations()

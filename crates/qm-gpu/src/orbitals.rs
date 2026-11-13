@@ -99,6 +99,13 @@
 //! iteration (`eigen::lobpcg`'s callback, which the SCF never passes); an abort returns `None` and
 //! leaves the previous vectors and result as they were.
 //!
+//! The re-measure → sort → τ-set face density → block edge tail is one function,
+//! `record_unoccupied`, shared with the Harris display solve (`crate::harris`), whose unoccupied
+//! states come out of its own single LOBPCG (no occupied-agreement step). Its vectors reach a view
+//! through [`OrbitalView::adopt_unoccupied`], which copies them into this view's pool fields and
+//! record (the view never borrows the `HarrisState`), so the next `update` on the Harris state shows
+//! them as rows n_σ.. exactly as it shows this view's own.
+//!
 //! # Orbital shares ([`OrbitalView::shares`]; orbital-atom-shares spec, plan Task 3)
 //! The Hirshfeld split of each displayed ψ̃ between the nuclei, display only — the f64 reference
 //! is `sim::charges::{Weights::at, orbital_shares_many}` (whose module doc carries the physics):
@@ -168,7 +175,7 @@
 //! (`radial_profiles_match_the_cpu_reference`). The displayed fields are f32 lincombs with f32
 //! coefficients: |ψ̃_gpu − ψ̃_cpu| ≲ d·2⁻²⁴·max|ψ| (`display_copy_matches_cpu_reference`).
 use crate::batch::{Batch, Recorder};
-use crate::eigen::{lobpcg, rayleigh_residuals, GpuHamiltonian, Stop as EigenStop};
+use crate::eigen::{lobpcg, rayleigh_residuals, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 use crate::grid::{map_read_f32, readbacks_on_this_thread, Field, GpuGrid};
 use crate::kernels::{workgroups_for, Kernels, COLOUR_MAX_TERMS, WORKGROUP};
 use crate::physics::{NucleusRecord, MAX_NUCLEI};
@@ -180,7 +187,7 @@ use nalgebra::DMatrix;
 use qm::orbitals::{block_edge, clusters, occupied_disagreement, occupied_error, tau, Tracker, UpdateInput, N_LM, RADIAL_BIN_H, UNOCC_GUARD};
 pub use qm::orbitals::{Moments, RadialProfile, Spin, SpinSummary, Unoccupied, UpdateOutput};
 use qm::scf::initial_orbitals;
-use qm::ScfSettings;
+use qm::{QmError, ScfSettings};
 
 /// The colours of the 12 colour slots of `qm::orbitals` (`PALETTE_SLOTS`; spec §3: a fixed
 /// qualitative palette — display data, not physics). Linear RGB in [0, 1].
@@ -525,6 +532,11 @@ impl OrbitalView {
     /// device swap would not (the view's buffers live on the old device).
     fn follow_grid(&mut self, solver: &GpuSolver, state: &GpuState) {
         assert!(state.grid == *solver.grid(), "OrbitalView: the state is from another grid than the solver's");
+        self.follow_solver_grid(solver);
+    }
+
+    /// [`follow_grid`](Self::follow_grid) without a state (`adopt_unoccupied`).
+    fn follow_solver_grid(&mut self, solver: &GpuSolver) {
         if self.grid == *solver.grid() { return; }
         self.reset();
         self.grid = solver.grid().clone();
@@ -1064,38 +1076,18 @@ impl OrbitalView {
                 }
                 b.submit();
             }
-            // re-measure ε and the residual on the shown vectors; sort
-            let (lam, res) = match rayleigh_residuals(&ctx, k, &g, &self.reducer, &h, &phis, work) {
-                Ok(v) => v,
-                Err(e) => {
+            // re-measure, sort, τ-set face densities and the block edge (`record_unoccupied`, shared with Harris)
+            let sum = Self::field(&mut self.pool, &ctx, &g);
+            let recorded = record_unoccupied(&ctx, k, &g, &self.reducer, &h, work, phis, ev_scf, tol, tau_scf, &sum, &mut out, ch);
+            self.pool.push(sum);
+            match recorded {
+                Ok(v) => kept[ch] = v,
+                Err((e, phis)) => {
                     failure = Some(format!("the display eigensolve failed: {e}"));
                     self.pool.extend(phis);
                     break;
                 }
-            };
-            let mut rows: Vec<(f64, f64, Field)> = phis.into_iter().enumerate().map(|(i, f)| (lam[i], res[i], f)).collect();
-            rows.sort_by(|a, c| a.0.total_cmp(&c.0));
-            for (e, r, f) in rows {
-                out.evals[ch].push(e);
-                out.residuals[ch].push(r);
-                out.converged[ch].push(r <= tol);
-                kept[ch].push(f);
             }
-            // the face density of each τ-set (`qm::orbitals` §8, review M1): max over the outermost
-            // plane of Σ_set φ², rotation-invariant (so the shown ψ̃'s); one readback per set
-            out.face_density[ch] = vec![0.0; kept[ch].len()];
-            let sum = Self::field(&mut self.pool, &ctx, &g);
-            for set in clusters(&out.evals[ch], tau_scf) {
-                let mut b = Batch::new(&ctx, "unoccupied set face density");
-                fill_in(&mut b, k, &g, &sum, 0.0);
-                for f in &kept[ch][set.clone()] { mul_add_sq_in(&mut b, k, &g, &sum, f); }
-                // FaceMax of Σφ² is already a density (it is max |Σφ²|, Σφ² ≥ 0)
-                let face = self.reducer.many_in(&mut b, k, &g, &[Reduction::FaceMax(&sum)])[0];
-                for i in set { out.face_density[ch][i] = face; }
-            }
-            self.pool.push(sum);
-            let all: Vec<f64> = ev_scf.iter().chain(&out.evals[ch]).copied().collect();
-            out.hidden[ch] = block_edge(&all, nc, nc + ku, tau_scf).1;
         }
         self.pool.extend([vu, vd]);
         if aborted {
@@ -1114,6 +1106,32 @@ impl OrbitalView {
         Some(out)
     }
 
+    /// Shows another solve's unoccupied vectors — a Harris display solve's (`crate::harris`,
+    /// `HarrisState::unoccupied`) — as rows n_σ.. of the following updates, in place of this view's own:
+    /// `vectors` are **copied** into this view's pool fields (one batch of copies; the view never borrows
+    /// their owner, which may overwrite them on its next solve), and `info` replaces
+    /// [`unoccupied_info`](Self::unoccupied_info). `info`'s counts must be the vectors'. The caller
+    /// passes the occupied rows' state to `update` (the Harris state: its orbitals are the levels
+    /// with f > 0, these the rest, ascending).
+    pub fn adopt_unoccupied(&mut self, solver: &GpuSolver, vectors: [&[Field]; 2], info: Unoccupied) {
+        assert_eq!(info.count(), [vectors[0].len(), vectors[1].len()], "adopt_unoccupied: the record and the vectors disagree");
+        self.follow_solver_grid(solver);
+        for v in std::mem::take(&mut self.unocc) { self.pool.extend(v); }
+        let (ctx, g) = (self.ctx.clone(), self.g);
+        let mut b = Batch::new(&ctx, "adopt unoccupied");
+        let mut copies: [Vec<Field>; 2] = [Vec::new(), Vec::new()];
+        for (ch, srcs) in vectors.iter().enumerate() {
+            for src in srcs.iter() {
+                let f = Self::field(&mut self.pool, &ctx, &g);
+                lincomb_in(&mut b, &solver.k, &g, &f, &[(1.0, src)]);
+                copies[ch].push(f);
+            }
+        }
+        b.submit();
+        self.unocc = copies;
+        self.unocc_info = Some(info);
+    }
+
     /// `unpad` + `copy_buffer_to_texture` of `f` into `vol`, recorded into `b`
     /// (`GpuSolver::copy_density_to_volume`'s path, on this view's own row buffer).
     fn copy_to_volume(&self, b: &mut Batch, k: &Kernels, f: &Field, vol: &Volume3D) {
@@ -1127,6 +1145,48 @@ impl OrbitalView {
             wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
         );
     }
+}
+
+/// The tail of a display eigensolve (module doc, "Unoccupied orbitals"), shared by
+/// [`OrbitalView::unoccupied`] and `GpuSolver::harris`: channel `ch`'s unoccupied vectors `phis` are
+/// re-measured (`eigen::rayleigh_residuals`: ε and the true residual, two readbacks; `work` built for
+/// k ≥ `phis.len()`), sorted by ε, given their τ-set's face density (max over the outermost plane of
+/// Σ_set φ², rotation-invariant; one readback per set, `sum` the scratch) and the block-edge rule's
+/// hidden count over `occupied_evals` followed by theirs. Fills channel `ch` of `out` (evals,
+/// residuals, converged at `tol`, face_density, hidden) and returns the vectors in that order; on a
+/// numerical failure the vectors come back with the error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_unoccupied(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, reducer: &Reducer, h: &GpuHamiltonian, work: &mut LobpcgWork,
+                                phis: Vec<Field>, occupied_evals: &[f64], tol: f64, tau_scf: f64, sum: &Field, out: &mut Unoccupied, ch: usize)
+                                -> Result<Vec<Field>, (QmError, Vec<Field>)> {
+    let (lam, res) = match rayleigh_residuals(ctx, k, g, reducer, h, &phis, work) {
+        Ok(v) => v,
+        Err(e) => return Err((e, phis)),
+    };
+    let mut rows: Vec<(f64, f64, Field)> = phis.into_iter().enumerate().map(|(i, f)| (lam[i], res[i], f)).collect();
+    rows.sort_by(|a, c| a.0.total_cmp(&c.0));
+    let mut kept = Vec::with_capacity(rows.len());
+    for (e, r, f) in rows {
+        out.evals[ch].push(e);
+        out.residuals[ch].push(r);
+        out.converged[ch].push(r <= tol);
+        kept.push(f);
+    }
+    // the face density of each τ-set (`qm::orbitals` §8, review M1): max over the outermost
+    // plane of Σ_set φ², rotation-invariant (so the shown ψ̃'s); one readback per set
+    out.face_density[ch] = vec![0.0; kept.len()];
+    for set in clusters(&out.evals[ch], tau_scf) {
+        let mut b = Batch::new(ctx, "unoccupied set face density");
+        fill_in(&mut b, k, g, sum, 0.0);
+        for f in &kept[set.clone()] { mul_add_sq_in(&mut b, k, g, sum, f); }
+        // FaceMax of Σφ² is already a density (it is max |Σφ²|, Σφ² ≥ 0)
+        let face = reducer.many_in(&mut b, k, g, &[Reduction::FaceMax(sum)])[0];
+        for i in set { out.face_density[ch][i] = face; }
+    }
+    let nc = occupied_evals.len();
+    let all: Vec<f64> = occupied_evals.iter().chain(&out.evals[ch]).copied().collect();
+    out.hidden[ch] = block_edge(&all, nc, nc + kept.len(), tau_scf).1;
+    Ok(kept)
 }
 
 #[cfg(test)]
