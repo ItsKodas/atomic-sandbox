@@ -31,7 +31,10 @@ pub(super) fn wide_grid(ui: &Ui, id: &str, cols: usize) -> egui::Grid {
     let w = ui.available_width();
     let gap = ui.spacing().item_spacing.x * (cols.saturating_sub(1)) as f32;
     let share = ((w - gap) / cols.max(1) as f32).max(40.0);
-    egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(w.max(share))
+    // a column may grow to what the others leave at their least (it used to be the whole width,
+    // so a long value ran past the panel's right edge instead of wrapping)
+    let most = (w - gap - share * (cols.saturating_sub(1)) as f32).max(share);
+    egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(most)
 }
 
 /// The panel's icon (its tab, docking spec D-4).
@@ -161,11 +164,19 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
         }
     });
     ui.add(egui::Separator::default().spacing(6.0));
+    // the body's right edge: the tile's margin is the same on both sides (`workspace::tree`'s
+    // tab body), and while the vertical bar shows it takes its own width instead of floating over
+    // the content's right edge (user report 2026-11-14: cards and right-aligned words touched it)
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating_allocated_width = scroll.floating_allocated_width.max(scroll.bar_width + 2.0);
     egui::ScrollArea::vertical()
         .id_salt(("dock", tab as u8))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
+            // the body's visible part and its content rect (the tests' margin checks)
+            super::probe_rect(&format!("dock-clip-{}", tab.name()), ui.clip_rect());
+            super::probe_rect(&format!("dock-content-{}", tab.name()), ui.max_rect());
             match tab {
                 DockTab::Readouts => readouts::show(ui, st, input, acts),
                 DockTab::Graph => graph::show(ui, st, input),

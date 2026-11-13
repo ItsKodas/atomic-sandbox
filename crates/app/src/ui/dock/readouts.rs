@@ -33,6 +33,10 @@ fn tile(ui: &mut Ui, key: &str, value: RichText, unit: &str, tip: &str) {
         .on_hover_text(tip);
 }
 
+/// Below this width (points) the energies' Ha and eV stack in one cell (side by side they need
+/// about 400 pt with the row names).
+const STACK_BELOW: f32 = 400.0;
+
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<super::super::Action>) {
     let Some(s) = input.snapshot else {
         ui.weak("no solution yet");
@@ -88,11 +92,12 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls.");
         });
         let units = st.energy_units;
+        let stacked = ui.available_width() < STACK_BELOW;
         super::wide_grid(ui, "energies", 3).striped(true).show(ui, |ui| {
             let mut row = |name: &str, x: f64, strong: bool, tip: &str| {
                 let n = if strong { RichText::new(name).strong() } else { RichText::new(name) };
                 ui.label(n).on_hover_text(tip);
-                energy_cells(ui, x, units, strong);
+                energy_cells(ui, x, units, strong, stacked);
                 ui.end_row();
             };
             row("KE (nuclei)", d.kinetic, false, "Σ ½ m v² of the nuclei (lab frame)");
@@ -239,6 +244,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
     let d = &s.dynamics;
     let e = &d.eval.energy;
     let units = st.energy_units;
+    let stacked = ui.available_width() < STACK_BELOW;
     let r = egui::CollapsingHeader::new("Energy breakdown and solver")
         .id_salt("energy-breakdown")
         .default_open(false)
@@ -247,7 +253,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
             super::wide_grid(ui, "energy", 3).striped(true).show(ui, |ui| {
                 let mut row = |name: &str, x: f64| {
                     ui.label(name);
-                    energy_cells(ui, x, units, false);
+                    energy_cells(ui, x, units, false, stacked);
                     ui.end_row();
                 };
                 row(pseudo::energy_label(&d.eval.pseudised), e.total);

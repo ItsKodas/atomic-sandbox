@@ -11284,3 +11284,94 @@ mod model_panel_misfit {
         assert!(t.contains("0 of at most 27.1 training samples it can't reproduce") && t.contains("body-4 degree 3"), "{t}");
     }
 }
+
+
+/// User report 2026-11-14: the panels had no padding on the right (the Activity job card, the
+/// timeline, "see Model" touched the edge). Every panel's text, at about 320 pt and wide, ends at
+/// least the left margin before the panel's right edge; so do the right-aligned "see Model"
+/// (Activity) and the "N % DFT" chip (Model).
+#[test]
+fn every_panel_keeps_its_right_margin() {
+    fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+        match s {
+            egui::epaint::Shape::Text(t) => f(t),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+            _ => {}
+        }
+    }
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.fallback_fraction_100 = 0.12;
+    snap.activity.events = activity_tab::every_kind_of_event();
+    snap.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    snap.activity.knowledge = Some(std::sync::Arc::new(knowledge::fixture_map()));
+    let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&snap), &cam) };
+    for tab in [DockTab::Model, DockTab::Activity, DockTab::Knowledge, DockTab::Orbitals, DockTab::View, DockTab::Readouts, DockTab::Selection, DockTab::Log] {
+        for w in [320.0f32, 600.0] {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx);
+            let mut st = UiState::new("h2o", &scene);
+            st.backend = Backend::Estimated;
+            st.activity.absorb(&snap);
+            st.activity_sections.trust = true;
+            st.view_sections = super::dock::view::Sections::all(true);
+            st.workspace.set_node(super::workspace::layout::parse(&format!("H({:.4},3D,[{}*])", 1.0 - w / 1400.0, tab.name())).unwrap());
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0))), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let (clip, content) = (probed_rect(&format!("dock-clip-{}", tab.name())), probed_rect(&format!("dock-content-{}", tab.name())));
+            let margin = content.left() - clip.left();
+            assert!(margin >= 6.0, "{tab:?} at {w}: left margin {margin}");
+            let edge = clip.right() - margin + 0.5;
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| (c.clip_rect.left() - clip.left()).abs() < 1.0 && (c.clip_rect.right() - clip.right()).abs() < 1.0) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.top() < clip.bottom() {
+                        checked += 1;
+                        assert!(r.right() <= edge, "{tab:?} at {w}: {:?} ends at {} (the right margin ends at {edge})", t.galley.text(), r.right());
+                    }
+                });
+            }
+            assert!(checked > 0, "{tab:?} at {w}: no text checked");
+            // the right-aligned words and the boxes drawn to the full width (a card's border, the timeline)
+            let probes: &[&str] = match tab {
+                DockTab::Activity => &["activity-fold-trust-link", "activity-job-card", "activity-timeline"],
+                DockTab::Model => &["model-dft-chip", "model-verdict", "model-fold-file"],
+                _ => &[],
+            };
+            for p in probes {
+                let r = probed_rect(p);
+                assert!(r.right() <= edge, "{tab:?} at {w}: {p} {r:?} past {edge}");
+            }
+        }
+    }
+}
+
+/// The toolbar's layouts fit their heights (`toolbar::HEIGHT`, `HEIGHT_COMPACT`): the bar ends at
+/// the window's bottom edge, full (1700 pt) and compact (1400 pt) — at 84 pt the full bar was laid
+/// out 3 pt below it — and `bars_height` names the heights the chrome laid out.
+#[test]
+fn the_toolbar_fits_the_window() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    for (w, h) in [(WIDE, toolbar::HEIGHT), (1400.0, toolbar::HEIGHT_COMPACT)] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let bar = probed_rect("toolbar-rect");
+        assert!((bar.bottom() - 900.0).abs() < 0.5 && (bar.height() - h).abs() < 0.5, "at {w}: {bar:?}");
+        assert_eq!(bars_height(&st, w).1, h, "at {w}");
+    }
+}

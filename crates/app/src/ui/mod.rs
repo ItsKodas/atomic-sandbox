@@ -790,6 +790,9 @@ pub struct UiState {
     /// The Model panel's folds that are open (`dock::model`; the profile's `model_sections`):
     /// Teach next and Health by default. Display state: not recorded.
     pub model_sections: dock::model::Sections,
+    /// The width (points) the toolbar's full layout needs, measured by its last frame
+    /// (`toolbar::show`; 0 before it): narrower, it is compact. Read by [`bars_height`].
+    pub toolbar_full_width: f32,
     /// The Activity panel's folds that are open (`activity::Sections`; the profile's
     /// `activity_sections`, with the Training fold's `activity.training_open`). Display state.
     pub activity_sections: activity::Sections,
@@ -1035,6 +1038,7 @@ impl UiState {
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
             model_sections: dock::model::Sections::default(),
+            toolbar_full_width: 0.0,
             activity_sections: activity::Sections::default(),
             orbital_sections: dock::orbitals::Sections::default(),
             knowledge_sections: knowledge::Sections::default(),
@@ -1376,6 +1380,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
     let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
+    probe_rect("toolbar-rect", bar_rect);
     activity::bar(root, st, input, bar_rect);
     let view = workspace::tree::show(root, st, input, &mut acts);
     out.view = Some(view);
@@ -1781,6 +1786,17 @@ pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()
     Some(())
 }
 
+/// The top bar's and the toolbar's heights (points) in a window `width` points wide: the layouts
+/// `show` picks at that width (the top bar compact below [`COMPACT_WIDTH`], the toolbar also below
+/// the width its full layout needs). The viewer's resize estimate (`Viewer::resize_viewport`)
+/// keeps the 3D view's margins from them.
+pub fn bars_height(st: &UiState, width: f32) -> (f32, f32) {
+    let compact = width < COMPACT_WIDTH;
+    let top = if compact { menus::TOP_BAR_COMPACT } else { menus::TOP_BAR };
+    let bottom = if compact || width < st.toolbar_full_width { toolbar::HEIGHT_COMPACT } else { toolbar::HEIGHT };
+    (top, bottom)
+}
+
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
 /// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`); 1–4
 /// pick the Tool segments ([`TOOL_KEYS`]).
@@ -2021,7 +2037,9 @@ fn box_advice_with(scene: &Scene, solvers: u64, budget: crate::quality::VramBudg
 }
 
 /// An energy's two grid cells in the chosen units (Ha and eV; the unused one blank).
-fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
+/// An energy's two grid cells in `units`; `stacked`: both units in the first cell, one under the
+/// other (a narrow panel: side by side they ran past its right edge).
+fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool, stacked: bool) {
     let t = |s: String| {
         let r = egui::RichText::new(s).monospace();
         if strong {
@@ -2038,6 +2056,14 @@ fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
         }
         EnergyUnits::Ev => {
             ui.label(t(format!("{ev:+.3} eV")));
+            ui.label("");
+        }
+        EnergyUnits::Both if stacked => {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(t(format!("{x:+.6} Ha")));
+                ui.label(t(format!("{ev:+.3} eV")));
+            });
             ui.label("");
         }
         EnergyUnits::Both => {

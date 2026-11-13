@@ -71,6 +71,15 @@ fn estimated_tip(gpu: bool) -> String {
     format!("a surrogate model fitted to this scene's DFT (teacher: the {teacher} solver), with a Bayesian uncertainty: it answers a step in ~10 µs when it is sure and hands the step to DFT when it is not. Without a model a sampling pass runs first.")
 }
 
+/// The toolbar's height (points), full and compact: what each layout's tallest group needs with
+/// the bar's 6 pt margins. The full layout's groups (caps line, 30 pt row, sub-line) need 75 pt
+/// inside them — measured: at 84 the full bar was laid out 3 pt below the window's bottom edge
+/// (its last pixels cut off, and the 3D view's bottom 3 pt off what a resize estimates,
+/// `ui::bars_height`); the compact one's single row fits 50. `the_toolbar_fits_the_window` pins
+/// both.
+pub const HEIGHT: f32 = 87.0;
+pub const HEIGHT_COMPACT: f32 = 50.0;
+
 /// Draws the toolbar and returns its rect (the progress bar sits on its top edge).
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) -> egui::Rect {
     // The full layout's fixed widths need `Widths::full` points (≈ 1584 with the fonts in use, the
@@ -78,9 +87,13 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     // the default 1400-pt window gets the compact one): on a window narrower than that (but above
     // the shared `COMPACT_WIDTH`) the toolbar takes its compact layout rather than running its
     // Solver group off the edge. The top bar keeps its own switch.
-    let compact = compact || root.available_width() < Widths::measure(root).full;
+    let full = Widths::measure(root).full;
+    // kept for the resize estimate (`ui::bars_height`): the viewer maps a cursor through the new
+    // viewport before the next frame lays the bars out
+    st.toolbar_full_width = full;
+    let compact = compact || root.available_width() < full;
     egui::Panel::bottom("toolbar")
-        .exact_size(if compact { 50.0 } else { 84.0 })
+        .exact_size(if compact { HEIGHT_COMPACT } else { HEIGHT })
         .resizable(false)
         .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(6, 6)).stroke(Stroke::new(1.0, theme::LINE)))
         .show(root, |ui| {
