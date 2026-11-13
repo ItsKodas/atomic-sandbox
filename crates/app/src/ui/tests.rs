@@ -5095,6 +5095,8 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // open-shell model (the energy half of C1): the energy RMS with the misfits counted
+        assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
         // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");

@@ -1,6 +1,6 @@
 # One model for radicals and closed shells (2026-11-13)
 
-Status: design, awaiting the user's approval. Measurements behind it: `crates/validate/references.md`
+Status: implemented (branch `claude/charming-keller-0bc26b`, merged 2026-11-14; approved by the user 2026-11-13, §4.3 amended by the user's C1 and energy-half decisions). Measurements behind it: `crates/validate/references.md`
 "Why the collection fails its residuals at every refit" and "Raising the body-4 degree" (2026-11-12).
 
 ## 1. Intent
