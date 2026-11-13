@@ -8485,6 +8485,8 @@ mod updates {
         let inp = input(&scene, None, &cam);
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
+        // the fixture's oldest release, not this build's version (the panel's title names it)
+        st.update.current = ver("0.1.0");
         st.update.releases = releases();
         st.update.open = true;
         assert_eq!(st.update.channel, Channel::Stable, "Stable by default");

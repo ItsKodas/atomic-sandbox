@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "app"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "egui",
  "egui-wgpu",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "gpu"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "bytemuck",
  "gpu",
@@ -2544,7 +2544,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "providers"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "gpu",
  "nalgebra",
@@ -2564,7 +2564,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qm"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "approx",
  "libm",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "qm-gpu"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "bytemuck",
  "gpu",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "approx",
  "bytemuck",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "sim"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "approx",
  "gpu",
@@ -3264,7 +3264,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surrogate"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "rand 0.8.8",
  "units",
@@ -3564,7 +3564,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "units"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "approx",
 ]
@@ -3628,7 +3628,7 @@ dependencies = [
 
 [[package]]
 name = "validate"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "approx",
  "gpu",
