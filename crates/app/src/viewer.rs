@@ -1036,7 +1036,6 @@ impl Viewer {
             // paused already: the mirror is the driver's state; playing: read after the Pause lands
             let base = if resume { Vec::new() } else { set.iter().map(|&i| (i, self.scene.nuclei[i].pos)).collect() };
             self.tool.gizmo = Some(tools::GizmoDrag { handle: h, base, centre: c, start, resume, delta: [0.0; 3], start_angle, angle: 0.0 });
-            self.ui.auto_bonds.drag_started();
         } else if let Some(i) = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei) {
             if self.mouse.shift {
                 let mut g = set;
@@ -1180,10 +1179,6 @@ impl Viewer {
         if let Some(g) = self.tool.gizmo.take() {
             if g.resume && !self.playing {
                 self.send(Command::Dyn(DynCommand::Play));
-            }
-            // a handle that moved the group: the bonds a second later (`ui::auto_bonds`)
-            if g.delta != [0.0; 3] || g.angle != 0.0 {
-                self.ui.auto_bonds.drag_ended(Instant::now());
             }
         }
         if let Some(a) = self.tool.boxing.take() {
@@ -1364,8 +1359,6 @@ impl Viewer {
         self.tool.dragging = true;
         self.tool.spring = false;
         self.tool.drag_plane = Some(plane);
-        self.tool.drag_moved = false;
-        self.ui.auto_bonds.drag_started();
     }
 
     /// One motion event of the current Select-drag: the position is clamped into the cell
@@ -1376,22 +1369,16 @@ impl Viewer {
         };
         let pos = tools::clamp_into_cell(pos, &self.scene);
         for c in tools::drag_commands(&mut self.tool.spring, self.playing, index, pos) {
-            self.tool.drag_moved = true;
             self.send(c);
         }
     }
 
     /// Ends the Select-drag: button release, focus loss or the cursor leaving the window
-    /// (`DragEnd` if the spring is active). A drag that moved its nucleus arms the refresh of the
-    /// bonds a second later (`ui::auto_bonds`).
+    /// (`DragEnd` if the spring is active).
     pub fn end_drag(&mut self) {
         if self.tool.dragging && self.tool.spring {
             self.send(Command::Dyn(DynCommand::DragEnd));
         }
-        if self.tool.dragging && self.tool.drag_moved {
-            self.ui.auto_bonds.drag_ended(Instant::now());
-        }
-        self.tool.drag_moved = false;
         self.tool.dragging = false;
         self.tool.spring = false;
         self.tool.drag_plane = None;
