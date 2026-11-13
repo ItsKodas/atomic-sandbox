@@ -18,10 +18,11 @@
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
 //! | `.lock` | the owning process id while a writer has it open |
 //! | `samples.bin.dropped-<n>` | the bytes a damaged tail held, set aside when it was cut (never deleted) |
+//! | `samples.bin.bak` | the samples file as it was before the last purge ([`Collection::purge`]; replaced by the next purge) |
 //!
 //! `references.txt` and `history.bin` are rewritten whole through a temporary file renamed into
 //! place; `samples.bin` is only ever appended to (or cut back to its last whole record after a
-//! crash, below).
+//! crash, below) — except by the user's **purge** of forgotten samples (below), which rewrites it.
 //!
 //! # `samples.bin` records
 //!
@@ -66,6 +67,40 @@
 //! An append that fails part-way without a crash (disk full, an I/O error) cuts the file back to
 //! the last whole record before it returns the error, so a partial record never sits in front of
 //! later appends; if even that cut fails, the handle turns read-only.
+//!
+//! # Purging forgotten samples (2026-11-14, the Model tab's "Purge forgotten (N)…")
+//!
+//! [`Collection::purge`] deletes samples the user forgot ([`crate::quarantine::is_forgotten_code`])
+//! from `samples.bin` for good. **Sample ids are positional** — a sample is its index in file order,
+//! and a status record names its sample by that index — so a purge **renumbers**: every later
+//! sample moves down by the number of purged samples before it, and the purge returns the old → new
+//! map ([`PurgeOutcome::map`]) for whoever holds indices (the provider remaps its store, links,
+//! fences, the misfit set, the leave-one-out rows and the rest from it). Stable ids stored in the
+//! records were weighed and not taken: every reader, the provider's store and the sidecar index
+//! samples by position, and a new record version would make every older build refuse the
+//! collection. Nothing else on disk names a sample by index: `history.bin` holds audit points (no
+//! sample ids), `references.txt` references, `bond_experience.txt` bond examples, `README.txt`
+//! counts (rewritten after the purge).
+//!
+//! The rewrite, under the collection's lock (a handle without it — another live process holds
+//! `.lock` — is refused, nothing written):
+//!
+//! 1. the new file is built in memory from the current one, record by record: the magic and the
+//!    header as they are, every kept sample record **byte for byte**, every status record of a kept
+//!    sample with its index remapped (byte for byte when the index did not move), the purged
+//!    samples' records and their status records left out; it is parsed back and checked against
+//!    the kept samples and codes before anything is written;
+//! 2. it is written to `samples.bin.new`, flushed and synced;
+//! 3. the current file is written to `samples.bin.bak.new` (synced) and renamed over
+//!    `samples.bin.bak` (an older backup is replaced) — a copy, not a rename of `samples.bin`, so
+//!    `samples.bin` exists at every instant: a crash between two renames would leave none, and the
+//!    next open would start an empty collection;
+//! 4. `samples.bin.new` is renamed over `samples.bin` (one atomic replace).
+//!
+//! A failure at any step before 4 leaves `samples.bin` exactly as it was (the `.new` files are
+//! removed); after 4 the purge is done. The in-memory samples, codes and fingerprints follow only
+//! when the rename succeeded. A read-only handle of another process that was open meanwhile keeps
+//! its old view (it never writes) until it reopens.
 //!
 //! # Admission (spec §4.2, controller rulings P3/P5 of Task 3)
 //!
@@ -160,6 +195,22 @@ pub const REFUSE_DUPLICATE: &str = "an identical teacher answer is already in th
 pub const REFUSE_LONE: &str = "lone atoms (no atom has a neighbour within the model's cutoff — nothing to learn)";
 /// The refusal of an imported `SampleTag::Reference` sample (module doc, "References").
 pub const REFUSE_REFERENCE_SAMPLE: &str = "an isolated-atom reference solve: a collection keeps its references in references.txt, with their box";
+
+/// The backup a purge leaves of the samples file (module doc, "Purging forgotten samples").
+pub const PURGE_BACKUP: &str = "samples.bin.bak";
+/// The refusal of a purge by a handle without the lock (another live process holds it).
+pub const REFUSE_PURGE_LOCKED: &str = "another copy of the app has this collection open — close it first";
+
+/// What [`Collection::purge`] did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PurgeOutcome {
+    /// Samples deleted.
+    pub purged: usize,
+    /// Per sample index before the purge: its index after it, `None` for a purged one.
+    pub map: Vec<Option<usize>>,
+    /// The backup of the samples file as it was (`None` when nothing was purged and nothing written).
+    pub backup: Option<PathBuf>,
+}
 
 /// One isolated-atom reference of a collection (module doc, "References"): the energy (Hartree),
 /// the box it was solved in (grid points per side; always `Some` for a stored reference — it is
@@ -266,6 +317,10 @@ pub struct Collection {
     /// Test hook: the next record write stops after this many bytes with an error.
     #[cfg(test)]
     fail_next_write: Option<usize>,
+    /// Test hook: the next purge fails right before this step (2, 3, 4 of the module doc, or 5
+    /// for the final rename itself).
+    #[cfg(test)]
+    pub(crate) fail_purge_before: Option<u8>,
 }
 
 /// What [`Collection::open`] found.
@@ -679,6 +734,61 @@ fn parse(bytes: &[u8], key: &SurfaceKey) -> Result<Parsed, String> {
     Ok(out)
 }
 
+/// `samples.bin`'s whole records (`bytes`, magic included) without the samples `map` purges
+/// (module doc, "Purging forgotten samples"): the magic, the header and every kept sample record
+/// byte for byte; every kept sample's status record with its index remapped (byte for byte when it
+/// did not move); a purged sample's records left out.
+fn rewrite_without(bytes: &[u8], map: &[Option<usize>]) -> Result<Vec<u8>, String> {
+    if bytes.len() < MAGIC.len() || &bytes[..8] != MAGIC {
+        return Err("not a collection (bad magic)".into());
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(MAGIC);
+    let (mut at, mut sample) = (8usize, 0usize);
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if rest.len() < 8 {
+            return Err("a record is cut short".into());
+        }
+        let len = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
+        if len > MAX_RECORD || 8 + len > rest.len() || len < 2 {
+            return Err("a record is cut short".into());
+        }
+        let payload = &rest[8..8 + len];
+        if crc32(payload) != u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes")) {
+            return Err("a record's checksum fails (the file changed on disk)".into());
+        }
+        let whole = &rest[..8 + len];
+        match payload[0] {
+            REC_HEADER => out.extend_from_slice(whole),
+            REC_SAMPLE => {
+                let m = map.get(sample).ok_or("the file holds more samples than this handle read")?;
+                if m.is_some() {
+                    out.extend_from_slice(whole);
+                }
+                sample += 1;
+            }
+            REC_STATUS => {
+                let mut c = Cursor { b: payload, at: 2 };
+                let i = c.u64("sample index")? as usize;
+                let code = c.u8("code")?;
+                c.done()?;
+                match map.get(i).ok_or_else(|| format!("a status for sample {i} past the samples read"))? {
+                    Some(j) if *j == i => out.extend_from_slice(whole),
+                    Some(j) => out.extend_from_slice(&status_record(*j, code)),
+                    None => {}
+                }
+            }
+            k => return Err(format!("record kind {k} is not one this build writes")),
+        }
+        at += 8 + len;
+    }
+    if sample != map.len() {
+        return Err(format!("the file holds {sample} samples, this handle {}", map.len()));
+    }
+    Ok(out)
+}
+
 /// The identity of a sample for duplicate detection: Z and the exact bits of positions, energy
 /// and forces.
 fn fingerprint(s: &Sample) -> u64 {
@@ -916,6 +1026,8 @@ impl Collection {
             good_len,
             #[cfg(test)]
             fail_next_write: None,
+            #[cfg(test)]
+            fail_purge_before: None,
         };
         Ok((c, report))
     }
@@ -1073,6 +1185,8 @@ impl Collection {
             good_len: self.good_len,
             #[cfg(test)]
             fail_next_write: None,
+            #[cfg(test)]
+            fail_purge_before: None,
         }
     }
 
@@ -1085,6 +1199,142 @@ impl Collection {
         self.write_record(&status_record(index, code))?;
         self.quarantine[index] = code;
         Ok(())
+    }
+
+    /// The process holding the lock when this handle opened read-only for it (`None`: this handle
+    /// owns the lock, or turned read-only after a failed write).
+    pub fn locked_by(&self) -> Option<u32> {
+        self.locked_by
+    }
+
+    /// Whether [`purge`](Self::purge) may run on this handle: `None`, or why not (another process
+    /// holds the lock — [`REFUSE_PURGE_LOCKED`] —, or a write failed and the handle is read-only).
+    pub fn purge_refusal(&self) -> Option<String> {
+        if self.locked_by.is_some() {
+            return Some(REFUSE_PURGE_LOCKED.to_string());
+        }
+        self.writable().err()
+    }
+
+    /// **Purges** samples `indices` — each one the user forgot ([`crate::quarantine::is_forgotten_code`])
+    /// — from `samples.bin` for good, atomically, keeping a backup (module doc, "Purging forgotten
+    /// samples"). The kept samples are renumbered: the outcome's `map` says where each went. `Err`,
+    /// nothing changed on disk or in memory: the lock is another process's, an index is out of range
+    /// or not forgotten, or a step of the rewrite failed. An empty `indices` writes nothing.
+    pub fn purge(&mut self, indices: &[usize]) -> Result<PurgeOutcome, String> {
+        if let Some(why) = self.purge_refusal() {
+            return Err(why);
+        }
+        let n = self.samples.len();
+        let mut gone = vec![false; n];
+        for &i in indices {
+            let Some(&code) = self.quarantine.get(i) else {
+                return Err(format!("no sample {i} (the collection holds {n})"));
+            };
+            if !crate::quarantine::is_forgotten_code(code) {
+                return Err(format!("sample {i} is not forgotten (code {code}): only forgotten samples are purged"));
+            }
+            gone[i] = true;
+        }
+        let mut map = Vec::with_capacity(n);
+        let mut next = 0usize;
+        for &g in &gone {
+            if g {
+                map.push(None);
+            } else {
+                map.push(Some(next));
+                next += 1;
+            }
+        }
+        let purged = n - next;
+        if purged == 0 {
+            return Ok(PurgeOutcome { purged: 0, map, backup: None });
+        }
+        let path = self.folder.join("samples.bin");
+        let old = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if (old.len() as u64) < self.good_len {
+            return Err(format!("{}: the file is shorter than the records this handle wrote — reopen the collection", path.display()));
+        }
+        // 1. the new file, checked before anything is written
+        let new = rewrite_without(&old[..self.good_len as usize], &map).map_err(|e| format!("{}: {e}; nothing was changed", path.display()))?;
+        let kept: Vec<CollectionSample> = self.samples.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(s, _)| s.clone()).collect();
+        let kept_codes: Vec<u8> = self.quarantine.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(&q, _)| q).collect();
+        let check = parse(&new, &self.key).map_err(|e| format!("the rewritten samples file does not read back ({e}); nothing was changed"))?;
+        if check.samples != kept || check.quarantine != kept_codes || check.good_len != new.len() {
+            return Err("the rewritten samples file does not hold exactly the kept samples and codes; nothing was changed".into());
+        }
+        #[cfg(test)]
+        let fail = self.fail_purge_before.take();
+        #[cfg(not(test))]
+        let fail: Option<u8> = None;
+        let injected = |step: u8| -> io::Result<()> {
+            if fail == Some(step) {
+                Err(io::Error::other(format!("injected failure before step {step}")))
+            } else {
+                Ok(())
+            }
+        };
+        let (tmp, bak, bak_tmp) = (self.folder.join("samples.bin.new"), self.folder.join(PURGE_BACKUP), self.folder.join("samples.bin.bak.new"));
+        // 2.–3. the new file and the backup, each synced
+        let staged = (|| -> io::Result<()> {
+            injected(2)?;
+            let mut f = File::create(&tmp)?;
+            f.write_all(&new)?;
+            f.flush()?;
+            f.sync_all()?;
+            drop(f);
+            injected(3)?;
+            let mut b = File::create(&bak_tmp)?;
+            b.write_all(&old)?;
+            b.flush()?;
+            b.sync_all()?;
+            drop(b);
+            std::fs::rename(&bak_tmp, &bak)?;
+            injected(4)
+        })();
+        if let Err(e) = staged {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&bak_tmp);
+            return Err(format!("{}: the purge stopped ({e}); samples.bin is unchanged", self.folder.display()));
+        }
+        // 4. the one atomic replace (the append handle is closed first: nothing holds the old file)
+        self.file = None;
+        let renamed = injected(5).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = renamed {
+            let _ = std::fs::remove_file(&tmp);
+            self.file = OpenOptions::new().write(true).open(&path).ok();
+            if self.file.is_none() {
+                self.read_only = true;
+            }
+            return Err(format!("{}: the purge stopped ({e}); samples.bin is unchanged", path.display()));
+        }
+        let reopened = OpenOptions::new().write(true).open(&path);
+        self.apply_purge(kept, kept_codes, new.len());
+        match reopened {
+            Ok(f) => self.file = Some(f),
+            Err(e) => {
+                // the purge is on disk; only further writes need a reopen
+                self.read_only = true;
+                return Err(format!("{}: purged {purged} samples, but the file could not be reopened for appending ({e}): the collection is read-only until reopened", path.display()));
+            }
+        }
+        let _ = self.write_readme();
+        Ok(PurgeOutcome { purged, map, backup: Some(bak) })
+    }
+
+    /// The in-memory side of a purge that reached the disk.
+    fn apply_purge(&mut self, kept: Vec<CollectionSample>, codes: Vec<u8>, len: usize) {
+        self.seen = kept.iter().map(|s| fingerprint(&s.sample)).collect();
+        self.geometries = kept.iter().map(|s| geometry_print(&s.sample.z, &s.sample.pos)).collect();
+        self.samples = kept;
+        self.quarantine = codes;
+        self.good_len = len as u64;
+    }
+
+    /// Purges every sample the user forgot ([`purge`](Self::purge) of all of them).
+    pub fn purge_forgotten(&mut self) -> Result<PurgeOutcome, String> {
+        let all: Vec<usize> = (0..self.samples.len()).filter(|&i| crate::quarantine::is_forgotten_code(self.quarantine[i])).collect();
+        self.purge(&all)
     }
 
     /// Sets the reference of `z` in its box (`r.grid_n`, required) as given (no rule applied:
@@ -1745,6 +1995,150 @@ mod tests {
         assert!(!rd.locked_by_other && !d.read_only, "{rd:?}");
         assert!(rd.notes.iter().any(|n| n.contains("stale")), "{:?}", rd.notes);
         assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), std::process::id().to_string());
+    }
+
+    /// The frames of `samples.bin` after the magic: (kind, the whole record's bytes).
+    fn frames(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut at = 8;
+        while at < bytes.len() {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            out.push((bytes[at + 8], bytes[at..at + 8 + len].to_vec()));
+            at += 8 + len;
+        }
+        out
+    }
+
+    /// A collection of 8 samples with a status history: 2 and 5 forgotten, 3 held, 6 superseded
+    /// (and 1 held, then released: a status record that names a kept sample whose index moves).
+    fn purge_fixture(dir: &Path, key: &SurfaceKey) {
+        let (mut c, _) = Collection::open(dir, key).unwrap();
+        for i in 0..8 {
+            c.append(cs(i)).unwrap();
+        }
+        c.set_status(1, Q_HELD).unwrap();
+        c.set_status(2, crate::quarantine::Q_FORGOTTEN).unwrap();
+        c.set_status(3, Q_HELD).unwrap();
+        c.set_status(5, crate::quarantine::Q_FORGOTTEN).unwrap();
+        c.set_status(6, Q_SUPERSEDED).unwrap();
+        c.set_status(1, Q_NONE).unwrap();
+        c.set_reference(1, CollectionReference { energy: -0.478, grid_n: Some(49), face_density: Some(1e-9) }).unwrap();
+        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
+        c.save_history().unwrap();
+    }
+
+    /// The purge (module doc, "Purging forgotten samples"): exactly the forgotten samples go; every
+    /// other sample record is byte-identical, the kept samples' statuses follow them to their new
+    /// index (a status whose index did not move is byte-identical), the references and the history
+    /// are untouched, the backup holds the old file byte for byte and a second purge replaces it;
+    /// appends follow the rewritten file and a reopen reads the same.
+    #[test]
+    fn a_purge_removes_exactly_the_forgotten_samples_and_renumbers_the_rest() {
+        use crate::quarantine::Q_FORGOTTEN;
+        let dir = root("purge");
+        let key = prov().surface_key();
+        purge_fixture(&dir, &key);
+        let path = samples_path(&dir, &key);
+        let folder = dir.join(key.slug());
+        let before = std::fs::read(&path).unwrap();
+        let (refs, hist) = (std::fs::read(folder.join("references.txt")).unwrap(), std::fs::read(folder.join("history.bin")).unwrap());
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE, Q_FORGOTTEN, Q_HELD, Q_NONE, Q_FORGOTTEN, Q_SUPERSEDED, Q_NONE]);
+        // only forgotten samples may be purged
+        assert!(c.purge(&[3]).unwrap_err().contains("not forgotten"), "a held sample is the trust system's, not the user's");
+        assert!(c.purge(&[8]).unwrap_err().contains("no sample 8"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a refused purge writes nothing");
+        let out = c.purge_forgotten().unwrap();
+        assert_eq!(out.purged, 2);
+        assert_eq!(out.map, vec![Some(0), Some(1), None, Some(2), Some(3), None, Some(4), Some(5)]);
+        assert_eq!(out.backup.as_deref(), Some(folder.join(PURGE_BACKUP).as_path()));
+        assert_eq!(std::fs::read(folder.join(PURGE_BACKUP)).unwrap(), before, "the backup is the old file, byte for byte");
+        let kept: Vec<CollectionSample> = [0, 1, 3, 4, 6, 7].into_iter().map(cs).collect();
+        assert_eq!(c.samples, kept);
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE, Q_HELD, Q_NONE, Q_SUPERSEDED, Q_NONE], "the kept codes follow their samples");
+        assert!(!c.holds_answer(&h2(2)) && c.holds_answer(&h2(3)), "the fingerprints follow the purge");
+        assert!(!folder.join("samples.bin.new").exists() && !folder.join("samples.bin.bak.new").exists());
+        // record by record: every kept sample record byte-identical, in order
+        let (old_f, new_f) = (frames(&before), frames(&std::fs::read(&path).unwrap()));
+        let samples = |f: &[(u8, Vec<u8>)]| f.iter().filter(|r| r.0 == REC_SAMPLE).map(|r| r.1.clone()).collect::<Vec<_>>();
+        let old_s = samples(&old_f);
+        assert_eq!(samples(&new_f), [0, 1, 3, 4, 6, 7].into_iter().map(|i| old_s[i].clone()).collect::<Vec<_>>());
+        assert_eq!(new_f[0], old_f[0], "the header is the same record");
+        // statuses: 1 held / 1 released stay byte-identical (index 1 did not move); 3 → 2, 6 → 4 rewritten; 2 and 5's gone
+        let statuses: Vec<Vec<u8>> = new_f.iter().filter(|r| r.0 == REC_STATUS).map(|r| r.1.clone()).collect();
+        assert_eq!(statuses, vec![status_record(1, Q_HELD), status_record(2, Q_HELD), status_record(4, Q_SUPERSEDED), status_record(1, Q_NONE)]);
+        assert_eq!(std::fs::read(folder.join("references.txt")).unwrap(), refs);
+        assert_eq!(std::fs::read(folder.join("history.bin")).unwrap(), hist);
+        assert!(std::fs::read_to_string(folder.join("README.txt")).unwrap().contains("6 samples:"), "the README is rewritten");
+        // the handle appends after the rewritten records
+        c.append(cs(8)).unwrap();
+        c.set_status(5, crate::quarantine::Q_FORGOTTEN).unwrap(); // cs(7), now at 5
+        drop(c);
+        let (mut c, r) = Collection::open(&dir, &key).unwrap();
+        assert_eq!((r.samples, r.dropped_tail), (7, 0), "{r:?}");
+        assert_eq!(c.samples, [0, 1, 3, 4, 6, 7, 8].into_iter().map(cs).collect::<Vec<_>>());
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE, Q_HELD, Q_NONE, Q_SUPERSEDED, Q_FORGOTTEN, Q_NONE]);
+        assert_eq!(c.history.len(), 1);
+        // a second purge replaces the older backup
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!(c.purge_forgotten().unwrap().purged, 1);
+        assert_eq!(std::fs::read(folder.join(PURGE_BACKUP)).unwrap(), second, "the older backup is replaced");
+        // nothing forgotten: nothing written
+        let now = std::fs::read(&path).unwrap();
+        let none = c.purge_forgotten().unwrap();
+        assert_eq!((none.purged, none.backup.is_none()), (0, true));
+        assert_eq!(std::fs::read(&path).unwrap(), now);
+    }
+
+    /// A handle without the lock (another live holder — here a second handle in this process, the
+    /// same rule as another process) is refused with the user's words, nothing changed.
+    #[test]
+    fn a_purge_without_the_lock_is_refused() {
+        let dir = root("purge-lock");
+        let key = prov().surface_key();
+        purge_fixture(&dir, &key);
+        let path = samples_path(&dir, &key);
+        let before = std::fs::read(&path).unwrap();
+        let (_writer, _) = Collection::open(&dir, &key).unwrap();
+        let (mut reader, r) = Collection::open(&dir, &key).unwrap();
+        assert!(r.locked_by_other && reader.read_only);
+        assert_eq!(reader.purge_refusal().as_deref(), Some(REFUSE_PURGE_LOCKED));
+        assert_eq!(reader.purge_forgotten().unwrap_err(), REFUSE_PURGE_LOCKED);
+        assert_eq!(reader.samples.len(), 8);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+        assert!(!dir.join(key.slug()).join(PURGE_BACKUP).exists());
+    }
+
+    /// A failure at any step before the final rename — injected — leaves `samples.bin` byte for byte
+    /// as it was and loadable, the handle unchanged and still appending; no `.new` file is left.
+    #[test]
+    fn a_purge_that_fails_before_the_final_rename_leaves_the_original() {
+        let dir = root("purge-fail");
+        let key = prov().surface_key();
+        purge_fixture(&dir, &key);
+        let path = samples_path(&dir, &key);
+        let folder = dir.join(key.slug());
+        let before = std::fs::read(&path).unwrap();
+        for step in [2u8, 3, 4, 5] {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            c.fail_purge_before = Some(step);
+            let e = c.purge_forgotten().unwrap_err();
+            assert!(e.contains("injected") && e.contains("unchanged"), "step {step}: {e}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "step {step}: the original stands");
+            assert!(!folder.join("samples.bin.new").exists() && !folder.join("samples.bin.bak.new").exists(), "step {step}");
+            assert_eq!(c.samples.len(), 8, "step {step}: nothing changed in memory");
+            drop(c);
+            let (c, r) = Collection::open(&dir, &key).unwrap();
+            assert_eq!((r.samples, r.dropped_tail), (8, 0), "step {step}: loadable");
+            assert_eq!(c.samples, (0..8).map(cs).collect::<Vec<_>>());
+        }
+        // the handle that failed still appends after its records
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        c.fail_purge_before = Some(5);
+        assert!(c.purge_forgotten().is_err());
+        c.append(cs(9)).unwrap();
+        drop(c);
+        assert_eq!(Collection::open(&dir, &key).unwrap().0.samples.len(), 9);
     }
 
     /// Writes `set` as a version-6 file.

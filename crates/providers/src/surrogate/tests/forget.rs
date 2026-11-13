@@ -316,7 +316,7 @@ fn forget_and_restore_on_a_read_only_collection_say_this_session_only() {
 }
 
 /// A model over a fresh shared collection in `dir`: 40 H₂ samples and the H reference, fitted.
-fn small_collection(dir: &std::path::Path) -> (SurrogateKs, surrogate::SurfaceKey) {
+pub(super) fn small_collection(dir: &std::path::Path) -> (SurrogateKs, surrogate::SurfaceKey) {
     let (mut s, _) = pair_student();
     s.attach_collection(dir, &h2(1.4)).unwrap();
     s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));

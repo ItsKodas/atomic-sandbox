@@ -443,6 +443,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().forgotten_samples()
     }
 
+    fn purge_forgotten(&mut self) -> Result<crate::provider::PurgeReport, String> {
+        self.lock().purge_forgotten()
+    }
+
+    fn purge_refusal(&self) -> Option<String> {
+        self.lock().purge_refusal()
+    }
+
     fn fitted(&self) -> bool {
         Trainable::fitted(&*self.lock())
     }

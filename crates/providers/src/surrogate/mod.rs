@@ -818,6 +818,9 @@
 //! forgotten, so an agreeing teacher answer next to it — where nothing is released or superseded —
 //! is an ordinary one: thinned and copy-checked like an envelope (rule 5) fallback's (`admit`; final review
 //! I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`), not a new sample at every step.
+//! **Purge** (2026-11-14, `purge_forgotten`, the `purge` module doc): deletes the forgotten samples
+//! for good — from the store and the shared collection's file — once the refit after the last
+//! Forget has run; no refit, the fit bitwise unchanged, every index the provider holds remapped.
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
@@ -1144,6 +1147,7 @@ mod knowledge;
 mod ledger;
 mod lone;
 mod policy;
+mod purge;
 mod quarantine;
 mod shared;
 pub use shared::COLLECTION_CHECKPOINT_PREFIX;
@@ -3253,6 +3257,14 @@ impl Trainable for SurrogateKs {
 
     fn forgotten_samples(&self) -> Vec<sim::SampleSuspect> {
         SurrogateKs::forgotten_samples(self)
+    }
+
+    fn purge_forgotten(&mut self) -> Result<sim::PurgeReport, String> {
+        SurrogateKs::purge_forgotten(self)
+    }
+
+    fn purge_refusal(&self) -> Option<String> {
+        SurrogateKs::purge_refusal(self)
     }
 
     fn set_audit_every(&mut self, n: usize) {

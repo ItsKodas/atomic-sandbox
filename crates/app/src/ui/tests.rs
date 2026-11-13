@@ -212,6 +212,8 @@ pub(crate) fn model() -> ModelStatus {
         lone_note: None,
         collections: false,
         last_import: None,
+        purge_refusal: None,
+        last_purge: None,
         use_collection: false,
         source_is_autosave: false,
         specialised: Vec::new(),
@@ -1323,6 +1325,110 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
         assert!(t.contains(why), "{why}: {t}");
         assert!(!t.contains("#1804"), "{t}");
     }
+}
+
+/// 2026-11-14: "Purge forgotten (N)…" in the forgotten list's header — hidden with nothing
+/// forgotten; a click opens the inline confirmation (nothing sent); Cancel closes it and sends
+/// nothing; Purge sends exactly `Command::PurgeForgotten`, recorded as `# not replayable:
+/// purge-forgotten` (a replay skips it); disabled with the provider's reason or during a pass; the
+/// outcome goes to the status line once.
+#[test]
+fn purge_forgotten_needs_its_inline_confirmation() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let base = ModelStatus { suspects: vec![suspect(1804, "HO", "fallback", Some(38.46))], ..model() };
+    let with = ModelStatus { forgotten_samples: vec![suspect(40, "H2", "audit", None), suspect(41, "H2", "audit", None)], forgotten: 2, ..base.clone() };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let reveal = |st: &mut UiState, inp: &PanelInput<'_>| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, inp, 1400.0, vec![]);
+        }
+    };
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let acted = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.actions.clone()).collect::<Vec<_>>();
+    // nothing forgotten: no button
+    let snap = snapshot(&scene, Backend::Estimated, Some(base.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    assert!(!texts(&ctx, &mut st, &inp).contains("Purge forgotten"), "hidden at N = 0");
+    // two forgotten: the button; its click only opens the confirmation
+    let snap = snapshot(&scene, Backend::Estimated, Some(with.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Purge forgotten (2)…"), "{t}");
+    let confirm = super::dock::model::purge_confirm_text(2);
+    assert!(confirm.starts_with("Delete 2 forgotten samples from the shared collection for good?") && confirm.contains("samples.bin.bak (replacing an older backup)") && confirm.ends_with("This can't be undone from the app."), "{confirm}");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "the first click sends nothing");
+    assert!(st.purge_confirm);
+    assert!(texts(&ctx, &mut st, &inp).contains(&confirm[..60]), "the confirmation shows");
+    // Cancel: nothing sent, the confirmation closes
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-cancel");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "Cancel sends nothing");
+    assert!(!st.purge_confirm);
+    assert!(!texts(&ctx, &mut st, &inp).contains(&confirm[..60]));
+    // Purge: exactly the command
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-confirm");
+    assert!(matches!(sent(&outs).as_slice(), [Command::PurgeForgotten]), "{:?}", sent(&outs));
+    assert!(matches!(acted(&outs).as_slice(), [Action::PurgeForgotten]));
+    assert!(!st.purge_confirm);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::PurgeForgotten), Some("purge-forgotten"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::PurgeForgotten));
+    assert!(line.starts_with("# not replayable: purge-forgotten"), "{line}");
+    // disabled with the provider's reason: a click opens nothing
+    let refused = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(refused));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && !st.purge_confirm, "disabled");
+    // the outcome on the status line, once
+    let report = sim::PurgeReport { purged: 2, from_collection: 2, backup: Some(std::path::PathBuf::from("models/collections/x/samples.bin.bak")) };
+    let done = ModelStatus { forgotten_samples: Vec::new(), forgotten: 0, last_purge: Some((1, Ok(report))), ..base.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(done));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "purged 2 forgotten samples (backup: samples.bin.bak)");
+    st.set_status("something else");
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "something else", "shown once");
+    let failed = ModelStatus { last_purge: Some((2, Err(surrogate_refusal()))), ..base };
+    let snap = snapshot(&scene, Backend::Estimated, Some(failed));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, format!("purge forgotten samples refused: {}", surrogate_refusal()));
+}
+
+fn surrogate_refusal() -> String {
+    "another copy of the app has this collection open — close it first".into()
 }
 
 /// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and

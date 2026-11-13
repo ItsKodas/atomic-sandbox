@@ -414,6 +414,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SaveSpecialised(_) => "specialised",
         Action::ForgetSample(_) => "forget-sample",
         Action::RestoreSample(_) => "restore-sample",
+        Action::PurgeForgotten => "purge-forgotten",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
@@ -434,8 +435,10 @@ fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
     // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
     // nor an import of data folders (it copies files into the installed build's root; a replay never does),
-    // nor the updater's check, download and restart (a replay never touches the network or installs)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
+    // nor the updater's check, download and restart (a replay never touches the network or installs),
+    // nor a purge of forgotten samples (like the data import, it rewrites files on disk; the fit and
+    // every prediction stand unchanged, so the replayed run does not diverge)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update" | "purge-forgotten")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

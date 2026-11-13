@@ -1136,6 +1136,23 @@ pub trait Trainable {
     fn forgotten_samples(&self) -> Vec<SampleSuspect> {
         Vec::new()
     }
+    /// **Purges** every sample the user forgot, for good (the Model tab's "Purge forgotten (N)…"):
+    /// deleted from the model's samples and, when they are in the attached shared collection, from
+    /// its samples file (rewritten atomically, the old file kept as `samples.bin.bak`). Only
+    /// forgotten samples go — never held, superseded, box-affected or draft ones. The fit stands
+    /// unchanged (forgotten samples are already out of it): no refit. Sample ids are positional, so
+    /// every later sample is renumbered — a [`SampleId`] taken before the purge is refused after it.
+    /// `Err` with the reason, nothing changed ([`purge_refusal`](Self::purge_refusal)'s reasons, a
+    /// failed write). The default refuses.
+    fn purge_forgotten(&mut self) -> Result<PurgeReport, String> {
+        Err("this provider does not learn".into())
+    }
+    /// Why [`purge_forgotten`](Self::purge_forgotten) would be refused now (`None`: it may run):
+    /// nothing forgotten, a pass or a refit running, the refit after a Forget not run yet, another
+    /// copy of the app holding the collection's lock. The default: it does not learn.
+    fn purge_refusal(&self) -> Option<String> {
+        Some("this provider does not learn".into())
+    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1350,6 +1367,18 @@ pub struct ImportSummary {
     pub imported: usize,
     pub refused: Vec<(Option<usize>, String)>,
     pub notes: Vec<String>,
+}
+
+/// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PurgeReport {
+    /// Forgotten samples deleted in all.
+    pub purged: usize,
+    /// Of them, deleted from the shared collection's samples file.
+    pub from_collection: usize,
+    /// The collection's backup of its samples file as it was before (`None` without a collection
+    /// write).
+    pub backup: Option<std::path::PathBuf>,
 }
 
 /// A teach-around offer (`TrainableStatus::teach_offer`).

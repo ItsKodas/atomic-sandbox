@@ -56,6 +56,12 @@ pub const Q_DRAFT: u8 = 4;
 /// - A newer build reads every older file and collection as before: code 7 never appears in them.
 pub const Q_FORGOTTEN: u8 = 7;
 
+/// Whether `code` marks a sample the user forgot ([`Q_FORGOTTEN`]): what a purge deletes
+/// (`crate::collection`, "Purging forgotten samples").
+pub fn is_forgotten_code(code: u8) -> bool {
+    code == Q_FORGOTTEN
+}
+
 /// Whether `code` is one a file or a collection may hold ([`Q_NONE`]…[`Q_BOX`] and
 /// [`Q_FORGOTTEN`]; [`Q_DRAFT`] is carried by the sample's tag, 5 and 6 are the provider's own).
 pub fn is_persisted_code(code: u8) -> bool {

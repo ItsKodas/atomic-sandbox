@@ -46,6 +46,19 @@ struct VerdictKey {
     policy: FallbackPolicy,
 }
 
+impl StrictVerdict {
+    /// A purge (`purge` module): the recorded codes follow the kept samples, so the verdict still
+    /// stands for the same fit and fences.
+    pub(super) fn retain_samples(&mut self, keep: &[bool]) {
+        let mut i = 0;
+        self.key.quarantine.retain(|_| {
+            let k = keep.get(i).copied().unwrap_or(true);
+            i += 1;
+            k
+        });
+    }
+}
+
 /// Where a stored sample came from, in words (the readiness readout's worst-sample note).
 pub(super) fn origin_words(tag: SampleTag) -> &'static str {
     match tag {

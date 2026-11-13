@@ -505,7 +505,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     // spec 2026-11-12 R2: the fit's worst-fitting samples, each with Forget; the forgotten ones with Restore
     fold(ui, st, Section::Suspects, "Worst-fitting samples", worst, None, |ui, st| {
-        super::group(ui, st, "d-suspects", |ui, _| suspects(ui, m, acts));
+        super::group(ui, st, "d-suspects", |ui, st| suspects(ui, st, m, sampling, acts));
     });
     let details_summary = m.map(|m| (format!("epoch {} · {} samples", m.epoch, m.samples), theme::INK_DIM));
     fold(ui, st, Section::Details, "Details", details_summary, None, |ui, st| details(ui, st, input, m, d, sampling));
@@ -1053,11 +1053,24 @@ pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the n
 /// The hover of a row's Forget.
 const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it";
 
+/// "Purge forgotten (N)…"'s inline confirmation (2026-11-14).
+pub fn purge_confirm_text(n: usize) -> String {
+    format!(
+        "Delete {n} forgotten sample{} from the shared collection for good? A backup of its samples file is kept as samples.bin.bak (replacing an older backup). This can't be undone from the app.",
+        if n == 1 { "" } else { "s" }
+    )
+}
+/// The hover of "Purge forgotten (N)…".
+const PURGE_TIP: &str = "delete the forgotten samples for good — from the shared collection's samples file too (its old file is kept as samples.bin.bak), or, with a model file, from the model (Save model then writes it without them). Only the samples you forgot: held, superseded, box-affected and draft samples stay. The fit is unchanged — they are already out of it — and later samples are renumbered";
+
 /// The "Worst-fitting samples" section's body (spec R2): the fit's worst samples by their
 /// leave-one-out ratio (`ModelStatus::suspects`), each with **Forget** (`Action::ForgetSample`),
 /// the caption, and the forgotten samples, each with **Restore** (`Action::RestoreSample`); with no
-/// model, or no ranking yet, it says why.
-pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
+/// model, or no ranking yet, it says why. The forgotten list's header carries **Purge forgotten
+/// (N)…** (2026-11-14; hidden with none forgotten, disabled with the reason during a pass or a
+/// refit or when the provider refuses — `ModelStatus::purge_refusal`): it opens an inline
+/// confirmation whose **Purge** emits `Action::PurgeForgotten` and whose **Cancel** emits nothing.
+pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
     match m {
         None => {
             ui.weak(SUSPECTS_NO_MODEL);
@@ -1082,9 +1095,45 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
             ui.label(RichText::new(SUSPECTS_CAPTION).size(11.0).color(theme::INK_DIM));
         }
     }
-    let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else { return };
+    let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else {
+        st.purge_confirm = false;
+        return;
+    };
+    let n = m.forgotten_samples.len();
     ui.add_space(4.0);
-    ui.label(RichText::new(format!("forgotten ({}): held out of the fit until restored", m.forgotten_samples.len())).size(11.5));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("forgotten ({n}): held out of the fit until restored")).size(11.5));
+        let why = if sampling { Some("a sampling pass is running — purge once it is done") } else { m.purge_refusal.as_deref() };
+        let b = egui::Button::new(RichText::new(format!("Purge forgotten ({n})…")).color(theme::DANGER_INK));
+        let r = super::super::probed("purge-forgotten", ui.add_enabled(why.is_none() && !st.purge_confirm, b)).on_hover_text(PURGE_TIP);
+        let r = match why {
+            Some(w) => r.on_disabled_hover_text(w),
+            None => r,
+        };
+        if r.clicked() {
+            st.purge_confirm = true;
+        }
+    });
+    if st.purge_confirm {
+        egui::Frame::new()
+            .fill(RED.gamma_multiply(0.08))
+            .stroke(egui::Stroke::new(1.0, RED.gamma_multiply(0.6)))
+            .corner_radius(7)
+            .inner_margin(egui::Margin::symmetric(9, 7))
+            .show(ui, |ui| {
+                ui.label(RichText::new(purge_confirm_text(n)).size(11.5));
+                ui.horizontal(|ui| {
+                    let purge = egui::Button::new(RichText::new("Purge").strong().color(Color32::WHITE)).fill(RED.gamma_multiply(0.8));
+                    if super::super::probed("purge-confirm", ui.add(purge)).clicked() {
+                        acts.push(Action::PurgeForgotten);
+                        st.purge_confirm = false;
+                    }
+                    if super::super::probed("purge-cancel", ui.button("Cancel")).clicked() {
+                        st.purge_confirm = false;
+                    }
+                });
+            });
+    }
     for s in &m.forgotten_samples {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));
