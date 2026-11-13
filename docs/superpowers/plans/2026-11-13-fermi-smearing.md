@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace `DegenerateShells` and all-electron aufbau with one continuous rule, Fermi–Dirac occupations at kT = 1e-3 Ha per spin channel, so the SCF converges on hand-built clusters; report and learn the Mermin free energy F = E − TS; carry the user's collections onto the new surface key by a user-started re-solve pass that never writes the old folder.
+**Goal:** Replace `DegenerateShells` and all-electron aufbau with one continuous rule, Fermi–Dirac occupations at kT = 5e-3 Ha per spin channel (the user's 2026-11-14 ruling after V0; 1e-3 before), so the SCF converges on hand-built clusters; report and learn the Mermin free energy F = E − TS; carry the user's collections onto the new surface key by a user-started re-solve pass that never writes the old folder.
 
 **Architecture:**
 - One host f64 function in `qm` (`fermi_dirac`: μ_σ by two tie-directed bisections, f, S) is called by the CPU loop and imported by `qm-gpu`. `Energy.total` becomes F, so every consumer of `total` gets F unchanged.
-- `providers` switches every scene to FD under new provenance tags (`none/fd1e-3`, `…/fd1e-3/stop2x…`) and replaces the occupation-pattern watch with a work-consistency guard, `branch_jump`.
+- `providers` switches every scene to FD under new provenance tags (`none/fd5e-3/pin1e-5`, `…/fd5e-3/stop2x…/pin1e-5`) and replaces the occupation-pattern watch with a work-consistency guard, `branch_jump`.
 - The collection migration is a pass in `providers::sampling`. It reads the predecessor folder through a strictly read-only open, re-solves every sample cold and classifies it U/T/S. It appends to the new folder, holds S-class samples at status code 8 and reviews them by leave-one-out inside a refit.
 
 **Tech Stack:** Rust (workspace crates `qm`, `qm-gpu`, `sim`, `providers`, `surrogate`, `app`, `validate`), wgpu/WGSL (f32 grid), egui.
@@ -16,14 +16,15 @@
 ## Global Constraints
 
 - **Constants (spec §4, §5, §6.3, §7.4; all global, none per element, rule 1):**
-  - `ELECTRON_KT = 1e-3` Ha (T_el = 315.8 K, shown as 316 K). Not exposed in the app, no dev flag. Harnesses set `kt` through `ScfSettings`.
+  - `ELECTRON_KT = 5e-3` Ha (T_el = 1 578.9 K, shown as 1579 K; the user's 2026-11-14 ruling, spec §2 item 3). Not exposed in the app, no dev flag. Harnesses set `kt` through `ScfSettings`.
+  - `GPU_PARTIAL_TOL = 1e-5` (qm-gpu): the GPU SCF stops at max(tol_eff, 1e-5) on a step whose occupations have a partial level; gapped GPU solves and the CPU keep their tolerance (spec §5.1).
   - `WITNESS_GAP = 0.1` Ha (the renamed `CANDIDATE_TAU`); tail arm 36 kT; `MAX_WITNESS_GROWTH = 16`.
   - μ bracket [ε_min − 50 kT, ε_max + 50 kT]; backstop 2 048 halvings.
   - `PARTIAL_OCCUPATION_MIN = 1e-6`.
   - `branch_jump`: factor 3, window 8, reach 0.1 Bohr, κ_max = 1 Ha/Bohr³.
   - Migration: ε_E = 1e-5 Ha per sample, ε_F = 1.5e-4 Ha/Bohr per component.
   - `Q_RESOLVED = 8`; collection `RECORD_VERSION` 1 → 2; one new sidecar magic.
-- **Tags:** pseudised `<word>/<surface_hash:016x>/fd1e-3/stop2x<floor>` (`fd{kT:e}`); all-electron `none/fd1e-3`. Every "is this the all-electron surface" comparison goes through `providers::pseudo::is_all_electron_tag`.
+- **Tags:** pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x<floor>/pin1e-5` (`fd{kT:e}`, `pin{GPU_PARTIAL_TOL:e}`); all-electron `none/fd5e-3/pin1e-5`. Every "is this the all-electron surface" comparison goes through `providers::pseudo::is_all_electron_tag`.
 - **Unchanged (anti-goals, spec §3):**
   - the mixer (Pulay/DIIS, α = 0.3, m = 6), the stall stop (W = 50, 1e-3 per electron), the convergence criterion, the cold guess, dt;
   - the force code (only its docs change);
@@ -63,7 +64,14 @@ Later tasks name these by role. The implementer uses the right-hand column.
 
 ---
 
-### Task 1: V0, open-shell stability at kT = 1e-3 (entry gate, pre-registered stop) — **physics**
+### Task 1: V0, open-shell stability (entry gate, pre-registered stop) — **physics**
+
+**Status (2026-11-14).** Run at kT = 1e-3 on 2026-11-13: **FAIL** (the V0 note). The user ruled on 2026-11-14:
+kT = 5 mHa, with the lone-atom reference scan's stop at 1e-5 (spec §2 item 3; where the stop applies: spec §5.1).
+V0 was re-run under that ruling on 2026-11-14, with Si, S, Cl (and P as N's analogue) and the spec's molecular cases
+added (the V0 note's 2026-11-14 section). Steps 1–3 below are done for both runs; Step 4 (the physics review of the
+verdict) and Step 6 are what remain. The steps are kept as written, with kT = 5 mHa and the 1e-5 stop where they
+name a kT or a stop.
 
 **Files:**
 - Read, then append to (do not rewrite): `docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md`. Another agent may already have written it. Create it if it is absent.
@@ -83,6 +91,8 @@ Later tasks name these by role. The implementer uses the right-hand column.
 - [ ] **Step 1: Inventory.** If the note exists, add a section "Coverage (plan Task 1)". It holds one row per item below, marked measured / missing:
   - **Cases:**
     - pseudo C, O and F, B if the recipe accepts it, and N as the gapped control;
+    - pseudo Si, S and Cl (accepted 3p open shells), and P as N's 3p analogue (gapped at M = 4, open at M = 2). Al,
+      Na and Mg are refused by the recipe (all-electron under `Cores only`), Li and Be too;
     - every M the reference scan solves;
     - four sites: the node, the cube centre, (0, h/2, h/2) and a generic site;
     - both grids: h_req and Accurate;
@@ -101,14 +111,15 @@ Later tasks name these by role. The implementer uses the right-hand column.
   - **convergence:** ≤ 60 iterations without the stall stop;
   - **site spread:** spread(F) − spread(E_DS) ≤ 6σ_path + 1e-6 Ha;
   - **same winner:** the scan's winning M is the same at every site;
-  - **jitter:** the Δρ floor sits ≥ 3× below the GPU stop rule max(tol, 2·floor·N).
+  - **jitter:** the Δρ floor sits ≥ 3× below the GPU stop rule max(tol, 2·floor·N), which for a solve with a partial level is max(that, 1e-5) (spec §5.1) [kT-5].
 - [ ] **Step 4: Physics review of the verdict.** Brief the `physics-reviewer` with the note and spec §4.7(d) and §9 V0, not the code. It checks that the rules were applied exactly as pre-registered, that the U extraction is right, and that the M = 1 outcome is read against kT*_s ≳ 5 mHa.
 - [ ] **Step 5: If any species or M fails, STOP.**
   - Report to the user: the failing cases with their numbers; the measured smallest passing kT, if measured; whether option (ii)'s convergence precondition holds.
   - Give options (i), (ii) and (iii) verbatim from spec §9. Do not choose.
   - Do not start Task 2.
   - After the user's ruling: amend the spec, and the "1e-3"/"fd1e-3"/"316 K" constants of this plan if kT moves. Re-run V0 under the ruling, then continue.
-- [ ] **Step 6: On PASS,** write the V0 subsection of references.md: the study, U↑↑/U_c/U_s, the jitter floors, the seeding. Commit `git commit -o -m "docs(v0): open-shell stability at kT = 1e-3 …" -- docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md crates/validate/references.md`. The diagnostic code stays uncommitted.
+  - **Done 2026-11-14:** the ruling (kT = 5 mHa, 1e-5 scan stop) is applied to the spec and this plan. The re-run passes states, spread and winner everywhere, and still misses: the jitter rule for the non-winning M = 1-type states and the O₂ singlet / NH at auto, and convergence for S at M = 1 on Accurate (61 at one site) and all-electron O at M = 5 (spec §9 V0 "Outcome"). **Task 2 waits for the user to accept these as documented, or to rule otherwise.**
+- [ ] **Step 6: On PASS,** write the V0 subsection of references.md: the study, U↑↑/U_c/U_s, the jitter floors, the seeding. Commit `git commit -o -m "docs(v0): open-shell stability at kT = 5e-3 …" -- docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md crates/validate/references.md`. The diagnostic code stays uncommitted.
 
 **Gates:** none (a measurement). **Time:** about 30 min if the note covers everything, else about 1–2 h of serial GPU solves.
 
@@ -157,20 +168,21 @@ Later tasks name these by role. The implementer uses the right-hand column.
   - **Witness cost:** all-electron per-solve time.
   - **E‴ of the stiffest bonds.**
 
-- [ ] **Step 1: V3 aspect.** Use the GPU prototype on all-electron H₄ at 41³ × 0.30, σ = h (`DIAG_DS=1 SCF_SMEAR=1e-3`, `DIAG_N=41`, `DIAG_H=0.30`). Scan the aspect until:
-  - c ∈ [5e-3, 5e-2] Ha/Bohr;
+- [ ] **Step 0: Re-measure the V2 pins at kT = 5 mHa** [kT-5]. Spec §9's V2 table and D§6's F/TS values were measured at 1e-3, so they cannot pin a 5 mHa solve. Run the diagnosis harness (`scf_stall_diag`, `SCF_SMEAR=5e-3`, the D§2 cases, 81³ × 0.15, the app tolerance raised by `effective_gpu_tol`, and the partial-level stop of spec §5.1 emulated by `DIAG_TOL`=1e-5 on the cases that keep a partial level) and record per case: converged or not, iterations, F, TS. Each case must converge without the stall stop or the cap; a case that does not is a STOP (report, do not re-budget). The V2 budgets become ≈ 1.5× these counts (the spec's rule, unchanged) and the F/TS pins these values; write both into the spec's V2 table as an amendment and into the note.
+- [ ] **Step 1: V3 aspect.** Use the GPU prototype on all-electron H₄ at 41³ × 0.30, σ = h (`DIAG_DS=1 SCF_SMEAR=5e-3`, `DIAG_N=41`, `DIAG_H=0.30`). Scan the aspect until:
+  - c ∈ [5e-3, 1e-1] Ha/Bohr (at kT = 5 mHa: |d(TS)/dx| ≤ 0.45·c needs c ≥ 4.4e-3, and F‴ ≈ 0.2·c³/(kT)² keeps the plain |FD(δ) − FD(2δ)| = F‴δ²/2 ≤ 1e-3 up to c ≈ 0.13; the 1e-3 window was [5e-3, 5e-2]) [kT-5];
   - |d(TS)/dx| ≥ 2 mHa/Bohr;
   - the whole 4δ span (δ = 0.01 Bohr) lies in that regime;
   - the plain |FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr.
 
   Record the candidate. Task 6 confirms it on the CPU, since no CPU prototype exists.
 - [ ] **Step 2: V5 NVE case (N₃).** On the pseudo-N surface at h_req:
-  - Confirm that LSDA keeps N₃ linear (the bend force is restoring at small angles), with a ²Π_g ground state (TS at linear = 2 kT ln 2 within 1e-5 Ha).
-  - Find a start bend that splits the π pair by about 10 kT, with h²/4·E_mode ≤ 1e-4 Ha.
+  - Confirm that LSDA keeps N₃ linear (the bend force is restoring at small angles), with a ²Π_g ground state (TS at linear = 2 kT ln 2 = 6.93 mHa at 5 mHa, within 1e-5 Ha).
+  - Find a start bend that splits the π pair by about 10 kT (50 mHa at 5 mHa [kT-5]), with h²/4·E_mode ≤ 1e-4 Ha. The larger split needs a larger bend than at 1e-3; if no bend meets both, STOP and report (the spec's NVE case needs an amendment).
   - Choose a box that keeps the face density within `box_affected_face_density(h)`.
   - If N₃ fails, substitute another linear ²Π radical (the review suggests CO₂⁺) with the same properties.
   - If none qualifies, STOP and report: the spec needs an amendment.
-- [ ] **Step 3: All-electron witness cost.** H₂ and H₃⁺ at 49³ × 0.25: per-solve time, cold and warm, aufbau against the witness configuration (`DIAG_DS=1`). Median of 5. For the README and references.md.
+- [ ] **Step 3: All-electron witness cost.** H₂ and H₃⁺ at 49³ × 0.25: per-solve time, cold and warm, aufbau against the witness configuration (`DIAG_DS=1`, `SCF_SMEAR=5e-3`, so both witness arms run). Median of 5. For the README and references.md. At 5 mHa the 36 kT arm (0.18 Ha above μ) binds in every channel, not only pinned ones (spec §4.2), so also record the extra vectors per channel and the pseudised H₂O cold/warm time against DS at 57³ and 81³; V0 measured cold solves 3–9× DS for the 3p atoms at 14 Bohr (the V0 note, 2026-11-14).
 - [ ] **Step 4: E‴ of the stiffest bonds.**
   - O–H (in H₂O) and N–H (in NH₃) on the default pseudo surface at h = 0.15, 7 points from 0.8 R_e to 1.0 R_e; fit (1/12)|E‴|.
   - Expected: below κ_max = 1 Ha/Bohr³ ("M7 forces" OH gives about 0.18).
@@ -194,7 +206,7 @@ Later tasks name these by role. The implementer uses the right-hand column.
 - Produces:
 
 ```rust
-pub const ELECTRON_KT: f64 = 1e-3;          // Ha
+pub const ELECTRON_KT: f64 = 5e-3;          // Ha (spec §2 item 3, 2026-11-14)
 pub const WITNESS_GAP: f64 = 0.1;           // Ha, from ε_{N_σ}
 pub const WITNESS_TAIL_KT: f64 = 36.0;      // ε_k − μ ≥ 36 kT
 pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
@@ -226,7 +238,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
 - `PartialLevel.index` is the level's rank in ascending order within its channel. A level is partial when min(f, 1−f) ≥ 1e-6.
 
 - [ ] **Step 1: Write the failing tests** in `occupations.rs`:
-  - `fd_degenerate_pair_half_filled`: evals [−0.3, −0.3], n = 1, kT = 1e-3. f == [0.5, 0.5] exactly; |μ + 0.3| ≤ 1e-15; |entropy − 2 ln 2| ≤ 1e-14.
+  - `fd_degenerate_pair_half_filled`: evals [−0.3, −0.3], n = 1, kT = 1e-3 (any kT; the unit tests use explicit values). f == [0.5, 0.5] exactly; |μ + 0.3| ≤ 1e-15; |entropy − 2 ln 2| ≤ 1e-14.
   - `fd_gap_symmetric_mu`: evals [−0.3, −0.3 + 5kT], n = 1. f₀ = 1/(1 + e^{−2.5}) and f₁ = 1/(1 + e^{2.5}) within 1e-14; |μ − (−0.3 + 2.5kT)| ≤ 1e-12.
   - `fd_gapped_plateau_midpoint` [MUST-1, SHOULD-5]: evals [−0.5, −0.5, 0.1], n = 2.
     - f[0] == f[1] == 1.0;
@@ -290,10 +302,10 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
     - |ts − 4·ELECTRON_KT·ln 2| ≤ 1e-8;
     - |internal − E_DS| ≤ 1e-8, where E_DS is the same solve under `DegenerateShells { tau: DEGENERACY_TAU }` run in the test;
     - print E_DS; Task 10 replaces the DS run with this literal.
-  - `fd_matches_aufbau_on_gapped` (§5): H₂ (R = 1.4) and H₂O (the `gpu_vs_cpu` geometry), 41³ × 0.30, tol = eig_tol = 1e-9: |total_FD − total_Aufbau| ≤ 1e-8 and ts ≤ 1e-12.
+  - `fd_matches_aufbau_on_gapped` (§5): H₂ (R = 1.4) and H₂O (the `gpu_vs_cpu` geometry), 41³ × 0.30, tol = eig_tol = 1e-9, at an explicit `FermiDirac { kt: 1e-3 }` (spec ruling 46 [kT-5]): |total_FD − total_Aufbau| ≤ 1e-8 and ts ≤ 1e-12. Also print, not assert, each one's frontier gap and TS at `ELECTRON_KT` for references.md.
   - `fd_all_electron_grows_witnesses`: H₂ under FD stores ≥ n_σ + 1 orbitals per occupied channel, and `witness_reached` holds for each.
   - `fd_empty_channel_has_no_mu`: H atom → `mu[0].is_some()`, `mu[1].is_none()`, `partial` empty, ts ≤ 1e-12.
-  - `fd_warm_state_from_other_scheme_is_cold` (Review Focus 1): warm states converged at `FermiDirac { kt: 2e-3 }` and at `Aufbau`, given to an FD kT = 1e-3 solve of the same H₂, give results bitwise equal to the cold solve.
+  - `fd_warm_state_from_other_scheme_is_cold` (Review Focus 1): warm states converged at `FermiDirac { kt: 2e-3 }` and at `Aufbau`, given to an FD `ELECTRON_KT` solve of the same H₂, give results bitwise equal to the cold solve.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p qm --release fd_`. Expected: compile FAIL (no `FermiDirac`, `internal`, `partial`).
 - [ ] **Step 3: Implement.**
   - `solve_shared` under FD: grow one vector at a time until `witness_reached` on the re-solved levels, capped by `MAX_WITNESS_GROWTH` (same error, its message citing `WITNESS_GAP`).
@@ -358,6 +370,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
   - F_HF in the progress energy;
   - `ScfStats`;
   - the module paragraph;
+  - **the partial-level stop** (spec §5.1) [kT-5]: `pub const GPU_PARTIAL_TOL: f64 = 1e-5`; the convergence test compares Δρ with `max(settings.tol, GPU_PARTIAL_TOL)` on a step whose occupations have a partial level (`qm::partial_levels` non-empty in either channel), else with `settings.tol`; `ScfStats.tol_used` reports the tolerance the converged step was tested against (also on the CPU, where it is always `settings.tol`). The stall watch and the cap are unchanged;
   - **revert the `SCF_SMEAR` and `SCF_TRACE2` knobs** (the uncommitted diag hunks).
 - Modify `crates/qm-gpu/src/forces.rs`: module doc (−dF/dR, as in Task 5) and the test settings at ~l. 734.
 - Modify `crates/qm/src/scf.rs`: `ScfSettings::for_grid` → `occupations: Occupations::FermiDirac { kt: ELECTRON_KT }`, and its doc.
@@ -372,10 +385,11 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
 - [ ] **Step 1: Write the failing tests.**
   - qm-gpu `diis_reset_mixes_only_new_map_residuals` (spec §5): fill the DIIS history with entries from map A; apply the frozen-orbital reset; push one entry measured on map B. Assert the next mix equals plain α-mixing of B's residual: zero weight on any A entry.
   - qm-gpu `gpu_fd_warm_state_from_other_kt_is_cold` (Review Focus 1): bitwise equal to the cold solve, as in Task 5.
-  - gpu_vs_cpu `gpu_fd_h4_square_matches_cpu` and `gpu_fd_pseudo_o_m<M>_matches_cpu`, one per M Task 1 settled on [MUST-5]. σ = h = 0.25, 49³. Each asserts:
+  - qm-gpu `gpu_partial_stop_only_with_a_partial_level` (spec §5.1) [kT-5]: (a) all-electron H₂ at tol 1e-6 (gapped) converges with `tol_used == 1e-6` and Δρ < 1e-6, bitwise the same stop as before the rule; (b) a lone pseudo-O at M = 3, tol 1e-6, converges with `tol_used == GPU_PARTIAL_TOL` within 60 iterations; (c) the same O on the CPU reports `tol_used == 1e-6`.
+  - gpu_vs_cpu `gpu_fd_h4_square_matches_cpu` and `gpu_fd_pseudo_o_m<M>_matches_cpu`, one per M Task 1 settled on [MUST-5]: **M = 3 (the winner) and M = 1** (both symmetric at every site at 5 mHa; M = 5 is gapped and already covered by `pseudo_o_triplet_matches_cpu`'s family) [kT-5]. σ = h = 0.25, 49³. The GPU side stops at the partial-level 1e-5 (spec §5.1) and the CPU at 1e-6; V0 measured the stop's own error on the pseudo surface at ≤ 1.7 µHa in F and ≤ 3.2e-6 Ha/Bohr per force component, inside `E_BOUND_PSEUDO` = 6e-6 and `F_BOUND_PSEUDO` = 6e-5, so the bounds stay. Each asserts:
     - |F_gpu − F_cpu| and |TS_gpu − TS_cpu| within the suite's existing energy bounds (`E_BOUND`/`E_BOUND_PSEUDO`);
     - where a partial level exists, |μ_gpu − μ_cpu| ≤ `EPS_BOUND_PSEUDO`;
-    - per level, |Δf| ≤ `EPS_BOUND_PSEUDO / (2.0 * ELECTRON_KT)` (= 5e-3);
+    - per level, |Δf| ≤ `EPS_BOUND_PSEUDO / (2.0 * ELECTRON_KT)` (= 1e-3 at kT = 5 mHa; 5e-3 at 1e-3) [kT-5];
     - Σf over each degenerate cluster (CPU levels within 1e-6 Ha of each other) agrees within 1e-9;
     - the same state class on both solvers: Symmetric if |TS − TS_cf| ≤ 0.05·TS_cf, Polarised if TS ≤ 0.05·TS_cf, anything else fails (ruling R9);
     - forces within the existing force bounds.
@@ -437,9 +451,9 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - **`spin_change`** is |Δ∫|ρ↑ − ρ↓|| when N↑ = N↓. Take it from the adapter's existing spin reduction (`SpinSummary::abs_integral`'s source); `None` otherwise.
 - **Tiers** (ruling R8):
   - Sample tier when `scf_tol_used ≤ SAMPLE_TOL`: pseudo (1.87e-6, 5e-5 = `PSEUDO_FORCE_NOISE`); all-electron (5.4e-6, the all-electron force path scatter from references.md, measured here as warm vs cold ×5 if none is on record).
-  - App tier otherwise: measured in Step 1.
+  - App tier otherwise: measured in Step 1. Every GPU solve with a partial level stops at 1e-5 (spec §5.1) and reports `scf_tol_used` = 1e-5, so it is judged on this tier even when the provider's tolerance is the sample one [kT-5].
 
-- [ ] **Step 1: Measure the app tier.** Pseudo and all-electron H₂O at `effective_gpu_tol(INTERACTIVE_TOL)`, warm vs cold, 5 repeats: σ_E and the largest per-component σ_F. Record them in references.md as the constants `noise_tier` returns.
+- [ ] **Step 1: Measure the app tier.** Pseudo and all-electron H₂O at `effective_gpu_tol(INTERACTIVE_TOL)`, warm vs cold, 5 repeats: σ_E and the largest per-component σ_F. Add a pinned case, linear OH at the sample tolerance (it stops at the partial-level 1e-5), because that tier now also holds pinned teacher solves; the tier is the larger of the two cases' scatters. Record them in references.md as the constants `noise_tier` returns [kT-5].
 - [ ] **Step 2: Write the failing tests.**
   - `branch_jump.rs`, on an analytic Morse dimer (D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8), pseudo sample tier:
     - `synthetic_jump_is_flagged`: 0.02 Bohr steps; from step 10 on, E shifted by +12 mHa. Flagged at step 10 only.
@@ -503,9 +517,9 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - [ ] **Step 1: Record the legacy strings before any change.** On the unmodified tree, print `provenance_tag` for every `IonicPolicy`, under both `set_dimer_backend(Cpu)` and `Gpu`. Save them into the new test as literals. These are the only source of truth for `legacy_tag_of`.
 - [ ] **Step 2: Write the failing tests.**
   - pseudo.rs:
-    - `tag_strings_are_fd`: the all-electron tag is `"none/fd1e-3"`; a pseudised tag matches `^<word>/[0-9a-f]{16}/fd1e-3/stop2x5e-8$`.
+    - `tag_strings_are_fd`: the all-electron tag is `"none/fd5e-3/pin1e-5"`; a pseudised tag matches `^<word>/[0-9a-f]{16}/fd5e-3/stop2x5e-8/pin1e-5$`.
     - `legacy_tag_of_matches_recorded_ds_strings`: every policy × backend equals the Step 1 literal.
-    - `is_all_electron_tag_cases`: `"none"` and `"none/fd1e-3"` are true; `"cores/0123456789abcdef/fd1e-3/stop2x5e-8"` and `""` are false.
+    - `is_all_electron_tag_cases`: `"none"` and `"none/fd5e-3/pin1e-5"` are true; `"cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"` and `""` are false.
   - ks.rs: the Aufbau assert (~l. 3179) becomes `FermiDirac { kt: ELECTRON_KT }`, with the re-pin reason. The stall-stop bitwise pins are re-pinned with the reason.
   - `fd_regression.rs` (V2, GPU, release-only). Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, at the app tolerance raised by `effective_gpu_tol`, with the stall stop on.
     - `fd_converges_default_policy_stallers`: H₄ rhombus ≤ 20, lopsided tetra ≤ 50, H₄ seed 1 ≤ 20, H₅ seed 3 ≤ 30, H₈ seed 8 ≤ 25 iterations.
@@ -560,13 +574,13 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
   - lone.rs: `closed_spin_channels(1, None)` is true; `(2, Some(false))` true; `(8, Some(true))` false; `(2, None)` false.
   - `polarised_or_partial_o_is_declined` (V8): an O reference whose winning solve has partial levels → declined.
   - pseudo.rs (providers):
-    - `dimer_procedure_hashes_fd`: `DIMER_PROCEDURE`'s debug text names `FermiDirac` and `1e-3`;
+    - `dimer_procedure_hashes_fd`: `DIMER_PROCEDURE`'s debug text names `FermiDirac`, `5e-3` and the GPU partial stop `1e-5` (the gate's 3-D solves run on the GPU);
     - `core_recipe_hash_unchanged`: equal to the literal recorded on the tree before this task.
 - [ ] **Step 3: Run them to check they fail.** Expected: FAIL.
 - [ ] **Step 4: Implement, then delete DS.** `rg "DegenerateShells|degenerate_shell_occupations|released_occupations|DEGENERACY_TAU|CANDIDATE_TAU|FractionalShell|shared_runs|fn decide" crates` must return nothing. Docs may cite them as history.
 - [ ] **Step 5: Run them to check they pass**, then `cargo build --workspace --release`.
 - [ ] **Step 6: Physics review.** The reviewer checks:
-  - the lone rule's 28 mHa "no partial level" argument (spec §6.4);
+  - the lone rule's "no partial level" argument (spec §6.4): 27.6 kT = 138 mHa at 5 mHa [kT-5];
   - each moved reference against its closed-form TS (spec §4.3 table);
   - that the scan's winning M is unchanged;
   - that the generation records are bitwise identical with only `recipe_hash` moved.
@@ -576,7 +590,7 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
   - `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min);
   - `--test pseudo_gen` (~9 min): `generation_record_table_matches_references_md` stays bitwise; H and He regenerate once (about 1 min);
   - `--test pseudo` (~1 h);
-  - `--test pseudo_oracles` (~1.5–2 h): the dimer verdicts and R_e/ω reproduce within the backend margin; `pseudo_o_triplet_matches_cpu` and `gpu_oxygen_reference_multiplicity` move by the measured −TS, recorded with the closed form.
+  - `--test pseudo_oracles` (~1.5–2 h): the dimer verdicts and R_e/ω reproduce within the backend margin; `pseudo_o_triplet_matches_cpu` and `gpu_oxygen_reference_multiplicity` move by the measured −TS, recorded with the closed form (O at M = 3: 3 kT s(⅓) = 9.5477e-3 Ha at 5 mHa; V0 measured TS within 1e-9 of it at every site) [kT-5]. The scan's winner stays M = 3, and it now converges through the partial-level 1e-5 stop.
 - [ ] **Step 8: Commit** the files above.
 
 **Time:** about 3–3.5 h of gates.
@@ -638,12 +652,12 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - Consumes: `EvalStats.{partial, energy.internal, energy.ts, branch_jump}`, `qm::ELECTRON_KT`, and `units::hartree_to_kelvin` (rule 3: the K value is converted only here).
 
 - [ ] **Step 1: Write the failing tests** (app unit tests). Strings are verbatim from spec §6.6:
-  - `energy_label_reads_f`: no pseudised species → `"F (electronic free energy, T_el 316 K)"`; any pseudised species → `"F (electronic free energy, valence, pseudopotential, T_el 316 K)"`. The 316 comes from `units::hartree_to_kelvin(qm::ELECTRON_KT)` rounded.
+  - `energy_label_reads_f`: no pseudised species → `"F (electronic free energy, T_el 1579 K)"`; any pseudised species → `"F (electronic free energy, valence, pseudopotential, T_el 1579 K)"`. The 1579 comes from `units::hartree_to_kelvin(qm::ELECTRON_KT)` rounded.
   - `energy_tooltip_text`: equals the §6.6 tooltip verbatim.
-  - `breakdown_rows`: the labels are kinetic, external, Hartree, xc, nuclear, `E (internal)`, `−TS (electronic entropy, T_el 316 K)`, `F`.
+  - `breakdown_rows`: the labels are kinetic, external, Hartree, xc, nuclear, `E (internal)`, `−TS (electronic entropy, T_el 1579 K)`, `F`.
   - `e_total_reads_ke_plus_f`: the row tip is `"KE + F: conserved in NVE without tools"`.
-  - `solve_log_ts_line`: ts = 1.9e-3 → contains `"−TS = 1.9 mHa"`; ts = 9e-7 → no −TS text.
-  - `compare_note_when_partial`: ts ≥ 1e-6 → `"ours is at T_el = 316 K with partly occupied levels; PySCF's is integer-occupied"`; otherwise absent.
+  - `solve_log_ts_line`: ts = 9.5477e-3 (a lone O at M = 3 at 5 mHa) → contains `"−TS = 9.5 mHa"`; ts = 9e-7 → no −TS text.
+  - `compare_note_when_partial`: ts ≥ 1e-6 → `"ours is at T_el = 1579 K with partly occupied levels; PySCF's is integer-occupied"`; otherwise absent.
   - `orbital_rows_per_level_f`: f < 1e-6 shows as empty; f = ⅓ shows its f.
   - `branch_jump_warning_shown`: a stats warning with `BRANCH_JUMP_WARNING` reaches the readouts' warning list.
   - `reference_energies_say_free_energy` (spec §4.7(i)): every place the app shows E − ΣE_ref says the references are free energies at T_el. Find those places with `rg "reference" crates/app/src/ui`.
@@ -974,3 +988,5 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 - **R16.** Starting a migration is a recorded `ui::Action`, but a replay never starts one, as with the PySCF setup.
 - **R17.** "<version>" in the legacy-model refusal is this build's `CARGO_PKG_VERSION`.
 - **R18.** V5 dynamics (Task 11) comes before the UI (Task 12), swapping spec §11's A5/A6. This closes the whole-solver-half review before the UI copy is written.
+- **R19 (2026-11-14, the user's ruling after V0).** kT = 5 mHa, and the reference scan's stop at 1e-5. Spec §2 item 3 and rulings 42–46 apply it: every GPU solve with a partial level stops at max(tol_eff, 1e-5) (Task 7 implements `GPU_PARTIAL_TOL`; Task 9's tags carry `fd5e-3` and `pin1e-5`); the witness stays 36 kT / 16; V2's pins are re-measured at 5 mHa (Task 3, step 0); the FD ≡ Aufbau test runs at an explicit kT = 1e-3 (Task 5). Every "316 K" in Tasks 12 and 16 is 1579 K (`units::hartree_to_kelvin(ELECTRON_KT)`, rounded).
+- **R20.** The V0 re-run at 5 mHa (Task 1) covers B, C, N, O, F, Si, P, S, Cl, all-electron O and the spec's molecules (OH along an axis and off-axis, the O₂ singlet at auto and triplet, H₂O, NH at auto and at M = 3). Its numbers are in the V0 note's 2026-11-14 section; Task 1 step 6 copies the summary into references.md.

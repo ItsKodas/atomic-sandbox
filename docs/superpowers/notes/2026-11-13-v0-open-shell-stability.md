@@ -7,6 +7,9 @@ prototype and harness stay uncommitted in the `scf-stall` worktree.
 
 ## Verdict
 
+> **2026-11-14:** the user ruled kT = 5 mHa with a 1e-5 scan stop; the re-run under that ruling is the last
+> section, "2026-11-14: V0 at kT = 5 mHa".
+
 **V0 fails at kT = 1e-3 Ha.** The pre-registered stop applies, and the user rules among (i)–(iii).
 
 Every accepted open-shell species fails at least one rule at kT = 1e-3. The gapped controls pass (N at M = 4, O and C
@@ -661,3 +664,301 @@ The AE rows use the pseudo ordering; read them through §6.
 | F | 0.15 | 4 | fd3e-3 | S/S✗/S✗/S✗ | 37,–,–,– | 21,99,–,– | 12,96,–,27 |
 | F | 0.15 | 4 | fd5e-3 | S/S/S/S✗ | 26,26,42,– | 12,23,34,37 | 11,20,30,12 |
 | F | 0.15 | 4 | fd8e-3 | S✗/S✗/S✗/S✗ | –,–,–,– | –,–,–,– | –,–,–,– |
+
+## 2026-11-14: V0 at kT = 5 mHa with the scan stop at 1e-5 (the user's ruling)
+
+The user ruled on 2026-11-14: option (i), **kT = 5 mHa (Fermi–Dirac)**, with the lone-atom reference scan's
+convergence stop at **1e-5** instead of 1e-6. This section re-runs V0 under that ruling, adds the species and cases
+§1.3 left out (Si, S, Cl, and P as N's analogue; the spec's molecular cases), measures the 36 kT witness arm in
+every case, and measures what stopping at 1e-5 costs in F and in the forces. No production code was changed; the
+prototype and the harness stay uncommitted.
+
+### Method
+
+- **Prototype:** unchanged (`qm::scf::diag_smear`, §1.1).
+- **Harness:** a new `v0_cases` test in `crates/providers/src/scf_stall_diag.rs` (uncommitted), next to
+  `v0_open_shell`. Atoms and molecules go through `providers::ks::problem` exactly as `GpuKs` builds them (`Accepted`,
+  or `none` for all-electron), at tol 1e-5 raised by `effective_gpu_tol` (which leaves 1e-5 for every case here).
+  Iteration cap 100; the V0 rule is ≤ 60. Stall stop at its default (it never fired).
+- **Cases:** the box, sites and grids of §1.2 (14 Bohr, odd n; node, centre, face, generic; h_req and 0.15).
+  - Pseudo B, C, N, O, F (as before), and **Si, P, S, Cl** (h_req 0.35 for all four), every multiplicity
+    `allowed_multiplicities` gives the scan: 1, 3, 5 for C, O, Si, S; 2, 4 for B, N, F, P, Cl.
+  - All-electron O at M = 1, 3 and 5, Balanced (0.25) and Accurate (0.15), σ = h.
+  - **Molecules** (spec §9 "V0 in detail"), pseudo throughout (H pseudised by the GPU dimer gate), the centroid at the
+    site, on 0.20 (the finest h_req of their species) and 0.15:
+    - OH at auto (M = 2), R = 1.834 Bohr. **OH is a diatomic, so "bent" has no meaning for it.** I read the spec's
+      "OH (bent, linear)" as the two cases that differ physically: the bond along a lattice axis (`oh_lin`; the π
+      pair degenerate by the lattice's C4) and along a low-symmetry direction (1, 0.37, 0.21)/|·| (`oh_gen`; the π
+      pair split by the egg-box only). If the spec meant a bent radical such as HO₂ or H₂O⁺, that case is not run.
+    - O₂ at auto (M = 1, the restricted singlet the scene solve gives) and at M = 3, R = 2.282 Bohr, along x.
+    - H₂O at auto, O–H 1.81 Bohr, 104.4° (the diagnosis geometry).
+    - NH at auto (M = 1) and, for reference, at M = 3, R = 1.958 Bohr, along x.
+- **Per site and mode** (DS and FD at 5 mHa):
+  1. cold at tol 1e-5;
+  2. warm at tol 1e-5 (σ_path = RMS(F_warm − F_cold)/√2, as in §1.2);
+  3. FD only, **noise**: warm steps at tol 1e-12, abandoned after 15 steps (so the state is parked, not dropped);
+     the median and maximum Δρ of steps 3–15 are the floor. Every one of these steps is a tight eigen step (below
+     Δρ = eig_tol/`EIG_TOL_FRACTION` ≥ 1e-6/0.0015 = 6.7e-4 the Δρ-tied eigen tolerance is clamped at the effective
+     `eig_tol`), so this is the floor the stop test sees;
+  4. FD only, **tight**: a warm re-solve at tol 3e-6 from the parked floor state. F_tight − F_cold and the largest
+     force-component change measure the error of stopping at 1e-5 (the residual of the tight state is ≤ 3e-6, so
+     these are upper estimates of the stop error plus the path scatter);
+  5. molecules only: a further warm re-solve at **tol 1e-6** (cap 40), the sample teacher's tolerance, to see whether
+     a pinned molecule can reach it at all.
+- **Witness:** per channel, the extra vectors k − N_σ the solve ended with, the reach (ε_max − μ)/kT, and
+  ε_max − ε_(N). The second arm needs (ε_max − μ)/kT ≥ 36; `MAX_WITNESS_GROWTH` = 16.
+- **Rules:** as pre-registered (spec §9): convergence ≤ 60 iterations at every site; site spread of F ≤ DS spread of
+  E + 6σ_path + 1e-6 Ha; the same winning M at every site; the jitter rule, floor ≤ stop/3 = 3.3e-6.
+- GPU jobs ran one at a time at BelowNormal priority, sharing the GPU with the user's session.
+
+### Verdict at kT = 5 mHa with the 1e-5 stop
+
+**States, site spread and winner: pass for every species.** Every accepted open-shell species (B, C, N, O, F, Si, P,
+S, Cl) and all-electron O end, in every converged solve at every site, on both grids and at every scanned M, in the
+symmetric ensemble or a gapped state (TS equal to
+the closed form to ≤ 1e-6 relative, or 0.3–0.6 % above it where a diffuse level is also partly occupied: F and Cl at
+M = 4; O and S at M = 5 carry 6–7e-5 Ha from that level alone). No converged solve polarises. The F spread is within the DS spread + 6σ_path + 1e-6 Ha everywhere it can be formed, and
+the scan's winning M is the same at every site and equals the DS winner: B 2, C 3, N 4, O 3, F 2, Si 3, P 4, S 3, Cl 2. All-electron O wins at M = 1
+(the gapped 1s² 2p⁶ of §6) on both grids; on Balanced, DS picked M = 3 at three of four sites because its M = 1
+stalls there (the pre-existing failure of §6), and FD fixes that.
+
+**Convergence (≤ 60 iterations at every site): two misses.** S at M = 1 on Accurate (61 iterations at the node, after a 30-step plateau at 1.3–2.5e-5), and all-electron O at M = 5 (not converged in 100 at 2 of 4 sites on Balanced and 3 of 4 on Accurate; best Δρ ≈ 1.7e-5). Neither is a scan winner, and the scan leaves a failed multiplicity out, so no winner changes; both are V0 failures as pre-registered.
+
+**Jitter rule (floor median ≤ stop/3 = 3.3e-6): fails for the M = 1-type states.** It fails for O, C and S at M = 1 on both grids, Si at M = 1 on Accurate, N and P at M = 2 on both grids, all-electron O at M = 5, one Si M = 3 site (Accurate, generic: 6.2e-6), and the O₂ singlet and NH at auto. For these the 1e-5
+stop is reached by a downward fluctuation of a floor whose median is 1e-6 to 2.8e-5, not with a factor-3 margin;
+every other case clears it by 4.5× to > 1e4×. See "D. The noise floor".
+
+**Molecules: pass, with the same jitter caveat for the two-pair singlets.** OH (axis and off-axis), the O₂ triplet,
+H₂O and NH at M = 3 pass every rule. The O₂ singlet and NH at auto (two half-filled pairs, TS = 4 kT ln 2 =
+13.863 mHa at every site) converge within 19 and 42 iterations, are symmetric at every site, and miss only the jitter
+rule. NH at auto has no DS spread to compare with: **`DegenerateShells` stalls on singlet NH at every site on both
+grids** (stall stop at 57 iterations, best Δρ 7e-2), a pre-existing DS failure that FD fixes. Its FD spread (0.0104 /
+0.0087 mHa) equals the egg-box spread of the same nuclei at M = 3 under DS (0.0106 / 0.0090).
+
+**Witness (36 kT): fits in every case.** At most 15 of the 16 allowed extra vectors (S at M = 5, h_req); 7–12 for Si
+and S at M = 3, P, F and Cl at M = 4 and the M = 5 states; 2–5 for B, C, N, O, F, Cl at their winning M, the
+molecules and all-electron O at M = 1, 3. The cold-solve cost of the 3p atoms is 5–80× DS. Spec §4.2 (ruling 43) keeps 36 kT and 16 and lists the
+options.
+
+**The 1e-5 stop costs ≤ 1.7 µHa in F and ≤ 8.8e-7 Ha/Bohr in the forces of the partial-level solves on the pseudo
+surface** (≤ 3.2e-6 including gapped ones; ≤ 2.9 µHa and ≤ 2.1e-6 all-electron), at or below the f32 path scatter. See "B".
+
+### A1. Table: lone atoms at kT = 5 mHa, tol 1e-5 (FD rows; the DS rows give the spread bound)
+
+Columns: the end state (S symmetric, TS against the closed form; P a gapped closed shell, TS ≈ 0; g gapped; tsX a
+non-closed-form TS of X mHa); the cold iterations at node/centre/face/generic (✗ = not converged in 100); the F
+spread against the pre-registered bound (DS spread + 6σ_path + 1e-6 Ha; "nan" where DS did not converge at every
+site); σ_path; the noise floor (median of warm steps 3–15 at tol 1e-12, range over the four sites; 0 = the noise run
+converged at once, floor < 1e-10); the largest single noisy Δρ; how many sites have a median ≤ 3.3e-6 (the jitter
+rule against the 1e-5 stop); the witness; TS against the closed form; the stop error (B below).
+
+| case | M | h | state | cold iterations (node/centre/face/generic) | F spread / bound (mHa) | σ_path (µHa) | noise median, range over sites | noise max | sites with median ≤ 3.3e-6 | witness: max extra (min reach, kT) | TS / closed form | stop error: max \|ΔF\| (µHa), max \|ΔF_I\| (Ha/Bohr) | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| O (AE) | 1 | 0.25 | P | 12/11/11/11 | 1.0309 / nan | 0.62 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (72) | 0.0000–0.0000 | 1.65, 1.6e-06 | pass (no DS spread: DS stalls) |
+| O (AE) | 1 | 0.15 | P | 16/16/14/15 | 0.5802 / 0.5820 | 0.79 | 6.5e-12–2.8e-07 | 6.3e-07 | 4/4 | 2 (82) | 0.0003–0.0003 | 2.91, 2.1e-06 | pass |
+| O (AE) | 3 | 0.25 | S | 26/19/15/14 | 1.2440 / 1.2470 | 0.97 | 6.4e-07–1.4e-06 | 2.0e-06 | 4/4 | 5 (45) | 0.9999–1.0000 | 1.67, 6.3e-07 | pass |
+| O (AE) | 3 | 0.15 | S | 14/15/16/15 | 0.6247 / 0.6333 | 1.06 | 1.0e-07–1.5e-06 | 2.4e-06 | 4/4 | 5 (43) | 1.0000–1.0000 | 1.68, 2.0e-06 | pass |
+| O (AE) | 5 | 0.25 | ts19.141,ts19.148 | 35/✗/28/✗ | 0.9135 / 1.3690 | 0.54 | 5.4e-06–6.5e-06 | 1.5e-05 | 0/2 | 9 (41) | TS 1.9e-02 Ha | 2.55, 5.9e-07 | **conv, jitter 2/2** |
+| O (AE) | 5 | 0.15 | ts20.720,ts20.731,ts20.743 | ✗/21/62/72 | 0.2852 / 0.5854 | 0.50 | 3.3e-06–6.2e-06 | 9.9e-06 | 1/3 | 9 (41) | TS 2.1e-02 Ha | 1.47, 2.1e-06 | **conv, jitter 2/3** |
+| B | 2 | 0.35 | S | 9/10/12/11 | 0.0259 / 0.0273 | 0.06 | 7.7e-08–2.6e-07 | 1.3e-06 | 4/4 | 4 (53) | 1.0000–1.0000 | 0.14, 1.1e-08 | pass |
+| B | 2 | 0.15 | S | 10/18/17/11 | 0.0039 / 0.0050 | 0.03 | 9.2e-08–3.8e-07 | 1.1e-06 | 4/4 | 4 (54) | 1.0000 | 0.08, 5.0e-09 | pass |
+| B | 4 | 0.35 | S | 10/9/9/9 | 0.0461 / 0.0475 | 0.05 | 8.4e-08–2.0e-07 | 2.9e-07 | 4/4 | 3 (56) | 1.0000–1.0000 | 0.06, 8.8e-08 | pass |
+| B | 4 | 0.15 | S | 10/19/13/17 | 0.0043 / 0.0056 | 0.04 | 1.7e-11–4.8e-07 | 5.6e-07 | 4/4 | 4 (57) | 1.0000–1.0000 | 0.08, 4.7e-09 | pass |
+| C | 1 | 0.3 | S | 11/14/33/14 | 0.0415 / 0.0432 | 0.14 | 3.7e-06–1.2e-05 | 2.2e-05 | 0/4 | 3 (50) | 1.0000–1.0000 | 0.32, 3.2e-08 | **jitter 4/4** |
+| C | 1 | 0.15 | S | 12/11/28/22 | 0.0019 / 0.0039 | 0.10 | 6.2e-07–9.0e-06 | 2.9e-05 | 2/4 | 3 (50) | 1.0000 | 0.24, 1.3e-08 | **jitter 2/4** |
+| C | 3 | 0.3 | S | 10/10/12/12 | 0.0495 / 0.0511 | 0.06 | 1.5e-07–2.7e-07 | 4.8e-07 | 4/4 | 4 (54) | 1.0000–1.0000 | 0.36, 3.8e-08 | pass |
+| C | 3 | 0.15 | S | 12/12/13/11 | 0.0020 / 0.0036 | 0.09 | 4.6e-08–1.3e-07 | 2.2e-07 | 4/4 | 4 (53) | 1.0000 | 0.18, 1.8e-08 | pass |
+| C | 5 | 0.3 | g | 9/9/9/10 | 0.2208 / 0.2220 | 0.04 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (41) | TS 1.1e-13 Ha | 0.10, 0.0e+00 | pass |
+| C | 5 | 0.15 | g | 10/10/10/10 | 0.0013 / 0.0026 | 0.04 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (41) | TS 1.1e-13 Ha | 0.10, 0.0e+00 | pass |
+| N | 2 | 0.2 | S | 18/20/20/21 | 0.0075 / 0.0111 | 0.37 | 1.6e-06–1.2e-05 | 4.1e-05 | 1/4 | 3 (56) | 1.0000 | 0.64, 7.3e-08 | **jitter 3/4** |
+| N | 2 | 0.15 | S | 17/14/14/14 | 0.0015 / 0.0035 | 0.22 | 2.2e-06–7.0e-06 | 1.1e-05 | 3/4 | 3 (56) | 1.0000 | 0.44, 4.9e-08 | **jitter 1/4** |
+| N | 4 | 0.2 | g | 12/12/11/12 | 0.0083 / 0.0097 | 0.11 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (40) | TS 6.4e-16 Ha | 0.29, 0.0e+00 | pass |
+| N | 4 | 0.15 | g | 16/16/16/13 | 0.0009 / 0.0022 | 0.05 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (40) | TS 6.5e-16 Ha | 0.12, 0.0e+00 | pass |
+| O | 1 | 0.2 | S | 15/15/16/22 | 0.0056 / 0.0096 | 0.42 | 5.2e-06–9.3e-06 | 9.5e-05 | 0/4 | 2 (74) | 1.0000 | 1.00, 1.9e-07 | **jitter 4/4** |
+| O | 1 | 0.15 | S | 15/17/18/14 | 0.0012 / 0.0042 | 0.28 | 1.5e-06–1.4e-05 | 3.8e-05 | 2/4 | 2 (74) | 1.0000 | 0.37, 2.2e-07 | **jitter 2/4** |
+| O | 3 | 0.2 | S | 16/27/17/16 | 0.0062 / 0.0103 | 0.45 | 9.5e-08–5.0e-07 | 1.2e-06 | 4/4 | 3 (41) | 1.0000–1.0000 | 0.85, 1.3e-07 | pass |
+| O | 3 | 0.15 | S | 16/21/19/19 | 0.0010 / 0.0035 | 0.26 | 6.9e-08–8.2e-07 | 2.3e-06 | 4/4 | 3 (41) | 1.0000 | 0.60, 8.1e-08 | pass |
+| O | 5 | 0.2 | ts0.063 | 11/12/12/12 | 0.0378 / 0.0405 | 0.10 | 9.7e-11–2.1e-10 | 2.3e-10 | 4/4 | 9 (46) | TS 6.3e-05 Ha | 0.49, 1.0e-10 | pass |
+| O | 5 | 0.15 | ts0.063 | 11/13/12/12 | 0.0198 / 0.0219 | 0.11 | 7.3e-11–2.8e-10 | 2.8e-10 | 4/4 | 9 (46) | TS 6.3e-05 Ha | 0.22, 4.3e-07 | pass |
+| F | 2 | 0.15 | S | 13/17/16/15 | 0.0016 / 0.0058 | 0.45 | 1.4e-07–2.2e-06 | 3.3e-06 | 4/4 | 2 (47) | 1.0000 | 1.67, 1.9e-07 | pass |
+| F | 4 | 0.15 | S | 11/20/30/12 | 0.0173 / 0.0205 | 0.37 | 3.3e-07–1.2e-06 | 4.1e-06 | 4/4 | 9 (45) | 1.0033–1.0033 | 1.13, 1.5e-07 | pass |
+| Si | 1 | 0.35 | S | 15/12/20/15 | 0.0517 / 0.0529 | 0.05 | 9.1e-07–1.7e-06 | 1.9e-05 | 4/4 | 9 (56) | 1.0000–1.0000 | 0.13, 4.6e-09 | pass |
+| Si | 1 | 0.15 | S | 14/11/28/36 | 0.0113 / 0.0125 | 0.04 | 1.1e-06–5.2e-06 | 6.2e-06 | 2/4 | 9 (54) | 1.0000–1.0000 | 0.12, 3.4e-09 | **jitter 2/4** |
+| Si | 3 | 0.35 | S | 10/11/11/10 | 0.0459 / 0.0478 | 0.09 | 7.5e-08–1.9e-07 | 2.4e-07 | 4/4 | 8 (57) | 1.0000–1.0000 | 0.16, 7.2e-09 | pass |
+| Si | 3 | 0.15 | S | 12/12/12/22 | 0.0102 / 0.0114 | 0.05 | 0.0e+00–6.2e-06 | 8.5e-06 | 3/4 | 9 (58) | 1.0000–1.0000 | 0.15, 1.8e-07 | **jitter 1/4** |
+| Si | 5 | 0.35 | g | 10/10/10/10 | 0.0558 / 0.0568 | 0.01 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 12 (63) | TS 3.6e-11 Ha | 0.02, 6.8e-08 | pass |
+| Si | 5 | 0.15 | g | 11/11/11/12 | 0.0104 / 0.0114 | 0.02 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 10 (58) | TS 2.5e-11 Ha | 0.04, 0.0e+00 | pass |
+| P | 2 | 0.35 | S | 11/15/18/20 | 0.0297 / 0.0322 | 0.18 | 1.5e-06–1.3e-05 | 1.7e-05 | 1/4 | 7 (61) | 1.0000–1.0000 | 0.38, 1.3e-08 | **jitter 3/4** |
+| P | 2 | 0.15 | S | 10/27/25/29 | 0.0070 / 0.0082 | 0.06 | 5.5e-07–3.5e-06 | 2.0e-05 | 3/4 | 7 (61) | 1.0000–1.0000 | 0.12, 5.0e-09 | **jitter 1/4** |
+| P | 4 | 0.35 | g | 13/13/13/11 | 0.0243 / 0.0261 | 0.05 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 10 (63) | TS 2.6e-12 Ha | 0.11, 3.2e-06 | pass |
+| P | 4 | 0.15 | g | 11/11/11/11 | 0.0055 / 0.0070 | 0.04 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 10 (64) | TS 1.9e-12 Ha | 0.12, 0.0e+00 | pass |
+| S | 1 | 0.35 | S | 9/10/14/14 | 0.0175 / 0.0197 | 0.22 | 7.4e-07–5.6e-06 | 1.3e-05 | 1/4 | 3 (72) | 1.0000 | 0.40, 1.2e-07 | **jitter 3/4** |
+| S | 1 | 0.15 | S | 61/35/38/41 | 0.0043 / 0.0054 | 0.09 | 2.5e-06–7.2e-06 | 2.3e-05 | 1/4 | 4 (73) | 1.0000 | 0.25, 1.6e-08 | **conv, jitter 3/4** |
+| S | 3 | 0.35 | S | 13/11/11/11 | 0.0169 / 0.0185 | 0.07 | 1.3e-07–4.1e-07 | 4.7e-07 | 4/4 | 9 (52) | 1.0000–1.0000 | 0.50, 5.6e-08 | pass |
+| S | 3 | 0.15 | S | 11/22/11/12 | 0.0037 / 0.0051 | 0.09 | 2.6e-07–5.1e-07 | 8.0e-07 | 4/4 | 8 (52) | 1.0000 | 0.24, 5.8e-07 | pass |
+| S | 5 | 0.35 | ts0.072,ts0.073 | 10/11/12/11 | 0.1062 / 0.1079 | 0.17 | 1.2e-10–2.0e-07 | 2.1e-07 | 4/4 | 15 (45) | TS 7.3e-05 Ha | 0.31, 5.5e-08 | pass |
+| S | 5 | 0.15 | ts0.064 | 10/12/54/12 | 0.0205 / 0.0218 | 0.06 | 1.5e-10–1.2e-07 | 2.5e-07 | 4/4 | 10 (44) | TS 6.4e-05 Ha | 0.22, 2.8e-07 | pass |
+| Cl | 2 | 0.35 | S | 9/9/9/10 | 0.0096 / 0.0118 | 0.22 | 2.6e-07–5.2e-07 | 8.3e-07 | 4/4 | 2 (50) | 1.0000–1.0000 | 0.54, 3.8e-08 | pass |
+| Cl | 2 | 0.15 | S | 12/9/20/12 | 0.0018 / 0.0045 | 0.17 | 1.6e-07–1.6e-06 | 1.9e-06 | 4/4 | 3 (51) | 1.0000 | 0.54, 2.6e-08 | pass |
+| Cl | 4 | 0.35 | S | 11/14/14/12 | 0.1085 / 0.1111 | 0.25 | 6.3e-07–1.3e-06 | 2.1e-06 | 4/4 | 10 (46) | 1.0060–1.0061 | 0.49, 4.6e-07 | pass |
+| Cl | 4 | 0.15 | S | 11/23/30/23 | 0.0208 / 0.0225 | 0.11 | 1.9e-07–6.3e-07 | 8.3e-07 | 4/4 | 10 (47) | 1.0053–1.0053 | 0.15, 2.5e-08 | pass |
+
+Notes on the table:
+- **All-electron O at M = 1 on Balanced (0.25)**: DS stalls at three of four sites (the pre-existing failure of §6),
+  so there is no DS spread; FD converges at all four in 11–12 iterations to the gapped 1s² 2p⁶ (2s above 2p on the
+  σ = h surface, §6). Its FD spread, 1.03 mHa, is the all-electron egg-box (M = 3's DS spread on the same grid is
+  1.24 mHa). On Balanced the DS winner was M = 3 at three sites only because its M = 1 failed there; FD's winner is
+  M = 1 at every site.
+- **All-electron O at M = 5** is a new case (not run at 1e-3). Its 6th ↑ electron sits in a diffuse, triply
+  degenerate level at −0.02 Ha (f ≈ ⅓ each; TS 19–21 mHa). It is the worst noise case measured (best Δρ 1.7e-5 in
+  100 iterations at three sites) and **fails the convergence rule at 2 of 4 sites on Balanced and 3 of 4 on
+  Accurate**. It lies 670 mHa above the M = 1 winner, and the scan leaves a failed multiplicity out, so the winner is
+  unaffected, but it is a V0 convergence failure as pre-registered.
+- **S at M = 1 on Accurate** took 61 iterations at the node (rule: 60), after a 30-step plateau at 1.3–2.5e-5: a
+  convergence failure by one iteration. Its other sites took 35–41.
+- The DS warm re-solves of the diffuse M = 5 / M = 4 cases take ~25 iterations because DS's release fires again;
+  that is DS's behaviour, not FD's.
+
+### A2. Table: the spec's molecular cases at kT = 5 mHa
+
+| case | M | h | state | cold iterations (node/centre/face/generic) | F spread / bound (mHa) | σ_path (µHa) | noise median, range over sites | noise max | sites with median ≤ 3.3e-6 | witness: max extra (min reach, kT) | TS / closed form | stop error: max \|ΔF\| (µHa), max \|ΔF_I\| (Ha/Bohr) | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| H₂O | auto | 0.2 | g | 16/13/13/13 | 0.0042 / 0.0051 | 0.07 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (40) | TS 5.9e-12 Ha | 0.19, 0.0e+00 | pass |
+| H₂O | auto | 0.15 | g | 13/13/14/13 | 0.0030 / 0.0057 | 0.19 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 2 (40) | TS 5.9e-12 Ha | 0.46, 0.0e+00 | pass |
+| NH | auto | 0.2 | ts13.863 | 15/14/16/16 | 0.0104 / nan | 0.22 | 4.5e-06–9.6e-06 | 6.9e-05 | 0/4 | 2 (51) | TS 1.4e-02 Ha | 0.56, 8.0e-08 | **jitter 4/4** (spread: DS stalls; vs NH M = 3 DS 0.0106) |
+| NH | auto | 0.15 | ts13.863 | 15/15/42/19 | 0.0087 / nan | 0.21 | 2.9e-06–9.6e-06 | 1.8e-05 | 1/4 | 2 (51) | TS 1.4e-02 Ha | 0.47, 6.0e-08 | **jitter 3/4** (spread: DS stalls; vs NH M = 3 DS 0.0090) |
+| NH | 3 | 0.2 | ts0.000 | 20/14/17/14 | 0.0106 / 0.0121 | 0.08 | 0.0e+00–8.0e-12 | 8.0e-12 | 4/4 | 3 (48) | TS 2.9e-07 Ha | 0.12, 4.4e-07 | pass |
+| NH | 3 | 0.15 | ts0.000 | 15/14/14/14 | 0.0090 / 0.0102 | 0.04 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 4 (48) | TS 2.9e-07 Ha | 0.12, 1.0e-12 | pass |
+| O₂ | auto | 0.2 | ts13.863 | 16/19/19/19 | 0.0090 / 0.0137 | 0.47 | 8.9e-07–2.8e-05 | 5.2e-05 | 2/4 | 2 (53) | TS 1.4e-02 Ha | 1.19, 2.3e-07 | **jitter 2/4** |
+| O₂ | auto | 0.15 | ts13.863 | 14/16/18/18 | 0.0018 / 0.0085 | 0.66 | 6.8e-07–8.1e-06 | 1.3e-05 | 2/4 | 2 (53) | TS 1.4e-02 Ha | 1.56, 1.4e-07 | **jitter 2/4** |
+| O₂ | 3 | 0.2 | g | 13/17/13/16 | 0.0076 / 0.0093 | 0.18 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 3 (40) | TS 2.0e-12 Ha | 0.59, 0.0e+00 | pass |
+| O₂ | 3 | 0.15 | g | 15/15/13/14 | 0.0037 / 0.0058 | 0.25 | 0.0e+00–0.0e+00 | 0.0e+00 | 4/4 | 3 (40) | TS 2.0e-12 Ha | 0.63, 0.0e+00 | pass |
+| OH off-axis | auto | 0.2 | ts6.931 | 14/18/35/14 | 0.0062 / 0.0103 | 0.44 | 5.8e-08–1.6e-06 | 5.7e-06 | 4/4 | 3 (53) | TS 6.9e-03 Ha | 0.92, 8.8e-07 | pass |
+| OH off-axis | auto | 0.15 | ts6.931 | 43/14/14/14 | 0.0047 / 0.0078 | 0.36 | 5.4e-08–9.5e-07 | 1.6e-06 | 4/4 | 4 (53) | TS 6.9e-03 Ha | 0.76, 1.1e-07 | pass |
+| OH along x | auto | 0.2 | ts6.931 | 14/14/14/14 | 0.0057 / 0.0079 | 0.25 | 2.9e-08–5.2e-07 | 9.1e-07 | 4/4 | 3 (53) | TS 6.9e-03 Ha | 0.70, 1.0e-07 | pass |
+| OH along x | auto | 0.15 | ts6.931 | 14/14/21/14 | 0.0033 / 0.0049 | 0.20 | 7.4e-08–2.6e-07 | 5.5e-07 | 4/4 | 4 (53) | TS 6.9e-03 Ha | 0.68, 7.7e-08 | pass |
+
+- **OH** (axis and off-axis): the ↓ π pair holds one hole, TS = 2 kT ln 2 = 6.931 mHa at every site (off-axis the
+  egg-box splits the pair by 5e-6 Ha, f = 0.5001/0.4999). Passes every rule; reaches 1e-6 from the floor in 1–3
+  steps.
+- **O₂ singlet at auto** and **NH at auto**: two half-filled pairs, TS = 4 kT ln 2 = 13.863 mHa at every site, E equal
+  to the DS E (O₂: −32.448841 against −32.448843 at the node, h = 0.15), i.e. the migration's class T. They converge in
+  ≤ 19 (O₂) and ≤ 42 (NH) iterations at 1e-5 but miss the jitter rule (floor medians up to 2.8e-5 and 9.6e-6). From
+  the floor, a re-solve to 1e-6 took 1–40 iterations, and failed once (O₂, h = 0.20, centre: best 1.0e-6 in 40).
+  **`DegenerateShells` stalls on singlet NH at every site on both grids** (stall stop at 57 iterations, best Δρ
+  7e-2), so its spread is compared with the same nuclei's DS spread at M = 3 (0.0106 / 0.0090 mHa): FD gives 0.0104 /
+  0.0087.
+- **O₂ triplet, H₂O, NH at M = 3**: gapped (TS ≤ 3e-7 Ha); pass. H₂O's frontier gap on the pseudo surface at h = 0.15
+  is 0.252 Ha (HOMO −0.2710, LUMO −0.0189), TS 5.9e-12 Ha.
+- Not run: the lopsided-tetrahedron seeding (§4.7(e) of the spec, item of A1), and a bent radical if the spec's
+  "OH (bent)" meant one (method).
+
+### C. The witness at 5 mHa
+
+The 36 kT arm fits under `MAX_WITNESS_GROWTH` = 16 in every case (table column "witness"):
+- 2–5 extra vectors for B, C, N, O, F and Cl at their winning M, S at M = 1, the molecules, and all-electron O at
+  M = 1 and 3;
+- 7–12 for Si at every M, S at M = 3, P at both M, F and Cl at M = 4, O and all-electron O at M = 5;
+- **15 for S at M = 5 on h_req** (the 4s-like ↑ level against the box states), the only case near the cap.
+
+At 8 mHa (§7) O at M = 5 and F at M = 4 exceeded 16; at 5 mHa they need 9. The reach lands at 40–82 kT, because one
+added vector often jumps across a cluster of near-degenerate box states. Since box states scale as L³, a box a few
+per cent larger than 14 Bohr can push S at M = 5 over the cap; the scan then leaves that multiplicity out, and every
+winner needs ≤ 10.
+
+**Cost.** Mean cold-solve time, FD against DS (GPU shared with the user's session, so indicative): 2p atoms and the
+molecules 1–5× (H₂O 15 s against 8 s at 95³; O₂ triplet 34 against 7); the 3p atoms 5–80× (Si at M = 5: 80 s against
+1–2 s; S at M = 3, 0.15: 60 against 4; Cl at M = 4, 0.15: 227 against 47). The time is the one-vector-at-a-time growth,
+each growth re-solving the block; warm solves keep the block and take 1 step.
+
+**Verdict on the arm: no change is needed for V0.** The options, if the user wants margin or speed, are in spec §4.2
+(a larger cap; multi-vector growth; or a 25 kT arm derived from the stop, whose neglected charge is ≈ 4e-12 e), none
+of them a tolerance change.
+
+### D. The noise floor at 5 mHa, and the 1e-5 margin
+
+The f32 floor (median Δρ of warm steps at tol 1e-12, tight eigen steps) against the 1e-5 stop:
+- **Gapped states** (O₂ triplet, H₂O, NH at M = 3, N and P at M = 4, Si at M = 5, all-electron O at M = 1): ≤ 3e-10, or
+  converged at once. Margin > 3e4.
+- **One open channel, three levels at f = ⅓ or ⅔** (the winners of B, C, O, F, Si, S, Cl; F and Cl at M = 4), and OH:
+  medians 5e-8 to 2.2e-6; margin 4.5–150×. One exception: Si at M = 3 on Accurate, generic site (6.2e-6).
+- **Two open channels or two half-filled pairs** (O, C, Si, S at M = 1; N and P at M = 2; the O₂ singlet and NH at
+  auto) and all-electron O at M = 5: medians **1e-6 to 2.8e-5**, single steps up to 9.5e-5. The jitter rule fails at
+  most of their sites. The 1e-5 stop is still reached within the 60-iteration rule at every site except S at M = 1
+  (61) and all-electron O at M = 5, because the floor fluctuates and one step below 1e-5 ends the solve.
+- The floor is not stationary across runs: O at M = 1, h_req, node had a median of 1.7e-6 in the 1e-3 study's 5 mHa
+  row (§4) and 6.4e-6 here.
+
+**Is 1e-5 a safe margin?** For gapped and single-open-channel states (every scan winner, OH, H₂O): yes, ≥ 4× and
+usually ≥ 20×. For the M = 1-type states it is not a factor-3 margin; it is a first-passage stop that converged in
+9–61 iterations here. None of these is a scan winner, and a failed multiplicity is left out of the scan, but the O₂
+singlet and NH at auto are scene states a user can build, so a live solve of them can take ~40 iterations and
+occasionally hit the stall stop. A factor-3 margin over the worst median (2.8e-5) would need a stop near 1e-4, which I
+do not propose: it is the user's value, the energy and
+force cost of 1e-5 is already below the f32 scatter, and the remedy for the noise is an FD-aware stop criterion or a
+tighter final eigensolve (§9 above), not a looser Δρ.
+
+### B. Where the 1e-5 stop applies (my ruling), and what it costs
+
+**Ruling.** On the GPU, under FD, a step is converged at `max(tol_eff, 1e-5)` when its occupations have a partial
+level (min(f, 1 − f) ≥ 1e-6 in either channel), and at `tol_eff` otherwise. `tol_eff` is today's
+`effective_gpu_tol` (max(tol, 2·5e-8·N)) under an ionic setup, `tol` otherwise. The CPU f64 path keeps `tol`. It
+applies to every GPU SCF, not only the reference scan. The spec's section 5.1 states it; ruling 42 records it.
+
+**Why every partial-level solve and not only the scan.** The floor belongs to the partly occupied level, not to
+the lone atom. The molecules show it:
+- the O₂ singlet at auto and NH at auto (two half-filled pairs, TS = 4 kT ln 2) have floor medians up to
+  2.8e-5 and 9.6e-6, and a warm re-solve to the sample tolerance 1e-6 from the floor took 1–40 iterations, with one
+  failure at 40 (O₂ at h = 0.20, best 1.0e-6);
+- the lone M = 1 atoms reached 1e-6 at almost no site in the 1e-3 study (§2, §3 above).
+
+The sample teacher (1e-6) would stall on exactly these states in a collection, the migration re-solves at 1e-6,
+and an O₂ or OH in the user's H/N/O collection is a real case. Restricting the stop to the scan would leave those to
+the stall stop.
+
+**Why not every FD solve.** A gapped solve has no FD floor: H₂O, the O₂ triplet, NH at M = 3 and the gapped atoms reach
+1e-6 in one warm step (their noise runs sit at Δρ ≤ 3e-10). Keeping their stop at 1e-6 keeps every gapped pin and
+label exactly as today.
+
+**Interaction with the existing rule and the provenance.**
+- `effective_gpu_tol` is unchanged and still applied first; the partial-level 1e-5 is a further floor on top of it.
+  At N ≤ 100 valence electrons the storage floor term (2·5e-8·N ≤ 1e-5) never exceeds the new one.
+- `Provenance::tol` and `ReferenceKey::tol` keep the nominal tolerance, as they already do for `effective_gpu_tol`.
+- The rule is named in the tag: `…/fd5e-3/stop2x5e-8/pin1e-5` and `none/fd5e-3/pin1e-5`.
+- `ScfStats` reports the tolerance the converged step was tested against, so `EvalStats::scf_tol_used` is 1e-5 for
+  such a solve and `branch_jump` uses the 1e-5 noise tier for it.
+
+**Effect on energies and forces.**
+- *Estimate.* F is stationary in ρ, so a residual δρ of L1 norm 1e-5 changes F at second order: roughly its Hartree
+  self-energy over a ~1 Bohr region, ‖δρ‖²/R ≈ 1e-10 Ha. The force on nucleus I is first order: at most
+  ‖δρ‖₁·max|∇V_loc,I| ≈ 1e-5 × 2 Ha/Bohr = 2e-5 Ha/Bohr for pseudo-O (Z_v = 6, r_c ≈ 1.1 Bohr), a strict upper bound.
+- *Measured* (cold at 1e-5 against a warm re-solve to 3e-6 from the floor state, every FD case above):
+  - pseudo surface, |ΔF| ≤ 1.7 µHa (F at M = 2); |ΔF_I| ≤ 8.8e-7 Ha/Bohr per component on every solve with a partial
+    level (OH off-axis), ≤ 3.2e-6 including gapped ones (P at M = 4, generic site, whose cold stop was at
+    Δρ = 9.1e-6);
+  - all-electron O, |ΔF| ≤ 2.9 µHa, |ΔF_I| ≤ 2.1e-6 Ha/Bohr;
+  - the warm/cold path scatter σ_path for comparison: 0.01–0.7 µHa pseudo, 0.5–1.1 µHa all-electron.
+- So the stop error is not resolved above the f32 path scatter in F (the 1e-10 Ha estimate is far below it), and the
+  forces' sits ≥ 6× under the linear bound (≥ 20× on the partial-level solves). Against the surface's tolerances:
+  ≥ 15× under `PSEUDO_FORCE_NOISE` (5e-5; ≥ 57× on the partial-level solves), ≥ 47× under the migration's
+  ε_F (1.5e-4), and ≤ ε_E/3 in energy.
+
+### E. Not measured, or not verified
+
+- **The CPU f64 cross-check at 5 mHa** of the worst cases (S at M = 1 on Accurate, all-electron O at M = 5) was not
+  run, to keep the PC usable; whether S M = 1's 30-step plateau is f32 noise or a slow physical mode is therefore
+  not separated. The 1e-3 study's CPU check (§5.2) showed the f32 floor is what held O at M = 1 at 2 mHa.
+- **The lopsided-tetrahedron seeding** (spec §4.7(e)) and **a bent radical**, if "OH (bent)" meant one.
+- **Statistics:** one cold solve per site and case; the noise-limited iteration counts are stochastic (§1.3), and the
+  floor medians move by up to 4× between runs of the same case.
+- **The integer-limit U** was not re-measured; §5.1's values stand.
+- **Wall times** are indicative: the GPU was shared with the user's session and, after a pause for a suspected GPU
+  overheating, the last batches (all-electron O at M = 5, P, C, N, B) ran one at a time with 3-minute gaps.
+
+### F. Reproducing
+
+`cargo test -p providers --release v0_cases -- --ignored --nocapture` (uncommitted harness), with `V0_Z` or `V0_MOL`,
+`V0_POLICY`, `V0_GRIDS`, `V0_MS`, `V0_MODES` (default `ds,fd5e-3`), `V0_SITES`, `V0_TOL` (1e-5), `V0_TIGHT` (3e-6),
+`V0_TIGHT2` (molecules: 1e-6), `V0_NOISE`, `V0_NOISE_STEPS` (15), `V0_MAXIT` (100). Batches: O, Si, S, Cl, F, the
+molecules, all-electron O (M = 1, 3 and then M = 5), P (M = 2, M = 4), C (M = 1, 3, then 5), N and B; about 520 GPU
+solves (cold, warm, noise and tight), ≈ 4.5 h of GPU time.
