@@ -1,7 +1,9 @@
 # Fermi–Dirac occupations and the Mermin free energy (2026-11-13)
 
 Status: design. The user approved the fix and the collection option on 2026-11-13 (section 2); everything else here
-is a ruling of mine and is listed in section 13. Evidence: `docs/superpowers/notes/2026-11-13-scf-stall-diagnosis.md`
+is a ruling of mine and is listed in section 13. The design has been amended for the physics review of 682960e
+(MUST 6, SHOULD 10, NOTE 9). Each finding is applied where its section is; the review IDs appear in brackets, e.g.
+[MUST-1], and section 13 lists the rulings. Evidence: `docs/superpowers/notes/2026-11-13-scf-stall-diagnosis.md`
 ("the diagnosis" below; its section numbers are cited as D§n). Implementation starts only **after the trust rework
 on branch `claude/charming-keller-0bc26b` has merged to `main`** and `scf-stall` has been rebased onto it (section 11).
 
@@ -15,7 +17,7 @@ iterations, and neither branch is self-consistent. The all-electron integer aufb
 H₆ seed 5, H₂O + 2 H) with the textbook level-flipping problem.
 
 This spec replaces both rules with one continuous rule, **Fermi–Dirac occupations at a fixed electronic temperature**.
-The solver then minimises and reports the **Mermin free energy F = E − TS**. The prototype (D§6) converged all 23
+The solver then converges to a stationary point of, and reports, the **Mermin free energy F = E − TS** [SHOULD-3]. The prototype (D§6) converged all 23
 default-policy cases and the 3 all-electron failures, and left gapped systems unchanged (H₂ ΔE = 0, H₂O 1e-6).
 
 It also keeps the user's trained collections. F differs from the old E for open-shell and near-degenerate samples,
@@ -26,7 +28,8 @@ the new solver, never by deleting or converting the old data.
 
 1. Fermi–Dirac occupations at a fixed kT = 1e-3 Ha (≈ 316 K), with a chemical potential per spin channel. They
    replace the τ_c equal share of `DegenerateShells` and its two-phase release.
-   - The solver reports and minimises F = E − TS.
+   - The solver reports and minimises F = E − TS. Strictly, the SCF makes F stationary on the branch it reaches
+     (section 4.7(e)) [SHOULD-3].
    - The forces stay as they are. They are already f-weighted Hellmann–Feynman forces, i.e. −dF/dR.
    - MD, relax and the surrogate's energy labels use F.
    - The DIIS clear/push order at a release must be fixed if any release logic survives. Removing the release path
@@ -44,7 +47,9 @@ the new solver, never by deleting or converting the old data.
   takes 56 iterations under aufbau today. None of them may end by the stall stop or the cap.
 - **G2. One rule.** One occupation rule for every scene the providers solve, all-electron and pseudised alike.
   `DegenerateShells`, its release and its "pattern frozen by rank" logic are deleted.
-- **G3. One energy.** F is *the* energy: what the solver minimises, what `ForceProvider` returns, what MD conserves
+- **G3. One energy.** F is *the* energy: what the solver makes stationary (self-consistent) — the minimum of F on the
+  branch the SCF reaches, which is not always the global one (section 4.7(e)) [SHOULD-3] —, what `ForceProvider`
+  returns, what MD conserves
   (with K), what relax minimises and what the surrogate learns. E and TS are available next to it, labelled.
 - **G4. CPU = GPU.** The f64 reference (`qm`) and the GPU solver (`qm-gpu`) implement the rule with the same shared
   host code and agree within `gpu_vs_cpu`'s existing bounds.
@@ -94,12 +99,31 @@ f_iσ = 1 / (1 + exp(x_iσ)),   x_iσ = (ε_iσ − μ_σ) / kT,   Σ_i f_iσ = 
 
 - Bracket: [ε_min − 50 kT, ε_max + 50 kT]. At the lower end every f ≤ e^{−50}, so Σf < N_σ. At the upper end every
   f ≥ 1 − e^{−50}, and k_σ > N_σ gives Σf > N_σ. No other bracket logic is needed.
-- Step: halve the bracket on the sign of Σf(mid) − N_σ. Stop when the midpoint equals an endpoint in f64, i.e. the
-  bracket is exhausted. That takes about 60 halvings for a 20 Ha bracket (all-electron O 1s), a few µs.
-- After it, |Σf − N_σ| ≲ k_σ·ulp(μ)/(4kT) ≈ 1e-13. The density is still charge-renormalised per channel by the
-  mixer, as today.
-- No tolerance parameter and no iteration cap are needed, and the function is deterministic: the same f64 inputs give
-  the same μ on every run and in both solvers.
+- **Non-finite input** [SHOULD-1]. A non-finite eigenvalue raises `QmError::Numerical` before the bisection starts.
+  Without this check a NaN would never compare equal to an endpoint, so the stop rule below would never fire.
+- **Step.** Halve the bracket on the sign of Σf(mid) − N_σ. Stop when the midpoint equals an endpoint in f64, i.e. the
+  bracket is exhausted.
+  - The count is about 60 halvings when |μ| ~ 1 (a 20 Ha bracket, as for all-electron O 1s).
+  - The worst case for finite inputs is about 1 100, when μ is near 0 and the f64 spacing reaches subnormals
+    [NOTE-1]. That is still µs.
+  - A backstop cap of 2 048 halvings never binds. It is there only so that termination never depends on the stop rule
+    alone.
+- **Ties and the gapped plateau** [MUST-1]. In a gapped channel, Σf is exactly N_σ in f64 over a whole plateau of μ.
+  - The plateau runs from about ε_HOMO + 37 kT, where 1 − f_HOMO drops below ½ ulp(1), to about ε_LUMO − 36 kT, where
+    f_LUMO drops below ½ ulp(N_σ). It exists whenever the gap exceeds about 74 kT, i.e. for every closed-shell molecule.
+  - On the plateau, "halve on the sign" is undefined, and a tie rule would drive μ to one edge rather than to the FD
+    root near mid-gap.
+  - The solver therefore runs the bisection twice:
+    - with Σf(mid) − N_σ ≥ 0 moving the upper end, which converges to the least μ with Σf ≥ N_σ;
+    - with Σf(mid) − N_σ ≤ 0 moving the lower end, which converges to the greatest μ with Σf ≤ N_σ.
+  - It reports the midpoint of the two. Without a plateau the two coincide to f64.
+  - Only the f matter for the physics, and they are identical to ≤ e^{−36} anywhere on the plateau.
+  - μ_σ is a reported diagnostic only where the channel has a partial level (section 5). In a gapped channel it is
+    printed as the plateau midpoint and never compared across solvers or used by any test as a physical number.
+- After the bisection, |Σf − N_σ| ≲ k_σ·ulp(μ)/(4kT) ≈ 1e-13. The density is still charge-renormalised per channel by
+  the mixer, as today.
+- No tolerance parameter is needed, and the function is deterministic: the same f64 inputs give the same μ and f on
+  every run and in both solvers.
 
 **Per spin, not joint (the user's decision; why).** A per-channel μ_σ at fixed N_σ is the fixed-spin-moment
 ensemble.
@@ -116,15 +140,30 @@ The rule needs every level with non-negligible f, so each channel grows its bloc
 satisfies:
 
 ```text
-ε_kσ − μ_σ ≥ max(WITNESS_GAP, 36 kT),   WITNESS_GAP = 0.1 Ha
+ε_kσ ≥ ε_{N_σ,σ} + WITNESS_GAP   and   ε_kσ − μ_σ ≥ 36 kT,   WITNESS_GAP = 0.1 Ha
 ```
 
-- At 36 kT, f < 2.4e-16, below f64 resolution next to 1. At 0.1 Ha = 100 kT, f ≈ 4e-44.
-- WITNESS_GAP keeps today's τ_c reach, which is the configuration the prototype ran (D§6) and today's cost on the
-  pseudo path. The 36 kT arm only matters if a harness raises kT above 2.8 mHa.
-- Growth is one vector at a time, with μ recomputed each time. Adding a level above μ only lowers μ, so the test is
-  monotone.
+Here ε_{N_σ,σ} is the N_σ-th lowest level [MUST-1].
+
+- **The first arm** is today's τ_c reach, measured from the N_σ-th level and not from μ. It is exactly the configuration
+  the prototype ran: the prototype applied FD only after `degenerate_shell_occupations` had accepted that witness
+  (`qm-gpu/src/scf.rs`, D§6). So the cost claim below and V2's "match the prototype" premise rest on the configuration
+  production will run.
+  - A μ-relative witness would have meant ε_HOMO + 0.137 Ha or ε_LUMO + 0.064 Ha in a gapped channel, depending on the
+    tie rule.
+- **The second arm** is the FD tail condition. At 36 kT, f < 2.4e-16, below f64 resolution next to 1; at 0.1 Ha =
+  100 kT, f ≈ 4e-44. It binds only when μ lies more than 0.064 Ha above ε_{N_σ} (a pinned level above the N_σ-th) or
+  when a harness raises kT.
+- Growth is one vector at a time, re-testing both arms on the re-solved levels. Growing the block re-solves every
+  level, so no monotonicity is claimed. The loop is bounded by the cap.
 - The cap stays: `MAX_WITNESS_GROWTH` = 16, with the same error when it is exceeded.
+  - **A new error path** [NOTE-6]. All-electron scenes now grow witnesses. In a large box, or with an unbound LSDA
+    HOMO (anions), the density of box states inside 0.1 Ha of ε_{N_σ} can exceed 16. N(E) ∝ L³E^{3/2} gives about 28
+    states per 0.1 Ha at L = 20 Bohr near 0.2 Ha.
+  - The ε_N-relative arm keeps the window as today's, so the risk is the pseudo path's existing one, now also on the
+    all-electron path.
+  - V8 pins it with an all-electron H⁻ at the app's largest box. Its outcome (converges, or the documented cap error)
+    is recorded.
 - **Cost (measured in Task A1, section 11).** All-electron scenes have not grown witnesses until now. Under `Aufbau`
   they solve exactly N_σ vectors, so they now pay at least one extra vector per occupied channel. The default policy
   (`Accepted`, pseudised H) already pays it. The change in all-electron per-solve time is measured on H₂ and H₃⁺ at
@@ -161,11 +200,18 @@ satisfies:
 
 The lone-O rows hold only if the symmetric ensemble survives at this kT; section 4.7(d) says why that is not certain.
 
-**Gapped systems.** With a gap of ≥ 37 kT on each side of μ, every f is exactly 0.0 or 1.0 in f64 and S ≤ 1e-14.
-So TS = 0 on every closed shell, every integer-per-spin open shell, and 4 of the 5 stallers (D§6: TS ≤ 2e-7).
+**Gapped systems** [SHOULD-5]. With a gap of at least 37 kT on each side of μ:
+- every f below μ is exactly 1.0 in f64;
+- every f above μ is ≤ e^{−36}. It is representable down to 1e-308, so it is never 0.0. (The prototype's
+  `x > 40 → 0.0` clip hid this.)
+- S ≤ 1e-14.
 
-**Not computed: the kT → 0 estimate.** Gillan's E₀ ≈ ½(E + F) is exact to O(T²) for a smooth density of states. It is
-off by TS/2 exactly in the degenerate case, the one where it would matter, so it is not reported.
+So TS ≤ 1e-14 Ha on every closed shell and every integer-per-spin open shell gapped by ≥ 74 kT. On 4 of the 5 stallers
+D§6 measured TS ≤ 2e-7 Ha [NOTE-7]: they are integer-occupied, but not by a 74 kT margin.
+
+**Not computed: the kT → 0 estimate** [NOTE-8]. For a smooth density of states the T² terms of E and F cancel in
+Gillan's E₀ ≈ ½(E + F), so its error starts beyond T². It is off by TS/2 exactly in the degenerate case, the one where
+it would matter, so it is not reported.
 
 ### 4.4 Forces: −dF/dR, unchanged code
 
@@ -176,8 +222,10 @@ F[{ψ}, {f}] at fixed N_σ is stationary in both ψ and f:
 
 So dF/dR = ∂F/∂R|explicit. The occupation derivatives drop out (Σ_i μ_σ df_i/dR = μ_σ dN_σ/dR = 0), which leaves the
 Hellmann–Feynman force with f-weighted density and projector sums. The existing code computes exactly that
-(`crates/qm/src/forces.rs`, local term and nonlocal projector sum; `crates/qm-gpu/src/forces.rs`). It has been
-f-weighted since M7, so **no force code changes.**
+(`crates/qm/src/forces.rs`, local term and nonlocal projector sum; `crates/qm-gpu/src/forces.rs`), to the same floors as
+today: the SCF and eigen residuals, and the discrete Hartree map's asymmetry (≲ 1e-5 Ha/Bohr, `forces.rs` module doc)
+[SHOULD-8]. The code has been f-weighted since M7, so **no force code changes**. Only the module docs change, from
+"−dE/dR at fixed occupations" to "−dF/dR of the Mermin functional, stationary in ψ and f" (section 10).
 
 What changes is what the force is the derivative of. Paired with E, these forces would be inconsistent by
 d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level crosses μ. Hence G3.
@@ -213,16 +261,21 @@ d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level cro
 
 ### 4.7 What the new state is (rule 7)
 
-- **(a) Gapped systems.** F = E bit for bit or within the SCF tolerance: H₂ 0, H₂O 1e-6 (D§6). Nothing physical
-  changes.
+- **(a) Gapped systems.** F = E to within the GPU path scatter [SHOULD-6]. D§6 measured H₂ ΔE = 0 and H₂O ΔE = 1e-6 Ha,
+  against warm-vs-cold path scatters of up to 1.87e-6 Ha (pseudo H₂O, `references.md` "SCF, GPU against CPU").
+  Nothing physical changes.
 - **(b) Exactly degenerate partly filled shells** (symmetric H₄, the H₅ ring's ↓ pair, linear OH's π, a symmetric
   atom).
   - FD gives the same equal-weight ensemble `DegenerateShells` gave, so E is unchanged and F = E − TS (table above).
-  - The lattice-split pairs (≤ 5.3e-5 Ha) get f within 1.3 % of equal instead of exactly equal.
+  - The lattice-split pairs (≤ 5.3e-5 Ha) get f = ½ ∓ Δ/(8kT) = ½ ∓ 0.0066 instead of exactly ½: 0.0066 absolute,
+    1.3 % relative [NOTE-2].
   - The pseudopotential spec's §5.7 argument (levels this close are thermally co-occupied) is now the rule itself,
     made continuous.
-- **(c) Near-degenerate frontier ("pinned") states.** F lies below E by TS, which is O(kT·N_pinned). This is a real
-  T_el = 316 K effect, not an error: the system has an electronic temperature. It biases nothing in gapped systems.
+- **(c) Near-degenerate frontier ("pinned") states.** F lies below E by TS, which is O(kT·N_pinned). This is the
+  Mermin–Kohn–Sham functional at the fixed electronic temperature T_el, with ground-state LSDA xc [SHOULD-4].
+  - S is the entropy of the KS occupations, not the molecule's physical electronic entropy. The H₄ square's 4 ln 2
+    counts two independent half-filled pairs per spin, not the many-body multiplet degeneracy.
+  - It is a defined, documented part of the surface, not a solver error. It biases nothing in gapped systems.
 - **(d) Open-shell atoms below the polarisation threshold: an open question gated by Task A1.**
   - The pseudopotential spec §5.7 says the symmetric FD state is unstable to orbital polarisation below ≈ 3 mHa. Its
     stated reason is that integer occupation of an O 2p set splits it by 11.6–11.8 mHa.
@@ -234,25 +287,70 @@ d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level cro
   - That is the round-1 path-dependence §5.7's two phases were built against (a lone O 4.1 mHa lower at
     (0, h/2, h/2)). On the M = 3 integer branch, it would also bring back the orientation zero mode (Δρ stalled at
     7e-5).
-  - The diagnosis did not test lone open-shell atoms. **Task A1 measures this before any production code, and stops
-    for a user ruling if it fails** (section 9, V0).
+  - **The threshold is species-dependent** [MUST-2]. U grows with orbital compactness (F 2p > O 2p > C 2p). Rule 1
+    forbids a per-element kT, so the one global kT must be stable for the worst accepted species, on both surfaces.
+    The all-electron open-shell atoms ran aufbau until now: pseudo spec §6.1 says "the O triplet stops at the SCF cap".
+  - **Predictions pre-registered for V0** [SHOULD-9]:
+    - *M = 3:* kT* = f(1−f)·U = (2/9)·U, with f = ⅓ and U ≈ 11.8 mHa from the integer splitting, so ≈ 2.6 mHa.
+      The symmetric state is predicted to be a saddle at kT = 1e-3.
+    - *M = 1:* both channels have f = ⅔ in three p levels, so the occupation modes couple across channels.
+      - The charge-like mode (the same pattern in both channels) has U_c = U↑↑ + U↑↓. The measured M = 1 integer
+        behaviour (the occupied pair's oblate density pushes the empty p *below* an occupied one) says this mode is
+        anti-aufbau, U_c < 0, and stable.
+      - The spin-like mode (opposite patterns) has U_s = U↑↑ − U↑↓, with kT*_s = (2/9)·U_s. If the opposite-spin cross
+        term favours the swap (U↑↓ < 0), then U_s > U↑↑ and kT*_s exceeds the M = 3 value.
+      - So "symmetric at M = 3, polarised at M = 1" is an anticipated outcome, not a surprise. V0 extracts U↑↑, U_c and
+        U_s from the integer states' splittings and checks them against the observed state at each M.
+    - *GPU occupation jitter:* FD turns f32 eigenvalue noise into density noise, at up to 1/(4kT) = 250 Ha⁻¹; the
+      equal share of `DegenerateShells` was exactly flat. V0 records the per-iteration jitter δε of the shell's
+      eigenvalues near convergence on the GPU. It must keep the implied Δρ floor, ≈ 2δε/(4kT)·∫ ||ψ_i|² − |ψ_j|²|, a
+      factor 3 below the GPU stop rule max(tol, 2·floor·N). Failing that is a V0 failure.
+  - The diagnosis did not test lone open-shell atoms. **Task A1 measures this before any production code, for every
+    accepted open-shell species, both multiplicities and both surfaces, and stops for a user ruling if any fails**
+    (section 9, V0).
 - **(e) Broken symmetry is not addressed.** Smearing converges to the nearest stationary state, not the lowest.
   - The lopsided H₄ tetrahedron (D§6, pseudo-H, 81³ × 0.15) converges to a spin-symmetric state with its frontier pair
     pinned at μ (f = 0.57 / 0.43): F = −1.932837 Ha.
   - Unsmeared runs reach spin-broken integer states at E = −1.944984 (α = 0.1) and −1.956852 (α = 0.05), 12 and
     24 mHa lower.
   - All-electron: F = −1.813947 against the integer −1.826310 (12.4 mHa).
-  - This is LSDA's static-correlation regime. A spin-symmetric cold guess (ρ↑ = ρ↓ when N↑ = N↓) stays symmetric.
+  - This is LSDA's static-correlation regime.
+  - **Two claims here are empirical until Task A1 tests them** [SHOULD-2]:
+    - **"A spin-symmetric cold guess stays symmetric."** The two channels start from different random vectors
+      (seeds 1 and 2; the witness seeds differ by spin), so ρ↑ = ρ↓ holds only to eigensolver noise. The symmetry
+      survives because the DIIS map damps the antisymmetric mode within one solve. Nothing guarantees that across
+      thousands of warm-started MD steps that restart DIIS.
+    - **"The 12–24 mHa gap is LSDA broken symmetry."** It compares F of the FD state with E of two integer states
+      found under the old rule. It is physics only if those broken-symmetry states are also stationary points of F at
+      kT = 1e-3. Their gaps (0.031 / 0.027 Ha ≫ kT) make that likely, but it is not yet tested.
+    - Task A1 seeds FD with the α = 0.1 and α = 0.05 broken-symmetry densities. It confirms that each stays (TS ≲ 1e-6)
+      at F ≈ E within the path scatter, i.e. that the spin-symmetric state is a higher stationary point of the same F.
+  - **A structural alternative, for the user to decide** (offered, not adopted; ruling 33). Under auto with N↑ = N↓ and
+    a symmetric guess, the two channels could share seeds, or be one solve. ρ↑ = ρ↓ would then be exact, and the auto
+    surface would be the spin-restricted one by construction: one branch and no jumps, at the documented
+    restricted-vs-broken cost.
   - Documented in `references.md`, not hidden. A symmetry-breaking nudge is a separate decision (non-goal).
 - **(f) What MD conserves.** BO-MD on F conserves F + K_nuc. E + K_nuc is not conserved where TS varies along the path,
   and the readouts say so (section 6.6).
-- **(g) A new failure mode, stated.** The occupation-pattern warning (`EvalStats::occupation_changed`) goes away,
-  because F(R) is smooth in the levels.
-  - What smoothness does not prevent is a warm-started trajectory crossing from one stationary state to another, such
-    as the restricted fractional and broken-symmetry states of (e). F then jumps.
-  - Occupations do not flag this. It shows as NVE drift, and in a collection as a label the leave-one-out machinery
-    cannot fit.
-  - Documented as a limitation.
+- **(g) Branch jumps, and their guard** [MUST-3]. On one branch F(R) is smooth in the levels, so the
+  occupation-pattern warning (`EvalStats::occupation_changed`) loses its reason.
+  - Smoothness does not stop a warm-started trajectory crossing from one stationary state to another, such as the
+    restricted fractional and broken-symmetry states of (e). F then jumps by up to 12–24 mHa for the lopsided H₄. That
+    is 2–4× the nuclear KE of four atoms at 300 K (5.7 mHa).
+  - Occupations cannot flag this, NVE drift is not a detector, and leave-one-out catches it only after both branches
+    are stored.
+  - So the old watch is **replaced, not just retired**, by a work-consistency guard, `EvalStats::branch_jump`
+    (section 6.3). It warns and refuses surrogate training on a step whose ΔF does not match the work the forces did.
+    That is stricter than the old watch.
+- **(h) Separated fragments share μ_σ** [SHOULD-10]. One μ_σ per channel spans the whole box. Where two far-apart
+  fragments' frontier levels align within a few kT, FD puts fractional charge or spin on each: LSDA's delocalisation
+  error, made continuous.
+  - `DegenerateShells` did the same inside its 0.1 Ha window, and aufbau did it as integer flips. It is not new
+    physics, but the user can build it (H and O far apart, a dissociating heteronuclear bond).
+  - Documented in `references.md` "Approximation gaps".
+- **(i) Atomisation and binding energies** [NOTE-4]. Energies taken against isolated-atom references shift by
+  +TS_atom: a lone O carries −1.9 mHa at M = 3 at T_el (if it stays symmetric; V0). This is stated in `references.md`,
+  and wherever the app shows E − ΣE_ref, the text says the references are free energies at T_el.
 
 ## 5. Solver changes (`qm`, `qm-gpu`)
 
@@ -342,9 +440,43 @@ Every scene gets `FermiDirac { kt: ELECTRON_KT }`, whatever the ionic policy, so
 
 - `EvalStats.fractional` (`sim::SharedShell`) becomes the per-level list (`sim::PartialLevel { spin, index, eps, f }`).
   `EvalStats.energy` (`EnergyBreakdown`) gains `internal` and `ts`.
-- `EvalStats::occupation_changed`, its watch in `providers::ks` and the surrogate's refusal to train on such a step are
-  **retired**. They existed because E(R) jumped when a DS pattern switched (pseudo spec §5.7, "Molecules"), and F(R)
-  does not jump. Section 4.7(g) states what replaces that guard.
+- **`EvalStats::occupation_changed` is replaced by `EvalStats::branch_jump`** [MUST-3]. The old flag existed because
+  E(R) jumped when a DS pattern switched (pseudo spec §5.7, "Molecules"). On one branch F(R) does not jump, but it does
+  across branches (section 4.7(g)).
+
+  **The check.** After each evaluation, the Kohn–Sham adapter in `providers::ks` compares it with *the same provider's
+  previous evaluation*, as the old watch did, and with the same "differs from the last teacher call" meaning under the
+  surrogate. With ΔR the per-atom displacement between the two geometries and F_t, F_{t+1} the forces at each:
+
+  ```text
+  ΔF = F(R_{t+1}) − F(R_t)          (the energy change)
+  W  = −½ Σ_I (F_I,t + F_I,t+1)·ΔR_I   (the trapezoid work estimate)
+  m  = |ΔF − W|                        (the mismatch)
+  b  = 3·(√2·σ_E + ‖ΔR‖·σ_F/√2) + 3·κ̂·‖ΔR‖³
+  ```
+
+  - **σ_E and σ_F** are the surface's measured per-solve path scatters of the energy and of a force component. On the
+    pseudo surface: 1.87e-6 Ha (H₂O warm vs cold) and `PSEUDO_FORCE_NOISE` = 5e-5 Ha/Bohr. On the all-electron
+    surface: its measured values (`references.md`; 5.4e-6 Ha for all-electron H₂O). They are taken from the
+    references, not fitted per scene.
+  - **‖ΔR‖** is the Euclidean norm of the 3N-vector of displacements.
+  - **κ̂** stands in for the trapezoid's third-order term, (1/12)|E‴| along the step. It is the running median of
+    m/‖ΔR‖³ over the last 8 judged steps (0 before there are 8), so on a smooth branch the bound tracks the integrator
+    error and the noise. A branch jump is an O(mHa) mismatch at a step where both terms are ~1e-5 Ha. At a typical
+    0.02 Bohr MD step on the pseudo surface, b ≈ 1.2e-5 Ha.
+  - **The step is judged** only when the largest single-atom displacement since the previous evaluation is ≤ 0.1 Bohr:
+    consecutive MD, relax or drag steps, and consecutive teacher calls during a fallback streak. Otherwise
+    `branch_jump` is `None` (not judged). An edit that resets the provider restarts the history.
+  - **On m > b:** `branch_jump = Some(m)`, a warning in `EvalStats` ("F changed by m more than the forces' work: the
+    SCF moved to another stationary state"), and **the surrogate refuses to train on that step**. That is exactly the
+    role the occupation-pattern watch had.
+  - **Spin measure.** For N↑ = N↓ the change of ∫|ρ↑ − ρ↓| between the two evaluations is reported with it, since the
+    restricted ↔ broken-symmetry switch shows there.
+  - **The constants' derivation** (the factor 3, the window of 8, the 0.1 Bohr reach) is reviewed by the physics
+    reviewer in the plan. None of them may be loosened to make a test pass.
+  - **Coverage, stated honestly.** Sampling-pass solves are of unrelated perturbed geometries (displacement > 0.1 Bohr
+    from the previous solve), so the guard does not judge them. Those labels rely on the leave-one-out machinery, as
+    today.
 
 ### 6.4 The lone-atom composition rule (`providers::surrogate`, lone atoms)
 
@@ -358,6 +490,10 @@ spin channel, so that k ≥ 2 far-apart copies compose to k·E_ref. It becomes: 
 - A polarised-integer open shell (the outcome of section 4.7(d) if it happens) shows partial levels at that gap, so it
   is declined, which is the safe side.
 - `AtomReference::fractional` is recorded from `partial` as before.
+- **Z = 1 is not "DFT-equivalent"** [NOTE-9]. The Z = 1 branch composes k far-apart H as k·E_ref(M = 2). A DFT solve of
+  an even number of far-apart H at auto is the restricted ½/½ ensemble, tens of mHa above that sum. That gap
+  pre-exists (the lone-atom doc's 4.6e-2 Ha at 6.4 Bohr). FD lowers the DFT side by a further 2 kT ln 2 per pair.
+  "Compose to k·E_ref" is the rule's answer, not a claim that DFT gives it. The lone-atom doc says so.
 
 ### 6.5 Reference scan, MD, relax, surrogate
 
@@ -371,8 +507,9 @@ spin channel, so that k ≥ 2 far-apart copies compose to k·E_ref. It becomes: 
 
 | where | today | new |
 |---|---|---|
-| Readouts row | "E_KS" / "E_KS (valence, pseudopotential)" | "F (free energy, T_el 316 K)" / "F (valence, pseudopotential, T_el 316 K)" |
-| Readouts tooltip | — | "Kohn–Sham free energy F = E − T_el·S at the electronic temperature T_el = 316 K (kT = 1 mHa). For a gapped molecule TS = 0 and F = E. Partly occupied levels (open shells, nearly degenerate frontier levels) carry TS > 0. The forces, the dynamics and the trained model all use F." |
+| Readouts row | "E_KS" / "E_KS (valence, pseudopotential)" | "F (electronic free energy, T_el 316 K)" / "F (electronic free energy, valence, pseudopotential, T_el 316 K)" [SHOULD-4] |
+| Readouts tooltip | — | "Kohn–Sham free energy F = E − T_el·S at the electronic temperature T_el = 316 K (kT = 1 mHa). For a gapped molecule TS = 0 and F = E. Partly occupied levels (open shells, nearly degenerate frontier levels) carry TS > 0. The forces, the dynamics and the trained model all use F. T_el is a fixed numerical electronic temperature, independent of the thermostat; F does not include the nuclei's entropy." [SHOULD-4] |
+| Branch-jump warning | — | "F changed by … more than the forces' work: the SCF moved to another stationary state (not trained on)" (section 6.3) |
 | "E total" row and the graph | KE + E_KS | KE + F, so "E total" reads "KE + F: conserved in NVE without tools" |
 | Energy breakdown | kinetic … nuclear, total | kinetic, external, Hartree, xc, nuclear, **E (internal)**, **−TS (electronic entropy, T_el 316 K)**, **F** |
 | Activity iteration energy | E_HF | F_HF (same row, renamed) |
@@ -469,8 +606,12 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
 | **T**, entropy only | not U, \|E_new − E_old\| ≤ ε_E (the internal energy), every force within ε_F | the same electronic state (an equal-share ensemble before and the same f now); only the reported quantity changed, by −TS |
 | **S**, state changed | anything else | the old rule had a different state here: e.g. a released integer pattern where FD now pins the frontier at μ (H₆ seed 5: E −3.148291 before, F −3.148504 now), or a different SCF branch |
 
-- **ε_E** is 10× the measured per-solve path scatter of a converged GPU energy (6e-7 Ha, `references.md` "Dynamics")
-  and 100× below the model's 1 mHa/atom energy bound.
+- **ε_E** [SHOULD-7] is 5× the largest measured path scatter on the pseudo surface (1.87e-6 Ha, H₂O warm vs cold,
+  `references.md` "SCF, GPU against CPU"), about 2× all-electron H₂O's (5.4e-6), and 100× below the model's
+  1 mHa/atom energy bound.
+  - The earlier "10× the 6e-7 Ha scatter" cited the H₂ number, which is the wrong surface for an H/N/O collection.
+  - Because the margin is thinner on O-containing samples, V11 reports the fraction of class S whose only failing test
+    is |ΔE| ∈ (ε_E, 3ε_E] as the false-S estimate.
 - **ε_F** is 3 × `PSEUDO_FORCE_NOISE` (5e-5 Ha/Bohr, the teacher's measured path scatter), the tier an audit already
   judges against.
 - **Both errors are safe.** A false "changed" costs one review. A false "unchanged" keeps a label within 1e-5 Ha of the
@@ -488,8 +629,9 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
 - **T.** The re-solved label (F_new, forces_new) is appended with the old record's metadata, and the old code is
   carried. The review is the T test itself:
   - the internal energy and every force agree with an answer the old trust machinery had already judged;
-  - the label moved by exactly the defined −TS term, which is smooth across geometries (a constant 1.386 mHa for every
-    linear OH, say).
+  - the label moved by exactly the defined −TS term. That term is C^∞ but steep near a degeneracy [NOTE-5]: 2 kT ln 2 =
+    1.386 mHa for a linear OH, falling to 0 over a range of width ~kT/|dΔ/dR|, a few degrees of bend. The fit sees it
+    as any other feature of the surface.
   - The refit after migration judges it like any fitted sample.
 - **S.** The re-solved label is appended with the old metadata and status code **8, `Q_RESOLVED`** ("re-solved for the
   new solver, awaiting review"). Two exceptions keep their old code: a forgotten sample keeps code 7, because the
@@ -501,7 +643,11 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
   - The new folder starts an empty history.
   - Without evidence, the calibrated class verdict falls back to its no-evidence rule (`calibrate` module doc), so the
     first refits are more conservative until audits accumulate. The summary says so.
-- **`bond_experience.txt`** (display only, safe to delete): copied unchanged.
+- **`bond_experience.txt`** (display only, safe to delete): copied unchanged [NOTE-9].
+  - It holds bond verdicts (Z, neighbour counts, R, bonded), not energies.
+  - Those verdicts came from old-surface densities. They differ only where levels were partly occupied, and they guess
+    a display only.
+  - The README paragraph says so.
 - **`README.txt`**: regenerated, with the migration paragraph (section 7.8).
 - **`migration.txt`** (new). It holds:
   - the source slug and its `key.txt`, the build version and the date;
@@ -650,7 +796,8 @@ only, named by role so they survive the merge:
 6. **The shared-collection attach**: predecessor detection and the migration pass hook (section 7.2–7.3).
 7. **The policy's label-noise prior** (`force_noise_prior`): it reads "all-electron" from the tag through
    `is_all_electron_tag`.
-8. **The occupation-change training refusal**: deleted (section 6.3).
+8. **The occupation-change training refusal**: replaced, at the same place, by the branch-jump refusal (section 6.3)
+   [MUST-3].
 
 The plan re-reads these against `main` after the merge. If the rework changed what one of them means, the plan records
 the mapping, and this spec is amended rather than reinterpreted silently.
@@ -663,32 +810,61 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 
 | # | suite / command | what it must show |
 |---|---|---|
-| **V0** | **Task A1 measurement (entry gate)**, before production code. The diagnosis's env-gated `SCF_SMEAR=1e-3` path on the GPU, plus a CPU f64 cross-check of the worst case. | See "V0 in detail" below. |
-| V1 | `cargo test -p units -p qm -p sim -p surrogate --release` | **FD unit tests:** two levels with N = 1, degenerate (f = ½, μ = ε, S = 2 ln 2); a gap Δ (f = 1/(1 + e^{±Δ/2kT}) at the symmetric μ); a gap ≥ 37 kT (f exactly 0.0 / 1.0, S ≤ 1e-14); N_σ = 0; the bracket's validity; determinism (same bits twice); s(f) against the direct formula on a grid of f, plus the 0 ln 0 limit. **Witness rule.** **Energy invariant** (total = internal − ts). **CPU H₄ square a = 1.8** (41³ × 0.30, axes-aligned, exactly degenerate): TS = 4 kT ln 2 within 1e-8 Ha, and E equal to the DS-era E within 1e-6. **FD ≡ Aufbau** on H₂ and H₂O within tol. The DIIS-reset test (section 5). The collection: v2 records, code 8, the read-only open leaving every file byte-identical. |
+| **V0** | **Task A1 measurement (entry gate)**, before production code. The diagnosis's env-gated `SCF_SMEAR=1e-3` path on the GPU, plus a CPU f64 cross-check of each species' worst case. | See "V0 in detail" below. |
+| V1 | `cargo test -p units -p qm -p sim -p surrogate --release` | **FD unit tests:**<br>• two levels with N = 1, degenerate (f = ½, μ = ε, S = 2 ln 2);<br>• a gap Δ (f = 1/(1 + e^{±Δ/2kT}) at the symmetric μ);<br>• a gap ≥ 74 kT [SHOULD-5]: f below μ exactly 1.0, f above μ ≤ e^{−36}, S ≤ 1e-14, μ the plateau midpoint of section 4.1 (both bisections) [MUST-1];<br>• N_σ = 0; the bracket's validity;<br>• a NaN eigenvalue → `QmError::Numerical` before bisecting [SHOULD-1];<br>• the worst-case halving count near μ = 0 stays under the backstop;<br>• determinism (same bits twice);<br>• s(f) against the direct formula on a grid of f, plus the 0 ln 0 limit.<br>**Witness rule**, both arms. **Energy invariant** (total = internal − ts).<br>**CPU H₄ square a = 1.8** (41³ × 0.30, axes-aligned, exactly degenerate, tol 1e-9): TS = 4 kT ln 2 within 1e-8 Ha, and E equal to the DS-era E within 1e-8 Ha (same f by symmetry) [SHOULD-6].<br>**FD ≡ Aufbau** on H₂ and H₂O (CPU f64, tol = eig_tol = 1e-9): \|ΔE\| ≤ 1e-8 Ha, since the f agree to e^{−100} [SHOULD-6].<br>The DIIS-reset test (section 5). The collection: v2 records, code 8, the read-only open leaving every file byte-identical. |
 | V2 | **Regression (new; `cargo test -p providers --release`, GPU, release-only).** The diagnosis harness reduced and committed. Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, the app's tolerance raised by `effective_gpu_tol`, stall stop on. | See "V2 cases" below. |
-| V3 | `cargo test -p validate --release --test oracles` | **σ → 0 oracles** (H, He, H₂): numbers unchanged within the existing tolerances, and **TS ≤ 1e-12** asserted on every oracle system (they are gapped or single-electron). **New FD-consistency oracle** (CPU f64, 41³ × 0.30, tol 1e-9): see "V3 force oracle" below. |
-| V4 | `cargo test -p validate --release --test gpu_vs_cpu` | Existing cases within existing bounds. New cases at the suite's fixed σ = h = 0.25, 49³: H₄ square (degenerate) and a lone pseudo-O at the M V0 settled on. Each checks \|F_gpu − F_cpu\|, \|TS_gpu − TS_cpu\|, μ_σ, and per-level f within 1e-6, plus forces, all within the suite's existing energy and force bounds. |
-| V5 | `cargo test -p validate --release --test dynamics` | Existing tests unchanged (gapped H₂ and H₃⁺: the conserved quantity is F = E). See "V5 new test" below. |
-| V6 | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | **Generation records:** bitwise unchanged, with `recipe_hash` moved by `DIMER_PROCEDURE` only. **Dimer-gate verdicts and R_e / ω:** reproduce within the backend margin. **Lone-atom references and the O multiplicity scan** (`pseudo_o_triplet_matches_cpu`, `gpu_oxygen_reference_multiplicity`, `degenerate_spread_at_low_symmetry_sites` repurposed as V0's site study): these move by the measured −TS. Each moved reference is stated in `references.md` with its TS and, for an exactly degenerate shell, the closed-form value (section 4.3). The scan keeps the same M (lowest F). |
-| V7 | `cargo test -p validate --release --test surrogate` | Passes, with labels now F; the H₂ and H₃⁺ tests are gapped, so their pins hold. New test: a model file or collection with a legacy tag is refused, and its collection is found as the predecessor. New migration integration test (GPU, small): a collection of H₂ samples (U), linear OH samples (T: ΔF = −2 kT ln 2, E and forces unchanged) and one near-square H₄ (S, reviewed). It checks the counts, the codes, the review's release, and the old folder hashing identical before and after. |
-| V8 | `cargo test -p providers --release` | The provider unit tests. The tag strings (`none/fd1e-3`, `…/fd1e-3/stop2x…`). `legacy_tag_of` pinned against the recorded strings. The re-pinned bitwise tests, each with its reason. The lone-rule test on a polarised-or-partial O (declined). |
+| V3 | `cargo test -p validate --release --test oracles` | **σ → 0 oracles** (H, He, H₂): numbers unchanged within the existing tolerances, and **TS ≤ 1e-12** asserted on every oracle system (they are gapped or single-electron).<br>**New FD-consistency oracle** (CPU f64, 41³ × 0.30, tol 1e-9): see "V3 force oracle" below. |
+| V4 | `cargo test -p validate --release --test gpu_vs_cpu` | Existing cases within existing bounds. New cases at the suite's fixed σ = h = 0.25, 49³: H₄ square (degenerate), and a lone pseudo-O at each M V0 settled on [MUST-5]. Each case checks:<br>• \|F_gpu − F_cpu\| and \|TS_gpu − TS_cpu\| within the suite's energy bounds (TS is second order in Δε: \|ΔTS\| ≲ Δε²/(16kT) per pair);<br>• μ_σ within `EPS_BOUND_PSEUDO` (1e-5 Ha) where a partial level exists, and not compared in gapped channels (section 4.1);<br>• per-level \|Δf\| ≤ `EPS_BOUND_PSEUDO`/(4kT) = 2.5e-3;<br>• the sum of f over each degenerate cluster within 1e-9;<br>• **both solvers in the same state class** (symmetric vs polarised, by TS against the closed form), so that an f32-vs-f64 split onto different stationary states is detected, not averaged over.<br>Forces are checked against the existing force bounds. |
+| V5 | `cargo test -p validate --release --test dynamics` | Existing tests unchanged (gapped H₂ and H₃⁺: the conserved quantity is F = E). See "V5 new tests" below. |
+| V6 | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | **Generation records:** bitwise unchanged, with `recipe_hash` moved by `DIMER_PROCEDURE` only.<br>**Dimer-gate verdicts and R_e / ω:** reproduce within the backend margin.<br>**Lone-atom references and the O multiplicity scan** (`pseudo_o_triplet_matches_cpu`, `gpu_oxygen_reference_multiplicity`; `degenerate_spread_at_low_symmetry_sites` repurposed as V0's site study): these move by the measured −TS. Each moved reference is stated in `references.md` with its TS and, for an exactly degenerate shell, the closed-form value (section 4.3). The scan keeps the same M (lowest F). |
+| V7 | `cargo test -p validate --release --test surrogate` | Passes, with labels now F; the H₂ and H₃⁺ tests are gapped, so their pins hold.<br>A model file or collection with a legacy tag is refused, and its collection is found as the predecessor.<br>**Migration integration test** (GPU, small): a collection of H₂ samples (U), linear OH samples (T: ΔF = −2 kT ln 2, E and forces unchanged) and one near-square H₄ (S, reviewed). It checks the counts, the codes, the review's release, and the old folder hashing identical before and after.<br>**Branch-jump refusal** [MUST-3]: a teacher answer stream with a synthetic stationary-state switch (the same geometry path, F shifted by 12 mHa from one step on) is warned and not trained on; the steps before and after it are trained on. |
+| V8 | `cargo test -p providers --release` | The provider unit tests.<br>The tag strings (`none/fd1e-3`, `…/fd1e-3/stop2x…`). `legacy_tag_of` pinned against the recorded strings. The re-pinned bitwise tests, each with its reason.<br>The lone-rule test on a polarised-or-partial O (declined).<br>**`branch_jump`** [MUST-3]: a synthetic jump is flagged; a smooth analytic path (a Morse dimer stepped at MD-sized displacements) is never flagged; a displacement > 0.1 Bohr is not judged.<br>**Witness cap** [NOTE-6]: all-electron H⁻ at the app's largest box. |
 | V9 | `--test tools`, `--test charges`, `--test orbitals` | Density and orbital consumers. Gapped systems leave the numbers unchanged. The orbital display shows per-level f. |
-| V10 | `cargo test -p app --release` (incl. replays) | Label tests (`energy_label` → the F wording). Formats (`collection` = 2, the sidecar bumped, the downgrade line for a migrated folder). The offer / progress / summary text from a fixture predecessor. The replay scripts (they pin quality, walls and ionic; any energy expectation is gapped). |
-| V11 | **Dry run on a copy of the user's collection** (measurement, `#[ignore]`d, never on the original) | Counts per class, the class U maximum deviations, the time per sample, and the review outcome (released / kept out). Then the refit's trust verdict against the pre-migration one, recorded in `references.md` "Fermi–Dirac migration". **Must:** the source copy is byte-identical afterwards, and no sample changes code without a logged reason. **Reported, not gated:** whether the migrated collection is trusted as before. If it is not, the reason is investigated before merge. |
+| V10 | `cargo test -p app --release` (incl. replays) | Label tests (`energy_label` → the F wording).<br>Formats (`collection` = 2, the sidecar bumped, the downgrade line for a migrated folder).<br>The offer / progress / summary text from a fixture predecessor.<br>The replay scripts (they pin quality, walls and ionic; any energy expectation is gapped). |
+| V11 | **Dry run on a copy of the user's collection** (measurement, `#[ignore]`d, never on the original) | Counts per class, the class U maximum deviations, the time per sample, and the review outcome (released / kept out). Then the refit's trust verdict against the pre-migration one, recorded in `references.md` "Fermi–Dirac migration".<br>**The false-S estimate** [SHOULD-7]: the fraction of class S whose only failing test is \|ΔE\| ∈ (ε_E, 3ε_E].<br>**Must:** the source copy is byte-identical afterwards, and no sample changes code without a logged reason.<br>**Reported, not gated:** whether the migrated collection is trusted as before. If it is not, the reason is investigated before merge. |
 
-**V0 in detail.**
-- **Cases.** Lone pseudo-O at M = 1 and M = 3, each at four sites: the node, the cube centre, (0, h/2, h/2) and a
-  generic site. Grids: h_req and Accurate. Plus OH (bent and linear), the O₂ singlet and triplet, H₂O, and NH at auto.
-- **Proceed if every case converges within 60 iterations without the stall stop.** Also, for each species and M, the
-  **site spread of F** must not exceed the `DegenerateShells` site spread of E, measured the same way, by more than
-  1e-4 Ha. Comparing like with like cancels the egg-box. The DS failure V0 guards against was 4.1 mHa.
-- **Record which state each case reaches:** symmetric (TS ≈ the closed form) or polarised (TS ≈ 0).
-- **If V0 fails, stop and ask the user.** Neither of these is chosen by me:
-  - (i) raise kT to the measured stability threshold, predicted ≈ 3 mHa by pseudo spec §5.7. That threshold would be
-    measured as the smallest kT with a site spread within bound. It costs a larger F bias on stretched and pinned
-    states.
-  - (ii) keep 1e-3 and document the site dependence of open-shell O as an LSDA symmetry-dilemma artefact, with the
-    lone-atom rule already declining such atoms in pairs.
+**V0 in detail** [MUST-2, SHOULD-6, SHOULD-9].
+
+- **Cases.**
+  - Every species the recipe accepts with an open-shell ground state: pseudo C, O and F, and B if accepted, with N as
+    the gapped control.
+  - Each at every multiplicity the reference scan solves.
+  - Each at four sites (the node, the cube centre, (0, h/2, h/2) and a generic site) and on both grids (h_req and
+    Accurate).
+  - All-electron O at M = 1 and M = 3 (Balanced and Accurate).
+  - Plus OH (bent, linear), the O₂ singlet and triplet, H₂O, and NH at auto.
+- **Proceed, per species, if all three hold:**
+  - **Convergence.** Every case converges within 60 iterations without the stall stop.
+  - **Site spread.** For each species and M, the site spread of F does not exceed the `DegenerateShells` site spread of
+    E, measured the same way, by more than **6σ_path + 1e-6 Ha**.
+    - σ_path is that species' GPU per-solve path scatter, measured in V0 itself by a warm and a cold solve at each
+      site. The factor 6 covers the difference of two spreads, each from 4 solves, at 3σ.
+    - The 1e-6 Ha term bounds the derived lattice-split differences between the FD and the equal-share f: ≈ Δ·δf ≈
+      5.3e-5 × 0.0066 = 3.5e-7 in E, and second order in TS.
+    - Comparing like with like cancels the egg-box. The DS failure V0 guards against was 4.1 mHa.
+  - **Same winner.** The reference scan's winning M is the same at every site.
+- **Record** for each case:
+  - which state it reaches: symmetric (TS ≈ the closed form) or polarised (TS ≈ 0);
+  - U↑↑, U_c and U_s from the integer states' splittings, against the section 4.7(d) predictions;
+  - the GPU eigenvalue jitter and its implied Δρ floor, which must sit a factor 3 below the GPU stop rule (otherwise
+    V0 fails);
+  - the lopsided-tetrahedron seeding of section 4.7(e) [SHOULD-2].
+- **If any species fails, stop and ask the user.** The user rules on one global kT for all species (rule 1). None of
+  these options is chosen by me:
+  - **(i)** Raise kT to the measured stability threshold of the worst species (predicted ≈ 3 mHa for O by pseudo spec
+    §5.7; higher for F). It is measured as the smallest kT that passes every rule above. It costs a larger F bias on
+    stretched and pinned states.
+  - **(ii)** Keep 1e-3 and document the site dependence of the failing open-shell species as an LSDA symmetry-dilemma
+    artefact, with the lone-atom rule already declining such atoms in pairs.
+    - Option (ii) still requires the reference scan to converge at every M at every site [SHOULD-9]. A lone-atom
+      reference that stalls blocks every sample of that species, so (ii) is available only if the convergence rule
+      above holds.
+  - **(iii)** [NOTE-3] Raise the width with Marzari–Vanderbilt cold smearing instead of FD. The failure is set by the
+    occupation function's slope at μ (FD: 1/(4kT)), not by FD as such.
+    - Cold smearing has non-negative occupations, a variational generalised free energy, and an energy bias of O(σ³)
+      for non-degenerate pinned states. That answers (i)'s cost.
+    - It keeps a −TS-like term at exact degeneracies.
+    - It departs from the user's FD choice, so it is only offered.
 
 **V2 cases.** Coordinates are D§2.1's centred ones; the rhombus and tetrahedron as listed in D§2.
 
@@ -707,26 +883,43 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 - Each case must **converge** (no stall stop, no cap) within its budget, about 1.5× the prototype's count.
 - **F and TS** must match the prototype's D§6 values within 1e-5 Ha. Examples: rhombus F −2.079319, tetra
   F −1.932837 with TS 2.7e-3, H₂O + 2 H AE F −47.339721.
+  - Production now runs the prototype's witness rule (section 4.2), so this comparison is like with like.
 - A mismatch is investigated, never re-pinned blindly. Once checked, the pins are the production values.
-- The controls H₂ and H₂O must keep the D§6 energies within 1e-6.
+- **The controls** [SHOULD-6]: H₂ and H₂O must keep the D§6 energies within 3 × max(achieved, path scatter): H₂ 2e-6 Ha,
+  H₂O 6e-6 Ha (the suite's rule). Production changes the block size (witnesses), and so the bits.
 
-**V3 force oracle.**
+**V3 force oracle** [MUST-4].
 - **Geometry.** A near-square H₄ rectangle whose frontier gap is a few kT. Task A1 picks the aspect from a short scan
-  so that |d(TS)/dx| ≥ 2 mHa/Bohr.
-- **Method.** A central difference with δ = 0.01 Bohr along one atom's in-plane coordinate.
-- **Must show both:**
-  - |F_HF,x + ΔF/2δ| is within the existing HF-vs-finite-difference force bound of the `qm` force tests (the number
-    stated in `references.md` "M7 forces", not a new one);
-  - |F_HF,x + ΔE/2δ| ≥ 5× that bound, so the test tells F's derivative from E's.
+  so that |d(TS)/dx| ≥ 2 mHa/Bohr. It also checks that the whole 4δ span of the stencil lies where the ratio test below
+  passes.
+- **Method.** Central differences at δ = 0.01 and 0.02 Bohr along one atom's in-plane coordinate, combined by
+  Richardson as in `oh_hf_force_matches_fd`.
+- **The δ-scaling check.** The test asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5]: the plain FD error is the δ² term, so
+  δ resolves the TS swing.
+  - Near a pinned pair, F contains −kT ln(2 cosh(Δ/2kT)) per channel. Its third derivative scales as c³/(kT)², so a
+    plain FD(0.01) can be off by ~2e-3, 20× the bound, on truncation alone.
+- **Must show both, on the Richardson value:**
+  - |HF_x + dF/dx|_Rich ≤ 1e-4 Ha/Bohr (the "M7 forces" bound, which is defined on Richardson);
+  - |HF_x + dE/dx|_Rich ≥ 5e-4 Ha/Bohr, so the test tells F's derivative from E's.
 
-**V5 new test.**
-- **Setup.** NVE on an all-electron H₄ square, a = 1.8, at 49³ × 0.25, released from rest with a 1e-3 Bohr
-  rectangular perturbation. Run 400 steps of 0.25 fs. The square is a saddle: the gap opens as it falls toward a
-  rectangle, and TS swings by ≈ 2.8 mHa.
-- **Must show:**
-  - the drift of F + K stays within the suite's existing NVE drift bound (`nve_energy_drift_is_bounded`'s bound, per
-    atom);
-  - E + K moves by ≥ 1 mHa over the run, so the test sees the difference.
+**V5 new tests** [MUST-6]. The draft's H₄-square NVE run is withdrawn, for four reasons:
+- its ≈ 0.27 Ha release toward 2 H₂ gives a Verlet swing of ≥ 1 mHa, the size of the signal;
+- the fragments reach the faces of the 12 Bohr box;
+- its "per atom" scaling of the drift bound was underived;
+- "E + K moves" is the identity E + K = (F + K) + TS.
+
+The two tests that replace it:
+1. **Work-integral oracle** (CPU f64, the V3 geometry). Move one atom along a prescribed 0.2 Bohr path crossing the TS
+   swing, in 40 steps, and integrate W = −∫F_HF·dx by Simpson.
+   - Assert |W + ΔF| ≤ the Simpson bound plus 40× the per-point force scatter.
+   - Assert |W + ΔE| ≥ 5× that.
+2. **NVE** on a case whose released energy keeps h²/4·E_mode ≤ 1e-4 Ha, chosen by Task A1. Examples: a near-square H₄
+   at larger a, or a stretched-H₂ geometry whose σg/σu gap crosses a few kT, started at its turning point.
+   - The box must keep the face density below the box rule throughout.
+   - The drift and fluctuation bounds are re-derived for that trajectory by the suite's own rule (the
+     `nve_energy_drift_is_bounded` method), not scaled per atom.
+   - Assert F + K within those bounds, and max TS − min TS ≥ 1 mHa along the run, so the trajectory really crosses the
+     TS swing.
 
 **Bitwise pins.** `gpu_none_policy_is_bitwise_today`, the stall-stop bitwise tests and every other pin of the old
 all-electron or DS bits are re-pinned in the same commit as the rule change. Each gets a one-line reason: "all-electron
@@ -744,7 +937,7 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
   - §5.5's provenance-tag text gets the new format.
 - **The main design spec** (`2026-10-12-atomic-sandbox-design.md`).
   - §6 "SCF loop": "Integer aufbau occupations in v1; Fermi smearing later" becomes "Fermi–Dirac occupations at
-    kT = 1 mHa; the solver minimises F = E − TS (spec 2026-11-13)".
+    kT = 1 mHa; the SCF converges to a stationary point of F = E − TS (spec 2026-11-13)".
   - §11 roadmap item 2: Fermi smearing is done for finite boxes; periodic cells and PBE remain.
 - **The orbital-viewer spec, item 4.** Note that fractional, spherical occupations arrived with this spec, so the
   shared-shell rows are now per-level f.
@@ -752,9 +945,19 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
   - "Approximation gaps that are expected": F = E − TS at T_el = 316 K. TS = 0 on gapped systems. Closed-form TS for
     exactly degenerate shells. The restricted-vs-broken-symmetry H₄ gap (12–24 mHa pseudo, 12.4 mHa all-electron;
     section 4.7(e)). F, not E, is what MD conserves.
+  - Also under "Approximation gaps":
+    - S is the KS-occupation entropy with ground-state LSDA xc, not the physical electronic entropy [SHOULD-4].
+    - Separated fragments share μ_σ (LSDA delocalisation, section 4.7(h)) [SHOULD-10].
+    - Atomisation and binding energies shift by +TS_atom (section 4.7(i)) [NOTE-4].
+    - The Z = 1 lone-rule composition is not DFT-equivalent (section 6.4) [NOTE-9].
   - Every moved reference, with its TS (V6).
-  - The V0 site study, V2's pins, V3's force-oracle numbers, V5's drift, the all-electron witness cost (section 4.2),
-    the shipped models' re-make, and V11's dry run under a new section, "Fermi–Dirac migration".
+  - Under a new section, "Fermi–Dirac migration":
+    - the V0 study (every species, both surfaces, U↑↑/U_c/U_s, the GPU jitter floor, the lopsided-tetra seeding);
+    - V2's pins, V3's Richardson and ratio numbers, V5's work-integral and NVE bounds with their derivation;
+    - the `branch_jump` constants and their derivation;
+    - the all-electron witness cost and the H⁻ witness-cap outcome (section 4.2);
+    - the shipped models' re-make;
+    - V11's dry run, including the false-S estimate.
 - **`docs/dev-reference.md`**:
   - New section "Occupations (Fermi–Dirac)": the constants and where they live, the tag format, `legacy_tag_of`, and
     the bitwise re-pins.
@@ -762,7 +965,8 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
     record v2, the sidecar bump, the downgrade line.
   - "Shared collections": record v2 and code 8.
   - "SCF stall stop": no release restart.
-  - "Test suites": V2 and the new oracle, NVE and migration tests.
+  - "Test suites": V2 and the new oracle, the work-integral, NVE, branch-jump and migration tests.
+  - The `branch_jump` guard (section 6.3), in the occupations section.
 - **`README.md`** (CLAUDE.md, the user's rule):
   - The readouts (F, T_el, E and −TS in the breakdown).
   - "SCF converges on loose hand-built clusters".
@@ -774,7 +978,10 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
   - `surrogate::collection` (records v2, the read-only open, the migration files in the layout table);
   - `surrogate::quarantine` (code 8, and an older build meeting it);
   - `providers::pseudo` (the tag);
-  - `providers::ks` (no longer "exactly today's problem");
+  - `providers::ks` (no longer "exactly today's problem"; `branch_jump` replaces the occupation watch);
+  - the `qm::forces` and `qm_gpu::forces` module docs [SHOULD-8]: the forces are −dF/dR of the Mermin functional,
+    stationary in ψ and f, not −dE/dR. The "Janak … at fixed occupations" grounding and the "spec §5.7" citation are
+    rewritten.
   - the lone-atom rule's doc;
   - `app::update::formats` (the table and the downgrade line).
 - **DEVLOG.md** at the merge (memory: DEVLOG upkeep). Link the diagnosis note forward to this spec.
@@ -787,12 +994,20 @@ Model tags are per CLAUDE.md. All are dispatched on Opus, per the 2026-10-21 rul
 0. **Prerequisite.** `claude/charming-keller-0bc26b` has merged to `main`. Rebase `scf-stall`. Re-read the touch points
    in section 8. The diagnostic files (`scf_stall_diag.rs`, the env knobs in `qm-gpu/src/scf.rs`) stay uncommitted
    until A2, where the harness is reduced into V2 and the env knobs are removed.
-1. **A1 (Fable-class, measurement):** V0. Also choose V3's aspect and measure the all-electron witness cost.
+1. **A1 (Fable-class, measurement):** V0, over every accepted open-shell species, both M and both surfaces (MUST-2). It
+   includes the U↑↑/U_c/U_s extraction, the GPU jitter floor, and the seeding of the lopsided tetrahedron with its
+   α = 0.1 and α = 0.05 broken-symmetry densities (SHOULD-2). A1 also:
+   - chooses V3's aspect and checks its 4δ span;
+   - chooses V5's NVE case (h²/4·E_mode ≤ 1e-4 Ha, the face density within the box rule);
+   - measures the all-electron witness cost.
+
    **Stop here if V0 fails.**
 2. **A2 (Fable-class):** `qm` FD, energies and stats; delete DS; V1; the V3 oracle; the physics review.
 3. **A3 (Opus):** `qm-gpu` on the shared host function; V4.
-4. **A4 (Opus):** providers: `problem`, the tag, `legacy_tag_of`, `is_all_electron_tag`, `DIMER_PROCEDURE`, the lone
-   rule, `EvalStats`, the scan's F; V2, V6, V8.
+4. **A4 (Opus; `branch_jump` physics-reviewed):** providers: `problem`, the tag, `legacy_tag_of`,
+   `is_all_electron_tag`, `DIMER_PROCEDURE`, the lone rule, `EvalStats` with `branch_jump` and its training refusal, the
+   scan's F; V2, V6, V8. The plan also greps every consumer that rebuilds a total from `Energy` components instead of
+   reading `total` (the app's breakdown, the sidecar, `sim::references`); the review did not trace these.
 5. **A5 (Opus):** UI readouts, breakdown, orbital rows, Compare note; V10 (labels).
 6. **A6 (Fable-class):** V5 dynamics, plus a physics review of the whole solver half.
 7. **B1 (Opus):** `surrogate::collection`: the read-only open, records v2, code 8, `migration.txt`; the sidecar bump;
@@ -808,7 +1023,8 @@ key.
 
 ## 12. Risks
 
-1. **The lone open-shell O at kT = 1e-3** (section 4.7(d)). Gated by V0, and the user rules if it fails.
+1. **Open-shell atoms at kT = 1e-3** (section 4.7(d)): every accepted open-shell species, both M, both surfaces, and
+   the GPU jitter floor. Gated by V0, and the user rules on one global kT if any fails.
 2. **All-electron per-solve cost goes up** (witness vectors). Measured and reported, not hidden. The default policy
    already pays it.
 3. **The migration takes about 1–2 h of GPU time.** It is optional to start, pausable and resumable, and live use is
@@ -817,9 +1033,13 @@ key.
    review then judges siblings together (section 7.6).
 5. **The trust rework changes a touch point's meaning.** The plan re-reads them after the merge and amends this spec
    (section 8).
-6. **Stationary-state switches along trajectories** (section 4.7(g)). Documented, and seen as drift or a leave-one-out
-   misfit.
-7. **Slow convergence on pinned states** (the tetra 28–32 iterations, all-electron H₂O + 2 H 79). V2's budgets cover
+6. **Stationary-state switches along trajectories** (section 4.7(g)). Caught by the `branch_jump` guard on judged
+   steps (warning plus training refusal). Sampling-pass solves are not judged by it and rely on leave-one-out.
+7. **The `branch_jump` bound is too tight or too loose.** Too tight refuses good steps; too loose misses jumps. V8 pins
+   both directions on analytic paths, its constants are derived and reviewed, and none may be loosened to pass.
+8. **f32 eigenvalue jitter at degenerate shells becomes density noise on the GPU** (250 Ha⁻¹). Measured in V0 against
+   the GPU stop rule.
+9. **Slow convergence on pinned states** (the tetra 28–32 iterations, all-electron H₂O + 2 H 79). V2's budgets cover
    them. The stall stop must not fire on any V2 case.
 
 ## 13. Rulings I made (not decided by the user)
@@ -829,10 +1049,16 @@ key.
    surface's tag and bits, and its stalls.
 2. `Aufbau` stays in `qm` only as the kT → 0 test reference. `for_grid` defaults to FD, so the oracles test the app's
    path.
-3. **The μ bisection.** Bracket [ε_min − 50 kT, ε_max + 50 kT], halving to f64 exhaustion, with no tolerance
-   parameter. Shared host f64 code for both solvers.
-4. **The witness condition** is ε_k − μ ≥ max(0.1 Ha, 36 kT). It keeps today's 0.1 Ha reach (the prototype's
-   configuration) and `MAX_WITNESS_GROWTH` = 16.
+3. **The μ bisection** (amended for MUST-1, SHOULD-1 and NOTE-1).
+   - Bracket [ε_min − 50 kT, ε_max + 50 kT], halving to f64 exhaustion, with no tolerance parameter.
+   - Two tie-directed bisections; the plateau midpoint is reported.
+   - A non-finite eigenvalue is `QmError::Numerical` before bisecting.
+   - A 2 048-halving backstop.
+   - μ is a physical diagnostic only where a partial level exists.
+   - Shared host f64 code for both solvers.
+4. **The witness condition** (amended for MUST-1) is ε_k ≥ ε_{N_σ} + 0.1 Ha **and** ε_k − μ ≥ 36 kT.
+   - The first arm is exactly today's reach and the prototype's configuration.
+   - `MAX_WITNESS_GROWTH` = 16 stays, and its new all-electron error path is pinned by V8 (H⁻) [NOTE-6].
 5. **The entropy** is evaluated from x as ln(1 + e^{−|x|}) + |x|·min(f, 1−f), with Neumaier summation.
 6. **`Energy.total` = F**, with `internal` (E) and `ts` added. The per-iteration energy shown is F_HF.
 7. **Gillan's E₀ = ½(E + F) is not computed or shown.**
@@ -841,8 +1067,13 @@ key.
 9. **"Auto" multiplicity keeps its meaning** (lowest M of the parity). The reference scan compares F.
 10. **`PARTIAL_OCCUPATION_MIN` = 1e-6** defines a partial level. The lone-atom "ends at a gap" test becomes "no partial
     level" on both surfaces, and the `all_electron` argument goes.
-11. **`occupation_changed` and its training refusal are retired.** The new failure mode (state switches) is
-    documented instead.
+11. **`occupation_changed` is replaced by `branch_jump`** (amended for MUST-3), a stricter guard.
+    - It compares ΔF with the trapezoid work of the forces between consecutive evaluations of one provider (largest
+      atom displacement ≤ 0.1 Bohr).
+    - The bound is 3× the path-scatter noise, plus 3× a running-median third-order term over 8 judged steps.
+    - On a failure: a warning, and no surrogate training on that step.
+    - For N↑ = N↓ the change of ∫|ρ↑ − ρ↓| is reported with it.
+    - The constants are physics-reviewed in the plan.
 12. **The DIIS fix** is achieved by deleting the release path. The frozen-orbital reset stays (its order is correct),
     pinned by a test.
 13. **Tags:** `…/fd1e-3/stop2x…` and `none/fd1e-3`. Comparisons go through `is_all_electron_tag`.
@@ -871,10 +1102,56 @@ key.
 26. **A downgrade-warning line** names the pre-migration folder the older version will use.
 27. **The shipped `.model` files are re-made** by the same engine in a headless harness, or re-taught if one fails its
     trust rule. **In-app migration of user `.model` files is a non-goal**; they get a clear refusal reason.
-28. **V0 is an entry gate with a pre-registered stop.** If lone open-shell O fails at kT = 1e-3, the user chooses
-    between raising kT and documenting the site dependence. I do not pick.
+28. **V0 is an entry gate with a pre-registered stop** (amended for MUST-2, SHOULD-6, SHOULD-9 and NOTE-3).
+    - It covers every accepted open-shell species at every scanned M, on both grids and at four sites, plus
+      all-electron O at M = 1 and 3.
+    - The site-spread margin is derived: 6σ_path + 1e-6 Ha.
+    - The scan's winning M must be the same at every site.
+    - The M = 1 two-channel predictions, the GPU jitter floor and the convergence precondition of option (ii) are
+      pre-registered.
+    - If any species fails, the user rules on one global kT: (i) raise kT, (ii) document the site dependence, or
+      (iii) Marzari–Vanderbilt cold smearing (offered only). I do not pick.
 29. **V2 budgets are about 1.5× the prototype's iteration counts**, and F and TS are pinned to D§6 within 1e-5 Ha.
-    Bitwise pins are re-pinned with a reason, never deleted.
-30. **Readout wording:** "F (free energy, T_el 316 K)", E and −TS in the breakdown, a −TS note in the solve log when
-    TS ≥ 1e-6 Ha, and a note in the PySCF compare.
+    The controls are pinned at 3 × max(achieved, path scatter): H₂ 2e-6, H₂O 6e-6 [SHOULD-6]. Bitwise pins are
+    re-pinned with a reason, never deleted.
+30. **Readout wording** (amended for SHOULD-4):
+    - the row reads "F (electronic free energy, T_el 316 K)";
+    - the tooltip adds that T_el is a fixed numerical temperature, independent of the thermostat, and that F excludes
+      the nuclei's entropy;
+    - E and −TS appear in the breakdown;
+    - the solve log gets a −TS note when TS ≥ 1e-6 Ha;
+    - the PySCF compare gets a note.
 31. **It ships as one merge** (solver plus migration), and implementation starts after the trust rework merges.
+
+**Added after the physics review of 682960e** (each is my call on how to apply the finding):
+
+32. **V3** [MUST-4] uses Richardson on δ = 0.01 / 0.02 Bohr against the "M7 forces" Richardson bound, 1e-4 Ha/Bohr.
+    - It asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5].
+    - Its discrimination threshold is |HF + dE/dx|_Rich ≥ 5e-4 Ha/Bohr.
+33. **The shared-seed spin-restricted auto surface** [SHOULD-2] is written into section 4.7(e) as an alternative for
+    the user, not adopted. Task A1 seeds the tetrahedron with its broken-symmetry densities, to test the 12–24 mHa
+    "LSDA broken symmetry" claim under F.
+34. **V4** [MUST-5]:
+    - μ is compared within `EPS_BOUND_PSEUDO` only where a partial level exists;
+    - per-level |Δf| ≤ `EPS_BOUND_PSEUDO`/(4kT);
+    - the sum of f per degenerate cluster within 1e-9;
+    - TS against the energy bounds;
+    - the same state class required on both solvers.
+35. **V5** [MUST-6]: the H₄-square NVE run is withdrawn. In its place:
+    - a CPU work-integral oracle: Simpson over 40 steps on the V3 geometry, |W + ΔF| ≤ the Simpson bound plus 40× the
+      force scatter, and |W + ΔE| ≥ 5× that;
+    - an NVE run on a low-release case chosen by A1, with bounds re-derived by the suite's own rule (never scaled per
+      atom), and a TS swing ≥ 1 mHa along it.
+36. **Wording and documentation fixes:**
+    - "minimises" becomes "makes stationary on the branch reached" [SHOULD-3];
+    - "a real T_el effect" becomes "the Mermin–Kohn–Sham functional with ground-state xc; S is the KS-occupation
+      entropy" [SHOULD-4];
+    - the gapped f is "1.0 below μ, ≤ e^{−36} above, never 0.0" [SHOULD-5];
+    - the force-module docs say −dF/dR, to today's floors [SHOULD-8];
+    - new sections 4.7(h) (shared μ_σ across fragments, SHOULD-10) and 4.7(i) (atomisation energies shift by +TS_atom,
+      NOTE-4);
+    - NOTE-2, 5, 7, 8 and 9 are applied as wording.
+37. **ε_E stays 1e-5 Ha** [SHOULD-7], with its derivation corrected: 5× the pseudo H₂O path scatter of 1.87e-6.
+    V11 reports the false-S estimate. I kept the value rather than raising it, because a false S costs only one review,
+    while a larger ε_E would carry real changes of up to that size as "unchanged".
+38. **Every SHOULD is applied; none is declined.** All NOTEs are applied, NOTE-3 as option (iii) for the user only.
