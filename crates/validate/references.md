@@ -4400,7 +4400,7 @@ Findings:
    The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
 4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.
 
-## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone)
+## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone at the checks)
 
 Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run with the test hook `body4_force`. `d4` runs on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, 106 held on disk). `s4` runs on a synthetic four-species store, **for cost only**: every N of the even-indexed samples is made C with the labels untouched (they are N₂'s labels, meaningless for carbon), C's references are copied from N's per box, and jittered replicas (`replica(…, 1e-4)`) take it to 10 830 samples, read-only. Command: `REFIT_COST=d4 REFIT_WHOLE=0 COLLECTION_DIR=<copy> cargo test -p providers --release --lib refit_cost_on_a_collection -- --ignored --nocapture --test-threads 1` (then `REFIT_COST=s4` on a fresh copy).
 
@@ -4410,6 +4410,8 @@ Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run
 | 3 | 1 805 | 3 | 1 902 | 36.19 s (2) | 23.37 s (2) | 32.39 s (2) | yes: force 1.82e-3 ≤ 2.0e-3, energy 9.0e-4 Ha/atom | 51 → 40 → 37 (54, 11, 3 released) |
 | 4 (synthetic) | 10 830 | 2 | 2 688 | 436.83 s (8) | — | — | no: force 5.6e-3 (the S = 3 H₃O misfit, replicated) | 624 |
 | 4 (synthetic) | 10 830 | 3 | 5 344 | **1 087.42 s (2)** | — | — | yes: force 1.98e-3 | 300 (330 released) |
+
+"Held after" is the store's held count after each refit (attach → second → incremental). It is not the count on disk less the releases: the attach changes a few holds before any release (106 on disk → 104 at D₄ = 2, where nothing is released; 636 → 624 at S = 4), not traced.
 
 Phases at S = 3 (each the provider's own function on the standing fit):
 
@@ -4422,9 +4424,9 @@ Phases at S = 3 (each the provider's own function on the standing fit):
 | LOO per sample, 2 / 3 / 4 atoms | 3.7 / 5.3 / 6.9 ms | 12.7 / 17.9 / 22.9 ms | 3.4 |
 | active set (rule 5e) | 1.78 s | 5.71 s | 3.2 |
 | one `fit_store`, nothing new | 4.39 s | 11.47 s | 2.6 |
-| the growth rule's floor pass (`grown_body4_degree`) | — | 0.057–0.081 s (0.68–0.73 s at S = 4) | |
+| the growth rule's floor pass (`grown_body4_degree`; "cold" clears only the floor cache) | — | 0.057–0.081 s (0.68–0.73 s at S = 4) | |
 
 Findings:
-1. **The stop condition fired.** At S = 4 and 10 000 samples a D₄ = 3 refit is ≈ 540 s per fit (spectral search and null space ∝ Q′³, ×22 from Q′ 1 902; leave-one-out and active set ∝ P·Q′²). D₄ = 2 is over the 300 s limit there too (437 s), because the failed recovery reruns 7 fits at every refit.
-2. **At S = 3, D₄ = 3 is both trusted and cheaper per refit than D₄ = 2's recovery reruns** (2 fits against 7–8). Each refit releases more held samples (51 → 40 → 37), so a "second refit gives the same holds" check needs the releases to settle first (Task 8).
+1. **The stop condition fired.** At S = 4 and 10 000 samples a D₄ = 3 refit is ≈ 540 s per fit (spectral search and null space ∝ Q′³, ×22 from Q′ 1 902; leave-one-out and active set ∝ P·Q′²). D₄ = 2 is over the 300 s limit there too (437 s, 8 fits), because the failed recovery reruns its 7 fits. Only the cold attach was timed at S = 4; that it reruns at every refit is inferred from S = 3.
+2. **At S = 3, D₄ = 3 is trusted, with 2 fits per refit instead of 7–8; it is not cheaper.** Each fit is 2.6× dearer, so a refit takes 1.1–1.4× D₄ = 2's wall time (36.2 / 23.4 / 32.4 s against 27.1 / 21.5 / 23.4 s). Each refit releases more held samples (51 → 40 → 37), so a "second refit gives the same holds" check needs the releases to settle first (Task 8).
 3. **The user's decision (2026-11-13): accept the cost.** D₄ = 3 for every species set, with no column budget. While playing the refit runs in the background (fix 4 above) and the standing model answers; paused, it is a wait of that length. Not built: D₄ = 3 for many-body centres only, a smaller body-4 n_max, or skipping a recovery that already failed on the same samples (that changes fit behaviour).
