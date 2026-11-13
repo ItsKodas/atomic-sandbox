@@ -978,6 +978,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
             st.search.open = false;
         }
     }
+    // a wide window too: the toolbar's Thermostat group needs ≈ 1590 pt
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &input(&scene, None, &cam), 1700.0, vec![]);
+    }
     // every search entry's anchor is marked by a widget group in some layout (a misspelt anchor
     // would silently stop revealing)
     let marked = search::MARKED.with(|m| m.borrow().clone());
@@ -1872,8 +1876,11 @@ fn fs_per_s_shows_three_figures_in_five_characters_at_most() {
 /// Every toolbar group keeps its rect (to 0.5 pt) whatever the live values — fs/s 1 vs 999 999,
 /// this tick's rate, fallbacks 0 vs 100 %, epoch 1 vs 9999, the solver line long (untrusted,
 /// sampling) vs short (DFT) vs absent, the selection, the dt warning, the pull, the speed and
-/// dt fields, the element — in the full layout and the compact one; and no group outgrows the
-/// width it was given (`toolbar::Widths`), nor the window.
+/// dt fields, the element, the thermostat (on / off, 0 K … 20 000 K) — in the full layout and the
+/// compact one; and no group outgrows the width it was given (`toolbar::Widths`), nor the
+/// window. The Thermostat group sits between dt and Tool where the window has room for it: at
+/// 1600 (full) and 1240 (compact: its two boxes, no slider), not at 1400 (the full layout's
+/// other groups fill it) nor 1000.
 #[test]
 fn the_toolbar_groups_hold_still_when_live_values_change() {
     use toolbar::GROUPS;
@@ -1913,29 +1920,39 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         target: None,
     });
     let dft = snapshot(&scene, Backend::Gpu, None);
-    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
-    let states: [(Option<&Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool); 5] = [
-        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false),
-        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true),
-        (None, None, Some(0), 37, 0.25, 8, 0.0125, false),
-        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true),
-        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true),
+    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing, thermostat on / T)
+    type State<'a> = (Option<&'a Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool, bool, f64);
+    let states: [State; 5] = [
+        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false, false, 0.0),
+        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true, true, 20_000.0),
+        (None, None, Some(0), 37, 0.25, 8, 0.0125, false, true, 300.0),
+        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true, false, 4999.5),
+        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true, true, 1.0),
     ];
     for w in [1600.0, 1400.0, 1240.0, 1000.0] {
         let mut first: Option<std::collections::BTreeMap<&'static str, (egui::Rect, f32)>> = None;
-        for (k, &(snap, rate, selected, speed, dt, element, pull, playing)) in states.iter().enumerate() {
+        for (k, &(snap, rate, selected, speed, dt, element, pull, playing, on, t)) in states.iter().enumerate() {
             let mut st = UiState::new("h2o", &scene);
             st.gpu_available = true;
             st.backend = snap.map_or(Backend::Estimated, |s| s.backend);
             st.mode = ToolMode::Select;
             (st.speed, st.dt_fs, st.element, st.drag_force) = (speed, dt, element, pull);
+            (st.thermostat_on, st.thermostat_t) = (on, t);
             let inp = PanelInput { selected, playing, measured_fs_per_s: rate, ..input(&scene, snap, &cam) };
             for _ in 0..2 {
                 GROUPS.with(|g| g.borrow_mut().clear());
                 frame(&ctx, &mut st, &inp, w, vec![]);
             }
             let groups = GROUPS.with(|g| g.borrow().clone());
-            assert_eq!(groups.len(), 7, "{w}: {:?}", groups.keys());
+            let thermostat = w == 1600.0 || w == 1240.0;
+            assert_eq!(groups.len(), if thermostat { 8 } else { 7 }, "{w}: {:?}", groups.keys());
+            if thermostat {
+                // after dt, before Tool, overlapping neither
+                let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+                assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+            }
+            assert_eq!(PROBES.with(|p| p.borrow().contains_key("tb-thermostat-slider")), w == 1600.0, "{w}: the slider");
+            PROBES.with(|p| p.borrow_mut().clear());
             for (anchor, (rect, width)) in &groups {
                 assert!(rect.width() <= width + 0.5, "{w} state {k}: {anchor} is {} wide, given {width}", rect.width());
                 assert!(rect.right() <= w, "{w} state {k}: {anchor} ends at {} past the window", rect.right());
@@ -1956,6 +1973,145 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
     }
+}
+
+// ---- the toolbar's Thermostat group (user request 2026-11-14) ----
+
+/// The thermostat slider's travel: T = 5000 K · u³ — monotone, 0–1000 K beyond half the travel,
+/// whole kelvin back from the travel, and a target above the top pins the slider at its end.
+#[test]
+fn the_thermostat_slider_favours_low_temperatures() {
+    use toolbar::{thermostat_from_travel as from, thermostat_travel as travel, THERMOSTAT_SLIDER_MAX_K as TOP};
+    assert_eq!((travel(0.0), travel(TOP), from(0.0), from(1.0)), (0.0, 1.0, 0.0, TOP));
+    assert!(travel(1000.0) > 0.5, "0–1000 K takes more than half the travel: {}", travel(1000.0));
+    assert!((travel(1000.0) - 0.2f64.cbrt()).abs() < 1e-12 && (travel(300.0) - 0.06f64.cbrt()).abs() < 1e-12);
+    assert_eq!(from(0.5), 625.0);
+    let mut last = -1.0;
+    for k in 0..=5000 {
+        let t = k as f64;
+        let u = travel(t);
+        assert!(u > last, "monotone at {t} K");
+        last = u;
+        assert_eq!(from(u), t, "{t} K survives the round trip");
+    }
+    for t in [5000.5, 20_000.0, 1e6] {
+        assert_eq!(travel(t), 1.0, "{t} K pins the slider at its end");
+    }
+    assert_eq!(travel(-5.0), 0.0);
+}
+
+/// The text shapes painted inside `rect` in one frame `w` wide, in paint order.
+fn texts_in(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, rect: egui::Rect) -> String {
+    fn walk(s: &egui::epaint::Shape, rect: egui::Rect, out: &mut String) {
+        match s {
+            egui::epaint::Shape::Text(t) if rect.expand(2.0).contains(t.pos) => out.push_str(t.galley.text()),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, rect, out)),
+            _ => {}
+        }
+    }
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0))), ..Default::default() };
+    let mut full = ctx.run_ui(raw, |root| {
+        show(root, st, inp);
+    });
+    full.textures_delta.clear();
+    let mut out = String::new();
+    full.shapes.iter().for_each(|c| walk(&c.shape, rect, &mut out));
+    out
+}
+
+fn actions(outs: &[PanelOutput]) -> Vec<Action> {
+    outs.iter().flat_map(|o| o.actions.iter().cloned()).collect()
+}
+
+/// The toolbar's Thermostat group sends the Physics menu's own `Action::Thermostat`: its box is the
+/// menu's checkbox (the same action, the same driver command); its slider and its value set the
+/// target in kelvin whatever the scale shown and leave the thermostat off when it is off (no
+/// driver command then); the compact slot's shorter slider maps the same.
+#[test]
+fn the_toolbar_thermostat_sends_the_menus_action() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    // the menu's checkbox, for comparison
+    let mut menu = UiState::new("h2", &scene);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let from_menu = actions(&click_widget(&ctx, &mut menu, &inp, "thermostat"));
+    egui::Popup::close_all(&ctx);
+    assert_eq!(from_menu, vec![Action::Thermostat { on: true, t: 300.0, tau: 10.0 }]);
+    // full, and compact with its short slider (at 1240 the compact slot has the boxes alone)
+    for w in [1600.0, 1300.0] {
+        let mut st = UiState::new("h2", &scene);
+        st.temp_units = TempUnits::C;
+        // the slider's middle: half the travel, 5000 K / 8, in kelvin although °C is shown
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(dyn_commands(&outs).is_empty() && !st.thermostat_on && st.thermostat_t == 625.0, "{w}: off stays off");
+        // dragged right: hotter, still off
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 12.0);
+        assert!(st.thermostat_t > 625.0 && !st.thermostat_on, "{w}: {}", st.thermostat_t);
+        assert!(actions(&outs).iter().all(|a| matches!(a, Action::Thermostat { on: false, .. })));
+        // the box: the menu's action, the menu's command
+        st.thermostat_t = 300.0;
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), from_menu, "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(Some((t, tau)))] if *t == 300.0 && *tau == 10.0), "{w}");
+        // on: a new target is sent to the driver
+        let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0));
+        assert!(matches!(c.as_slice(), [DynCommand::SetThermostat(Some((t, _)))] if *t == 625.0), "{w}: {c:?}");
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(None)]), "{w}");
+    }
+}
+
+/// The target box shows the target in the chosen scale and takes a typed value in it, any value
+/// from absolute zero up: 20 000 K typed is kept — the slider pinned at its end, and neither it
+/// nor the Physics menu's own box (no top either now) pulls it back to 5000 K.
+#[test]
+fn the_toolbar_thermostat_box_shows_the_scale_and_keeps_any_target() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+    }
+    let rect = probed_rect("tb-thermostat-t");
+    for (u, shown) in [(TempUnits::K, "300 K"), (TempUnits::C, "26.9 °C"), (TempUnits::F, "80.3 °F")] {
+        st.temp_units = u;
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+        assert_eq!(texts_in(&ctx, &mut st, &inp, 1600.0, rect), shown);
+    }
+    // typed in °F: 100 °F is 310.93 K
+    let type_in = |st: &mut UiState, text: &str| {
+        let mut outs = press_widget_w(&ctx, st, &inp, 1600.0, "tb-thermostat-t", 0.0);
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![egui::Event::Text(text.into())]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![]));
+        actions(&outs)
+    };
+    let a = type_in(&mut st, "100");
+    assert!(matches!(a.as_slice(), [Action::Thermostat { on: false, t, tau }] if (*t - units::fahrenheit_to_kelvin(100.0)).abs() < 1e-9 && *tau == 10.0), "{a:?}");
+    // above the slider's top, in kelvin
+    st.temp_units = TempUnits::K;
+    let a = type_in(&mut st, "20000");
+    assert_eq!(a, vec![Action::Thermostat { on: false, t: 20_000.0, tau: 10.0 }]);
+    assert_eq!(st.thermostat_t, 20_000.0);
+    // drawn again, toolbar and Physics menu open: nothing changes it
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1600.0, vec![]).actions.is_empty());
+    }
+    egui::Popup::close_all(&ctx);
+    assert_eq!(st.thermostat_t, 20_000.0, "kept above the slider's top");
+    assert!(texts_in(&ctx, &mut st, &inp, 1600.0, probed_rect("tb-thermostat-t")).starts_with("20000"));
+    assert!(probed_rect("tb-thermostat-slider").width() > 70.0, "the full slider");
 }
 
 // ---- M6 Task 10: bonds, molecules, badge, relax, isotopes, the periodic table ----

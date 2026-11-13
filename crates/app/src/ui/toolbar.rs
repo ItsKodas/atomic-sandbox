@@ -1,6 +1,7 @@
 //! The bottom toolbar: what the hands do. Groups (mockup §1): Time (Rewind, Play / Pause, Step),
 //! Speed (steps per tick, the measured fs/s large, the watchable preset and this tick's rate),
-//! dt, Tool (Orbit / Place / Select), the element chips (a pick switches to Place), the
+//! dt, Thermostat (on / off, the target on a slider and in a box, user request 2026-11-14), Tool
+//! (Orbit / Place / Select), the element chips (a pick switches to Place), the
 //! selection's actions (Pin, Focus, Delete) and the Solver (CPU / GPU / Estimated, with the
 //! trust light and who answered this step). The compact layout (mockup §4) drops the labels and
 //! folds the element chips into one chip with a periodic-table flyout.
@@ -34,6 +35,29 @@ const EDIT_TIP: &str = "Edit: click an atom, Shift-click to add or remove, drag 
 const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
+const THERMOSTAT_TIP: &str = "Bussi CSVR (canonical velocity rescaling): the box switches it on and off; the slider (0–5000 K, most of its travel below 1000 K) and the value set its target, in the scale chosen in Physics ▸ Thermostat (K / °C / °F) — typed, any value from absolute zero up, also above the slider's top. Moving the target never switches it on. The coupling time τ is in Physics ▸ Thermostat. Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.";
+const THERMOSTAT_ON_TIP: &str = "thermostat on / off (Bussi CSVR; the same switch as Physics ▸ Thermostat)";
+const THERMOSTAT_T_TIP: &str = "target temperature: drag or type, any value from absolute zero up (0 K = −273.15 °C = −459.67 °F)";
+/// The Speed and Thermostat sliders' length (full layout).
+const SLIDER_W: f32 = 80.0;
+/// The compact layout's thermostat slider.
+const C_SLIDER_W: f32 = 48.0;
+
+/// The thermostat slider's top (K). The value box takes any target from 0 K up; a target above
+/// this pins the slider at its end.
+pub(crate) const THERMOSTAT_SLIDER_MAX_K: f64 = 5000.0;
+
+/// Where target `t` (K) sits on the thermostat slider, as travel 0…1: T = 5000 K · u³, so
+/// 0–1000 K takes 58 % of the travel (300 K sits at 39 %, 2500 K at 79 %); above the top it pins
+/// at 1.
+pub(crate) fn thermostat_travel(t: f64) -> f64 {
+    (t.max(0.0) / THERMOSTAT_SLIDER_MAX_K).cbrt().min(1.0)
+}
+
+/// The target (K, whole kelvin) at travel `u` of the thermostat slider ([`thermostat_travel`]'s inverse).
+pub(crate) fn thermostat_from_travel(u: f64) -> f64 {
+    (THERMOSTAT_SLIDER_MAX_K * u.clamp(0.0, 1.0).powi(3)).round()
+}
 
 /// The ⚠ Model only toggle's label and tooltip (user request 2026-11-12; rule 7: it says plainly
 /// what goes unchecked).
@@ -50,7 +74,11 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     // The full layout's fixed widths need `Widths::full` points: on a window narrower than that
     // (but above the shared `COMPACT_WIDTH`) the toolbar takes its compact layout rather than
     // running its Solver group off the edge. The top bar keeps its own switch.
-    let compact = compact || root.available_width() < Widths::measure(root).full;
+    let w = Widths::measure(root);
+    let compact = compact || root.available_width() < w.full;
+    // the Thermostat group where the window has room for it besides the rest (`Widths::full`
+    // without it, so the full layout still fits 1400 pt; `Widths::full_thermostat`)
+    let thermostat = !compact && root.available_width() >= w.full_thermostat;
     egui::Panel::bottom("toolbar")
         .exact_size(if compact { 50.0 } else { 84.0 })
         .resizable(false)
@@ -60,7 +88,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
                 if compact {
                     compact_bar(ui, st, input, acts)
                 } else {
-                    full_bar(ui, st, input, acts)
+                    full_bar(ui, st, input, thermostat, acts)
                 }
             });
         })
@@ -75,6 +103,8 @@ const PAD: f32 = 2.0;
 /// The width a separator between two groups takes (the line in its middle), besides the item
 /// spacing on either side.
 const SEP: f32 = 4.0;
+/// The compact bar's separators (`ui.separator()`: egui's default spacing).
+const C_SEP: f32 = 6.0;
 /// The least room (points) the compact Solver line is drawn in: its light and a few letters.
 const MIN_SUB: f32 = 48.0;
 /// The selection hint. The Selection group is sized for a selection's coordinates (|x| < 10
@@ -95,6 +125,7 @@ struct Widths {
     time: f32,
     speed: f32,
     dt: f32,
+    thermostat: f32,
     tool: f32,
     elements: f32,
     selection: f32,
@@ -105,14 +136,24 @@ struct Widths {
     solver_row: f32,
     /// The whole full bar with the Solver group at its row: the window width it needs.
     full: f32,
+    /// [`Self::full`] with the Thermostat group too: the window width that shows it.
+    full_thermostat: f32,
     // the full layout's slots
     speed_field: f32,
     rate: f32,
     dt_field: f32,
+    /// The thermostat's target box (both layouts).
+    thermostat_field: f32,
     // the compact layout's groups
     c_time: f32,
     c_speed: f32,
     c_dt: f32,
+    /// The compact Thermostat slot: the box, a short slider and the target box.
+    c_thermostat: f32,
+    /// ... without the slider (a narrower window): the box and the target box.
+    c_thermostat_box: f32,
+    /// What the compact bar needs after dt's separator besides the Thermostat slot.
+    c_after_dt: f32,
     c_tool: f32,
     c_elements: f32,
     c_selection: f32,
@@ -151,6 +192,12 @@ impl Widths {
         let speed_field = field(&MAX_SPEED.to_string());
         let rate_full = rate(&FontId::monospace(15.0), "");
         let dt_field = field("0.000 fs");
+        // the widest target the box shows (one decimal; °F the widest scale): a target past
+        // 99 999 °F (≈ 55 000 K) still shows, a little wider
+        let thermostat_field = field("99999.9 °F");
+        // the on / off box (no text: the group's label names it)
+        let check = interact.y.max(s.spacing.icon_width) + 2.0;
+        let thermostat_row = |slider: f32| check + sp + slider + sp + thermostat_field;
         let play = btn("      Pause").max(84.0);
         let relax = btn("Relax").max(btn("Stop")).max(RELAX_W);
         let selection_row = s.spacing.icon_width + s.spacing.icon_spacing + w("Pin", &body) + sp + btn("Focus") + sp + btn("Delete");
@@ -170,6 +217,7 @@ impl Widths {
                 line_w(&["watchable (≈ ", "99.9", " fs/s)"]) + 2.0 * bp + sp + line_w(&["· tick ", "00.0k", " fs/s"]),
             ]) + PAD,
             dt: max(&[caps("dt", false), dt_field, w("under-resolved", &sub), w(&format!("amber > {DT_WARN_FS}"), &sub)]) + PAD,
+            thermostat: max(&[caps("Thermostat", true), thermostat_row(SLIDER_W), line_w(&["off · τ ", "1000", " fs"])]) + PAD,
             tool: max(&[
                 caps("Tool", false),
                 segs(&[btn("      Inspect"), 30.0, 30.0, 30.0]),
@@ -181,12 +229,17 @@ impl Widths {
             solver: max(&[caps("Solver", false), solver_row, model_only + solver_sub]) + PAD,
             solver_row: solver_row + PAD,
             full: 0.0,
+            full_thermostat: 0.0,
             speed_field,
             rate: rate_full,
             dt_field,
+            thermostat_field,
             c_time: 28.0 + sp + 30.0 + sp + 28.0,
             c_speed: c_speed_field + sp + c_rate + sp + w("watch", &sub) + 2.0 * bp,
             c_dt: dt_field,
+            c_thermostat: thermostat_row(C_SLIDER_W),
+            c_thermostat_box: check + sp + thermostat_field,
+            c_after_dt: 0.0,
             c_tool: segs(&[30.0; 4]),
             c_elements: (w("He ▾", &mono) + 2.0 * bp).max(40.0),
             c_selection: selection_row + sp + w("no selection", &body),
@@ -199,6 +252,14 @@ impl Widths {
         // the panel's margin and stroke on both sides, six separators (8 + item spacing a side)
         let g = &widths;
         widths.full = 2.0 * 7.0 + g.time + g.speed + g.dt + g.tool + g.elements + g.selection + 6.0 * (SEP + 2.0 * sp) + g.solver_row;
+        // and the Thermostat group with its separator
+        widths.full_thermostat = widths.full + widths.thermostat + SEP + 2.0 * sp;
+        // the compact bar after dt's separator, without the Thermostat slot: Tool, the element
+        // chip, Selection and the Solver's row with room for ⚠ Model only (whatever the solver, so
+        // the slot does not move with it; the Thermostat gives way first), with their two
+        // separators (`C_SEP`)
+        let g = &widths;
+        widths.c_after_dt = g.c_tool + sp + g.c_elements + 2.0 * (C_SEP + 2.0 * sp) + g.c_selection + g.c_solver_row + g.model_only;
         widths
     }
 
@@ -299,6 +360,11 @@ fn row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// A sub-line that elides at its slot's edge (the full text on hover); plain text is drawn dim at
 /// [`SUB`], styled text and layout jobs as given.
 fn sub(ui: &mut Ui, text: impl Into<WidgetText>) -> egui::Response {
+    // no room left for even its "…" (a narrow compact Solver slot, after the source label): not
+    // drawn, rather than an ellipsis past the slot's edge
+    if ui.available_width() < 12.0 {
+        return ui.interact(egui::Rect::NOTHING, ui.next_auto_id(), egui::Sense::hover());
+    }
     let text = match text.into() {
         WidgetText::Text(t) => WidgetText::from(RichText::new(t).size(SUB).color(theme::INK_DIM)),
         styled => styled,
@@ -315,7 +381,8 @@ fn kbd(ui: &mut Ui, key: &str) {
         .show(ui, |ui| ui.label(RichText::new(key).monospace().size(10.0).color(theme::INK_DIM)));
 }
 
-fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+/// The full layout; `thermostat`: the window has room for the Thermostat group too.
+fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, thermostat: bool, acts: &mut Vec<Action>) {
     let w = Widths::measure(ui);
     let sampling = input.sampling();
     let d = input.snapshot.map(|s| &s.dynamics);
@@ -338,7 +405,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     group(ui, st, "tb-speed", "Speed · steps per tick", Some(SPEED_TIP), w.speed, |ui, st| {
         row(ui, |ui| {
             let mut speed = st.speed;
-            ui.spacing_mut().slider_width = 80.0;
+            ui.spacing_mut().slider_width = SLIDER_W;
             let slid = ui.add(egui::Slider::new(&mut speed, 1..=MAX_SPEED).logarithmic(true).show_value(false)).on_hover_text(SPEED_TIP).changed();
             let typed = field(ui, w.speed_field, |ui| probed("speed", ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED))))
                 .on_hover_text(SPEED_TIP)
@@ -380,6 +447,15 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             None => sub(ui, format!("amber > {DT_WARN_FS}")),
         };
     });
+    // where the window has room (≈ 1590 pt): the rest of the full layout keeps fitting 1400
+    if thermostat {
+        group(ui, st, "tb-thermostat", "Thermostat", Some(THERMOSTAT_TIP), w.thermostat, |ui, st| {
+            row(ui, |ui| thermostat_controls(ui, st, Some(SLIDER_W), w.thermostat_field, acts));
+            let state = if st.thermostat_on { "on" } else { "off" };
+            sub(ui, line(&[&format!("{state} · τ "), &super::sig3(st.thermostat_tau), " fs"], SUB, theme::INK_DIM))
+                .on_hover_text("the coupling time τ: smaller = tighter control, more disturbed dynamics (Physics ▸ Thermostat sets it)");
+        });
+    }
     group(ui, st, "tb-tool", "Tool", None, w.tool, |ui, st| {
         row(ui, |ui| tool_segments(ui, st, false, acts));
         if st.mode == ToolMode::Select {
@@ -470,6 +546,17 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
     let r = slot(ui, w.c_dt, |ui| field(ui, w.dt_field, |ui| dt_field(ui, st, acts)));
     mark(ui, st, "tb-dt", r.response.rect, w.c_dt);
     ui.separator();
+    // the Thermostat slot where the rest still fits after it: with its short slider, else the
+    // two boxes alone (Speed's compact slot keeps its box too), else (a very narrow window) not
+    // drawn — Physics ▸ Thermostat holds the same controls
+    let room = ui.available_width() - (C_SEP + 2.0 * ui.spacing().item_spacing.x) - w.c_after_dt;
+    let slider = if room >= w.c_thermostat { Some(C_SLIDER_W) } else { None };
+    let c_thermostat = if slider.is_some() { w.c_thermostat } else { w.c_thermostat_box };
+    if room >= c_thermostat {
+        let r = slot(ui, c_thermostat, |ui| thermostat_controls(ui, st, slider, w.thermostat_field, acts));
+        mark(ui, st, "tb-thermostat", r.response.rect, c_thermostat);
+        ui.separator();
+    }
     let r = slot(ui, w.c_tool, |ui| tool_segments(ui, st, true, acts));
     mark(ui, st, "tb-tool", r.response.rect, w.c_tool);
     let r = slot(ui, w.c_elements, |ui| element_flyout(ui, st, w.c_elements, acts));
@@ -526,6 +613,45 @@ pub(crate) fn fs_per_s(r: f64) -> String {
         }
     }
     ">1P".into()
+}
+
+/// The thermostat's on / off box, its target slider (`slider` points long, if any) and its target box
+/// (`field_w` wide, in the chosen scale). They send the Physics menu's own
+/// [`Action::Thermostat`] (one path to the worker): the box flips `on`, the slider and the value
+/// set `t` (K) and leave `on` as it is.
+fn thermostat_controls(ui: &mut Ui, st: &UiState, slider: Option<f32>, field_w: f32, acts: &mut Vec<Action>) {
+    let (mut on, mut t, tau) = (st.thermostat_on, st.thermostat_t, st.thermostat_tau);
+    let toggled = probed("tb-thermostat-on", ui.checkbox(&mut on, "")).on_hover_text(THERMOSTAT_ON_TIP).changed();
+    // the travel, pinned at its end above the top: drawing it never changes the target
+    let mut slid = false;
+    if let Some(len) = slider {
+        let mut u = thermostat_travel(t);
+        ui.spacing_mut().slider_width = len;
+        slid = probed("tb-thermostat-slider", ui.add(egui::Slider::new(&mut u, 0.0..=1.0).show_value(false)))
+            .on_hover_text(format!("{THERMOSTAT_T_TIP}; the slider spans 0–{} (most of its travel below 1000 K)", st.temp_units.show(THERMOSTAT_SLIDER_MAX_K, 0)))
+            .changed();
+        if slid {
+            t = thermostat_from_travel(u);
+        }
+    }
+    // typed in the chosen scale, kept in kelvin, clamped at absolute zero, no top
+    let tu = st.temp_units;
+    let mut shown = tu.from_k(t);
+    let typed = field(ui, field_w, |ui| {
+        probed(
+            "tb-thermostat-t",
+            ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(1).suffix(tu.suffix())),
+        )
+    })
+    .on_hover_text(THERMOSTAT_T_TIP)
+    .changed();
+    if typed {
+        t = tu.to_k(shown);
+    }
+    // (a typed value is applied again when its box loses focus: sent once)
+    if (toggled || slid || typed) && (on, t) != (st.thermostat_on, st.thermostat_t) {
+        acts.push(Action::Thermostat { on, t, tau });
+    }
 }
 
 fn time_buttons(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, sampling: bool, compact: bool, acts: &mut Vec<Action>) {
@@ -758,4 +884,5 @@ the fit's own words: {d}"),
         epoch
     ));
 }
+
 

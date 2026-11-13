@@ -130,6 +130,9 @@ pub const ENTRIES: &[Entry] = &[
     e("Ionic potential", "pseudopotential all-electron cores valence nlcc ionic policy none cores only all species h_req egg-box", Menu(M::Physics), "m-ionic"),
     e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
+    // the toolbar's group (user request 2026-11-14), where the window has room for it; after the
+    // menu's entry, which is there at every width, so "therm" finds that one first
+    e("Thermostat target slider (toolbar)", "temperature T target heat on off hot cold", Toolbar, "tb-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),
     e("Time step dt (Physics menu)", "fs", Menu(M::Physics), "m-dt"),

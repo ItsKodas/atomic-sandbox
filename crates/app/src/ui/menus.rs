@@ -810,12 +810,13 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
             let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
-            // typed in the chosen scale, kept in kelvin, clamped at absolute zero
+            // typed in the chosen scale, kept in kelvin, clamped at absolute zero, no top (the
+            // toolbar's box takes any target too: a range here would pull one above it back down)
             let tu = st.temp_units;
             let mut shown = tu.from_k(t);
             let tc = probed(
                 "thermostat-t",
-                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 5000.0)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
             )
             .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
             .changed();
