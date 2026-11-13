@@ -2212,6 +2212,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         draft_banner: None,
         bonds_label: None,
         stale_bonds_line: None,
+        experience_bonds: Vec::new(),
         probe: None,
     };
     let mut out = crate::ui::PanelOutput::default();

@@ -144,6 +144,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         draft_banner: None,
         bonds_label: None,
         stale_bonds_line: None,
+        experience_bonds: Vec::new(),
         pseudo_generating: None,
         probe: None,
     }
@@ -936,6 +937,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     st.model_sections = super::dock::model::Sections::all(true); // every Model-panel anchor drawn
     st.orbital_sections = super::dock::orbitals::Sections::all(true); // every Orbitals-panel anchor drawn
     st.readouts_sections = super::dock::readouts::Sections::all(true); // every Readouts-panel anchor drawn
+    st.selection_sections = super::dock::selection::Sections::all(true); // every Selection-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -2365,6 +2367,8 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
     assert!(matches!(search::results("what training", 1)[0].place, search::Place::Dock(DockTab::View)));
     st.open_tab(DockTab::Selection);
+    // the isotope label opens the picker (the atom card's mass label, 2026-11-14)
+    click_widget(&ctx, &mut st, &inp, "selection-isotope");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
     // the periodic table
@@ -11629,5 +11633,281 @@ mod readouts_merge {
             }
             assert!(checked > 30, "{checked} texts checked");
         }
+    }
+}
+
+/// The Selection panel (user request 2026-11-14, the approved mockup): the atom card with its
+/// badge, name, charge pill and isotope label, the icon row's actions, NEIGHBOURS (guides and bonds
+/// merged, chips, angles), the molecule line, the folds; the group and the empty states.
+mod selection_redesign {
+    use super::super::dock::selection::{self as sel, BondChip, Section, Sections};
+    use super::*;
+
+    fn report(i: usize, j: usize, verdict: sim::Verdict, lap: Option<f64>) -> sim::PairReport {
+        sim::PairReport {
+            i,
+            j,
+            route: Some(sim::Route::Saddle),
+            s: Some(0.4),
+            rho_min: Some(0.2),
+            transverse_ratio: Some(1.01),
+            rho_pro: Some(0.15),
+            enhancement: Some(1.3),
+            march_end: None,
+            march_stop: None,
+            verdict,
+            laplacian: lap,
+            laplacian_noise: lap.map(|_| 0.02),
+        }
+    }
+
+    /// Water with its bonds (O–H twice; H–H examined, not bonded), the reports, the charges and
+    /// the molecule's name.
+    fn water(scene: &Scene) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Gpu, None);
+        s.dynamics.bonds = Some(graph(3, &[(0, 1), (0, 2)], vec![vec![0, 1, 2]], 0.0));
+        let bonded = sim::Verdict::Bonded { multi_centre: false };
+        s.dynamics.pair_reports = vec![report(0, 1, bonded, Some(-1.2)), report(0, 2, bonded, Some(0.3)), report(1, 2, sim::Verdict::NotAccumulated, Some(0.1))].into();
+        s.labels = std::sync::Arc::new(vec![crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0))]);
+        let pos: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+        s.dynamics.charges = Some(std::sync::Arc::new(sim::PartialCharges {
+            q: vec![-0.3, 0.15, 0.15],
+            counted: vec![8.0, 1.0, 1.0],
+            z: vec![8, 1, 1],
+            positions: pos,
+            electrons: 10.0,
+            system_charge: 0,
+            t: 0.0,
+            step: 4,
+            source: sim::ChargeSource::Step,
+            ionic: "none".into(),
+            dipole: [0.0; 3],
+        }));
+        s
+    }
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// The atom card: badge, "Oxygen #0", the pseudopotential's short form, the isotope label, the
+    /// charge pill; the icon row's actions (pin, focus, delete, deselect) and the follow toggle.
+    #[test]
+    fn the_atom_card_and_its_icon_row() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["Oxygen", "#0", "all-electron", "¹⁶O ▾", "−0.30 e", "Del removes it · Esc deselects", "NEIGHBOURS · WITHIN 6 BOHR", "H₂O — water"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        let (card, pill) = (probed_rect("selection-card"), probed_rect("selection-charge"));
+        assert!(card.contains_rect(pill) && pill.left() > probed_rect("selection-name").right(), "the pill on the right");
+        for (probe, want) in [("sel-focus", Action::Focus), ("sel-delete", Action::Delete(0)), ("sel-deselect", Action::Deselect)] {
+            let outs = click_widget(&ctx, &mut st, &inp, probe);
+            assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == want), "{probe}: {want:?}");
+        }
+        let was = st.follow_selected;
+        let outs = click_widget(&ctx, &mut st, &inp, "follow-selected");
+        assert!(outs.iter().all(|o| o.actions.is_empty()) && st.follow_selected == !was, "follow toggles the display setting");
+        // pin: off without the dynamics' pins (its rule as before), a toggle with them
+        let outs = click_widget(&ctx, &mut st, &inp, "sel-pin");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "no pins known: disabled");
+        let mut pins = water(&scene);
+        pins.dynamics.pins = vec![false; 3].into();
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&pins), &cam) };
+        let outs = click_widget(&ctx, &mut st, &inp, "sel-pin");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| matches!(a, Action::Pin(0, true))), "pin");
+        // the isotope picker: the same action as before
+        click_widget(&ctx, &mut st, &inp, "selection-isotope");
+        let outs = click_widget(&ctx, &mut st, &inp, "selection-isotope-18");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::SetIsotope { index: 0, a: 18 }));
+    }
+
+    /// NEIGHBOURS: the guides and the bonds in one list by distance, each with its chip (covalent,
+    /// weak contact, no bond; guessed where experience draws a bond; faded while stale), the angle
+    /// at the atom under the pair it joins, and the molecule line.
+    #[test]
+    fn neighbours_merge_guides_and_bonds() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let rows = sel::neighbours(&inp, 0);
+        assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>().len(), 2);
+        assert!(rows.windows(2).all(|w| w[0].distance <= w[1].distance), "nearest first");
+        let chip = |rows: &[sel::Neighbour], j: usize| rows.iter().find(|r| r.index == j).unwrap().chip;
+        assert_eq!((chip(&rows, 1), chip(&rows, 2)), (Some(BondChip::Covalent), Some(BondChip::WeakContact)));
+        let h = PanelInput { selected: Some(1), ..input(&scene, Some(&s), &cam) };
+        let rows = sel::neighbours(&h, 1);
+        assert_eq!(chip(&rows, 2), Some(BondChip::NoBond), "H–H: examined, not a bond");
+        let guess = PanelInput { experience_bonds: vec![(1, 2)], ..input(&scene, Some(&s), &cam) };
+        assert_eq!(chip(&sel::neighbours(&guess, 1), 2), Some(BondChip::Guessed), "experience draws it");
+        let bare = snapshot(&scene, Backend::Gpu, None);
+        assert!(sel::neighbours(&input(&scene, Some(&bare), &cam), 0).iter().all(|r| r.chip.is_none()), "no graph yet: no chip");
+        // on screen: rows in order, the angle under the second O–H, the chips' words
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("covalent") && t.contains("weak contact") && t.contains("Bohr · "), "{t}");
+        let angle = t.find("∠H–O–H").expect("the angle at O");
+        assert!(angle > t.find("H #2").unwrap() && angle > t.find("H #1").unwrap(), "under the pair it joins:\n{t}");
+        assert!(probed_rect("selection-neighbour-0").bottom() <= probed_rect("selection-neighbour-1").top() + 0.5);
+        probed_rect("selection-molecule");
+        // stale bonds: the chips faded (and the honesty line under the list)
+        let mut stale = water(&scene);
+        stale.dynamics.bonds_stale = true;
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&stale), &cam) };
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("bonds from the last DFT step"), "{t}");
+    }
+
+    /// The folds: Details holds position, electrons and the pseudopotential line; Scene molecules
+    /// and Partial charges (Σq in the header); kept in the profile; with nothing selected the empty
+    /// state, the molecules and the charges open.
+    #[test]
+    fn the_folds_and_the_empty_state() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Details") && t.contains("Σq +0.0000 e") && !t.contains("composition") && !t.contains("Hirshfeld"), "folded:\n{t}");
+        st.selection_sections = Sections::all(true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("position") && t.contains("composition") && t.contains("electrons") && t.contains("Hirshfeld") && t.contains("Σq = +0.0000 e"), "{t}");
+        let text = profile::capture(&st);
+        assert!(text.contains("\nselection_sections = details,molecules,charges\n"));
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.selection_sections, Sections::default());
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.selection_sections.is_open(Section::Details));
+        // nothing selected
+        st.selection_sections = Sections::default();
+        let none = input(&scene, Some(&s), &cam);
+        let t = texts(&ctx, &mut st, &none);
+        assert!(t.contains(sel::EMPTY) && t.contains("H₂O — water") && t.contains("Hirshfeld"), "the molecules and the charges open:\n{t}");
+        // a pseudised O whose egg-box force is not certified at this grid: an amber ⚠ on the
+        // Details header (the warning is never hidden in the fold), the short form on the card
+        let mut pseudo = water(&scene);
+        pseudo.dynamics.eval.pseudised = vec![sim::PseudoSummary { z: 8, z_v: 6.0, f: 1.2, local: String::new(), r_c_max: 1.0, h_req: None, h_eb: None, r_core: 0.5, record: "the record".into() }].into();
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&pseudo), &cam) };
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("⚠ egg-box") && t.contains("pseudo · Z_v 6") && !t.contains("egg-box force not certified"), "{t}");
+        st.selection_sections.set(Section::Details, true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("egg-box force not certified at this grid"), "the warning inside:
+{t}");
+    }
+
+    /// The Edit tool's group: "3 atoms selected", the chips, the pairwise distances sorted, the last
+    /// one clicked as a line; Delete acts as before.
+    #[test]
+    fn a_group_shows_its_pairwise_distances() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(2), ..input(&scene, Some(&s), &cam) };
+        let d = sel::pairwise(&inp, &[0, 1, 2]);
+        assert_eq!(d.len(), 3);
+        assert!(d.windows(2).all(|w| w[0].2 <= w[1].2));
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        st.mode = ToolMode::Edit;
+        st.edit_group = vec![0, 1, 2];
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("3 atoms selected") && t.contains("O #0") && t.contains("DISTANCES IN THE GROUP") && t.contains("last clicked: H #2"), "{t}");
+        probed_rect("selection-pair-2");
+    }
+
+    /// At about 320 pt the parts stack inside the panel and no text runs past its right edge.
+    #[test]
+    fn the_selection_panel_fits_320_pt() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Selection*])").unwrap());
+        st.selection_sections = Sections::all(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+        let mut shapes = Vec::new();
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let panel = probed_rect("selection-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+        let order = ["selection-card", "selection-neighbours", "selection-molecule", "selection-fold-details", "selection-fold-molecules", "selection-fold-charges"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        for k in 0..2 {
+            let (row, chip) = (probed_rect(&format!("selection-neighbour-{k}")), probed_rect(&format!("selection-chip-{k}")));
+            assert!(row.contains_rect(chip) && chip.right() <= panel.right() + 1.0, "{row:?} {chip:?}");
+        }
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 20, "{checked} texts checked");
     }
 }

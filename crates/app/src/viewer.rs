@@ -1256,6 +1256,7 @@ impl Viewer {
             draft_banner: None,
             bonds_label: None,
             stale_bonds_line: None,
+            experience_bonds: Vec::new(),
             probe: self.sim.as_ref().map(|w| w.probe().view()),
         };
         ui::actions::apply(&mut self.ui, &input, a, &mut out);
@@ -2706,6 +2707,11 @@ impl Viewer {
         }
         let bonds_label = self.bonds_label();
         let stale_bonds_line = self.stale_bonds_line();
+        // the pairs experience draws as bonds (the Selection panel's "guessed" chips)
+        let experience_bonds: Vec<(usize, usize)> = self
+            .experience_shown()
+            .map(|x| x.graph.bonds.iter().zip(&x.looks).filter(|(_, l)| **l == crate::overlay::BondLook::Experience).map(|(b, _)| (b.i.min(b.j), b.i.max(b.j))).collect())
+            .unwrap_or_default();
         self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
         let probe = self.sim.as_ref().map(|w| w.probe().view());
@@ -2732,6 +2738,7 @@ impl Viewer {
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                     stale_bonds_line: stale_bonds_line.clone(),
+                    experience_bonds: experience_bonds.clone(),
                     probe,
                 },
             );
@@ -2785,6 +2792,7 @@ impl Viewer {
                 draft_banner: draft_banner.clone(),
                 bonds_label: bonds_label.clone(),
                 stale_bonds_line: stale_bonds_line.clone(),
+                experience_bonds: experience_bonds.clone(),
                 probe,
             };
             let ui_state = &mut self.ui;

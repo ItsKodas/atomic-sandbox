@@ -10,7 +10,7 @@ mod log;
 pub mod model;
 pub mod orbitals;
 pub mod readouts;
-mod selection;
+pub mod selection;
 pub mod view;
 
 #[cfg(test)]

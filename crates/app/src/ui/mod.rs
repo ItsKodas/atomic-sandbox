@@ -794,6 +794,9 @@ pub struct UiState {
     /// The Readouts panel's folds that are open (`dock::readouts`; the profile's
     /// `readouts_sections`): Work done, Energy breakdown and solver, Compare. Display state.
     pub readouts_sections: dock::readouts::Sections,
+    /// The Selection panel's folds that are open (`dock::selection`; the profile's
+    /// `selection_sections`): Details, Scene molecules, Partial charges. Display state.
+    pub selection_sections: dock::selection::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -1034,6 +1037,7 @@ impl UiState {
             orbital_sections: dock::orbitals::Sections::default(),
             knowledge_sections: knowledge::Sections::default(),
             readouts_sections: dock::readouts::Sections::default(),
+            selection_sections: dock::selection::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
@@ -1267,6 +1271,10 @@ pub struct PanelInput<'a> {
     /// The stale bonds' line while experience draws over them (`viewer::stale_bonds_line`: "bonds
     /// from experience (N pairs) · last DFT t = … fs"); `None` for the plain `bonds_label` line.
     pub stale_bonds_line: Option<String>,
+    /// The pairs (lower index first) the guess from experience draws as bonds over a stale graph
+    /// (`viewer::Viewer::experience_shown`, the looks that are `BondLook::Experience`): the
+    /// Selection panel's "guessed" chips. Empty when it draws nothing.
+    pub experience_bonds: Vec<(usize, usize)>,
     /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
     /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
     /// snapshot still moves on screen.

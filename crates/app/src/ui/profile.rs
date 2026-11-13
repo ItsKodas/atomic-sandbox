@@ -7,7 +7,7 @@
 //! `workspace::detached`), the view and density-look settings and which
 //! of the View panel's sections are open (`view_sections = what,looks`) and which of the Model
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
-//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`), the units, the Version
+//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
 //! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
@@ -89,6 +89,7 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("orbital_sections = {}\n", st.orbital_sections.encode());
     out += &format!("knowledge_sections = {}\n", st.knowledge_sections.encode());
     out += &format!("readouts_sections = {}\n", st.readouts_sections.encode());
+    out += &format!("selection_sections = {}\n", st.selection_sections.encode());
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
@@ -160,6 +161,8 @@ pub fn apply(st: &mut UiState, text: &str) {
     st.knowledge_sections = kv.get("knowledge_sections").map_or_else(Default::default, |v| super::knowledge::Sections::parse(v));
     // the Readouts panel's folds (2026-11-14); absent, all closed
     st.readouts_sections = kv.get("readouts_sections").map_or_else(Default::default, |v| super::dock::readouts::Sections::parse(v));
+    // the Selection panel's folds (2026-11-14); absent, all closed
+    st.selection_sections = kv.get("selection_sections").map_or_else(Default::default, |v| super::dock::selection::Sections::parse(v));
     if let Some(v) = kv.get("layout") {
         // the Graph panel merged into Readouts (2026-11-14): its name migrated on every line at once
         let mut values: Vec<&str> = vec![v, kv.get("hidden").copied().unwrap_or_default()];
