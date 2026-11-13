@@ -418,17 +418,28 @@ fn learned(m: &ModelStatus) -> Vec<(String, usize, String)> {
     out
 }
 
+/// A shared collection's folder key (`surrogate::SurfaceKey::slug`,
+/// `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_accepted-0123456789ab`) in the surface chip's words:
+/// (functional, h, ionic potential: none / cores / pseudo); `None` for a key of another shape.
+pub fn slug_words(slug: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = slug.split('_').collect();
+    (parts.len() >= 6).then(|| {
+        let h = parts[1].strip_prefix('h').unwrap_or(parts[1]).to_string();
+        let ionic = match parts[parts.len() - 1].split('-').next().unwrap_or("none") {
+            "none" => "none",
+            "cores" => "cores",
+            _ => "pseudo",
+        };
+        (parts[0].to_uppercase(), h, ionic.to_string())
+    })
+}
+
 /// The surface chip's words: "Shared · LSDA · h 0.15 · pseudo" — where the model comes from (the
 /// shared collection, a model file, this scene or session only), the functional, h, and the ionic
 /// potential (none / cores / pseudo). A shared collection's from its folder key
 /// (`surrogate::SurfaceKey::slug`), else the scene's (a model taught elsewhere says so in the
 /// verdict).
 pub fn surface_chip(m: &ModelStatus, scene: &crate::scene::Scene) -> String {
-    let ionic_word = |w: &str| match w {
-        "none" => "none",
-        "cores" => "cores",
-        _ => "pseudo",
-    };
     let from_scene = || {
         let w = match scene.ionic {
             sim::IonicPolicy::None => "none",
@@ -438,15 +449,7 @@ pub fn surface_chip(m: &ModelStatus, scene: &crate::scene::Scene) -> String {
         ("LSDA".to_string(), format!("{}", scene.grid_h), w.to_string())
     };
     let (who, (f, h, ionic)) = match &m.source {
-        sim::ModelSource::Collection { slug, read_only, .. } => {
-            let parts: Vec<&str> = slug.split('_').collect();
-            let parsed = (parts.len() >= 6).then(|| {
-                let h = parts[1].strip_prefix('h').unwrap_or(parts[1]).to_string();
-                let ionic = parts[parts.len() - 1].split('-').next().unwrap_or("none");
-                (parts[0].to_uppercase(), h, ionic_word(ionic).to_string())
-            });
-            (if *read_only { "Shared (read-only)" } else { "Shared" }, parsed.unwrap_or_else(from_scene))
-        }
+        sim::ModelSource::Collection { slug, read_only, .. } => (if *read_only { "Shared (read-only)" } else { "Shared" }, slug_words(slug).unwrap_or_else(from_scene)),
         sim::ModelSource::File(_) => ("Model file", from_scene()),
         sim::ModelSource::None if m.collections => ("This scene", from_scene()),
         sim::ModelSource::None => ("This session", from_scene()),
@@ -554,7 +557,7 @@ fn fold(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<
 }
 
 /// A small rounded chip (the surface chip, the "N % DFT" chip).
-fn chip(ui: &mut Ui, text: &str, colour: Color32) -> egui::Response {
+pub(in crate::ui) fn chip(ui: &mut Ui, text: &str, colour: Color32) -> egui::Response {
     egui::Frame::new()
         .fill(colour.gamma_multiply(0.10))
         .stroke(Stroke::new(1.0, colour.gamma_multiply(0.6)))
@@ -565,7 +568,7 @@ fn chip(ui: &mut Ui, text: &str, colour: Color32) -> egui::Response {
 }
 
 /// The text's width at a chip's font, with the chip's margins.
-fn chip_width(ui: &Ui, text: &str) -> f32 {
+pub(in crate::ui) fn chip_width(ui: &Ui, text: &str) -> f32 {
     ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), theme::INK).size().x + 16.0
 }
 

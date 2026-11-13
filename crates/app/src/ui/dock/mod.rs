@@ -174,7 +174,7 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
                 DockTab::Orbitals => orbitals::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
-                DockTab::Knowledge => super::knowledge::tab(ui, st, input),
+                DockTab::Knowledge => super::knowledge::tab(ui, st, input, acts),
                 DockTab::View => view::show(ui, st, acts),
             }
         });

@@ -796,6 +796,9 @@ pub struct UiState {
     /// The Orbitals panel's folds that are open (`dock::orbitals`; the profile's
     /// `orbital_sections`): the Spin readout in Spin density mode by default. Display state.
     pub orbital_sections: dock::orbitals::Sections,
+    /// The Knowledge panel's folds that are open (`knowledge::Sections`; the profile's
+    /// `knowledge_sections`): "Why thin?", closed by default. Display state.
+    pub knowledge_sections: knowledge::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -1034,6 +1037,7 @@ impl UiState {
             model_sections: dock::model::Sections::default(),
             activity_sections: activity::Sections::default(),
             orbital_sections: dock::orbitals::Sections::default(),
+            knowledge_sections: knowledge::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,

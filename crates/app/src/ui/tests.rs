@@ -7366,17 +7366,17 @@ mod knowledge_map {
         assert!(st.activity.knowledge.is_some(), "the map is kept from the snapshot");
         alone(&mut st, DockTab::Knowledge);
         let t = texts(&ctx, &mut st, &inp);
-        for want in ["lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a", "2140 samples · H C O", "3 trusted", "2 thin", "1 never seen", "C–C · never", "C–H · trusted", "H–H · thin", "2140 atoms", "THIS SCENE ASKS"] {
+        for want in ["Shared collection", "2140 samples", "3 trusted", "2 thin", "1 never", "C–C · never", "C–H · trusted", "H–H · thin", "THIS SCENE ASKS"] {
             assert!(t.contains(want), "{want:?} in the tab:\n{t}");
         }
         // nothing picked: the weakest pair the scene asks (C–C, never seen) and its empty histogram
-        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("never taught"), "{t}");
+        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("Never seen — no fitted sample has these two"), "{t}");
         // a click on a line's label picks the pair: its histogram with the scene's distances
         let outs = click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
         assert_eq!(st.knowledge.pick, Pick::Pair(1, 6));
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("the pair you picked · 610 samples") && t.contains("asked now (the open scene):") && t.contains("2 at 2.06 taught"), "{t}");
+        assert!(t.contains("the pair you picked") && t.contains("(610 samples)") && t.contains("now 2.06"), "{t}");
         // a node picks its element: neighbour counts and bond angles, the scene's atoms marked
         click_widget(&ctx, &mut st, &inp, "knowledge-element-6");
         assert_eq!(st.knowledge.pick, Pick::Element(6));
@@ -7428,8 +7428,10 @@ mod knowledge_map {
         st.activity.absorb(&snap);
         alone(&mut st, DockTab::Knowledge);
         st.knowledge.pick = Pick::Pair(1, 1);
+        st.knowledge_sections.why = true; // the detail lines are in "Why thin?"
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("thin: taught, but not everywhere it was met"), "{t}");
+        assert!(t.contains("Still missing: three-or-more-atom arrangements around H, with H and N, 3 of 92 samples."), "the card's sentence:\n{t}");
         assert!(t.contains("Three-or-more-atom arrangements around H, with H and N — not yet (3 of 92 samples needed)"), "the short key, in the Activity tab's words:\n{t}");
         // only the keys where H sees H: not C's or N's (the Activity tab lists those elsewhere)
         assert!(t.contains("learned: pair around H, with H\n"), "{t}");
@@ -7636,7 +7638,7 @@ mod knowledge_map {
         }
         let map = probed_rect("knowledge-map");
         let at_1 = map_texts(&ctx, &mut st, &inp, map);
-        for want in ["O", "H", "O–H · trusted", "O–O · never", "H–H · thin", "880 atoms"] {
+        for want in ["O", "H", "O–H · trusted", "O–O · never", "H–H · thin", "880"] {
             assert!(at_1.iter().any(|t| t.0 == want), "{want:?} in {at_1:?}");
         }
         for zoom in [0.5, 4.0] {
@@ -7720,6 +7722,269 @@ mod knowledge_map {
         profile::apply(&mut half, "right_tabs = Log Model\n");
         assert!(once(&half), "{}", layout::encode(&half.workspace.to_node()));
     }
+
+    /// The texts on screen once the pointer has rested on the probed widget for its tooltip.
+    fn hover_of(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, probe: &str) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let c = probed_rect(probe).center();
+        let mut all = String::new();
+        for k in 0..8 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events: if k == 0 { vec![egui::Event::PointerMoved(c)] } else { vec![] },
+                time: Some(10.0 + 0.3 * k as f64),
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut all));
+        }
+        all
+    }
+
+    // ---- the redesigned panel (user's approved mockup, 2026-11-14) ----
+
+    fn knowledge_state(scene: &Scene, snap: &Snapshot) -> UiState {
+        let mut st = UiState::new("h2o", scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(snap);
+        alone(&mut st, DockTab::Knowledge);
+        st
+    }
+
+    /// The summary line: the collection as the Model tab's short surface chip (the folder key on
+    /// hover), the sample count, the pair counts in their colours; the old legend line is the ⓘ.
+    #[test]
+    fn the_knowledge_summary_is_a_chip_and_counts() {
+        assert_eq!(knowledge::map_chip("lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5"), "Shared · LSDA · h 0.15 · pseudo");
+        assert_eq!(knowledge::map_chip("lsda_h0.25_s0.25_tol1e-6_kohn-sham-gpu_none-0123"), "Shared · LSDA · h 0.25 · none");
+        assert_eq!(knowledge::map_chip(""), "This scene");
+        assert_eq!(knowledge::map_chip("lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a"), "Shared collection", "a key of another shape");
+        let scene = chain();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let mut m = knowledge::fixture_map();
+        m.slug = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5".into();
+        snap.activity.knowledge = Some(Arc::new(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["Shared · LSDA · h 0.15 · pseudo", "2140 samples", "3 trusted", "2 thin", "1 never"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("lsda_h0.15") && !t.contains("node area"), "the key and the legend are on hover:\n{t}");
+        let chip = probed_rect("knowledge-chip");
+        let counts: Vec<egui::Rect> = (0..3).map(|k| probed_rect(&format!("knowledge-count-{k}"))).collect();
+        assert!(counts.windows(2).all(|w| w[0].right() <= w[1].left()), "in order: {counts:?}");
+        assert!(counts[0].left() >= chip.right() || counts[0].top() >= chip.bottom(), "the counts after the chip, or right-aligned under it when narrow: {chip:?} {counts:?}");
+        let hover = hover_of(&ctx, &mut st, &inp, "knowledge-chip");
+        assert!(hover.contains("lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5") && hover.contains("r_cut 6.0 Bohr"), "{hover}");
+        // the counts beside the nodes, not under them
+        let (c, r) = disc(1);
+        let n = probed_rect("knowledge-count-node-1");
+        assert!(n.left() >= c.x + r && (n.center().y - c.y).abs() < 2.0, "beside the H node: {n:?} vs {c:?} r {r}");
+        assert!(t.contains("2140\n") && !t.contains("2140 atoms"), "{t}");
+    }
+
+    /// THIS SCENE ASKS: one chip per pair the scene has, weakest first; a click picks it as a click
+    /// on its line does, and the pair the card shows is outlined (nothing picked: the weakest).
+    #[test]
+    fn the_scene_chips_pick_like_the_map() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        texts(&ctx, &mut st, &inp);
+        let (cc, ch) = (probed_rect("knowledge-ask-6-6"), probed_rect("knowledge-ask-1-6"));
+        assert!(cc.left() < ch.left() || cc.top() < ch.top(), "C–C (never seen) first");
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-ask-1-6");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        let by_chip = st.knowledge.pick;
+        st.knowledge.pick = Pick::None;
+        click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
+        assert_eq!((by_chip, st.knowledge.pick), (Pick::Pair(1, 6), Pick::Pair(1, 6)));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("the pair you picked") && t.contains("Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met."), "{t}");
+    }
+
+    /// The card's sentence for a thin, a trusted and a never-seen pair; the bars split into taught
+    /// (green) and thin (amber) bins exactly as the overlay's count rule says; the "now" marker
+    /// stands at the open scene's distance and the old "asked now" line is gone.
+    #[test]
+    fn the_pair_card_says_one_sentence_and_marks_now() {
+        let map = knowledge::fixture_map();
+        let p = |z: (u8, u8)| map.pair(z.0, z.1).unwrap();
+        assert_eq!(knowledge::pair_sentence(&map, p((1, 6)), &[]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.");
+        assert_eq!(knowledge::pair_sentence(&map, p((6, 6)), &[]), "Never seen — no fitted sample has these two within 6.0 Bohr. Train a scene that has it.");
+        assert_eq!(knowledge::pair_sentence(&map, p((1, 1)), &[]), "Taught 1.4–5.1 Bohr (2140 samples). Not yet trusted everywhere it was met.");
+        let short = sim::SpeciesVerdict {
+            z: 1,
+            neighbours: vec![1, 7],
+            trusted: false,
+            refusal: Some((sim::ClassKey::Samples, 3.0, 92.0)),
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 0,
+            trusted_since: None,
+            inflation: 1.0,
+            samples: 3,
+            columns: 92,
+        };
+        let learned = sim::SpeciesVerdict { trusted: true, refusal: None, neighbours: vec![1], ..short.clone() };
+        let s = knowledge::pair_sentence(&map, p((1, 1)), &[("many-body", &short), ("pair", &learned)]);
+        assert_eq!(s, "Taught 1.4–5.1 Bohr (2140 samples). Still missing: three-or-more-atom arrangements around H, with H and N, 3 of 92 samples.");
+        // the bars: C–H's bin 20 (1200 distances) taught, bin 35 (4, alone) thin, empty bins none
+        let bars = knowledge::bar_colours(p((1, 6)));
+        assert_eq!((bars[20], bars[35], bars[0]), (Some(GREEN), Some(AMBER), None));
+        assert!(bars.iter().flatten().all(|c| *c == GREEN || *c == AMBER));
+        // on screen: C–H, asked at 2.06 Bohr (two C–H in the chain)
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 6);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("now 2.06") && !t.contains("asked now (the open scene)") && !t.contains("2 at 2.06 taught"), "{t}");
+        let h = probed_rect("knowledge-histogram");
+        let plot_left = h.left() + 26.0;
+        let plot_w = h.width() - 34.0;
+        let x = (plot_left + (2.06 / 6.0) as f32 * plot_w).round();
+        let now = probed_rect("knowledge-now");
+        assert!((now.left() - 4.0 - x).abs() < 1.5, "the marker at 2.06 Bohr: label {now:?}, line at {x}");
+    }
+
+    /// Teach this emits the Model tab's Sample more — the same `Action::Sample` — and follows its
+    /// enabled rule (off while a pass runs).
+    #[test]
+    fn teach_this_is_sample_more() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        let want = sample_button(&st, &inp);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-teach");
+        let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+        assert_eq!(acts, [&Action::Sample { long: want.long }], "{acts:?}");
+        // a pass running: the button is off
+        let mut running = with_map(&scene, model());
+        running.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
+        let inp = input(&scene, Some(&running), &cam);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-teach");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled while sampling");
+    }
+
+    /// "Why thin?" holds the old detail lines (closed by default); its state is kept in the
+    /// profile as `knowledge_sections`.
+    #[test]
+    fn why_thin_holds_the_detail_and_is_kept_in_the_profile() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 1);
+        assert!(profile::capture(&st).contains("\nknowledge_sections = \n"));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Why thin?") && !t.contains("thin: taught, but not everywhere"), "{t}");
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-fold-why");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+        assert!(st.knowledge_sections.why);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("thin: taught, but not everywhere it was met") && t.contains("taught 1.4–5.1 Bohr · first peak ends at"), "{t}");
+        let text = profile::capture(&st);
+        assert!(text.contains("\nknowledge_sections = why\n"));
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.knowledge_sections.why);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert!(!fresh.knowledge_sections.why, "absent: closed");
+    }
+
+    /// At about 320 pt the panel's parts stack inside it and no text runs past its right edge.
+    #[test]
+    fn the_knowledge_panel_fits_320_pt() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for pick in [Pick::Pair(1, 1), Pick::Pair(6, 6), Pick::Element(6)] {
+            let mut st = UiState::new("h2o", &scene);
+            st.backend = Backend::Estimated;
+            st.activity.absorb(&snap);
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Knowledge*])").unwrap());
+            st.knowledge.pick = pick;
+            st.knowledge_sections.why = true;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("knowledge-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let mut parts = vec!["knowledge-chip", "knowledge-count-2", "knowledge-map", "knowledge-ask-6-6", "knowledge-card"];
+            if matches!(pick, Pick::Pair(..)) {
+                parts.extend(["knowledge-teach", "knowledge-histogram"]);
+            }
+            for p in &parts {
+                let r = probed_rect(p);
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{pick:?} {p}: {r:?} outside {panel:?}");
+            }
+            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect("knowledge-card").top(), "{pick:?}: stacked");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{pick:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 15, "{checked} texts checked");
+        }
+    }
+
 }
 
 /// Docking Task 4 (spec D-6, D-7): the View panel holds the View menu's controls in five folding
