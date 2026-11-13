@@ -951,15 +951,22 @@ impl Viewer {
     /// bar and the toolbar have fixed heights) — so a cursor event before that frame maps through
     /// the new rect, not the old one. Exact for the default layout, whose 3D tile spans the
     /// workspace's height; the next `run_ui` replaces the estimate with the chrome's own rect (a
-    /// stacked layout, a switch to compact).
+    /// stacked layout). A width that switches the top bar or the toolbar between its full and
+    /// compact layouts (`ui::bars_height`: the toolbar's full layout needs ≈ 1584 pt since the
+    /// Thermostat group, so the default 1400-pt window is compact and a maximised one full) moves
+    /// those margins by the change of the bars' heights.
     fn resize_viewport(&mut self, w: f32, h: f32) {
         let Some((sw, sh)) = self.screen.filter(|&(sw, _)| w > 0.0 && h > 0.0 && sw > 0.0) else { return };
         let vp = self.viewport;
         let sx = w / sw;
-        let bottom = sh - (vp.origin[1] + vp.size[1]);
+        let ppp = self.egui_ctx.pixels_per_point();
+        let (top0, bottom0) = ui::bars_height(&self.ui, sw / ppp);
+        let (top1, bottom1) = ui::bars_height(&self.ui, w / ppp);
+        let top = vp.origin[1] + (top1 - top0) * ppp;
+        let bottom = sh - (vp.origin[1] + vp.size[1]) + (bottom1 - bottom0) * ppp;
         self.viewport = Viewport {
-            origin: [vp.origin[0] * sx, vp.origin[1]],
-            size: [(vp.size[0] * sx).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+            origin: [vp.origin[0] * sx, top],
+            size: [(vp.size[0] * sx).max(1.0), (h - top - bottom).max(1.0)],
         };
         self.screen = Some((w, h));
     }

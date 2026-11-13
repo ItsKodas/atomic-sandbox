@@ -10347,3 +10347,25 @@ mod model_panel_misfit {
         assert!(t.contains("0 of at most 27.1 training samples it can't reproduce") && t.contains("body-4 degree 3"), "{t}");
     }
 }
+
+
+/// The toolbar's layouts fit their heights (`toolbar::HEIGHT`, `HEIGHT_COMPACT`): the bar ends at
+/// the window's bottom edge, full (1700 pt) and compact (1400 pt) — at 84 pt the full bar was laid
+/// out 3 pt below it — and `bars_height` names the heights the chrome laid out.
+#[test]
+fn the_toolbar_fits_the_window() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    for (w, h) in [(WIDE, toolbar::HEIGHT), (1400.0, toolbar::HEIGHT_COMPACT)] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let bar = probed_rect("toolbar-rect");
+        assert!((bar.bottom() - 900.0).abs() < 0.5 && (bar.height() - h).abs() < 0.5, "at {w}: {bar:?}");
+        assert_eq!(bars_height(&st, w).1, h, "at {w}");
+    }
+}

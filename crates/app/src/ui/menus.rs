@@ -11,6 +11,10 @@ use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
 use sim::dynamics::{DT_WARN_FS, F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
 
+/// The top bar's height (points), full and compact (below `ui::COMPACT_WIDTH`).
+pub const TOP_BAR: f32 = 38.0;
+pub const TOP_BAR_COMPACT: f32 = 34.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuId {
     File,
@@ -51,7 +55,7 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
     let mut hot: Vec<egui::Rect> = Vec::new();
     let mut max_button = egui::Rect::NOTHING;
     let panel = egui::Panel::top("top-bar")
-        .exact_size(if compact { 34.0 } else { 38.0 })
+        .exact_size(if compact { TOP_BAR_COMPACT } else { TOP_BAR })
         .resizable(false)
         .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, theme::LINE)))
         .show(root, |ui| {

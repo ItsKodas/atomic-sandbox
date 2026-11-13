@@ -790,6 +790,9 @@ pub struct UiState {
     /// The Model panel's folds that are open (`dock::model`; the profile's `model_sections`):
     /// Teach next and Health by default. Display state: not recorded.
     pub model_sections: dock::model::Sections,
+    /// The width (points) the toolbar's full layout needs, measured by its last frame
+    /// (`toolbar::show`; 0 before it): narrower, it is compact. Read by [`bars_height`].
+    pub toolbar_full_width: f32,
     /// The Activity panel's folds that are open (`activity::Sections`; the profile's
     /// `activity_sections`, with the Training fold's `activity.training_open`). Display state.
     pub activity_sections: activity::Sections,
@@ -1029,6 +1032,7 @@ impl UiState {
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
             model_sections: dock::model::Sections::default(),
+            toolbar_full_width: 0.0,
             activity_sections: activity::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
@@ -1368,6 +1372,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
     let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
+    probe_rect("toolbar-rect", bar_rect);
     activity::bar(root, st, input, bar_rect);
     let view = workspace::tree::show(root, st, input, &mut acts);
     out.view = Some(view);
@@ -1771,6 +1776,17 @@ pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()
     let m = menus::MenuId::ALL.into_iter().find(|m| m.title().eq_ignore_ascii_case(name))?;
     egui::Popup::open_id(ctx, menus::popup_id(m));
     Some(())
+}
+
+/// The top bar's and the toolbar's heights (points) in a window `width` points wide: the layouts
+/// `show` picks at that width (the top bar compact below [`COMPACT_WIDTH`], the toolbar also below
+/// the width its full layout needs). The viewer's resize estimate (`Viewer::resize_viewport`)
+/// keeps the 3D view's margins from them.
+pub fn bars_height(st: &UiState, width: f32) -> (f32, f32) {
+    let compact = width < COMPACT_WIDTH;
+    let top = if compact { menus::TOP_BAR_COMPACT } else { menus::TOP_BAR };
+    let bottom = if compact || width < st.toolbar_full_width { toolbar::HEIGHT_COMPACT } else { toolbar::HEIGHT };
+    (top, bottom)
 }
 
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
