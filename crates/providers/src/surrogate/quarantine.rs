@@ -596,6 +596,66 @@ impl SurrogateKs {
         self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
+    /// [`near_misfit_atoms`](Self::near_misfit_atoms) after filling the descriptor cache while M
+    /// has misfit atoms (`ensure_desc_cache`): the step's path (`evaluate`, the audit's judgement),
+    /// which would otherwise describe M's samples afresh at every call.
+    pub(super) fn near_misfit(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
+        if self.has_misfit_atoms() {
+            self.ensure_desc_cache();
+        }
+        self.near_misfit_atoms(pos, z)
+    }
+
+    /// Whether the misfit fence stands (`misfit_fence`: M has misfit atoms, within its limit).
+    pub(super) fn has_misfit_atoms(&self) -> bool {
+        self.misfit_fence().is_some()
+    }
+
+    /// Which query atoms are **near a misfit** (spec 2026-11-13 §4.3; `trust` module doc, "M, the
+    /// misfit set"): one entry per atom of (`pos`, `z`), true when the atom's descriptor is within
+    /// the near-quarantine distance (`QUARANTINE_FRACTION × max_descriptor_distance` training
+    /// spreads, [`spread_distance`] — the per-atom distance the quarantine fence is built from) of a
+    /// misfit atom of its species ([`Misfit::atoms`]). Per atom, not the worst atom: the DFT
+    /// solvers refuse a geometry when **any** atom is near, `atom_verdicts` refuses exactly those.
+    /// Read-only: the misfit atoms are read from the descriptor cache when it covers the model's
+    /// basis (`ensure_desc_cache`), else described on the fly, as
+    /// [`quarantine_distances_cached`](Self::quarantine_distances_cached) does — the same numbers
+    /// either way. All false without a misfit fence (`misfit_fence`: no misfit atom, or M beyond
+    /// its limit — the model is then untrusted as a whole; described nothing), a model or an
+    /// envelope.
+    pub(super) fn near_misfit_atoms(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
+        let none = vec![false; pos.len()];
+        let Some(m) = self.misfit_fence() else { return none };
+        let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return none };
+        let basis = &model.basis;
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return none };
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        // the misfit atoms as (species index, descriptor), each sample described once
+        let mut targets: Vec<(usize, &[f64])> = Vec::with_capacity(m.atoms.len());
+        let mut owned: Vec<(usize, Vec<(usize, Vec<f64>)>)> = Vec::new();
+        for &i in &m.samples {
+            if !(cached && self.desc_cache.get(i).is_some()) {
+                if let Some(s) = store.samples.get(i) {
+                    owned.push((i, describe_sample(basis, s)));
+                }
+            }
+        }
+        for &(i, j) in &m.atoms {
+            let atoms: Option<&[(usize, Vec<f64>)]> = match self.desc_cache.get(i).filter(|_| cached) {
+                Some(a) => Some(a),
+                None => owned.iter().find(|(k, _)| *k == i).map(|(_, a)| &a[..]),
+            };
+            if let Some((s, d)) = atoms.and_then(|a| a.get(j)) {
+                targets.push((*s, d));
+            }
+        }
+        sp.iter()
+            .zip(&desc)
+            .map(|(qs, qd)| targets.iter().any(|(s, d)| s == qs && spread_distance(env, *s, qd, d) <= limit))
+            .collect()
+    }
+
     /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
     /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
     /// factor 2 of the worst ratio. The force bound is the policy's per-atom bound while the
@@ -699,7 +759,8 @@ impl SurrogateKs {
     /// Whether a teacher answer becomes a training sample (`surrogate` module doc: box-affected answers,
     /// quarantined neighbourhoods, thinning); when not, the reason goes to `notes`. `model` is the
     /// model's answer at the geometry when it was consulted; `near` the quarantined samples
-    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies. The
+    /// fencing it; `near_misfit` whether an atom is near a misfit (`near_misfit_atoms`); `keep`
+    /// the rule's own verdict; `thin` whether thinning applies. The
     /// [`Admission`] carries the verdict (`kept`) and which branch gave it (`outcome`, activity
     /// spec A3) — each return below is one branch; the outcome is read off it, never decides.
     #[allow(clippy::too_many_arguments)]
@@ -712,6 +773,7 @@ impl SurrogateKs {
         face: Option<f64>,
         model: Option<(f64, &[[f64; 3]])>,
         near: &[usize],
+        near_misfit: bool,
         keep: bool,
         thin: bool,
         dedup: bool,
@@ -810,6 +872,20 @@ impl SurrogateKs {
                 "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
             ));
             return yes(TeachOutcome::KeptReleased { released, superseded });
+        }
+        // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3): the
+        // near-quarantine admission without its votes — kept (on the normal path below) only when
+        // it agrees with the model, so a region the model cannot fit stays refused without a parked
+        // scene growing M; it is learned when a later refit fits M's samples
+        if near_misfit {
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            if !agrees {
+                notes.push(match model {
+                    Some(_) => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the teacher disagrees with the model there (a later refit at more samples or a higher body-4 degree may fit it)".into(),
+                    None => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the model was not consulted here (a later refit at more samples or a higher body-4 degree may fit it)".into(),
+                });
+                return no(TeachOutcome::MisfitDisagrees);
+            }
         }
         // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are
         // kept — but never a copy where copies could satisfy the rule (`is_label_copy`; round 1 of

@@ -1291,6 +1291,162 @@ fn a_nan_residual_is_not_a_misfit() {
     assert!(checks.iter().any(|c| c.key == TrustKey::Misfit && c.met && c.value == 0.0), "{checks:?}");
 }
 
+/// The Task 5 store ([`task5_store`]) for the `NearMisfit` tests, its teacher the surface the
+/// strays came from: the exact Morse with the strays' +0.01 Ha at r = 1.63 (a Gaussian bump of
+/// 0.01 Ha centred there, width 0.1 Bohr: flat at the centre, so the forces there are the Morse's).
+/// The precondition, asserted: at r = 1.63 the model's answer disagrees with the teacher's
+/// (`SurrogateKs::agree` false). The scenes are in the store's own 33³ cell (`cell`), not
+/// `in_big_cell`: the model's grid is 33³, and a 49³ scene is refused by rule 3 (other settings).
+///
+/// Not the exact Morse teacher of the plan: against it the model **agrees** at r = 1.63 (measured:
+/// 9.0e-5 Ha/atom off, the bound 1e-3 — the 120 good samples pin the fit, it moves 1.8e-4 Ha towards
+/// the three strays), and raising the strays' offset does not make it disagree while the model
+/// stays trusted (measured at 0.03 Ha: 7.4e-5 Ha/atom, still agreeing; at 0.1 Ha the whole fit moves,
+/// 2.9e-3 Ha/atom, every one of the 123 samples is in M and the model is untrusted by the misfit row,
+/// so rule 4 refuses before the misfit fence). A teacher whose answer there is the strays' own is the
+/// case the fence is for: a region whose labels the fit cannot reproduce.
+fn near_misfit_store() -> SurrogateKs {
+    let mut s = task5_store();
+    s.teacher = Box::new(Bumped { inner: MorseDimer::h2(), amp: 0.01, r0: 1.63, w: 0.1 });
+    let near = h2(1.63);
+    let (pos, z) = pos_z(&near);
+    let pred = s.model.as_ref().unwrap().predict(&pos, &z, false).unwrap();
+    let t = s.teacher.evaluate(&near, &mut never()).unwrap();
+    println!("r = 1.63: model {:.6} Ha, teacher {:.6} Ha (per atom {:.2e}); forces model {:?} teacher {:?}", pred.energy, t.energy, (pred.energy - t.energy).abs() / 2.0, pred.forces, t.forces);
+    assert!(s.trusted(), "the premise: the Task 5 store is trusted: {:?}", s.untrusted_reason());
+    assert!(!SurrogateKs::agree(&s.policy, 2, pred.energy, &pred.forces, t.energy, &t.forces), "the precondition: the model disagrees with the teacher at r = 1.63");
+    s
+}
+
+/// §4.3, per atom: an atom within the near-quarantine distance of a misfit atom refuses the
+/// geometry (`TeachRule::NearMisfit`, the teacher answers); a geometry far from M is the model's.
+#[test]
+fn a_geometry_near_a_misfit_is_refused_and_far_ones_answer() {
+    use sim::activity::TeachRule as R;
+    let mut s = near_misfit_store();
+    let near = h2(1.63);
+    let r = s.evaluate(&near, &mut never()).unwrap();
+    let ev = s.ledger.events.back().cloned().expect("an activity row");
+    println!("r = 1.63: {:?}; row {:?} {:?} atom {:?}: {}", r.stats.source, ev.rule, ev.outcome, ev.atom, ev.detail);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert_eq!(ev.rule, R::NearMisfit, "{}", ev.detail);
+    assert!(ev.atom.is_some(), "the refusal names the atom: {ev:?}");
+    let far = s.evaluate(&h2(2.1), &mut never()).unwrap();
+    assert_eq!(far.stats.source, Source::Surrogate, "{:?}", s.ledger.events.back());
+    let (pos, z) = pos_z(&near);
+    let g = s.geometry_refusal(&pos, &z);
+    assert_eq!(g.as_ref().map(|r| r.rule), Some(R::NearMisfit), "{g:?}");
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&near));
+    assert!(matches!(v, Err((R::NearMisfit, Some(_)))), "{v:?}");
+}
+
+/// §4.3, per atom: in a scene of an H₂ next to the misfit (r = 1.63) and an H₂ far from it (r = 2.1)
+/// beyond the 6 Bohr cutoff of each other, `atom_verdicts` refuses exactly the first pair's atoms with
+/// `NearMisfit` and not the geometry; `would_answer` refuses the scene (an atom is near).
+#[test]
+fn atom_verdicts_mark_exactly_the_atoms_near_a_misfit() {
+    use sim::activity::TeachRule as R;
+    let s = near_misfit_store();
+    // corner to corner of the store's 33³ cell (its grid is the model's: a 49³ scene is rule 3's),
+    // the two pairs' nearest atoms 8.8 Bohr apart
+    let mut sc = h2(1.63);
+    sc.nuclei = vec![
+        Nucleus::new(1, [-3.0, -3.0, -3.0]),
+        Nucleus::new(1, [-3.0 + 1.63, -3.0, -3.0]),
+        Nucleus::new(1, [3.0, 3.0, 3.0]),
+        Nucleus::new(1, [3.0 - 2.1, 3.0, 3.0]),
+    ];
+    let a = s.atom_verdicts(&sc).expect("atoms");
+    println!("atom verdicts {a:?}");
+    assert_eq!(a.geometry, None, "{a:?}");
+    assert_eq!(a.atoms[0..2], [Some(R::NearMisfit); 2], "{a:?}");
+    assert_eq!(a.atoms[2..4], [None, None], "{a:?}");
+    let (pos, z) = pos_z(&sc);
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+    assert!(matches!(v, Err((R::NearMisfit, Some(0 | 1)))), "{v:?}");
+    assert!(!a.answers());
+}
+
+/// §4.3, admission: a teacher answer next to a misfit takes the near-quarantine admission path —
+/// kept only when it agrees with the model, no fence vote. The teacher at r = 1.63 disagrees with
+/// the model ([`near_misfit_store`]): not kept (`MisfitDisagrees`), no vote, and twenty
+/// such steps then a refit leave M as it was. With the per-atom energy threshold at 1 Ha the
+/// model's answer agrees and the answer is kept. (The threshold is set on the field, not through
+/// `set_policy`: that re-judges M against the new threshold and would empty it, and the test is of
+/// the admission next to a misfit.)
+#[test]
+fn an_answer_near_a_misfit_is_kept_only_if_it_agrees() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R};
+    let mut s = near_misfit_store();
+    let m0 = s.misfit().unwrap().samples.clone();
+    let n0 = s.samples();
+    let near = h2(1.63);
+    for k in 0..20 {
+        let r = s.evaluate(&near, &mut never()).unwrap();
+        let ev = s.ledger.events.back().cloned().expect("an activity row");
+        if k == 0 {
+            println!("row {:?} {:?}: {} / notes {:?}", ev.rule, ev.outcome, ev.detail, r.stats.notes);
+        }
+        assert_eq!((r.stats.source, ev.rule, ev.outcome), (Source::Fallback, R::NearMisfit, K::MisfitDisagrees), "step {k}: {}", ev.detail);
+        assert!(r.stats.notes.iter().any(|n| n.contains("next to a training sample the model cannot reproduce")), "{:?}", r.stats.notes);
+        assert_eq!(s.samples(), n0, "not kept");
+        assert!(s.fence_votes.is_empty() && s.vote_pending.is_empty(), "no fence vote");
+    }
+    s.refit().unwrap();
+    assert_eq!(s.misfit().unwrap().samples, m0, "M as it was");
+    s.policy.energy_std_per_atom = 1.0;
+    s.last_variance = None;
+    let r = s.evaluate(&near, &mut never()).unwrap();
+    let ev = s.ledger.events.back().cloned().expect("an activity row");
+    println!("agreeing: {:?} {:?}: {}", ev.rule, ev.outcome, ev.detail);
+    assert_eq!((r.stats.source, ev.rule, ev.outcome), (Source::Fallback, R::NearMisfit, K::Kept), "{}", ev.detail);
+    assert_eq!(s.samples(), n0 + 1);
+}
+
+/// §4.3: a misfit fence lifts when a refit fits its samples — here by raising the per-atom energy
+/// threshold above the strays' offset (as `a_quarantined_sample_is_released_when_the_model_reproduces_it`
+/// does), then refitting: M is empty and r = 1.63 is the model's.
+#[test]
+fn a_misfit_fence_lifts_when_a_refit_fits_it() {
+    let mut s = near_misfit_store();
+    assert_eq!(s.evaluate(&h2(1.63), &mut never()).unwrap().stats.source, Source::Fallback, "the premise: fenced");
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-2, ..FallbackPolicy::default() });
+    s.refit().unwrap();
+    let m = s.misfit().expect("a misfit record");
+    println!("threshold 1e-2: M {:?}; trusted {}", m.samples, s.trusted());
+    assert!(m.samples.is_empty() && m.atoms.is_empty(), "{m:?}");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let r = s.evaluate(&h2(1.63), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", s.ledger.events.back());
+}
+
+/// §4.3 with §4.2 (no ratchet): an M beyond its limit untrusts the model as a whole and fences
+/// nothing — with every answer near M refused and never kept (the model is not consulted under
+/// rule 4, so none can agree with it), the store could never grow the data a refit fits M with.
+/// The store of `a_large_misfit_untrusts_the_model` (40 good + 6 strays 0.1 Ha off): no atom is near
+/// a misfit, and the teacher's answer at a stray's geometry is refused by the misfit row (rule 4)
+/// and admitted as any untrusted model's answer is, not `MisfitDisagrees`.
+#[test]
+fn a_misfit_beyond_its_limit_fences_nothing() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R, TrustKey};
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    for k in 0..6 {
+        add_stray(&mut s, 1.3 + 0.15 * k as f64, 0.1);
+    }
+    s.refit().unwrap();
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::Misfit), "the premise");
+    assert!(s.misfit().is_some_and(|m| !m.atoms.is_empty()) && s.misfit_fence().is_none());
+    let sc = h2(1.45);
+    let (pos, z) = pos_z(&sc);
+    assert_eq!(s.near_misfit_atoms(&pos, &z), vec![false, false]);
+    assert!(s.geometry_refusal(&pos, &z).is_none_or(|r| r.rule != R::NearMisfit));
+    s.evaluate(&sc, &mut never()).unwrap();
+    let ev = s.ledger.events.back().cloned().unwrap();
+    println!("r = 1.45: {:?} {:?}: {}", ev.rule, ev.outcome, ev.detail);
+    assert_eq!(ev.rule, R::Untrusted(TrustKey::Misfit));
+    assert_ne!(ev.outcome, K::MisfitDisagrees);
+}
+
 /// A long-range Morse teacher (a = 0.3: at R = 8 the pair still binds by 4.4e-2 Ha, while
 /// every feature of the 6 Bohr cutoff model has vanished and it can only say Σ E_ref) — a
 /// geometry genuinely unrepresentable. Task 8 fix round 4 (the re-review's Important): the
@@ -7954,13 +8110,14 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
         assert_eq!(*e, d, "atom {j}");
     }
     // every code is distinct and named
-    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment];
+    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment, TeachRule::NearMisfit];
     let codes: std::collections::BTreeSet<u8> = rules.iter().map(|&r| history_rule_code(r)).collect();
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
-    // 22 is the capped segment's (M8a Task 10); the next code is unnamed
-    assert_eq!(history_rule_name(23), "?");
+    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3); the
+    // next code is unnamed
+    assert_eq!(history_rule_name(24), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();

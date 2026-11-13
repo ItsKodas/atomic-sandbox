@@ -4207,12 +4207,16 @@ mod activity_words {
     #[test]
     fn every_rule_and_outcome_is_worded() {
         use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
-        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::NearMisfit, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
             assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
         }
-        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }, sim::activity::TeachOutcome::MisfitDisagrees] {
             assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
         }
+        // the misfit fence's words (spec 2026-11-13 §4.3): the refusal is never silent
+        assert_eq!(rule_label(sim::activity::TeachRule::NearMisfit, None), "misfit");
+        assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
+        assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
     }
 }
 

@@ -174,10 +174,11 @@ pub(super) fn non_finite_answer(pred: &surrogate::Prediction) -> Option<Refusal>
 
 /// Whether a refusal is a fact about the geometry rather than about the fit's global state
 /// (round 1 of the 2026-10-18 trust review, MUST-1): outside the training envelope (5a–5c), an
-/// unspanned direction (5d, and 5e at γ = ∞), beyond the grade (5e), a non-finite answer, or a
-/// quarantine fence. Rule 4 (untrusted), 4b (class), 5e without a grade (MaxVol unconverged:
-/// global) and 6–7 (uncertainty) lift with more data or a refit, so a draft-mode audit refused only
-/// by those is an ordinary audit.
+/// unspanned direction (5d, and 5e at γ = ∞), beyond the grade (5e), a non-finite answer, a
+/// quarantine fence, or an atom near a misfit (`NearMisfit`, spec 2026-11-13 §4.3: a fact about
+/// the geometry under the fit that stands, as the quarantine fence is). Rule 4 (untrusted), 4b
+/// (class), 5e without a grade (MaxVol unconverged: global) and 6–7 (uncertainty) lift with more
+/// data or a refit, so a draft-mode audit refused only by those is an ordinary audit.
 pub(super) fn geometry_specific(rule: TeachRule) -> bool {
     matches!(
         rule,
@@ -189,6 +190,7 @@ pub(super) fn geometry_specific(rule: TeachRule) -> bool {
             | TeachRule::Grade
             | TeachRule::NonFiniteAnswer
             | TeachRule::NearQuarantine
+            | TeachRule::NearMisfit
     )
 }
 
@@ -534,8 +536,10 @@ impl SurrogateKs {
     /// The strict policy's verdict **per atom** at `scene`'s geometry ([`AtomVerdicts`]; M8a Task 6,
     /// the transfer test's "atoms it calls trusted"). Read-only, the teacher is never called, and
     /// every number is the one [`would_answer`](Self::would_answer) reads: `would_answer` is `Ok`
-    /// exactly when [`AtomVerdicts::answers`]. `None` for an empty scene. The fence reads the
-    /// descriptor cache as `would_answer` does (`ensure_desc_cache` first while samples are held).
+    /// exactly when [`AtomVerdicts::answers`]. `None` for an empty scene. The fences read the
+    /// descriptor cache as `would_answer` does (`ensure_desc_cache` first while samples are held
+    /// or M has misfit atoms). Near a misfit refuses per atom, never the geometry: exactly the
+    /// atoms near a misfit atom (`near_misfit_atoms`; spec 2026-11-13 §4.3).
     pub fn atom_verdicts(&self, scene: &Scene) -> Option<AtomVerdicts> {
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -622,7 +626,14 @@ impl SurrogateKs {
                 geometry = geometry.or(Some(r.rule));
             }
         }
-        // the fences refuse the geometry
+        // near a misfit (spec 2026-11-13 §4.3): per atom, not the geometry — exactly the atoms
+        // whose environment is near a misfit atom (`would_answer` refuses when any is)
+        for (i, near) in self.near_misfit_atoms(&pos, &z).into_iter().enumerate() {
+            if near {
+                refuse(&mut atoms, i, TeachRule::NearMisfit);
+            }
+        }
+        // the quarantine and audit fences refuse the geometry
         if geometry.is_none() {
             if !self.near_quarantined_cached(&pos, &z).is_empty() {
                 geometry = Some(TeachRule::NearQuarantine);

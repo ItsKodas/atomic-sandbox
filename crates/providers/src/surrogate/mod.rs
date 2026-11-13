@@ -680,6 +680,24 @@
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
 //!
+//! **Near a misfit** (spec 2026-11-13 §4.3; the misfit set M is the `trust` module doc's): a
+//! sample's *misfit atoms* are, for a force misfit, its trained atoms whose force ratio exceeds 1,
+//! for an energy misfit every trained atom (`Misfit::atoms`). A query atom is near a misfit when
+//! its descriptor is within the near-quarantine distance ([`QUARANTINE_FRACTION`] ·
+//! `max_descriptor_distance` training spreads, the per-atom L∞ distance the quarantine fence is
+//! built from) of a misfit atom of its species (`near_misfit_atoms`). A geometry is refused when
+//! **any** atom is near (`TeachRule::NearMisfit`, after the quarantine fence, naming the first such
+//! atom) — broader than the quarantine fence's all-atom test, deliberately; `atom_verdicts` refuses
+//! exactly those atoms. The teacher's answer there takes the near-quarantine admission without its
+//! votes: kept (on the normal path) only when it agrees with the model, else not kept
+//! (`TeachOutcome::MisfitDisagrees`), so a region the model cannot fit stays refused without a
+//! parked scene growing M. The fence lifts when a refit fits M's samples (a larger store, a higher
+//! body-4 degree): M is recomputed at every fit. Sampling-pass answers keep their own path. The
+//! fence stands only while M is within its limit (`misfit_fence`): beyond it the model is
+//! untrusted as a whole (the `Misfit` row; rule 4 refuses every step) and its answers are kept as
+//! any untrusted model's are — fencing an M that may be the whole store would refuse, and never
+//! keep, the data a later refit could fit it with (a ratchet; spec §4.2).
+//!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
@@ -1077,6 +1095,10 @@ struct Handoff {
     dedup: bool,
     /// Quarantined samples within the quarantine radius of this geometry (module doc).
     near: Vec<usize>,
+    /// An atom of this geometry is near a misfit (`near_misfit_atoms`; spec 2026-11-13 §4.3):
+    /// the answer is kept only if it agrees with the model (`admit`). Computed wherever `near` is,
+    /// false where `near` is empty for want of a model.
+    near_misfit: bool,
     model: Option<ModelAnswer>,
     audit: bool,
     /// Report the step on the teacher's surface although the model was consulted (rule 5, the
@@ -1660,7 +1682,7 @@ impl SurrogateKs {
             TeachOutcome::ShellNotKept
         } else {
             // a capped segment's answer is kept with the scene's mask (module doc, "Masked scenes")
-            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
+            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.near_misfit, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
         };
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
@@ -1958,7 +1980,8 @@ impl ForceProvider for SurrogateKs {
         if scene.train_mask().is_some() {
             let reason = Refusal::new("surrogate: a capped segment teaches its interior atoms — the model does not answer here (its caps and edge atoms are not the source scene's)", TeachRule::Segment, None);
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
+            let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
+            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
@@ -1978,8 +2001,9 @@ impl ForceProvider for SurrogateKs {
                 }
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+                let near_misfit = keep_sample && self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
                 let history_rule = history_rule_code(reason.rule);
-                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, model: None, audit: false, teacher_surface: false, history_rule };
+                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -2013,6 +2037,7 @@ impl ForceProvider for SurrogateKs {
         if let Some(reason) = non_finite_answer(&pred) {
             self.record_verdict(&pos, &z, Some(strict_gate.unwrap_or_else(|| reason.clone())));
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+            let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
             let h = Handoff {
                 prov,
                 pos,
@@ -2023,6 +2048,7 @@ impl ForceProvider for SurrogateKs {
                 thin: false,
                 dedup: false,
                 near,
+                near_misfit,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
                 audit: false,
                 teacher_surface: true,
@@ -2078,6 +2104,24 @@ impl ForceProvider for SurrogateKs {
                 TeachRule::NearQuarantine,
                 None,
             ));
+        }
+        // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3; `trust`
+        // module doc, "M, the misfit set"): refused when **any** atom is near — broader than the
+        // all-atom quarantine test above, deliberately — and the teacher's answer is kept only if
+        // it agrees with the model (`admit`), whichever rule fired first
+        let near_misfit_atoms = self.near_misfit(&pos, &z);
+        let near_misfit = near_misfit_atoms.contains(&true);
+        if reason.is_none() {
+            if let Some(i) = near_misfit_atoms.iter().position(|&b| b) {
+                reason = Some(Refusal::new(
+                    format!(
+                        "surrogate: atom {i} is within {:.2} training spreads of a training sample the model cannot reproduce",
+                        QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+                    ),
+                    TeachRule::NearMisfit,
+                    Some(i),
+                ));
+            }
         }
         // the shell fence (Ruling shell → fence; final review I1): whichever rule names the
         // refusal, a geometry inside a fenced shell band is answered by the teacher and the answer
@@ -2164,6 +2208,7 @@ impl ForceProvider for SurrogateKs {
                 thin: (by_envelope || by_class) && !class_short && !forced,
                 dedup: (by_envelope || by_class || by_audit_fence) && !forced,
                 near,
+                near_misfit,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
                 audit,
                 // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)

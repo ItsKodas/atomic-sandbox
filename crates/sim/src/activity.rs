@@ -464,6 +464,10 @@ pub enum TeachRule {
     /// answer, draft mode included (activity Task 3b).
     NonFiniteAnswer,
     NearQuarantine,
+    /// An atom's environment is within the near-quarantine distance of a misfit atom — a training
+    /// sample the model cannot reproduce (`providers::surrogate`, spec 2026-11-13 §4.3): the
+    /// geometry is refused when any atom is near; `atom` names the first.
+    NearMisfit,
     Audit,
     RelaxVerification,
     Pass(PassJob),
@@ -496,6 +500,9 @@ pub enum TeachOutcome {
     /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
     LoneNotKept,
     FenceDisagrees,
+    /// A teacher answer next to a training sample the model cannot reproduce (`NearMisfit`) that
+    /// disagrees with the model: used for its step, not kept, no fence vote (spec 2026-11-13 §4.3).
+    MisfitDisagrees,
     WaitingForPass,
     /// Used for its step, not kept for this model: its settings differ.
     NotOffered,

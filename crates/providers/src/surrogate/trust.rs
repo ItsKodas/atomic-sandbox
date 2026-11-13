@@ -365,6 +365,16 @@ impl SurrogateKs {
         self.misfit.as_ref()
     }
 
+    /// M as the **misfit fence** (spec 2026-11-13 §4.3; `surrogate` module doc, "Near a misfit"):
+    /// M when it has misfit atoms and is within its limit (the `Misfit` row met), else `None`. The
+    /// fence is the local refusal of a model M leaves trusted; an M beyond its limit untrusts the
+    /// model as a whole (rule 4 refuses every step), and fencing it too would refuse — and never
+    /// keep — the teacher's answers wherever the store is (with every sample a misfit, everywhere),
+    /// the only data a later refit could fit M with: a ratchet (spec §4.2's "no ratchet").
+    pub(super) fn misfit_fence(&self) -> Option<&Misfit> {
+        self.misfit.as_ref().filter(|m| !m.atoms.is_empty() && !misfit_exceeds(m))
+    }
+
     /// Whether stored sample `i` is in M (a fitted sample the fit that stands cannot reproduce).
     pub(super) fn in_misfit(&self, i: usize) -> bool {
         self.misfit.as_ref().is_some_and(|m| m.samples.binary_search(&i).is_ok())
@@ -1386,6 +1396,20 @@ impl SurrogateKs {
         })
     }
 
+    /// The refusal of a geometry with an atom near a misfit (`near_misfit_atoms`; spec 2026-11-13
+    /// §4.3), naming the first such atom — `evaluate`'s text. `None` when no atom is near.
+    pub(super) fn near_misfit_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+        let i = self.near_misfit_atoms(pos, z).iter().position(|&b| b)?;
+        Some(Refusal::new(
+            format!(
+                "surrogate: atom {i} is within {:.2} training spreads of a training sample the model cannot reproduce",
+                QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+            ),
+            TeachRule::NearMisfit,
+            Some(i),
+        ))
+    }
+
     /// The refusal of a geometry inside an audit fence (`near_audit_fence`).
     pub(super) fn audit_fence_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
         if let Some(r) = self.shell_fence_refusal(pos, z) {
@@ -1405,7 +1429,8 @@ impl SurrogateKs {
 
     /// The geometry-specific refusals at (`pos`, `z`) whatever the fit's global state (round 1,
     /// MUST-1): a non-finite answer, the envelope (5a–5c, 5e — not "no grade", which is global),
-    /// the novelty (5d), a quarantine or audit fence. `None`: strict mode refuses there only for
+    /// the novelty (5d), a quarantine fence, an atom near a misfit (`NearMisfit`, spec 2026-11-13
+    /// §4.3) or an audit fence. `None`: strict mode refuses there only for
     /// reasons that lift with trust (4, 4b, 6, 7), or answers.
     pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
         let model = self.model.as_ref()?;
@@ -1428,6 +1453,9 @@ impl SurrogateKs {
         }
         if !self.near_quarantined_cached(pos, z).is_empty() {
             return Some(Refusal::new("surrogate: near a quarantined geometry", TeachRule::NearQuarantine, None));
+        }
+        if let Some(r) = self.near_misfit_refusal(pos, z) {
+            return Some(r);
         }
         self.audit_fence_refusal(pos, z)
     }
