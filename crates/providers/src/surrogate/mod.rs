@@ -2204,9 +2204,12 @@ impl ForceProvider for SurrogateKs {
                 shell_fence: by_shell_fence,
                 // the variance rules' fallbacks are the answers active learning asks for, and so
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
-                // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
-                thin: (by_envelope || by_class) && !class_short && !forced,
-                dedup: (by_envelope || by_class || by_audit_fence) && !forced,
+                // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2); next
+                // to a misfit (whichever rule named the refusal) an agreeing answer is kept but M
+                // does not lift on it as a quarantine fence does, so a parked scene would keep one
+                // per step: thinned and never a copy, as rule 4's answers (Task 6 review, ruling 10)
+                thin: (by_envelope || by_class || near_misfit) && !class_short && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence || near_misfit) && !forced,
                 near,
                 near_misfit,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),

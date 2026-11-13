@@ -222,7 +222,7 @@ impl SurrogateKs {
     /// Whether any fence can refuse (a quarantined sample, a misfit atom, an audit or a shell
     /// fence): the views re-judge the cached answered points only then.
     fn any_fence(&self) -> bool {
-        self.quarantined() > 0 || self.has_misfit_atoms() || !self.audit_fences.is_empty()
+        self.quarantined() > 0 || self.misfit_fence_stands() || !self.audit_fences.is_empty()
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
@@ -238,7 +238,7 @@ impl SurrogateKs {
     /// Both caches decide nothing.
     pub fn training_views(&mut self) -> Option<TrainingViews> {
         let t0 = Instant::now();
-        if self.quarantined() > 0 || self.has_misfit_atoms() {
+        if self.quarantined() > 0 || self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
         if self.curve_cache.as_ref().is_none_or(|c| c.model_gen != self.model_gen) {

@@ -1472,6 +1472,10 @@ impl SurrogateKs {
         }
         // `geometry_refusal` reads the active set (rule 5e): the standing fit's, not a deferred one's
         self.ensure_trust_passes();
+        // the misfit fence reads M's descriptors once from the cache, not once per held sample
+        if self.misfit_fence_stands() {
+            self.ensure_desc_cache();
+        }
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
         let mut promoted = 0;
         for i in held {

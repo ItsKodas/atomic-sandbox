@@ -777,6 +777,11 @@ impl SurrogateKs {
         // R3-2: the checks judged near each blocker
         let mut judged_near: BTreeMap<usize, usize> = targets.iter().map(|&t| (t, 0)).collect();
         let mut deferred_near: BTreeMap<usize, usize> = BTreeMap::new();
+        // `geometry_refusal` below reads M's descriptors from the cache (the misfit fence), not
+        // once per check
+        if self.misfit_fence_stands() {
+            self.ensure_desc_cache();
+        }
         for h in holdouts {
             if h.unfit {
                 continue; // must not be trained on, not judged either

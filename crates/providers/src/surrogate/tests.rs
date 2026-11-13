@@ -1371,9 +1371,12 @@ fn atom_verdicts_mark_exactly_the_atoms_near_a_misfit() {
 /// kept only when it agrees with the model, no fence vote. The teacher at r = 1.63 disagrees with
 /// the model ([`near_misfit_store`]): not kept (`MisfitDisagrees`), no vote, and twenty
 /// such steps then a refit leave M as it was. With the per-atom energy threshold at 1 Ha the
-/// model's answer agrees and the answer is kept. (The threshold is set on the field, not through
-/// `set_policy`: that re-judges M against the new threshold and would empty it, and the test is of
-/// the admission next to a misfit.)
+/// model's answer agrees and the answer takes the normal path, thinned and deduplicated (review
+/// fix round 1, ruling 10: M does not lift on an agreeing answer as a quarantine fence does, so a
+/// parked scene would otherwise keep one per step) — at the stray's own geometry the answer is a
+/// copy of the stray, a new label next to it is kept, its repeat is a copy and a nearby label is
+/// thinned. (The threshold is set on the field, not through `set_policy`: that re-judges M against
+/// the new threshold and would empty it, and the test is of the admission next to a misfit.)
 #[test]
 fn an_answer_near_a_misfit_is_kept_only_if_it_agrees() {
     use sim::activity::{TeachOutcome as K, TeachRule as R};
@@ -1396,21 +1399,44 @@ fn an_answer_near_a_misfit_is_kept_only_if_it_agrees() {
     assert_eq!(s.misfit().unwrap().samples, m0, "M as it was");
     s.policy.energy_std_per_atom = 1.0;
     s.last_variance = None;
-    let r = s.evaluate(&near, &mut never()).unwrap();
-    let ev = s.ledger.events.back().cloned().expect("an activity row");
-    println!("agreeing: {:?} {:?}: {}", ev.rule, ev.outcome, ev.detail);
-    assert_eq!((r.stats.source, ev.rule, ev.outcome), (Source::Fallback, R::NearMisfit, K::Kept), "{}", ev.detail);
+    let agreeing = |s: &mut SurrogateKs, r: f64| {
+        let res = s.evaluate(&h2(r), &mut never()).unwrap();
+        let ev = s.ledger.events.back().cloned().expect("an activity row");
+        println!("agreeing at r = {r}: {:?} {:?}; notes {:?}", ev.rule, ev.outcome, res.stats.notes);
+        assert_eq!((res.stats.source, ev.rule), (Source::Fallback, R::NearMisfit), "{}", ev.detail);
+        (ev.outcome, res.stats.notes)
+    };
+    // the teacher's answer at the middle stray's own geometry is that stray's label: a copy
+    let (o, notes) = agreeing(&mut s, 1.63);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains("a copy of stored sample #121")), "{notes:?}");
+    assert_eq!(s.samples(), n0);
+    // a new label next to it agrees with the model and is kept
+    assert_eq!(agreeing(&mut s, 1.631).0, K::Kept);
+    assert_eq!(s.samples(), n0 + 1);
+    // review fix round 1 (ruling 10): M does not lift on an agreeing answer, so the same geometry
+    // again is not kept a second time (a copy, MUST-2) …
+    let (o, notes) = agreeing(&mut s, 1.631);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains(&format!("a copy of stored sample #{n0}"))), "{notes:?}");
+    // … and a nearby new label is thinned (one in THIN_EVERY is kept)
+    let (o, notes) = agreeing(&mut s, 1.632);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains("training spreads from a stored one")), "{notes:?}");
     assert_eq!(s.samples(), n0 + 1);
 }
 
-/// §4.3: a misfit fence lifts when a refit fits its samples — here by raising the per-atom energy
-/// threshold above the strays' offset (as `a_quarantined_sample_is_released_when_the_model_reproduces_it`
-/// does), then refitting: M is empty and r = 1.63 is the model's.
+/// §4.3: a misfit fence lifts when the fit reproduces its samples — here by raising the per-atom
+/// energy threshold above the strays' offset (as `a_quarantined_sample_is_released_when_the_model_reproduces_it`
+/// does). `set_policy` lifts it: it re-judges M against the new threshold (M is empty right after
+/// it); the refit that follows recomputes M and keeps it empty, and r = 1.63 is the model's.
 #[test]
 fn a_misfit_fence_lifts_when_a_refit_fits_it() {
     let mut s = near_misfit_store();
     assert_eq!(s.evaluate(&h2(1.63), &mut never()).unwrap().stats.source, Source::Fallback, "the premise: fenced");
     s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-2, ..FallbackPolicy::default() });
+    let m = s.misfit().expect("a misfit record");
+    assert!(m.samples.is_empty() && m.atoms.is_empty() && s.misfit_fence().is_none(), "set_policy lifts the fence: {m:?}");
     s.refit().unwrap();
     let m = s.misfit().expect("a misfit record");
     println!("threshold 1e-2: M {:?}; trusted {}", m.samples, s.trusted());

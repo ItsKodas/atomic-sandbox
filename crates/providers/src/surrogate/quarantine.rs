@@ -600,14 +600,14 @@ impl SurrogateKs {
     /// has misfit atoms (`ensure_desc_cache`): the step's path (`evaluate`, the audit's judgement),
     /// which would otherwise describe M's samples afresh at every call.
     pub(super) fn near_misfit(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
-        if self.has_misfit_atoms() {
+        if self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
         self.near_misfit_atoms(pos, z)
     }
 
     /// Whether the misfit fence stands (`misfit_fence`: M has misfit atoms, within its limit).
-    pub(super) fn has_misfit_atoms(&self) -> bool {
+    pub(super) fn misfit_fence_stands(&self) -> bool {
         self.misfit_fence().is_some()
     }
 
@@ -622,7 +622,8 @@ impl SurrogateKs {
     /// [`quarantine_distances_cached`](Self::quarantine_distances_cached) does — the same numbers
     /// either way. All false without a misfit fence (`misfit_fence`: no misfit atom, or M beyond
     /// its limit — the model is then untrusted as a whole; described nothing), a model or an
-    /// envelope.
+    /// envelope. As in the quarantine fence, a query or misfit sample that cannot be described
+    /// and a NaN envelope unit read as "far" (unreachable for known species on a finite fit).
     pub(super) fn near_misfit_atoms(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
         let none = vec![false; pos.len()];
         let Some(m) = self.misfit_fence() else { return none };
