@@ -4399,3 +4399,32 @@ Findings:
    S = 4 is Q′ 2 688 → 5 344 (a 0.2 GB Gram per matrix). D₄ = 4 is 46× slower (222 s a fit) and not better.
    The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
 4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.
+
+## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone)
+
+Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run with the test hook `body4_force`. `d4` runs on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, 106 held on disk). `s4` runs on a synthetic four-species store, **for cost only**: every N of the even-indexed samples is made C with the labels untouched (they are N₂'s labels, meaningless for carbon), C's references are copied from N's per box, and jittered replicas (`replica(…, 1e-4)`) take it to 10 830 samples, read-only. Command: `REFIT_COST=d4 REFIT_WHOLE=0 COLLECTION_DIR=<copy> cargo test -p providers --release --lib refit_cost_on_a_collection -- --ignored --nocapture --test-threads 1` (then `REFIT_COST=s4` on a fresh copy).
+
+| S | samples | D₄ | Q′ | cold attach | second refit, nothing new | incremental +25 | trusted | held after |
+|---|---|---|---|---|---|---|---|---|
+| 3 | 1 805 | 2 | 1 032 | 27.08 s (8 fits) | 21.45 s (7) | 23.35 s (7) | no: force 5.6e-3 > 2.4e-3 Ha/Bohr | 104 → 104 → 104 |
+| 3 | 1 805 | 3 | 1 902 | 36.19 s (2) | 23.37 s (2) | 32.39 s (2) | yes: force 1.82e-3 ≤ 2.0e-3, energy 9.0e-4 Ha/atom | 51 → 40 → 37 (54, 11, 3 released) |
+| 4 (synthetic) | 10 830 | 2 | 2 688 | 436.83 s (8) | — | — | no: force 5.6e-3 (the S = 3 H₃O misfit, replicated) | 624 |
+| 4 (synthetic) | 10 830 | 3 | 5 344 | **1 087.42 s (2)** | — | — | yes: force 1.98e-3 | 300 (330 released) |
+
+Phases at S = 3 (each the provider's own function on the standing fit):
+
+| phase | D₄ = 2 | D₄ = 3 | ratio |
+|---|---|---|---|
+| spectral search | 1.74 s (7 rounds) | 8.99 s (5 rounds) | 5.2 |
+| refit after +25 | 2.00 s | 7.78 s | 3.9 |
+| null space | 0.37 s | 1.97 s | 5.3 |
+| class leave-one-out (threaded pass) | 1.24 s | 3.82 s | 3.1 |
+| LOO per sample, 2 / 3 / 4 atoms | 3.7 / 5.3 / 6.9 ms | 12.7 / 17.9 / 22.9 ms | 3.4 |
+| active set (rule 5e) | 1.78 s | 5.71 s | 3.2 |
+| one `fit_store`, nothing new | 4.39 s | 11.47 s | 2.6 |
+| the growth rule's floor pass (`grown_body4_degree`) | — | 0.057–0.081 s (0.68–0.73 s at S = 4) | |
+
+Findings:
+1. **The stop condition fired.** At S = 4 and 10 000 samples a D₄ = 3 refit is ≈ 540 s per fit (spectral search and null space ∝ Q′³, ×22 from Q′ 1 902; leave-one-out and active set ∝ P·Q′²). D₄ = 2 is over the 300 s limit there too (437 s), because the failed recovery reruns 7 fits at every refit.
+2. **At S = 3, D₄ = 3 is both trusted and cheaper per refit than D₄ = 2's recovery reruns** (2 fits against 7–8). Each refit releases more held samples (51 → 40 → 37), so a "second refit gives the same holds" check needs the releases to settle first (Task 8).
+3. **The user's decision (2026-11-13): accept the cost.** D₄ = 3 for every species set, with no column budget. While playing the refit runs in the background (fix 4 above) and the standing model answers; paused, it is a wait of that length. Not built: D₄ = 3 for many-body centres only, a smaller body-4 n_max, or skipping a recovery that already failed on the same samples (that changes fit behaviour).

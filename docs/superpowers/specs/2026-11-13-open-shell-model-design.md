@@ -162,6 +162,11 @@ justified in `references.md`. Acceptance (§5) is unchanged by them.
    S = 4 refit at 10 000 samples exceeds 5 minutes on the 9800X3D, stop and bring the numbers to the user
    before merging (options then: D₄ = 3 only for many-body centres, or a smaller n_max in the body-4
    block).
+   *Fired 2026-11-13:* the synthetic S = 4 store (10 830 samples) took 1 087 s for its cold attach refit
+   at D₄ = 3 (2 fits, ≈ 540 s each, Q′ 5 344); D₄ = 2 took 437 s there (8 fits, the failed recovery
+   rerunning). **The user's decision: accept the cost** — D₄ = 3 for every species set, no column
+   budget; while playing the refit runs in the background (fix 4), paused it is a wait. Numbers in
+   `references.md` "Refit cost at body-4 degree 3 (2026-11-13)".
 7. **Physics review** (physics-reviewer agent) of §4.2–4.3 before they land, the class-statistics
    exclusion of M first: that `NearMisfit` plus the class and audit rules leave no path to answering a
    misfit region as trusted.
