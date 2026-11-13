@@ -298,7 +298,9 @@ pub(super) fn trained_keys(s: &Sample, keys: Vec<Option<surrogate::EnvKey>>) -> 
 /// ratio² and its samples — so a key with a fraction f of its atoms in M at leave-one-out ratio
 /// r_M has R ≥ √f·r_M; they stay out of the **max** terms (M's ratios are above 1 by construction:
 /// in a max they would refuse every atom sharing its key) and of the sample counts (the evidence
-/// floors: M never helps a class or key reach one).
+/// floors: M never helps a class or key reach one). The energy RMS is a readout only: no verdict
+/// reads it (`class_refusal` reads the energy max, `calibrate::verdict` the measured energy), so the
+/// bound R ≥ √f·r_M guards a force misfit, not an energy one.
 #[derive(Clone, Copy, Debug, Default)]
 struct LooSums {
     /// The samples outside M holding the class or key.
@@ -1289,7 +1291,9 @@ impl SurrogateKs {
     /// an **audit fence** (round 1, SHOULD-3): the global untrust turns local — geometries within
     /// the quarantine radius of it fall back, everything else is judged by the rest of the policy
     /// (the class rule still sees the sample's leave-one-out when it is fitted — when the sample is
-    /// in the misfit set M, through its RMS terms only: C1, references.md "Local misfit"). Fenced cases are
+    /// in the misfit set M, through its RMS terms only: C1, references.md "Local misfit" — for a
+    /// force misfit (r_M the LOO force ratio); an energy misfit gains no class-rule guard, since
+    /// R_E,c decides no verdict). Fenced cases are
     /// judged too and lifted when they pass — **except a shell fence** (`AuditOrigin::ShellCheck`;
     /// final review C1): it is a measured structural limitation of the cutoff, not a model error
     /// a refit can cure, and a one-point re-judgement at the check's geometry says nothing about
