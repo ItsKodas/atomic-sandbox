@@ -814,10 +814,31 @@
 //! sample in the fit (code 0) can be forgotten, so Restore returns it to exactly that; the buttons
 //! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
 //! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
-//! as before (rule 8, Task 2 fix round 1 I1). Its fence is therefore permanent while it stays
-//! forgotten, so an agreeing teacher answer next to it — where nothing is released or superseded —
-//! is an ordinary one: thinned and copy-checked like an envelope (rule 5) fallback's (`admit`; final review
-//! I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`), not a new sample at every step.
+//! as before (rule 8, Task 2 fix round 1 I1). An agreeing teacher answer next to it — where nothing
+//! is released or superseded — is an ordinary one: thinned and copy-checked like an envelope (rule
+//! 5) fallback's (`admit`; final review I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`),
+//! not a new sample at every step — and a vote toward lifting its fence (below).
+//!
+//! **Lifting a forgotten sample's fence** (2026-11-14, user-approved trust change; the user's 45
+//! forgotten H₂ perturbation samples fenced ordinary H₂ geometries, every step fell back with
+//! |ΔE| ≈ 0.9 mHa — inside the model's bound — and was thinned, forever). The mirror of fence voting:
+//! a fresh teacher answer near a geometry whose fencing samples are **all forgotten** that **agrees**
+//! with the model (`agree`, the same test a release uses) is an agreeing vote (`lift_votes`, the
+//! answer with its residual teacher − model and the model generation). When [`FENCE_VOTES`]
+//! consecutive agreeing votes have the same atom count, the same model generation, overlap in the
+//! forgotten samples they were next to and agree with each other (`votes_agree`, on their residuals),
+//! the fence of every forgotten sample those votes were next to is **lifted**: code
+//! `Q_FORGOTTEN_UNFENCED` (8, persisted like 7 — a collection status record written at once, the
+//! sidecar's `sample_quarantine`; files from before read as not lifted), and the last answer is
+//! kept (`TeachOutcome::FenceLifted`, not thinned) so the region has fresh data; the model answers
+//! there again. A lifted sample stays forgotten — out of the fit, never released or superseded,
+//! listed with Restore (which returns it to code 0, clearing the lift) and purged by a purge — it
+//! only stops fencing. A disagreeing answer next to the fence clears the run (and votes as before:
+//! [`FENCE_VOTES`] consistent disagreeing answers keep one, `KeptByVote`); a refit, an install or a
+//! load clears it too (the residuals were the old model's). A fence that also holds a quarantined
+//! sample behaves as before — the agreeing answer releases or supersedes the quarantined part, the
+//! forgotten part keeps fencing, and no lift vote is cast. Rule 8 is untouched: a failed audit is
+//! re-judged at every refit, whatever its sample's code.
 //! **Purge** (2026-11-14, `purge_forgotten`, the `purge` module doc): deletes the forgotten samples
 //! for good — from the store and the shared collection's file — once the refit after the last
 //! Forget has run; no refit, the fit bitwise unchanged, every index the provider holds remapped.
@@ -1438,6 +1459,9 @@ pub struct SurrogateKs {
     /// Fence voting (module doc): the last disagreeing answers inside a fence, and how many
     /// samples each fenced sample has had kept by a vote.
     fence_votes: Vec<FenceVote>,
+    /// Lifting a forgotten sample's fence (module doc): the last fresh answers near only-forgotten
+    /// fencing samples that **agreed** with the model; [`FENCE_VOTES`] consistent ones lift it.
+    lift_votes: Vec<FenceVote>,
     fence_kept: BTreeMap<usize, u32>,
     /// Samples a vote kept that the next refit has not judged yet: (store index, the fenced
     /// samples it was kept next to). While one is pending its region takes no further vote.
@@ -1653,6 +1677,7 @@ impl SurrogateKs {
             held_audit: None,
             face: Vec::new(),
             fence_votes: Vec::new(),
+            lift_votes: Vec::new(),
             fence_kept: BTreeMap::new(),
             vote_pending: Vec::new(),
             streak: 0,
@@ -2675,7 +2700,7 @@ impl SurrogateKs {
             match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
                 Q_BOX => c.box_excluded += 1,
                 Q_HELD | Q_SUPERSEDED => c.quarantined += 1,
-                Q_FORGOTTEN => c.forgotten += 1,
+                Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => c.forgotten += 1,
                 Q_NONE if i < self.accumulated => c.fitted += 1,
                 _ => c.other += 1,
             }

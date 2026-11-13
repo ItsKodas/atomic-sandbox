@@ -152,6 +152,10 @@ impl SurrogateKs {
             v.near = v.near.iter().filter_map(|&i| m(i)).collect();
         }
         self.fence_votes.retain(|v| !v.near.is_empty());
+        for v in &mut self.lift_votes {
+            v.near = v.near.iter().filter_map(|&i| m(i)).collect();
+        }
+        self.lift_votes.retain(|v| !v.near.is_empty());
         self.fence_kept = std::mem::take(&mut self.fence_kept).into_iter().filter_map(|(i, c)| m(i).map(|j| (j, c))).collect();
         self.vote_pending = std::mem::take(&mut self.vote_pending)
             .into_iter()

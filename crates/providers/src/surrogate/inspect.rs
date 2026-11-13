@@ -81,6 +81,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_HELD) => "quarantined",
         Some(Q_SUPERSEDED) => "superseded",
         Some(Q_FORGOTTEN) => "forgotten (by the user)",
+        Some(Q_FORGOTTEN_UNFENCED) => "forgotten (by the user; fence lifted)",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",

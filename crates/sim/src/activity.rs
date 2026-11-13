@@ -484,6 +484,10 @@ pub enum TeachOutcome {
     KeptBoxAffected,
     KeptByVote,
     KeptReleased { released: u32, superseded: u32 },
+    /// Kept: the last of `FENCE_VOTES` consecutive, mutually consistent fresh answers near forgotten
+    /// samples that agree with the model — the fence of `lifted` forgotten samples is lifted
+    /// (`providers::surrogate`, "Lifting a forgotten sample's fence"; 2026-11-14).
+    FenceLifted { lifted: u32 },
     Thinned,
     BoxNotKept,
     /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
@@ -521,7 +525,7 @@ pub enum TeachOutcome {
 
 impl TeachOutcome {
     pub fn is_kept(self) -> bool {
-        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. })
+        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. })
     }
 }
 

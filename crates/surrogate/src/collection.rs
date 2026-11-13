@@ -47,7 +47,8 @@
 //!   with that index ([`crate::quarantine`] codes); the latest record per sample wins on load.
 //!   Code 7 ([`crate::quarantine::Q_FORGOTTEN`], 2026-11-12: forgotten by the user) is new; the
 //!   reader keeps any code, so a build before it reads such a record and holds the sample out of
-//!   its fit (its doc says what else that build does with it).
+//!   its fit (its doc says what else that build does with it). Code 8
+//!   ([`crate::quarantine::Q_FORGOTTEN_UNFENCED`], 2026-11-14: forgotten, its fence lifted) the same way.
 //!   A sample enters with [`Q_NONE`] (the admission rules refuse every other code).
 //!
 //! Every record kind is version 1. A record whose checksum holds but whose kind, version or flags
@@ -238,7 +239,7 @@ fn refuse_charge(q: i32) -> String {
 }
 
 fn refuse_quarantined(code: u8) -> String {
-    if code == crate::quarantine::Q_FORGOTTEN {
+    if crate::quarantine::is_forgotten_code(code) {
         // the user forgot it (Model tab): not a quarantine (Task 2 fix round 1, M4)
         format!("forgotten sample (code {code})")
     } else {
@@ -1548,7 +1549,7 @@ impl Collection {
             count(crate::quarantine::Q_SUPERSEDED),
             count(Q_BOX),
             count(Q_DRAFT),
-            count(crate::quarantine::Q_FORGOTTEN)
+            count(crate::quarantine::Q_FORGOTTEN) + count(crate::quarantine::Q_FORGOTTEN_UNFENCED)
         ));
         let mut tags: BTreeMap<String, usize> = BTreeMap::new();
         for s in &self.samples {

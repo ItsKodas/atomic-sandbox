@@ -157,6 +157,7 @@ impl SurrogateKs {
         self.lone_codes.clear();
         self.face.clear();
         self.fence_votes.clear();
+        self.lift_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = None;
@@ -424,6 +425,7 @@ impl SurrogateKs {
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
+        self.lift_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = (model.basis.body3 && model.basis.degree_cap != Basis::new(&[]).degree_cap).then_some(model.basis.degree_cap);

@@ -172,6 +172,7 @@ pub fn outcome_label(o: K) -> String {
         K::KeptBoxAffected => "kept (box)".into(),
         K::KeptByVote => "kept by vote".into(),
         K::KeptReleased { released, .. } => format!("kept, released {released}"),
+        K::FenceLifted { .. } => "kept, fence lifted".into(),
         K::Thinned => "skipped: similar".into(),
         K::BoxNotKept => "not kept: box".into(),
         K::UnfitNotKept => "not kept: cores / occupations".into(),
@@ -197,6 +198,10 @@ pub fn outcome_sentence(o: K) -> String {
         K::KeptBoxAffected => "kept while the model is being built; it touches the box walls and leaves the fit once enough others exist".into(),
         K::KeptByVote => format!("kept: {FENCE_VOTES} fresh answers agree with each other but not with the model — the next refit decides"),
         K::KeptReleased { released, superseded } => format!("kept: it agrees with the model, so {released} quarantined samples were released ({superseded} superseded)"),
+        K::FenceLifted { lifted } => format!(
+            "kept: {FENCE_VOTES} fresh answers here agree with the model, so the fence of {lifted} forgotten sample{} is lifted — the model answers here again; they stay forgotten (Restore brings them back)",
+            if lifted == 1 { "" } else { "s" }
+        ),
         K::Thinned => format!("skipped: too similar to a sample already held (one in {THIN_EVERY} such is kept)"),
         K::BoxNotKept => "not kept: it touches the box walls — the box's squeeze, not the molecule".into(),
         K::UnfitNotKept => "used for this step, not kept: two atoms' cores overlap (the frozen-core approximation fails there) or the shared-shell occupation changed since the last step (the energy jumps)".into(),

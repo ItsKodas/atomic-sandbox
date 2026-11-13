@@ -11285,6 +11285,9 @@ mod forget;
 /// 2026-11-14: purging the forgotten samples (`purge.rs`).
 mod purge;
 
+/// 2026-11-14: a forgotten sample's fence lifts after agreeing answers (`fence_lift.rs`).
+mod fence_lift;
+
 /// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
 /// the stored scenes, a measurement only (`scope_measure.rs`).
 mod scope_measure;

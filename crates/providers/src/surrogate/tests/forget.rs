@@ -88,10 +88,11 @@ fn a_forgotten_sample_is_not_fitted_and_never_released() {
     assert_eq!((s.quarantine[k], s.superseded(), s.samples()), (Q_FORGOTTEN, 0, before + 1));
 }
 
-/// Final review I1: a forgotten sample's fence is permanent (never released or superseded), so the
-/// model refuses next to it at every visit — and each agreeing teacher answer there is an ordinary
-/// one: the first is kept (as pinned above), a second at the same geometry is a copy of it and a
-/// third a hair away is thinned, as anywhere else; before, every visit added a sample.
+/// Final review I1: a forgotten sample is never released or superseded, and each agreeing teacher
+/// answer next to it is an ordinary one: the first is kept (as pinned above), a second at the same
+/// geometry is a copy of it, as anywhere else; before, every visit added a sample. Since
+/// 2026-11-14 (the fence lift, `fence_lift.rs`) the fence is no longer permanent: the third
+/// consecutive agreeing answer — which was thinned before — lifts it and is kept.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn agreeing_answers_next_to_a_forgotten_sample_are_thinned() {
@@ -132,10 +133,14 @@ fn agreeing_answers_next_to_a_forgotten_sample_are_thinned() {
     let notes = visit(&mut s, 0.0);
     assert_eq!(s.samples(), before + 1, "the second, the same answer, is not: {notes:?}");
     assert!(notes.iter().any(|n| n.contains("a copy of stored sample")), "{notes:?}");
-    let notes = visit(&mut s, 2e-3);
-    assert_eq!(s.samples(), before + 1, "a third a hair away is thinned: {notes:?}");
-    assert!(notes.iter().any(|n| n.contains("training spreads from a stored one")), "{notes:?}");
-    assert!(s.near_quarantined(&at(&s, 0.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]) == vec![k], "the fence stays");
+    // the third a hair away: before 2026-11-14 thinned with the fence standing; now it lifts it
+    let sc = at(&s, 2e-3);
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("the fence of 1 forgotten sample is lifted")), "{:?}", r.stats.notes);
+    assert_eq!((s.quarantine[k], s.forgotten(), s.samples()), (Q_FORGOTTEN_UNFENCED, 1, before + 2), "still forgotten, the answer kept");
+    assert!(s.near_quarantined(&at(&s, 0.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]).is_empty(), "the fence is lifted");
 }
 
 /// Restore: back in the fit at the refit (code 0, what it had); a sample that is not forgotten is
