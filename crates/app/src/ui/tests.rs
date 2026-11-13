@@ -934,6 +934,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     st.show_knowledge = true; // the overlay's legend over every layout
     st.view_sections = super::dock::view::Sections::all(true); // every View-panel anchor drawn
     st.model_sections = super::dock::model::Sections::all(true); // every Model-panel anchor drawn
+    st.orbital_sections = super::dock::orbitals::Sections::all(true); // every Orbitals-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -3457,7 +3458,8 @@ mod orbital_viewer {
         PROBES.with(|p| p.borrow_mut().clear());
         let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
         let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
-        assert!(has("↑↓ paired · 1 occupied") && has("↑↓ unoccupied") && has("#1 ↑↓") && has("occ 2"), "{texts:?}");
+        assert!(has("↑↓ paired · 1 occupied") && has("↑↓ unoccupied") && has("#1 ↑↓"), "{texts:?}");
+        assert!(!has("occ 2"), "a whole occupation is the diagram's arrows, not a badge: {texts:?}");
         assert!(!has("↑ spin") && !has("↓ spin") && !has("↓: none occupied"), "{texts:?}");
         let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
         assert!(probed("orbital-↑↓-1") && probed("orbital-↑↓-3"));
@@ -3521,8 +3523,10 @@ mod orbital_viewer {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
         let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
-        let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
-        assert!(has("#1 ↑↓") && has("↓ not converged (residual 3.0e-4)"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("#1 ↑↓")), "{texts:?}");
+        // the caveat is the row's ⚠, its full text on hover
+        let t = hover_text(&ctx, &mut st, &inp, "warn-↑↓-1");
+        assert!(t.contains("↓ not converged (residual 3.0e-4)"), "{t}");
     }
 
     /// Every pinned honesty string is in the text its widget shows (tooltips are built by these
@@ -4202,9 +4206,10 @@ mod orbital_viewer {
         let mut st = UiState::new("h2o", &scene);
         st.show = ShowMode::Orbitals;
         alone(&mut st, DockTab::Orbitals);
+        st.orbital_sections.set(crate::ui::dock::orbitals::Section::Box, true); // the box state's row is in its fold
         PROBES.with(|p| p.borrow_mut().clear());
         let texts: Vec<String> = coloured_texts(&ctx, &mut st, &inp).into_iter().map(|(t, _)| t).collect();
-        for h in ["O #0", "H #1", "box states", "from an earlier geometry"] {
+        for h in ["O #0", "H #1", "Box states (1)", "from an earlier geometry"] {
             assert!(texts.iter().any(|t| t == h), "{h}: {texts:?}");
         }
         let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
@@ -4407,6 +4412,381 @@ mod orbital_viewer {
         let h1 = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(faint(&coloured_texts(&ctx, &mut st, &h1)), ["#2 ↑↓"], "picked and not lit: still readable");
     }
+
+    // ---- the redesigned tab (user's approved mockup, 2026-11-14) ----
+
+    /// The probes of one frame of the tab (cleared first), drawn alone at 1400 pt.
+    fn probes_of(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> std::collections::BTreeSet<String> {
+        for _ in 0..2 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, 1400.0, vec![]);
+        PROBES.with(|p| p.borrow().keys().cloned().collect())
+    }
+
+    /// Only the mode on screen draws its controls — no greyed controls of the others; the rare
+    /// controls of All orbitals coloured are under "more"; "empty shown" only where it acts.
+    #[test]
+    fn only_the_modes_own_controls_are_drawn() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Orbitals);
+        st.volume_mode = crate::ui::VOLUME_ISO;
+        let orbitals = ["orbitals-render", "orbitals-iso"];
+        let coloured = ["orbitals-blend", "orbitals-enclosed"];
+        let more = ["orbitals-hide-core", "preset-valence", "orbitals-scale"];
+        let none_of = |p: &std::collections::BTreeSet<String>, names: &[&str], what: &str| {
+            for n in names {
+                assert!(!p.contains(*n), "{what}: {n} drawn");
+            }
+        };
+        let all_of = |p: &std::collections::BTreeSet<String>, names: &[&str], what: &str| {
+            for n in names {
+                assert!(p.contains(*n), "{what}: {n} missing");
+            }
+        };
+        st.show = ShowMode::Orbitals;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &orbitals, "Orbitals");
+        assert!(p.contains("unoccupied"));
+        none_of(&p, &coloured, "Orbitals");
+        none_of(&p, &more, "Orbitals");
+        st.show = ShowMode::Coloured;
+        st.colour_look.enclose = Some(90);
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &coloured, "Coloured");
+        assert!(p.contains("unoccupied") && p.contains("orbitals-fold-more"));
+        none_of(&p, &orbitals, "Coloured");
+        none_of(&p, &more, "Coloured, more folded");
+        st.orbital_sections.set(Section::More, true);
+        st.colour_look.enclose = None;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &more, "Coloured, more open");
+        assert!(!p.contains("orbitals-enclosed"), "draw: density has no enclosed share");
+        st.show = ShowMode::Spin;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &orbitals, "Spin (render and its iso)");
+        assert!(!p.contains("unoccupied"), "Spin density solves no unoccupied orbitals");
+        none_of(&p, &coloured, "Spin");
+        st.show = ShowMode::Density;
+        let p = probes_of(&ctx, &mut st, &inp);
+        none_of(&p, &[&orbitals[..], &coloured[..], &more[..], &["unoccupied"]].concat(), "Density");
+        // Ctrl K: a control of another mode is marked on its mode's button
+        let mode_button = probed_rect("show-colour");
+        assert_eq!(probed_rect("anchor-d-orb-colour"), mode_button);
+        assert_eq!(probed_rect("anchor-d-orb-style"), probed_rect("show-orbitals"));
+        // and a reveal of a "more" control unfolds it in its mode
+        st.show = ShowMode::Coloured;
+        st.orbital_sections.set(Section::More, false);
+        st.search.reveal = Some(("d-orb-colour-more", std::time::Instant::now(), false));
+        probes_of(&ctx, &mut st, &inp);
+        assert!(st.orbital_sections.is_open(Section::More), "the reveal unfolds more");
+    }
+
+    /// The level diagram: one line per spatial orbital (a closed shell's pair is one), HOMO and LUMO
+    /// labelled with ε, the gap's value; no gap for a partly filled shell; box states above the
+    /// dashed line; ↑ and ↓ columns for an open shell.
+    #[test]
+    fn the_level_diagram_labels_homo_lumo_and_the_gap() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let o = h2_closed();
+        let (split, es) = orbitals::entries(&o);
+        assert!(!split && es.len() == 2, "one entry per pair");
+        let levels = Levels::of(&o.rows);
+        let lay = orbitals::level_layout(&es, split, &levels, 120.0, 120.0);
+        assert_eq!((lay.columns, lay.lines.len()), (1, 2));
+        assert!(lay.lines[1].y < lay.lines[0].y, "σ_u above σ_g: {lay:?}");
+        assert!(lay.dashed.is_none() && lay.homo_y == Some(lay.lines[0].y) && lay.lumo_y == Some(lay.lines[1].y));
+        // on screen
+        let snap = with_payload(&scene, Backend::Gpu, o.clone());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert_eq!(p.iter().filter(|k| k.starts_with("level-")).count(), 2, "{p:?}");
+        assert!(p.contains("level-↑↓-1") && p.contains("level-↑↓-3"));
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        let has = |n: &str| texts.iter().any(|t| t == n);
+        assert!(has("HOMO −0.500 Ha") && has("LUMO 0.020 Ha") && has("gap 0.520 Ha"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("ENERGY LEVELS · ")), "{texts:?}");
+        // a partly filled shell: no gap is quoted
+        let third = 1.0 / 3.0;
+        let mut frac = payload(
+            vec![
+                row(Spin::Up, 0, 1, 0, -0.87, 1.0, idx(1)),
+                row(Spin::Down, 0, 3, 0, -0.83, 1.0, idx(1)),
+                row(Spin::Down, 1, 4, 1, -0.28, third, idx(2)),
+                row(Spin::Down, 2, 5, 2, -0.28, third, idx(3)),
+                row(Spin::Down, 3, 6, 3, -0.28, third, idx(4)),
+                row(Spin::Down, 4, 7, 4, 0.05, 0.0, idx(5)),
+            ],
+            OrbitalRequest::List,
+        );
+        frac.spin = SpinSummary { n_up: 1, n_dn: 2, integral: -1.0, abs_integral: 1.0, ..closed_spin() };
+        let (split, es) = orbitals::entries(&frac);
+        let lay = orbitals::level_layout(&es, split, &Levels::of(&frac.rows), 80.0, 120.0);
+        assert_eq!(lay.columns, 2, "↑ and ↓ side by side");
+        let p_lines: Vec<_> = lay.lines.iter().filter(|l| (es[l.entry].r.energy + 0.28).abs() < 1e-9).collect();
+        assert_eq!(p_lines.len(), 3);
+        assert!(p_lines.iter().all(|l| l.y == p_lines[0].y && l.column == 1), "the degenerate shell side by side in ↓");
+        assert!(p_lines.windows(2).all(|w| w[0].x1 <= w[1].x0), "not on top of each other");
+        let snap = with_payload(&scene, Backend::Gpu, frac);
+        let inp = input(&scene, Some(&snap), &cam);
+        for _ in 0..2 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 6.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "HOMO −0.280 Ha") && texts.iter().any(|t| t == "partly filled: no gap"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("gap ")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "1/3"), "the fraction on the arrow: {texts:?}");
+        // box states: faded above the dashed line
+        let mut boxed = h2_closed();
+        let mut b = row(Spin::Up, 2, 9, 2, 0.04, 0.0, idx(3));
+        b.box_state = true;
+        boxed.rows.push(b.clone());
+        b.spin = Spin::Down;
+        b.track = 10;
+        boxed.rows.push(b);
+        let (split, es) = orbitals::entries(&boxed);
+        let lay = orbitals::level_layout(&es, split, &Levels::of(&boxed.rows), 120.0, 120.0);
+        let d = lay.dashed.expect("a dashed line");
+        assert!(lay.lines.iter().all(|l| if l.boxed { l.y < d } else { l.y > d }), "{lay:?}");
+        assert_eq!(lay.lines.iter().filter(|l| l.boxed).count(), 1);
+    }
+
+    /// A click on a level picks the same orbital as a click on its row (closed shell: the ↑
+    /// member; open shell: the row's own channel).
+    #[test]
+    fn clicking_a_level_picks_like_its_row() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        for (o, probe) in [(h2_closed(), "↑↓-1"), (h2_closed(), "↑↓-3"), (payload(h2_rows(), OrbitalRequest::List), "↓-2")] {
+            let snap = with_payload(&scene, Backend::Gpu, o);
+            let inp = input(&scene, Some(&snap), &cam);
+            let level = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("level-{probe}")));
+            let pick = st.orbital_pick;
+            let row = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("orbital-{probe}")));
+            assert_eq!(level.len(), 1, "{probe}");
+            assert_eq!(level, row, "{probe}");
+            assert_eq!(pick, st.orbital_pick, "{probe}");
+        }
+    }
+
+    /// The compact rows: HOMO and LUMO are badges on their rows (no line of their own); the caveats
+    /// are one ⚠ with the full text on hover; a degenerate set reads ×n.
+    #[test]
+    fn homo_and_lumo_are_badges_on_the_rows() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut o = h2_closed();
+        o.rows[1].rotated = true;
+        o.rows[3].rotated = true;
+        o.rows[1].cluster = Some((2, 1e-5));
+        o.rows[3].cluster = Some((2, 1e-5));
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        probes_of(&ctx, &mut st, &inp);
+        let inside = |badge: &str, row: &str| {
+            let (b, r) = (probed_rect(badge), probed_rect(row));
+            assert!(b.center().y > r.top() && b.center().y < r.bottom(), "{badge} {b:?} on the row {row} {r:?}");
+        };
+        inside("homo-↑↓-1", "orbital-↑↓-1");
+        inside("lumo-↑↓-3", "orbital-↑↓-3");
+        inside("eps-↑↓-1", "orbital-↑↓-1");
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "×2"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("rotated for display") || t.starts_with("degenerate ×")), "no tag lines: {texts:?}");
+        let t = hover_text(&ctx, &mut st, &inp, "warn-↑↓-3");
+        assert!(t.contains("rotated for display") && t.contains("rotated within a degenerate set for display"), "{t}");
+    }
+
+    /// Box states are listed only inside their fold (closed by default), under one shared warning.
+    #[test]
+    fn box_states_are_only_in_their_fold() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut o = h2_closed();
+        for (spin, track) in [(Spin::Up, 9), (Spin::Down, 10)] {
+            let mut b = row(spin, 2, track, 2, 0.04, 0.0, idx(3));
+            b.box_state = true;
+            o.rows.push(b);
+        }
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        assert!(!st.orbital_sections.is_open(Section::Box));
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert!(p.contains("orbitals-fold-box") && !p.contains("orbital-↑↓-9"), "{p:?}");
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Box states (1)") && texts.iter().any(|t| t == "unbound at this box size"), "{texts:?}");
+        click_widget(&ctx, &mut st, &inp, "orbitals-fold-box");
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert!(p.contains("orbital-↑↓-9"));
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 6.0).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts.iter().filter(|t| t.contains(orbitals::BOX_STATE_TIP)).count(), 1, "one shared warning: {texts:?}");
+        assert!(probed_rect("orbital-↑↓-9").top() > probed_rect("orbitals-list").bottom(), "below the list, in the fold");
+    }
+
+    /// The folds' open state is display state kept in the profile (`orbital_sections`): a header
+    /// click sends nothing; the line round-trips; absent is the default (the Spin readout in Spin
+    /// density mode); outside Spin mode the readout says "Spin view only".
+    #[test]
+    fn the_orbital_folds_are_kept_in_the_profile() {
+        use crate::ui::dock::orbitals::{Section, Sections};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        assert!(profile::capture(&st).contains("\norbital_sections = spin\n"));
+        let texts: Vec<String> = { probes_of(&ctx, &mut st, &inp); frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect() };
+        assert!(texts.iter().any(|t| t == "Spin view only"), "{texts:?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "orbitals-fold-about");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        click_widget(&ctx, &mut st, &inp, "orbitals-fold-spin");
+        assert_eq!(st.orbital_sections.encode(), "spin,spin-other,about");
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.orbital_sections.encode(), "spin,spin-other,about");
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.orbital_sections, Sections::default());
+        profile::apply(&mut fresh, "orbital_sections = \n");
+        assert_eq!(fresh.orbital_sections, Sections::all(false));
+        assert!(!fresh.orbital_sections.is_open(Section::Spin));
+    }
+
+    /// Every honesty constant's text is still reachable: in full in About orbitals, and the view
+    /// card's one-line note carries KS_NOTE and SPIN_NOTE on hover.
+    #[test]
+    fn every_honesty_text_is_reachable() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        st.orbital_sections.set(Section::About, true);
+        let texts: Vec<String> = coloured_texts(&ctx, &mut st, &inp).into_iter().map(|(t, _)| t).collect();
+        for c in [orbitals::KS_NOTE, orbitals::SPIN_NOTE, orbitals::HOMO_TIP, orbitals::GAP_TIP, orbitals::UNOCCUPIED_TIP, orbitals::BOX_STATE_TIP, orbitals::SIGN_TIP, orbitals::PAIRED_TIP] {
+            assert!(texts.iter().any(|t| t == c), "{c:?} not in About orbitals");
+        }
+        let t = hover_text(&ctx, &mut st, &inp, "orbitals-ks-note");
+        assert!(t.contains(orbitals::KS_NOTE) && t.contains(orbitals::SPIN_NOTE), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-gap");
+        assert!(t.contains(orbitals::GAP_TIP), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-homo");
+        assert!(t.contains(orbitals::HOMO_TIP), "{t}");
+    }
+
+    /// At about 320 pt, with a grouped open-shell molecule, every fold open and the coloured mode's
+    /// controls, the sections stack without overlap, rows keep ε clear of their labels, and no text
+    /// runs past the panel's right edge.
+    #[test]
+    fn the_orbitals_panel_fits_320_pt() {
+        use crate::ui::dock::orbitals::Sections;
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let mut o = water_by_atom();
+        let mut b = row(Spin::Up, 3, 6, 3, 0.03, 0.0, idx(4));
+        b.box_state = true;
+        o.rows.push(b);
+        o.rows[0].not_converged = true;
+        o.rows[0].residual = Some(3e-4);
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for mode in [ShowMode::Coloured, ShowMode::Orbitals, ShowMode::Spin] {
+            let mut st = UiState::new("h2o", &scene);
+            st.show = mode;
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Orbitals*])").unwrap());
+            st.orbital_sections = Sections::all(true);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 4000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("orbitals-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["orbitals-view", "orbitals-levels", "orbitals-list", "orbitals-fold-box", "orbitals-fold-spin", "orbitals-fold-about"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{mode:?} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{mode:?} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            for t in [1, 2, 3, 4, 5] {
+                let arrows = if t <= 3 { "↑" } else { "↓" };
+                let (label, eps) = (probed_rect(&format!("orbital-{arrows}-{t}")), probed_rect(&format!("eps-{arrows}-{t}")));
+                assert!(label.right() < eps.left(), "{mode:?} row {t}: ε {eps:?} over the label {label:?}");
+                let share = probed_rect(&format!("share-{arrows}-{t}"));
+                assert!(eps.right() <= share.left() + 0.5 && share.right() <= panel.right() + 1.0, "{mode:?} row {t}: {eps:?} / {share:?}");
+            }
+            let warn = probed_rect("warn-↑-1");
+            assert!(warn.right() < probed_rect("eps-↑-1").left(), "{mode:?}: the ⚠ clear of ε");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{mode:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
+    }
+
 }
 
 /// The Activity tab (activity spec §3.3): state, job rows, the solve log, the views contract.

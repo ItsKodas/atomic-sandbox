@@ -1,8 +1,13 @@
-//! The Orbitals tab (orbital-viewer spec §3, §3.1; plan Task 7): the `show` selector, the list of
-//! Kohn–Sham orbitals — both spin channels, grouped by channel and in energy order — with ε in
-//! Hartree and eV, occupation and tags, the picker (by track: the selection follows the orbital as
-//! levels reorder), the per-mode controls (phase or |ψ|², "show unoccupied: m", the iso sliders,
-//! the colour blend and scale, the include checkboxes) and the spin readout block.
+//! The Orbitals tab (orbital-viewer spec §3, §3.1; plan Task 7; restructured 2026-11-14 from the
+//! user's approved mockup). Top to bottom: the **view card** (the `show` selector and only the
+//! controls of the mode on screen — the rarer ones of All orbitals coloured under "more"; a search
+//! anchor of another mode is marked on its mode's button, [`MODE_ANCHORS`]), the **energy-level
+//! diagram** ([`entries`], [`level_layout`]: one line per spatial orbital, ↑/↓ columns when the
+//! spins differ, HOMO / LUMO / the Kohn–Sham gap, box states above a dashed line; a click picks
+//! the orbital, as its row does) with the "empty shown" count, the **compact list** (one row per
+//! spatial orbital, HOMO / LUMO / ×n badges, one ⚠ holding the caveats) and the folds Box states,
+//! Spin readout and About orbitals ([`Sections`], `UiState::orbital_sections`, the profile's
+//! `orbital_sections`). Display-only: every control emits the `Action` it did before.
 //!
 //! **Rule 7 lives here.** Every fact §2 of the spec lists is a constant below, and a tooltip or a
 //! line of the list carries it: a Kohn–Sham orbital is an auxiliary object, not a measured
@@ -832,12 +837,165 @@ impl Place {
     }
 }
 
+// ---- the tab's folds (2026-11-14 redesign) ----
+
+/// One of the tab's folds (`UiState::orbital_sections`, the profile's `orbital_sections`). All
+/// start closed but the Spin readout in Spin density mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// "more" in the view card: the rarer controls of the mode on screen (All orbitals coloured:
+    /// hide core orbitals, the quick presets, the scale).
+    More,
+    /// "Box states (n)": the states of the simulation box, out of the main list.
+    Box,
+    /// "Spin readout" in Spin density mode (open by default).
+    Spin,
+    /// "Spin readout" in the other modes ("Spin view only"; closed by default).
+    SpinElsewhere,
+    /// "About orbitals": the full honesty texts.
+    About,
+}
+
+impl Section {
+    pub const ALL: [Section; 5] = [Section::More, Section::Box, Section::Spin, Section::SpinElsewhere, Section::About];
+
+    /// Its word in the profile's `orbital_sections` line.
+    pub fn id(self) -> &'static str {
+        match self {
+            Section::More => "more",
+            Section::Box => "box",
+            Section::Spin => "spin",
+            Section::SpinElsewhere => "spin-other",
+            Section::About => "about",
+        }
+    }
+
+    /// The search anchors its contents mark: a Ctrl K reveal of one unfolds it (the Spin readout's
+    /// anchor unfolds the fold of the mode on screen, [`reveal`]).
+    pub fn anchors(self) -> &'static [&'static str] {
+        match self {
+            Section::More => &["d-orb-colour-more"],
+            Section::Box => &[],
+            Section::Spin | Section::SpinElsewhere => &["d-orb-spin"],
+            Section::About => &["d-orb-about"],
+        }
+    }
+}
+
+/// Which folds are open (`UiState::orbital_sections`): the Spin readout (in Spin density mode) by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sections([bool; 5]);
+
+impl Default for Sections {
+    fn default() -> Self {
+        let mut s = Sections([false; 5]);
+        s.set(Section::Spin, true);
+        s
+    }
+}
+
+impl Sections {
+    pub fn is_open(&self, s: Section) -> bool {
+        self.0[s as usize]
+    }
+
+    pub fn set(&mut self, s: Section, open: bool) {
+        self.0[s as usize] = open;
+    }
+
+    /// Every fold open (or none).
+    #[cfg(test)]
+    pub fn all(open: bool) -> Sections {
+        Sections([open; 5])
+    }
+
+    /// The profile's value: the open folds' ids, comma separated.
+    pub fn encode(&self) -> String {
+        Section::ALL.into_iter().filter(|&s| self.is_open(s)).map(Section::id).collect::<Vec<_>>().join(",")
+    }
+
+    /// The profile's value read back: the ids named are open, the rest closed; unknown words are dropped.
+    pub fn parse(v: &str) -> Sections {
+        let mut s = Sections([false; 5]);
+        for w in v.split(',').map(str::trim) {
+            if let Some(x) = Section::ALL.into_iter().find(|x| x.id().eq_ignore_ascii_case(w)) {
+                s.set(x, true);
+            }
+        }
+        s
+    }
+}
+
+/// The per-mode controls' search anchors and the mode that draws them. While another mode is on
+/// screen (or None) the anchor is marked on its mode's button in the `show` selector, so Ctrl K
+/// shows where the control lives instead of finding nothing.
+pub const MODE_ANCHORS: [(&str, ShowMode); 5] = [
+    ("d-orb-style", ShowMode::Orbitals),
+    ("d-orb-iso", ShowMode::Orbitals),
+    ("d-orb-colour", ShowMode::Coloured),
+    ("d-orb-colour-more", ShowMode::Coloured),
+    ("d-orb-unocc", ShowMode::Orbitals),
+];
+
+/// Whether the mode on screen draws the controls of `anchor` ([`MODE_ANCHORS`]).
+pub fn anchor_in_mode(anchor: &str, st: &UiState) -> bool {
+    if st.hide_cloud {
+        return false;
+    }
+    match anchor {
+        "d-orb-style" => st.show == ShowMode::Orbitals,
+        "d-orb-iso" => matches!(st.show, ShowMode::Orbitals | ShowMode::Spin),
+        "d-orb-colour" | "d-orb-colour-more" => st.show == ShowMode::Coloured,
+        "d-orb-unocc" => matches!(st.show, ShowMode::Orbitals | ShowMode::Coloured),
+        _ => true,
+    }
+}
+
+/// A Ctrl K reveal unfolds the fold holding its anchor (it stays open).
+fn reveal(st: &mut UiState) {
+    let Some(a) = st.search.unrevealed() else { return };
+    let in_spin = st.show == ShowMode::Spin && !st.hide_cloud;
+    for s in Section::ALL.into_iter().filter(|s| s.anchors().contains(&a)) {
+        match s {
+            Section::Spin if !in_spin => {}
+            Section::SpinElsewhere if in_spin => {}
+            Section::More if !anchor_in_mode(a, st) => {}
+            _ => st.orbital_sections.set(s, true),
+        }
+    }
+}
+
+/// A fold: its header (`theme::fold_header`, probed `orbitals-fold-<probe>`) and, while open, its body.
+#[allow(clippy::too_many_arguments)]
+fn fold(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<(String, Color32)>, sub: bool, probe: &str, body: impl FnOnce(&mut Ui, &mut UiState)) {
+    let (r, _) = theme::fold_header(ui, title, st.orbital_sections.is_open(s), summary, None, sub);
+    super::super::probe_rect(&format!("orbitals-fold-{probe}"), r.rect);
+    if r.clicked() {
+        let open = st.orbital_sections.is_open(s);
+        st.orbital_sections.set(s, !open);
+    }
+    if st.orbital_sections.is_open(s) {
+        ui.indent(("orbitals-fold", s.id()), |ui| body(ui, st));
+        ui.add_space(4.0);
+    }
+}
+
 // ---- the tab ----
+
+/// The view card's one-line note (its full text, [`KS_NOTE`] and [`SPIN_NOTE`], on hover and in About orbitals).
+pub const KS_SHORT: &str = "Kohn–Sham orbitals: auxiliary objects of DFT, not measured wavefunctions";
+/// The one-line note in Spin density mode.
+pub const SPIN_SHORT: &str = "Spin is intrinsic, not a rotation; orbitals are stationary";
 
 /// The `show` selector: one button per mode, probed as `{prefix}-{word}`; returns the picked mode.
 /// "None" (first) hides the electron cloud altogether (`hidden`, `UiState::hide_cloud`); picking a
 /// mode shows it again.
 pub fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str) -> Option<ShowMode> {
+    show_selector_at(ui, current, hidden, prefix, &mut Vec::new())
+}
+
+/// [`show_selector`], collecting each mode button's rect in `rects`.
+fn show_selector_at(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str, rects: &mut Vec<(ShowMode, egui::Rect)>) -> Option<ShowMode> {
     let mut picked = None;
     egui::Frame::new()
         .fill(theme::APP)
@@ -856,6 +1014,7 @@ pub fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: 
                 for mode in ShowMode::ALL {
                     let r = ui.add(egui::Button::selectable(!*hidden && current == mode, mode.title())).on_hover_text(mode_tip(mode));
                     super::super::probe(&format!("{prefix}-{}", mode.word()), &r);
+                    rects.push((mode, r.rect));
                     if r.clicked() {
                         *hidden = false;
                         picked = Some(mode);
@@ -866,31 +1025,66 @@ pub fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: 
     picked
 }
 
+/// The tab, top to bottom (user's approved mockup, 2026-11-14): the view card (the `show`
+/// selector and only the mode's own controls, the rare ones under "more"), the energy-level
+/// diagram, the compact orbital list, then the folds Box states, Spin readout and About orbitals.
+/// Display-only restructuring: every control emits the `Action` (or writes the `UiState`) it did before.
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    reveal(st);
+    // the visible part of the panel (the tests' width checks)
+    super::super::probe_rect("orbitals-panel", ui.clip_rect());
     let payload: Option<&OrbitalDisplay> = input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref());
-    super::group(ui, st, "d-orb-mode", |ui, st| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label("show");
-            theme::info(ui, format!("{KS_NOTE} {SPIN_NOTE}"));
-        });
-        if let Some(m) = show_selector(ui, st.show, &mut st.hide_cloud, "show") {
-            acts.push(Action::Show(m));
-        }
-        ui.add(egui::Label::new(RichText::new(KS_NOTE).size(11.0).color(theme::INK_DIM)).wrap());
-        if st.show == ShowMode::Spin {
-            ui.add(egui::Label::new(RichText::new(SPIN_NOTE).size(11.0).color(theme::INK_DIM)).wrap());
-        }
-        if let Some(l) = &input.orbital_label {
-            ui.add(egui::Label::new(RichText::new(l).color(super::super::AMBER)).wrap());
-        }
-    });
-    if st.show == ShowMode::Density {
-        theme::note(ui, "pick Orbitals, All orbitals coloured or Spin density above (or View ▸ What you see) to see the Kohn–Sham orbitals; they need a DFT step.");
+    let card = ui.scope(|ui| super::group(ui, st, "d-orb-mode", |ui, st| view_card(ui, st, input, payload, acts))).response.rect;
+    super::super::probe_rect("orbitals-view", card);
+    ui.add_space(6.0);
+    // the largest Zσ of the scene's all-electron nuclei: the molecule's smeared-core note
+    let pseudised = super::super::pseudo::pseudised(input);
+    let z_sigma = input.snapshot.map_or(0.0, |s| largest_smeared_z_sigma(&s.dynamics.scene, &pseudised));
+    // the groups name and the selection lights the scene's atoms (orbital-atom-shares spec)
+    let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+    let selected = selected_atoms(input.selected, &st.edit_group, scene_z.len());
+    let refs_pending = input.snapshot.is_some_and(|s| !s.dynamics.bonds_pending.is_empty());
+    let li = ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending };
+    let name = crate::names::common_name(&scene_z, input.scene.charge)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::names::formula(&scene_z, (input.scene.charge != 0).then_some(input.scene.charge)));
+    let levels_rect = levels_section(ui, st, payload, input.orbital_waiting, &name, &li, acts);
+    ui.add_space(6.0);
+    if !list(ui, st, payload, &li, acts) {
+        // no rows yet: Ctrl K's orbital list points at the levels' note
+        super::super::search::mark(ui, st, "d-orb-list", levels_rect);
     }
-    controls(ui, st, payload, input.orbital_waiting, acts);
-    super::group(ui, st, "d-orb-spin", |ui, st| {
-        theme::section(ui, "Spin readout");
-        match (st.show == ShowMode::Spin, payload) {
+    ui.add_space(4.0);
+    // the folds
+    if let Some(o) = payload {
+        let (split, all) = entries(o);
+        let boxed: Vec<Entry<'_>> = all.into_iter().filter(|e| e.box_state()).collect();
+        if !boxed.is_empty() {
+            let unbound = boxed.iter().all(|e| e.r.eps_range.1 >= 0.0);
+            let summary = (if unbound { "unbound at this box size" } else { "energies box-affected" }.to_string(), super::super::AMBER);
+            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            let picked = picked_of(o);
+            fold(ui, st, Section::Box, &format!("Box states ({})", boxed.len()), Some(summary), false, "box", |ui, st| {
+                super::group(ui, st, "d-orb-box", |ui, st| {
+                    // one shared explanation (each row's own wording, by the sign of ε, is on its ⚠)
+                    let head = if unbound { "Unbound in LSDA at this box size" } else { "States of the box (some bound, their tails on the walls)" };
+                    ui.add(egui::Label::new(RichText::new(format!("{head}: {BOX_STATE_TIP}")).size(11.0).color(super::super::AMBER)).wrap());
+                    for e in &boxed {
+                        row(ui, st, *e, &levels, e.picked(picked), &Place::default(), acts);
+                    }
+                    let _ = split;
+                });
+            });
+        }
+    }
+    let in_spin = st.show == ShowMode::Spin && !st.hide_cloud;
+    let (s, summary) = if in_spin {
+        (Section::Spin, payload.map(|o| (format!("n↑ {} · n↓ {}", o.spin.n_up, o.spin.n_dn), theme::INK_DIM)))
+    } else {
+        (Section::SpinElsewhere, Some(("Spin view only".to_string(), theme::INK_FAINT)))
+    };
+    fold(ui, st, s, "Spin readout", summary, false, "spin", |ui, st| {
+        super::group(ui, st, "d-orb-spin", |ui, _| match (in_spin, payload) {
             (true, Some(o)) => {
                 for l in spin_lines(&o.spin) {
                     ui.add(egui::Label::new(RichText::new(l).size(11.5)).wrap());
@@ -902,121 +1096,187 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             (false, _) => {
                 theme::note(ui, "n↑, n↓, ∫m, ∫|m| and max|m|/max ρ appear here in Spin density mode");
             }
-        }
-    });
-    if let Some(o) = payload {
-        for n in visible_notes(o, st.orbital_pick_adopted) {
-            ui.add(egui::Label::new(RichText::new(n).size(11.5).color(super::super::AMBER)).wrap());
-        }
-    }
-    // the largest Zσ of the scene's all-electron nuclei: the molecule's smeared-core note
-    let pseudised = super::super::pseudo::pseudised(input);
-    let z_sigma = input.snapshot.map_or(0.0, |s| largest_smeared_z_sigma(&s.dynamics.scene, &pseudised));
-    // the groups name and the selection lights the scene's atoms (orbital-atom-shares spec)
-    let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
-    let selected = selected_atoms(input.selected, &st.edit_group, scene_z.len());
-    let refs_pending = input.snapshot.is_some_and(|s| !s.dynamics.bonds_pending.is_empty());
-    list(ui, st, payload, &ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending }, acts);
-}
-
-/// The per-mode controls, always drawn (a search result can reveal them) and enabled for the modes
-/// that use them: phase or |ψ|², the iso sliders, the colour blend and scale, the include reset,
-/// and "show unoccupied".
-fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, waiting: bool, acts: &mut Vec<Action>) {
-    super::group(ui, st, "d-orb-style", |ui, st| {
-        ui.add_enabled_ui(st.show == ShowMode::Orbitals, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("draw as");
-                if let Some(p) = theme::segmented(ui, st.orbital_phase, &[(true, "phase ±", SIGN_TIP), (false, "|ψ|²", "the orbital squared: where the electron in this orbital is likely to be, with the density's colour ramp")]) {
-                    acts.push(Action::OrbitalPhase(p));
-                }
-            });
         });
     });
-    super::group(ui, st, "d-orb-iso", |ui, st| {
-        let spin = st.show == ShowMode::Spin;
-        let signed = spin || (st.show == ShowMode::Orbitals && st.orbital_phase);
-        let iso_on = st.volume_mode == super::super::VOLUME_ISO;
-        let iso = if spin { &mut st.spin_iso } else { &mut st.phase_iso };
-        ui.add_enabled(signed && iso_on, egui::Slider::new(iso, 0.02..=0.9).logarithmic(true).text(if spin { "iso (× the spin scale)" } else { "iso (× max|ψ|)" }))
-            .on_hover_text("the ± isosurface (View ▸ How it looks ▸ render as isosurface, or the Isosurface switch in the view): surfaces at ±iso times the field's scale. For an orbital the scale is the largest |ψ| over its degenerate set");
+    fold(ui, st, Section::About, "About orbitals", None, false, "about", |ui, st| {
+        super::group(ui, st, "d-orb-about", |ui, _| {
+            for (head, text) in ABOUT {
+                ui.label(RichText::new(*head).size(11.5).strong().color(theme::INK));
+                ui.add(egui::Label::new(RichText::new(*text).size(11.0).color(theme::INK_DIM)).wrap());
+                ui.add_space(3.0);
+            }
+        });
     });
-    super::group(ui, st, "d-orb-colour", |ui, st| {
-        ui.add_enabled_ui(st.show == ShowMode::Coloured, |ui| {
-            // boundary surfaces (user request 2026-10-19): each orbital as the region enclosing a
-            // share of its probability, a shell just inside it (the default) or filled; or the density
-            let mut look = st.colour_look;
-            ui.horizontal(|ui| {
-                ui.label("draw");
-                let now = match look.enclose {
-                    None => 2,
-                    Some(_) if look.shell => 0,
-                    Some(_) => 1,
-                };
-                if let Some(m) = theme::segmented(ui, now, &[
-                    (0, "shell", "each orbital's boundary surface: a thin shell just inside the surface that encloses the chosen share of its probability — the textbook picture, hollow inside"),
-                    (1, "filled", "each orbital's whole region inside that surface, evenly filled"),
-                    (2, "density", "each orbital by its density, fading out smoothly (no boundary)"),
-                ]) {
-                    let pct = look.enclose.unwrap_or(90);
-                    (look.enclose, look.shell) = match m {
-                        0 => (Some(pct), true),
-                        1 => (Some(pct), false),
-                        _ => (None, look.shell),
-                    };
-                }
-            });
-            if let Some(mut pct) = look.enclose {
-                let r = ui.add(egui::Slider::new(&mut pct, 50..=99).suffix(" %").text("enclosed"))
-                    .on_hover_text("the share of each orbital's probability inside its surface (textbooks use 90 %): higher draws bigger, fuzzier-edged lobes");
-                // one request when the slider is let go (or clicked), not one per step of a drag
-                if pct != look.enclose.unwrap_or(90) && (r.drag_stopped() || !r.dragged()) {
-                    look.enclose = Some(pct);
+}
+
+/// The About orbitals fold: every honesty text of the tab in full (rule 7).
+pub const ABOUT: &[(&str, &str)] = &[
+    ("What an orbital is", KS_NOTE),
+    ("Spin", SPIN_NOTE),
+    ("The HOMO", HOMO_TIP),
+    ("Unoccupied orbitals and the gap", GAP_TIP),
+    ("Why some are states of the box", UNOCCUPIED_TIP),
+    ("A state of the box", BOX_STATE_TIP),
+    ("The colours of a phase surface", SIGN_TIP),
+    ("↑↓ pairs", PAIRED_TIP),
+];
+
+/// The view card: the `show` selector, the controls of the mode on screen only, the one-line note.
+fn view_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+    egui::Frame::new().fill(theme::PANEL_2).stroke(egui::Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut rects = Vec::new();
+        if let Some(m) = show_selector_at(ui, st.show, &mut st.hide_cloud, "show", &mut rects) {
+            acts.push(Action::Show(m));
+        }
+        ui.add_space(4.0);
+        mode_controls(ui, st, payload, acts);
+        // the controls of the other modes: Ctrl K points at the mode that has them
+        for (anchor, mode) in MODE_ANCHORS {
+            if !anchor_in_mode(anchor, st) {
+                if let Some((_, r)) = rects.iter().find(|(m, _)| *m == mode) {
+                    super::super::search::mark(ui, st, anchor, *r);
                 }
             }
-            ui.checkbox(&mut look.hide_core, "hide core orbitals").on_hover_text(format!(
+        }
+        ui.add_space(2.0);
+        let short = if st.show == ShowMode::Spin { SPIN_SHORT } else { KS_SHORT };
+        let r = ui.add(egui::Label::new(RichText::new(short).size(11.0).color(theme::INK_DIM)).truncate()).on_hover_text(format!("{KS_NOTE} {SPIN_NOTE}"));
+        super::super::probe("orbitals-ks-note", &r);
+        if let Some(l) = &input.orbital_label {
+            ui.add(egui::Label::new(RichText::new(l).color(super::super::AMBER)).wrap());
+        }
+    });
+}
+
+/// Only the controls of the mode on screen (no greyed controls of the others).
+fn mode_controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+    if st.hide_cloud {
+        theme::note(ui, "no electron cloud: only the atoms, their bonds and labels — pick a mode to show one");
+        return;
+    }
+    match st.show {
+        ShowMode::Density => {
+            ui.add(egui::Label::new(RichText::new("the total electron density. Pick Orbitals, All orbitals coloured or Spin density to see the Kohn–Sham orbitals; they need a DFT step").size(11.0).color(theme::INK_DIM)).wrap());
+        }
+        ShowMode::Orbitals => {
+            super::group(ui, st, "d-orb-style", |ui, st| {
+                ui.horizontal(|ui| {
+                    ui.label("draw as");
+                    if let Some(p) = theme::segmented(ui, st.orbital_phase, &[(true, "phase ±", SIGN_TIP), (false, "|ψ|²", "the orbital squared: where the electron in this orbital is likely to be, with the density's colour ramp")]) {
+                        acts.push(Action::OrbitalPhase(p));
+                    }
+                });
+            });
+            render_row(ui, st, false, acts);
+        }
+        ShowMode::Spin => render_row(ui, st, true, acts),
+        ShowMode::Coloured => coloured_controls(ui, st, payload, acts),
+    }
+}
+
+/// Render as volume / isosurface / dots (the View panel's control, the same `Action`), then the
+/// iso slider while the ± isosurface is drawn.
+fn render_row(ui: &mut Ui, st: &mut UiState, spin: bool, acts: &mut Vec<Action>) {
+    use super::super::{VOLUME_DOTS, VOLUME_ISO, VOLUME_VOLUME};
+    let r = ui.horizontal(|ui| {
+        ui.label("render");
+        let ori = "volume / isosurface: a glowing volume with the sign's colour, or the ± isosurface. Dots: random samples of the field (the View panel's render as)";
+        if let Some(m) = theme::segmented(ui, st.volume_mode, &[(VOLUME_VOLUME, "volume", ori), (VOLUME_ISO, "isosurface", ori), (VOLUME_DOTS, "dots", "random samples of the field, ∝ |ψ|² or |m| per cell: dots are samples of where an electron is likely to be — not electrons")]) {
+            acts.push(Action::VolumeMode(m));
+        }
+    });
+    super::super::probe_rect("orbitals-render", r.response.rect);
+    let signed = spin || st.orbital_phase;
+    if signed && st.volume_mode == VOLUME_ISO {
+        super::group(ui, st, "d-orb-iso", |ui, st| {
+            let iso = if spin { &mut st.spin_iso } else { &mut st.phase_iso };
+            let s = ui
+                .add(egui::Slider::new(iso, 0.02..=0.9).logarithmic(true).text(if spin { "iso (× the spin scale)" } else { "iso (× max|ψ|)" }))
+                .on_hover_text("the ± isosurface: surfaces at ±iso times the field's scale. For an orbital the scale is the largest |ψ| over its degenerate set");
+            super::super::probe("orbitals-iso", &s);
+        });
+    } else {
+        // the iso level is reached through render: isosurface
+        super::super::search::mark(ui, st, "d-orb-iso", r.response.rect);
+    }
+}
+
+/// All orbitals coloured: draw, enclosed %, blend (and the include reset) on the first lines; hide
+/// core orbitals, the quick presets and the scale under "more".
+fn coloured_controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+    super::group(ui, st, "d-orb-colour", |ui, st| {
+        // boundary surfaces (user request 2026-10-19): each orbital as the region enclosing a
+        // share of its probability, a shell just inside it (the default) or filled; or the density
+        let mut look = st.colour_look;
+        ui.horizontal(|ui| {
+            ui.label("draw");
+            let now = match look.enclose {
+                None => 2,
+                Some(_) if look.shell => 0,
+                Some(_) => 1,
+            };
+            if let Some(m) = theme::segmented(ui, now, &[
+                (0, "shell", "each orbital's boundary surface: a thin shell just inside the surface that encloses the chosen share of its probability — the textbook picture, hollow inside"),
+                (1, "filled", "each orbital's whole region inside that surface, evenly filled"),
+                (2, "density", "each orbital by its density, fading out smoothly (no boundary)"),
+            ]) {
+                let pct = look.enclose.unwrap_or(90);
+                (look.enclose, look.shell) = match m {
+                    0 => (Some(pct), true),
+                    1 => (Some(pct), false),
+                    _ => (None, look.shell),
+                };
+            }
+        });
+        if let Some(mut pct) = look.enclose {
+            let r = ui
+                .add(egui::Slider::new(&mut pct, 50..=99).suffix(" %").text("enclosed"))
+                .on_hover_text("the share of each orbital's probability inside its surface (textbooks use 90 %): higher draws bigger, fuzzier-edged lobes");
+            super::super::probe("orbitals-enclosed", &r);
+            // one request when the slider is let go (or clicked), not one per step of a drag
+            if pct != look.enclose.unwrap_or(90) && (r.drag_stopped() || !r.dragged()) {
+                look.enclose = Some(pct);
+            }
+        }
+        if look != st.colour_look {
+            acts.push(Action::ColourLook(look));
+        }
+        let r = ui.horizontal(|ui| {
+            ui.label("blend");
+            if let Some(a) = theme::segmented(ui, st.colour_additive, &[(true, "additive", "emission only: inner shells shine through the outer ones"), (false, "weighted", "emission–absorption: the front shell hides what is behind it")]) {
+                acts.push(Action::ColourBlend { additive: a });
+            }
+        });
+        super::super::probe_rect("orbitals-blend", r.response.rect);
+        if st.included.is_some() && super::super::probed("include-reset", ui.small_button("include every occupied orbital")).clicked() {
+            acts.push(Action::IncludeAllOccupied);
+        }
+    });
+    let summary = format!("{}{} · quick presets", if st.colour_look.hide_core { "core hidden · " } else { "" }, if st.colour_physical { "physical scale" } else { "each to its peak" });
+    fold(ui, st, Section::More, "more", Some((summary, theme::INK_FAINT)), true, "more", |ui, st| {
+        super::group(ui, st, "d-orb-colour-more", |ui, st| {
+            let mut look = st.colour_look;
+            let r = ui.checkbox(&mut look.hide_core, "hide core orbitals").on_hover_text(format!(
                 "leave out the inner-shell orbitals (more than {} Ha below the highest occupied one, e.g. Li's 1s) so the valence lobes show; a pseudised atom has none",
                 sim::CORE_GAP
             ));
+            super::super::probe("orbitals-hide-core", &r);
             if look != st.colour_look {
                 acts.push(Action::ColourLook(look));
             }
-            // the presets only where they act (they would push the list down in the other modes)
-            if st.show == ShowMode::Coloured {
-                presets(ui, st, payload, acts);
-            }
-            ui.horizontal(|ui| {
-                ui.label("blend");
-                if let Some(a) = theme::segmented(ui, st.colour_additive, &[(true, "additive", "emission only: inner shells shine through the outer ones"), (false, "weighted", "emission–absorption: the front shell hides what is behind it")]) {
-                    acts.push(Action::ColourBlend { additive: a });
-                }
-            });
-            ui.add_enabled_ui(st.colour_look.enclose.is_none(), |ui| ui.horizontal(|ui| {
-                ui.label("scale");
-                if let Some(p) = theme::segmented(ui, st.colour_physical, &[(false, "each to its peak", "each orbital scaled to its own peak: every shell equally visible"), (true, "physical", "scaled by the total density's maximum: summed over the orbitals the opacity is the density, and the hue is which orbital dominates locally")]) {
-                    acts.push(Action::ColourScale { physical: p });
-                }
-            }));
-            let note = if st.colour_physical { "physical scale: hue = which orbital dominates; opacity = the density" } else { "each orbital scaled to its own peak" };
-            theme::note(ui, note);
-            if st.included.is_some() && super::super::probed("include-reset", ui.small_button("include every occupied orbital")).clicked() {
-                acts.push(Action::IncludeAllOccupied);
-            }
-        });
-    });
-    super::group(ui, st, "d-orb-unocc", |ui, st| {
-        ui.add_enabled_ui(matches!(st.show, ShowMode::Orbitals | ShowMode::Coloured), |ui| {
-            let mut m = st.unoccupied;
-            let r = ui.add(egui::Slider::new(&mut m, 0..=UNOCCUPIED_MAX).text("show unoccupied (m per spin)")).on_hover_text(UNOCCUPIED_TIP);
-            super::super::probe("unoccupied", &r);
-            // one request when the slider is let go (or clicked), not one per step of a drag
-            if m != st.unoccupied && (r.drag_stopped() || !r.dragged()) {
-                acts.push(Action::Unoccupied(m));
-            }
-            let status = payload.and_then(|o| o.unoccupied.as_ref());
-            // while a change is pending the slider shows the new value; the lines speak of the request
-            for l in unoccupied_lines(st.orbital_request().unoccupied, status, waiting) {
-                ui.add(egui::Label::new(RichText::new(l).size(11.5).color(theme::INK_DIM)).wrap());
+            presets(ui, st, payload, acts);
+            if st.colour_look.enclose.is_none() {
+                let r = ui.horizontal(|ui| {
+                    ui.label("scale");
+                    if let Some(p) = theme::segmented(ui, st.colour_physical, &[(false, "each to its peak", "each orbital scaled to its own peak: every shell equally visible"), (true, "physical", "scaled by the total density's maximum: summed over the orbitals the opacity is the density, and the hue is which orbital dominates locally")]) {
+                        acts.push(Action::ColourScale { physical: p });
+                    }
+                });
+                super::super::probe_rect("orbitals-scale", r.response.rect);
+                theme::note(ui, if st.colour_physical { "physical scale: hue = which orbital dominates; opacity = the density" } else { "each orbital scaled to its own peak" });
+            } else {
+                theme::note(ui, "scale (each to its peak / physical) applies when draw is density");
             }
         });
     });
@@ -1062,171 +1322,568 @@ pub fn preset_tip(p: super::super::ColourPreset) -> String {
     }
 }
 
-/// The list: a heading per channel, a line per orbital and its tags, then the notes. With usable
-/// shares ([`grouped`]) the rows go under a heading per [`Group`], each group keeping the channel
-/// structure (one ↑↓ list for a closed shell, else ↑ then ↓) and the occupied / unoccupied split.
-fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, li: &ListInput<'_>, acts: &mut Vec<Action>) {
-    super::group(ui, st, "d-orb-list", |ui, st| {
-        ui.horizontal_wrapped(|ui| {
-            theme::section(ui, "Orbitals");
-            theme::info(ui, format!("label · spin · ε (Ha) · ε (eV) · occupation · largest atom share (in a molecule) · tags. {KS_NOTE} {HOMO_TIP}"));
+// ---- the entries: one per spatial orbital ----
+
+/// One spatial orbital of the list and the diagram: a row, or a closed shell's ↑↓ pair
+/// ([`paired`]; `partner` is the ↓ member, `r` the ↑ one).
+#[derive(Clone, Copy, Debug)]
+pub struct Entry<'a> {
+    pub r: &'a OrbitalInfo,
+    pub partner: Option<&'a OrbitalInfo>,
+}
+
+impl Entry<'_> {
+    /// "↑↓" for a pair, else the row's channel.
+    pub fn arrows(&self) -> &'static str {
+        if self.partner.is_some() { "↑↓" } else { arrow(self.r.spin) }
+    }
+
+    /// The occupation (a pair's summed).
+    pub fn occupation(&self) -> f64 {
+        self.r.occupation + self.partner.map_or(0.0, |d| d.occupation)
+    }
+
+    /// A state of the box (either member of a pair).
+    pub fn box_state(&self) -> bool {
+        self.r.box_state || self.partner.is_some_and(|d| d.box_state)
+    }
+
+    /// What the list shows for it.
+    pub fn view(&self, levels: &Levels) -> RowView {
+        match self.partner {
+            Some(d) => RowView::pair(self.r, d, levels),
+            None => RowView::of(self.r, levels),
+        }
+    }
+
+    /// Whether the orbital on screen is this one (either member of a pair).
+    pub fn picked(&self, picked: Option<(Spin, u32)>) -> bool {
+        picked == Some((self.r.spin, self.r.track)) || self.partner.is_some_and(|d| picked == Some((d.spin, d.track)))
+    }
+}
+
+/// The payload's entries: one per ↑↓ pair for a closed shell ([`paired`]; `false` returned), else
+/// the ↑ rows then the ↓ rows in energy order (`true`: the channels are split).
+pub fn entries(o: &OrbitalDisplay) -> (bool, Vec<Entry<'_>>) {
+    let [up, dn] = channels(&o.rows);
+    if paired(&o.rows, &o.spin) {
+        (false, merged(&up, &dn).into_iter().map(|(r, partner)| Entry { r, partner }).collect())
+    } else {
+        (true, up.into_iter().chain(dn).map(|r| Entry { r, partner: None }).collect())
+    }
+}
+
+/// The orbital the payload on screen shows, if one.
+fn picked_of(o: &OrbitalDisplay) -> Option<(Spin, u32)> {
+    match &o.what {
+        OrbitalRequest::Orbital { spin, track, .. } => Some((*spin, *track)),
+        _ => None,
+    }
+}
+
+// ---- the energy-level diagram ----
+
+/// One orbital's line in the diagram: its entry (an index into the entries given), its column
+/// (0, or 1 for the ↓ channel when the channels are split), its y (points down from the top) and
+/// x span (from the columns' left edge), and whether it is a state of the box (drawn faded above
+/// the dashed line).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LevelLine {
+    pub entry: usize,
+    pub column: usize,
+    pub y: f32,
+    pub x0: f32,
+    pub x1: f32,
+    pub boxed: bool,
+}
+
+/// The diagram's geometry ([`level_layout`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LevelLayout {
+    pub columns: usize,
+    pub lines: Vec<LevelLine>,
+    /// The dashed "box states" line's y, when there are box states.
+    pub dashed: Option<f32>,
+    /// The ys where the energy axis is broken (a gap too wide to draw to scale: core levels).
+    pub breaks: Vec<f32>,
+    pub height: f32,
+    pub homo_y: Option<f32>,
+    pub lumo_y: Option<f32>,
+}
+
+/// Top margin (room for the column heads and a LUMO label pushed up).
+const TOP: f32 = 22.0;
+/// The smallest and largest spacing of two levels (points): closer levels stay apart, a gap wider
+/// than `GAP_CAP` is drawn broken.
+const MIN_PX: f32 = 9.0;
+const GAP_CAP: f32 = 44.0;
+/// Spacing of the box states above the dashed line (not to scale: their energies are the box's).
+const BOX_PX: f32 = 11.0;
+
+/// The y of each energy, highest on top: the gaps between the distinct energies drawn to one
+/// scale, each clamped to [`MIN_PX`]…[`GAP_CAP`], the scale chosen so the levels fill `target`
+/// points; returns the ys (0 at the highest), the breaks and the height used.
+fn energy_axis(energies: &[f64], target: f32) -> (Vec<f32>, Vec<f32>, f32) {
+    let mut v: Vec<f64> = energies.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    v.dedup_by(|a, b| (*a - *b).abs() <= SAME_LEVEL);
+    let gaps: Vec<f64> = v.windows(2).map(|w| w[1] - w[0]).collect();
+    let span = |s: f64| -> f32 { gaps.iter().map(|g| ((g * s) as f32).clamp(MIN_PX, GAP_CAP)).sum() };
+    // bisection on log s for span(s) = target (monotone; it saturates at the clamps)
+    let (mut lo, mut hi) = (1e-3_f64.ln(), 1e7_f64.ln());
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if span(mid.exp()) < target {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    let s = hi.exp();
+    // heights from the bottom up, then flipped
+    let mut up = vec![0.0f32; v.len()];
+    let mut breaks_up = Vec::new();
+    for (i, g) in gaps.iter().enumerate() {
+        let px = (g * s) as f32;
+        let d = px.clamp(MIN_PX, GAP_CAP);
+        if px > GAP_CAP * 1.01 {
+            breaks_up.push(up[i] + d / 2.0);
+        }
+        up[i + 1] = up[i] + d;
+    }
+    let height = up.last().copied().unwrap_or(0.0);
+    let y_of = |e: f64| -> f32 {
+        let k = v.iter().enumerate().min_by(|a, b| (a.1 - e).abs().total_cmp(&(b.1 - e).abs())).map_or(0, |p| p.0);
+        height - up.get(k).copied().unwrap_or(0.0)
+    };
+    (energies.iter().map(|&e| y_of(e)).collect(), breaks_up.into_iter().map(|b| height - b).collect(), height)
+}
+
+/// The levels of one column: the entries (indices) in energy order, degenerate ones together —
+/// within [`SAME_LEVEL`], or members of one degenerate set (`OrbitalInfo::cluster`) within its spread.
+fn column_levels(entries: &[Entry<'_>], members: &[usize]) -> Vec<Vec<usize>> {
+    let mut m: Vec<usize> = members.to_vec();
+    m.sort_by(|&a, &b| entries[a].r.energy.total_cmp(&entries[b].r.energy));
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for i in m {
+        let r = entries[i].r;
+        let joins = out.last().is_some_and(|lvl| {
+            let first = entries[lvl[0]].r;
+            let d = r.energy - first.energy;
+            d <= SAME_LEVEL || matches!((r.cluster, first.cluster), (Some((n, s)), Some((n2, _))) if n == n2 && d <= s + SAME_LEVEL)
         });
-        let Some(o) = payload else {
-            theme::note(ui, "needs a DFT step");
-            return;
-        };
-        let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
-        if let Some(l) = levels_line(&levels) {
-            ui.add(egui::Label::new(RichText::new(l).monospace().size(11.0)).wrap()).on_hover_text(format!("{HOMO_TIP}. {GAP_TIP}"));
+        match out.last_mut() {
+            Some(lvl) if joins => lvl.push(i),
+            _ => out.push(vec![i]),
         }
-        // the warnings that qualify the list sit with it, above the rows (not below the fold)
-        if let Some(l) = lone_atom_line(o.lone_atom) {
-            let r = ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap());
-            if levels.inverted {
-                r.on_hover_text(HOMO_INVERTED_TIP);
-            }
+    }
+    out
+}
+
+/// Lay out the diagram for `entries` (split: ↑ and ↓ columns, else one merged column) in columns
+/// `col_w` points wide; `target` is the height the bound levels should fill.
+pub fn level_layout(entries: &[Entry<'_>], split: bool, levels: &Levels, col_w: f32, target: f32) -> LevelLayout {
+    let columns = if split { 2 } else { 1 };
+    let col_of = |e: &Entry<'_>| if split && e.r.spin == Spin::Down { 1 } else { 0 };
+    let mean = |lvl: &[usize]| lvl.iter().map(|&i| entries[i].r.energy).sum::<f64>() / lvl.len() as f64;
+    let mut bound: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut boxed: Vec<(usize, Vec<usize>)> = Vec::new();
+    for c in 0..columns {
+        let (b, n): (Vec<usize>, Vec<usize>) = (0..entries.len()).filter(|&i| col_of(&entries[i]) == c).partition(|&i| entries[i].box_state());
+        bound.extend(column_levels(entries, &n).into_iter().map(|l| (c, l)));
+        boxed.extend(column_levels(entries, &b).into_iter().map(|l| (c, l)));
+    }
+    // the box band: its levels in energy order, BOX_PX apart (the columns share the steps)
+    let mut box_e: Vec<f64> = boxed.iter().map(|(_, l)| mean(l)).collect();
+    box_e.sort_by(|a, b| a.total_cmp(b));
+    box_e.dedup_by(|a, b| (*a - *b).abs() <= SAME_LEVEL);
+    let band = if box_e.is_empty() { 0.0 } else { box_e.len() as f32 * BOX_PX + 8.0 };
+    let energies: Vec<f64> = bound.iter().map(|(_, l)| mean(l)).collect();
+    let (ys, breaks, h) = energy_axis(&energies, target);
+    let base = TOP + band;
+    let mut lines = Vec::new();
+    let place = |c: usize, lvl: &[usize], y: f32, is_box: bool, lines: &mut Vec<LevelLine>| {
+        let k = lvl.len() as f32;
+        let w = ((col_w - 6.0 - (k - 1.0) * 4.0) / k).min(44.0);
+        let total = k * w + (k - 1.0) * 4.0;
+        let x = c as f32 * col_w + (col_w - total) / 2.0;
+        for (j, &i) in lvl.iter().enumerate() {
+            let x0 = x + j as f32 * (w + 4.0);
+            lines.push(LevelLine { entry: i, column: c, y, x0, x1: x0 + w, boxed: is_box });
         }
-        if let Some(l) = smeared_molecule_line(o.lone_atom, li.z_sigma) {
-            ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap()).on_hover_text(SMEARED_MOLECULE_TIP);
+    };
+    for ((c, lvl), y) in bound.iter().zip(&ys) {
+        place(*c, lvl, base + y, false, &mut lines);
+    }
+    for (c, lvl) in &boxed {
+        let e = mean(lvl);
+        let k = box_e.iter().position(|x| (x - e).abs() <= SAME_LEVEL).unwrap_or(0);
+        place(*c, lvl, TOP + band - 8.0 - (k as f32 + 0.5) * BOX_PX, true, &mut lines);
+    }
+    let y_where = |want: &dyn Fn(&OrbitalInfo) -> bool| lines.iter().filter(|l| want(entries[l.entry].r) || entries[l.entry].partner.is_some_and(want)).map(|l| l.y).reduce(f32::min);
+    let homo_y = y_where(&|r: &OrbitalInfo| levels.is_homo(r));
+    let lumo_y = y_where(&|r: &OrbitalInfo| levels.is_lumo(r));
+    LevelLayout {
+        columns,
+        dashed: (!box_e.is_empty()).then_some(TOP + band - 4.0),
+        breaks: breaks.into_iter().map(|b| base + b).collect(),
+        height: base + h + 10.0,
+        homo_y,
+        lumo_y,
+        lines,
+    }
+}
+
+/// An occupation as the diagram labels it: thirds, halves and quarters as fractions ("1/3",
+/// "2/3", "1/2"), else two places.
+pub fn fraction_text(f: f64) -> String {
+    for (num, den) in [(1, 3), (2, 3), (1, 2), (4, 3), (5, 3), (1, 4), (3, 4)] {
+        if (f - num as f64 / den as f64).abs() < 1e-6 {
+            return format!("{num}/{den}");
         }
-        if o.rows.is_empty() {
-            theme::note(ui, "no electrons — nothing to show");
-        }
-        let by_atom = grouped(o, li.scene_z);
-        let picked = match &o.what {
-            OrbitalRequest::Orbital { spin, track, .. } => Some((*spin, *track)),
-            _ => None,
-        };
-        let unocc_current = o.unoccupied.as_ref().is_none_or(|u| u.current);
-        let [up, dn] = channels(&o.rows);
-        if paired(&o.rows, &o.spin) {
-            // a closed shell: one row per ↑↓ pair instead of two identical blocks (user request
-            // 2026-11-11); any difference between the spins splits the list again
-            let n_occ = up.iter().filter(|r| r.occupation > 0.0).count();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("↑↓ paired · {n_occ} occupied")).strong());
-                theme::info(ui, PAIRED_TIP);
-            });
-            let pairs = merged(&up, &dn);
-            // by atom (user request 2026-11-12), a pair placed by its ↑ member's shares
-            let ups: Vec<&OrbitalInfo> = pairs.iter().map(|(u, _)| *u).collect();
-            let blocks: Vec<(Option<Owner>, usize, Vec<usize>)> = if by_atom {
-                groups(&ups, li.scene_z, unocc_current).into_iter().map(|g| (Some(g.owner), g.others, g.rows)).collect()
-            } else {
-                vec![(None, 0, (0..pairs.len()).collect())]
-            };
-            for (owner, others, members) in blocks {
-                if let Some(owner) = &owner {
-                    group_heading(ui, owner, others, li.scene_z);
-                }
-                let mut shown_unocc = false;
-                for i in members {
-                    let (u, d) = pairs[i];
-                    if u.occupation == 0.0 && !shown_unocc {
-                        shown_unocc = true;
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("↑↓ unoccupied").color(theme::INK_DIM));
-                            theme::info(ui, UNOCCUPIED_TIP);
+    }
+    occupation_text(f)
+}
+
+/// The hover of a level or a row: "label · ε (Ha, eV) · occupation", the atom share, the tags.
+fn entry_tip(e: &Entry<'_>, v: &RowView, share: Option<&str>) -> String {
+    let mut t = format!("{} {} · ε {} Ha ({} eV) · occupation {}", v.label, e.arrows(), v.ha, v.ev, v.occupation);
+    if let Some(s) = share {
+        t += &format!("\n{s}");
+    }
+    for tag in &v.tags {
+        t += &format!("\n{}", tag.text);
+    }
+    t += "\nClick to show it.";
+    t
+}
+
+/// The energy-level section: its header ("ENERGY LEVELS · water", the unoccupied count), the
+/// unoccupied lines and the payload's notes, the warnings that qualify the levels, then the diagram.
+fn levels_section(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, waiting: bool, name: &str, li: &ListInput<'_>, acts: &mut Vec<Action>) -> egui::Rect {
+    let r = ui.scope(|ui| {
+        super::group(ui, st, "d-orb-levels", |ui, st| {
+            let unocc_here = anchor_in_mode("d-orb-unocc", st);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if unocc_here {
+                        super::group(ui, st, "d-orb-unocc", |ui, st| {
+                            let mut m = st.unoccupied;
+                            let r = ui
+                                .add(egui::DragValue::new(&mut m).range(0..=UNOCCUPIED_MAX).prefix("empty shown: "))
+                                .on_hover_text(format!("show unoccupied (m per spin, 0–{UNOCCUPIED_MAX}). {UNOCCUPIED_TIP}"));
+                            super::super::probe("unoccupied", &r);
+                            // one request when the drag is let go (or a value typed), not one per step of a drag
+                            if m != st.unoccupied && (r.drag_stopped() || !r.dragged()) {
+                                acts.push(Action::Unoccupied(m));
+                            }
                         });
                     }
-                    // either member picked shows the pair as selected
-                    let on = picked == Some((u.spin, u.track)) || d.is_some_and(|d| picked == Some((d.spin, d.track)));
-                    let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, u.shares.as_deref(), li.scene_z, li.selected));
-                    row(ui, st, u, d, &levels, on, &place, acts);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(theme::caps(&format!("Energy levels · {name}"))).truncate());
+                    });
+                });
+            });
+            if unocc_here {
+                let status = payload.and_then(|o| o.unoccupied.as_ref());
+                // while a change is pending the count shows the new value; the lines speak of the request
+                for l in unoccupied_lines(st.orbital_request().unoccupied, status, waiting) {
+                    ui.add(egui::Label::new(RichText::new(l).size(11.0).color(theme::INK_DIM)).wrap());
                 }
             }
-        } else {
-            let channel_line = |ui: &mut Ui, spin: Spin, rows: &[&OrbitalInfo]| {
-                let n_occ = rows.iter().filter(|r| r.occupation > 0.0).count();
+            let Some(o) = payload else {
+                theme::note(ui, "needs a DFT step");
+                return;
+            };
+            for n in visible_notes(o, st.orbital_pick_adopted) {
+                ui.add(egui::Label::new(RichText::new(n).size(11.0).color(super::super::AMBER)).wrap());
+            }
+            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            // the warnings that qualify the levels sit above them
+            if let Some(l) = lone_atom_line(o.lone_atom) {
+                let r = ui.add(egui::Label::new(RichText::new(l).size(11.0).color(super::super::AMBER)).wrap());
+                if levels.inverted {
+                    r.on_hover_text(HOMO_INVERTED_TIP);
+                }
+            }
+            if let Some(l) = smeared_molecule_line(o.lone_atom, li.z_sigma) {
+                ui.add(egui::Label::new(RichText::new(l).size(11.0).color(super::super::AMBER)).wrap()).on_hover_text(SMEARED_MOLECULE_TIP);
+            }
+            if o.rows.is_empty() {
+                theme::note(ui, "no electrons — nothing to show");
+                return;
+            }
+            diagram(ui, o, &levels, li, acts);
+        });
+    });
+    super::super::probe_rect("orbitals-levels", r.response.rect);
+    r.response.rect
+}
+
+/// The diagram's gutter (the ε axis) and label column (HOMO, LUMO, the gap) widths.
+const AXIS_W: f32 = 22.0;
+const LABELS_W: f32 = 104.0;
+
+/// The diagram, painted: the ε axis (broken where a gap is too wide), one line per orbital in its
+/// colour, degenerate ones side by side, ↑/↓ on the occupied ones (a fraction labelled), HOMO and
+/// LUMO with ε, the Kohn–Sham gap bracket (none for a partly filled shell), the box states faded
+/// above a dashed line. A click on a line picks that orbital, as its row does.
+fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>, acts: &mut Vec<Action>) {
+    use egui::{pos2, vec2, Align2, FontId, Stroke};
+    let (split, es) = entries(o);
+    let w = ui.available_width().max(200.0);
+    let cols = if split { 2.0 } else { 1.0 };
+    let col_w = ((w - AXIS_W - LABELS_W) / cols).clamp(40.0, 150.0);
+    let n_bound = es.iter().filter(|e| !e.box_state()).count() as f32;
+    let target = (n_bound * 16.0).clamp(60.0, 170.0);
+    let lay = level_layout(&es, split, levels, col_w, target);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, lay.height), egui::Sense::hover());
+    let p = ui.painter_at(rect.expand(2.0));
+    let x0 = rect.left() + AXIS_W;
+    let at = |x: f32, y: f32| pos2(x0 + x, rect.top() + y);
+    // the axis, broken where a gap is not to scale
+    let ax = rect.left() + 8.0;
+    p.line_segment([pos2(ax, rect.top() + 14.0), pos2(ax, rect.bottom() - 4.0)], Stroke::new(1.0, theme::INK_FAINT));
+    p.text(pos2(ax + 3.0, rect.top() + 2.0), Align2::LEFT_TOP, "ε", FontId::proportional(10.5), theme::INK_FAINT);
+    for b in &lay.breaks {
+        let y = rect.top() + b;
+        p.rect_filled(egui::Rect::from_center_size(pos2(ax, y), vec2(9.0, 6.0)), 0.0, theme::PANEL);
+        for dy in [-2.0, 2.0] {
+            p.line_segment([pos2(ax - 4.0, y + dy + 1.0), pos2(ax + 4.0, y + dy - 1.0)], Stroke::new(1.0, theme::INK_FAINT));
+        }
+    }
+    let axis = ui.interact(egui::Rect::from_min_max(pos2(rect.left(), rect.top()), pos2(x0 - 2.0, rect.bottom())), ui.id().with("orb-axis"), egui::Sense::hover());
+    axis.on_hover_text("ε, the Kohn–Sham eigenvalue (Ha), increasing upwards: the gaps are drawn to one scale except where the axis is broken (a gap too wide to draw — the core levels); levels closer than the line spacing are drawn apart. Hover a level for its ε in Ha and eV");
+    if split {
+        for (c, s) in [(0.0, "↑"), (1.0, "↓")] {
+            p.text(at(c * col_w + col_w / 2.0, 2.0), Align2::CENTER_TOP, s, FontId::monospace(10.5), theme::INK_DIM);
+        }
+    }
+    if let Some(d) = lay.dashed {
+        let y = rect.top() + d;
+        p.extend(egui::Shape::dashed_line(&[pos2(x0, y), pos2(x0 + cols * col_w, y)], Stroke::new(1.0, super::super::AMBER.gamma_multiply(0.6)), 4.0, 3.0));
+        p.text(pos2(x0 + cols * col_w + 4.0, y), Align2::LEFT_CENTER, "box states", FontId::proportional(10.0), super::super::AMBER.gamma_multiply(0.8));
+        let r = ui.interact(egui::Rect::from_min_max(pos2(x0, y - 3.0), pos2(x0 + cols * col_w + 60.0, y + 3.0)), ui.id().with("orb-dashed"), egui::Sense::hover());
+        super::super::probe("levels-box-line", &r);
+        r.on_hover_text(format!("above the line: states of the box, faded, in their energy order but not to scale (the axis breaks here). {BOX_STATE_TIP}"));
+    }
+    let picked = picked_of(o);
+    let by_atom = grouped(o, li.scene_z);
+    for l in &lay.lines {
+        let e = es[l.entry];
+        let colour = providers::orbitals::ORBITAL_PALETTE[e.r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
+        let c = swatch(colour);
+        let c = if l.boxed { c.gamma_multiply(0.4) } else { c };
+        let line = egui::Rect::from_min_max(at(l.x0, l.y - 6.0), at(l.x1, l.y + 6.0));
+        let r = ui.interact(line, ui.id().with(("orb-level", e.r.spin == Spin::Down, e.r.track)), egui::Sense::click());
+        if e.picked(picked) {
+            p.rect_filled(line.expand(1.0), 3.0, theme::ACCENT_BG);
+        } else if r.hovered() {
+            p.rect_filled(line.expand(1.0), 3.0, theme::PANEL_3);
+        }
+        p.line_segment([pos2(line.left(), line.center().y), pos2(line.right(), line.center().y)], Stroke::new(2.5, c));
+        let occ = e.occupation();
+        if occ > 1e-9 {
+            let whole = (occ - occ.round()).abs() < 1e-9;
+            let mid = line.center();
+            if whole {
+                p.text(mid, Align2::CENTER_CENTER, e.arrows(), FontId::monospace(10.0), theme::INK);
+            } else {
+                // a partly occupied orbital: a dim arrow and its fraction (honest: not a whole electron)
+                p.text(mid - vec2(4.0, 0.0), Align2::RIGHT_CENTER, e.arrows(), FontId::monospace(10.0), theme::INK_DIM);
+                p.text(mid - vec2(3.0, 0.0), Align2::LEFT_CENTER, fraction_text(occ), FontId::proportional(8.5), theme::INK);
+            }
+        }
+        super::super::probe(&format!("level-{}-{}", e.arrows(), e.r.track), &r);
+        let v = e.view(levels);
+        let share = e.r.shares.as_deref().filter(|_| by_atom && !e.box_state()).map(|s| share_hover(s, li.scene_z));
+        let r = r.on_hover_text(entry_tip(&e, &v, share.as_deref()));
+        if r.clicked() {
+            acts.push(Action::PickOrbital { spin: e.r.spin, track: e.r.track });
+        }
+    }
+    // HOMO, LUMO and the gap, right of the columns
+    let lx = x0 + cols * col_w + 12.0;
+    let line_text = levels_line(levels).unwrap_or_default();
+    let label = |y: f32, text: String, colour: Color32, tip: String, probe: &str| {
+        let g = p.layout_no_wrap(text, FontId::proportional(10.5), colour);
+        let r = egui::Rect::from_min_size(pos2(lx, rect.top() + y - g.size().y / 2.0), g.size());
+        p.galley(r.min, g, colour);
+        let resp = ui.interact(r, ui.id().with(probe), egui::Sense::hover());
+        super::super::probe(probe, &resp);
+        resp.on_hover_text(tip);
+    };
+    if let (Some(h), Some(hy)) = (levels.homo, lay.homo_y) {
+        let warn = levels.inverted;
+        let tip = if warn { format!("{line_text}\n\n{HOMO_INVERTED_TIP}. {HOMO_TIP}") } else { format!("{line_text}\n\n{HOMO_TIP}") };
+        label(hy, format!("HOMO {} Ha", energy_ha(h)), if warn { super::super::AMBER } else { theme::INK_DIM }, tip, "levels-homo");
+        match (levels.gap(), levels.lumo, lay.lumo_y) {
+            (Some(g), Some(u), Some(uy)) => {
+                let uy_label = uy.min(hy - 26.0).max(6.0);
+                label(uy_label, format!("LUMO {} Ha", energy_ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}"), "levels-lumo");
+                // the bracket from the HOMO's line to the LUMO's
+                let bx = lx - 5.0;
+                let (ty, by) = (rect.top() + uy, rect.top() + hy);
+                let s = Stroke::new(1.0, theme::INK_FAINT);
+                p.line_segment([pos2(bx, ty), pos2(bx, by)], s);
+                p.line_segment([pos2(bx - 3.0, ty), pos2(bx, ty)], s);
+                p.line_segment([pos2(bx - 3.0, by), pos2(bx, by)], s);
+                // a gap that is the box's, unconverged or stale is not a property of the molecule (rule 7)
+                let caveat = levels.lumo_box || levels.lumo_unconverged || levels.stale;
+                let text = format!("gap {} Ha{}", minus(g, 3), if caveat { " ⚠" } else { "" });
+                let tip = format!("Kohn–Sham gap {} Ha ({} eV).\n{line_text}\n\n{GAP_TIP}", minus(g, 3), minus(units::hartree_to_ev(g), 2));
+                label((uy_label + hy) / 2.0, text, if caveat { super::super::AMBER } else { theme::INK }, tip, "levels-gap");
+            }
+            _ if levels.fractional => {
+                label(hy + 13.0, "partly filled: no gap".into(), theme::INK_FAINT, format!("{line_text}\n\n{GAP_TIP}"), "levels-gap");
+            }
+            (_, Some(u), Some(uy)) => label(uy.min(hy - 14.0).max(6.0), format!("LUMO {} Ha", energy_ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}"), "levels-lumo"),
+            _ => {}
+        }
+    }
+}
+
+// ---- the list ----
+
+/// A small inline badge (HOMO, LUMO, ×2, a fractional occupation).
+fn badge(ui: &mut Ui, text: &str, colour: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(colour.gamma_multiply(0.14))
+        .corner_radius(3)
+        .inner_margin(egui::Margin::symmetric(3, 0))
+        .show(ui, |ui| ui.label(RichText::new(text).size(9.5).color(colour)))
+        .response
+}
+
+/// The list: a heading, then one compact row per spatial orbital (box states are in their fold).
+/// With usable shares ([`grouped`]) the rows go under a heading per [`Group`], each group keeping
+/// the channel structure (one ↑↓ list for a closed shell, else ↑ then ↓) and the occupied /
+/// unoccupied split.
+fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, li: &ListInput<'_>, acts: &mut Vec<Action>) -> bool {
+    let Some(o) = payload.filter(|o| !o.rows.is_empty()) else { return false };
+    let r = ui.scope(|ui| {
+        super::group(ui, st, "d-orb-list", |ui, st| {
+            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            let by_atom = grouped(o, li.scene_z);
+            let picked = picked_of(o);
+            let unocc_current = o.unoccupied.as_ref().is_none_or(|u| u.current);
+            let (split, all) = entries(o);
+            let shown: Vec<Entry<'_>> = all.into_iter().filter(|e| !e.box_state()).collect();
+            let rows: Vec<&OrbitalInfo> = shown.iter().map(|e| e.r).collect();
+            let tip = format!("one row per spatial orbital: colour · label · badges (HOMO, LUMO, ×n degenerate, a fractional occupation; ⚠ holds the caveats, on hover) · ε in Ha (eV on hover) · largest atom share (in a molecule). {KS_NOTE} {HOMO_TIP}");
+            if !split {
+                // a closed shell: one row per ↑↓ pair (user request 2026-11-11)
+                let n_occ = shown.iter().filter(|e| e.r.occupation > 0.0).count();
+                ui.horizontal_wrapped(|ui| {
+                    theme::section(ui, "Orbitals");
+                    ui.label(RichText::new(format!("↑↓ paired · {n_occ} occupied")).size(11.0).color(theme::INK_DIM));
+                    theme::info(ui, format!("{PAIRED_TIP}\n\n{tip}"));
+                });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    theme::section(ui, "Orbitals");
+                    theme::info(ui, tip);
+                });
+            }
+            let channel_line = |ui: &mut Ui, spin: Spin, n_occ: usize| {
                 if n_occ == 0 {
-                    ui.label(RichText::new(format!("{}: none occupied", arrow(spin))).color(theme::INK_DIM));
+                    ui.label(RichText::new(format!("{}: none occupied", arrow(spin))).size(11.0).color(theme::INK_DIM));
                 } else {
-                    ui.label(RichText::new(format!("{} spin · {n_occ} occupied", arrow(spin))).strong());
+                    ui.label(RichText::new(format!("{} spin · {n_occ} occupied", arrow(spin))).size(11.0).strong());
                 }
             };
-            // one block per channel as before; by atom (user request 2026-11-12), the channels'
-            // counts first, then each group with its ↑ rows then its ↓ rows
-            let all: Vec<&OrbitalInfo> = up.iter().chain(dn.iter()).copied().collect();
+            let occ_of = |s: Spin| rows.iter().filter(|r| r.spin == s && r.occupation > 0.0).count();
+            if split && by_atom {
+                channel_line(ui, Spin::Up, occ_of(Spin::Up));
+                channel_line(ui, Spin::Down, occ_of(Spin::Down));
+            }
             let blocks: Vec<(Option<Owner>, usize, Vec<usize>)> = if by_atom {
-                channel_line(ui, Spin::Up, &up);
-                channel_line(ui, Spin::Down, &dn);
-                groups(&all, li.scene_z, unocc_current).into_iter().map(|g| (Some(g.owner), g.others, g.rows)).collect()
+                groups(&rows, li.scene_z, unocc_current).into_iter().map(|g| (Some(g.owner), g.others, g.rows)).collect()
             } else {
-                vec![(None, 0, (0..all.len()).collect())]
+                vec![(None, 0, (0..rows.len()).collect())]
             };
             for (owner, others, members) in blocks {
                 if let Some(owner) = &owner {
                     group_heading(ui, owner, others, li.scene_z);
                 }
-                for spin in [Spin::Up, Spin::Down] {
-                    let rows: Vec<&OrbitalInfo> = members.iter().map(|&i| all[i]).filter(|r| r.spin == spin).collect();
-                    match &owner {
-                        None => channel_line(ui, spin, &rows),
-                        Some(_) if rows.is_empty() => continue,
-                        Some(_) => {
-                            ui.label(RichText::new(format!("{} spin", arrow(spin))).size(11.0).color(theme::INK_DIM));
+                // a closed shell: one run of pairs; split: the ↑ rows, then the ↓ rows
+                let runs: Vec<(Option<Spin>, Vec<usize>)> = if split {
+                    [Spin::Up, Spin::Down].into_iter().map(|s| (Some(s), members.iter().copied().filter(|&i| rows[i].spin == s).collect())).collect()
+                } else {
+                    vec![(None, members)]
+                };
+                for (spin, mine) in runs {
+                    if let Some(spin) = spin {
+                        match &owner {
+                            None => channel_line(ui, spin, occ_of(spin)),
+                            Some(_) if mine.is_empty() => continue,
+                            Some(_) => {
+                                ui.label(RichText::new(format!("{} spin", arrow(spin))).size(10.5).color(theme::INK_DIM));
+                            }
                         }
                     }
                     let mut shown_unocc = false;
-                    for r in rows {
-                        if r.occupation == 0.0 && !shown_unocc {
+                    for i in mine {
+                        let e = shown[i];
+                        if e.r.occupation == 0.0 && !shown_unocc {
                             shown_unocc = true;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(format!("{} unoccupied", arrow(spin))).color(theme::INK_DIM));
-                                theme::info(ui, UNOCCUPIED_TIP);
-                            });
+                            unocc_heading(ui, &format!("{} unoccupied", spin.map_or("↑↓", arrow)));
                         }
-                        let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, r.shares.as_deref(), li.scene_z, li.selected));
-                        row(ui, st, r, None, &levels, picked == Some((r.spin, r.track)), &place, acts);
+                        let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, e.r.shares.as_deref(), li.scene_z, li.selected));
+                        row(ui, st, e, &levels, e.picked(picked), &place, acts);
                     }
                 }
             }
-        }
-        // why a molecule's list is not by atom, under the rows: the rows do not move when the
-        // shares arrive and the note goes
-        if let Some(n) = shares_note(o, li.scene_z, li.refs_pending) {
-            theme::note(ui, n);
-        }
-        if o.rows.iter().any(|r| r.occupation == 0.0) {
-            ui.add(egui::Label::new(RichText::new(GAP_TIP).size(11.0).color(theme::INK_FAINT)).wrap());
-        }
+            // why a molecule's list is not by atom, under the rows: the rows do not move when the
+            // shares arrive and the note goes
+            if let Some(n) = shares_note(o, li.scene_z, li.refs_pending) {
+                theme::note(ui, n);
+            }
+        });
+    });
+    super::super::probe_rect("orbitals-list", r.response.rect);
+    true
+}
+
+/// The small "↑↓ unoccupied" divider, its tooltip [`UNOCCUPIED_TIP`].
+fn unocc_heading(ui: &mut Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(text).size(10.5).color(theme::INK_DIM));
+        theme::info(ui, UNOCCUPIED_TIP);
     });
 }
 
 /// A group's heading in the grouped list, its tooltip saying what puts a row under it.
 fn group_heading(ui: &mut Ui, owner: &Owner, others: usize, z: &[u8]) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(heading(owner, others, z)).strong().color(theme::INK)).on_hover_text(heading_tip(owner));
+    ui.add_space(3.0);
+    ui.label(RichText::new(heading(owner, others, z)).size(11.5).strong().color(theme::INK)).on_hover_text(heading_tip(owner));
 }
 
-/// One orbital: swatch, include box (all-coloured mode), the label as the picker, ε, occupation,
-/// its largest atom share (`place`, in a molecule with shares), then its tags. With `partner` (the
-/// ↓ member of a closed shell's pair, [`paired`]; user request 2026-11-11) `r` is the ↑ member and
-/// the row stands for both: labelled `↑↓`, probed `orbital-↑↓-{↑ track}`, the occupations summed;
-/// a click picks the ↑ orbital and the include box toggles both tracks. A row the selection does
-/// not light (`place.faint`; user request 2026-11-12) is drawn in faint ink and stays clickable;
-/// its warning tags keep their amber (a caveat is never hidden), and a picked row keeps its full
-/// ink (faint text on the selection fill would be hard to read; Task 4 review, Minor 5).
-#[allow(clippy::too_many_arguments)]
-fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalInfo>, levels: &Levels, picked: bool, place: &Place, acts: &mut Vec<Action>) {
-    let v = match partner {
-        Some(d) => RowView::pair(r, d, levels),
-        None => RowView::of(r, levels),
-    };
-    let arrows = if partner.is_some() { "↑↓" } else { arrow(r.spin) };
+/// One compact row: swatch, include box (All orbitals coloured), the label as the picker, the
+/// badges (HOMO, LUMO, ×n, a fractional occupation), one ⚠ whose tooltip carries every other tag
+/// in full (amber when one warns — not converged, a box state, the box walls; dim for rotated, a
+/// grid split, the residual, a smeared nucleus), then right-aligned ε (Ha; eV on hover) and the
+/// largest atom share (`place`, in a molecule with shares). A pair (`e.partner`, a closed shell)
+/// is labelled `↑↓`, probed `orbital-↑↓-{↑ track}`; a click picks the ↑ orbital and the include
+/// box toggles both tracks. A row the selection does not light (`place.faint`) is drawn in faint
+/// ink and stays clickable; its ⚠ keeps its amber; a picked row keeps its full ink.
+fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, picked: bool, place: &Place, acts: &mut Vec<Action>) {
+    let r = e.r;
+    let v = e.view(levels);
+    let arrows = e.arrows();
     let colour = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
     let faint = place.faint && !picked;
-    // the secondary ink: dim, or faint with the rest of a row the selection does not light
     let dim = if faint { theme::INK_FAINT } else { theme::INK_DIM };
     ui.horizontal(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
         let sw = swatch(colour);
-        ui.painter().rect_filled(rect, 3.0, if faint { sw.gamma_multiply(0.35) } else { sw });
-        resp.on_hover_text(if st.show == ShowMode::Coloured { "this orbital's colour in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)" } else { "this orbital's colour in All orbitals coloured" });
+        ui.painter().rect_filled(rect, 2.5, if faint { sw.gamma_multiply(0.35) } else { sw });
+        resp.on_hover_text("this orbital's colour: its line in the diagram and in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)");
         if st.show == ShowMode::Coloured {
             // a pair's box is on while either member is drawn, and switches both
-            let mut on = included(st, r) || partner.is_some_and(|d| included(st, d));
-            let tip = match (partner.is_some(), r.occupation > 0.0) {
+            let mut on = included(st, r) || e.partner.is_some_and(|d| included(st, d));
+            let tip = match (e.partner.is_some(), r.occupation > 0.0) {
                 (_, false) => UNOCC_INCLUDE_TIP,
                 (true, true) => "include this pair (its ↑ and its ↓ orbital) in the colour volume",
                 (false, true) => "include this orbital in the colour volume",
@@ -1235,7 +1892,7 @@ fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalI
             super::super::probe(&format!("include-{}", r.track), &cb);
             if cb.changed() {
                 acts.push(Action::Include { track: r.track, on });
-                if let Some(d) = partner.filter(|d| d.track != r.track) {
+                if let Some(d) = e.partner.filter(|d| d.track != r.track) {
                     acts.push(Action::Include { track: d.track, on });
                 }
             }
@@ -1248,30 +1905,47 @@ fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, partner: Option<&OrbitalI
         if b.clicked() {
             acts.push(Action::PickOrbital { spin: r.spin, track: r.track });
         }
-        let ha = RichText::new(&v.ha).monospace();
-        ui.label(if faint { ha.color(theme::INK_FAINT) } else { ha }).on_hover_text("ε in Hartree: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow");
-        ui.label(RichText::new(&v.ev).monospace().color(dim)).on_hover_text("ε in eV (1 Ha = 27.2114 eV; converted for display only)");
-        let occ_tip = if partner.is_some() {
-            "occupation of the pair: the sum of its ↑ and its ↓ orbital's (1 + 1 = 2 for a closed shell; a fraction is a degenerate shell shared equally, summed over both spins — pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
-        } else {
-            "occupation: 1 or 0 (integer aufbau); a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
-        };
-        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(dim)).on_hover_text(occ_tip);
-        if let Some((text, hover)) = &place.share {
-            // set off from the occupation ("occ 2 · O #0 79 %": the controller's screenshot read
-            // "occ 2 O #0 79 %" as one run)
-            ui.label(RichText::new("·").monospace().color(dim));
-            let s = ui.label(RichText::new(text).monospace().color(dim)).on_hover_text(hover);
-            super::super::probe(&format!("share-{arrows}-{}", r.track), &s);
-        }
-    });
-    if !v.tags.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(18.0);
-            for t in &v.tags {
-                let c = if t.warn { super::super::AMBER } else { dim };
-                ui.label(RichText::new(&t.text).size(11.0).color(c)).on_hover_text(&t.tip);
+        let mut notes: Vec<&Tag> = Vec::new();
+        for t in &v.tags {
+            if t.text.starts_with("HOMO") {
+                let c = if t.warn { super::super::AMBER } else { theme::ACCENT_INK };
+                let b = badge(ui, if t.warn { "HOMO*" } else { "HOMO" }, c).on_hover_text(format!("{}: {}", t.text, t.tip));
+                super::super::probe(&format!("homo-{arrows}-{}", r.track), &b);
+            } else if t.text == "LUMO" {
+                let b = badge(ui, "LUMO", theme::ACCENT_INK).on_hover_text(&t.tip);
+                super::super::probe(&format!("lumo-{arrows}-{}", r.track), &b);
+            } else if let (true, Some((d, _))) = (t.text.starts_with("degenerate"), r.cluster) {
+                badge(ui, &format!("×{d}"), dim).on_hover_text(format!("{}: {}", t.text, t.tip));
+            } else {
+                notes.push(t);
             }
+        }
+        let occ = e.occupation();
+        if occ > 1e-9 && (occ - occ.round()).abs() > 1e-9 {
+            let occ_tip = if e.partner.is_some() {
+                "occupation of the pair: the sum of its ↑ and its ↓ orbital's (a fraction is a degenerate shell shared equally, summed over both spins — pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
+            } else {
+                "occupation: a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
+            };
+            badge(ui, &format!("occ {}", fraction_text(occ)), dim).on_hover_text(occ_tip);
+        }
+        if !notes.is_empty() {
+            let warn = notes.iter().any(|t| t.warn);
+            let tip = notes.iter().map(|t| format!("{} — {}", t.text, t.tip)).collect::<Vec<_>>().join("\n\n");
+            let w = ui.label(RichText::new("⚠").size(11.0).color(if warn { super::super::AMBER } else { dim })).on_hover_text(tip);
+            super::super::probe(&format!("warn-{arrows}-{}", r.track), &w);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some((text, hover)) = &place.share {
+                let s = ui.label(RichText::new(text).monospace().size(10.5).color(dim)).on_hover_text(hover);
+                super::super::probe(&format!("share-{arrows}-{}", r.track), &s);
+            }
+            let ha = RichText::new(&v.ha).monospace().size(11.5);
+            let h = ui.label(if faint { ha.color(theme::INK_FAINT) } else { ha }).on_hover_text(format!(
+                "ε = {} Ha ({} eV; 1 Ha = 27.2114 eV, converted for display only) · occupation {}: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow",
+                v.ha, v.ev, v.occupation
+            ));
+            super::super::probe(&format!("eps-{arrows}-{}", r.track), &h);
         });
-    }
+    });
 }

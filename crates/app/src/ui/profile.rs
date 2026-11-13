@@ -7,7 +7,7 @@
 //! `workspace::detached`), the view and density-look settings and which
 //! of the View panel's sections are open (`view_sections = what,looks`) and which of the Model
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
-//! (`activity_sections = trust,training`), the units, the Version
+//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
 //! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
@@ -84,6 +84,7 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("view_sections = {}\n", st.view_sections.encode());
     out += &format!("model_sections = {}\n", st.model_sections.encode());
     out += &format!("activity_sections = {}\n", st.activity_sections.encode(st.activity.training_open));
+    out += &format!("orbital_sections = {}\n", st.orbital_sections.encode());
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
@@ -149,6 +150,8 @@ pub fn apply(st: &mut UiState, text: &str) {
     let (sections, training) = kv.get("activity_sections").map_or((Default::default(), false), |v| super::activity::Sections::parse(v));
     st.activity_sections = sections;
     st.activity.training_open = training;
+    // the Orbitals panel's folds (2026-11-14); a profile from before them opens the Spin readout only
+    st.orbital_sections = kv.get("orbital_sections").map_or_else(Default::default, |v| super::dock::orbitals::Sections::parse(v));
     if let Some(v) = kv.get("layout") {
         st.workspace.close_windows();
         st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
