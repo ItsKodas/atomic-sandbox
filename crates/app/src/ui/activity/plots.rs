@@ -1,5 +1,5 @@
 //! The training plots and the event timeline (activity spec §3.3.5, §3.3.6, §9): hand-painted like
-//! the Graph tab's sparkline (egui `Painter`, no plot crate), from the views the worker built and
+//! the old Graph tab's sparkline (egui `Painter`, no plot crate), from the views the worker built and
 //! the app-side histories. Pure painters over cached vectors: nothing here asks for a solve.
 //!
 //! What the plots say, and do not say (physics honesty, spec §9):

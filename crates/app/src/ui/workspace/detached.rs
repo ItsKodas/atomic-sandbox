@@ -616,10 +616,10 @@ mod tests {
         assert_eq!(opens(&w.take_requests()), vec![(id, vec![Activity])]);
         assert!(w.take_requests().is_empty(), "asked once");
         assert_eq!(w.window_title(id), "Activity — Atomic Sandbox");
-        // the OS window closed: back to the leaf it left (beside Log and Graph), shown
+        // the OS window closed: back to the leaf it left (beside Log), shown
         w.window_closed(id);
         assert!(w.windows().is_empty());
-        assert_eq!(layout::encode(&w.to_node()), before.replace("[Log*,Activity,Graph]", "[Log,Graph,Activity*]"));
+        assert_eq!(layout::encode(&w.to_node()), before.replace("[Log*,Activity]", "[Log,Activity*]"));
         assert!(w.take_requests().is_empty(), "no Close: the window side closed it");
     }
 
@@ -631,25 +631,25 @@ mod tests {
         assert!(w.visible(Orbitals) && !w.visible(View));
         // its leaf is gone: both come back together right of the 3D view
         w.window_closed(id);
-        assert_eq!(layout::encode(&w.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,H(0.70,3D,[View*,Orbitals]),[Log*,Activity,Graph]))");
+        assert_eq!(layout::encode(&w.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,H(0.70,3D,[View*,Orbitals]),[Log*,Activity]))");
     }
 
     #[test]
     fn tabs_move_between_windows_and_back_by_the_menu() {
         let mut w = Workspace::default();
         let a = w.pop_out(&[Activity], Activity).unwrap();
-        let b = w.pop_out(&[Graph], Graph).unwrap();
+        let b = w.pop_out(&[Readouts], Readouts).unwrap();
         assert_eq!(opens(&w.take_requests()).len(), 2);
-        w.move_to_window(Graph, a);
-        assert_eq!(w.window_panels(a), vec![Activity, Graph]);
+        w.move_to_window(Readouts, a);
+        assert_eq!(w.window_panels(a), vec![Activity, Readouts]);
         assert_eq!(w.windows(), vec![a], "window {b} emptied and closed");
         assert_eq!(w.take_requests(), vec![WindowRequest::Close { id: b }]);
         w.move_to_window(Model, a);
-        assert_eq!(w.window_panels(a), vec![Activity, Graph, Model]);
+        assert_eq!(w.window_panels(a), vec![Activity, Readouts, Model]);
         w.move_to_main(&[Model]);
         assert_eq!(w.window_of(Model), None);
         assert!(layout::encode(&w.to_node()).contains("[Knowledge,Model*]"), "back beside Knowledge, shown: {}", layout::encode(&w.to_node()));
-        w.move_to_main(&[Activity, Graph]);
+        w.move_to_main(&[Activity, Readouts]);
         assert!(w.windows().is_empty());
         assert_eq!(w.take_requests(), vec![WindowRequest::Close { id: a }]);
         assert_eq!(layout::panels(&w.to_node()).len(), DockTab::PANELS.len(), "every panel back");
@@ -658,12 +658,12 @@ mod tests {
     #[test]
     fn showing_a_detached_panel_focuses_its_window_and_closing_its_last_panel_closes_it() {
         let mut w = Workspace::default();
-        let id = w.pop_out(&[Activity, Graph], Activity).unwrap();
+        let id = w.pop_out(&[Activity, Readouts], Activity).unwrap();
         w.take_requests();
-        w.show_panel(Graph);
-        assert!(w.visible(Graph) && !w.visible(Activity));
+        w.show_panel(Readouts);
+        assert!(w.visible(Readouts) && !w.visible(Activity));
         assert_eq!(w.take_requests(), vec![WindowRequest::Focus { id }]);
-        w.close_panel(Graph);
+        w.close_panel(Readouts);
         w.close_panel(Activity);
         assert!(!w.present(Activity) && w.windows().is_empty());
         assert_eq!(w.take_requests(), vec![WindowRequest::Close { id }]);
@@ -683,27 +683,27 @@ mod tests {
         assert!(w.windows().is_empty() && w.window_of(Activity).is_none());
         assert_eq!(w.take_requests(), vec![WindowRequest::Close { id }]);
         // a hidden list never takes a detached panel
-        let id = w.pop_out(&[Graph], Graph).unwrap();
-        w.set_hidden(vec![layout::Hidden { tab: Graph, edge: layout::Edge::Left, size: 300.0 }]);
-        assert_eq!((w.window_of(Graph), w.hidden().len()), (Some(id), 0));
+        let id = w.pop_out(&[Readouts], Readouts).unwrap();
+        w.set_hidden(vec![layout::Hidden { tab: Readouts, edge: layout::Edge::Left, size: 300.0 }]);
+        assert_eq!((w.window_of(Readouts), w.hidden().len()), (Some(id), 0));
     }
 
     #[test]
     fn the_window_line_round_trips() {
-        let tree = layout::parse_window("V(0.50,[Activity*],[Graph*])").unwrap();
+        let tree = layout::parse_window("V(0.50,[Activity*],[Readouts*])").unwrap();
         let r = WinRect { x: 1920, y: 0, w: 1920, h: 1040 };
         let line = encode_window(Some(r), false, &tree);
-        assert_eq!(line, "1920,0,1920,1040 V(0.50,[Activity*],[Graph*])");
+        assert_eq!(line, "1920,0,1920,1040 V(0.50,[Activity*],[Readouts*])");
         assert_eq!(parse_window(&line), Some((Some(r), false, tree.clone())));
         // maximised: `max` after the rect (review M4)
         let max = WinRect { x: 2552, y: -8, w: 1920, h: 1009 };
         let line = encode_window(Some(max), true, &tree);
-        assert_eq!(line, "2552,-8,1920,1009 max V(0.50,[Activity*],[Graph*])");
+        assert_eq!(line, "2552,-8,1920,1009 max V(0.50,[Activity*],[Readouts*])");
         assert_eq!(parse_window(&line), Some((Some(max), true, tree.clone())));
         assert_eq!(parse_window("2552,-8,1920,1009   max   [Log*]"), Some((Some(max), true, layout::parse_window("[Log*]").unwrap())));
         assert_eq!(parse_window("-1280,100,1280,1000   [Log*]"), Some((Some(WinRect { x: -1280, y: 100, w: 1280, h: 1000 }), false, layout::parse_window("[Log*]").unwrap())));
-        assert_eq!(encode_window(None, true, &tree), "V(0.50,[Activity*],[Graph*])", "no rect: no max");
-        assert_eq!(parse_window("V(0.50,[Activity*],[Graph*])"), Some((None, false, tree)));
+        assert_eq!(encode_window(None, true, &tree), "V(0.50,[Activity*],[Readouts*])", "no rect: no max");
+        assert_eq!(parse_window("V(0.50,[Activity*],[Readouts*])"), Some((None, false, tree)));
         assert_eq!(parse_window("0,0,0,0 [Log]").map(|(r, m, _)| (r, m)), Some((None, false)), "a zero size reads as unknown");
         assert_eq!(parse_window("0,0,0,0 max [Log]").map(|(r, m, _)| (r, m)), Some((None, false)), "max means nothing without a rect");
         for bad in ["", "1,2,3,4", "1,2,3,4 3D", "1,2,3,4 max", "1,2,3,4 maximal [Log]", "x,y,w,h [Bogus]", "nonsense"] {
@@ -718,24 +718,24 @@ mod tests {
         let mut w = Workspace::default();
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
-            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Activity*]").unwrap()),
-            (Some(WinRect { x: 5000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap()),
+            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Readouts*]").unwrap()),
+            (Some(WinRect { x: 5000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Activity*]").unwrap()),
         ]);
         assert_eq!(w.windows().len(), 2);
         w.set_monitors(vec![primary, second]);
         let r = w.take_requests();
-        assert_eq!(opens(&r).iter().map(|o| o.1.clone()).collect::<Vec<_>>(), vec![vec![Activity]], "only the one on a monitor opens");
-        assert_eq!(w.window_of(Graph), None);
-        assert!(layout::encode(&w.to_node()).contains("[Log,Graph*]"), "Graph docked back beside Log, its default leaf-mate: {}", layout::encode(&w.to_node()));
+        assert_eq!(opens(&r).iter().map(|o| o.1.clone()).collect::<Vec<_>>(), vec![vec![Readouts]], "only the one on a monitor opens");
+        assert_eq!(w.window_of(Activity), None);
+        assert!(layout::encode(&w.to_node()).contains("[Log,Activity*]"), "Activity docked back beside Log, its default leaf-mate: {}", layout::encode(&w.to_node()));
         assert_eq!(w.take_notes().len(), 1);
-        // unplug the second monitor: the next start docks Activity back too
+        // unplug the second monitor: the next start docks Readouts back too
         let saved = w.saved_windows();
         let mut next = Workspace::default();
         next.set_node(w.to_node());
         next.set_windows(saved);
         next.set_monitors(vec![primary]);
         assert!(opens(&next.take_requests()).is_empty() && next.windows().is_empty());
-        assert!(layout::panels(&next.to_node()).contains(&Activity));
+        assert!(layout::panels(&next.to_node()).contains(&Readouts));
     }
 
     /// A window saved maximised (`max`; the Two monitors window: its rect as Windows reports a
@@ -750,7 +750,7 @@ mod tests {
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
             (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), true, layout::parse_window("[Activity*]").unwrap()),
-            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap()),
+            (Some(WinRect { x: 2600, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Readouts*]").unwrap()),
             (Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), false, layout::parse_window("[Model*]").unwrap()),
         ]);
         w.set_monitors(vec![WinRect { x: 0, y: 0, w: 2560, h: 1440 }, second]);
@@ -773,13 +773,13 @@ mod tests {
     fn a_window_maximised_on_an_unplugged_monitor_docks_back() {
         let primary = WinRect { x: 0, y: 0, w: 2560, h: 1440 };
         let second = WinRect { x: 2560, y: 0, w: 1920, h: 1080 };
-        let saved = || vec![(Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), true, layout::parse_window("V(0.50,[Activity*],[Graph*])").unwrap())];
+        let saved = || vec![(Some(WinRect { x: 2552, y: -8, w: 1920, h: 1009 }), true, layout::parse_window("V(0.50,[Activity*],[Readouts*])").unwrap())];
         let mut w = Workspace::default();
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(saved());
         w.set_monitors(vec![primary]);
         assert!(opens(&w.take_requests()).is_empty() && w.windows().is_empty(), "docked back");
-        assert!(w.present(Activity) && w.present(Graph) && w.window_of(Activity).is_none());
+        assert!(w.present(Activity) && w.present(Readouts) && w.window_of(Activity).is_none());
         assert_eq!(w.take_notes().len(), 1);
         // both monitors connected: it stays detached
         let mut both = Workspace::default();
@@ -797,7 +797,7 @@ mod tests {
     fn an_empty_monitor_list_is_unknown() {
         let mut w = Workspace::default();
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
-        w.set_windows(vec![(Some(WinRect { x: 9000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Graph*]").unwrap())]);
+        w.set_windows(vec![(Some(WinRect { x: 9000, y: 40, w: 800, h: 900 }), false, layout::parse_window("[Readouts*]").unwrap())]);
         w.set_monitors(vec![]);
         assert_eq!(opens(&w.take_requests()).len(), 1);
         assert!(w.take_notes().is_empty());
@@ -810,17 +810,17 @@ mod tests {
     #[test]
     fn a_panel_alone_in_its_leaf_docks_back_beside_the_view() {
         let mut w = Workspace::default();
-        w.set_node(layout::parse("H(0.70,3D,V(0.50,[Log*],[Graph*]))").unwrap());
-        let id = w.pop_out(&[Graph], Graph).unwrap();
+        w.set_node(layout::parse("H(0.70,3D,V(0.50,[Log*],[Activity*]))").unwrap());
+        let id = w.pop_out(&[Activity], Activity).unwrap();
         w.window_closed(id);
-        assert_eq!(layout::encode(&w.to_node()), "H(0.70,H(0.70,3D,[Graph*]),[Log*])");
-        // the same window read from a profile: Graph has no origin, so beside Log (its default leaf-mate)
+        assert_eq!(layout::encode(&w.to_node()), "H(0.70,H(0.70,3D,[Activity*]),[Log*])");
+        // the same window read from a profile: Activity has no origin, so beside Log (its default leaf-mate)
         let mut p = Workspace::default();
         p.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
-        p.set_windows(vec![(None, false, layout::parse_window("[Graph*]").unwrap())]);
+        p.set_windows(vec![(None, false, layout::parse_window("[Activity*]").unwrap())]);
         let id = p.windows()[0];
         p.window_closed(id);
-        assert_eq!(layout::encode(&p.to_node()), "H(0.70,3D,[Log,Graph*])");
+        assert_eq!(layout::encode(&p.to_node()), "H(0.70,3D,[Log,Activity*])");
     }
 
     #[test]
@@ -828,13 +828,13 @@ mod tests {
         let mut w = Workspace::default(); // every panel in the main tree
         w.set_node(layout::parse("H(0.70,3D,[Log*])").unwrap());
         w.set_windows(vec![
-            (None, false, layout::parse_window("V(0.5,[Activity*,Log],[Graph])").unwrap()),
-            (None, false, layout::parse_window("[Graph*,Model]").unwrap()),
+            (None, false, layout::parse_window("V(0.5,[Activity*,Log],[Readouts])").unwrap()),
+            (None, false, layout::parse_window("[Readouts*,Model]").unwrap()),
             (None, false, layout::parse_window("[Log*]").unwrap()),
         ]);
         let ids = w.windows();
         assert_eq!(ids.len(), 2, "the third held only Log, already placed");
-        assert_eq!(layout::encode(&w.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Graph*])");
+        assert_eq!(layout::encode(&w.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Readouts*])");
         assert_eq!(layout::encode(&w.window_node(ids[1]).unwrap()), "[Model*]");
     }
 
@@ -843,7 +843,7 @@ mod tests {
         let (tree, hidden) = Preset::TwoMonitors.tree();
         assert!(hidden.is_empty());
         let win = Preset::TwoMonitors.window().unwrap();
-        assert_eq!(layout::encode(&win), "V(0.50,[Activity*],[Graph*])");
+        assert_eq!(layout::encode(&win), "V(0.50,[Activity*],[Readouts*])");
         let mut all = layout::panels(&tree);
         all.extend(layout::panels(&win));
         assert_eq!(all.len(), DockTab::PANELS.len());

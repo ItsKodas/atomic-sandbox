@@ -935,6 +935,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     st.view_sections = super::dock::view::Sections::all(true); // every View-panel anchor drawn
     st.model_sections = super::dock::model::Sections::all(true); // every Model-panel anchor drawn
     st.orbital_sections = super::dock::orbitals::Sections::all(true); // every Orbitals-panel anchor drawn
+    st.readouts_sections = super::dock::readouts::Sections::all(true); // every Readouts-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -5118,7 +5119,7 @@ mod activity_tab {
         st.activity.views_sent = false; // Viewer::start
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
         // hiding the panel behind another tab of its leaf turns them off again, showing it on
-        st.open_tab(DockTab::Graph);
+        st.open_tab(DockTab::Log);
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
         st.open_tab(DockTab::Activity);
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
@@ -6348,27 +6349,27 @@ fn the_workspace_shows_one_tab_per_leaf() {
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    // a tab click shows its panel, in its own leaf only (Activity and Graph are tabbed with the
-    // Log since docking Task 4)
-    click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
-    assert_eq!(shown(&st), vec![Model, Selection, View, Graph]);
+    // a tab click shows its panel, in its own leaf only (Activity is tabbed with the Log since
+    // docking Task 4)
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
+    assert_eq!(shown(&st), vec![Model, Selection, View, Activity]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Knowledge");
-    assert_eq!(shown(&st), vec![Knowledge, Selection, View, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, View, Activity]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Orbitals");
-    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Activity]);
     // open_tab shows a panel where it is
     st.open_tab(Readouts);
-    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Activity]);
     st.open_tab(Log);
     assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Log]);
     // closed, it is gone; open_tab brings it back in the right column's first leaf
-    st.workspace.close_panel(Graph);
-    assert!(!st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
-    st.open_tab(Graph);
-    assert!(st.tab_shown(Graph));
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,V(0.62,[View,Orbitals,Graph*],[Log*,Activity])))");
+    st.workspace.close_panel(Activity);
+    assert!(!st.tab_shown(Activity) && !layout::panels(&st.workspace.to_node()).contains(&Activity));
+    st.open_tab(Activity);
+    assert!(st.tab_shown(Activity));
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,V(0.62,[View,Orbitals,Activity*],[Log*])))");
     // the right column closed: a panel shown again gets a new split right of the view
-    for t in [View, Orbitals, Graph, Log, Activity] {
+    for t in [View, Orbitals, Log, Activity] {
         st.workspace.close_panel(t);
     }
     st.open_tab(Log);
@@ -6390,12 +6391,12 @@ fn the_workspace_shows_one_tab_per_leaf() {
     assert!(st.tab_shown(View) && !st.tab_shown(Orbitals));
     // the chrome renders every arrangement without a command or an error: the default, every
     // panel in one leaf, the 3D view between stacked leaves, every panel closed
-    for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,Graph,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Graph*,Readouts]))")] {
+    for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Activity*,Readouts]))")] {
         match text {
             Some(t) => st.workspace.set_node(layout::parse(t).unwrap()),
             None => st.reset_layout(),
         }
-        assert!(layout::panels(&st.workspace.to_node()).len() == 9 || text.is_some());
+        assert!(layout::panels(&st.workspace.to_node()).len() == DockTab::PANELS.len() || text.is_some());
         for w in [1400.0, 1000.0] {
             assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{text:?} at {w}");
         }
@@ -6460,7 +6461,7 @@ fn the_workspace_is_not_recorded() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let mut outs = vec![click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log")];
+    let mut outs = vec![click_widget(&ctx, &mut st, &inp, "dock-tab-Readouts"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log")];
     st.workspace.close_panel(DockTab::Log);
     outs.push(vec![frame(&ctx, &mut st, &inp, 1400.0, vec![])]);
     st.open_tab(DockTab::Log);
@@ -6533,7 +6534,7 @@ fn a_tiny_window_draws() {
     use super::workspace::layout::{Edge, Hidden};
     st.reset_layout();
     st.workspace.set_hidden(vec![]);
-    for (t, edge) in [(DockTab::Graph, Edge::Left), (DockTab::Log, Edge::Right), (DockTab::Readouts, Edge::Bottom)] {
+    for (t, edge) in [(DockTab::Activity, Edge::Left), (DockTab::Log, Edge::Right), (DockTab::Readouts, Edge::Bottom)] {
         st.workspace.close_panel(t);
         st.workspace.pin(t, false);
         let h = st.workspace.hidden().iter().position(|h| h.tab == t).unwrap();
@@ -6542,7 +6543,7 @@ fn a_tiny_window_draws() {
         st.workspace.set_hidden(all);
     }
     assert_eq!(st.workspace.hidden().len(), 3);
-    for t in [DockTab::Graph, DockTab::Log, DockTab::Readouts] {
+    for t in [DockTab::Activity, DockTab::Log, DockTab::Readouts] {
         st.open_tab(t);
         for size in [egui::vec2(320.0, 240.0), egui::vec2(1.0, 1.0), egui::vec2(320.0, 240.0)] {
             for _ in 0..3 {
@@ -6568,7 +6569,7 @@ fn a_tab_keeps_its_width_when_its_dot_comes_and_goes() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     // the Log behind another tab (on screen, it reads its count away)
-    st.workspace.set_node(super::workspace::layout::parse("H(0.70,3D,[Graph*,Log,View])").unwrap());
+    st.workspace.set_node(super::workspace::layout::parse("H(0.70,3D,[Activity*,Log,View])").unwrap());
     let probe = |name: &str| PROBES.with(|p| p.borrow()[name]);
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
@@ -6595,14 +6596,14 @@ fn the_painted_close_button_closes_its_leaf() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Activity*,Orbitals],[Log*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    let close = probed_rect("dock-close-Graph");
-    let graph = probed_rect("dock-tab-Graph");
+    let close = probed_rect("dock-close-Activity");
+    let graph = probed_rect("dock-tab-Activity");
     assert!(close.left() > graph.right() && (close.center().y - graph.center().y).abs() < 4.0, "close {close:?} at the bar's end, tab {graph:?}");
-    let outs = click_widget(&ctx, &mut st, &inp, "dock-close-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-close-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
 }
@@ -6620,7 +6621,7 @@ fn the_profile_keeps_the_layout() {
         assert!(!text.contains(old), "{old} in\n{text}");
     }
     assert_eq!(profile::defaults(&st), text, "a fresh state's profile is the defaults");
-    let custom = "V(0.30,[Log*,Graph],H(0.60,3D,[Model,View*]))";
+    let custom = "V(0.30,[Log*,Activity],H(0.60,3D,[Model,View*]))";
     st.workspace.set_node(layout::parse(custom).unwrap());
     let text = profile::capture(&st);
     let mut back = UiState::new("h2", &scene);
@@ -6654,7 +6655,7 @@ fn frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, time: f
 
 /// Spec D-10: unpinning takes a panel out of the tree onto the strip of the 3D view's edge its
 /// leaf lay beyond, remembering its size (the left column's Readouts: left, its 24 % width; the
-/// right column's Graph: right; a leaf under the view: bottom, its height); the strips are carved
+/// right column's Activity: right; a leaf under the view: bottom, its height); the strips are carved
 /// from the 3D view; `open_tab` opens its flyout at that edge (`tab_shown` while it is out); its
 /// pin docks it back beside the 3D view on that edge.
 #[test]
@@ -6677,15 +6678,15 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     let h = st.workspace.hidden()[0];
     assert_eq!((h.tab, h.edge), (Readouts, Edge::Left));
     assert!((320.0..345.0).contains(&h.size), "the left column's width, 24 % of 1400: {}", h.size);
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     assert_eq!(st.workspace.hidden()[1].edge, Edge::Right);
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity])))");
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))");
     let mut view = egui::Rect::NOTHING;
     for _ in 0..2 {
         view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
     }
     let (left, right) = (probed_rect("strip-Left"), probed_rect("strip-Right"));
-    assert!(left.contains_rect(probed_rect("strip-icon-Readouts")) && right.contains_rect(probed_rect("strip-icon-Graph")), "each on its edge's strip");
+    assert!(left.contains_rect(probed_rect("strip-icon-Readouts")) && right.contains_rect(probed_rect("strip-icon-Activity")), "each on its edge's strip");
     assert!((left.left() - tile.left()).abs() < 1.0 && (left.right() - view.left()).abs() < 1.0, "the left strip at the view's left: {left:?}, view {view:?}");
     assert!((right.right() - tile.right()).abs() < 1.0 && (right.left() - view.right()).abs() < 1.0, "{right:?}, view {view:?}");
     assert!((tile.width() - view.width() - 2.0 * super::workspace::autohide::STRIP).abs() < 1.0, "the strips are carved from the tile: {tile:?} → {view:?}");
@@ -6701,7 +6702,7 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     let outs = click_widget(&ctx, &mut st, &inp, "flyout-pin-Readouts");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
     assert_eq!(st.workspace.flyout(), None);
-    assert_eq!(st.workspace.hidden().iter().map(|h| h.tab).collect::<Vec<_>>(), vec![Graph]);
+    assert_eq!(st.workspace.hidden().iter().map(|h| h.tab).collect::<Vec<_>>(), vec![Activity]);
     let enc = layout::encode(&st.workspace.to_node());
     assert!(enc.starts_with("H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,H(") && enc.contains(",[Readouts*],3D),"), "{enc}");
     assert!(st.tab_shown(Readouts));
@@ -6723,13 +6724,13 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     st.workspace.pin(Log, true);
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,V(0.60,3D,[Log*]),[Model*])", "back where it was");
     // a closed panel unpins to the right edge; pinning a closed panel shows it
-    st.workspace.close_panel(Graph);
-    st.workspace.pin(Graph, false);
+    st.workspace.close_panel(Activity);
+    st.workspace.pin(Activity, false);
     assert_eq!(st.workspace.hidden()[0].edge, Edge::Right);
-    st.workspace.close_panel(Graph);
-    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph), "closing a hidden panel takes it off its strip");
-    st.workspace.pin(Graph, true);
-    assert!(st.tab_shown(Graph) && layout::panels(&st.workspace.to_node()).contains(&Graph));
+    st.workspace.close_panel(Activity);
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Activity), "closing a hidden panel takes it off its strip");
+    st.workspace.pin(Activity, true);
+    assert!(st.tab_shown(Activity) && layout::panels(&st.workspace.to_node()).contains(&Activity));
     st.reset_layout();
     assert!(st.workspace.hidden().is_empty());
 }
@@ -6742,12 +6743,12 @@ fn a_panel_unpinned_before_drawing_folds_to_its_side_in_the_tree() {
     use DockTab::*;
     let scene = Scene::preset("h2").unwrap();
     let mut st = UiState::new("h2", &scene);
-    for t in [Readouts, Model, Graph, View] {
+    for t in [Readouts, Model, Activity, View] {
         st.workspace.pin(t, false);
     }
     let edges: Vec<_> = st.workspace.hidden().iter().map(|h| (h.tab, h.edge, h.size)).collect();
     let d = super::workspace::autohide::DEFAULT_SIZE;
-    assert_eq!(edges, vec![(Readouts, Edge::Left, d), (Model, Edge::Left, d), (Graph, Edge::Right, d), (View, Edge::Right, d)]);
+    assert_eq!(edges, vec![(Readouts, Edge::Left, d), (Model, Edge::Left, d), (Activity, Edge::Right, d), (View, Edge::Right, d)]);
     st.workspace.set_node(layout::parse("V(0.30,[Model*],V(0.60,3D,[Log*]))").unwrap());
     st.workspace.pin(Log, false);
     st.workspace.pin(Model, false);
@@ -6761,14 +6762,14 @@ fn a_panel_unpinned_before_drawing_folds_to_its_side_in_the_tree() {
 #[test]
 fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let dt = 1.0 / 60.0;
     let mut t = 10.0;
     let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
@@ -6779,40 +6780,40 @@ fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     let mut view = egui::Rect::NOTHING;
     for _ in 0..2 {
         view = step(&mut st, vec![]).view.unwrap();
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     for i in 0..=18 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
         if i <= 13 {
             assert_eq!(st.workspace.flyout(), None, "{} ms of hover", i * 1000 / 60);
         }
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "open after 300 ms of hover");
-    assert!(st.tab_shown(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity), "open after 300 ms of hover");
+    assert!(st.tab_shown(Activity));
     // over the flyout it stays out
     for _ in 0..12 {
         step(&mut st, vec![]);
     }
-    let fly = probed_rect("flyout-Graph");
+    let fly = probed_rect("flyout-Activity");
     for _ in 0..40 {
         step(&mut st, vec![egui::Event::PointerMoved(fly.center())]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "the pointer on the flyout");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "the pointer on the flyout");
     // away from both: still out at 400 ms, gone by 600 ms
     let away = egui::pos2(view.right() - 40.0, view.center().y);
     assert!(!fly.contains(away));
     for i in 0..=36 {
         step(&mut st, vec![egui::Event::PointerMoved(away)]);
         if i <= 24 {
-            assert_eq!(st.workspace.flyout(), Some(Graph), "{} ms away", i * 1000 / 60);
+            assert_eq!(st.workspace.flyout(), Some(Activity), "{} ms away", i * 1000 / 60);
         }
     }
     assert_eq!(st.workspace.flyout(), None, "hidden after 600 ms away");
-    assert!(!st.tab_shown(Graph));
+    assert!(!st.tab_shown(Activity));
 }
 
 /// Spec D-10: a click on a strip icon keeps the flyout out until the next click elsewhere (the
@@ -6822,14 +6823,14 @@ fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
 #[test]
 fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let mut outs = Vec::new();
     let mut t = 10.0;
     macro_rules! step {
@@ -6841,50 +6842,50 @@ fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
     for _ in 0..2 {
         step!(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     for _ in 0..2 {
         step!(&mut st, vec![]);
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     step!(&mut st, vec![egui::Event::PointerMoved(icon), pointer(icon, true)]);
     step!(&mut st, vec![pointer(icon, false)]);
-    assert_eq!(st.workspace.flyout(), Some(Graph), "a click opens it at once");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "a click opens it at once");
     for _ in 0..12 {
         step!(&mut st, vec![]);
     }
-    let fly = probed_rect("flyout-Graph");
+    let fly = probed_rect("flyout-Activity");
     let away = egui::pos2(fly.right() + 200.0, fly.center().y);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "clicked open: a second away does not hide it");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "clicked open: a second away does not hide it");
     // a click inside it does not hide it either
     step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
     step!(&mut st, vec![pointer(fly.center(), false)]);
-    assert_eq!(st.workspace.flyout(), Some(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity));
     // a click elsewhere does
     step!(&mut st, vec![egui::Event::PointerMoved(away), pointer(away, true)]);
     step!(&mut st, vec![pointer(away, false)]);
     assert_eq!(st.workspace.flyout(), None, "a click on the 3D view hides it");
     // open_tab opens it the same way; Esc hides it and does not deselect
-    st.open_tab(Graph);
+    st.open_tab(Activity);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "open_tab: stuck open");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "open_tab: stuck open");
     step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert_eq!(st.workspace.flyout(), None, "Esc hides it");
     // hover-opened, then worked in: it stays when the pointer leaves
     for _ in 0..20 {
         step!(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity));
     step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
     step!(&mut st, vec![pointer(fly.center(), false)]);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "a press inside keeps it out");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "a press inside keeps it out");
     step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty() && !o.deselect), "display state; Esc on a flyout does not deselect");
     // with no flyout, Esc deselects as before
@@ -6898,14 +6899,14 @@ fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
 #[test]
 fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let mut t = 10.0;
     let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
         frame_at(&ctx, st, &inp, t, events);
@@ -6914,15 +6915,15 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     for _ in 0..20 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "hover-opened");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "hover-opened");
     step(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert_eq!(st.workspace.flyout(), None, "Esc");
     for _ in 0..40 {
@@ -6934,7 +6935,7 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     for _ in 0..20 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "back on the icon: the hover opens it again");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "back on the icon: the hover opens it again");
 }
 
 /// The flyout takes the pointer over itself — egui's, so the 3D view does not orbit through it —
@@ -6943,24 +6944,24 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
 #[test]
 fn the_flyout_takes_the_pointer_and_the_3d_view_keeps_the_rest() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Model*],H(0.70,3D,[Graph*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Model*],H(0.70,3D,[Activity*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    st.workspace.pin(Graph, false);
-    st.open_tab(Graph);
+    st.workspace.pin(Activity, false);
+    st.open_tab(Activity);
     let mut view = egui::Rect::NOTHING;
     for _ in 0..12 {
         view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
     }
-    let (fly, strip) = (probed_rect("flyout-Graph"), probed_rect("strip-Right"));
+    let (fly, strip) = (probed_rect("flyout-Activity"), probed_rect("strip-Right"));
     assert!((fly.right() - view.right()).abs() < 1.0 && (strip.left() - view.right()).abs() < 1.0, "the flyout against the right strip: {fly:?} {strip:?} {view:?}");
     let over = |st: &mut UiState, at: egui::Pos2| {
         frame(&ctx, st, &inp, 1400.0, vec![egui::Event::PointerMoved(at)]);
@@ -6970,7 +6971,7 @@ fn the_flyout_takes_the_pointer_and_the_3d_view_keeps_the_rest() {
     assert_eq!(over(&mut st, egui::pos2(fly.left() + 4.0, fly.bottom() - 4.0)), (true, true), "all of it");
     assert_eq!(over(&mut st, egui::pos2(fly.left() - 60.0, fly.center().y)), (false, false), "the 3D view beside it is not");
     assert_eq!(over(&mut st, strip.center()), (true, true), "the strip is egui's");
-    assert_eq!(st.workspace.flyout(), Some(Graph), "opened by open_tab: still out");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "opened by open_tab: still out");
 }
 
 /// A leaf's tab bar ends with its pin, left of the close button: clicking where the Pin icon is
@@ -6985,27 +6986,27 @@ fn the_tab_bar_pin_unpins_the_active_tab() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Activity*,Orbitals],[Log*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    let (pin, pop, close, graph) = (probed_rect("dock-pin-Graph"), probed_rect("dock-pop-Graph"), probed_rect("dock-close-Graph"), probed_rect("dock-tab-Graph"));
+    let (pin, pop, close, graph) = (probed_rect("dock-pin-Activity"), probed_rect("dock-pop-Activity"), probed_rect("dock-close-Activity"), probed_rect("dock-tab-Activity"));
     // the bar ends pin, pop out, close (spec D-4)
     assert!(pin.left() > graph.right() && (pin.right() - pop.left()).abs() < 0.5 && (pop.right() - close.left()).abs() < 0.5, "pin {pin:?}, pop {pop:?}, close {close:?}");
     assert!((pin.center().y - close.center().y).abs() < 0.5 && (pop.center().y - close.center().y).abs() < 0.5);
-    let outs = click_widget(&ctx, &mut st, &inp, "dock-pin-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-pin-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
     let h = st.workspace.hidden();
-    assert_eq!((h.len(), h[0].tab, h[0].edge), (1, Graph, Edge::Right));
+    assert_eq!((h.len(), h[0].tab, h[0].edge), (1, Activity, Edge::Right));
     // its flyout's close button closes it (the Window menu brings it back)
-    st.open_tab(Graph);
+    st.open_tab(Activity);
     for _ in 0..12 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]); // past the slide
     }
-    let outs = click_widget(&ctx, &mut st, &inp, "flyout-close-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "flyout-close-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
-    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Activity) && !layout::panels(&st.workspace.to_node()).contains(&Activity));
 }
 
 /// The profile keeps the auto-hidden panels (`hidden = …`, spec D-8) and reads them back onto
@@ -7025,32 +7026,33 @@ fn the_profile_keeps_the_hidden_panels() {
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     st.workspace.pin(Readouts, false);
     let text = profile::capture(&st);
     let line = text.lines().find(|l| l.starts_with("hidden = ")).unwrap();
-    assert!(line.starts_with("hidden = Graph:right:") && line.contains(", Readouts:left:"), "{line}");
+    assert!(line.starts_with("hidden = Activity:right:") && line.contains(", Readouts:left:"), "{line}");
     let mut back = UiState::new("h2", &scene);
     profile::apply(&mut back, &text);
     assert_eq!(back.workspace.to_node(), st.workspace.to_node());
     assert_eq!(layout::encode_hidden(back.workspace.hidden()), layout::encode_hidden(st.workspace.hidden()));
-    back.open_tab(Graph);
-    assert!(back.tab_shown(Graph), "reachable: open_tab opens its flyout");
+    back.open_tab(Activity);
+    assert!(back.tab_shown(Activity), "reachable: open_tab opens its flyout");
     for _ in 0..2 {
         frame(&ctx, &mut back, &inp, 1400.0, vec![]);
     }
-    probed_rect("strip-icon-Graph");
+    probed_rect("strip-icon-Activity");
     probed_rect("strip-icon-Readouts");
     // a layout line without a hidden line: nothing hidden
     let mut s = UiState::new("h2", &scene);
-    s.workspace.set_hidden(vec![layout::Hidden { tab: Graph, edge: Edge::Left, size: 300.0 }]);
+    s.workspace.set_hidden(vec![layout::Hidden { tab: Activity, edge: Edge::Left, size: 300.0 }]);
     profile::apply(&mut s, &format!("layout = {}\n", layout::encode(&st.workspace.to_node())));
     assert!(s.workspace.hidden().is_empty());
     // a hidden panel the layout places: the layout's
-    profile::apply(&mut s, &format!("layout = {}\nhidden = Log:left:300, Graph:bottom:250\n", layout::encode(&layout::default_layout())));
+    profile::apply(&mut s, &format!("layout = {}\nhidden = Log:left:300, Activity:bottom:250\n", layout::encode(&layout::default_layout())));
     assert_eq!(s.workspace.hidden(), &[]);
     profile::apply(&mut s, "layout = H(0.70,3D,[Log*])\nhidden = log:left:300, GRAPH:bottom:5000, Bogus:left:300\n");
-    assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Graph, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
+    // (an old profile's Graph, merged into Readouts: Readouts takes its place when no line names Readouts)
+    assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Readouts, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
 }
 
 /// Deferred finding (docking D1 review): `egui_dock` clamps each split's fraction to leave 80 pt
@@ -7702,19 +7704,21 @@ mod knowledge_map {
             DockTab::PANELS.into_iter().all(|t| p.iter().filter(|&&x| x == t).count() == 1) && p.len() == DockTab::PANELS.len()
         };
         let mut old = UiState::new("h2o", &scene);
+        // (it names the Graph panel, merged into Readouts since 2026-11-14: dropped, and its
+        // left_tab with it — the leaf's first tab shows)
         profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\nleft_tab = Graph\nleft_width = 400\ndock_open = false\n");
         assert!(once(&old), "{}", layout::encode(&old.workspace.to_node()));
         assert_eq!(
             layout::encode(&old.workspace.to_node()),
-            "H(0.24,[Activity,Readouts,Graph*,Log],H(0.70,3D,[Model,View,Orbitals,Selection*,Knowledge]))",
+            "H(0.24,[Activity*,Readouts,Log],H(0.70,3D,[Model,View,Orbitals,Selection*,Knowledge]))",
             "the moved Log stays left; Knowledge, never listed, joins the right column"
         );
-        assert!(old.tab_shown(DockTab::Selection) && old.tab_shown(DockTab::Graph));
+        assert!(old.tab_shown(DockTab::Selection) && old.tab_shown(DockTab::Activity));
         // a tab named twice keeps its first place (it was ignored by the old docks' reader)
         let mut dup = UiState::new("h2o", &scene);
         profile::apply(&mut dup, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Log\n");
         assert!(once(&dup), "{}", layout::encode(&dup.workspace.to_node()));
-        assert!(layout::encode(&dup.workspace.to_node()).starts_with("H(0.24,[Activity*,Readouts,Graph,Log],"), "{}", layout::encode(&dup.workspace.to_node()));
+        assert!(layout::encode(&dup.workspace.to_node()).starts_with("H(0.24,[Activity*,Readouts,Log],"), "{}", layout::encode(&dup.workspace.to_node()));
         // only one of the two lists: the other column gets the panels it does not name
         let mut half = UiState::new("h2o", &scene);
         profile::apply(&mut half, "right_tabs = Log Model\n");
@@ -8490,9 +8494,9 @@ mod view_panel {
             outs
         };
         let mut outs = Vec::new();
-        assert!(!st.tab_shown(DockTab::Graph));
-        outs.extend(in_window(&mut st, "window-Graph"));
-        assert!(st.tab_shown(DockTab::Graph) && !st.tab_shown(DockTab::Log));
+        assert!(!st.tab_shown(DockTab::Activity));
+        outs.extend(in_window(&mut st, "window-Activity"));
+        assert!(st.tab_shown(DockTab::Activity) && !st.tab_shown(DockTab::Log));
         st.workspace.close_panel(DockTab::Knowledge);
         outs.extend(in_window(&mut st, "window-Knowledge"));
         assert!(st.tab_shown(DockTab::Knowledge), "a closed panel comes back");
@@ -8524,7 +8528,7 @@ mod view_panel {
         let mut st = UiState::new("h2", &scene);
         let arrangement = |st: &UiState| (layout::encode(&st.workspace.to_node()), layout::encode_hidden(st.workspace.hidden()));
         for (w, path) in [(1400.0, &["menu-Window", "layouts-submenu"][..]), (1200.0, &["menu-all", "menu-Window", "layouts-submenu"][..])] {
-            st.workspace.set_node(layout::parse("H(0.50,[Log*,Graph],V(0.30,3D,[Model*]))").unwrap());
+            st.workspace.set_node(layout::parse("H(0.50,[Log*,Readouts],V(0.30,3D,[Model*]))").unwrap());
             for p in [Preset::Training, Preset::Presenting, Preset::TwoMonitors, Preset::Training, Preset::OneMonitor] {
                 let before = arrangement(&st);
                 let mut outs = Vec::new();
@@ -8548,9 +8552,9 @@ mod view_panel {
         assert!(saved.contains(&format!("\nhidden = {}\n", layout::encode_hidden(&Preset::Presenting.tree().1))), "{saved}");
         assert!(DockTab::PANELS.into_iter().all(|t| st.workspace.present(t) && !st.tab_shown(t)), "hidden panels are present");
         st.reset_layout();
-        assert!(st.workspace.present(DockTab::Graph) && !st.tab_shown(DockTab::Graph), "a tab behind Log is present");
-        st.workspace.close_panel(DockTab::Graph);
-        assert!(!st.workspace.present(DockTab::Graph), "a closed panel is not");
+        assert!(st.workspace.present(DockTab::Readouts) && !st.tab_shown(DockTab::Readouts), "a tab behind Log is present");
+        st.workspace.close_panel(DockTab::Readouts);
+        assert!(!st.workspace.present(DockTab::Readouts), "a closed panel is not");
         // Ctrl K finds each preset (and Reset layout) in the Window menu's Layouts group
         for p in Preset::ALL {
             let r = search::results(&format!("layout {}", p.title()), 1);
@@ -8635,19 +8639,19 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
-        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Graph, "tab-menu-new-window");
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
+        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Readouts, "tab-menu-new-window");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         let id = match st.workspace.windows().as_slice() {
             [id] => *id,
             w => panic!("{w:?}"),
         };
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
-        assert!(matches!(requests(&outs).as_slice(), [WindowRequest::Open { panels, .. }] if *panels == vec![DockTab::Graph]), "{:?}", requests(&outs));
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts]);
+        assert!(matches!(requests(&outs).as_slice(), [WindowRequest::Open { panels, .. }] if *panels == vec![DockTab::Readouts]), "{:?}", requests(&outs));
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         // Orbitals into that window by its number
         tab_menu(&ctx, &mut st, &inp, DockTab::Orbitals, &format!("tab-menu-window-{id}"));
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph, DockTab::Orbitals]);
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts, DockTab::Orbitals]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
         // from inside the window, Orbitals back to the main window: it left a leaf of its own, so
         // beside the 3D view on the right
@@ -8656,12 +8660,12 @@ mod detached_windows {
         PROBES.with(|m| m.borrow_mut().clear());
         let outs = tab_menu_in_window(&wctx, &mut st, &inp, id, DockTab::Orbitals, "tab-menu-main");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Orbitals*]),[Log*])");
     }
 
     /// Review I2: the tab menu's Reset the layout with two monitors (it runs while the main tree
-    /// is lent out) applies Two monitors whole: one detached window holding Activity over Graph,
+    /// is lent out) applies Two monitors whole: one detached window holding Activity over Readouts,
     /// both in the workspace — from the default layout, and again from Two monitors itself (the
     /// old window closes, a new one opens).
     #[test]
@@ -8679,10 +8683,10 @@ mod detached_windows {
                 [id] => *id,
                 w => panic!("one window: {w:?}"),
             };
-            assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity, DockTab::Graph]);
-            assert!(st.workspace.present(DockTab::Activity) && st.workspace.present(DockTab::Graph), "neither closed");
+            assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity, DockTab::Readouts]);
+            assert!(st.workspace.present(DockTab::Activity) && st.workspace.present(DockTab::Readouts), "neither closed");
             assert_eq!(st.workspace.to_node(), Preset::TwoMonitors.tree().0);
-            let open = WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Graph], rect: Some(SECOND), size: None, fill: true };
+            let open = WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Readouts], rect: Some(SECOND), size: None, fill: true };
             assert!(requests(outs).contains(&open), "{:?}", requests(outs));
             id
         };
@@ -8706,19 +8710,19 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
-        let outs = click_widget(&ctx, &mut st, &inp, "dock-pop-Graph");
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
+        let outs = click_widget(&ctx, &mut st, &inp, "dock-pop-Readouts");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
         let ids = st.workspace.windows();
         assert_eq!(ids.len(), 1);
         let id = ids[0];
-        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "[Graph*,Orbitals]");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "[Readouts*,Orbitals]");
         match requests(&outs).as_slice() {
-            [WindowRequest::Open { id: o, panels, rect: None, size: Some(_), fill: false }] => assert_eq!((*o, panels.clone()), (id, vec![DockTab::Graph, DockTab::Orbitals])),
+            [WindowRequest::Open { id: o, panels, rect: None, size: Some(_), fill: false }] => assert_eq!((*o, panels.clone()), (id, vec![DockTab::Readouts, DockTab::Orbitals])),
             r => panic!("{r:?}"),
         }
-        assert!(st.tab_shown(DockTab::Graph) && st.workspace.present(DockTab::Orbitals) && !st.tab_shown(DockTab::Orbitals));
+        assert!(st.tab_shown(DockTab::Readouts) && st.workspace.present(DockTab::Orbitals) && !st.tab_shown(DockTab::Orbitals));
         // the window's own context draws its tabs (and no pin: it has no strips)
         let wctx = egui::Context::default();
         apply_theme(&wctx);
@@ -8726,16 +8730,16 @@ mod detached_windows {
         for _ in 0..2 {
             assert!(window_frame(&wctx, &mut st, &inp, id, vec![]).actions.is_empty());
         }
-        let (tab, pop, close) = (probed_rect("dock-tab-Graph"), probed_rect("dock-pop-Graph"), probed_rect("dock-close-Graph"));
+        let (tab, pop, close) = (probed_rect("dock-tab-Readouts"), probed_rect("dock-pop-Readouts"), probed_rect("dock-close-Readouts"));
         assert!(tab.right() < pop.left() && (pop.right() - close.left()).abs() < 0.5 && close.right() <= 600.5, "tab {tab:?} pop {pop:?} close {close:?}");
-        assert!(PROBES.with(|m| !m.borrow().contains_key("dock-pin-Graph")), "no pin in a detached window");
+        assert!(PROBES.with(|m| !m.borrow().contains_key("dock-pin-Readouts")), "no pin in a detached window");
         // Dock back: both panels into the main window — their leaf is gone, so together beside the
         // 3D view on the right, the shown one still shown — and the window closes
-        let outs = click_in_window(&wctx, &mut st, &inp, id, "dock-pop-Graph");
+        let outs = click_in_window(&wctx, &mut st, &inp, id, "dock-pop-Readouts");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert!(st.workspace.windows().is_empty());
         assert_eq!(requests(&outs), vec![WindowRequest::Close { id }]);
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Graph*,Orbitals]),[Log*])");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Readouts*,Orbitals]),[Log*])");
     }
 
     /// A panel's body draws in a detached window's own context, from the same state, and counts
@@ -8784,7 +8788,7 @@ mod detached_windows {
     }
 
     /// Closing the OS window (the window side reports it) docks its panels back where they
-    /// left: Activity into the leaf it shared with Log and Graph.
+    /// left: Activity into the leaf it shared with Log.
     #[test]
     fn closing_the_window_returns_activity_to_its_old_leaf() {
         let scene = Scene::preset("h2").unwrap();
@@ -8795,7 +8799,7 @@ mod detached_windows {
         assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity]);
         st.workspace.window_closed(id);
         assert!(st.workspace.windows().is_empty());
-        assert_eq!(layout::encode(&st.workspace.to_node()), before.replace("[Log*,Activity,Graph]", "[Log,Graph,Activity*]"));
+        assert_eq!(layout::encode(&st.workspace.to_node()), before.replace("[Log*,Activity]", "[Log,Activity*]"));
     }
 
     /// The profile writes one `window = x,y,w,h <tree>` line per detached window and reads them
@@ -8806,11 +8810,11 @@ mod detached_windows {
         let scene = Scene::preset("h2").unwrap();
         let mut st = UiState::new("h2", &scene);
         assert!(!profile::capture(&st).contains("window ="), "none by default");
-        let a = st.workspace.pop_out(&[DockTab::Activity, DockTab::Graph], DockTab::Graph).unwrap();
+        let a = st.workspace.pop_out(&[DockTab::Activity, DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.set_window_rect(a, Some(WinRect { x: 2600, y: 30, w: 900, h: 1000 }), true);
         st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
         let text = profile::capture(&st);
-        assert!(text.contains("\nwindow = 2600,30,900,1000 max [Activity,Graph*]\nwindow = [Log*]\n"), "{text}");
+        assert!(text.contains("\nwindow = 2600,30,900,1000 max [Activity,Readouts*]\nwindow = [Log*]\n"), "{text}");
         assert!(text.contains(&format!("\nlayout = {}\n", layout::encode(&st.workspace.to_node()))), "{text}");
         let mut back = UiState::new("h2", &scene);
         profile::apply(&mut back, &text);
@@ -8834,11 +8838,11 @@ mod detached_windows {
         let opened: Vec<Vec<DockTab>> = out.windows.iter().filter_map(|r| if let WindowRequest::Open { panels, .. } = r { Some(panels.clone()) } else { None }).collect();
         assert_eq!(opened, vec![vec![DockTab::Log]]);
         let main = layout::panels(&one.workspace.to_node());
-        assert!(main.contains(&DockTab::Activity) && main.contains(&DockTab::Graph));
+        assert!(main.contains(&DockTab::Activity) && main.contains(&DockTab::Readouts));
         assert!(one.status.contains("no connected monitor"), "{}", one.status);
     }
 
-    /// Two monitors (spec D-11): with a second monitor, Activity over Graph in a window filling
+    /// Two monitors (spec D-11): with a second monitor, Activity over Readouts in a window filling
     /// it (maximised there) and the rest as One monitor less those two; Reset layout is then Two
     /// monitors too. With one monitor it is One monitor and the status says so.
     #[test]
@@ -8850,8 +8854,8 @@ mod detached_windows {
         assert_eq!(st.workspace.to_node(), Preset::TwoMonitors.tree().0);
         let ids = st.workspace.windows();
         assert_eq!(ids.len(), 1);
-        assert_eq!(layout::encode(&st.workspace.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Graph*])");
-        let open = |id: u32| WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Graph], rect: Some(SECOND), size: None, fill: true };
+        assert_eq!(layout::encode(&st.workspace.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Readouts*])");
+        let open = |id: u32| WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Readouts], rect: Some(SECOND), size: None, fill: true };
         assert_eq!(st.workspace.take_requests(), vec![open(ids[0])]);
         // applying it again replaces the window (the old one closes)
         st.apply_layout(Preset::TwoMonitors);
@@ -8881,7 +8885,7 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        let id = st.workspace.pop_out(&[DockTab::Graph, DockTab::Activity], DockTab::Graph).unwrap();
+        let id = st.workspace.pop_out(&[DockTab::Readouts, DockTab::Activity], DockTab::Readouts).unwrap();
         let first = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         assert!(matches!(first.windows.as_slice(), [WindowRequest::Open { .. }]));
         assert!(!st.tab_shown(DockTab::Activity));
@@ -8986,21 +8990,21 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
         st.workspace.set_monitors(vec![PRIMARY, SECOND]);
         st.workspace.set_work_areas(vec![WinRect { x: 0, y: 0, w: 2560, h: 1400 }, SECOND]);
         st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
-        let leaf = st.workspace.leaf_rect(DockTab::Graph).unwrap();
+        let leaf = st.workspace.leaf_rect(DockTab::Readouts).unwrap();
         let (w, h) = (leaf.width().round() as u32, leaf.height().round() as u32);
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(1700.0, 1300.0)], false, &mut main, &mut |_| vec![]);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[egui::pos2(1700.0, 1300.0)], false, &mut main, &mut |_| vec![]);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert_eq!(drawn, None, "no window under the cursor draws a target");
-        let id = st.workspace.window_of(DockTab::Graph).expect("in a new window");
-        assert_eq!(opened(&outs), vec![(id, vec![DockTab::Graph], Some(WinRect { x: 1700, y: 1400 - h as i32, w, h }))]);
+        let id = st.workspace.window_of(DockTab::Readouts).expect("in a new window");
+        assert_eq!(opened(&outs), vec![(id, vec![DockTab::Readouts], Some(WinRect { x: 1700, y: 1400 - h as i32, w, h }))]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
         // on the second monitor, beyond its right edge less the window's width: kept on it
@@ -9035,7 +9039,7 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Model,Activity]))").unwrap());
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*,Model,Activity]))").unwrap());
         let id = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 2.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
@@ -9053,14 +9057,14 @@ mod detached_windows {
         let (_, drawn) = drag_tab(&mut st, DockTab::Model, &[at(190.0, 400.0)], false, &mut main, &mut win);
         assert!(drawn.is_some_and(|r| r.contains(egui::pos2(190.0, 400.0))), "{drawn:?}");
         assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Activity,Log*])");
-        // its tab bar, on the Activity tab: Graph goes before it
+        // its tab bar, on the Activity tab: Readouts goes before it
         for _ in 0..2 {
             win(&mut st);
         }
         let tab = probed_rect("dock-tab-Activity").center();
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(tab.x, tab.y)], false, &mut main, &mut win);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(tab.x, tab.y)], false, &mut main, &mut win);
         assert!(drawn.is_some_and(|r| r.contains(tab)), "the tab is lit: {drawn:?}");
-        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Graph*,Activity,Log])");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Readouts*,Activity,Log])");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Orbitals*])");
         assert_eq!(st.workspace.floats_for_test(), 0);
         // over the window's title bar (its frame, not its client area): no target, nothing moves
@@ -9082,8 +9086,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         let view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
@@ -9091,14 +9095,14 @@ mod detached_windows {
         let at = |p: egui::Pos2| egui::pos2(p.x - 1500.0, p.y - 100.0);
         let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
         let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(view.center())], false, &mut win, &mut main);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(view.center())], false, &mut win, &mut main);
         assert_eq!(drawn, None, "the 3D view's tile has no centre target");
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph], "refused: it stays");
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts], "refused: it stays");
         let left = view.center() - egui::vec2(110.0, 0.0);
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(left)], false, &mut win, &mut main);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(left)], false, &mut win, &mut main);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert!(drawn.is_some_and(|r| r.contains(left)), "{drawn:?}");
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.50,[Graph*],3D),[Log*])");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.50,[Readouts*],3D),[Log*])");
         assert!(st.workspace.windows().is_empty());
         assert!(requests(&outs).contains(&WindowRequest::Close { id }), "{:?}", requests(&outs));
     }
@@ -9115,7 +9119,7 @@ mod detached_windows {
             apply_theme(c);
         }
         let mut st = UiState::new("h2", &scene);
-        let a = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        let a = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         let b = st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(b), 2200, 100, 600.0, 800.0, 1.0), place(Some(a), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
@@ -9124,7 +9128,7 @@ mod detached_windows {
         // window a's leaf centre, from window b's points
         let (outs, drawn) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1800.0 - 2200.0, 500.0 - 100.0)], false, &mut src, &mut others);
         assert!(drawn.is_some());
-        assert_eq!(layout::encode(&st.workspace.window_node(a).unwrap()), "[Graph,Log*]");
+        assert_eq!(layout::encode(&st.workspace.window_node(a).unwrap()), "[Readouts,Log*]");
         assert_eq!(st.workspace.windows(), vec![a]);
         assert!(requests(&outs).contains(&WindowRequest::Close { id: b }));
     }
@@ -9140,7 +9144,7 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
+        let tree = "H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))";
         st.workspace.set_node(layout::parse(tree).unwrap());
         st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
@@ -9149,14 +9153,14 @@ mod detached_windows {
         let (log, view) = (st.workspace.leaf_rect(DockTab::Log).unwrap(), frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap());
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
         for spot in [log.left_bottom() + egui::vec2(12.0, -12.0), view.left_top() + egui::vec2(20.0, 20.0)] {
-            let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[spot], false, &mut main, &mut |_| vec![]);
+            let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[spot], false, &mut main, &mut |_| vec![]);
             assert!(opened(&outs).is_empty(), "{spot:?}");
             assert_eq!(layout::encode(&st.workspace.to_node()), layout::encode(&layout::parse(tree).unwrap()), "{spot:?}");
             assert_eq!(st.workspace.floats_for_test(), 0, "{spot:?}");
         }
-        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[log.center()], false, &mut main, &mut |_| vec![]);
+        let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[log.center()], false, &mut main, &mut |_| vec![]);
         assert!(opened(&outs).is_empty());
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Graph*]))");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Readouts*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
     }
 
@@ -9182,8 +9186,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Activity]))").unwrap());
+        let tree = "H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))";
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*,Activity]))").unwrap());
         let b = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
         st.workspace.take_requests();
         assert_eq!(layout::encode(&st.workspace.to_node()), tree);
@@ -9198,16 +9202,16 @@ mod detached_windows {
         cover(&mut st, 40.0, 760.0);
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
         let mut win = |st: &mut UiState| vec![window_frame_at(&wctx, st, &inp, b, 1.0, vec![])];
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[log], false, &mut main, &mut win);
         assert_eq!(drawn, None, "B's corner is no target");
         assert!(opened(&outs).is_empty());
         assert_eq!(layout::encode(&st.workspace.to_node()), tree, "the main window's hidden drop was undone");
         assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity*]");
         // B's centre over the main window's Log centre: into B, once
         cover(&mut st, 300.0, 400.0);
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[log], false, &mut main, &mut win);
         assert!(drawn.is_some());
-        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity,Graph*]");
+        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity,Readouts*]");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
 
@@ -9247,22 +9251,22 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_monitors(vec![PRIMARY, SECOND]);
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
         let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
         // desktop (3000, 300), on the second monitor, from the window's points
-        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(3000.0 - 1500.0, 300.0 - 100.0)], false, &mut win, &mut main);
+        let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[egui::pos2(3000.0 - 1500.0, 300.0 - 100.0)], false, &mut win, &mut main);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        let new = st.workspace.window_of(DockTab::Graph).expect("in a new window");
+        let new = st.workspace.window_of(DockTab::Readouts).expect("in a new window");
         assert_ne!(new, id);
         assert_eq!(st.workspace.windows(), vec![new]);
         let r = requests(&outs);
         assert_eq!(r.iter().filter(|r| **r == WindowRequest::Close { id }).count(), 1, "{r:?}");
-        assert_eq!(opened(&outs), vec![(new, vec![DockTab::Graph], Some(WinRect { x: 3000, y: 1080 - 800, w: 600, h: 800 }))]);
+        assert_eq!(opened(&outs), vec![(new, vec![DockTab::Readouts], Some(WinRect { x: 3000, y: 1080 - 800, w: 600, h: 800 }))]);
     }
 
     /// Task 11 review M3: a drag whose source window closes under it is forgotten — the window
@@ -9276,8 +9280,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
@@ -9285,14 +9289,14 @@ mod detached_windows {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
         let log = st.workspace.leaf_rect(DockTab::Log).unwrap().center();
-        let c = probed_rect("dock-tab-Graph").center();
+        let c = probed_rect("dock-tab-Readouts").center();
         window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(c), pointer(c, true)]);
         for p in [c + egui::vec2(12.0, 0.0), c + egui::vec2(50.0, 0.0), egui::pos2(log.x - 1500.0, log.y - 100.0)] {
             window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(p)]);
         }
         PROBES.with(|m| m.borrow_mut().remove("drop-target"));
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
-        assert_eq!(st.workspace.dragging(), Some(DockTab::Graph));
+        assert_eq!(st.workspace.dragging(), Some(DockTab::Readouts));
         assert!(PROBES.with(|m| m.borrow().contains_key("drop-target")), "the main window draws the Log leaf's targets");
         // the window closes under the drag (Alt+F4 with the button held)
         st.workspace.window_closed(id);
@@ -11373,5 +11377,257 @@ fn the_toolbar_fits_the_window() {
         let bar = probed_rect("toolbar-rect");
         assert!((bar.bottom() - 900.0).abs() < 0.5 && (bar.height() - h).abs() < 0.5, "at {w}: {bar:?}");
         assert_eq!(bars_height(&st, w).1, h, "at {w}");
+    }
+}
+
+/// The Readouts panel with the Graph panel merged into it (user request 2026-11-14, the approved
+/// mockup): the chart card's two plots on a real ΔE axis, the energies, the status line with the
+/// health dots, the folds; the Graph panel's migration out of profiles, presets and `--ui`.
+mod readouts_merge {
+    use super::super::dock::readouts::{delta_axis, plot_heights, Section, Sections};
+    use super::*;
+    use sim::Source;
+
+    /// A snapshot whose history holds `n` points: E total `e(i)`, T `t(i)` K, every third step a
+    /// fallback, the rest the model's.
+    fn with_history(scene: &Scene, n: usize, e: impl Fn(usize) -> f64, t: impl Fn(usize) -> f64) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Estimated, Some(model()));
+        s.dynamics.history = (0..n).map(|i| (i as f64 * 20.0, e(i), t(i))).collect::<Vec<_>>().into();
+        s.dynamics.history_source = (0..n).map(|i| if i % 3 == 0 { Source::Fallback } else { Source::Surrogate }).collect::<Vec<_>>().into();
+        s.dynamics.history_guess = vec![false; n].into();
+        s
+    }
+
+    fn texts_and_shapes(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2) -> (String, Vec<egui::epaint::ClippedShape>) {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let mut out = String::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        (out, shapes)
+    }
+
+    /// The ΔE axis: µHa with zero inside and labelled ticks at a 1-2-5 step; a flat E total stays
+    /// flat (a 1e-7 Ha wiggle within 1 pt of zero even at the plot's smallest height); past 1000 µHa
+    /// the unit is mHa.
+    #[test]
+    fn the_delta_e_axis_is_real() {
+        let wiggle: Vec<f64> = (0..400).map(|i| 1e-7 * (i as f64 * 0.7).sin()).collect();
+        let a = delta_axis(&wiggle);
+        assert_eq!(a.unit, "µHa");
+        assert!(a.lo < 0.0 && a.hi > 0.0 && a.ticks.contains(&0.0), "{a:?}");
+        assert!(a.ticks.windows(2).all(|w| (w[1] - w[0] - (a.ticks[1] - a.ticks[0])).abs() < 1e-9), "evenly spaced: {a:?}");
+        let step = a.ticks[1] - a.ticks[0];
+        assert!([1.0, 2.0, 5.0, 10.0].iter().any(|k| ((step / 10f64.powf(step.log10().floor())) - k).abs() < 1e-9), "a 1-2-5 step: {step}");
+        for view_h in [900.0, 200.0] {
+            let (_, e_h) = plot_heights(view_h);
+            let plot = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, e_h));
+            let zero = a.y(0.0, plot);
+            for d in &wiggle {
+                assert!((a.y(d * a.per_ha, plot) - zero).abs() <= 1.0, "a 1e-7 Ha wiggle draws within 1 pt of zero at {e_h} pt");
+            }
+        }
+        // a real swing: mHa past 1000 µHa
+        let swing = [0.0, 4e-4, 2.5e-3, -1e-4];
+        let a = delta_axis(&swing);
+        assert_eq!(a.unit, "mHa");
+        assert!(a.lo <= -0.1 && a.hi >= 2.5, "{a:?}");
+        assert_eq!(delta_axis(&[0.0, 9e-4]).unit, "µHa", "900 µHa stays in µHa");
+        // the minimum heights
+        assert_eq!(plot_heights(100.0), (48.0, 70.0));
+    }
+
+    /// The panel: Graph is gone, Readouts carries both plots (T over ΔE), coloured per step by who
+    /// answered it, T labelled in the chosen unit, the ticks and zero line on screen, the current E
+    /// total; the old series selector is gone; the explanatory text is the card's ⓘ.
+    #[test]
+    fn readouts_carries_both_plots() {
+        assert!(DockTab::PANELS.iter().all(|t| t.name() != "Graph"));
+        assert_eq!(search::results("graph", 1)[0].place, search::Place::Dock(DockTab::Readouts), "Ctrl K's graph finds the Readouts chart");
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_history(&scene, 300, |i| -1.1667 + 2e-6 * (i as f64 * 0.3).sin(), |i| 300.0 + 10.0 * (i as f64 / 299.0));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.temp_units = TempUnits::C;
+        let (t, shapes) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        let e_now = format!("E total {:+.6} Ha", snap.dynamics.total);
+        for want in ["E TOTAL AND T", "ΔE µHa", "27 °C", "37 °C", e_now.as_str(), "surrogate", "fallback (DFT)"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("E total + T") && !t.contains("Each curve is scaled to its own range"), "no series selector, the note is the ⓘ:\n{t}");
+        let (tp, dp) = (probed_rect("chart-t"), probed_rect("chart-delta"));
+        assert!(tp.bottom() <= dp.top() && (tp.left() - dp.left()).abs() < 0.5 && (tp.right() - dp.right()).abs() < 0.5, "stacked on one time axis: {tp:?} {dp:?}");
+        let zero = probed_rect("chart-zero");
+        assert!(dp.top() < zero.top() && zero.top() < dp.bottom());
+        // the ΔE line's colours: the model's and the fallback's
+        let mut colours = std::collections::BTreeSet::new();
+        fn segs(s: &egui::epaint::Shape, inside: egui::Rect, out: &mut std::collections::BTreeSet<[u8; 4]>) {
+            match s {
+                egui::epaint::Shape::LineSegment { points, stroke } if inside.contains(points[0]) && inside.contains(points[1]) => {
+                    out.insert(stroke.color.to_array());
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| segs(s, inside, out)),
+                _ => {}
+            }
+        }
+        shapes.iter().for_each(|c| segs(&c.shape, dp.expand(0.5), &mut colours));
+        for s in [Source::Surrogate, Source::Fallback] {
+            assert!(colours.contains(&source_colour(s).to_array()), "{s:?} coloured: {colours:?}");
+        }
+    }
+
+    /// The status line, a health warning's own line, the energies in the header's units, and the
+    /// folds holding the work rows, the breakdown and the reference comparison.
+    #[test]
+    fn the_status_line_energies_and_folds() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.dt_warning = Some("dt 0.9 fs is above the safe step for H".into());
+        snap.dynamics.work_refit = -0.000317;
+        snap.dynamics.source = Source::Surrogate;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.energy_units = EnergyUnits::Ha;
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert!(t.contains("dt 0.9 fs is above the safe step for H"), "a warning prints its text:\n{t}");
+        probed_rect("readouts-dot-1");
+        assert!(probed_rect("readouts-warning-1").top() > probed_rect("readouts-status").top());
+        assert!(t.contains("t ") && t.contains("ms/step · model, no SCF"), "{t}");
+        assert!(t.contains("KE (nuclei)") && t.contains("E conserved") && !t.contains(" eV"), "Ha only:\n{t}");
+        assert!(t.contains("walls 0 · refit −0.000317 · mismatch 0") && !t.contains("work done by tools"), "the work rows folded, their summary shown:\n{t}");
+        st.energy_units = EnergyUnits::Ev;
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert!(t.contains(" eV") && !t.contains(&format!("{:+.6} Ha", snap.dynamics.kinetic)) && !t.contains(&format!("{:+.6} Ha", snap.dynamics.total)), "eV only:\n{t}");
+        for (s, want) in [(Section::Work, "work done by tools"), (Section::Breakdown, "SCF iterations"), (Section::Compare, "An outside code answers")] {
+            st.readouts_sections = Sections::default();
+            let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+            assert!(!t.contains(want), "{s:?} folded");
+            click_widget(&ctx, &mut st, &inp, &format!("readouts-fold-{}", s.id()));
+            assert!(st.readouts_sections.is_open(s));
+            let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+            assert!(t.contains(want), "{s:?} holds {want:?}:\n{t}");
+        }
+        // kept in the profile
+        st.readouts_sections = Sections::default();
+        st.readouts_sections.set(Section::Breakdown, true);
+        let text = profile::capture(&st);
+        assert!(text.contains("\nreadouts_sections = breakdown\n"));
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.readouts_sections, st.readouts_sections);
+    }
+
+    /// A profile naming Graph loads with Readouts in its place; with Readouts named too, Graph's
+    /// slot goes and no empty leaf is left; a detached window holding only Graph is dropped; the
+    /// presets and `--ui tab=graph` / `detach=graph` name Readouts.
+    #[test]
+    fn graph_migrates_to_readouts() {
+        use super::super::workspace::{layout, presets::Preset};
+        let scene = Scene::preset("h2").unwrap();
+        let count = |st: &UiState, t: DockTab| layout::panels(&st.workspace.to_node()).iter().filter(|&&x| x == t).count();
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, "layout = H(0.24,[Model*,Knowledge,Selection],H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Graph])))\nhidden = \n");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,[Model*,Knowledge,Selection],H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Readouts])))", "Readouts takes Graph's place");
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, "layout = H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Graph*])))\nhidden = \n");
+        let enc = layout::encode(&st.workspace.to_node());
+        assert_eq!(enc, "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,[View*,Orbitals]))", "Graph's leaf collapsed: {enc}");
+        assert!(!enc.contains("[]") && count(&st, DockTab::Readouts) == 1);
+        // Graph only on the hidden line, Readouts in the tree: dropped
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {}\nhidden = Graph:right:320\n", layout::encode(&layout::default_layout())));
+        assert!(st.workspace.hidden().is_empty() && count(&st, DockTab::Readouts) == 1);
+        // the old Two monitors window (Activity over Graph): with Readouts in the main tree the
+        // window keeps Activity only; without it, Readouts takes Graph's place in the window
+        let main = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {main}\nhidden = \nwindow = 1920,0,1920,1040 V(0.50,[Activity*],[Graph*])\n"));
+        let ws = st.workspace.windows();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(st.workspace.window_panels(ws[0]), vec![DockTab::Activity], "the window keeps Activity only");
+        let old_two = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {old_two}\nhidden = \nwindow = 1920,0,1920,1040 V(0.50,[Activity*],[Graph*])\n"));
+        let ws = st.workspace.windows();
+        assert_eq!(st.workspace.window_panels(ws[0]), vec![DockTab::Activity, DockTab::Readouts], "Readouts in the Graph's place");
+        // the presets
+        assert_eq!(layout::encode(&Preset::TwoMonitors.window().unwrap()), "V(0.50,[Activity*],[Readouts*])");
+        assert!(layout::encode(&Preset::Training.tree().0).contains("[Readouts*]"));
+        assert!(!layout::encode(&layout::default_layout()).contains("Graph"));
+        // the screenshot harness's words
+        assert_eq!(crate::ui::panel_named("graph"), Some(DockTab::Readouts));
+        assert_eq!(crate::ui::panels_named("activity, Graph"), Ok(vec![DockTab::Activity, DockTab::Readouts]));
+    }
+
+    /// At about 320 pt the panel's parts stack inside it and no text runs past its right edge.
+    #[test]
+    fn the_readouts_panel_fits_320_pt() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 300, |i| -1.1667 + 3e-3 * (i as f64 / 299.0), |i| 300.0 + 40.0 * (i as f64 * 0.1).sin());
+        snap.dynamics.dt_warning = Some("dt 0.9 fs is above the safe step for the lightest nucleus here".into());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for units in [EnergyUnits::Both, EnergyUnits::Ha] {
+            let mut st = UiState::new("h2", &scene);
+            st.energy_units = units;
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Readouts*])").unwrap());
+            st.readouts_sections = Sections::all(true);
+            PROBES.with(|p| p.borrow_mut().clear());
+            let (_, shapes) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 3000.0));
+            let panel = probed_rect("readouts-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["anchor-d-tiles", "readouts-chart", "anchor-d-energies", "readouts-status", "readouts-fold-work", "readouts-fold-breakdown", "readouts-fold-compare"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{units:?} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{units:?} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{units:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
     }
 }

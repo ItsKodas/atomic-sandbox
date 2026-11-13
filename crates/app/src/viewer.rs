@@ -3683,13 +3683,13 @@ nucleus 1 {a} {} {}
         for _ in 0..3 {
             run(&mut v, vec![]);
         }
-        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Graph").copied()).expect("the Graph tab").center();
+        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Readouts").copied()).expect("the Readouts tab").center();
         let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
         run(&mut v, vec![egui::Event::PointerMoved(c), button(c, true)]);
         for dx in [12.0, 50.0] {
             run(&mut v, vec![egui::Event::PointerMoved(c + egui::vec2(dx, 0.0))]);
         }
-        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Graph));
+        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Readouts));
         v.tool.selected = Some(0);
         v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
         assert_eq!(v.tool.selected, Some(0), "the drag's Esc does not deselect");
@@ -3755,8 +3755,8 @@ nucleus 1 {a} {} {}
         assert!((1060.0..1100.0).contains(&(both.origin[0] + both.size[0])), "the right column is on the right: {both:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
         // closing the right column's panels gives its width back, to the window's edge
-        // (Activity and Graph are tabbed with the Log since docking Task 4)
-        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity, DockTab::Graph] {
+        // (Activity is tabbed with the Log since docking Task 4)
+        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity] {
             v.ui.workspace.close_panel(t);
         }
         let left_only = frames(&mut v);

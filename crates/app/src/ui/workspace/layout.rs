@@ -22,7 +22,7 @@
 //! A detached window's tree (spec D-12, D3) is the same grammar without the 3D view
 //! ([`parse_window`]; a `3D` in it is dropped).
 //!
-//! The auto-hidden panels (spec D-8, D-10; D2) are a second line, `hidden = Graph:left:340,
+//! The auto-hidden panels (spec D-8, D-10; D2) are a second line, `hidden = Log:left:340,
 //! Log:right:300`: each panel's name, the 3D view's edge it folded to and its remembered size in
 //! points (its width; its height on the bottom edge). [`parse_hidden`] is total too: names and
 //! edges are read in any case, a size is clamped to [`HIDDEN_MIN`]..=[`HIDDEN_MAX`], an entry
@@ -131,17 +131,16 @@ fn encode_into(n: &Node, out: &mut String) {
     }
 }
 
-/// The D1 default (spec D-9's example, exactly): Model / Knowledge over Selection / Readouts on the
-/// left (24 %), the 3D view, View / Orbitals over Log / Activity / Graph on the right (30 %).
-/// Activity and Graph sat in the lower-left leaf until docking Task 4 (2026-11-03): with four tabs
-/// there the Graph tab was scrolled off its bar at 1400 pt.
+/// The D1 default (spec D-9's example, without the Graph panel merged into Readouts on
+/// 2026-11-14): Model / Knowledge over Selection / Readouts on the left (24 %), the 3D view, View /
+/// Orbitals over Log / Activity on the right (30 %).
 pub fn default_layout() -> Node {
     use DockTab::*;
     split(
         true,
         0.24,
         split(false, 0.55, leaf(vec![Model, Knowledge], 0), leaf(vec![Selection, Readouts], 0)),
-        split(true, 0.70, Node::View3d, split(false, 0.62, leaf(vec![View, Orbitals], 0), leaf(vec![Log, Activity, Graph], 0))),
+        split(true, 0.70, Node::View3d, split(false, 0.62, leaf(vec![View, Orbitals], 0), leaf(vec![Log, Activity], 0))),
     )
 }
 
@@ -319,6 +318,42 @@ pub fn parse_hidden(s: &str) -> Vec<Hidden> {
     out
 }
 
+/// A profile's `layout`, `hidden` and `window` values with the Graph panel (merged into Readouts
+/// on 2026-11-14) migrated: where any of them names Readouts, every "Graph" is dropped (its slot
+/// goes; [`clean`] collapses a leaf left empty), else "Graph" becomes "Readouts" (the merged panel
+/// takes the Graph's place). Names are matched whole, any case, between the grammar's punctuation.
+pub fn migrate_graph(values: &[&str]) -> Vec<String> {
+    const PUNCT: &str = "[](),*:";
+    let words = |s: &str| s.split(|c: char| PUNCT.contains(c)).map(str::trim).map(str::to_string).collect::<Vec<_>>();
+    let has_readouts = values.iter().any(|v| words(v).iter().any(|w| w.eq_ignore_ascii_case("Readouts")));
+    let to = if has_readouts { "" } else { "Readouts" };
+    values
+        .iter()
+        .map(|v| {
+            let mut out = String::with_capacity(v.len());
+            let mut word = String::new();
+            let flush = |word: &mut String, out: &mut String| {
+                if word.trim().eq_ignore_ascii_case("Graph") {
+                    out.push_str(to);
+                } else {
+                    out.push_str(word);
+                }
+                word.clear();
+            };
+            for c in v.chars() {
+                if PUNCT.contains(c) {
+                    flush(&mut word, &mut out);
+                    out.push(c);
+                } else {
+                    word.push(c);
+                }
+            }
+            flush(&mut word, &mut out);
+            out
+        })
+        .collect()
+}
+
 /// The panel a saved name means: its [`DockTab::name`] or [`DockTab::title`], any case.
 fn tab_named(w: &str) -> Option<DockTab> {
     DockTab::PANELS.into_iter().find(|t| w.eq_ignore_ascii_case(t.name()) || w.eq_ignore_ascii_case(t.title()))
@@ -415,13 +450,13 @@ mod tests {
     use DockTab::*;
 
     /// The old docks' default tab lists (before docking Task 2), as an old profile holds them.
-    const OLD_LEFT: [DockTab; 3] = [Activity, Readouts, Graph];
+    const OLD_LEFT: [DockTab; 2] = [Activity, Readouts];
     const OLD_RIGHT: [DockTab; 5] = [Model, Knowledge, Orbitals, Selection, Log];
     /// The old sweep constant's order (`DockTab::ALL` before docking Task 2: View was not a tab).
-    const OLD_ALL: [DockTab; 8] = [Activity, Readouts, Graph, Model, Knowledge, Orbitals, Selection, Log];
+    const OLD_ALL: [DockTab; 7] = [Activity, Readouts, Model, Knowledge, Orbitals, Selection, Log];
 
     /// Spec D-9's example, verbatim: the D1 default.
-    const D9: &str = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Graph])))";
+    const D9: &str = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity])))";
 
     fn leaf(tabs: &[DockTab], active: usize) -> Node {
         Node::Leaf { tabs: tabs.to_vec(), active }
@@ -443,7 +478,7 @@ mod tests {
         assert_eq!(parse(D9), Some(d.clone()));
         assert_eq!(parse(&encode(&d)), Some(d.clone()));
         assert_all_once(&d);
-        assert_eq!(panels(&d), vec![Model, Knowledge, Selection, Readouts, View, Orbitals, Log, Activity, Graph], "reading order: depth first");
+        assert_eq!(panels(&d), vec![Model, Knowledge, Selection, Readouts, View, Orbitals, Log, Activity], "reading order: depth first");
     }
 
     #[test]
@@ -467,14 +502,14 @@ mod tests {
 
     #[test]
     fn a_duplicate_keeps_its_first_place() {
-        let got = parse("H(0.3,[Log,Model*],V(0.5,3D,[Model,Graph,Log*]))").unwrap();
+        let got = parse("H(0.3,[Log,Model*],V(0.5,3D,[Model,Knowledge,Log*]))").unwrap();
         assert_eq!(
             got,
             Node::Split {
                 horizontal: true,
                 frac: 0.3,
                 a: Box::new(leaf(&[Log, Model], 1)),
-                b: Box::new(Node::Split { horizontal: false, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Graph], 0)) }),
+                b: Box::new(Node::Split { horizontal: false, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Knowledge], 0)) }),
             }
         );
         // a second 3D view is a duplicate too
@@ -509,21 +544,21 @@ mod tests {
 
     #[test]
     fn whitespace_is_tolerated() {
-        let spaced = " H ( 0.24 , V( 0.55,[ Model * , Knowledge ],[Selection*, Readouts]) ,\n H(0.70, 3D ,V(0.62,[View*,Orbitals],[ Log* ,Activity, Graph] ) ) ) ";
+        let spaced = " H ( 0.24 , V( 0.55,[ Model * , Knowledge ],[Selection*, Readouts]) ,\n H(0.70, 3D ,V(0.62,[View*,Orbitals],[ Log* ,Activity] ) ) ) ";
         assert_eq!(parse(spaced), Some(default_layout()));
     }
 
     #[test]
     fn the_active_tab_follows_its_star() {
-        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Graph,Log*])") else { panic!() };
-        assert_eq!(*b, leaf(&[Model, Graph, Log], 2));
-        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Graph,Log])") else { panic!() };
-        assert_eq!(*b, leaf(&[Model, Graph, Log], 0), "no star: the first");
-        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Bogus*,Graph])") else { panic!() };
-        assert_eq!(*b, leaf(&[Model, Graph], 0), "the starred name was dropped: the first");
+        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Knowledge,Log*])") else { panic!() };
+        assert_eq!(*b, leaf(&[Model, Knowledge, Log], 2));
+        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Knowledge,Log])") else { panic!() };
+        assert_eq!(*b, leaf(&[Model, Knowledge, Log], 0), "no star: the first");
+        let Some(Node::Split { b, .. }) = parse("V(0.5,3D,[Model,Bogus*,Knowledge])") else { panic!() };
+        assert_eq!(*b, leaf(&[Model, Knowledge], 0), "the starred name was dropped: the first");
         // clean keeps the active tab when tabs before it go
-        assert_eq!(clean(Node::Split { horizontal: true, frac: 0.5, a: Box::new(leaf(&[Log], 0)), b: Box::new(Node::Split { horizontal: true, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Log, Model, Graph], 2)) }) }),
-            Some(Node::Split { horizontal: true, frac: 0.5, a: Box::new(leaf(&[Log], 0)), b: Box::new(Node::Split { horizontal: true, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Model, Graph], 1)) }) }));
+        assert_eq!(clean(Node::Split { horizontal: true, frac: 0.5, a: Box::new(leaf(&[Log], 0)), b: Box::new(Node::Split { horizontal: true, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Log, Model, Knowledge], 2)) }) }),
+            Some(Node::Split { horizontal: true, frac: 0.5, a: Box::new(leaf(&[Log], 0)), b: Box::new(Node::Split { horizontal: true, frac: 0.5, a: Box::new(Node::View3d), b: Box::new(leaf(&[Model, Knowledge], 1)) }) }));
         // an out-of-range active is the first
         assert_eq!(clean(leaf(&[Model, Log], 7)), Some(leaf(&[Model, Log], 0)));
     }
@@ -538,32 +573,32 @@ mod tests {
     fn from_the_old_docks_default() {
         let n = from_sides(&OLD_LEFT, &OLD_RIGHT);
         assert_all_once(&n);
-        assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts,Graph],H(0.70,3D,V(0.62,[Model*,View,Knowledge,Orbitals,Selection],[Log*])))");
+        assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts],H(0.70,3D,V(0.62,[Model*,View,Knowledge,Orbitals,Selection],[Log*])))");
         assert_eq!(parse(&encode(&n)), Some(n));
     }
 
     #[test]
     fn from_sides_places_every_panel_once() {
         // the profile test's moved Log: it stays left, so the right column is one leaf
-        let n = from_sides(&[Activity, Readouts, Graph, Log], &[Model, Orbitals, Selection]);
+        let n = from_sides(&[Activity, Readouts, Log], &[Model, Orbitals, Selection]);
         assert_all_once(&n);
-        assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts,Graph,Log],H(0.70,3D,[Model*,View,Orbitals,Selection,Knowledge]))", "Knowledge was never listed: it joins the last right leaf");
+        assert_eq!(encode(&n), "H(0.24,[Activity*,Readouts,Log],H(0.70,3D,[Model*,View,Orbitals,Selection,Knowledge]))", "Knowledge was never listed: it joins the last right leaf");
         // nothing on the left: no left column
         let n = from_sides(&[], &OLD_ALL);
         assert_all_once(&n);
-        assert_eq!(encode(&n), "H(0.70,3D,V(0.62,[Activity*,View,Readouts,Graph,Model,Knowledge,Orbitals,Selection],[Log*]))");
+        assert_eq!(encode(&n), "H(0.70,3D,V(0.62,[Activity*,View,Readouts,Model,Knowledge,Orbitals,Selection],[Log*]))");
         // nothing on the right: View alone leads the right column, the missing panels join it
         let n = from_sides(&[Model], &[]);
         assert_all_once(&n);
-        assert_eq!(encode(&n), "H(0.24,[Model*],H(0.70,3D,[View*,Knowledge,Selection,Readouts,Orbitals,Log,Activity,Graph]))", "missing panels in PANELS order");
+        assert_eq!(encode(&n), "H(0.24,[Model*],H(0.70,3D,[View*,Knowledge,Selection,Readouts,Orbitals,Log,Activity]))", "missing panels in PANELS order");
         // only Log on the right: View leads the first leaf, the missing panels join [Log]
         let n = from_sides(&[Activity], &[Log]);
         assert_all_once(&n);
-        assert_eq!(encode(&n), "H(0.24,[Activity*],H(0.70,3D,V(0.62,[View*],[Log*,Model,Knowledge,Selection,Readouts,Orbitals,Graph])))");
+        assert_eq!(encode(&n), "H(0.24,[Activity*],H(0.70,3D,V(0.62,[View*],[Log*,Model,Knowledge,Selection,Readouts,Orbitals])))");
         // duplicates across and within the lists keep their first place
-        let n = from_sides(&[Log, Log, Graph], &[Graph, Model, Log]);
+        let n = from_sides(&[Log, Log, Readouts], &[Readouts, Model, Log]);
         assert_all_once(&n);
-        assert!(encode(&n).starts_with("H(0.24,[Log*,Graph],H(0.70,3D,[Model*,View,"), "{}", encode(&n));
+        assert!(encode(&n).starts_with("H(0.24,[Log*,Readouts],H(0.70,3D,[Model*,View,"), "{}", encode(&n));
         // a list that already holds View keeps it there
         let n = from_sides(&[View], &[]);
         assert_all_once(&n);
@@ -584,9 +619,9 @@ mod tests {
 
     #[test]
     fn a_window_tree_parses_without_the_3d_view() {
-        let n = parse_window("V(0.50,[Activity*],[Graph*])").unwrap();
-        assert_eq!(encode(&n), "V(0.50,[Activity*],[Graph*])");
-        assert_eq!(parse_window("H(0.3,3D,[Log*,Graph])"), Some(leaf(&[Log, Graph], 0)), "a 3D in a window's tree is dropped");
+        let n = parse_window("V(0.50,[Activity*],[Knowledge*])").unwrap();
+        assert_eq!(encode(&n), "V(0.50,[Activity*],[Knowledge*])");
+        assert_eq!(parse_window("H(0.3,3D,[Log*,Knowledge])"), Some(leaf(&[Log, Knowledge], 0)), "a 3D in a window's tree is dropped");
         for bad in ["3D", "", "[Bogus]", "V(0.5,[],[Nope])", "[Log] trailing", "H("] {
             assert_eq!(parse_window(bad), None, "{bad:?}");
         }
@@ -594,9 +629,9 @@ mod tests {
 
     #[test]
     fn hidden_panels_round_trip() {
-        let h = vec![Hidden { tab: Graph, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Right, size: 300.0 }, Hidden { tab: View, edge: Edge::Bottom, size: 260.4 }];
-        assert_eq!(encode_hidden(&h), "Graph:left:340, Log:right:300, View:bottom:260");
-        assert_eq!(parse_hidden("Graph:left:340, Log:right:300"), h[..2].to_vec(), "the spec's example");
+        let h = vec![Hidden { tab: Knowledge, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Right, size: 300.0 }, Hidden { tab: View, edge: Edge::Bottom, size: 260.4 }];
+        assert_eq!(encode_hidden(&h), "Knowledge:left:340, Log:right:300, View:bottom:260");
+        assert_eq!(parse_hidden("Knowledge:left:340, Log:right:300"), h[..2].to_vec(), "the spec's example");
         assert_eq!(encode_hidden(&parse_hidden(&encode_hidden(&h))), encode_hidden(&h));
         assert_eq!(encode_hidden(&[]), "");
         assert_eq!(parse_hidden(""), vec![]);
@@ -605,11 +640,11 @@ mod tests {
     #[test]
     fn hidden_names_and_edges_are_case_insensitive_sizes_clamped_unknown_dropped() {
         assert_eq!(
-            parse_hidden(" graph : LEFT : 340 ,LOG:Bottom:5000, model:right:12"),
-            vec![Hidden { tab: Graph, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Bottom, size: HIDDEN_MAX }, Hidden { tab: Model, edge: Edge::Right, size: HIDDEN_MIN }]
+            parse_hidden(" knowledge : LEFT : 340 ,LOG:Bottom:5000, model:right:12"),
+            vec![Hidden { tab: Knowledge, edge: Edge::Left, size: 340.0 }, Hidden { tab: Log, edge: Edge::Bottom, size: HIDDEN_MAX }, Hidden { tab: Model, edge: Edge::Right, size: HIDDEN_MIN }]
         );
         // an unknown name, an unknown edge, an unreadable size, a missing or extra field: dropped
-        assert_eq!(parse_hidden("Bogus:left:300, Graph:top:300, Log:left:wide, Model:left, View:left:300:9, Orbitals:left:NaN, Readouts:right:inf"), vec![Hidden { tab: Readouts, edge: Edge::Right, size: HIDDEN_MAX }]);
+        assert_eq!(parse_hidden("Bogus:left:300, Knowledge:top:300, Log:left:wide, Model:left, View:left:300:9, Orbitals:left:NaN, Readouts:right:inf"), vec![Hidden { tab: Readouts, edge: Edge::Right, size: HIDDEN_MAX }]);
         // a title reads as its panel; a duplicate keeps its first entry
         assert_eq!(parse_hidden("Model · estimated solver:left:300, Model:right:400"), vec![Hidden { tab: Model, edge: Edge::Left, size: 300.0 }]);
         assert_eq!(parse_hidden("garbage, ,:::,"), vec![]);

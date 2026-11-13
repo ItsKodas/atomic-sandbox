@@ -258,8 +258,8 @@ pub const TOOL_KEYS: [(egui::Key, ToolMode); 4] =
 /// [`DockTab::PANELS`]. Where each sits is the workspace tree's (`UiState::workspace`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
+    /// The tiles, the E total / T chart (the old Graph panel, merged 2026-11-14), the energies.
     Readouts,
-    Graph,
     Model,
     /// What runs, what the teacher was asked and why, and how the model learns (activity spec §3.3).
     Activity,
@@ -278,7 +278,7 @@ impl DockTab {
     /// Every panel of the workspace (docking spec D-2), View included (the tests' sweep, the saved
     /// layout's parser, the screenshot harness's `tab=`; the order a migrated layout adds panels
     /// an old profile never listed, `workspace::layout`).
-    pub const PANELS: [DockTab; 9] = [
+    pub const PANELS: [DockTab; 8] = [
         DockTab::Model,
         DockTab::Knowledge,
         DockTab::Selection,
@@ -287,7 +287,6 @@ impl DockTab {
         DockTab::Orbitals,
         DockTab::Log,
         DockTab::Activity,
-        DockTab::Graph,
     ];
     /// The panel's one-word name: its tab's label (docking spec D-4), its word in a saved layout
     /// (spec D-9: `[Model*,Knowledge]`) and in an old profile's `left_tabs` / `right_tabs` lines,
@@ -295,7 +294,6 @@ impl DockTab {
     pub fn name(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
-            DockTab::Graph => "Graph",
             DockTab::Model => "Model",
             DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
@@ -309,7 +307,6 @@ impl DockTab {
     pub fn title(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
-            DockTab::Graph => "Graph",
             DockTab::Model => "Model · estimated solver",
             DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
@@ -475,14 +472,6 @@ impl TempUnits {
     pub fn range(self, lo_k: f64, hi_k: f64) -> std::ops::RangeInclusive<f64> {
         self.from_k(lo_k.max(0.0))..=self.from_k(hi_k)
     }
-}
-
-/// The Graph tab's curves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GraphSeries {
-    Both,
-    Energy,
-    Temperature,
 }
 
 /// Help windows: the controls, and the "Physics, honestly" topics (long-form text).
@@ -802,6 +791,9 @@ pub struct UiState {
     /// The Knowledge panel's folds that are open (`knowledge::Sections`; the profile's
     /// `knowledge_sections`): "Why thin?", closed by default. Display state.
     pub knowledge_sections: knowledge::Sections,
+    /// The Readouts panel's folds that are open (`dock::readouts`; the profile's
+    /// `readouts_sections`): Work done, Energy breakdown and solver, Compare. Display state.
+    pub readouts_sections: dock::readouts::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -812,8 +804,7 @@ pub struct UiState {
     pub temp_avg: TempAverage,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
-    /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
-    pub graph_series: GraphSeries,
+    /// The Readouts chart's window: the newest [`SPARK_WINDOW`] points, or all (at most 2000).
     pub graph_all: bool,
     /// The session log (the Log panel and its tab's unread count, toasts) and its filter.
     pub log: LogBook,
@@ -1042,12 +1033,12 @@ impl UiState {
             activity_sections: activity::Sections::default(),
             orbital_sections: dock::orbitals::Sections::default(),
             knowledge_sections: knowledge::Sections::default(),
+            readouts_sections: dock::readouts::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
             temp_avg: TempAverage::default(),
             show_atom_card: true,
-            graph_series: GraphSeries::Both,
             graph_all: false,
             log: LogBook::default(),
             log_filter: LogFilter::All,
@@ -1447,6 +1438,15 @@ pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
     out
 }
 
+/// The panel a word names (`DockTab::name`, any case): the screenshot's `--ui tab=` and
+/// [`panels_named`]. "graph" names Readouts, which the Graph panel merged into on 2026-11-14.
+pub fn panel_named(w: &str) -> Option<DockTab> {
+    if w.trim().eq_ignore_ascii_case("graph") {
+        return Some(DockTab::Readouts);
+    }
+    DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w.trim()))
+}
+
 /// The panels a comma-separated list names (`DockTab::name`, any case): the windowed app's
 /// `--detach` and the screenshot's `--ui detach=`. An unknown name or an empty list is an error.
 pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
@@ -1454,7 +1454,7 @@ pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
         .split(',')
         .map(str::trim)
         .filter(|w| !w.is_empty())
-        .map(|w| DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w)).ok_or_else(|| format!("unknown panel {w}")))
+        .map(|w| panel_named(w).ok_or_else(|| format!("unknown panel {w}")))
         .collect::<Result<Vec<_>, _>>()?;
     if tabs.is_empty() {
         return Err("no panel named".into());

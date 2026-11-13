@@ -162,9 +162,9 @@ pub const ENTRIES: &[Entry] = &[
     e("E_KS", "Kohn-Sham energy", Dock(D::Readouts), "d-energies"),
     e("E total", "energy", Dock(D::Readouts), "d-energies"),
     e("E conserved", "energy invariant", Dock(D::Readouts), "d-energies"),
-    e("Work done by tools", "drag thermostat pins", Dock(D::Readouts), "d-energies"),
-    e("Model refit / force mismatch work", "estimated booking", Dock(D::Readouts), "d-energies"),
-    e("Walls (piston) work", "container booking", Dock(D::Readouts), "d-energies"),
+    e("Work done by tools", "drag thermostat pins", Dock(D::Readouts), "d-work"),
+    e("Model refit / force mismatch work", "estimated booking", Dock(D::Readouts), "d-work"),
+    e("Walls (piston) work", "container booking", Dock(D::Readouts), "d-work"),
     e("Energy units Ha / eV", "hartree electronvolt", Dock(D::Readouts), "d-energies"),
     e("Sim time and step", "t fs", Dock(D::Readouts), "d-time"),
     e("Steps last tick, ms per step", "cost", Dock(D::Readouts), "d-time"),
@@ -176,7 +176,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Set up PySCF", "install python pyscf wsl pip reference enable", Dock(D::Readouts), "d-compare"),
     e("Compare with reference (PySCF)", "pyscf reference forces dipole relax both bond lengths angles lda pbe b3lyp ccsd(t) deviation", Dock(D::Readouts), "d-compare"),
     // Graph
-    e("Graph: E total and T", "sparkline plot history curve", Dock(D::Graph), "d-graph"),
+    e("Graph (chart): E total and T", "sparkline plot history curve delta E micro hartree temperature window readouts", Dock(D::Readouts), "d-graph"),
     // Model
     // the Model panel (restructured 2026-11-14): the verdict card, Teach next, Health, the folds
     e("Model verdict (answering / falling back here)", "trusted this step who answered surrogate fallback DFT why reason surface shared", Dock(D::Model), "d-model"),

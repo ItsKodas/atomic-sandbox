@@ -6,11 +6,10 @@
 //! window — is the workspace tree's (`super::workspace::tree`), which draws the tabs and frames these
 //! bodies. All of it is display state: none of it is an `Action`, so nothing here is recorded.
 mod compare;
-mod graph;
 mod log;
 pub mod model;
 pub mod orbitals;
-mod readouts;
+pub mod readouts;
 mod selection;
 pub mod view;
 
@@ -41,7 +40,6 @@ pub(super) fn wide_grid(ui: &Ui, id: &str, cols: usize) -> egui::Grid {
 pub(super) fn icon(tab: DockTab) -> Icon {
     match tab {
         DockTab::Readouts => Icon::Readouts,
-        DockTab::Graph => Icon::Graph,
         DockTab::Model => Icon::Model,
         DockTab::Activity => Icon::Activity,
         DockTab::Orbitals => Icon::Orbitals,
@@ -96,16 +94,13 @@ pub(super) fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String
     match tab {
         DockTab::Readouts => match d {
             Some(d) => format!(
-                "Readouts\nT {} · E total {:+.6} Ha\ndrift {}",
+                "Readouts\nT {} · E total {:+.6} Ha\ndrift {}\nE total and T: {} points",
                 super::averaged_temperature_text(d, &st.temp_avg, 1, st.temp_units),
                 d.total,
-                d.drift_per_ps.map_or("—".into(), |x| format!("{x:+.2e} Ha/ps"))
+                d.drift_per_ps.map_or("—".into(), |x| format!("{x:+.2e} Ha/ps")),
+                d.history.len()
             ),
             None => "Readouts\nno solution yet".into(),
-        },
-        DockTab::Graph => match d {
-            Some(d) => format!("Graph\nE total and T: {} points", d.history.len()),
-            None => "Graph".into(),
         },
         DockTab::Model => match input.model() {
             Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m), input.scene, st).text, m.samples, m.epoch),
@@ -179,7 +174,6 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
             super::probe_rect(&format!("dock-content-{}", tab.name()), ui.max_rect());
             match tab {
                 DockTab::Readouts => readouts::show(ui, st, input, acts),
-                DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
                 DockTab::Activity => super::activity::show(ui, st, input, acts),
                 DockTab::Orbitals => orbitals::show(ui, st, input, acts),
