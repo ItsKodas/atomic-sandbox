@@ -29,15 +29,18 @@
 //! `DegenerateShells` a shared shell makes it exceed n_σ (pseudo-O triplet ↓: n = 2, f = 1, ⅓, ⅓, ⅓ ⇒
 //! n_occ = 4). So each channel starts from k_σ = n_σ + m + G plus the previous call's n_occ − n_σ (when it
 //! had the same n_σ), solves (one LOBPCG at the SCF's effective tol, `effective_eig_tol`, and cap,
-//! `EIGEN_MAX_ITER`), applies `qm::one_shot_occupations`, and when n_occ + m + G > k_σ appends the deficit
-//! as fresh `qm::scf::initial_orbitals` columns (seed 5 ↑ / 6 ↓, the columns past those already held)
-//! behind the current Ritz vectors and solves again — the converged columns cost ~0 iterations; this is
-//! the SCF's witness growth (`qm::scf` "Occupations"), bounded by `MAX_WITNESS_GROWTH` — then re-applies
-//! the occupations. A block larger than needed (the shell split since the last call) is trimmed from the
+//! `EIGEN_MAX_ITER`), applies `qm::one_shot_occupations`, and grows the block (`block_need`) when
+//! n_occ + m + G > k_σ **or** the occupations found no gap witness (`window_short`: the top computed level
+//! within τ_c of ε_F — which can come with a released cluster and n_occ = n_σ, so the count alone would
+//! not see it; then one more level, as the SCF's growth does): the new columns are fresh
+//! `qm::scf::initial_orbitals` ones (seed 5 ↑ / 6 ↓, the columns past those already held) behind the
+//! current Ritz vectors, and it solves again — the converged columns need no further work, but the solve
+//! runs until the new columns converge or reach the cap; this is the SCF's witness growth (`qm::scf`
+//! "Occupations"), bounded by `MAX_WITNESS_GROWTH` — then re-applies the occupations. A block larger than needed (the shell split since the last call) is trimmed from the
 //! top. So every completed solve keeps exactly n_occ + m + G levels: G above the occupied ones and above
 //! the m asked for, which hold the `DegenerateShells` gap witness whenever the shell has one within that
-//! reach, and the unoccupied record always has m + G vectors, the count `block_edge` reads m from. Only
-//! when the growth bound is hit can the window stay short (the note says so). The guess is this state's
+//! reach, and the unoccupied record always has m + G vectors, the count `block_edge` reads m from. A
+//! short window is left only at the growth bound (the note says so, and is emitted only then). The guess is this state's
 //! previous vectors (trimmed, or topped up with fresh columns), else `initial_orbitals`. Occupied and
 //! unoccupied come out of the **same** Rayleigh–Ritz, so there is no separate unoccupied step and no
 //! `occupied_disagreement` check (spec §4.2: the builder's choice). The f > 0 levels (the lowest by rank
@@ -108,7 +111,8 @@ pub struct HarrisInput<'a> {
 /// interleave only at a degenerate HOMO/LUMO pair under `Aufbau`); `n_occ` the
 /// levels with f > 0 (the state's orbitals); `notes` the informational lines (a released shell, a short
 /// window, an eigensolve at its cap); `iterations`/`at_cap` per channel (summed over the block's growth
-/// solves; at the cap in any of them); `cold` = some non-empty channel had no previous vector to start
+/// solves; at the cap in any of them); `solves` the LOBPCG calls per channel (1, plus one per growth of the
+/// block; 0 for a skipped channel); `cold` = some non-empty channel had no previous vector to start
 /// from (all from `initial_orbitals`); `wall` the call's wall time.
 #[derive(Clone, Debug)]
 pub struct HarrisSolve {
@@ -118,6 +122,7 @@ pub struct HarrisSolve {
     pub notes: Vec<String>,
     pub iterations: [usize; 2],
     pub at_cap: [bool; 2],
+    pub solves: [usize; 2],
     pub cold: bool,
     pub wall: Duration,
 }
@@ -237,6 +242,15 @@ fn grown<'w>(work: &'w mut Option<LobpcgWork>, work_k: &mut usize, ctx: &GpuCont
     work.as_mut().expect("sized above")
 }
 
+/// The levels the block must hold after an occupation pass (module doc): n_occ + m + G, and at least one
+/// more than it holds when there was no gap witness (`window_short`), capped at `k_max`. Larger than `len`
+/// ⇔ grow and solve again.
+fn block_need(n_occ: usize, m: usize, window_short: bool, len: usize, k_max: usize) -> usize {
+    let need = n_occ + m + UNOCC_GUARD;
+    let need = if window_short { need.max(len + 1) } else { need };
+    need.min(k_max)
+}
+
 const SPIN: [&str; 2] = ["↑", "↓"];
 
 impl GpuSolver {
@@ -328,6 +342,7 @@ impl GpuSolver {
         let mut info = Unoccupied::empty(tol);
         let mut done: [Option<Channel>; 2] = [None, None];
         let (mut cold, mut notes) = (false, Vec::new());
+        let mut solves = [0usize; 2];
         // Ok(true): aborted
         let mut outcome: Result<bool, QmError> = Ok(false);
         let sum = take(free, ctx, g);
@@ -351,6 +366,7 @@ impl GpuSolver {
             let (ev, one) = loop {
                 let mut ev = vec![0.0; x.len()];
                 let w = grown(work, work_k, ctx, g, x.len());
+                solves[ch] += 1;
                 let es = match lobpcg(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
                     Ok(es) => es,
                     Err(e) => { free.append(&mut x); outcome = Err(take_device_error().unwrap_or(e)); break 'channels; }
@@ -369,9 +385,9 @@ impl GpuSolver {
                 // the occupations of this one diagonalisation; the f > 0 levels are the lowest by rank
                 let one = one_shot_occupations(&ev, nc, ch as u8, settings.occupations);
                 let n_occ = one.f.iter().filter(|f| **f > 0.0).count();
-                let need = (n_occ + m + UNOCC_GUARD).min(k_max);
+                let need = block_need(n_occ, m, one.window_short, x.len(), k_max);
                 if need > x.len() {
-                    // a shared shell reached into the block: grow it behind the Ritz vectors and solve again
+                    // a shared shell reached into the block, or no gap witness: grow it behind the Ritz vectors
                     top_up(&mut x, need, free, ctx, g, grid, &system.nuclei, seed);
                     continue;
                 }
@@ -379,6 +395,7 @@ impl GpuSolver {
             };
             if one.released { notes.push(format!("spin {}: a shared shell of spread ≥ τ was split (one-shot release)", SPIN[ch])); }
             if one.window_short {
+                debug_assert!(x.len() >= k_max, "a short window below the growth bound grows the block");
                 notes.push(format!("spin {}: no gap witness among the {} computed levels (growth bound reached): every level within τ_c of ε_F shares", SPIN[ch], x.len()));
             }
             let order = ascending(&ev);
@@ -436,7 +453,7 @@ impl GpuSolver {
         };
         let ((eu, fu), (ed, fd)) = (level(&up, 0), level(&dn, 1));
         let solve = HarrisSolve { evals: [eu, ed], occ: [fu, fd], n_occ: [up.orbitals.len(), dn.orbitals.len()], notes,
-                                  iterations: info.iterations, at_cap: info.at_cap, cold, wall: t0.elapsed() };
+                                  iterations: info.iterations, at_cap: info.at_cap, solves, cold, wall: t0.elapsed() };
         let Channel { orbitals: orbitals_up, evals: evals_up, occ: occ_up, unocc: unocc_up } = up;
         let Channel { orbitals: orbitals_dn, evals: evals_dn, occ: occ_dn, unocc: unocc_dn } = dn;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up, orbitals_dn, evals_up, evals_dn,
@@ -456,6 +473,22 @@ mod tests {
     use crate::orbitals::{OrbitalView, Product, Spin};
     use crate::reduce::neumaier;
     use qm::{Grid, KsState, Nucleus, Occupations};
+
+    /// The growth trigger (review round 2): the qm unit case of a released short window
+    /// (`one_shot_marks_a_short_window`: ε = −1.0, −0.40, −0.39, −0.35, n = 2 ⇒ released, f = 1, 1, 0, 0,
+    /// n_occ = n = 2, `window_short`) needs one more level although n_occ + m + G = 4 = the block at m = 0; a
+    /// witnessed block of the right size needs none; a shared shell needs n_occ + m + G; the bound caps both.
+    #[test]
+    fn block_need_grows_a_short_window() {
+        let o = one_shot_occupations(&[-1.0, -0.40, -0.39, -0.35], 2, 0, Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU });
+        let n_occ = o.f.iter().filter(|f| **f > 0.0).count();
+        assert!(o.window_short && o.released && n_occ == 2, "{o:?}");
+        let k_max = 2 + UNOCC_GUARD + MAX_WITNESS_GROWTH;
+        assert_eq!(block_need(n_occ, 0, o.window_short, 4, k_max), 5, "a short window grows by one level");
+        assert_eq!(block_need(n_occ, 0, false, 4, k_max), 4, "a witnessed block of n_occ + G levels stays");
+        assert_eq!(block_need(4, 2, false, 6, k_max), 8, "a shared shell: n_occ + m + G");
+        assert_eq!(block_need(n_occ, 0, true, k_max, k_max), k_max, "at the bound: no further growth");
+    }
 
     fn ctx() -> Option<GpuContext> {
         let c = GpuContext::new_headless();
@@ -759,11 +792,16 @@ mod tests {
             assert!(unocc.len() >= 2, "spin {ch}: at least m = 2 unoccupied rows");
         }
         let again = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
-        println!("second call: cold {}, iterations {:?}", again.cold, again.iterations);
+        println!("second call: cold {}, iterations {:?}, solves {:?} (first call {:?} in {:?} solves, at cap {:?})",
+                 again.cold, again.iterations, again.solves, out.iterations, out.solves, out.at_cap);
+        assert_eq!(out.solves, [1, 2], "the first call grew ↓ once (n_occ↓ = 4 > n↓)");
         assert!(!again.cold && again.evals[1].len() == 4 + 2 + UNOCC_GUARD);
-        // ↑ converged on the first call: 0 iterations now. ↓ stopped at the cap there (its guard levels near
-        // 0.407 Ha, residual 5.7e-4 at 33³), so the warm restart continues that solve — fewer iterations, not 0
-        assert_eq!(again.iterations[0], 0, "↑: the previous block is converged on entry");
-        assert!(again.iterations[1] < out.iterations[1], "↓: the warm restart continues ({} vs {})", again.iterations[1], out.iterations[1]);
+        assert_eq!(again.solves, [1, 1], "sized from the last n_occ: no growth solve");
+        // a channel that converged on the first call is converged on entry; one that stopped at the cap (↓
+        // here: its guard levels near 0.407 Ha, residual 5.7e-4 at 33³) is continued by the warm restart
+        assert!(out.at_cap[1], "the premise of the ↓ case: the first call's ↓ solve ended at the cap");
+        for ch in 0..2 {
+            if !out.at_cap[ch] { assert_eq!(again.iterations[ch], 0, "spin {ch}: converged on entry"); }
+        }
     }
 }
