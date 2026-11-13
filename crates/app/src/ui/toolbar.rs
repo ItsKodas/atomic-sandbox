@@ -73,14 +73,12 @@ fn estimated_tip(gpu: bool) -> String {
 
 /// Draws the toolbar and returns its rect (the progress bar sits on its top edge).
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) -> egui::Rect {
-    // The full layout's fixed widths need `Widths::full` points: on a window narrower than that
-    // (but above the shared `COMPACT_WIDTH`) the toolbar takes its compact layout rather than
-    // running its Solver group off the edge. The top bar keeps its own switch.
-    let w = Widths::measure(root);
-    let compact = compact || root.available_width() < w.full;
-    // the Thermostat group where the window has room for it besides the rest (`Widths::full`
-    // without it, so the full layout still fits 1400 pt; `Widths::full_thermostat`)
-    let thermostat = !compact && root.available_width() >= w.full_thermostat;
+    // The full layout's fixed widths need `Widths::full` points (≈ 1584 with the fonts in use, the
+    // Thermostat group included: user ruling 2026-11-14, so the group is always in the bar and
+    // the default 1400-pt window gets the compact one): on a window narrower than that (but above
+    // the shared `COMPACT_WIDTH`) the toolbar takes its compact layout rather than running its
+    // Solver group off the edge. The top bar keeps its own switch.
+    let compact = compact || root.available_width() < Widths::measure(root).full;
     egui::Panel::bottom("toolbar")
         .exact_size(if compact { 50.0 } else { 84.0 })
         .resizable(false)
@@ -90,7 +88,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
                 if compact {
                     compact_bar(ui, st, input, acts)
                 } else {
-                    full_bar(ui, st, input, thermostat, acts)
+                    full_bar(ui, st, input, acts)
                 }
             });
         })
@@ -110,7 +108,7 @@ const C_SEP: f32 = 6.0;
 /// The least room (points) the compact Solver line is drawn in: its light and a few letters.
 const MIN_SUB: f32 = 48.0;
 /// The selection hint. The Selection group is sized for a selection's coordinates (|x| < 10
-/// Bohr), not for this: at 1400 pt that leaves the Solver line its room, and the hint elides its
+/// Bohr), not for this: at the full layout's narrowest that leaves the Solver line its room, and the hint elides its
 /// last words (full text on hover).
 const NO_SELECTION: &str = "no selection (Inspect or Edit: click a nucleus)";
 /// The Relax / Stop button's least width (the Time group, full layout).
@@ -138,8 +136,6 @@ struct Widths {
     solver_row: f32,
     /// The whole full bar with the Solver group at its row: the window width it needs.
     full: f32,
-    /// [`Self::full`] with the Thermostat group too: the window width that shows it.
-    full_thermostat: f32,
     // the full layout's slots
     speed_field: f32,
     rate: f32,
@@ -204,7 +200,7 @@ impl Widths {
         let relax = btn("Relax").max(btn("Stop")).max(RELAX_W);
         let selection_row = s.spacing.icon_width + s.spacing.icon_spacing + w("Pin", &body) + sp + btn("Focus") + sp + btn("Delete");
         // ⚠ Model only (shown under Estimated only): small, on the full layout's sub-line (its
-        // main row has no room left at 1400); beside the compact segments where the slot has room
+        // main row has no room left at the full layout's narrowest); beside the compact segments where the slot has room
         let model_only = sp + w(MODEL_ONLY, &sub) + 2.0 * bp;
         let solver_row = segs(&[btn("CPU"), btn("GPU"), btn("Estimated")]);
         let c_speed_field = field(&format!("×{MAX_SPEED}"));
@@ -231,7 +227,6 @@ impl Widths {
             solver: max(&[caps("Solver", false), solver_row, model_only + solver_sub]) + PAD,
             solver_row: solver_row + PAD,
             full: 0.0,
-            full_thermostat: 0.0,
             speed_field,
             rate: rate_full,
             dt_field,
@@ -251,11 +246,9 @@ impl Widths {
             c_speed_field,
             c_rate,
         };
-        // the panel's margin and stroke on both sides, six separators (8 + item spacing a side)
+        // the panel's margin and stroke on both sides, seven separators (8 + item spacing a side)
         let g = &widths;
-        widths.full = 2.0 * 7.0 + g.time + g.speed + g.dt + g.tool + g.elements + g.selection + 6.0 * (SEP + 2.0 * sp) + g.solver_row;
-        // and the Thermostat group with its separator
-        widths.full_thermostat = widths.full + widths.thermostat + SEP + 2.0 * sp;
+        widths.full = 2.0 * 7.0 + g.time + g.speed + g.dt + g.thermostat + g.tool + g.elements + g.selection + 7.0 * (SEP + 2.0 * sp) + g.solver_row;
         // the compact bar after dt's separator, without the Thermostat slot: Tool, the element
         // chip, Selection and the Solver's row with room for ⚠ Model only (whatever the solver, so
         // the slot does not move with it; the Thermostat gives way first), with their two
@@ -270,6 +263,15 @@ impl Widths {
     fn last(ui: &Ui, whole: f32, row: f32) -> f32 {
         whole.min(ui.available_width()).max(row)
     }
+}
+
+/// The window width (points) the full layout needs ([`Widths::full`], measured with `ctx`'s
+/// style): narrower, the toolbar is compact.
+#[cfg(test)]
+pub(crate) fn full_width(ctx: &egui::Context) -> f32 {
+    let mut full = 0.0;
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| full = Widths::measure(ui).full);
+    full
 }
 
 /// Width (points) of `text` in `font`, unwrapped.
@@ -383,8 +385,7 @@ fn kbd(ui: &mut Ui, key: &str) {
         .show(ui, |ui| ui.label(RichText::new(key).monospace().size(10.0).color(theme::INK_DIM)));
 }
 
-/// The full layout; `thermostat`: the window has room for the Thermostat group too.
-fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, thermostat: bool, acts: &mut Vec<Action>) {
+fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let w = Widths::measure(ui);
     let sampling = input.sampling();
     let d = input.snapshot.map(|s| &s.dynamics);
@@ -449,15 +450,12 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, thermostat: b
             None => sub(ui, format!("amber > {DT_WARN_FS}")),
         };
     });
-    // where the window has room (≈ 1590 pt): the rest of the full layout keeps fitting 1400
-    if thermostat {
-        group(ui, st, "tb-thermostat", "Thermostat", Some(THERMOSTAT_TIP), w.thermostat, |ui, st| {
-            row(ui, |ui| thermostat_controls(ui, st, Some(SLIDER_W), w.thermostat_field, acts));
-            let state = if st.thermostat_on { "on" } else { "off" };
-            sub(ui, line(&[&format!("{state} · τ "), &super::sig3(st.thermostat_tau), " fs"], SUB, theme::INK_DIM))
-                .on_hover_text("the coupling time τ: smaller = tighter control, more disturbed dynamics (Physics ▸ Thermostat sets it)");
-        });
-    }
+    group(ui, st, "tb-thermostat", "Thermostat", Some(THERMOSTAT_TIP), w.thermostat, |ui, st| {
+        row(ui, |ui| thermostat_controls(ui, st, Some(SLIDER_W), w.thermostat_field, acts));
+        let state = if st.thermostat_on { "on" } else { "off" };
+        sub(ui, line(&[&format!("{state} · τ "), &super::sig3(st.thermostat_tau), " fs"], SUB, theme::INK_DIM))
+            .on_hover_text("the coupling time τ: smaller = tighter control, more disturbed dynamics (Physics ▸ Thermostat sets it)");
+    });
     group(ui, st, "tb-tool", TOOL_LABEL, None, w.tool, |ui, st| {
         row(ui, |ui| tool_segments(ui, st, false, acts));
         if st.mode == ToolMode::Select {

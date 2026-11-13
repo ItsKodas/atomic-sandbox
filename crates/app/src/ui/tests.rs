@@ -1052,7 +1052,12 @@ fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, nam
     press_widget_w(ctx, st, inp, 1400.0, name, drag)
 }
 
-/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact layout).
+/// A window wide enough for the toolbar's full layout (it needs `toolbar::full_width`, ≈ 1584
+/// pt since the Thermostat group: the default 1400 gets the compact bar).
+const WIDE: f32 = 1700.0;
+
+/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact top bar, below
+/// `toolbar::full_width` the compact toolbar).
 fn press_widget_w(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, name: &str, drag: f32) -> Vec<PanelOutput> {
     for _ in 0..3 {
         frame(ctx, st, inp, w, vec![]);
@@ -1116,29 +1121,29 @@ fn clicking_the_toolbar_sends_the_old_commands() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.gpu_available = true;
-    let outs = click_widget(&ctx, &mut st, &inp, "play");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "play", 0.0);
     assert_eq!(outs.iter().filter(|o| o.toggle_play).count(), 1, "Play clicked once");
     st.speed = 50;
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "watchable"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "watchable", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::SetSpeed(1)]), "{c:?}");
     let dt = st.dt_fs;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "speed", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetSpeed(n) if *n > 1)), "{c:?}");
     assert!(st.speed > 1 && st.dt_fs == dt, "speed {} dt {}", st.speed, st.dt_fs);
     let speed = st.speed;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "dt", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "dt", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetDt(x) if *x > 0.25)), "{c:?}");
     assert_eq!(st.speed, speed);
-    let outs = click_widget(&ctx, &mut st, &inp, "element-8");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "element-8", 0.0);
     assert!(outs.iter().all(|o| o.commands.is_empty()));
     assert_eq!((st.element, st.mode), (8, ToolMode::Place));
-    click_widget(&ctx, &mut st, &inp, "solver-estimated");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-estimated", 0.0);
     assert_eq!(st.backend, Backend::Estimated);
-    click_widget(&ctx, &mut st, &inp, "solver-cpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-cpu", 0.0);
     assert_eq!(st.backend, Backend::Cpu);
-    click_widget(&ctx, &mut st, &inp, "solver-gpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-gpu", 0.0);
     assert_eq!(st.backend, Backend::Gpu);
-    let outs = click_widget(&ctx, &mut st, &inp, "delete");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "delete", 0.0);
     let removes: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::RemoveNucleus(1))).collect();
     assert_eq!(removes.len(), 1, "Delete removes the selected nucleus once");
 }
@@ -1878,9 +1883,9 @@ fn fs_per_s_shows_three_figures_in_five_characters_at_most() {
 /// sampling) vs short (DFT) vs absent, the selection, the dt warning, the pull, the speed and
 /// dt fields, the element, the thermostat (on / off, 0 K … 20 000 K) — in the full layout and the
 /// compact one; and no group outgrows the width it was given (`toolbar::Widths`), nor the
-/// window. The Thermostat group sits between dt and Tool where the window has room for it: at
-/// 1600 (full) and 1240 (compact: its two boxes, no slider), not at 1400 (the full layout's
-/// other groups fill it) nor 1000.
+/// window. The Thermostat group sits between dt and Tool where the window has room for it: in
+/// the full layout (1600), in the compact one at 1400 (its short slider) and 1240 (its two boxes
+/// alone), not at 1000.
 #[test]
 fn the_toolbar_groups_hold_still_when_live_values_change() {
     use toolbar::GROUPS;
@@ -1944,14 +1949,14 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
                 frame(&ctx, &mut st, &inp, w, vec![]);
             }
             let groups = GROUPS.with(|g| g.borrow().clone());
-            let thermostat = w == 1600.0 || w == 1240.0;
+            let thermostat = w != 1000.0;
             assert_eq!(groups.len(), if thermostat { 8 } else { 7 }, "{w}: {:?}", groups.keys());
             if thermostat {
                 // after dt, before Tool, overlapping neither
                 let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
                 assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
             }
-            assert_eq!(PROBES.with(|p| p.borrow().contains_key("tb-thermostat-slider")), w == 1600.0, "{w}: the slider");
+            assert_eq!(PROBES.with(|p| p.borrow().contains_key("tb-thermostat-slider")), w >= 1400.0, "{w}: the slider");
             PROBES.with(|p| p.borrow_mut().clear());
             for (anchor, (rect, width)) in &groups {
                 assert!(rect.width() <= width + 0.5, "{w} state {k}: {anchor} is {} wide, given {width}", rect.width());
@@ -1970,12 +1975,49 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         }
         let f = first.unwrap();
         let compact = f["tb-time"].0.height() < 40.0;
-        assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
+        assert_eq!(compact, w < 1600.0, "{w}: the full layout fits 1600, not 1400 (it needs {:.0})", toolbar::full_width(&ctx));
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
     }
 }
 
 // ---- the toolbar's Thermostat group (user request 2026-11-14) ----
+
+/// User ruling 2026-11-14: the toolbar is compact below the width its full layout needs with the
+/// Thermostat group (`toolbar::full_width`, measured from the groups' widths); at that width it
+/// is the full layout. The default 1400-pt window is compact and still holds the Thermostat slot
+/// (its short slider) between dt and Tool, overlapping neither.
+#[test]
+fn the_toolbar_is_full_from_the_width_its_groups_need() {
+    use toolbar::GROUPS;
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let full = toolbar::full_width(&ctx);
+    assert!((1400.0..1700.0).contains(&full), "the full layout's width: {full}");
+    let mut st = UiState::new("h2o", &scene);
+    st.backend = Backend::Estimated;
+    for (w, compact) in [(1400.0, true), (full.floor() - 1.0, true), (full.ceil(), false), (WIDE, false)] {
+        GROUPS.with(|g| g.borrow_mut().clear());
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..2 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let groups = GROUPS.with(|g| g.borrow().clone());
+        assert_eq!(groups["tb-time"].0.height() < 40.0, compact, "{w}: compact {compact}");
+        let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+        assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+        for (anchor, (rect, width)) in &groups {
+            assert!(rect.width() <= width + 0.5 && rect.right() <= w, "{w}: {anchor} {rect:?} given {width}");
+        }
+        for probe in ["tb-thermostat-on", "tb-thermostat-slider", "tb-thermostat-t"] {
+            let r = probed_rect(probe);
+            assert!(th.expand(0.5).contains_rect(r), "{w}: {probe} {r:?} inside the group {th:?}");
+        }
+    }
+}
 
 /// The thermostat slider's travel: T = 5000 K · u³ — monotone, 0–1000 K beyond half the travel,
 /// whole kelvin back from the travel, and a target above the top pins the slider at its end.
@@ -2136,16 +2178,16 @@ fn keys_1_to_4_pick_the_tools() {
     let press = |st: &mut UiState, key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers| {
         let repeat = false;
         let text = key.symbol_or_name().to_string();
-        let out = frame(&ctx, st, &inp, 1400.0, vec![digit(key, physical, modifiers, repeat), egui::Event::Text(text)]);
+        let out = frame(&ctx, st, &inp, WIDE, vec![digit(key, physical, modifiers, repeat), egui::Event::Text(text)]);
         // released (egui marks a press of a key it holds down as a repeat)
         let up = egui::Event::Key { key, physical_key: physical, pressed: false, repeat: false, modifiers };
-        frame(&ctx, st, &inp, 1400.0, vec![up]);
+        frame(&ctx, st, &inp, WIDE, vec![up]);
         out.actions
     };
     use egui::Key::{Num1, Num2, Num3, Num4};
     use egui::Modifiers as M;
     for _ in 0..2 {
-        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        frame(&ctx, &mut st, &inp, WIDE, vec![]);
     }
     assert_eq!(st.mode, ToolMode::Orbit);
     // the top row (logical and physical key), in an order where each one changes the tool
@@ -2157,7 +2199,7 @@ fn keys_1_to_4_pick_the_tools() {
     assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)]);
     assert_eq!(press(&mut st, Num3, None, M::NONE), vec![Action::Tool(ToolMode::Select)]);
     // the segments' own click sends the same action
-    assert_eq!(actions(&click_widget(&ctx, &mut st, &inp, "tool-Edit")), vec![Action::Tool(ToolMode::Edit)]);
+    assert_eq!(actions(&press_widget_w(&ctx, &mut st, &inp, WIDE, "tool-Edit", 0.0)), vec![Action::Tool(ToolMode::Edit)]);
     // modifiers and auto-repeats: nothing
     for m in [M::CTRL, M::COMMAND, M::ALT, M::SHIFT] {
         assert!(press(&mut st, Num1, Some(Num1), m).is_empty(), "{m:?}+1");
@@ -2165,26 +2207,26 @@ fn keys_1_to_4_pick_the_tools() {
     assert_eq!(st.mode, ToolMode::Edit);
     // held: egui marks the next press of a key still down an auto-repeat, which does nothing
     let held = digit(Num1, Some(Num1), M::NONE, false);
-    assert_eq!(frame(&ctx, &mut st, &inp, 1400.0, vec![held.clone(), egui::Event::Text("1".into())]).actions, vec![Action::Tool(ToolMode::Orbit)]);
+    assert_eq!(frame(&ctx, &mut st, &inp, WIDE, vec![held.clone(), egui::Event::Text("1".into())]).actions, vec![Action::Tool(ToolMode::Orbit)]);
     st.mode = ToolMode::Edit;
-    assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![held, egui::Event::Text("1".into())]).actions.is_empty(), "a repeat");
-    frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::Key { key: Num1, physical_key: Some(Num1), pressed: false, repeat: false, modifiers: M::NONE }]);
+    assert!(frame(&ctx, &mut st, &inp, WIDE, vec![held, egui::Event::Text("1".into())]).actions.is_empty(), "a repeat");
+    frame(&ctx, &mut st, &inp, WIDE, vec![egui::Event::Key { key: Num1, physical_key: Some(Num1), pressed: false, repeat: false, modifiers: M::NONE }]);
     assert_eq!(st.mode, ToolMode::Edit);
     // a text box with the keyboard (the speed box, clicked into its text): the digit is typed
-    click_widget(&ctx, &mut st, &inp, "speed");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 0.0);
     assert!(ctx.egui_wants_keyboard_input(), "the speed box is being typed in");
     let typed = press(&mut st, Num1, Some(Num1), M::NONE);
     assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "typed, not a tool: {typed:?}");
     assert_eq!(st.mode, ToolMode::Edit);
-    frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::Escape, M::NONE)]);
-    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    frame(&ctx, &mut st, &inp, WIDE, vec![key(egui::Key::Escape, M::NONE)]);
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
     assert!(!ctx.egui_wants_keyboard_input());
     // Ctrl K's search open (its field has the keyboard; the gate holds without it too)
     st.search.toggle();
     let typed = press(&mut st, Num2, Some(Num2), M::NONE);
     assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "the search is open: {typed:?}");
     st.search.toggle();
-    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
     assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)], "and back");
 }
 
@@ -2282,12 +2324,12 @@ fn clicking_the_m6_controls_sends_their_commands() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
     let mut relaxing = snapshot(&scene, Backend::Gpu, None);
     relaxing.dynamics.relax = Some(relax_progress(None));
     let inp_r = PanelInput { selected: Some(0), ..input(&scene, Some(&relaxing), &cam) };
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp_r, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp_r, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
     let in_menu = |st: &mut UiState, inp: &PanelInput<'_>, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
