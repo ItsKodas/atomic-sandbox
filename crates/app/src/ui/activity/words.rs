@@ -315,6 +315,8 @@ fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} of {q:.0} samples needed)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
+        // open-shell Task 7c: the energy RMS with the samples the model cannot reproduce
+        Some((ClassKey::EnergyRms, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier on average, training samples the model cannot reproduce included)"),
         // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound
         Some((ClassKey::WorstAtom, x, _)) if evidence < providers::surrogate::MIN_EVIDENCE => format!(
             "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",

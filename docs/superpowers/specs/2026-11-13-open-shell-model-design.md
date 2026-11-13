@@ -117,7 +117,9 @@ quantities of `compute_training_residuals` — exceeds 1. M is recomputed at eve
   (§5.7) signs it off specifically: M's region is refused by `NearMisfit`, the class rule judges the
   rest, audits keep calibrating it. Amended 2026-11-13 (Task 7 physics review C1, the user's decision):
   M stays in the class rule's RMS terms and is left out of its max terms, n_k and ā_c — see
-  references.md 'Local misfit'.
+  references.md 'Local misfit'. The energy half was added the same day (Task 7c, the user's decision):
+  a class or key whose energy LOO RMS, M included, exceeds 1 is refused when an M sample contributes
+  to it, so with M empty no verdict changes.
 - **Near a misfit, per atom (my calls; builder check Q4).** A sample's *misfit atoms*: for a force misfit
   the trained atoms whose force ratio exceeds 1; for an energy misfit every trained atom of the sample (an
   energy error has no single atom to blame). A query atom is **near a misfit** when its environment is

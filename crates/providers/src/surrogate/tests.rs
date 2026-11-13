@@ -1253,13 +1253,21 @@ fn hk_h_he() -> surrogate::EnvKey {
 /// (`skip_recovery`), so M is the fit's own. Returns the store and, for the key H{He}: (the
 /// fraction f of its fitted atoms in M, the RMS r_M of their leave-one-out force ratios).
 fn heh_misfit_store(delta: f64) -> (SurrogateKs, f64, f64) {
+    heh_misfit_store_with(delta, 0.0)
+}
+
+/// [`heh_misfit_store`] with the misfit copies' energies off too, by ±`de` Ha alternating with the
+/// same sign as their force offset (Task 7c: `de` > 0 with `delta` = 0 makes them energy misfits,
+/// their forces exact). The good samples are the same (an offset of 0.0 is exact).
+fn heh_misfit_store_with(delta: f64, de: f64) -> (SurrogateKs, f64, f64) {
     let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6);
     s.set_reference_energy(1, SpeciesMorse::atom(1));
     s.set_reference_energy(2, SpeciesMorse::atom(2));
     s.skip_recovery = true;
-    let add = |s: &mut SurrogateKs, sc: &Scene, df: f64| {
+    let add = |s: &mut SurrogateKs, sc: &Scene, df: f64, de: f64| {
         let (pos, z) = pos_z(sc);
         let (e, mut f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let e = e + de;
         let d: [f64; 3] = std::array::from_fn(|a| pos[1][a] - pos[0][a]);
         let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         for a in 0..3 {
@@ -1269,15 +1277,15 @@ fn heh_misfit_store(delta: f64) -> (SurrogateKs, f64, f64) {
     };
     let mut rng = StdRng::seed_from_u64(77);
     for i in 0..100 {
-        add(&mut s, &h2_at(1.1 + 1.2 * i as f64 / 99.0, &mut rng), 0.0);
+        add(&mut s, &h2_at(1.1 + 1.2 * i as f64 / 99.0, &mut rng), 0.0, 0.0);
     }
     for i in 0..HEH_GOOD {
         let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
-        add(&mut s, &dimer(2.0 + 1.4 * i as f64 / (HEH_GOOD - 1) as f64, unit_vector(&mut rng), origin, 1, 2), 0.0);
+        add(&mut s, &dimer(2.0 + 1.4 * i as f64 / (HEH_GOOD - 1) as f64, unit_vector(&mut rng), origin, 1, 2), 0.0, 0.0);
     }
     for k in 0..HEH_MISFITS {
         let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-        add(&mut s, &dimer(2.6, [0.0, 0.0, 1.0], [0.1 * k as f64, 0.0, 0.0], 1, 2), sign * delta);
+        add(&mut s, &dimer(2.6, [0.0, 0.0, 1.0], [0.1 * k as f64, 0.0, 0.0], 1, 2), sign * delta, sign * de);
     }
     s.refit().unwrap();
     let m = s.misfit().unwrap().samples.clone();
@@ -1363,6 +1371,111 @@ fn a_mild_misfit_keeps_its_key() {
     let (pos, z) = pos_z(&dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2));
     let rc = s.model.as_ref().unwrap().basis.r_cut;
     assert!(s.class_untrusted(&env_keys(&pos, &z, rc * rc)).is_none(), "the class rule answers a HeH geometry");
+}
+
+/// Task 7c, the energy half of C1 (the user's decision, 2026-11-13: "Yes, add it"): a key whose
+/// energy LOO RMS, M included, is beyond the tier is refused — but only when M contributes to its
+/// energy sum. The key H{He} with its two misfit copies' energies off by ±0.02 Ha (their forces
+/// exact): energy misfits, f_E·r_E² > 1 over the key's energy samples, the force terms within their
+/// bounds. An unsampled HeH geometry is refused by the class rule on energy, with words saying the
+/// misfits are counted; the H₂ key still answers. (Before 7c, R_E,c decided no verdict.)
+#[test]
+fn a_gross_energy_misfit_refuses_its_key() {
+    let (s, _, _) = heh_misfit_store_with(0.0, 0.02);
+    let m = s.misfit().unwrap();
+    let model = s.model.as_ref().unwrap();
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    // f_E, r_E over the key's energy samples (every HeH sample holds one H{He} atom)
+    let (mut n_e, mut ss) = (0usize, 0.0f64);
+    let mut in_m = 0usize;
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) || !env_keys(&smp.pos, &smp.z, rc2).contains(&Some(hk_h_he())) {
+            continue;
+        }
+        n_e += 1;
+        if m.samples.contains(&i) {
+            in_m += 1;
+            let e = surrogate::loo::leave_one_out(model, smp).and_then(|l| l.energy).expect("a defined energy leave-one-out");
+            let r = (if model.energy_per_atom { e.abs() } else { e.abs() / smp.pos.len() as f64 }) / s.policy.energy_std_per_atom;
+            ss += r * r;
+        }
+    }
+    let (f_e, r_e) = (in_m as f64 / n_e as f64, (ss / in_m.max(1) as f64).sqrt());
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} atoms {:?} of {} fitted; trusted {} {:?}; H{{He}}: f_E {f_e:.3}, r_E {r_e:.2}, f_E·r_E² {:.2}; judged {kst:?}", m.samples, m.atoms, m.fitted, s.trusted(), s.untrusted_reason(), f_e * r_e * r_e);
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "the premise: the model is trusted: {:?}", s.untrusted_reason());
+    assert!(f_e * r_e * r_e > 1.0, "the premise: f_E·r_E² > 1");
+    assert!(kst.force_rms <= 1.0 && kst.force_max <= 1.0, "the premise: the force rule does not decide: {kst:?}");
+    assert!(kst.energy_max <= 1.0 && kst.energy_rms > 1.0, "the premise: the energy max outside M is within the tier, the RMS with M beyond: {kst:?}");
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    println!("the verdict of H{{He}}: {v:?}");
+    assert!(matches!(v.refusal, Some((sim::ClassKey::EnergyRms, x, l)) if x == kst.energy_rms && l == 1.0), "refused on its energy RMS: {v:?}");
+    assert_eq!(kst.energy_misfits, HEH_MISFITS, "the two misfit copies are the key's M energy samples");
+    let (pos, z) = pos_z(&dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2));
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc2));
+    println!("the class rule at HeH r = 3.2: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    let Some((r, false)) = refused else { panic!("refused by the class rule, not its sample floor: {:?}", refused.map(|(r, s)| (r.text, s))) };
+    assert!(r.text.contains("energy error RMS") && r.text.contains("training samples the model cannot reproduce included"), "{}", r.text);
+    let (pos, z) = pos_z(&h2(1.5));
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc2)).is_none(), "the H₂ key still answers");
+}
+
+/// Task 7c's promise: with M empty the energy-RMS guard decides nothing. Built on the verdict
+/// function itself (a calibrated store whose key has an energy LOO RMS beyond 1 with M empty and is
+/// answered — 3+ audits of that key and an energy LOO beyond the tier with no misfit — is not
+/// practical to build from samples): in the calibrated path (20 audits at z = 1, W 0.33) a key
+/// with energy LOO RMS 3 and max 5 is answered exactly as before when no M sample counts
+/// (`energy_misfits` 0), and refused on `EnergyRms` at the bound 1 (no ENTER band) when one does;
+/// the uncalibrated path the same (RMS ≤ 1 with M passes; NaN with M fails). And on real stores
+/// with M empty — the 120-sample H₂ store, and the HeH store without offsets — no class or key
+/// counts an M energy sample, so no verdict there can read the guard.
+#[test]
+fn an_energy_rms_without_misfits_decides_nothing() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let mut ok = surrogate::AuditHistory::default();
+    for _ in 0..20 {
+        ok.push(history_point(PointKind::Audit, 2, 1, 1.0));
+    }
+    let cal = calibrate(&ok, &pol);
+    assert!(cal.per_class[0].calibrated() && !cal.per_class[1].calibrated(), "the premise: the pair class calibrated, the many-body not");
+    let st = ClassStats { samples: 100, force_rms: 0.4, force_max: 3.0, energy_rms: 3.0, energy_max: 5.0, energy_misfits: 0 };
+    for was in [false, true] {
+        assert_eq!(cal.class_verdict(0, &st, 29, was), ClassVerdict::Trusted, "calibrated, M empty: answered (was {was})");
+        match cal.class_verdict(0, &ClassStats { energy_misfits: 1, ..st }, 29, was) {
+            ClassVerdict::Untrusted { key, value, limit, reason } => {
+                assert_eq!((key, value, limit), (ClassKey::EnergyRms, 3.0, 1.0));
+                assert!(reason.contains("LOO energy error RMS 3.0× the tier (training samples the model cannot reproduce included)"), "{reason}");
+            }
+            v => panic!("calibrated, M contributing: refused, not {v:?}"),
+        }
+        // at the bound itself it passes (the limit is 1 in both paths, no ENTER band)
+        assert_eq!(cal.class_verdict(0, &ClassStats { energy_misfits: 1, energy_rms: 1.0, ..st }, 29, was), ClassVerdict::Trusted);
+        assert_eq!(cal.class_verdict(0, &ClassStats { energy_misfits: 1, energy_rms: 0.9, ..st }, 29, false), ClassVerdict::Trusted, "0.9 > ENTER still enters");
+    }
+    // uncalibrated (the many-body class): the rule of before decides; with M the RMS beyond 1 refuses
+    let un = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.8, energy_max: 0.9, energy_misfits: 0 };
+    assert_eq!(cal.class_verdict(1, &un, 29, false), ClassVerdict::Trusted);
+    assert_eq!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, ..un }, 29, false), ClassVerdict::Trusted, "RMS ≤ 1 with M passes");
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: 1.3, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::EnergyRms, .. }));
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: f64::NAN, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::EnergyRms, .. }), "NaN with M fails");
+    assert_eq!(cal.class_verdict(1, &ClassStats { energy_rms: f64::NAN, ..un }, 29, false), ClassVerdict::Trusted, "NaN without M: the rule of before (it reads no energy RMS)");
+    // the uncalibrated rule of before still decides first (the energy max)
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: 1.3, energy_max: 1.5, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::Energy, .. }));
+    // real stores with M empty: no M energy sample anywhere
+    let (h2_store, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let (heh, _, _) = heh_misfit_store_with(0.0, 0.0);
+    for s in [&h2_store, &heh] {
+        assert!(s.misfit().is_some_and(|m| m.samples.is_empty()), "the premise: M empty: {:?}", s.misfit());
+        let j = s.class_judge.as_ref().unwrap();
+        assert!(j.stats.iter().chain(j.key_stats.values()).all(|st| st.energy_misfits == 0), "{:?}", j.key_stats);
+        assert!(s.class_loo().iter().flat_map(|c| c.refusal.into_iter().chain(c.species.iter().filter_map(|v| v.refusal))).all(|(k, ..)| k != ClassKey::EnergyRms));
+    }
 }
 
 /// Review Focus 2: an environment key whose only samples are misfits has no samples of its own in
@@ -5307,7 +5420,8 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                     assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
-                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window => unreachable!("the uncalibrated rule never names the calibrated verdict"),
+                // `EnergyRms` is `calibrate::verdict`'s (open-shell Task 7c), never `class_refusal`'s
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
@@ -8480,7 +8594,7 @@ fn calibration_widens_when_audits_disagree() {
     use sim::ClassKey;
     use surrogate::history::PointKind;
     let pol = FallbackPolicy::default();
-    let class = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.2, energy_max: 0.6 };
+    let class = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.2, energy_max: 0.6, energy_misfits: 0 };
     let mut h = surrogate::AuditHistory::default();
     for _ in 0..20 {
         h.push(history_point(PointKind::Audit, 2, 1, 3.0));
@@ -8547,7 +8661,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
         calibrate(&h, &pol)
     };
     let z_for = |w: f64| w / (w_of(1.0) * infl); // z such that W_inflated = w
-    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0 };
+    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0, energy_misfits: 0 };
     let inside = audits(z_for(0.85));
     assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9, "{:?}", inside.per_class[0]);
     assert_eq!(inside.class_verdict(0, &st, 29, true), ClassVerdict::Trusted, "stays");
@@ -8845,7 +8959,7 @@ fn evidence_ages_by_model_generation_both_ways() {
     let pol = FallbackPolicy::default();
     let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
     let at = |p: surrogate::AuditPoint, gen: u64| surrogate::AuditPoint { model_gen: gen, ..p };
-    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 0.5 };
+    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 0.5, energy_misfits: 0 };
     let z_bad = 1.46 / w_of(1.0);
     let mut h = surrogate::AuditHistory::default();
     for _ in 0..8 {
@@ -10478,7 +10592,7 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     let h3 = || Some(vec![(1u8, vec![1u8]); 3]);
     let water = || Some(vec![(8u8, vec![1u8]), (1, vec![1, 8]), (1, vec![1, 8])]);
     let key = |z: u8, nb: &[u8]| surrogate::EnvKey { class: 2, z, neighbours: nb.to_vec() };
-    let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49 };
+    let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49, energy_misfits: 0 };
     let mut h = surrogate::AuditHistory::default();
     h.push(three_body_point(416, 5.66, h3()));
     for g in 0..81u64 {

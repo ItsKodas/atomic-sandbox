@@ -298,9 +298,10 @@ pub(super) fn trained_keys(s: &Sample, keys: Vec<Option<surrogate::EnvKey>>) -> 
 /// ratio² and its samples — so a key with a fraction f of its atoms in M at leave-one-out ratio
 /// r_M has R ≥ √f·r_M; they stay out of the **max** terms (M's ratios are above 1 by construction:
 /// in a max they would refuse every atom sharing its key) and of the sample counts (the evidence
-/// floors: M never helps a class or key reach one). The energy RMS is a readout only: no verdict
-/// reads it (`class_refusal` reads the energy max, `calibrate::verdict` the measured energy), so the
-/// bound R ≥ √f·r_M guards a force misfit, not an energy one.
+/// floors: M never helps a class or key reach one). The energy RMS refuses (`ClassKey::EnergyRms`,
+/// both paths, limit 1; Task 7c, the user's decision) only when M contributes to it — the count
+/// `energy_samples − own_energy_samples` is `ClassStats::energy_misfits` — so an energy misfit's
+/// key is refused at f·r_E² > 1, roughly, and with M empty no verdict changes.
 #[derive(Clone, Copy, Debug, Default)]
 struct LooSums {
     /// The samples outside M holding the class or key.
@@ -941,7 +942,7 @@ impl SurrogateKs {
             // samples outside M: M never helps a class or key reach an evidence floor
             let segments = a.own_energy_samples < a.samples;
             let (energy_rms, energy_max) = if segments && a.own_energy_samples < super::calibrate::MIN_EVIDENCE { (f64::INFINITY, f64::INFINITY) } else { (energy_rms, a.energy_max) };
-            super::calibrate::ClassStats { samples: a.samples, force_rms, force_max: a.force_max, energy_rms, energy_max }
+            super::calibrate::ClassStats { samples: a.samples, force_rms, force_max: a.force_max, energy_rms, energy_max, energy_misfits: a.energy_samples - a.own_energy_samples }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
         // a key only M's atoms hold has no samples of its own: it stays out of the judged keys, as
@@ -1098,7 +1099,8 @@ impl SurrogateKs {
         // verdict and this note, the M8a Task 2 review's M2); `None` cannot occur here
         // (`trusted == refusal.is_none()`) and is worded as the uncalibrated force rule
         let (key, value, limit) = s.refusal.unwrap_or((ClassKey::Force, l.force_max.max(l.force_rms), 1.0));
-        let class_st = super::calibrate::ClassStats { samples: l.samples, force_rms: l.force_rms, force_max: l.force_max, energy_rms: l.energy_rms, energy_max: l.energy_max };
+        // the words' numbers only (the verdict is `s.refusal`'s): `ClassLoo` carries no M count
+        let class_st = super::calibrate::ClassStats { samples: l.samples, force_rms: l.force_rms, force_max: l.force_max, energy_rms: l.energy_rms, energy_max: l.energy_max, energy_misfits: 0 };
         // a key's own count; a key no fitted atom holds has none (final review 5)
         let st = match self.class_judge.as_ref().filter(|_| !class_wide) {
             Some(j) => j.key_stats.get(k).copied().unwrap_or_else(|| unseen_key_stats(&class_st)),
@@ -1291,9 +1293,9 @@ impl SurrogateKs {
     /// an **audit fence** (round 1, SHOULD-3): the global untrust turns local — geometries within
     /// the quarantine radius of it fall back, everything else is judged by the rest of the policy
     /// (the class rule still sees the sample's leave-one-out when it is fitted — when the sample is
-    /// in the misfit set M, through its RMS terms only: C1, references.md "Local misfit" — for a
-    /// force misfit (r_M the LOO force ratio); an energy misfit gains no class-rule guard, since
-    /// R_E,c decides no verdict). Fenced cases are
+    /// in the misfit set M, through its RMS terms only: C1, references.md "Local misfit" — the
+    /// force RMS for a force misfit, f·r_M² > 1, and the energy RMS with M beyond 1 for an energy
+    /// misfit, `ClassKey::EnergyRms`, Task 7c). Fenced cases are
     /// judged too and lifted when they pass — **except a shell fence** (`AuditOrigin::ShellCheck`;
     /// final review C1): it is a measured structural limitation of the cutoff, not a model error
     /// a refit can cure, and a one-point re-judgement at the check's geometry says nothing about
