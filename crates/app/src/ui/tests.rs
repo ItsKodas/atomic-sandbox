@@ -161,6 +161,7 @@ pub(crate) fn model() -> ModelStatus {
         pending_refit: false,
         epoch: 3,
         fit: Some((271, 40, 2.1e-6, 1.6e-5)),
+        body4_degree: None,
         residuals: None,
         force_bound: 2e-3,
         provenance_mismatch: None,
@@ -2816,7 +2817,7 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
     use sim::activity::{TrustCheck, TrustKey as K};
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
-    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise, audit]
         .into_iter()
         .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0, worst: None })
         .collect()
@@ -4781,6 +4782,7 @@ mod activity_words {
             "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
         );
         assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Misfit), None, RowCtx::default()), "the model was not trusted then: too many training samples it could not reproduce");
     }
 
     /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
@@ -4822,12 +4824,16 @@ mod activity_words {
     #[test]
     fn every_rule_and_outcome_is_worded() {
         use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
-        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::NearMisfit, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
             assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
         }
-        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }, sim::activity::TeachOutcome::MisfitDisagrees] {
             assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
         }
+        // the misfit fence's words (spec 2026-11-13 §4.3): the refusal is never silent
+        assert_eq!(rule_label(sim::activity::TeachRule::NearMisfit, None), "misfit");
+        assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
+        assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
     }
 }
 
@@ -5144,6 +5150,16 @@ mod activity_trust {
         assert_eq!(mha(0.0), "0");
     }
 
+    /// Spec 2026-11-13 §4.3: the misfit row reads as the training samples the model cannot
+    /// reproduce, the count against 10 % of the fitted samples.
+    #[test]
+    fn the_misfit_line_counts_the_samples_it_cannot_reproduce() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3, worst: None };
+        assert_eq!(trust_line(&c, AuditSeen::Never, 20), "Few training samples it cannot reproduce — 3 of at most 12.3 (10 % of the fitted samples)");
+    }
+
     /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
     /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
     /// by default.
@@ -5242,6 +5258,8 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // open-shell model (the energy half of C1): the energy RMS with the misfits counted
+        assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
         // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
@@ -5317,7 +5335,8 @@ mod activity_trust {
     fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
         use sim::activity::TrustKey as K;
         let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+        // the misfit row too (spec 2026-11-13 §4.3): before it, those samples failed the residual rows
+        for key in [K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise] {
             assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
         }
         for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {

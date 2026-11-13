@@ -714,7 +714,8 @@
 //!    failed; the rounds held those victims, round after round, and ended untrusted at 165 held,
 //!    while the sample's leave-one-out ratio was 962× (rank 1 of 1 700; the next 5.2×). Pinned on
 //!    an analytic fixture (`tests/recovery_loo.rs`): one force-only compressed H₂ among H₃ and H₂ —
-//!    the training ranking holds 7 victims and ends untrusted, the leave-one-out ranking holds the
+//!    the training ranking's rounds hold 7 victims and do not recover (the refit gives them back,
+//!    no ratchet), the leave-one-out ranking holds the
 //!    outlier alone and trusts. The recovery note names the worst ratio held ("3 samples
 //!    quarantined — the fit without each predicts it at up to 38× its bound, and the fit without
 //!    them recovers (…)"; "…, and the fit without them passes" when its residuals and noise pass
@@ -737,8 +738,19 @@
 //!    (below) ends untrusted at 47 held by it, trusted at 38 held by the fallback. On the user's
 //!    pre-1805 snapshot #1804 is held in round 1, but the refit's release step (run first, against
 //!    the fit #1804 bends) puts #1455 back: the first refit ends untrusted at 1.0185× (128 held,
-//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held). The holds of a
-//!    recovery that did not restore trust stay (and are written to a collection): a sample held by
+//!    the fallback 165 held at 1.46×), the next trusted at 0.9950× (122 held) — measured before
+//!    the no-ratchet rule below. **No ratchet** (spec 2026-11-13 §4.2, wrapping the whole
+//!    recovery since the open-shell merge): a result stands when it recovers, or short of the
+//!    counts when it passes the residuals and the noise; when no step (the leave-one-out rounds,
+//!    their fallback, step 3) passes the residuals, the refit ends with the codes, the degree cap
+//!    and the fit it entered with — a forgotten sample's code untouched — so nothing is held or
+//!    written to a collection, the note says "recovery did not restore trust; no samples held"
+//!    (`settle_recovery_note` rewords it when the refit ends trusted), and the samples still over
+//!    their bounds are the misfit set M (`trust` module doc). Inside `quarantine_rounds`, when
+//!    neither ranking recovers, a leave-one-out result that fails the residuals yields to a
+//!    training-ranking one that passes them (so the wrapper never discards what the ranking before
+//!    R1 kept). The holds of a recovery that passed its residuals stay (and are written to a
+//!    collection): a sample held by
 //!    the leave-one-out ranking is one the fit without it misses, so a later refit's release by
 //!    reproduction rarely takes it back. A held sample leaves the hold only when a later fit
 //!    reproduces it (released into the fit) or a fresh agreeing teacher answer next to it
@@ -751,7 +763,8 @@
 //!    capped fit fails, the default basis is tried first exactly as step 1 tries the cap (kept if
 //!    it alone passes, counts included), and when the quarantine on the capped basis cannot
 //!    recover either, the same quarantine rounds run again from the default basis (from the state
-//!    the refit entered with) — that result stands only if it is trusted, else step 2's does. The
+//!    the refit entered with) — that result stands only if it is trusted, else step 2's does when
+//!    it passes the residuals, else the entry state (no ratchet, above). The
 //!    case (`references.md` "M8a stuck collection"): one stretched-H₂ label under cap 6 drove the
 //!    energy noise to 2e-2 Ha/atom and spread its misfit over the H₂ samples (379 named as
 //!    offenders, re-measured 2026-11-12; 380 when first recorded), so step 2 named
@@ -771,6 +784,24 @@
 //! model now reproduces it too, or else marked **superseded** — contradicted by a fresh answer
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
+//!
+//! **Near a misfit** (spec 2026-11-13 §4.3; the misfit set M is the `trust` module doc's): a
+//! sample's *misfit atoms* are, for a force misfit, its trained atoms whose force ratio exceeds 1,
+//! for an energy misfit every trained atom (`Misfit::atoms`). A query atom is near a misfit when
+//! its descriptor is within the near-quarantine distance ([`QUARANTINE_FRACTION`] ·
+//! `max_descriptor_distance` training spreads, the per-atom L∞ distance the quarantine fence is
+//! built from) of a misfit atom of its species (`near_misfit_atoms`). A geometry is refused when
+//! **any** atom is near (`TeachRule::NearMisfit`, after the quarantine fence, naming the first such
+//! atom) — broader than the quarantine fence's all-atom test, deliberately; `atom_verdicts` refuses
+//! exactly those atoms. The teacher's answer there takes the near-quarantine admission without its
+//! votes: kept (on the normal path) only when it agrees with the model, else not kept
+//! (`TeachOutcome::MisfitDisagrees`), so a region the model cannot fit stays refused without a
+//! parked scene growing M. The fence lifts when a refit fits M's samples (a larger store, a higher
+//! body-4 degree): M is recomputed at every fit. Sampling-pass answers keep their own path. The
+//! fence stands only while M is within its limit (`misfit_fence`): beyond it the model is
+//! untrusted as a whole (the `Misfit` row; rule 4 refuses every step) and its answers are kept as
+//! any untrusted model's are — fencing an M that may be the whole store would refuse, and never
+//! keep, the data a later refit could fit it with (a ratchet; spec §4.2).
 //!
 //! **Forgotten samples** (spec `2026-11-12-sample-recovery-design.md` R2; `Q_FORGOTTEN` = 7, its
 //! doc in `surrogate::quarantine`): the user's Forget in the Model tab's "Worst-fitting samples"
@@ -1042,7 +1073,7 @@
 //!   samples only is judged as before. `loo_rms` and `loo_force_errors` likewise.
 //! - **Sample floors** (`trust::key_column_counts`, the whole-model union floor, `fit_floor`'s
 //!   cache key): only interior atoms touch a key's columns and count as its samples.
-//! - **Training residuals, recovery and release** (`compute_training_residuals`, `worst_offenders`,
+//! - **Training residuals, misfit set, recovery and release** (`compute_residuals`, `worst_offenders`,
 //!   `reproduces_sample`): the fitted rows only, so a cap's force never quarantines a segment.
 //! - **Teach-around**: a masked sample is never a blocker (its geometry is a cut-out the segment
 //!   scene's own pass teaches); the failed-audit re-judgement (`judge_case`) of a masked sample —
@@ -1136,7 +1167,7 @@ pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, SUSPECTS_SHOWN, THIN_EVERY, THIN_FRACTION,
 };
-pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use trust::{atom_class, env_class, LooRms, Misfit, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use background::BackgroundPoll;
 pub use views::Verdict;
 pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
@@ -1199,6 +1230,10 @@ struct Handoff {
     dedup: bool,
     /// Quarantined samples within the quarantine radius of this geometry (module doc).
     near: Vec<usize>,
+    /// An atom of this geometry is near a misfit (`near_misfit_atoms`; spec 2026-11-13 §4.3):
+    /// the answer is kept only if it agrees with the model (`admit`). Computed wherever `near` is,
+    /// false where `near` is empty for want of a model.
+    near_misfit: bool,
     model: Option<ModelAnswer>,
     audit: bool,
     /// Report the step on the teacher's surface although the model was consulted (rule 5, the
@@ -1237,6 +1272,9 @@ pub struct SurrogateKs {
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
+    /// The misfit set M of the fit that stands (`trust` module doc; spec 2026-11-13 §4.3): set
+    /// with `training_residuals` at every fit, never persisted.
+    misfit: Option<Misfit>,
     /// Per environment class (pair, many-body): the fit's leave-one-out numbers and verdict
     /// (module doc, "Class-wise trust"); empty before the first fit.
     class_loo: Vec<ClassLoo>,
@@ -1265,6 +1303,10 @@ pub struct SurrogateKs {
     /// the reference the deferred refit is compared with (`refit_cost` tests).
     #[cfg(test)]
     eager_trust_passes: bool,
+    /// Tests only: a refit runs no trust recovery, so the misfit set is tested on the fit as it
+    /// comes (`refit_fits`).
+    #[cfg(test)]
+    pub(super) skip_recovery: bool,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -1293,8 +1335,10 @@ pub struct SurrogateKs {
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
     /// keyed by a fingerprint of those samples and that basis (`fit_floor`; the status asks for it
-    /// every snapshot, a descriptor pass over the store each time would cost ms).
-    fit_floor_cache: std::sync::Mutex<Option<(u64, usize)>>,
+    /// every snapshot, a descriptor pass over the store each time would cost ms). One slot per
+    /// body-4 degree: a refit asks for the floor at each degree it weighs
+    /// ([`grown_body4_degree`](Self::grown_body4_degree)), and the two must not evict each other.
+    fit_floor_cache: std::sync::Mutex<BTreeMap<usize, (u64, usize)>>,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1308,6 +1352,11 @@ pub struct SurrogateKs {
     lone_codes: BTreeMap<usize, u8>,
     /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
     degree_cap: Option<usize>,
+    /// The body-4 degree D₄ a collection's basis is built at (spec 2026-11-13 §4.1): chosen at every
+    /// fit by [`grown_body4_degree`](Self::grown_body4_degree) and written here when the fit
+    /// succeeds, set from a loaded file's basis; [`surrogate::BODY4_DEGREE_START`] otherwise. Only a
+    /// basis with the body-4 block carries it (`default_basis`): a per-scene basis keeps the start.
+    body4_degree: usize,
     /// Thinned candidates since the last kept fallback sample (thinning; the no-model cap).
     since_kept: usize,
     /// Per stored sample: its atoms' (species index, descriptor) under `desc_basis`.
@@ -1471,6 +1520,10 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: the body-4 degree every fit takes instead of the growth rule's
+    /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
+    #[cfg(test)]
+    pub(super) body4_force: Option<usize>,
     /// Tests only: the recovery's rounds rank by the training residual alone, as before spec R1
     /// (`training_offenders`, no leave-one-out rounds first) — the premise a test compares with.
     #[cfg(test)]
@@ -1543,6 +1596,7 @@ impl SurrogateKs {
             null_space: None,
             active_set: None,
             training_residuals: None,
+            misfit: None,
             class_loo: Vec::new(),
             class_memory: BTreeMap::new(),
             class_judge: None,
@@ -1559,12 +1613,13 @@ impl SurrogateKs {
             last: None,
             consults: 0,
             last_variance: None,
-            fit_floor_cache: std::sync::Mutex::new(None),
+            fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
             lone_codes: BTreeMap::new(),
             degree_cap: None,
+            body4_degree: surrogate::BODY4_DEGREE_START,
             since_kept: THIN_EVERY,
             desc_cache: Vec::new(),
             desc_basis: None,
@@ -1623,6 +1678,8 @@ impl SurrogateKs {
             loo_ratios: None,
             #[cfg(test)]
             eager_trust_passes: false,
+            #[cfg(test)]
+            skip_recovery: false,
             teach_rounds: BTreeMap::new(),
             teach_classes: Vec::new(),
             teach_start: None,
@@ -1633,6 +1690,8 @@ impl SurrogateKs {
             shared: None,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            body4_force: None,
             #[cfg(test)]
             training_ranking: false,
             collection_r_cut: surrogate::COLLECTION_R_CUT,
@@ -1774,7 +1833,7 @@ impl SurrogateKs {
             TeachOutcome::ShellNotKept
         } else {
             // a capped segment's answer is kept with the scene's mask (module doc, "Masked scenes")
-            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
+            self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.near_misfit, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
         };
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
@@ -2080,7 +2139,8 @@ impl ForceProvider for SurrogateKs {
         if scene.train_mask().is_some() {
             let reason = Refusal::new("surrogate: a capped segment teaches its interior atoms — the model does not answer here (its caps and edge atoms are not the source scene's)", TeachRule::Segment, None);
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
+            let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
+            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
@@ -2118,8 +2178,9 @@ impl ForceProvider for SurrogateKs {
                 }
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+                let near_misfit = keep_sample && self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
                 let history_rule = history_rule_code(reason.rule);
-                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, model: None, audit: false, teacher_surface: false, history_rule };
+                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -2153,6 +2214,7 @@ impl ForceProvider for SurrogateKs {
         if let Some(reason) = non_finite_answer(&pred) {
             self.record_verdict(&pos, &z, Some(strict_gate.unwrap_or_else(|| reason.clone())));
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+            let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
             let h = Handoff {
                 prov,
                 pos,
@@ -2163,6 +2225,7 @@ impl ForceProvider for SurrogateKs {
                 thin: false,
                 dedup: false,
                 near,
+                near_misfit,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
                 audit: false,
                 teacher_surface: true,
@@ -2234,6 +2297,24 @@ impl ForceProvider for SurrogateKs {
                 TeachRule::NearQuarantine,
                 None,
             ));
+        }
+        // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3; `trust`
+        // module doc, "M, the misfit set"): refused when **any** atom is near — broader than the
+        // all-atom quarantine test above, deliberately — and the teacher's answer is kept only if
+        // it agrees with the model (`admit`), whichever rule fired first
+        let near_misfit_atoms = self.near_misfit(&pos, &z);
+        let near_misfit = near_misfit_atoms.contains(&true);
+        if reason.is_none() {
+            if let Some(i) = near_misfit_atoms.iter().position(|&b| b) {
+                reason = Some(Refusal::new(
+                    format!(
+                        "surrogate: atom {i} is within {:.2} training spreads of a training sample the model cannot reproduce",
+                        QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+                    ),
+                    TeachRule::NearMisfit,
+                    Some(i),
+                ));
+            }
         }
         // the shell fence (Ruling shell → fence; final review I1): whichever rule names the
         // refusal, a geometry inside a fenced shell band is answered by the teacher and the answer
@@ -2320,10 +2401,16 @@ impl ForceProvider for SurrogateKs {
                 shell_fence: by_shell_fence,
                 // the variance rules' fallbacks are the answers active learning asks for, and so
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
-                // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
-                thin: (by_envelope || by_class || by_fence) && !class_short && !forced,
-                dedup: (by_envelope || by_class || by_audit_fence || by_fence) && !forced,
+                // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2); next
+                // to a misfit (whichever rule named the refusal) an agreeing answer is kept but M
+                // does not lift on it as a quarantine fence does, so a parked scene would keep one
+                // per step: thinned and never a copy, as rule 4's answers (Task 6 review, ruling 10);
+                // and refused by the quarantine fence alone (forgotten samples' permanent fence,
+                // sample-recovery final review I1): both thin, a geometry near either is thinned
+                thin: (by_envelope || by_class || by_fence || near_misfit) && !class_short && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence || by_fence || near_misfit) && !forced,
                 near,
+                near_misfit,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
                 audit,
                 // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)
@@ -2629,17 +2716,57 @@ impl SurrogateKs {
             (&s.force_mask, s.use_energy).hash(&mut h);
         }
         self.quarantine.hash(&mut h);
-        (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.r_cut.to_bits()).hash(&mut h);
+        (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.body4_degree, basis.r_cut.to_bits()).hash(&mut h);
         let key = h.finish();
-        if let Some((k, f)) = *self.fit_floor_cache.lock().unwrap() {
+        if let Some(&(k, f)) = self.fit_floor_cache.lock().unwrap().get(&basis.body4_degree) {
             if k == key {
                 return f;
             }
         }
         let union = trust::key_column_counts(basis, store.samples.iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
         let f = if union > 0 { union } else { basis.n_independent_columns() };
-        *self.fit_floor_cache.lock().unwrap() = Some((key, f));
+        self.fit_floor_cache.lock().unwrap().insert(basis.body4_degree, (key, f));
         f
+    }
+
+    /// The body-4 degree a fit of these species is built at (spec 2026-11-13 §4.1, "grown with the
+    /// store"): the highest D₄ from [`surrogate::BODY4_DEGREE_CAP`] down to
+    /// [`surrogate::BODY4_DEGREE_START`] at which the samples a fit would use
+    /// (`FitReport::n_samples`, the count the `Samples` row compares) meet the trust floor — the
+    /// `Samples` floor ([`fit_floor`](Self::fit_floor) of [`fit_basis`](Self::fit_basis) at that
+    /// degree, the columns the fitted atoms touch) plus [`MIN_RESIDUAL_DOF`], the convention of
+    /// `trust_floor` (controller ruling 4: at the bare floor the residual degrees of freedom are
+    /// short, and a collection trusted at 2 would step up into an untrusted fit). The same test
+    /// at every fit: it steps down when samples are forgotten or held below that floor, or when
+    /// appended samples touch new columns and raise the floor above the count. Without the body-4
+    /// block (per scene) the start, which such a basis carries unused.
+    pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
+        let start = surrogate::BODY4_DEGREE_START;
+        let basis = self.fit_basis(species);
+        if !basis.body4 {
+            return start;
+        }
+        #[cfg(test)]
+        if let Some(d) = self.body4_force {
+            return d;
+        }
+        let Some(store) = self.store.as_ref() else { return start };
+        let fitted = (0..store.samples.len()).filter(|&i| !self.excluded(i)).count();
+        (start + 1..=surrogate::BODY4_DEGREE_CAP)
+            .rev()
+            .find(|&d| {
+                let mut at = basis.clone();
+                at.body4_degree = d;
+                fitted >= self.fit_floor(&at) + MIN_RESIDUAL_DOF as usize
+            })
+            .unwrap_or(start)
+    }
+
+    /// The standing model's body-4 degree D₄ (spec 2026-11-13 §4.1; the Model tab's fit line):
+    /// `Some` only while its basis has the body-4 block (a collection's), `None` per scene or
+    /// without a model.
+    pub fn body4_degree(&self) -> Option<usize> {
+        self.model.as_ref().filter(|m| m.basis.body4).map(|m| m.basis.body4_degree)
     }
 
     /// The basis a fit of these species is built on: the default (`Basis::new`), the recovery
@@ -2667,6 +2794,11 @@ impl SurrogateKs {
         #[cfg(test)]
         {
             b.body4 &= !self.body4_off;
+        }
+        // the degree the last fit chose (`grown_body4_degree`); a basis without body-4 keeps
+        // `Basis::new`'s, bit for bit
+        if b.body4 {
+            b.body4_degree = self.body4_degree;
         }
         b
     }
@@ -3054,6 +3186,7 @@ impl Trainable for SurrogateKs {
             pending_refit: self.pending_refit(),
             epoch: self.epoch(),
             fit: self.report().map(|r| (r.n_samples, r.q_prime, r.rmse_energy_per_atom, r.rmse_force)),
+            body4_degree: self.body4_degree(),
             residuals: self.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
             force_bound: self.policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
             provenance_mismatch: self.provenance_mismatch(scene),

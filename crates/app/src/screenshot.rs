@@ -937,7 +937,7 @@ fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
                 m.samples,
                 m.trusted,
                 m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")),
-                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr"))
+                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}{}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr", m.body4_degree.map_or(String::new(), |d| format!(", body-4 degree {d}"))))
             );
             return if m.trusted { Ok(()) } else { Err("the model is not trusted after the pass".into()) };
         }

@@ -988,7 +988,7 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | rule 4b: per atom (2026-10-18 trust fixes) | each atom its own class (1 neighbour → pair, ≥ 2 → many-body; `atom_class`), a sample evidence for every class among its atoms, a query needing every class among its atoms trusted; 4b fallbacks never thinned | a one-off measurement of the user's water + H₂ session model (2026-10-18; 657 samples, saved by the build before the fixes, re-judged from its stored samples without DFT): per geometry pair 0 samples, many-body 587 at LOO force max **12.00×**, energy 1.02× (the screenshot); per atom pair 179 (12.0×, #345: a lone added H), many-body 587 (10.6×, #438: a stretched H–H scan point) — refused at the scene's own start geometry, the reason naming #345. **Rejected, measured:** fencing up to 10 % LOO outliers (nearest-sample refusal) trusted that file but let the stuck-escape repro's hot run answer H₃ up to **6.33×** the force bound and **6.2e-3** Ha/atom (182 judged; record 2.7× / 5.2e-4) — the max rule stands |
 | degree-cap retry (2026-10-18) | ruling S15 step 1 kept only if the trust rule's counts still hold (n ≥ Q′, both dof ≥ 30) | E1(e) of the water investigation: one H 0.9 Bohr from O took a trusted water model (n 333) to degree cap 6 (Q′ 176 → 344): untrusted for want of samples, then 4b by that sample (LOO 7.5×) — 0 of 100 strict steps answered at 300 K (`a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery`) |
 | a failed audit stays failed (2026-10-18) | re-judged after each refit by the new fit's leave-one-out prediction at the audited geometry (plain prediction if not kept); cleared when that passes the audit's own criteria, or when the recovery quarantines the sample (the fence takes over) | before, the refit its own kept sample triggered erased the failure; the H₂ fixture: still untrusted after the refit with the audited sample alone (LOO force 9.0e-3 > 7.2e-3 Ha/Bohr at r = 2.6), trusted after 16 neighbours (LOO gap 2.6e-8 Ha) |
-| failed-audit lifecycle (2026-10-18 round 1) | `AUDIT_BURST` = 3: answered steps audited after a cleared failure; `AUDIT_REJUDGE_LIMIT` = 3: refits after which a still-failed audit becomes a local audit fence (also at once when the scene no longer holds its composition); persisted in the `.model` header `failed_audits` and re-judged on load | chosen, not measured: three audits are three teacher solves; three refits are three batches of kept samples near the trajectory. The fence radius is the quarantine's (`QUARANTINE_FRACTION`). **Why the limit cannot hide a failure the data can see** (round 1 re-review, R1-5): a fitted case's re-judge uses the class rule's leave-one-out with the same energy tier and a force bound that can only be looser (the pseudo floor), so "the re-judge fails" implies "the case's class fails rule 4b" — once fenced, its class stays refused everywhere, stronger than the fence; an unfitted case (an unfit answer — cores overlap, an occupation change — or one the store refused) gets the quarantine fence's radius, the documented policy for samples the model cannot represent. An off-composition fence re-activates when the composition returns (R1-4); one past the limit does not |
+| failed-audit lifecycle (2026-10-18 round 1) | `AUDIT_BURST` = 3: answered steps audited after a cleared failure; `AUDIT_REJUDGE_LIMIT` = 3: refits after which a still-failed audit becomes a local audit fence (also at once when the scene no longer holds its composition); persisted in the `.model` header `failed_audits` and re-judged on load | chosen, not measured: three audits are three teacher solves; three refits are three batches of kept samples near the trajectory. The fence radius is the quarantine's (`QUARANTINE_FRACTION`). **Why the limit cannot hide a failure the data can see** (round 1 re-review, R1-5): a fitted case's re-judge uses the class rule's leave-one-out with the same energy tier and a force bound that can only be looser (the pseudo floor), so "the re-judge fails" implies "the case's class fails rule 4b" — once fenced, its class stays refused everywhere, stronger than the fence (since the open-shell model, 2026-11-13: not when the fitted case lands in the misfit set M, whose leave-one-out the class rule sees in its RMS terms only — its key is refused when f·r_M² > 1 for a force misfit (r_M the LOO force ratio), and when its energy LOO RMS, M included, exceeds 1 for an energy misfit (f·r_E² > 1, roughly, r_E the energy ratio; Task 7c) — so the guarantee holds once those thresholds are crossed; see "Local misfit"); an unfitted case (an unfit answer — cores overlap, an occupation change — or one the store refused) gets the quarantine fence's radius, the documented policy for samples the model cannot represent. An off-composition fence re-activates when the composition returns (R1-4); one past the limit does not |
 | copies never kept (round 1, MUST-2; `is_label_copy`) | a rule-4/4b/5 fallback whose labels repeat the nearest stored sample of its atom sequence (inside the thinning radius) within the fit's own noise — \|ΔE\| ≤ N·s_E, every \|F_j\| within s_F — is never kept, exempt or not | no new constant (the fit's noise levels). Why: 100 copies of one geometry shrink s_F ×0.62 and rule 6's epistemic std ×0.64 (`a_parked_molecule_neither_floods_the_store_nor_shrinks_the_noise`, printed counterfactual); 2000 parked steps under 4b add 1 sample and move s_F ×0.996 and rule 6's std ×0.987 (the test's bound: within 5 %, a test bound, not a policy one). Copies are judged against fitted or pending samples only — never a held-out draft guess, a quarantined, superseded or box-excluded one (round 1 re-review, R1-1: comparing against a held-out guess refused the very fallbacks that let strict mode reach it, `a_parked_molecule_at_a_held_out_guess_still_teaches`). A first geometric version (a quarter of the thinning radius in spread units) called a vibrating H₂'s consecutive steps copies and the active-learning run never earned trust (18 samples in 300 steps, Q′ 29) — those are new labels (Δ\|F\| ≈ k·Δr ≈ 6e-4 ≫ s_F 4.5e-5) |
 | held-out draft guesses (round 1, MUST-1) | held out only for a geometry refusal (5a–5e but "no grade", non-finite, fence); re-checked at every refit, judged by the plain prediction and promoted once strict mode's domain reaches them | `a_held_out_guess_is_judged_when_strict_mode_reaches_it` |
 | teach around the blockers (2026-10-18, ruling 5) | per blocking sample (class LOO > 1): diagnosis by its in-sample ratio (the standing fit at it: \|ΔE\|/N over the tier, every atom's force residual over its bound) — ≤ 1 taught, > 1 refused ("the model cannot represent it"); `TEACH_PERTURBATIONS` 6 nudges (the plan's σ = 0.15 Bohr per coordinate, ×1.5 after every 40 rejected draws, ≤ 120 draws) and `TEACH_PATH_POINTS` 4 points at t = k/5 toward the nearest fitted sample of the same atom sequence (Kabsch-aligned), each beyond `THIN_FRACTION`·`max_descriptor_distance` from the blocker and from each other; one nudge and one path point held out; every geometry also no farther from the rest of the data (descriptor distance) than the blocker, path partners atom-matched over same-species permutations (≤ 720, a cost bound), path points closer than the blocker's and every fitted geometry's closest pair dropped; held-out checks kept as samples after judging (a failed one: failed audit with its index, origin "teach-check" in the `.model`); acceptance needs every class with samples trusted (n ≥ Q′ too — a short class with passing LOO is "needs samples"); `TEACH_MAX_BLOCKERS` 5 per offer, `TEACH_ROUNDS` 2 per environment class, restarted after a regular pass or once the class is trusted (not per blocker: a round's own samples can become the next blockers — the user's file: #438 10.6× → #664 19.6× → #688 1.47×) | no new tolerance: acceptance is the unchanged class rule (max LOO ≤ 1 over every fitted sample of the class, the blocker kept in the fit), the trust rule, and the held-out checks at the audit criterion (energy tier, each atom's force bound, 1×). The counts are the review's ("≈ 6 perturbations, ≈ 4 path points, 2 held out, at most 5 blockers, two rounds"); the distance is the thinning radius so no geometry is a copy the leave-one-out could lean on. Measured: Morse `gap_blocked(2.0, 3.6)` LOO 5.2× → accepted after 9 solves; the 5.1 Bohr tail (LOO 1.05×) → not accepted, structural at the cutoff (all residuals 1.88× the tier: V_Morse(r_cut = 6) ≈ −3.4e-3 Ha the f_c basis cannot carry); GPU: `teaching_around_a_blocker_restores_its_class` (surrogate suite); a one-off measurement of the user's saved water + H₂ model (2026-10-18, a copy, two rounds, 64 solves): not accepted — #345 became predictable (pair 12.0× → 0.78×), the basis grew to Q′ 344, many-body 10.6× → 19.6× → 1.47×, one check failed at 1.66× |
@@ -4123,7 +4123,7 @@ An exploration, **not pinned** (no test reproduces the sweep; only seed 1804 at 
 | **first refit (the attach's) ends: the leave-one-out result stands** | 1 676 | **128** | 2.04e-3 > 2.00e-3 Ha/Bohr = **1.0185×, untrusted** | |
 | **the next refit** (nothing new; 3 fits, 17.4 s): release 6, step 1's cap 6 | 1 682 | **122** | **0.9950**, Q′ 1 590, **trusted** | |
 
-Pinned (measured, fix round 1): the first refit is **13 fits, 43.0 s** (entry, release, cap-6 retry, 5 leave-one-out rounds, 5 fallback rounds; 29.7–30.1 s without the fallback; 123 s for 8 fits before the refit speed-ups), untrusted at 1.0185× with **128 held**; the next refit is **3 fits, 17.4 s**, trusted at 0.9950× with **122 held**; #1804 held throughout, in round 1, alone, at 961.7× (its energy; force 38.5×), every other sample ≤ 5.2×.
+Pinned (measured, fix round 1): the first refit is **13 fits, 43.0 s** (entry, release, cap-6 retry, 5 leave-one-out rounds, 5 fallback rounds; 29.7–30.1 s without the fallback; 123 s for 8 fits before the refit speed-ups), untrusted at 1.0185× with **128 held**; the next refit is **3 fits, 17.4 s**, trusted at 0.9950× with **122 held**; #1804 held throughout that run, in round 1, alone, at 961.7× (its energy; force 38.5×), every other sample ≤ 5.2×. *Measured before the open-shell merge, on main's code (body-4 degree 2, a failed recovery's holds kept); not what HEAD does — at HEAD #1804 is expected to stay in the fit (the merge paragraph below; not re-measured).*
 
 **The spec's expectation was wrong** (spec R1: "the fit is trusted; fewer than 110 samples are held"; the coordinator's fix-round-1 ruling). It came from the collection debug's measurement of #1804 held out *before* the entry fit: n 1 698, worst 0.9991, trusted, 105 held. The refit's release step runs before the recovery, against the fit #1804 still bends, and releases #1455 (an H₃O targeted sample that bent fit happens to reproduce); with #1455 in and #1804 out the fit is at 1.0070× (reproduced alone: #1804 held, #1455 released, 1.0070). The collection's margin is ≈ 0.1 % (every trusted fit measured sits at 0.96–1.00×), and the rounds are not monotone (1.007 → 1.131 → 1.0185 with 23 more held). Compared with the training-residual ranking from the same state (165 held, untrusted at 1.46×, 3.69e-3 > 2.53e-3): 37 fewer held and the miss is 1.9 % instead of 46 %, and the next refit trusts it (122 held). Changing the release order or keeping the best round were ruled out (fix round 1: outside R1).
 
@@ -4146,7 +4146,9 @@ Under R1 alone step 3 stood only if trusted, so the refit fell back to step 2's 
 - *Holds of a failed recovery persist.* On the pre-1805 snapshot the first refit's rounds 2–5 held 23 samples (105 → 128 held; worst 1.0070 → 1.131 → 1.0185) without restoring trust; they are written to the collection as status records. The next refit released 6 of the 128 by reproduction (122 held). A sample the leave-one-out ranking held is one the fit without it misses, so release by reproduction rarely takes it back. A held sample leaves the hold only when a later fit reproduces it (released into the fit) or a fresh teacher answer next to it that agrees with the model supersedes it, which ends its fence but keeps it out of the fit. The user's Restore (Task 2) does not apply: it clears only a forgotten sample (code 7), and only a code-0 sample can be forgotten. (Corrected in the final fix round: an earlier version of this line said Restore could take a held sample back.)
 - *Candidates exclude samples held or forgotten since the fit* (`worst_offenders`), so a sample is never named or counted twice against the cap.
 
-**Re-pinned (explained).** `a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery`: the training ranking still ends untrusted with the true reason (1.8e-3 > 1.0e-3 Ha/atom, nothing held: the spread misfit names more than the cap); the leave-one-out ranking names the tight H₃ alone (718×), holds it, and the cap-4 fit is trusted — both pinned. `a_scripted_session_decides_exactly_as_before` / `views_and_verdicts_between_the_steps_change_no_decision`: one trace line differs, the recovery note's words (the same one sample held); with the old words substituted back the trace hashes to the old pin. Re-pinned again in fix round 2 for the new wording (0xdd8a_dc25_aa37_49e3), the same line; the round-1 words substituted back give the round-1 pin.
+**Merged with the open-shell model (2026-11-14; spec `2026-11-13-open-shell-model-design.md` §4.2 G2, "Local misfit" below).** The two rankings above are the steps of step 2; the open-shell branch's no-ratchet rule wraps the whole recovery. A result stands when it recovers (residuals, noise and counts), or, short of that, when it passes the residuals and noise (main's "passes" outcome, which the open-shell branch kept too); when no step — the leave-one-out rounds, the training-residual fallback, step 3 — passes the residuals, the refit ends with the codes, degree cap and fit it started with (a forgotten sample's code 7 untouched: the recovery never writes it) and the note "recovery did not restore trust; no samples held". So *"Holds of a failed recovery persist"* above no longer holds for a recovery whose residuals still fail. On the pre-1805 snapshot at D₄ = 2 (where the numbers above were measured) **all 24 holds** of the first refit's rounds would now be given back, #1804's among them: the restore puts back the whole quarantine vector of the state on entry, and that state comes after the release step (104 held, #1804 in the fit), so round 1's hold of #1804 goes back with the 23 of rounds 2–5 (worst 1.0185×, residuals failing); the samples still over their bounds become the misfit set M (trusted when |M| is within 10 % of the fitted samples, refused near them by `NearMisfit`). *Corrected in the final whole-branch review (2026-11-14, I1): an earlier version of this paragraph counted only the 23 and the pinned line above said "#1804 held throughout" without a date.* At HEAD the D₄ = 2 case does not arise on this snapshot: the growth rule attaches it at **D₄ = 3**, where Task 4's `refit_cost` d4 run (pre-merge, a copy of the same 1 805 samples, "Refit cost at body-4 degree 3" below) measured the attach **trusted in 2 fits with no recovery** (54 released). #1804 is then in the fit, refused only by the class rule's O{H} / H{O} pair keys on the sample floor (n_k = 1; "Acceptance", the HO exception). `recovery_on_a_collection_snapshot` keeps its pre-merge `assert!(held_1804)`, documented as expected to fail at HEAD. Not re-measured on the snapshot at the merge or since. One change inside `quarantine_rounds`: when neither ranking recovers, the leave-one-out result still stands, unless it fails the residuals and the training result passes them — the recovery keeps a result that does not recover only when it passes the residuals, so keeping the failing one would discard a training-ranking result the recovery before R1 kept ("never worse than before" under the wrapper). `a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery`'s training-ranking half now ends untrusted on the misfit row (nothing held), not "training energy residual": M takes the samples the residual rows judged.
+
+**Re-pinned (explained).** `a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery`: the training ranking still ends untrusted with nothing held (the spread misfit names more than the cap). Before the open-shell merge its reason was the training energy residual (1.8e-3 > 1.0e-3 Ha/atom); since the merge the test asserts the all-sample residuals still fail, the counts hold, nothing is held, and the refusal is the `Misfit` row (`TrustKey::Misfit`: the samples the residual rows judged are in M, more than its 10 % limit; the merge paragraph above). *Wording corrected in the final whole-branch review (2026-11-14, M5).* The leave-one-out ranking names the tight H₃ alone (718×), holds it, and the cap-4 fit is trusted — both pinned. `a_scripted_session_decides_exactly_as_before` / `views_and_verdicts_between_the_steps_change_no_decision`: one trace line differs, the recovery note's words (the same one sample held); with the old words substituted back the trace hashes to the old pin. Re-pinned again in fix round 2 for the new wording (0xdd8a_dc25_aa37_49e3), the same line; the round-1 words substituted back give the round-1 pin.
 
 ## M8a body-4 (Task 5, 2026-10-22; `surrogate::descriptor` "Body-4 features", `surrogate::fit` "The large-basis path"; release, Ryzen 7 9800X3D, CPU; the user's app open)
 
@@ -4374,6 +4376,293 @@ What the user waits for at 50 000 samples (Q′ 1 032, 2.7 atoms per sample), ex
 - Paused (or before the first fit), it is still a wait of that length.
 
 What is left: the active set's MaxVol scan on threads, and the recovery's repeated searches.
+
+## Why the collection fails its residuals at every refit (2026-11-12; `providers` `surrogate::tests::residual_diag::residual_failures_on_a_collection`, `#[ignore]`d diagnosis; release, CPU; a copy of the user's collection: surface lsda, h = σ = 0.15, tol 1e-6, GPU teacher, ionic `all`; 1 805 samples, 106 held on disk; body-4 basis, H/N/O, Q′ 1 032)
+
+**Symptom.** Every refit runs trust recovery and quarantines more samples. The copy's attach refit took 106 → 165 held and stayed untrusted: "max training force residual 3.7e-3 > 2.5e-3 Ha/Bohr". The live collection went from 106 held (13:43) to 170 held + 2 superseded of 1 825 (14:23). The recovery stops at 10 % of the store (`QUARANTINE_MAX_FRACTION`, 182 here). From then on it can hold nothing more and the model stays untrusted.
+
+**It is the forces, not the energies.** After the attach's refit, no fitted sample's energy exceeds 1e-3 Ha/atom. Every fitted sample over its force bound is in the H₃O scene: neutral H₃O, the doublet radical, at 105³. The worst force residuals per scene, as rms |ΔF|/√3 and the worst ratio to the bound:
+
+| scene (multiplicity) | atoms | rms (Ha/Bohr) | p99.9 | worst ratio |
+|---|---|---|---|---|
+| H₂ (1) | 944 | 8.8e-4 | 8.0e-3 | 0.80 |
+| H₂O (1) | 1 203 | 6.0e-4 | 3.8e-3 | 0.56 |
+| H₃ (2) | 951 | 7.8e-4 | 8.8e-3 | 0.94 |
+| **H₃O (2)** | 748 | **1.3e-3** | 5.0e-3 | **1.46** |
+| N₂ (1) | 522 | 1.4e-5 | 6.4e-5 | 0.02 |
+
+**The labels are smooth, and the misfit is smooth.** Samples #1340–#1409 are one hot-burst trajectory: H₃O losing an H, one O–H going from 1.9 to 3.6 Bohr. Along it the teacher's energy and forces change smoothly, with no jump that would mean a change of SCF branch. The model's error also changes smoothly. It peaks on the O atom at about 1e-2 Ha/Bohr against teacher forces of 0.01–0.07 Ha/Bohr, around O–H ≈ 2.4–3.0 Bohr. The recovery takes the samples within a factor 2 of the worst. Their neighbours on the same trajectory then become the worst, and they fit no better without them. So each round peels one band: 5 rounds per refit, then again at the next refit, until the cap.
+
+**Hold-out fits (no recovery, the disk's codes plus the hold named):**
+
+| fit | basis (Q′) | trusted | failing condition |
+|---|---|---|---|
+| all, codes on disk | default (1 032) | no | force 5.6e-3 > 2.4e-3 (H₃O) |
+| all | cap 6 (1 590) | no | force 4.1e-3 > 2.9e-3 (H₃O, 1.42) |
+| every H₃O held | default | no | force 4.0e-3 > 2.0e-3 (one H₃ scan point, 1.99) |
+| every H₃O held | cap 6 | no | energy 1.14e-3 > 1.0e-3 Ha/atom (H₂ fallbacks #143/#144 at 103³, #1499 at 101³) |
+| **H₃O alone** (245 samples) | default | **yes** | — (worst force 0.94 of its bound) |
+| **doublets alone** (H₃, H₃O, HO) | cap 6 | **yes** | — (worst 0.87) |
+| doublets alone | default | no | force 1.28 (H₃O) |
+| singlets alone (H₂, H₂O, N₂) | default | no | energy 1.09e-3 (the same H₂ fallbacks) |
+
+**Root cause.** The H₃O labels are self-consistent: alone, the model fits them and trusts them. What it cannot do is fit H₃O and H₂O together. Holding the H₃O samples out cuts H₂O's force rms from 6.0e-4 to 1.6e-4 (default basis) or 8.8e-5 Ha/Bohr (cap 6). The two scenes share their O–H pair and H–O–H three-body environments, and their forces there disagree. The difference would have to come from the body-4 terms, whose degree is at most 2. The physical reason is the extra electron. Neutral H₃O has 11 electrons, H₂O's 10 plus one unpaired one, and that electron changes the O–H bonding across the whole molecule. A local descriptor sees that only through the four-body geometry. This explanation is consistent with the hold-outs; it is not proven. Neither more data nor quarantine fixes it: the model has to compromise between the two scenes, and the samples it quarantines are good labels.
+
+**Why it repeats.** A recovery that does not restore trust still keeps its holds: `recover_trust` step 2 returns the last round's state, and the codes go to the collection as status records. Each refit therefore throws away more valid H₃O labels (61 at the copy's attach, by its recovery note) while the model stays untrusted. The recovery note says "the model cannot represent them", but the H₃O-alone fit shows it can.
+
+**Second, smaller blocker.** Without H₃O, the singlets fail by 4–14 % on the energies of a few H₂ fallbacks at 101³/103³. The H₂ energy residual has a mean offset that varies with the box size even after each sample is rebased to its box's atom references: +1.6e-4 Ha/atom at 81³, −8e-5 at 101³, −3.0e-4 at 103³, −5e-5 at 105³. Not investigated further here.
+
+Nothing was changed: the trust rule and the recovery are safety rules. Options for the user:
+1. **A failed recovery keeps nothing.** When the rounds do not restore trust, restore the state the refit started from. The model is untrusted either way, so this never trusts more; it stops the ratchet and keeps the labels.
+2. **Separate models by spin multiplicity.** The fits above trust the doublets alone, and the singlets come close. This is a design change to how collections are split (spec §4.2 already keeps each sample's multiplicity); it needs its own spec.
+3. **A larger body-4 basis** (D₄ = 3). Not measured; Q′ grows to about 5 300 at S = 4, so the refit cost grows with it.
+
+## Raising the body-4 degree (2026-11-12; a measurement, nothing changed in the build)
+
+Follow-up to the section above, after the user's goal for the estimated model was restated: "place a
+heap of atoms down in the estimated model and watch them all form bonds" — Sandbox-scale scenes, far
+beyond what one DFT box holds. Splitting collections by whole-box spin multiplicity (option 2 above) does
+not fit that goal: in a large box the total multiplicity says nothing about any one atom's surroundings,
+and Sandbox has no teacher to read it from. A heap of loose atoms is all open-shell fragments at the start,
+so radicals have to be fitted by the same local model as closed shells. This measures option 3.
+
+Run: `residual_diag` with `DIAG_SPIKE=1` on a copy of the user's H/N/O collection (1 805 samples, 181 held
+on disk), the build's `body4_cap` patched to return D₄ = 2 (the shipped value), 3 and 4 in turn (a
+throwaway patch, reverted). Release, Ryzen 7 9800X3D, CPU, BelowNormal; other sessions' suites waited for.
+
+Same samples, same codes (the 180 holds on disk, default body-3 cap 4, no recovery):
+
+| D₄ | Q′ | fit | trusted | max F residual / bound | rms \|ΔF\|/√3 H₃O · H₂O · H₂ · H₃ (Ha/Bohr) | H₃O max ratio |
+|---|---|---|---|---|---|---|
+| 2 (shipped) | 1 032 | 4.8 s | **no** | 3.0e-3 / 2.6e-3 | 1.21e-3 · 5.56e-4 · 8.69e-4 · 7.77e-4 | 1.15 |
+| 3 | 1 902 | 21.8 s | **yes** | 1.77e-3 / 2.0e-3 | 4.69e-4 · 2.71e-4 · 5.38e-4 · 3.85e-4 | 0.48 |
+| 4 | 3 603 | 222 s | no (energy 1.5e-3 > 1e-3 Ha/atom) | 1.97e-3 / 2.0e-3 | — | — |
+
+The attach's refit with its recovery (what the app does):
+
+| D₄ | trusted | held after | held by scene | recovery |
+|---|---|---|---|---|
+| 2 | yes | 170 | H₃O 139, H₃ 29, H₂ 3 | 1 more quarantined |
+| 3 | yes | 112 | H₃O 90, H₃ 21, H₂ 2 | **68 released** ("the model now reproduces them") |
+| 4 | yes | 99 | — | 1 more quarantined |
+
+Findings:
+1. **The H₃O / H₂O conflict is mostly a capacity limit of the body-4 block, not spin.** At D₄ = 3 the same
+   fit cuts H₃O's force rms 2.6× and H₂O's 2.1×, and every scene's improves. The recovery then releases
+   held samples instead of holding more: the ratchet runs backwards.
+2. **Not everything is fitted.** 90 H₃O samples (the hot-burst H-loss trajectory, #1394–1402 still at F
+   ratio 5–8 at D₄ = 3) and 21 compressed H₃ geometries (energy up to 21× the bound) stay held. With every
+   hold cleared (S2) or every H₃O held and the rest cleared (S3), no D₄ is trusted (energy 7.8–8.1e-3 Ha/atom,
+   from those H₃ geometries) — so the hold-out fits S2–S4 do not separate H₃O from the other held samples.
+3. **Cost.** D₄ = 3 makes one fit ≈ 4.5× slower at S = 3 (Q′ 1 032 → 1 902); the module doc's estimate at
+   S = 4 is Q′ 2 688 → 5 344 (a 0.2 GB Gram per matrix). D₄ = 4 is 46× slower (222 s a fit) and not better.
+   The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
+4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.
+
+### Acceptance (2026-11-14, the recorded run; the user's decisions 2026-11-13; `providers` `surrogate::tests::residual_diag::acceptance_on_the_collection`, `#[ignore]`d; spec `2026-11-13-open-shell-model-design.md` §5.1–5.2; release, Ryzen 7 9800X3D, CPU, BelowNormal, alone)
+
+This runs the build with all of the open-shell model:
+- the D₄ growth rule;
+- a failed recovery holds nothing;
+- the misfit set M, its `Misfit` row and `NearMisfit`;
+- the class rule with M in its RMS terms (C1) and its energy half (`ClassKey::EnergyRms`), HEAD e0f15ac.
+
+It runs on a fresh copy of the user's 181-hold collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`: 1 805 samples; on disk 180 held (H₃O 144, H₃ 30, H₂O 4, H₂ 2) and 1 superseded. The test copies the folder again, before anything writes, for the D₄ = 2 provider.
+
+Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib acceptance_on_the_collection -- --ignored --nocapture --test-threads 1`. The recorded run (2026-11-14, after fix round 1) took 339 s. Five runs on five fresh copies — three before C1, two after — gave the same fit numbers to the last printed digit. C1 changes no verdict here: M is empty on the real refits. The wall times below are from the recorded run; they vary by ≈ 15 % from run to run (BelowNormal, the machine shared with the user's app).
+
+*Recorded at 98d81b9, before the main merge (6057835: main's `hold_out_lone` at the attach and its leave-one-out recovery ranking).* No recovery ran on the D₄ = 3 refits (2 fits each, nothing newly held) and |M| = 0 throughout, so the merge is not expected to change the result; it was not re-run after the merge. (The forced-D₄ = 2 comparator's attach did run a recovery, 4 fits; the merge's ranking could move its numbers, not re-measured.)
+
+**Result: PASS**, under the user's decisions of 2026-11-13:
+- (a) no refit-count bound on the convergence; 20 refits are only the test's runtime bound;
+- (b) HO's LOO rise is accepted as an exception;
+- (c) C2 is rejected.
+
+| assertion | measured | verdict |
+|---|---|---|
+| attach: the growth rule picks D₄ = 3 | D₄ = 3, Q′ 1 902 | pass |
+| attach: trusted | yes; training residuals energy 8.98e-4 Ha/atom (≤ 1e-3), force 1.76e-3 ≤ 2.0e-3 Ha/Bohr | pass |
+| attach: held after ≤ held before | 180 → 112 (0 newly held) | pass |
+| attach: ≥ 68 released | 68 (H₃O 54, H₃ 9, H₂O 4, H₂ 1) | pass |
+| refits: the held count never rises | 112 → 88 → 71 → 54 → 45 → 44 → 43 → 42 → 42 | pass |
+| refits: every refit fits (`fit_store` runs), so the fixed point is not vacuous | 2, 2, 2, 2, 2, 2, 2, 1 fits | pass |
+| refits: a fixed point (the same codes and the same M at two successive refits) | refit 8 repeats refit 7 | pass (decision a) |
+| §5.2, per scene: the force rms at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 Ha/Bohr | every scene | pass |
+| §5.2, per scene: the LOO force RMS at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 Ha/Bohr | every scene but HO; HO is the accepted exception | pass (decision b) |
+| §5.2 on the same samples (D₄ = 2 fitted on the D₄ = 3 codes): the force rms and the LOO force RMS, the same condition and exception | every scene, HO included | pass |
+
+**M by scene: empty.** |M| = 0 at the attach and at every refit after it, and at D₄ = 2. The model holds its unreproducible samples (H₃O 23, H₃ 18, H₂ 1 at the fixed point) rather than fitting them as misfits. The `Misfit` row, `NearMisfit` and the C1 terms are therefore not exercised by this collection's own refits. The populated test variant below exercises them.
+
+**The convergence sequence** (nothing new between refits):
+
+| refit | held | released | newly held | \|M\| | trusted | fit_store calls | wall (s) |
+|---|---|---|---|---|---|---|---|
+| attach | 112 | 68 | 0 | 0 | yes | 2 | 37.62 |
+| 1 | 88 | 24 | 0 | 0 | yes | 2 | 29.29 |
+| 2 | 71 | 17 | 0 | 0 | yes | 2 | 27.20 |
+| 3 | 54 | 17 | 0 | 0 | yes | 2 | 27.63 |
+| 4 | 45 | 9 | 0 | 0 | yes | 2 | 27.61 |
+| 5 | 44 | 1 | 0 | 0 | yes | 2 | 31.31 |
+| 6 | 43 | 1 | 0 | 0 | yes | 2 | 30.40 |
+| 7 | 42 | 1 | 0 | 0 | yes | 2 | 28.80 |
+| 8 | 42 | 0 | 0 | 0 | yes | 1 | 12.90 |
+
+At the fixed point, 42 samples are held: H₃O 23, H₃ 18, H₂ 1, plus the H₂ sample superseded on disk. 138 of the 180 holds have been released. The training residuals there are energy 9.01e-4 Ha/atom and force 1.88e-3 ≤ 2.0e-3 Ha/Bohr.
+
+**Why 8 refits.** `refit_fits` runs one release pass per refit (`release_reproduced`): it fits, releases what that fit reproduces, and refits once. Each refit's fit, with the samples it just released, then reproduces the next band of held samples. This is the banded structure the 2026-11-12 diagnosis found, peeled the other way. The sequence is monotone and stays trusted throughout; it is not a ratchet.
+
+Ruling 11 had expected a fixed point within 5 refits. The user dropped that bound (decision a). Until the fixed point, each refit (about 21–31 s at S = 3 over the runs) releases a few more samples.
+
+**§5.2 per scene.** The D₄ = 3 side is the fixed point. The D₄ = 2 side is a forced-D₄ = 2 provider's attach refit on its own fresh copy: trusted, held 180 → 170 (H₃O 139, H₃ 29, H₂ 2), Q′ 1 032, 4 fits, 18.79 s. The rms values are per Cartesian component over the trained atoms of the fitted samples, in Ha/Bohr (`loo_rms`'s definition, per scene). No sample had an undefined LOO.
+
+| scene | samples fitted D₄ 3 / 2 | force rms D₄ = 3 | D₄ = 2 | LOO force RMS D₄ = 3 | D₄ = 2 | verdict |
+|---|---|---|---|---|---|---|
+| H₂ | 473 / 472 | 6.06e-4 | 8.76e-4 | 8.67e-4 | 1.10e-3 | ok |
+| H₂O | 408 / 408 | 3.93e-4 | 5.75e-4 | 5.26e-4 | 7.63e-4 | ok |
+| H₃ | 329 / 318 | 4.51e-4 | 7.82e-4 | 5.63e-4 | 1.03e-3 | ok |
+| H₃O | 290 / 174 | 6.90e-4 | 1.24e-3 | 8.04e-4 | 1.39e-3 | ok |
+| **HO** | 1 / 1 | 8.12e-5 | 2.75e-4 | **2.12e-1** | **1.87e-1** | LOO rose: **the accepted exception** |
+| N₂ | 261 / 261 | 1.36e-5 | 1.44e-5 | 4.62e-5 | 5.63e-5 | ok (both < 1e-4) |
+
+The two sides do not fit the same samples: D₄ = 3 fits 116 more H₃O samples, the hard ones. The test therefore also asserts the comparison on the same samples (spec §5 item 2, "same-sample comparison"; fix round 1): D₄ = 2 refitted on the D₄ = 3 fixed point's codes, with no recovery, under the same condition and the same HO exception. It is a weak comparator: that D₄ = 2 fit is itself untrusted and unrecovered (force 6.4e-3 > 2.35e-3 Ha/Bohr, energy 1.16e-3 Ha/atom), because it fits the samples D₄ = 2's own recovery holds. On those samples D₄ = 3 is lower in every scene, HO included, so the exception is not needed there.
+
+| scene | force rms D₄ = 3 | D₄ = 2 | LOO D₄ = 3 | D₄ = 2 |
+|---|---|---|---|---|
+| H₂ | 6.06e-4 | 1.02e-3 | 8.67e-4 | 1.31e-3 |
+| H₂O | 3.93e-4 | 1.11e-3 | 5.26e-4 | 1.50e-3 |
+| H₃ | 4.51e-4 | 9.59e-4 | 5.63e-4 | 1.14e-3 |
+| H₃O | 6.90e-4 | 1.85e-3 | 8.04e-4 | 1.98e-3 |
+| HO | 8.12e-5 | 1.75e-3 | 2.12e-1 | 3.44e-1 |
+| N₂ | 1.36e-5 | 1.40e-5 | 4.62e-5 | 4.98e-5 |
+
+**The HO exception** (the user's decision 2026-11-13, b). HO is one sample: store #1804, a 95³ fallback.
+- Its geometry is O–H = 1.311 Bohr, compressed far inside the bond (about 1.83 Bohr at equilibrium), with |F| = 0.718 Ha/Bohr on both atoms.
+- It is the store's only pair-class O–H geometry. A diatomic has no three- or four-body terms, so its LOO is the pair term's extrapolation to a distance no other sample covers. That error is 0.19–0.21 Ha/Bohr per component, about 30 % of the force, at either degree.
+- Its keys, O{H} and H{O} (pair class), are refused by the class rule at both degrees on the sample floor (`ClassKey::Samples`): n_k = 1 against a column floor q_k of 52 at D₄ = 3 and 38 at D₄ = 2. Their LOO ratio RMS at D₄ = 3 is 8.1 (force) and 108 (energy).
+
+The test does not assume the exception; it checks its conditions. It exempts HO's LOO only while HO has one fitted sample at both degrees and every key of its atoms has n_k = 1 (`key_stats`) and is refused by the class rule, at both. HO's in-sample force rms stays asserted. Every other scene is asserted in full. The gap is real: one sample of a compressed OH radical teaches the model nothing it can transfer to that geometry.
+
+**C1 on the class rule as built** (the Task 7 review, landed in 22553fd and e0f15ac). For each class key, the table gives the provider's own statistics from `compute_class_loo_full` (R_c and R_E,c with M in the RMS terms; n_k without M; M's energy samples in the sum) and the standing verdict from `class_loo`. The test recomputes the M-in numbers independently; they match the provider's in every row.
+
+On the attach's refit (M empty), no number moves:
+- trusted: H{H} pair (n_k 613, R_c 0.181, R_E,c 0.246), N{N} pair (261, 0.005, 0.003), H{H} many-body (322, 0.175, 0.071), H{H,O} many-body (631, 0.158, 0.041), O{H} many-body (631, 0.122, 0.041);
+- refused: the HO keys H{O} and O{H} pair (n_k 1, R_c 8.08, R_E,c 108), on `Samples`.
+
+The populated variant is test-only: D₄ = 3 with every held sample back in the fit and no recovery (`fit_store`). It is trusted, with |M| = 30 samples and 57 atoms (H₃ 21, H₃O 6, H₂ 3) and a limit base of 1 804. Its training residuals outside M are energy 9.99e-4 Ha/atom and force 2.20e-3 ≤ 2.37e-3 Ha/Bohr. In the table, f and r_M are M's share of the key's atoms and their LOO force ratio RMS. f_E and r_E are M's share of the key's energy samples and their LOO energy ratio RMS.
+
+| key | n_k | R_c (M in) | R_E,c (M in) | M energy samples | before C1 (M out) R_c, R_E,c | f | r_M | f_E | r_E | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| H{H} pair | 608 | 0.293 | 0.206 | 7 | 0.186, 0.170 | 0.011 | 2.13 | 0.011 | 1.09 | trusted |
+| H{O} pair | 1 | 22.0 | 40.9 | 0 | 22.0, 40.9 | 0 | — | 0 | — | refused (`Samples`, 1 < 52) |
+| N{N} pair | 261 | 0.005 | 0.003 | 0 | 0.005, 0.003 | 0 | — | 0 | — | trusted |
+| O{H} pair | 1 | 22.0 | 40.9 | 0 | 22.0, 40.9 | 0 | — | 0 | — | refused (`Samples`, 1 < 52) |
+| H{H} many-body | 322 | 0.645 | 0.773 | 21 | 0.264, 0.132 | 0.073 | 2.19 | 0.061 | 3.08 | trusted |
+| H{H,O} many-body | 715 | 0.243 | 0.082 | 6 | 0.204, 0.078 | 0.010 | 1.33 | 0.008 | 0.29 | trusted |
+| O{H} many-body | 715 | 0.264 | 0.082 | 6 | 0.189, 0.078 | 0.008 | 2.03 | 0.008 | 0.29 | trusted |
+
+With C1 and the energy guard, the only keys refused are the one-sample HO keys, and they are refused on the sample floor. No key is refused by M. H{H} many-body, the H₃ key that holds most of M, has R_E,c = 0.773 ≤ 1 with 21 M energy samples (f_E·r_E² = 0.58), so the energy guard does not refuse it. Its R_c = 0.645 is under 1/√2, and it stays trusted. The review's lower bound √f·r_M = 0.59 is consistent with the measured 0.645. The class-level summary line ("class pair: refused, `Samples`") is the pair class's first refused key, HO's. H{H} and N{N} pair are trusted on their own keys.
+
+**C2, rejected (decision c): the record of why.** The measurement is the share of fitted samples outside M, and of their atoms, that the misfit fence flags at their own geometries. Each atom's L∞ spread distance to the nearest misfit atom of its species is compared with the shipped radius, 0.30 spreads (`QUARANTINE_FRACTION × max_descriptor_distance`), and with 0.75 spreads (`THIN_FRACTION ×`). The test computes the distances itself and leaves the product constant alone. At the shipped radius, its sample counts match `near_misfit_atoms` in every scene. On the attach's refit (M empty), nothing is flagged at either radius. On the variant:
+
+| scene | samples | flagged at 0.30 | at 0.75 | atoms | flagged at 0.30 | at 0.75 |
+|---|---|---|---|---|---|---|
+| H₂ | 471 | 3 (0.6 %) | **316 (67.1 %)** | 942 | 6 (0.6 %) | 632 (67.1 %) |
+| H₂O | 408 | 0 | 0 | 1 224 | 0 | 0 |
+| H₃ | 326 | 140 (42.9 %) | 159 (48.8 %) | 978 | 143 (14.6 %) | 310 (31.7 %) |
+| H₃O | 307 | 1 (0.3 %) | 9 (2.9 %) | 1 228 | 1 (0.1 %) | 9 (0.7 %) |
+| HO | 1 | 0 | 0 | 2 | 0 | 0 |
+| N₂ | 261 | 0 | 0 | 522 | 0 | 0 |
+| all | 1 774 | 144 (8.1 %) | 484 (27.3 %) | 4 896 | 150 (3.1 %) | 951 (19.4 %) |
+
+At 0.75 the fence would refuse two thirds of the H₂ scene's own geometries. A likely reason is that M's three H₂ samples and the H₃ misfit atoms with one far neighbour lie in the H₂ pair region; this was not traced atom by atom. Water is untouched at either radius: its atoms stay more than 0.75 spreads from M's six H₃O samples. The review's benefit side was not measured: whether each radius reaches every non-M atom of a misfit key with a LOO ratio above 1.
+
+**Gaps (rule 7).**
+1. On the user's collection M is empty at every refit. The local-misfit path (G3) and C1 are not what make this collection trusted. D₄ = 3 plus the releases does that, and 42 samples stay held.
+2. The releases settle at refit 8. Until then each refit releases a few more samples.
+3. HO's LOO rise is accepted, not cured: one extrapolated geometry whose keys the sample floor refuses at both degrees.
+4. §5.2 is asserted both ways: over each degree's own fitted set (the brief's; D₄ = 2 holds 116 more H₃O samples) and on the same samples (a weak comparator: that D₄ = 2 fit is untrusted and unrecovered). D₄ = 3 passes both, HO's own-set LOO the one accepted exception.
+
+## Local misfit (2026-11-13; spec 2026-11-13-open-shell-model §4.3, Task 7 physics review)
+
+**C1 as landed** (`providers::surrogate::trust` `compute_class_loo_full`, `LooSums`; the user's decision, "C1 only"; it amends §4.3, which had left M out of the class rule entirely). The misfit set M is the fitted samples beyond their bounds in-sample (at most `QUARANTINE_MAX_FRACTION` = 10 % of the fitted samples, the `Misfit` row).
+
+- *Kept in:* M's samples enter the class rule's leave-one-out RMS sums, per class and per environment key. That is the force ratio² and its atom count, and the energy ratio² and its sample count. These are R_c (`force_rms`) and R_E,c (`energy_rms`).
+- *Left out:* the max terms (`force_max`, `energy_max`), the worst-sample and blocker readouts (the teach-around targets), the sample counts and n_k (the sample floor), and the energy-bearing count of the capped-segment rule. So M never helps a class or key reach an evidence floor. Also left out: the calibration's keys and the aleatoric level ā_c. Without M, ā_c is lower, so λ is larger: conservative.
+- A key held only by M's atoms is not judged: n_k = 0, refused on the sample floor, as before. A sample of M whose LOO is undefined makes the force RMS ∞ (it counts as infinitely off; its max is not kept). q_k still counts every fitted sample, M included (ruling 6, unchanged). Held samples stay out of everything.
+- *Effect:* a key with a fraction f of its atoms in M at LOO ratio RMS r_M has R ≥ √f·r_M. It is refused by the uncalibrated rule (rms ≤ 1) when f·r_M² > 1, and cannot enter the calibrated verdict (floor R ≤ `ENTER` = 1/√2) when f·r_M² > ½. No new constant. The max terms stay without M because M's ratios are above 1 by construction: in a max they would refuse every atom sharing its key (§4.3's objection, which holds for the max and not for the RMS).
+- *The energy half (Task 7c; the user's decision 2026-11-13, "Yes, add it").* Before it, R_E,c decided no verdict: the uncalibrated rule read the energy max outside M (`class_refusal`), the calibrated one the DFT-measured energy (`calibrate::verdict`), so an energy misfit had no class-rule guard. Now, in both paths, a class or key is refused (`ClassKey::EnergyRms`, words "LOO energy error RMS …× the tier (training samples the model cannot reproduce included)") when its energy LOO RMS, M included, exceeds 1 **and** an M sample contributes to that energy sum (`ClassStats::energy_misfits` > 0). Any M sample with a fitted energy engages the check, whatever kind of misfit it is: a force misfit's energy enters the sum as an energy misfit's does. Roughly, the key is refused when f·r_E² > 1, where — for the energy, here and below — f is the share of the key's energy samples that are in M and r_E their LOO energy ratio RMS (R_E,c² ≥ f·r_E²). The guard bites only when M contributes, so with M empty no verdict changes (uncalibrated, the RMS is at most the max, already ≤ 1; calibrated, the verdict never read the energy LOO). The limit is the bound, 1, in both paths, with no hysteresis at 1 for energy (the same limit to enter and to stay): the calibrated path has no ½ entry threshold for energy, because its energy check is the measured audit energy. NaN or ∞ with M contributing refuses. No new constant. On the Task 8 populated variant ("Acceptance (2026-11-14)" above, read on this code path), H{H} many-body has R_E,c = 0.773 ≤ 1 with 21 M energy samples, and R_c = 0.645 < 1/√2: it is trusted, not refused.
+
+Pinned by `providers` tests:
+
+- `the_class_rule_keeps_misfits_in_its_rms_only`: the Task 5 store, three energy misfits. The pair class and H{H} carry the RMS over every fitted sample. The energy RMS is 0.778 with M and 0.091 without it. The maxima, samples and ā_c are those outside M.
+- `a_gross_misfit_refuses_its_key`: H{He} with f = 0.062 and r_M = 5.87, so f·r_M² = 2.15. R = 1.47, refused on Force; H₂ is still answered.
+- `a_mild_misfit_keeps_its_key`: f·r_M² = 0.13 and R = 0.36, trusted.
+- `a_key_held_only_by_misfits_is_refused`: unchanged.
+- `a_gross_energy_misfit_refuses_its_key` (Task 7c): H{He} with two energy-misfit copies (±0.02 Ha): f_E = 0.062, r_E = 10.3, f_E·r_E² = 6.65; R_E = 2.58 with the energy max outside M 0.099 and the force terms ≤ 2e-4: refused on `EnergyRms`; H₂ still answered.
+- `an_energy_rms_without_misfits_decides_nothing` (Task 7c): on the verdict function, a calibrated key with energy LOO RMS 3 is answered with `energy_misfits` = 0 and refused with 1, at the bound 1 in both paths; on two stores with M empty no class or key counts an M energy sample.
+
+**Local misfit — what stays approximate (Task 7 review; adjusted for C1).** M is the set of fitted samples beyond their bounds, at most 10 % of the fitted samples. It is kept in the class rule's RMS terms (C1). It is left out of its max terms, n_k and its aleatoric level. Atoms within the near distance of a misfit atom of their species are refused (`NearMisfit`).
+
+The fence covers the *sampled* points of a misfit region, not the region. The measured misfit (H₃O, the 2026-11-12 diagnosis) is a smooth band along a trajectory. Take an unsampled geometry in that band, beyond the near distance of every misfit atom. It passes rules 5–7: the posterior is confident there, because M is fitted at full weight. It passes the class rule unless M's share of its key's RMS refuses the key (force: f·r_M² > 1 uncalibrated, > ½ to enter calibrated; energy: f·r_E² > 1, roughly, in both paths). A mild misfit in a key shared with well-fitted scenes does not refuse it.
+
+In the DFT solvers such an answer is caught by the next audit (rule 8: the whole model is untrusted, and the case is fenced after three refits). Once fenced, C1 restores most of the F2 guarantee ("the class rule still sees the sample's leave-one-out"), now through the RMS, not the max: for a force misfit through R_c (f·r_M² > 1), for an energy misfit through R_E,c (its energy LOO RMS, M included, beyond 1: f·r_E² > 1, roughly; Task 7c). **In Sandbox, which runs no audits, it is not caught** (C3 below).
+
+The trust rule bounds how many samples are misfits. Through the RMS it now also bounds how far beyond their bounds they are, per key: r_M² ≤ 1/f for a force misfit (r_M the LOO force ratio), r_E² ≲ 1/f for an energy misfit (r_E the energy ratio; Task 7c). A single gross misfit in a large key can still pass. The analogous 2026-10-18 design (up to 10 % of LOO outliers set aside) was measured unsafe: hot H₃ at 6.33× the force bound. This design sets aside fewer samples (in-sample > 1 only), but its residual risk is not measured.
+
+**The user's decision (2026-11-13):** C1 ("C1 only") and its energy half ("Yes, add it", Task 7c) landed the same day; C2 rejected (below), C3 carried to M8b.
+
+**C2 rejected by measurement** (the Task 8 table above). The populated test variant of the user's collection has |M| = 30. On it, widening the near distance from 0.30 to 0.75 spreads flags 67.1 % of the H₂ samples and atoms (0.6 % at 0.30), and 27.3 % of all samples (8.1 % at 0.30; of all atoms 19.4 %, 3.1 % at 0.30). The fence would refuse most of a well-fitted scene's own geometries, so the near distance stays 0.30. The unsampled band between the fence and the class rule stays as described above.
+
+**The separate-counts gap** (review, "A gap to document"; the spec chose it, builder check Q1). Held samples (at most 10 % of the store) and M (at most 10 % of the fitted samples) are separate counts. A trusted model can therefore leave up to about 19 % of its store unreproduced: 0.1 + 0.9 × 0.1. The 10 % cap's rationale ("a few strays, not the data", R1-5 above) was written for one count.
+
+**C3: carried to the M8b spec** (`2026-10-20-m8-shared-model-and-sandbox-design.md` §5, "Open physics item"). Sandbox's freeze rule must say what replaces the audit for keys holding misfit atoms, and its physics review must sign it off.
+
+## Open-shell gate: trust baseline against main (2026-11-14; `tests/surrogate.rs` `trust_baseline_report`, `#[ignore]`d; release, RX 7900 XTX shared with another worktree's app, BelowNormal, alone)
+
+The open-shell branch at 6a5ea29 (main 7d3cfbe merged in) and main 7d3cfbe itself were both run, in their own worktrees on the same machine.
+- **Cadence 50:** the two reports are identical except one active-learning flip's model generation (44 on the branch, 41 on main). Every decision, count and worst value is the same. This branch adds no missed large error.
+  - Audits beyond 1× or the tier while trusted: pair 0 / 64, many-body 1 / 12, active-learning pair 0 / 5.
+  - The checker's hot run: 513 answers, 269 judged, worst force residual 5.15× its bound, 21 answers beyond 3× or the energy tier.
+- **Cadence 10** (branch only): met. Pair 0 / 157, many-body 0 / 1, active learning 0 / 26; the hot run had 7 answers, worst 0.46×.
+- **Against the fix-round-3 record above (2026-10-21; 442 answers, worst 2.87×), main's cadence-50 hot run has risen.** It now answers 513 steps, including runs of 2–14 consecutive steps between 2.6× and 5.15× the force bound (steps 258–262, 843–856). The audits then catch them (134 rule-8 fallbacks). This was already on main before this branch. Not investigated here: an open item for main.
+
+## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone at the checks)
+
+Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run with the test hook `body4_force`. `d4` runs on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, 106 held on disk). `s4` runs on a synthetic four-species store, **for cost only**: every N of the even-indexed samples is made C with the labels untouched (they are N₂'s labels, meaningless for carbon), C's references are copied from N's per box, and jittered replicas (`replica(…, 1e-4)`) take it to 10 830 samples, read-only. Command: `REFIT_COST=d4 REFIT_WHOLE=0 COLLECTION_DIR=<copy> cargo test -p providers --release --lib refit_cost_on_a_collection -- --ignored --nocapture --test-threads 1` (then `REFIT_COST=s4` on a fresh copy).
+
+| S | samples | D₄ | Q′ | cold attach | second refit, nothing new | incremental +25 | trusted | held after |
+|---|---|---|---|---|---|---|---|---|
+| 3 | 1 805 | 2 | 1 032 | 27.08 s (8 fits) | 21.45 s (7) | 23.35 s (7) | no: force 5.6e-3 > 2.4e-3 Ha/Bohr | 104 → 104 → 104 |
+| 3 | 1 805 | 3 | 1 902 | 36.19 s (2) | 23.37 s (2) | 32.39 s (2) | yes: force 1.82e-3 ≤ 2.0e-3, energy 9.0e-4 Ha/atom | 51 → 40 → 37 (54, 11, 3 released) |
+| 4 (synthetic) | 10 830 | 2 | 2 688 | 436.83 s (8) | — | — | no: force 5.6e-3 (the S = 3 H₃O misfit, replicated) | 624 |
+| 4 (synthetic) | 10 830 | 3 | 5 344 | **1 087.42 s (2)** | — | — | yes: force 1.98e-3 | 300 (330 released) |
+
+"Held after" is the store's held count after each refit (attach → second → incremental). It is not the count on disk less the releases: the attach changes a few holds before any release (106 on disk → 104 at D₄ = 2, where nothing is released; 636 → 624 at S = 4), not traced.
+
+Phases at S = 3 (each the provider's own function on the standing fit):
+
+| phase | D₄ = 2 | D₄ = 3 | ratio |
+|---|---|---|---|
+| spectral search | 1.74 s (7 rounds) | 8.99 s (5 rounds) | 5.2 |
+| refit after +25 | 2.00 s | 7.78 s | 3.9 |
+| null space | 0.37 s | 1.97 s | 5.3 |
+| class leave-one-out (threaded pass) | 1.24 s | 3.82 s | 3.1 |
+| LOO per sample, 2 / 3 / 4 atoms | 3.7 / 5.3 / 6.9 ms | 12.7 / 17.9 / 22.9 ms | 3.4 |
+| active set (rule 5e) | 1.78 s | 5.71 s | 3.2 |
+| one `fit_store`, nothing new | 4.39 s | 11.47 s | 2.6 |
+| the growth rule's floor pass (`grown_body4_degree`; "cold" clears only the floor cache) | — | 0.057–0.081 s (0.68–0.73 s at S = 4) | |
+
+Findings:
+1. **The stop condition fired.** At S = 4 and 10 000 samples a D₄ = 3 refit is ≈ 540 s per fit (spectral search and null space ∝ Q′³, ×22 from Q′ 1 902; leave-one-out and active set ∝ P·Q′²). D₄ = 2 is over the 300 s limit there too (437 s, 8 fits), because the failed recovery reruns its 7 fits. Only the cold attach was timed at S = 4; that it reruns at every refit is inferred from S = 3.
+2. **At S = 3, D₄ = 3 is trusted, with 2 fits per refit instead of 7–8; it is not cheaper.** Each fit is 2.6× dearer, so a refit takes 1.1–1.4× D₄ = 2's wall time (36.2 / 23.4 / 32.4 s against 27.1 / 21.5 / 23.4 s). Each refit releases more held samples (51 → 40 → 37), so a "second refit gives the same holds" check needs the releases to settle first (Task 8).
+3. **The user's decision (2026-11-13): accept the cost.** D₄ = 3 for every species set, with no column budget. While playing the refit runs in the background (fix 4 above) and the standing model answers; paused, it is a wait of that length. Not built: D₄ = 3 for many-body centres only, a smaller body-4 n_max, or skipping a recovery that already failed on the same samples (that changes fit behaviour).
+4. **The 2-fit refits above were measured with |M| = 0. With M non-empty every refit runs the recovery** (final whole-branch review I2, 2026-11-14; a code reading and an estimate, **not a measurement**). `refit_fits` calls `recover_trust` whenever the all-sample `recoverable_fail()` holds. The all-sample residual rows fail on any fitted sample over its bound, and M is exactly those samples, so that is every refit while M is non-empty, a trusted model included. Since the main merge, such a recovery runs at most (counted from `recover_trust` / `quarantine_rounds` / `rounds_by`):
+   - step 1's degree-cap-6 retry: 1 fit, at a larger Q′ (2 460 at D₄ = 3, S = 3);
+   - 5 leave-one-out rounds: 5 per-sample leave-one-out passes (`ensure_loo_ratios`; the refit's fits defer the class pass, so none is cached) and 5 fits;
+   - 5 training-residual rounds from the same entry state: 5 fits;
+   - then the restore of the entry state (no fit).
+
+   That is 11 fits and 5 leave-one-out passes on top of the refit's own fit: **≈ 12 fits per refit instead of 2**. Fewer when a round names no offender or its offenders would cross the 10 % cap; one more when the release step releases something; step 3 (only after an earlier recovery left the cap set) adds 1 + 10. The review's estimate from the phase table above (≈ 11.5 s per fit, ≈ 3.8 s per leave-one-out pass at S = 3, D₄ = 3; the recovery's deferred fits skip the class pass and the active set, so it is on the high side): **about 3 min per refit at S = 3**, and **over an hour at S = 4** and 10 000 samples (≈ 540 s per fit). While playing it runs in the background and the standing model answers; paused, it is a wait of that length. Skipping a recovery that already failed on the same members is a possible follow-up; **the user has not decided it**.
 
 ## Scoped-trust measurement (step 3) (2026-11-13; the scoped-trust study's "Rule 3: measured counterfactual"; `providers` `surrogate::tests::scope_measure`; release, Ryzen 7 9800X3D, CPU, BelowNormal, other cargo jobs running) — a measurement, no behaviour changed
 

@@ -77,6 +77,7 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::EnergyUncertainty => "7 energy σ".into(),
         R::NonFiniteAnswer => "non-finite".into(),
         R::NearQuarantine => "fence".into(),
+        R::NearMisfit => "misfit".into(),
         R::Audit => "8 audit".into(),
         R::RelaxVerification => "relax check".into(),
         R::Segment => "segment".into(),
@@ -100,6 +101,7 @@ pub fn untrusted_title(key: TrustKey) -> &'static str {
         TrustKey::ResidualDofE | TrustKey::ResidualDofF => "too little data beyond the fit's own parameters",
         TrustKey::EnergyResidual => "it did not reproduce its own training energies",
         TrustKey::ForceResidual => "it did not reproduce its own training forces",
+        TrustKey::Misfit => "too many training samples it could not reproduce",
         TrustKey::ForceNoise => "its forces did not fit the data to within the force tier",
         TrustKey::Audit | TrustKey::AuditForces => "the last check against DFT had failed",
     }
@@ -151,6 +153,7 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
         R::NonFiniteAnswer => "the model's answer was not a finite number, so it was not used — this answer is the teacher's".into(),
         R::Segment => "this scene is a cut-out segment — DFT answers every step and teaches the model the forces of its interior atoms; the model does not answer here".into(),
         R::NearQuarantine => "this geometry is next to one the model could not learn".into(),
+        R::NearMisfit => "an atom here is next to a training sample the model cannot reproduce".into(),
         R::Audit => "a routine check of the model against DFT".into(),
         R::RelaxVerification => "checking the relaxed geometry with DFT".into(),
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("sampling: the isolated {} atom (spin multiplicity {multiplicity}), for its reference energy", symbol(z)),
@@ -175,6 +178,7 @@ pub fn outcome_label(o: K) -> String {
         K::ShellNotKept => "not kept: cutoff shell".into(),
         K::LoneNotKept => "not kept: lone atoms".into(),
         K::FenceDisagrees => "not kept: fence".into(),
+        K::MisfitDisagrees => "not kept: misfit".into(),
         K::WaitingForPass => "not kept: waiting for a pass".into(),
         K::NotOffered => "not kept: other settings".into(),
         K::HeldOut => "not kept: held-out check".into(),
@@ -199,6 +203,7 @@ pub fn outcome_sentence(o: K) -> String {
         K::ShellNotKept => "used for this step, not kept and not judged: a pair lies in the cutoff shell a shell check measured — the model's cutoff cannot represent it (a shell fence)".into(),
         K::LoneNotKept => "used for this step, not kept: no atom has a neighbour within the model's cutoff — a lone atom has nothing to learn (the isolated atom is the reference energy)".into(),
         K::FenceDisagrees => "not kept: next to a geometry the model could not learn, and the teacher still disagrees with the model there".into(),
+        K::MisfitDisagrees => "not kept: next to a training sample the model cannot reproduce, and the teacher disagrees with the model there".into(),
         K::WaitingForPass => "not kept: many answers are held without a model — run a sampling pass".into(),
         K::NotOffered => "used for this step, not kept for this model: its settings differ".into(),
         K::HeldOut => "a DFT solve held out on purpose to test the teaching — never trained on".into(),
@@ -279,6 +284,13 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::ResidualDofF => format!("Enough data beyond the fit's own parameters to measure its noise — forces {:.0} of {:.0}", c.value, c.limit),
         TrustKey::EnergyResidual => format!("Reproduces its own training energies to the accuracy it claims — worst {} mHa/atom{}, allowed {} mHa/atom", mha(c.value), worst_at(c), mha(c.limit)),
         TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}{}, allowed {} mHa/Bohr for that atom", mha(c.value), worst_at(c), mha(c.limit)),
+        // M: fitted samples over their bound, judged apart from the two lines above (spec 2026-11-13 §4.3)
+        TrustKey::Misfit => format!(
+            "Few training samples it cannot reproduce — {} of at most {:.1} (10 % of the fitted samples){}",
+            c.value as usize,
+            c.limit,
+            c.worst.as_ref().map_or(String::new(), |_| format!("; worst{}", worst_at(c)))
+        ),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
         TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
@@ -323,6 +335,8 @@ fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} of {q:.0} samples needed)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
+        // open-shell Task 7c: the energy RMS with the samples the model cannot reproduce
+        Some((ClassKey::EnergyRms, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier on average, training samples the model cannot reproduce included)"),
         // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound
         Some((ClassKey::WorstAtom, x, _)) if evidence < providers::surrogate::MIN_EVIDENCE => format!(
             "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",

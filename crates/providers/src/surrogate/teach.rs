@@ -441,13 +441,12 @@ impl SurrogateKs {
         })
     }
 
-    /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
-    /// may still take it, the sample floor the richer basis would set and the environment keys it
-    /// would leave short — each key's own floor in that basis (M8a user-fix 3,
-    /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
-    fn richer_basis_floor(&self) -> Option<String> {
-        let model = self.model.as_ref()?;
-        let b = &model.basis;
+    /// The recovery's richer basis ([`richer_basis_floor`](Self::richer_basis_floor)): the store's
+    /// species at [`RECOVERY_DEGREE_CAP`] with the standing basis's body-4 block, body-4 degree
+    /// (spec 2026-11-13 §4.1: D₄ = min(cap, the chosen D₄)) and reach; `None` when the standing
+    /// body-3 basis is at the recovery's degree already, or the recovery cannot take it.
+    pub(super) fn richer_basis(&self) -> Option<Basis> {
+        let b = &self.model.as_ref()?.basis;
         if !b.body3 || b.degree_cap >= RECOVERY_DEGREE_CAP || self.degree_cap.is_some() {
             return None;
         }
@@ -457,7 +456,18 @@ impl SurrogateKs {
         let mut rich = Basis::new(&species);
         rich.degree_cap = RECOVERY_DEGREE_CAP;
         rich.body4 = b.body4;
+        rich.body4_degree = b.body4_degree;
         rich.r_cut = b.r_cut;
+        Some(rich)
+    }
+
+    /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
+    /// may still take it, the sample floor the richer basis would set and the environment keys it
+    /// would leave short — each key's own floor in that basis (M8a user-fix 3,
+    /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
+    fn richer_basis_floor(&self) -> Option<String> {
+        let rich = self.richer_basis()?;
+        let b = &self.model.as_ref()?.basis;
         let store = self.store.as_ref()?;
         let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
         let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
@@ -767,6 +777,11 @@ impl SurrogateKs {
         // R3-2: the checks judged near each blocker
         let mut judged_near: BTreeMap<usize, usize> = targets.iter().map(|&t| (t, 0)).collect();
         let mut deferred_near: BTreeMap<usize, usize> = BTreeMap::new();
+        // `geometry_refusal` below reads M's descriptors from the cache (the misfit fence), not
+        // once per check
+        if self.misfit_fence_stands() {
+            self.ensure_desc_cache();
+        }
         for h in holdouts {
             if h.unfit {
                 continue; // must not be trained on, not judged either

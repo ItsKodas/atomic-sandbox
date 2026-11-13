@@ -296,11 +296,14 @@ fn misspecified_fit_is_untrusted_by_its_training_residuals() {
     assert!(rep.n_samples >= rep.q_prime && rep.residual_dof_e >= MIN_RESIDUAL_DOF && rep.residual_dof_f >= MIN_RESIDUAL_DOF, "{rep:?}: the sample-count conditions pass; only the residuals can refuse");
     assert!(!s.trusted(), "the misspecified fit must not be trusted");
     assert!(tr.energy_per_atom > 3e-3, "{tr:?}: max training energy residual ≥ 3× energy_std_per_atom");
-    assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"), "{:?}", s.untrusted_reason());
+    // every sample is beyond its bound, so the misfit set is the whole store and the misfit row
+    // refuses (spec 2026-11-13 §4.3); the recovery's all-sample residuals fail
+    assert!(s.residuals_fail());
+    assert!(s.untrusted_reason().unwrap().contains("training samples the model cannot reproduce"), "{:?}", s.untrusted_reason());
     let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
     assert_eq!(r.stats.energy_surface(), Surface::Teacher);
-    assert!(r.stats.notes.iter().any(|n| n.contains("surrogate untrusted: max training energy residual")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.starts_with("surrogate untrusted: ") && n.contains("training samples the model cannot reproduce")), "{:?}", r.stats.notes);
     assert_eq!(calls(&h), 1);
     // the epistemic energy criterion alone (the floor N·s_E excluded, as the provider does)
     // would not have caught it at an in-window geometry: the point of the rule
@@ -887,7 +890,9 @@ fn thinning_keeps_one_in_ten_near_identical_fallbacks_and_every_far_one() {
     assert!(s.trusted());
     // untrusted by its residuals (an impossible energy threshold), not by its sample count
     s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
-    assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"));
+    // (every sample is then a misfit: the misfit row refuses, spec 2026-11-13 §4.3)
+    assert!(s.residuals_fail() && !s.trust_needs_samples());
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "{:?}", s.untrusted_reason());
     let n0 = s.samples();
     let mut copies = 0;
     for _ in 0..25 {
@@ -965,6 +970,819 @@ fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
     // Forget clears it
     s.forget();
     assert_eq!((s.quarantined(), s.superseded()), (0, 0));
+}
+
+/// Fourteen stray H₂ samples at distinct in-window bond lengths, the energy of the k-th off by
+/// `0.1 · 0.75^k` Ha (k = 0..13): each quarantine round names the few within a factor 2 of the
+/// worst, so the rounds reach the 10 % cap before they reach the last strays (measured on the
+/// 100-sample Morse store before the fix: 9 held, max residual still 3.7e-3 Ha/atom; at
+/// `0.2 · 0.75^k` the fit spreads the misfit over every sample and the rounds name none
+/// within the cap).
+fn graded_strays() -> Vec<(Scene, f64)> {
+    (0..14).map(|k| (dimer(1.25 + 0.9 * k as f64 / 13.0, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1), 0.1 * 0.75f64.powi(k))).collect()
+}
+
+/// Spec 2026-11-13 §4.2 (no ratchet): a trust recovery whose quarantine rounds cannot restore the
+/// training residuals within the 10 % cap holds nothing — before it, the samples the rounds named
+/// stayed held, and the next refit's rounds started from them (the collection's ratchet up to
+/// the cap). The fit that stands is the entry one, every sample in it; a second refit agrees.
+#[test]
+fn a_recovery_that_cannot_restore_trust_holds_nothing() {
+    let (mut s, _) = trained(1.2, 2.2, 100, FallbackPolicy::default());
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    for (sc, off) in graded_strays() {
+        let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+        bad.energy += off;
+        s.add_sample(bad, &sc).unwrap();
+    }
+    let rep = s.refit().unwrap();
+    // the entry fit's first round names these (the rounds' machinery engages on this store)
+    let named = s.worst_offenders().0.len();
+    println!(
+        "after the strays: {} samples fitted; holds the rounds left {}; the entry fit's first round names {named} (cap {:.1}); trusted {} {:?}; note {:?}",
+        rep.n_samples,
+        s.quarantined(),
+        QUARANTINE_MAX_FRACTION * s.samples() as f64,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    assert!(!s.trusted());
+    assert!(s.recoverable_fail(), "the fit still fails on its residuals");
+    assert!(named > 0, "the premise: the rounds have offenders to name");
+    assert_eq!(s.quarantined(), 0, "a failed recovery holds nothing");
+    assert!(s.recovery_note().unwrap().contains("recovery did not restore trust; no samples held"), "{:?}", s.recovery_note());
+    assert_eq!(rep.n_samples, 114, "the entry fit stands");
+    assert_eq!(s.refit().map(|r| r.n_samples).ok(), Some(114), "idempotent: every sample stays fitted");
+    assert_eq!(s.quarantined(), 0);
+}
+
+/// §4.2 in collection mode: a failed recovery writes no status record — the reopened
+/// collection's codes are those before the refit, its two pre-existing holds still held.
+#[test]
+fn a_failed_recovery_leaves_the_collection_codes_as_they_were() {
+    let dir = collection_root("no-ratchet");
+    let (mut s, _) = pair_student();
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let prov = s.provenance_for(&h2(1.4));
+    let mut notes = Vec::new();
+    let mut keep = |s: &mut SurrogateKs, sc: &Scene, off: f64| {
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &[1, 1]);
+        assert!(s.keep_sample(&pos, &[1, 1], e + off, &f, Some(0.0), Some(1), &prov, SampleTag::Scan, &mut notes), "{notes:?}");
+    };
+    let mut rng = StdRng::seed_from_u64(11);
+    for i in 0..100 {
+        keep(&mut s, &h2_at(1.2 + 1.0 * i as f64 / 99.0, &mut rng), 0.0);
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    // two strays held by an earlier refit, written to the collection
+    for (k, r) in [1.5, 1.9].into_iter().enumerate() {
+        keep(&mut s, &dimer(r, [0.0, 0.0, 1.0], [0.0; 3], 1, 1), 0.3);
+        s.quarantine.resize(s.samples(), Q_NONE);
+        s.quarantine[100 + k] = Q_HELD;
+    }
+    s.sync_collection_status();
+    assert_eq!(s.quarantined(), 2);
+    for (sc, off) in graded_strays() {
+        keep(&mut s, &sc, off);
+    }
+    let codes = s.collection().unwrap().quarantine.clone();
+    assert_eq!((codes.len(), codes.iter().filter(|&&q| q == Q_HELD).count()), (116, 2), "the premise");
+    let rep = s.refit().unwrap();
+    println!(
+        "after the strays: {} samples fitted; held {}; the entry fit's first round names {}; trusted {} {:?}; note {:?}",
+        rep.n_samples,
+        s.quarantined(),
+        s.worst_offenders().0.len(),
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    assert!(!s.trusted() && s.recoverable_fail(), "the premise: the recovery fails");
+    assert_eq!(s.quarantined(), 2, "the two earlier holds, nothing more");
+    assert!(s.recovery_note().unwrap().contains("recovery did not restore trust; no samples held"), "{:?}", s.recovery_note());
+    let key = prov.surface_key();
+    drop(s);
+    let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
+    assert_eq!(c.quarantine, codes, "no status record written");
+}
+
+// ---- Spec 2026-11-13 §4.3 (open-shell model Task 5): the misfit set M ----
+
+/// Adds an H₂ sample at bond length `r` whose energy is off by `off` Ha (the forces exact).
+fn add_stray(s: &mut SurrogateKs, r: f64, off: f64) {
+    let sc = dimer(r, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+    bad.energy += off;
+    s.add_sample(bad, &sc).unwrap();
+}
+
+/// "The Task 5 store": 120 good H₂ samples and three strays (+0.01 Ha, 5× the per-atom bound, at
+/// r = 1.55, 1.63, 1.71: indices 120–122), refitted without the trust recovery (`skip_recovery`),
+/// so M is the fit's own.
+fn task5_store() -> SurrogateKs {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.skip_recovery = true;
+    for r in [1.55, 1.63, 1.71] {
+        add_stray(&mut s, r, 0.01);
+    }
+    s.refit().unwrap();
+    s
+}
+
+/// §4.3: a few training samples the fit cannot reproduce leave the model trusted — they are counted
+/// (the `Misfit` row, against 10 % of the fitted samples) and the residual rows judge the rest;
+/// `training_residuals` still means every fitted sample.
+#[test]
+fn a_small_misfit_leaves_the_model_trusted() {
+    use sim::activity::TrustKey;
+    let s = task5_store();
+    let m = s.misfit().expect("a misfit record after the refit");
+    println!("M: samples {:?}; atoms {:?}; fitted {}; outside {:?}; all-sample {:?}", m.samples, m.atoms, m.fitted, m.outside, s.training_residuals());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    for i in [120, 121, 122] {
+        assert!(m.samples.contains(&i), "stray {i} in M: {:?}", m.samples);
+        assert!(m.atoms.contains(&(i, 0)) && m.atoms.contains(&(i, 1)), "an energy misfit blames every trained atom: {:?}", m.atoms);
+    }
+    let checks = s.trust_checks();
+    let row = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap_or_else(|| panic!("{k:?} row: {checks:?}")).clone();
+    let keys: Vec<TrustKey> = checks.iter().map(|c| c.key).collect();
+    let at = keys.iter().position(|&k| k == TrustKey::Misfit).unwrap();
+    assert_eq!(keys[at - 1], TrustKey::ForceResidual, "the misfit row follows the force residual row: {keys:?}");
+    let mis = row(TrustKey::Misfit);
+    println!("Misfit row: {} of {:.2} (fitted {}, store {})", mis.value, mis.limit, m.fitted, s.samples());
+    assert!(mis.met && mis.value == m.samples.len() as f64, "{mis:?}");
+    assert_eq!(mis.limit, QUARANTINE_MAX_FRACTION * m.fitted as f64, "10 % of the fitted samples");
+    let e = row(TrustKey::EnergyResidual);
+    assert!(e.met && e.value <= 1e-3, "the energy row judges the samples outside M: {e:?}");
+    assert_eq!(e.value, m.outside.energy_per_atom);
+    assert!(s.training_residuals().unwrap().energy_per_atom > 1e-3, "the all-sample residual keeps its meaning");
+    // where each row's value sits (trust-worst, merged 2026-11-14): the residual rows name a sample
+    // outside M (the one holding their value), the misfit row M's worst sample
+    let w = mis.worst.as_ref().expect("the misfit row names M's worst sample");
+    assert!(m.samples.contains(&w.id.index), "{w:?} in M {:?}", m.samples);
+    assert_eq!(Some(w.id), m.worst.map(|x| x.0));
+    let ew = e.worst.as_ref().expect("the energy row names where its value sits");
+    assert!(!m.samples.contains(&ew.id.index) && Some(ew.id) == m.outside.energy_at, "{ew:?} outside M");
+}
+
+/// §4.3: when M is more than 10 % of the fitted samples the model is untrusted by the misfit row,
+/// and its refusal counts M and names its scenes. 40 good + 6 equal strays (+0.1 Ha, distinct r):
+/// 6 > 4.6, so the quarantine rounds hold nothing (§4.2, Task 1) and the strays stay in M.
+#[test]
+fn a_large_misfit_untrusts_the_model() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    for k in 0..6 {
+        add_stray(&mut s, 1.3 + 0.15 * k as f64, 0.1);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().expect("a misfit record");
+    println!("M: {:?} of {} fitted; held {}; note {:?}; refusal {:?}", m.samples, m.fitted, s.quarantined(), s.recovery_note(), s.untrusted_check());
+    assert_eq!(s.quarantined(), 0, "the premise: the rounds held nothing");
+    assert!(!s.trusted());
+    let (key, text) = s.untrusted_check().unwrap();
+    assert_eq!(key, TrustKey::Misfit, "{text}");
+    assert!(text.contains("training samples the model cannot reproduce"), "{text}");
+    assert!(text.contains(&format!("{} ×", super::shared::formula(&[1, 1]))), "the scenes are named: {text}");
+    assert!(m.samples.len() >= 6 && (40..46).all(|i| m.samples.contains(&i)), "{:?}", m.samples);
+}
+
+/// The leave-one-out sums of the Task 5 store's pair class (every atom of its H₂ samples is a pair
+/// atom of the key H{H}), recomputed here over the fitted samples `which` selects: (Σ force ratio²,
+/// atoms, max force ratio, Σ energy ratio², energy samples, max energy ratio, Σ training force
+/// residual²/3) — the quantities `compute_class_loo_full` accumulates.
+fn pair_class_sums(s: &SurrogateKs, which: impl Fn(usize) -> bool) -> (f64, usize, f64, f64, usize, f64, f64) {
+    let model = s.model.as_ref().unwrap();
+    let mut out = (0.0, 0usize, 0.0f64, 0.0, 0usize, 0.0f64, 0.0);
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) || !which(i) {
+            continue;
+        }
+        let l = surrogate::loo::leave_one_out(model, smp).expect("a defined leave-one-out");
+        for (r, f) in l.forces.iter().zip(&smp.forces) {
+            let r = r.expect("every atom trained");
+            let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+            out.0 += (d / b) * (d / b);
+            out.1 += 1;
+            out.2 = out.2.max(d / b);
+        }
+        let n = smp.pos.len() as f64;
+        let e = l.energy.expect("the energy fitted");
+        let e = (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / s.policy.energy_std_per_atom;
+        out.3 += e * e;
+        out.4 += 1;
+        out.5 = out.5.max(e);
+        let (_, fm) = surrogate::energy_and_forces(model, &smp.pos, &smp.z).unwrap();
+        out.6 += fm.iter().zip(&smp.forces).map(|(a, b)| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)) / 3.0).sum::<f64>();
+    }
+    out
+}
+
+/// §4.3 as amended by the Task 7 physics review's C1 (the user's decision, 2026-11-13): M stays in
+/// the class rule's RMS terms and is left out of its max terms, its worst-sample and blocker
+/// readouts, n_k and ā_c. On the Task 5 store (three energy misfits) the pair class and its key
+/// H{H} carry the RMS over every fitted sample, M included — the energy RMS strictly above the one
+/// without M — and the maxima, sample counts and aleatoric level of the samples outside M; the
+/// class stays trusted (the uncalibrated rule reads the force RMS, which M's exact forces leave
+/// small, and the energy max outside M).
+#[test]
+fn the_class_rule_keeps_misfits_in_its_rms_only() {
+    let s = task5_store();
+    let m = s.misfit().unwrap().samples.clone();
+    println!("M {m:?}; pair class {:?}; worst {:?}; blockers {:?}", s.class_loo()[0], s.class_worst, s.class_blockers);
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.class_worst.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_worst);
+    assert!(s.class_blockers.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_blockers);
+    let all = pair_class_sums(&s, |_| true);
+    let out = pair_class_sums(&s, |i| !m.contains(&i));
+    let rms = |ss: f64, n: usize| (ss / n as f64).sqrt();
+    println!(
+        "force RMS with M {:.4} / without {:.4}; energy RMS with M {:.4} / without {:.4}; energy max with M {:.3} / without {:.3}",
+        rms(all.0, all.1),
+        rms(out.0, out.1),
+        rms(all.3, all.4),
+        rms(out.3, out.4),
+        all.5,
+        out.5
+    );
+    assert!(all.5 > 1.0 && out.5 <= 1.0, "the premise: M's energy LOO is beyond the tier, the rest within");
+    assert!(rms(all.3, all.4) > rms(out.3, out.4), "the premise: M raises the energy RMS");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1e-300);
+    let j = s.class_judge.as_ref().unwrap();
+    let c = &s.class_loo()[0];
+    for (what, st) in [("the pair class", j.stats[0]), ("the key H{H}", j.key_stats[&hk_pair()])] {
+        assert!(close(st.force_rms, rms(all.0, all.1)), "{what}: force RMS over every fitted sample, M included: {} vs {}", st.force_rms, rms(all.0, all.1));
+        assert!(close(st.energy_rms, rms(all.3, all.4)), "{what}: energy RMS over every fitted sample, M included: {} vs {}", st.energy_rms, rms(all.3, all.4));
+        assert!(close(st.force_max, out.2), "{what}: force max outside M: {} vs {}", st.force_max, out.2);
+        assert!(close(st.energy_max, out.5), "{what}: energy max outside M: {} vs {}", st.energy_max, out.5);
+        assert_eq!(st.samples, 120, "{what}: the samples outside M");
+    }
+    assert_eq!((c.force_rms, c.energy_rms, c.force_max, c.energy_max, c.samples), (j.stats[0].force_rms, j.stats[0].energy_rms, j.stats[0].force_max, j.stats[0].energy_max, j.stats[0].samples));
+    let sigma_f = s.report().unwrap().sigma_f;
+    let aleatoric = sigma_f.min((out.6 / out.1 as f64).sqrt());
+    println!("ā: judged {:.3e}; outside M {aleatoric:.3e}; with M {:.3e}; σ_f {sigma_f:.3e}", j.aleatoric[0], sigma_f.min((all.6 / all.1 as f64).sqrt()));
+    assert!(close(j.aleatoric[0], aleatoric), "ā_c over the samples outside M: {} vs {aleatoric}", j.aleatoric[0]);
+    // review fix 1: a key's sample count n_k leaves M out, its column floor q_k and the whole-model
+    // union do not (M is in the fit: a column only M touched would otherwise look spanned by
+    // data the fit cannot reproduce, and the floor would drop)
+    let j = s.class_judge.as_ref().unwrap();
+    let basis = &s.model.as_ref().unwrap().basis;
+    let fitted: Vec<(usize, &Sample)> = s.store().unwrap().samples.iter().enumerate().filter(|(i, _)| !s.excluded(*i)).collect();
+    let all = super::trust::key_column_counts(basis, fitted.iter().map(|&(_, x)| x));
+    let members = super::trust::key_column_counts(basis, fitted.iter().filter(|(i, _)| !m.contains(i)).map(|&(_, x)| x));
+    println!("key counts over every fitted sample {:?}, over the members {:?}; judged q_k {:?}", all.per_key, members.per_key, j.key_q);
+    assert!(!j.key_q.is_empty());
+    for (k, &q) in &j.key_q {
+        assert_eq!(q, all.per_key[k].1, "q_k over every fitted sample, M included: {k:?}");
+    }
+    for (k, st) in &j.key_stats {
+        assert_eq!(st.samples, members.per_key[k].0, "n_k over the members, M left out: {k:?}");
+    }
+    assert_eq!(j.key_stats[&hk_pair()].samples, 120, "the three strays are not the pair key's samples");
+    assert_eq!(j.fit_columns, all.union);
+}
+
+/// The key H{He} (the H of a HeH dimer, a pair atom).
+fn hk_h_he() -> surrogate::EnvKey {
+    surrogate::EnvKey { class: 1, z: 1, neighbours: vec![2] }
+}
+
+/// A store of two pair keys apart for C1 (open-shell Task 7b): 100 H₂ (the key H{H}) and
+/// `HEH_GOOD` HeH dimers (the keys H{He}, He{H}) on r ∈ [2.0, 3.4], all from the [`SpeciesMorse`]
+/// surface, plus `HEH_MISFITS` copies of one HeH geometry at r = 2.6 moved rigidly (the same
+/// descriptors) whose H force is off by ±`delta` Ha/Bohr along the bond, alternating — labels the
+/// fit cannot reproduce (it sits at their mean, the surface), so every copy is a force misfit while
+/// the fit elsewhere is untouched; the energies exact. Refitted without the trust recovery
+/// (`skip_recovery`), so M is the fit's own. Returns the store and, for the key H{He}: (the
+/// fraction f of its fitted atoms in M, the RMS r_M of their leave-one-out force ratios).
+fn heh_misfit_store(delta: f64) -> (SurrogateKs, f64, f64) {
+    heh_misfit_store_with(delta, 0.0)
+}
+
+/// [`heh_misfit_store`] with the misfit copies' energies off too, by ±`de` Ha alternating with the
+/// same sign as their force offset (Task 7c: `de` > 0 with `delta` = 0 makes them energy misfits,
+/// their forces exact). The good samples are the same (an offset of 0.0 is exact).
+fn heh_misfit_store_with(delta: f64, de: f64) -> (SurrogateKs, f64, f64) {
+    let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    s.skip_recovery = true;
+    let add = |s: &mut SurrogateKs, sc: &Scene, df: f64, de: f64| {
+        let (pos, z) = pos_z(sc);
+        let (e, mut f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let e = e + de;
+        let d: [f64; 3] = std::array::from_fn(|a| pos[1][a] - pos[0][a]);
+        let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        for a in 0..3 {
+            f[0][a] += df * d[a] / r;
+        }
+        s.add_sample(Sample { pos, z, energy: e, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, sc).unwrap();
+    };
+    let mut rng = StdRng::seed_from_u64(77);
+    for i in 0..100 {
+        add(&mut s, &h2_at(1.1 + 1.2 * i as f64 / 99.0, &mut rng), 0.0, 0.0);
+    }
+    for i in 0..HEH_GOOD {
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        add(&mut s, &dimer(2.0 + 1.4 * i as f64 / (HEH_GOOD - 1) as f64, unit_vector(&mut rng), origin, 1, 2), 0.0, 0.0);
+    }
+    for k in 0..HEH_MISFITS {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        add(&mut s, &dimer(2.6, [0.0, 0.0, 1.0], [0.1 * k as f64, 0.0, 0.0], 1, 2), sign * delta, sign * de);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap().samples.clone();
+    let model = s.model.as_ref().unwrap();
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    let (mut atoms, mut in_m, mut ss) = (0usize, 0usize, 0.0f64);
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) {
+            continue;
+        }
+        let keys = env_keys(&smp.pos, &smp.z, rc2);
+        for (j, k) in keys.iter().enumerate() {
+            if k.as_ref() != Some(&hk_h_he()) {
+                continue;
+            }
+            atoms += 1;
+            if m.contains(&i) {
+                in_m += 1;
+                let l = surrogate::loo::leave_one_out(model, smp).expect("a defined leave-one-out");
+                let (r, f) = (l.forces[j].unwrap(), smp.forces[j]);
+                let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], &f);
+                ss += (d / b) * (d / b);
+            }
+        }
+    }
+    let (f, r_m) = (in_m as f64 / atoms as f64, (ss / in_m.max(1) as f64).sqrt());
+    (s, f, r_m)
+}
+
+/// The good HeH dimers and the misfit copies of [`heh_misfit_store`].
+const HEH_GOOD: usize = 30;
+const HEH_MISFITS: usize = 2;
+
+/// C1 (Task 7 physics review): a key whose atoms are a fraction f in M at leave-one-out RMS ratio
+/// r_M has a class-rule force RMS R ≥ √f·r_M, so the uncalibrated rule (rms ≤ 1) refuses it when
+/// f·r_M² > 1 — here the key H{He}, its misfit H force 0.03 Ha/Bohr off. The H₂ key, far from it,
+/// is still trusted and the model is trusted: the misfit is local, and the class rule refuses
+/// exactly its key. (Before C1, M left out of the class rule entirely, H{He} stayed trusted.)
+#[test]
+fn a_gross_misfit_refuses_its_key() {
+    use sim::ClassKey;
+    let (s, f, r_m) = heh_misfit_store(0.03);
+    let m = s.misfit().unwrap();
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} of {} fitted; trusted {} {:?}; H{{He}}: f {f:.3}, r_M {r_m:.2}, f·r_M² {:.2}; judged {kst:?}; q_k {:?}", m.samples, m.fitted, s.trusted(), s.untrusted_reason(), f * r_m * r_m, j.key_q.get(&hk_h_he()));
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "the premise: the model is trusted: {:?}", s.untrusted_reason());
+    assert!(f * r_m * r_m > 1.0, "the premise: f·r_M² > 1");
+    assert!(kst.force_max <= 1.0, "the premise: the key's atoms outside M are within their bounds");
+    assert!(kst.force_rms >= f.sqrt() * r_m, "R ≥ √f·r_M: {} vs {}", kst.force_rms, f.sqrt() * r_m);
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    println!("the verdict of H{{He}}: {v:?}");
+    assert!(matches!(v.refusal, Some((ClassKey::Force, x, _)) if x > 1.0), "refused on its force RMS: {:?}", v.refusal);
+    // the class rule alone (not `NearMisfit`) at a HeH geometry away from the misfit copies (r =
+    // 3.2): refused by its key's verdict, not on the sample floor
+    let far_heh = dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2);
+    let (pos, z) = pos_z(&far_heh);
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc * rc));
+    println!("the class rule at HeH r = 3.2: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, false))), "refused by the class rule, not its sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+    let (pos, z) = pos_z(&h2(1.5));
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc * rc)).is_none(), "the H₂ key still answers");
+}
+
+/// C1: a mild misfit keeps its key — the key H{He} with f·r_M² well below ½ (its misfit H force
+/// 0.005 Ha/Bohr off: in M, its in-sample ratio 1.44) stays trusted by the class rule.
+#[test]
+fn a_mild_misfit_keeps_its_key() {
+    let (s, f, r_m) = heh_misfit_store(0.005);
+    let m = s.misfit().unwrap();
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} of {} fitted; trusted {}; H{{He}}: f {f:.3}, r_M {r_m:.2}, f·r_M² {:.3}; judged {kst:?}", m.samples, m.fitted, s.trusted(), f * r_m * r_m);
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(f * r_m * r_m < 0.25, "the premise: f·r_M² well below ½");
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    assert!(v.trusted, "{v:?}");
+    let (pos, z) = pos_z(&dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2));
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc * rc)).is_none(), "the class rule answers a HeH geometry");
+}
+
+/// Task 7c, the energy half of C1 (the user's decision, 2026-11-13: "Yes, add it"): a key whose
+/// energy LOO RMS, M included, is beyond the tier is refused — but only when M contributes to its
+/// energy sum. The key H{He} with its two misfit copies' energies off by ±0.02 Ha (their forces
+/// exact): energy misfits, f_E·r_E² > 1 over the key's energy samples, the force terms within their
+/// bounds. An unsampled HeH geometry is refused by the class rule on energy, with words saying the
+/// misfits are counted; the H₂ key still answers. (Before 7c, R_E,c decided no verdict.)
+#[test]
+fn a_gross_energy_misfit_refuses_its_key() {
+    let (s, _, _) = heh_misfit_store_with(0.0, 0.02);
+    let m = s.misfit().unwrap();
+    let model = s.model.as_ref().unwrap();
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    // f_E, r_E over the key's energy samples (every HeH sample holds one H{He} atom)
+    let (mut n_e, mut ss) = (0usize, 0.0f64);
+    let mut in_m = 0usize;
+    for (i, smp) in s.store().unwrap().samples.iter().enumerate() {
+        if s.excluded(i) || !env_keys(&smp.pos, &smp.z, rc2).contains(&Some(hk_h_he())) {
+            continue;
+        }
+        n_e += 1;
+        if m.samples.contains(&i) {
+            in_m += 1;
+            let e = surrogate::loo::leave_one_out(model, smp).and_then(|l| l.energy).expect("a defined energy leave-one-out");
+            let r = (if model.energy_per_atom { e.abs() } else { e.abs() / smp.pos.len() as f64 }) / s.policy.energy_std_per_atom;
+            ss += r * r;
+        }
+    }
+    let (f_e, r_e) = (in_m as f64 / n_e as f64, (ss / in_m.max(1) as f64).sqrt());
+    let j = s.class_judge.as_ref().unwrap();
+    let kst = j.key_stats[&hk_h_he()];
+    println!("M {:?} atoms {:?} of {} fitted; trusted {} {:?}; H{{He}}: f_E {f_e:.3}, r_E {r_e:.2}, f_E·r_E² {:.2}; judged {kst:?}", m.samples, m.atoms, m.fitted, s.trusted(), s.untrusted_reason(), f_e * r_e * r_e);
+    let n = s.samples();
+    assert!(m.samples == (n - HEH_MISFITS..n).collect::<Vec<_>>(), "the premise: M is exactly the misfit copies: {:?}", m.samples);
+    assert!(s.trusted(), "the premise: the model is trusted: {:?}", s.untrusted_reason());
+    assert!(f_e * r_e * r_e > 1.0, "the premise: f_E·r_E² > 1");
+    assert!(kst.force_rms <= 1.0 && kst.force_max <= 1.0, "the premise: the force rule does not decide: {kst:?}");
+    assert!(kst.energy_max <= 1.0 && kst.energy_rms > 1.0, "the premise: the energy max outside M is within the tier, the RMS with M beyond: {kst:?}");
+    let v = s.class_loo()[0].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned().expect("the key H{He} judged");
+    println!("the verdict of H{{He}}: {v:?}");
+    assert!(matches!(v.refusal, Some((sim::ClassKey::EnergyRms, x, l)) if x == kst.energy_rms && l == 1.0), "refused on its energy RMS: {v:?}");
+    assert_eq!(kst.energy_misfits, HEH_MISFITS, "the two misfit copies are the key's M energy samples");
+    let (pos, z) = pos_z(&dimer(3.2, [1.0, 0.0, 0.0], [0.0; 3], 1, 2));
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc2));
+    println!("the class rule at HeH r = 3.2: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    let Some((r, false)) = refused else { panic!("refused by the class rule, not its sample floor: {:?}", refused.map(|(r, s)| (r.text, s))) };
+    assert!(r.text.contains("energy error RMS") && r.text.contains("training samples the model cannot reproduce included"), "{}", r.text);
+    let (pos, z) = pos_z(&h2(1.5));
+    assert!(s.class_untrusted(&env_keys(&pos, &z, rc2)).is_none(), "the H₂ key still answers");
+}
+
+/// Task 7c's promise: with M empty the energy-RMS guard decides nothing. Built on the verdict
+/// function itself (a calibrated store whose key has an energy LOO RMS beyond 1 with M empty and is
+/// answered — 3+ audits of that key and an energy LOO beyond the tier with no misfit — is not
+/// practical to build from samples): in the calibrated path (20 audits at z = 1, W 0.33) a key
+/// with energy LOO RMS 3 and max 5 is answered exactly as before when no M sample counts
+/// (`energy_misfits` 0), and refused on `EnergyRms` at the bound 1 (no ENTER band) when one does;
+/// the uncalibrated path the same (RMS ≤ 1 with M passes; NaN with M fails). And on real stores
+/// with M empty — the 120-sample H₂ store, and the HeH store without offsets — no class or key
+/// counts an M energy sample, so no verdict there can read the guard.
+#[test]
+fn an_energy_rms_without_misfits_decides_nothing() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let mut ok = surrogate::AuditHistory::default();
+    for _ in 0..20 {
+        ok.push(history_point(PointKind::Audit, 2, 1, 1.0));
+    }
+    let cal = calibrate(&ok, &pol);
+    assert!(cal.per_class[0].calibrated() && !cal.per_class[1].calibrated(), "the premise: the pair class calibrated, the many-body not");
+    let st = ClassStats { samples: 100, force_rms: 0.4, force_max: 3.0, energy_rms: 3.0, energy_max: 5.0, energy_misfits: 0 };
+    for was in [false, true] {
+        assert_eq!(cal.class_verdict(0, &st, 29, was), ClassVerdict::Trusted, "calibrated, M empty: answered (was {was})");
+        match cal.class_verdict(0, &ClassStats { energy_misfits: 1, ..st }, 29, was) {
+            ClassVerdict::Untrusted { key, value, limit, reason } => {
+                assert_eq!((key, value, limit), (ClassKey::EnergyRms, 3.0, 1.0));
+                assert!(reason.contains("LOO energy error RMS 3.0× the tier (training samples the model cannot reproduce included)"), "{reason}");
+            }
+            v => panic!("calibrated, M contributing: refused, not {v:?}"),
+        }
+        // at the bound itself it passes (the limit is 1 in both paths, no ENTER band)
+        assert_eq!(cal.class_verdict(0, &ClassStats { energy_misfits: 1, energy_rms: 1.0, ..st }, 29, was), ClassVerdict::Trusted);
+        assert_eq!(cal.class_verdict(0, &ClassStats { energy_misfits: 1, energy_rms: 0.9, ..st }, 29, false), ClassVerdict::Trusted, "0.9 > ENTER still enters");
+    }
+    // uncalibrated (the many-body class): the rule of before decides; with M the RMS beyond 1 refuses
+    let un = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.8, energy_max: 0.9, energy_misfits: 0 };
+    assert_eq!(cal.class_verdict(1, &un, 29, false), ClassVerdict::Trusted);
+    assert_eq!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, ..un }, 29, false), ClassVerdict::Trusted, "RMS ≤ 1 with M passes");
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: 1.3, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::EnergyRms, .. }));
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: f64::NAN, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::EnergyRms, .. }), "NaN with M fails");
+    assert_eq!(cal.class_verdict(1, &ClassStats { energy_rms: f64::NAN, ..un }, 29, false), ClassVerdict::Trusted, "NaN without M: the rule of before (it reads no energy RMS)");
+    // the uncalibrated rule of before still decides first (the energy max)
+    assert!(matches!(cal.class_verdict(1, &ClassStats { energy_misfits: 2, energy_rms: 1.3, energy_max: 1.5, ..un }, 29, false), ClassVerdict::Untrusted { key: ClassKey::Energy, .. }));
+    // real stores with M empty: no M energy sample anywhere
+    let (h2_store, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let (heh, _, _) = heh_misfit_store_with(0.0, 0.0);
+    for s in [&h2_store, &heh] {
+        assert!(s.misfit().is_some_and(|m| m.samples.is_empty()), "the premise: M empty: {:?}", s.misfit());
+        let j = s.class_judge.as_ref().unwrap();
+        assert!(j.stats.iter().chain(j.key_stats.values()).all(|st| st.energy_misfits == 0), "{:?}", j.key_stats);
+        assert!(s.class_loo().iter().flat_map(|c| c.refusal.into_iter().chain(c.species.iter().filter_map(|v| v.refusal))).all(|(k, ..)| k != ClassKey::EnergyRms));
+    }
+}
+
+/// Review Focus 2: an environment key whose only samples are misfits has no samples of its own in
+/// the class statistics (n_k leaves M out; C1 keeps M in the RMS terms only) — the class rule
+/// refuses it on the sample floor. 120 good H₂ + three H₃
+/// samples the fit cannot reproduce (`skip_recovery`): one H₃ geometry, moved rigidly (the same
+/// descriptors), labelled +0.02, −0.02 and +0.02 Ha off — contradictory labels. (Three distinct
+/// H₃ geometries all +0.01 Ha off, the plan's store, are fitted: only they touch the many-body
+/// columns, which absorb the offset; measured M = [] on this store.)
+#[test]
+fn a_key_held_only_by_misfits_is_refused() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.skip_recovery = true;
+    let h3 = |k: usize| {
+        let o = [0.1 * k as f64, 0.0, 0.0];
+        let mut sc = dimer(1.45, [1.0, 0.0, 0.0], o, 1, 1);
+        sc.nuclei.push(Nucleus::new(1, [o[0] + 0.15, 1.8, 0.0]));
+        sc
+    };
+    for (k, off) in [0.02, -0.02, 0.02].into_iter().enumerate() {
+        let sc = h3(k);
+        let mut bad = pair_morse_sample(&sc);
+        bad.energy += off;
+        s.add_sample(bad, &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap();
+    println!("M {:?} of {} fitted; trusted {} {:?}", m.samples, m.fitted, s.trusted(), s.untrusted_reason());
+    assert!([120, 121, 122].iter().all(|i| m.samples.contains(i)), "the premise: the three H₃ samples are misfits: {:?}", m.samples);
+    let sc = h3(1);
+    let (pos, z) = pos_z(&sc);
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc * rc));
+    println!("the class rule at an H₃ geometry: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, true))), "refused on the sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+    // the member filter, not a small-sample floor: the many-body class (only the H₃ atoms are
+    // many-body) counts none of the three
+    assert_eq!(s.class_loo()[1].samples, 0, "{:?}", s.class_loo()[1]);
+}
+
+/// Review ruling 6 (fix round 2): a key's column floor q_k counts every fitted sample, M included —
+/// M is in the fit, so a column only M touches is set by data the fit cannot reproduce; only its
+/// sample count n_k leaves M out. The key: the middle H of He–H–He (many-body, neighbours {He}).
+/// Its members are symmetric linear He–H–He on a coordinate axis: the two He sit at ±d exactly, so
+/// every odd-l He channel of the middle atom cancels to 0.0 exactly and those body-3 columns are
+/// untouched. M is one bent He–H–He moved rigidly three times with contradictory labels (+0.02,
+/// −0.02, +0.02 Ha): its middle H touches the odd-l columns too. So q_k over every fitted sample
+/// is strictly above the members' count, and the members — enough for the members-only floor —
+/// are refused on the key's own sample floor.
+#[test]
+fn a_key_column_floor_counts_the_misfit_samples() {
+    // measured: q_k 29 over every fitted sample, 21 over the members (the odd-l (He, He) body-3
+    // columns) — 25 members sit between the two floors
+    const N: usize = 25;
+    let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    s.skip_recovery = true;
+    let add = |s: &mut SurrogateKs, pos: Vec<[f64; 3]>, off: f64| {
+        let z = vec![2, 1, 2];
+        let mut sc = h2(1.4);
+        sc.nuclei = pos.iter().zip(&z).map(|(&p, &zi)| Nucleus::new(zi, p)).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        s.add_sample(Sample { pos, z, energy: e + off, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc).unwrap();
+    };
+    for i in 0..N {
+        let d = 2.2 + 0.8 * i as f64 / (N - 1) as f64;
+        let mut u = [0.0; 3];
+        u[i % 3] = d;
+        add(&mut s, vec![u.map(|x| -x), [0.0; 3], u], 0.0);
+    }
+    let bent = |k: usize| {
+        let o = [0.1 * k as f64, 0.05 * k as f64, 0.0];
+        let t = 110f64.to_radians();
+        vec![[o[0] + 2.5, o[1], 0.0], o, [o[0] + 2.5 * t.cos(), o[1] + 2.5 * t.sin(), 0.0]]
+    };
+    for (k, off) in [0.02, -0.02, 0.02].into_iter().enumerate() {
+        add(&mut s, bent(k), off);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap().samples.clone();
+    let key = surrogate::EnvKey { class: 2, z: 1, neighbours: vec![2] };
+    let basis = &s.model.as_ref().unwrap().basis;
+    let fitted: Vec<(usize, &Sample)> = s.store().unwrap().samples.iter().enumerate().filter(|(i, _)| !s.excluded(*i)).collect();
+    let all = super::trust::key_column_counts(basis, fitted.iter().map(|&(_, x)| x));
+    let members = super::trust::key_column_counts(basis, fitted.iter().filter(|(i, _)| !m.contains(i)).map(|&(_, x)| x));
+    let (q_all, q_mem, n_mem) = (all.per_key[&key].1, members.per_key[&key].1, members.per_key[&key].0);
+    let v = s.class_loo()[1].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned();
+    println!("M {m:?}; key H{{He}}: q over every fitted sample {q_all}, over the members {q_mem}, members n_k {n_mem}; verdict {v:?}");
+    assert!([N, N + 1, N + 2].iter().all(|i| m.contains(i)), "the premise: the three bent samples are in M: {m:?}");
+    assert!(q_mem <= n_mem && n_mem < q_all, "the premise: enough members for the members-only floor, not for the all-fitted one");
+    let j = s.class_judge.as_ref().unwrap();
+    assert_eq!(j.key_q[&key], q_all, "q_k over every fitted sample, M included");
+    assert!(j.key_q[&key] > q_mem);
+    assert_eq!(j.key_stats[&key].samples, n_mem, "n_k over the members");
+    let refused = s.class_untrusted(&[Some(key.clone())]);
+    println!("the class rule for the key: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, true))), "refused on its sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+}
+
+/// Review Focus 1: a NaN residual is never a misfit — it stays with the samples the residual rows
+/// judge, and fails them (activity Task 3b), with M empty.
+#[test]
+fn a_nan_residual_is_not_a_misfit() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted());
+    poison_the_model(&mut s);
+    let (t, m) = s.compute_residuals().expect("a model and a store");
+    assert!(m.samples.is_empty() && m.atoms.is_empty(), "NaN ratios are not misfits: {m:?}");
+    assert_eq!(m.fitted, 120);
+    assert!(m.outside.energy_per_atom.is_nan() && m.outside.force.is_nan() && t.energy_per_atom.is_nan(), "{m:?} {t:?}");
+    (s.training_residuals, s.misfit) = (Some(t), Some(m));
+    assert!(!s.trusted());
+    let checks = s.trust_checks();
+    let first = checks.iter().find(|c| !c.met).unwrap();
+    assert!(matches!(first.key, TrustKey::EnergyResidual | TrustKey::ForceResidual) && first.value.is_nan(), "{checks:?}");
+    assert!(checks.iter().any(|c| c.key == TrustKey::Misfit && c.met && c.value == 0.0), "{checks:?}");
+}
+
+/// The Task 5 store ([`task5_store`]) for the `NearMisfit` tests, its teacher the surface the
+/// strays came from: the exact Morse with the strays' +0.01 Ha at r = 1.63 (a Gaussian bump of
+/// 0.01 Ha centred there, width 0.1 Bohr: flat at the centre, so the forces there are the Morse's).
+/// The precondition, asserted: at r = 1.63 the model's answer disagrees with the teacher's
+/// (`SurrogateKs::agree` false). The scenes are in the store's own 33³ cell (`cell`), not
+/// `in_big_cell`: the model's grid is 33³, and a 49³ scene is refused by rule 3 (other settings).
+///
+/// Not the exact Morse teacher of the plan: against it the model **agrees** at r = 1.63 (measured:
+/// 9.0e-5 Ha/atom off, the bound 1e-3 — the 120 good samples pin the fit, it moves 1.8e-4 Ha towards
+/// the three strays), and raising the strays' offset does not make it disagree while the model
+/// stays trusted (measured at 0.03 Ha: 7.4e-5 Ha/atom, still agreeing; at 0.1 Ha the whole fit moves,
+/// 2.9e-3 Ha/atom, every one of the 123 samples is in M and the model is untrusted by the misfit row,
+/// so rule 4 refuses before the misfit fence). A teacher whose answer there is the strays' own is the
+/// case the fence is for: a region whose labels the fit cannot reproduce.
+fn near_misfit_store() -> SurrogateKs {
+    let mut s = task5_store();
+    s.teacher = Box::new(Bumped { inner: MorseDimer::h2(), amp: 0.01, r0: 1.63, w: 0.1 });
+    let near = h2(1.63);
+    let (pos, z) = pos_z(&near);
+    let pred = s.model.as_ref().unwrap().predict(&pos, &z, false).unwrap();
+    let t = s.teacher.evaluate(&near, &mut never()).unwrap();
+    println!("r = 1.63: model {:.6} Ha, teacher {:.6} Ha (per atom {:.2e}); forces model {:?} teacher {:?}", pred.energy, t.energy, (pred.energy - t.energy).abs() / 2.0, pred.forces, t.forces);
+    assert!(s.trusted(), "the premise: the Task 5 store is trusted: {:?}", s.untrusted_reason());
+    assert!(!SurrogateKs::agree(&s.policy, 2, pred.energy, &pred.forces, t.energy, &t.forces), "the precondition: the model disagrees with the teacher at r = 1.63");
+    s
+}
+
+/// §4.3, per atom: an atom within the near-quarantine distance of a misfit atom refuses the
+/// geometry (`TeachRule::NearMisfit`, the teacher answers); a geometry far from M is the model's.
+#[test]
+fn a_geometry_near_a_misfit_is_refused_and_far_ones_answer() {
+    use sim::activity::TeachRule as R;
+    let mut s = near_misfit_store();
+    let near = h2(1.63);
+    let r = s.evaluate(&near, &mut never()).unwrap();
+    let ev = s.ledger.events.back().cloned().expect("an activity row");
+    println!("r = 1.63: {:?}; row {:?} {:?} atom {:?}: {}", r.stats.source, ev.rule, ev.outcome, ev.atom, ev.detail);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert_eq!(ev.rule, R::NearMisfit, "{}", ev.detail);
+    assert!(ev.atom.is_some(), "the refusal names the atom: {ev:?}");
+    let far = s.evaluate(&h2(2.1), &mut never()).unwrap();
+    assert_eq!(far.stats.source, Source::Surrogate, "{:?}", s.ledger.events.back());
+    let (pos, z) = pos_z(&near);
+    let g = s.geometry_refusal(&pos, &z);
+    assert_eq!(g.as_ref().map(|r| r.rule), Some(R::NearMisfit), "{g:?}");
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&near));
+    assert!(matches!(v, Err((R::NearMisfit, Some(_)))), "{v:?}");
+}
+
+/// §4.3, per atom: in a scene of an H₂ next to the misfit (r = 1.63) and an H₂ far from it (r = 2.1)
+/// beyond the 6 Bohr cutoff of each other, `atom_verdicts` refuses exactly the first pair's atoms with
+/// `NearMisfit` and not the geometry; `would_answer` refuses the scene (an atom is near).
+#[test]
+fn atom_verdicts_mark_exactly_the_atoms_near_a_misfit() {
+    use sim::activity::TeachRule as R;
+    let s = near_misfit_store();
+    // corner to corner of the store's 33³ cell (its grid is the model's: a 49³ scene is rule 3's),
+    // the two pairs' nearest atoms 8.8 Bohr apart
+    let mut sc = h2(1.63);
+    sc.nuclei = vec![
+        Nucleus::new(1, [-3.0, -3.0, -3.0]),
+        Nucleus::new(1, [-3.0 + 1.63, -3.0, -3.0]),
+        Nucleus::new(1, [3.0, 3.0, 3.0]),
+        Nucleus::new(1, [3.0 - 2.1, 3.0, 3.0]),
+    ];
+    let a = s.atom_verdicts(&sc).expect("atoms");
+    println!("atom verdicts {a:?}");
+    assert_eq!(a.geometry, None, "{a:?}");
+    assert_eq!(a.atoms[0..2], [Some(R::NearMisfit); 2], "{a:?}");
+    assert_eq!(a.atoms[2..4], [None, None], "{a:?}");
+    let (pos, z) = pos_z(&sc);
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+    assert!(matches!(v, Err((R::NearMisfit, Some(0 | 1)))), "{v:?}");
+    assert!(!a.answers());
+}
+
+/// §4.3, admission: a teacher answer next to a misfit takes the near-quarantine admission path —
+/// kept only when it agrees with the model, no fence vote. The teacher at r = 1.63 disagrees with
+/// the model ([`near_misfit_store`]): not kept (`MisfitDisagrees`), no vote, and twenty
+/// such steps then a refit leave M as it was. With the per-atom energy threshold at 1 Ha the
+/// model's answer agrees and the answer takes the normal path, thinned and deduplicated (review
+/// fix round 1, ruling 10: M does not lift on an agreeing answer as a quarantine fence does, so a
+/// parked scene would otherwise keep one per step) — at the stray's own geometry the answer is a
+/// copy of the stray, a new label next to it is kept, its repeat is a copy and a nearby label is
+/// thinned. (The threshold is set on the field, not through `set_policy`: that re-judges M against
+/// the new threshold and would empty it, and the test is of the admission next to a misfit.)
+#[test]
+fn an_answer_near_a_misfit_is_kept_only_if_it_agrees() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R};
+    let mut s = near_misfit_store();
+    let m0 = s.misfit().unwrap().samples.clone();
+    let n0 = s.samples();
+    let near = h2(1.63);
+    for k in 0..20 {
+        let r = s.evaluate(&near, &mut never()).unwrap();
+        let ev = s.ledger.events.back().cloned().expect("an activity row");
+        if k == 0 {
+            println!("row {:?} {:?}: {} / notes {:?}", ev.rule, ev.outcome, ev.detail, r.stats.notes);
+        }
+        assert_eq!((r.stats.source, ev.rule, ev.outcome), (Source::Fallback, R::NearMisfit, K::MisfitDisagrees), "step {k}: {}", ev.detail);
+        assert!(r.stats.notes.iter().any(|n| n.contains("next to a training sample the model cannot reproduce")), "{:?}", r.stats.notes);
+        assert_eq!(s.samples(), n0, "not kept");
+        assert!(s.fence_votes.is_empty() && s.vote_pending.is_empty(), "no fence vote");
+    }
+    s.refit().unwrap();
+    assert_eq!(s.misfit().unwrap().samples, m0, "M as it was");
+    s.policy.energy_std_per_atom = 1.0;
+    s.last_variance = None;
+    let agreeing = |s: &mut SurrogateKs, r: f64| {
+        let res = s.evaluate(&h2(r), &mut never()).unwrap();
+        let ev = s.ledger.events.back().cloned().expect("an activity row");
+        println!("agreeing at r = {r}: {:?} {:?}; notes {:?}", ev.rule, ev.outcome, res.stats.notes);
+        assert_eq!((res.stats.source, ev.rule), (Source::Fallback, R::NearMisfit), "{}", ev.detail);
+        (ev.outcome, res.stats.notes)
+    };
+    // the teacher's answer at the middle stray's own geometry is that stray's label: a copy
+    let (o, notes) = agreeing(&mut s, 1.63);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains("a copy of stored sample #121")), "{notes:?}");
+    assert_eq!(s.samples(), n0);
+    // a new label next to it agrees with the model and is kept
+    assert_eq!(agreeing(&mut s, 1.631).0, K::Kept);
+    assert_eq!(s.samples(), n0 + 1);
+    // review fix round 1 (ruling 10): M does not lift on an agreeing answer, so the same geometry
+    // again is not kept a second time (a copy, MUST-2) …
+    let (o, notes) = agreeing(&mut s, 1.631);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains(&format!("a copy of stored sample #{n0}"))), "{notes:?}");
+    // … and a nearby new label is thinned (one in THIN_EVERY is kept)
+    let (o, notes) = agreeing(&mut s, 1.632);
+    assert_eq!(o, K::Thinned);
+    assert!(notes.iter().any(|n| n.contains("training spreads from a stored one")), "{notes:?}");
+    assert_eq!(s.samples(), n0 + 1);
+}
+
+/// §4.3: a misfit fence lifts when the fit reproduces its samples — here by raising the per-atom
+/// energy threshold above the strays' offset (as `a_quarantined_sample_is_released_when_the_model_reproduces_it`
+/// does). `set_policy` lifts it: it re-judges M against the new threshold (M is empty right after
+/// it); the refit that follows recomputes M and keeps it empty, and r = 1.63 is the model's.
+#[test]
+fn a_misfit_fence_lifts_when_a_refit_fits_it() {
+    let mut s = near_misfit_store();
+    assert_eq!(s.evaluate(&h2(1.63), &mut never()).unwrap().stats.source, Source::Fallback, "the premise: fenced");
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-2, ..FallbackPolicy::default() });
+    let m = s.misfit().expect("a misfit record");
+    assert!(m.samples.is_empty() && m.atoms.is_empty() && s.misfit_fence().is_none(), "set_policy lifts the fence: {m:?}");
+    s.refit().unwrap();
+    let m = s.misfit().expect("a misfit record");
+    println!("threshold 1e-2: M {:?}; trusted {}", m.samples, s.trusted());
+    assert!(m.samples.is_empty() && m.atoms.is_empty(), "{m:?}");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let r = s.evaluate(&h2(1.63), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", s.ledger.events.back());
+}
+
+/// §4.3 with §4.2 (no ratchet): an M beyond its limit untrusts the model as a whole and fences
+/// nothing — with every answer near M refused and never kept (the model is not consulted under
+/// rule 4, so none can agree with it), the store could never grow the data a refit fits M with.
+/// The store of `a_large_misfit_untrusts_the_model` (40 good + 6 strays 0.1 Ha off): no atom is near
+/// a misfit, and the teacher's answer at a stray's geometry is refused by the misfit row (rule 4)
+/// and admitted as any untrusted model's answer is, not `MisfitDisagrees`.
+#[test]
+fn a_misfit_beyond_its_limit_fences_nothing() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R, TrustKey};
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    for k in 0..6 {
+        add_stray(&mut s, 1.3 + 0.15 * k as f64, 0.1);
+    }
+    s.refit().unwrap();
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::Misfit), "the premise");
+    assert!(s.misfit().is_some_and(|m| !m.atoms.is_empty()) && s.misfit_fence().is_none());
+    let sc = h2(1.45);
+    let (pos, z) = pos_z(&sc);
+    assert_eq!(s.near_misfit_atoms(&pos, &z), vec![false, false]);
+    assert!(s.geometry_refusal(&pos, &z).is_none_or(|r| r.rule != R::NearMisfit));
+    s.evaluate(&sc, &mut never()).unwrap();
+    let ev = s.ledger.events.back().cloned().unwrap();
+    println!("r = 1.45: {:?} {:?}: {}", ev.rule, ev.outcome, ev.detail);
+    assert_eq!(ev.rule, R::Untrusted(TrustKey::Misfit));
+    assert_ne!(ev.outcome, K::MisfitDisagrees);
 }
 
 /// A long-range Morse teacher (a = 0.3: at R = 8 the pair still binds by 4.4e-2 Ha, while
@@ -1719,11 +2537,30 @@ fn box_affected_samples_never_fence_and_leave_the_fit_at_the_trust_floor() {
         }
     };
     // 40 clean samples: below the floor (29 + 30), the confined ones stay in the fit; the
-    // residuals fail but none of them may be quarantined
+    // residuals fail but none of them may be quarantined (since spec 2026-11-13 §4.3 the three
+    // are the misfit set, 3 ≤ 4.3: the model is trusted with them in the fit)
     add(&mut s, 40);
     s.refit().unwrap();
-    println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded());
-    assert!(!s.trusted() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+    println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}, M {:?}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded(), s.misfit().map(|m| &m.samples));
+    assert!(s.residuals_fail() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let n_m = s.misfit().map_or(0, |m| m.samples.len());
+    assert!(s.misfit().is_some_and(|m| (0..3).all(|i| m.samples.contains(&i))), "{:?}", s.misfit());
+    // the recovery restored nothing, but the refit ends trusted: the note says what stays (review fix 2)
+    assert_eq!(
+        s.recovery_note(),
+        Some(format!("recovery did not restore the training residuals; no samples held; {n_m} samples the model cannot reproduce stay in the fit").as_str()),
+        "{:?}",
+        s.recovery_note()
+    );
+    // a policy change re-judges the note with the verdict it produces (review fix round 2)
+    let p = s.policy;
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..p });
+    assert!(!s.trusted());
+    assert_eq!(s.recovery_note(), Some("recovery did not restore trust; no samples held"));
+    s.set_policy(p);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.recovery_note().is_some_and(|n| n.starts_with("recovery did not restore the training residuals; no samples held; ")), "{:?}", s.recovery_note());
     // 30 more: the floor is met without them — they leave the fit, never quarantined
     add(&mut s, 30);
     let rep = s.refit().unwrap();
@@ -4265,9 +5102,11 @@ fn the_first_unmet_trust_check_is_the_refusal() {
     assert_eq!(first_unmet(&s), key(&s));
     assert!(matches!(key(&s), Some(TrustKey::ResidualDofE | TrustKey::ResidualDofF)), "{:?}", s.untrusted_reason());
     // training residuals (the misspecified fit of `misspecified_fit_is_untrusted_by_its_training_residuals`)
+    // (every sample is beyond its bound: the misfit row, spec 2026-11-13 §4.3)
     let (s, _) = trained_oscillatory(1.2, 2.2, 120, 0.02, 6.0);
     assert_eq!(first_unmet(&s), key(&s));
-    assert!(matches!(key(&s), Some(TrustKey::EnergyResidual | TrustKey::ForceResidual)), "{:?}", s.untrusted_reason());
+    assert_eq!(key(&s), Some(TrustKey::Misfit), "{:?}", s.untrusted_reason());
+    assert!(s.residuals_fail());
     // a failed audit, on the energy and on the forces
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     s.audit_failed = Some(0.5);
@@ -4298,11 +5137,22 @@ fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
     let tier = s.policy.energy_std_per_atom;
     s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF;
     s.training_residuals.as_mut().unwrap().energy_per_atom = tier;
+    // the residual rows read the samples outside M (spec 2026-11-13 §4.3)
+    s.misfit.as_mut().unwrap().outside.energy_per_atom = tier;
+    // |M| at its limit: 12 of 120 fitted
+    s.misfit.as_mut().unwrap().fitted = 120;
+    s.misfit.as_mut().unwrap().samples = (0..12).collect();
     let checks = s.trust_checks();
     let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
-    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "at the limit: {checks:?}");
+    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual) && met(TrustKey::Misfit), "at the limit: {checks:?}");
     assert_eq!(s.untrusted_check(), None);
     assert!(s.trusted());
+    // one over the misfit limit: unmet, and the refusal names the same key
+    s.misfit.as_mut().unwrap().samples = (0..13).collect();
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::Misfit));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::Misfit));
+    assert!(!s.trusted());
+    s.misfit.as_mut().unwrap().samples = (0..12).collect();
     // NaN: unmet, and the refusal names the same key
     s.report.as_mut().unwrap().residual_dof_e = f64::NAN;
     assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
@@ -4501,6 +5351,10 @@ fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
             }
             t
         });
+        // the residual rows read the samples outside M (spec 2026-11-13 §4.3): here M is empty, so
+        // they judge every fitted sample as the pre-Task-3 rule did (the misfit row's own
+        // decisions: `the_trust_checks_and_the_refusal_agree_at_equality_and_nan`)
+        s.misfit = s.training_residuals.map(|t| Misfit { samples: Vec::new(), atoms: Vec::new(), outside: t, fitted: report.n_samples, worst: None });
         s.audit_failed = rng.gen_bool(0.3).then(|| around(&mut rng, s.policy.energy_std_per_atom) * if rng.gen_bool(0.5) { -1.0 } else { 3.0 });
         s.audit_force = rng.gen_bool(0.4).then(|| (around(&mut rng, 2e-3), 2e-3));
         s.audit_atoms = rng.gen_range(0..4);
@@ -4603,7 +5457,8 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                     assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
-                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window => unreachable!("the uncalibrated rule never names the calibrated verdict"),
+                // `EnergyRms` is `calibrate::verdict`'s (open-shell Task 7c), never `class_refusal`'s
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
@@ -4670,12 +5525,28 @@ fn a_nan_in_any_trust_input_refuses_trust() {
     let (base, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(base.trusted());
     type Poke = fn(&mut SurrogateKs);
-    let cases: [(&str, Poke, TrustKey); 6] = [
+    // the residual rows read the samples outside M (spec 2026-11-13 §4.3): each residual poke
+    // sets the all-sample field and the same field of `misfit.outside`
+    let cases: [(&str, Poke, TrustKey); 7] = [
         ("residual_dof_e", |s| s.report.as_mut().unwrap().residual_dof_e = f64::NAN, TrustKey::ResidualDofE),
         ("residual_dof_f", |s| s.report.as_mut().unwrap().residual_dof_f = f64::NAN, TrustKey::ResidualDofF),
-        ("energy residual", |s| s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN, TrustKey::EnergyResidual),
-        ("force residual", |s| s.training_residuals.as_mut().unwrap().force = f64::NAN, TrustKey::ForceResidual),
-        ("force bound", |s| s.training_residuals.as_mut().unwrap().force_bound = f64::NAN, TrustKey::ForceResidual),
+        ("energy residual", |s| {
+            s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.energy_per_atom = f64::NAN;
+        }, TrustKey::EnergyResidual),
+        ("force residual", |s| {
+            s.training_residuals.as_mut().unwrap().force = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.force = f64::NAN;
+        }, TrustKey::ForceResidual),
+        ("force bound", |s| {
+            s.training_residuals.as_mut().unwrap().force_bound = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.force_bound = f64::NAN;
+        }, TrustKey::ForceResidual),
+        // |M| is a count (never NaN): one over its limit refuses with the misfit row
+        ("misfit count", |s| {
+            let m = s.misfit.as_mut().unwrap();
+            m.samples = (0..(QUARANTINE_MAX_FRACTION * m.fitted as f64).floor() as usize + 1).collect();
+        }, TrustKey::Misfit),
         ("σ_f", |s| s.report.as_mut().unwrap().sigma_f = f64::NAN, TrustKey::ForceNoise),
     ];
     for (name, poke, key) in cases {
@@ -4714,9 +5585,9 @@ fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.trusted() && s.class_loo()[0].trusted);
     poison_the_model(&mut s);
-    let t = s.compute_training_residuals().expect("a model and a store");
+    let (t, m) = s.compute_residuals().expect("a model and a store");
     assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
-    s.training_residuals = Some(t);
+    (s.training_residuals, s.misfit) = (Some(t), Some(m));
     assert!(!s.trusted());
     let classes = s.compute_class_loo_full().0.unwrap().0;
     let pair = &classes[0];
@@ -5257,7 +6128,7 @@ fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     s.accumulator = Some(acc);
     s.model = Some(model);
     s.report = Some(report);
-    s.training_residuals = s.compute_training_residuals();
+    (s.training_residuals, s.misfit) = s.compute_residuals().unzip();
     s.class_loo = s.compute_class_loo_full().0.map(|l| l.0).unwrap_or_default();
     s.rebuild_active_set();
     eprintln!(
@@ -6299,8 +7170,11 @@ fn dimers_and_a_tight_triangle(n: usize) -> SurrogateKs {
 /// model is short of samples (50 < Q′ 51; one dimer fewer and the cap-6 residuals fail too, one more and
 /// it is trusted) — the old rule kept exactly that. Now the retry is not kept: the cap stays 4.
 /// Ranked by their training residual (before 2026-11-12) the quarantine could not take the triangle
-/// out within its 10 % cap on this small store (the misfit spread over the dimers names more than 5)
-/// and the model reported the residual that actually fails; ranked by the leave-one-out ratio
+/// out within its 10 % cap on this small store (the misfit spread over the dimers names more than 5):
+/// it holds nothing, the all-sample residuals still fail, the counts hold, and since the open-shell
+/// merge the model ends untrusted on the misfit row (`TrustKey::Misfit`: the samples the residual
+/// rows judged before are in M, more of them than its 10 % limit) — before the merge it reported
+/// the training energy residual; ranked by the leave-one-out ratio
 /// (spec 2026-11-12 R1) the triangle is named alone, held, and the cap-4 fit without it is trusted —
 /// both pinned. On the 80-dimer store, where cap 6 leaves enough samples, the retry is kept and the
 /// model trusted.
@@ -6320,7 +7194,11 @@ fn a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery() {
     old.refit().unwrap();
     println!("training ranking: cap {:?}, trusted {} {:?}, quarantined {}", old.degree_cap, old.trusted(), old.untrusted_reason(), old.quarantined());
     assert_eq!(old.degree_cap, None, "the cap-6 retry is not kept");
-    assert!(old.untrusted_reason().is_some_and(|r| r.contains("training energy residual")), "the reason that is true: {:?}", old.untrusted_reason());
+    // (the cap-4 fit's misfit spreads over the store: the recovery holds nothing — no ratchet —
+    // and the refusal is the misfit row, spec 2026-11-13 §4.2–4.3; adapted at the open-shell merge
+    // from main's "training energy residual", the row M's samples no longer reach)
+    assert!(old.residuals_fail() && !old.trust_needs_samples() && old.quarantined() == 0, "{:?}", old.recovery_note());
+    assert_eq!(old.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "the reason that is true: {:?}", old.untrusted_reason());
     // the leave-one-out ranking: the triangle alone, then trusted at cap 4
     let mut s = dimers_and_a_tight_triangle(N_DIMERS);
     s.refit().unwrap();
@@ -6837,8 +7715,9 @@ fn kabsch_recovers_a_rotation() {
 
 /// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
 /// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
-/// follow has its blockers refused as structural ("the model cannot represent it"), and nothing
-/// is started for them.
+/// follow offers nothing and starts nothing: since spec 2026-11-13 §4.3 its samples (in-sample
+/// beyond their bounds) are the misfit set, never a class's blocker (C1: M is in the class RMS
+/// terms only), so they are offered to no teach-around.
 #[test]
 fn teach_diagnosis_separates_leverage_from_structure() {
     let (s, _h) = tail_blocked();
@@ -6854,25 +7733,18 @@ fn teach_diagnosis_separates_leverage_from_structure() {
     for (i, _, ins, _) in &o.refused {
         assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
     }
-    // structure: the basis cannot follow 12 extrema on 1 Bohr
+    // structure: the basis cannot follow 12 extrema on 1 Bohr. Every sample is beyond its bound
+    // in-sample, so it is in the misfit set and never a blocker (spec 2026-11-13 §4.3, C1): no
+    // blocker is offered (before §4.3 they were listed refused as "cannot represent")
     let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
     let d = m.teach_diagnosis();
-    let structural = d.iter().filter(|b| !b.teachable()).count();
-    println!("Morse + sinusoid: {} blockers, {structural} structural; worst {:?}", d.len(), d.first());
-    assert!(structural > 0, "{d:?}");
-    let o = m.teach_offer().expect("an offer naming the refused blockers");
-    for (i, _, ins, why) in &o.refused {
-        if *ins > 1.0 {
-            assert!(why.contains("cannot represent"), "#{i}: {why}");
-        }
-    }
-    for b in &o.blockers {
-        assert!(b.3 <= 1.0, "an offered blocker is a leverage one: {b:?}");
-    }
-    if o.blockers.is_empty() {
-        let e = m.start_teach(&h2(1.6)).unwrap_err();
-        assert!(e.starts_with("nothing to teach"), "{e}");
-    }
+    println!("Morse + sinusoid: {} blockers; M {:?}", d.len(), m.misfit().map(|x| x.samples.len()));
+    assert!(m.misfit().is_some_and(|x| x.samples.len() == 40), "{:?}", m.misfit());
+    assert!(d.is_empty(), "{d:?}");
+    let o = m.teach_offer();
+    assert!(o.as_ref().is_none_or(|o| o.blockers.is_empty()), "nothing offered: {o:?}");
+    let e = m.start_teach(&h2(1.6)).unwrap_err();
+    assert!(e.starts_with("nothing to teach") || e.starts_with("no environment class is blocked"), "{e}");
     // hand-made verdicts
     assert!(teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 0.9 }.teachable());
     assert!(!teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 1.1 }.teachable());
@@ -7052,8 +7924,9 @@ fn a_cancelled_teach_round_is_not_spent() {
 /// sampled (out to 5.4 Bohr) the fit matches the forces and shifts every energy by the tail value
 /// (all residuals +1.9× the energy tier per atom, measured), so the pass is not accepted, both
 /// held-out checks fail (failed audits of origin "teach check", kept with their samples' indices),
-/// the outcome and the reason say so, and the next offer
-/// refuses #60 as structural ("the model cannot represent it") instead of a second round.
+/// the outcome and the reason say so, and no second round is offered. Since spec 2026-11-13 §4.3
+/// every sample is then in the misfit set (the reason: "N training samples the model cannot
+/// reproduce"), never a class's blocker, so no blocker is left to refuse as structural.
 #[test]
 fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     let (mut s, _h) = tail_blocked();
@@ -7062,17 +7935,20 @@ fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
     println!("{outcome}");
     assert!(outcome.contains(": not accepted"), "{outcome}");
-    assert!(outcome.contains("cannot represent it"), "{outcome}");
+    // (since spec 2026-11-13 §4.3 the structure is told by the misfit row below: every sample is in
+    // M, so the class keeps no member and no class line says "cannot represent it")
     assert!(outcome.contains("2 off, so the model is untrusted until it predicts those geometries"), "{outcome}");
     assert!(!s.trusted());
     assert!(s.failed_audits.iter().all(|c| c.origin == AuditOrigin::TeachCheck && c.index.is_some()), "failed checks keep their samples' indices");
-    assert!(outcome.contains("– the model as a whole: untrusted — max training energy residual"), "the first unmet trust condition, named: {outcome}");
-    let o = s.teach_offer().expect("the offer names the refused blocker");
-    println!("{} refused (listed {}): {:?}", o.refused_total, o.refused.len(), o.refused);
-    assert!(o.blockers.is_empty(), "no second round on a structural class: {o:?}");
-    assert!(o.refused.len() <= TEACH_MAX_BLOCKERS && o.refused_total >= o.refused.len());
-    assert!(o.refused.iter().all(|r| r.2 > 1.0 && r.3.contains("cannot represent")), "{o:?}");
-    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+    // every residual is beyond the tier: the whole store is the misfit set (spec 2026-11-13 §4.3),
+    // named as the first unmet condition, and never a class's blocker — no blocker is
+    // offered (before §4.3 the offer listed them refused as "cannot represent")
+    assert!(outcome.contains("– the model as a whole: untrusted — ") && outcome.contains("training samples the model cannot reproduce"), "the first unmet trust condition, named: {outcome}");
+    let o = s.teach_offer();
+    println!("the offer after the round: {o:?}");
+    assert!(o.as_ref().is_none_or(|o| o.blockers.is_empty()), "no second round on a structural class: {o:?}");
+    let e = s.start_teach(&in_big_cell(h2(1.6))).unwrap_err();
+    assert!(e.starts_with("nothing to teach") || e.starts_with("no environment class is blocked"), "{e}");
 }
 
 /// `DynCommand::StartTeaching` through the driver (the app's "Teach around N blockers"): the
@@ -7619,13 +8495,14 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
         assert_eq!(*e, d, "atom {j}");
     }
     // every code is distinct and named
-    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment];
+    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment, TeachRule::NearMisfit];
     let codes: std::collections::BTreeSet<u8> = rules.iter().map(|&r| history_rule_code(r)).collect();
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
-    // 22 is the capped segment's (M8a Task 10); the next code is unnamed
-    assert_eq!(history_rule_name(23), "?");
+    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3); the
+    // next code is unnamed
+    assert_eq!(history_rule_name(24), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -7769,7 +8646,7 @@ fn calibration_widens_when_audits_disagree() {
     use sim::ClassKey;
     use surrogate::history::PointKind;
     let pol = FallbackPolicy::default();
-    let class = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.2, energy_max: 0.6 };
+    let class = ClassStats { samples: 100, force_rms: 0.4, force_max: 0.9, energy_rms: 0.2, energy_max: 0.6, energy_misfits: 0 };
     let mut h = surrogate::AuditHistory::default();
     for _ in 0..20 {
         h.push(history_point(PointKind::Audit, 2, 1, 3.0));
@@ -7836,7 +8713,7 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
         calibrate(&h, &pol)
     };
     let z_for = |w: f64| w / (w_of(1.0) * infl); // z such that W_inflated = w
-    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0 };
+    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0, energy_misfits: 0 };
     let inside = audits(z_for(0.85));
     assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9, "{:?}", inside.per_class[0]);
     assert_eq!(inside.class_verdict(0, &st, 29, true), ClassVerdict::Trusted, "stays");
@@ -8134,7 +9011,7 @@ fn evidence_ages_by_model_generation_both_ways() {
     let pol = FallbackPolicy::default();
     let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
     let at = |p: surrogate::AuditPoint, gen: u64| surrogate::AuditPoint { model_gen: gen, ..p };
-    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 0.5 };
+    let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 0.5, energy_misfits: 0 };
     let z_bad = 1.46 / w_of(1.0);
     let mut h = surrogate::AuditHistory::default();
     for _ in 0..8 {
@@ -8698,6 +9575,202 @@ fn collection_mode_learns_across_scenes() {
     for want in ["70 samples", "He (Z 2)", "H–He", "H2He: 30 samples, grid 41³", "H2: 40 samples, grid 33³"] {
         assert!(readme.contains(want), "README lacks '{want}':\n{readme}");
     }
+}
+
+// ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----
+
+/// A provider learning into a collection of its own under `dir`, with the H and He references of
+/// the 33³ box.
+fn d4_student(dir: &CollectionRoot) -> SurrogateKs {
+    let (mut s, _) = pair_student();
+    s.attach_collection(dir, &h2(1.4)).unwrap();
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    s.set_reference_solved(2, SpeciesMorse::atom(2), 33, Some(0.0));
+    s
+}
+
+/// A random cluster of the species `z` near the origin: each atom 1.3–2.6 Bohr from a random
+/// earlier one.
+fn d4_cluster(z: &[u8], rng: &mut StdRng) -> Vec<[f64; 3]> {
+    let mut pos = vec![[rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)]];
+    while pos.len() < z.len() {
+        let from = pos[rng.gen_range(0..pos.len())];
+        let (u, r) = (unit_vector(rng), rng.gen_range(1.3..2.6));
+        let p: [f64; 3] = std::array::from_fn(|k| from[k] + r * u[k]);
+        let near = pos.iter().all(|q| (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f64>() >= 1.2 * 1.2);
+        if near && p.iter().all(|x| x.abs() < 2.8) {
+            pos.push(p);
+        }
+    }
+    pos
+}
+
+/// Keeps teacher answers of random clusters, their species cycling through `kinds`, until the
+/// store holds `total` samples.
+fn d4_keep(s: &mut SurrogateKs, kinds: &[&[u8]], total: usize, rng: &mut StdRng) {
+    let prov = s.provenance_for(&h2(1.4));
+    let mut notes = Vec::new();
+    for i in s.samples()..total {
+        let z = kinds[i % kinds.len()];
+        let pos = d4_cluster(z, rng);
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, z);
+        assert!(s.keep_sample(&pos, z, e, &f, Some(0.0), Some(1), &prov, SampleTag::Scan, &mut notes), "{notes:?}");
+    }
+}
+
+/// The species of `s`'s store.
+fn d4_species(s: &SurrogateKs) -> Vec<u8> {
+    let mut sp: Vec<u8> = s.store.as_ref().unwrap().samples.iter().flat_map(|x| x.z.iter().copied()).collect();
+    sp.sort_unstable();
+    sp.dedup();
+    sp
+}
+
+/// The basis a fit of `s`'s store builds (`fit_basis`) at body-4 degree `d`.
+fn basis_at(s: &SurrogateKs, d: usize) -> Basis {
+    let mut b = s.fit_basis(&d4_species(s));
+    b.body4_degree = d;
+    b
+}
+
+/// The species mix of the body-4 degree tests: S = 2 (H, He), whose floors at D₄ = 2 and 3 are
+/// 284 and 468 columns — room for f₂ + 30 ≤ n < f₃ (H alone: 38 and 52, none).
+const D4_KINDS: [&[u8]; 5] = [&[1, 1], &[1, 1, 1], &[1, 1, 2], &[1, 2], &[1, 1, 2, 2]];
+
+/// Spec 2026-11-13 §4.1 with controller ruling 4: a collection's refit picks the highest body-4
+/// degree whose trust floor — the `Samples` floor f_d (the columns the fitted atoms touch at that
+/// degree) plus `MIN_RESIDUAL_DOF` — its fitted samples meet: 2 below f₃ + 30, also between f₃ and
+/// f₃ + 30 (where a D₄ = 3 fit would be short of residual degrees of freedom; the D₄ = 2 fit there
+/// is trusted), 3 from f₃ + 30, and 2 again when one sample is held back below it.
+#[test]
+fn a_collection_steps_its_body4_degree_up_when_the_samples_meet_the_floor() {
+    let dir = collection_root("d4-grow");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(3);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let (f2, f3) = (s.fit_floor(&basis_at(&s, 2)), s.fit_floor(&basis_at(&s, 3)));
+    println!("floors at 50 samples: D₄ = 2: {f2}, D₄ = 3: {f3}");
+    assert!(f2 < f3, "{f2} vs {f3}");
+    assert!(f2 + 30 < f3, "room between the floors: {f2} vs {f3}");
+    // f₂ + 30 ≤ n < f₃: degree 2
+    d4_keep(&mut s, &D4_KINDS, f2 + 30, &mut rng);
+    assert_eq!((s.fit_floor(&basis_at(&s, 2)), s.fit_floor(&basis_at(&s, 3))), (f2, f3), "the floors hold");
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(s.body4_degree(), Some(2));
+    assert_eq!(s.model().unwrap().basis.body4_degree, 2);
+    assert_eq!(s.basis().unwrap().body4_degree, 2, "the accumulator's basis too");
+    assert_eq!(rep.q_prime, basis_at(&s, 2).n_independent_columns());
+    // f₃ ≤ n < f₃ + 30: still degree 2, and trusted there
+    d4_keep(&mut s, &D4_KINDS, f3 + 15, &mut rng);
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(rep.n_samples, f3 + 15);
+    assert_eq!(s.body4_degree(), Some(2), "f₃ met, f₃ + MIN_RESIDUAL_DOF not");
+    assert_eq!(rep.q_prime, basis_at(&s, 2).n_independent_columns());
+    assert!(s.trusted(), "the D₄ = 2 fit between the floors stands trusted: {:?}", s.untrusted_reason());
+    // n ≥ f₃ + 30: degree 3
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    let rep = s.refit().unwrap();
+    println!("{} samples: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", s.samples(), rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (3, 3));
+    assert_eq!(rep.q_prime, basis_at(&s, 3).n_independent_columns());
+    // one sample held back below f₃ + 30 (a superseded code, written to the collection): degree 2 again
+    let n = s.samples();
+    let hold = n - (f3 + 29);
+    s.quarantine.resize(n, Q_NONE);
+    for q in &mut s.quarantine[n - hold..] {
+        *q = Q_SUPERSEDED;
+    }
+    s.sync_collection_status();
+    let rep = s.refit().unwrap();
+    println!("{hold} held: fit on {}, Q′ {}, D₄ {:?}; trusted {} {:?}", rep.n_samples, rep.q_prime, s.body4_degree(), s.trusted(), s.untrusted_reason());
+    assert!(rep.n_samples < f3 + 30, "{} fitted", rep.n_samples);
+    assert_eq!(s.body4_degree(), Some(2));
+    assert_eq!((s.model().unwrap().basis.body4_degree, s.basis().unwrap().body4_degree), (2, 2));
+}
+
+/// Spec 2026-11-13 §4.1 (task review fix 1): the trust recovery's richer basis the teach-around
+/// readout counts its per-key floors in (`richer_basis_floor`) keeps the standing body-4 degree —
+/// D₄ = min(6, 3) = 3 for a collection standing at 3, not the start's 2.
+#[test]
+fn the_richer_basis_keeps_the_standing_body4_degree() {
+    let dir = collection_root("d4-richer");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(7);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(3);
+    s.refit().unwrap();
+    assert_eq!(s.body4_degree(), Some(3), "the premise");
+    let rich = s.richer_basis().expect("the standing body-3 basis is below the recovery's degree");
+    assert_eq!((rich.degree_cap, rich.body4, rich.body4_degree, rich.body4_cap()), (RECOVERY_DEGREE_CAP, true, 3, 3));
+    let mut want = basis_at(&s, 3);
+    want.degree_cap = RECOVERY_DEGREE_CAP;
+    assert_eq!(rich, want, "the cap-6 basis at the standing degree");
+}
+
+/// Spec 2026-11-13 §4.1: a per-scene model's basis is `Basis::new`'s as before (no body-4, the
+/// start degree it never uses), and it has no body-4 degree to show.
+#[test]
+fn a_per_scene_model_keeps_its_basis() {
+    let (s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let mut want = Basis::new(&[1]);
+    if let Some(d) = s.degree_cap.filter(|_| want.body3) {
+        want.degree_cap = d;
+    }
+    let b = &s.model().unwrap().basis;
+    assert_eq!(*b, want);
+    assert!(!b.body4);
+    assert_eq!(b.body4_degree, surrogate::BODY4_DEGREE_START);
+    assert_eq!(s.body4_degree(), None);
+    assert_eq!(s.body4_degree, surrogate::BODY4_DEGREE_START);
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).body4_degree, None);
+}
+
+/// Spec 2026-11-13 §4.1, old files: a fitted model file written at D₄ = 2 loads and answers at 2
+/// (no refit, no refusal). A model file is a per-scene model (`install_sidecar` lets a collection
+/// go), so its own next refit is per scene — no body-4 block; the collection whose degree-2 fit
+/// it was steps up to 3 at its next refit, its store meeting f₃.
+#[test]
+fn a_loaded_degree_2_model_steps_up_at_its_next_refit() {
+    let dir = collection_root("d4-loaded");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(5);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(2);
+    s.refit().unwrap();
+    s.body4_force = None;
+    assert_eq!(s.body4_degree(), Some(2), "the premise: a degree-2 fit of a store that meets f₃");
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).body4_degree, Some(2), "the status carries it");
+    // a collection writes no model file (`save_sidecar`): the fit, written as `save_sidecar` writes one
+    let path = std::env::temp_dir().join(format!("as-d4-loaded-{}.model", std::process::id()));
+    surrogate::sidecar::write_full(&path, s.model().unwrap(), s.accumulator().unwrap(), s.report(), &s.store.as_ref().unwrap().samples, Some(surrogate::sidecar::REFERENCE_RULE), &[], &[], None).unwrap();
+    let sc = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((sc.model.basis.body4, sc.model.basis.body4_degree), (true, 2), "the file's own degree");
+    let (mut t, _) = pair_student();
+    t.install_sidecar(sc).unwrap();
+    assert_eq!(t.body4_degree(), Some(2));
+    assert_eq!(t.body4_degree, 2);
+    assert_eq!(t.basis().unwrap().body4_degree, 2);
+    // it answers as the saved model did
+    let pos = d4_cluster(&[1, 1, 2], &mut rng);
+    let (a, b) = (s.model().unwrap().predict(&pos, &[1, 1, 2], true).unwrap(), t.model().unwrap().predict(&pos, &[1, 1, 2], true).unwrap());
+    assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+    assert_eq!(a.forces, b.forces);
+    // its own next refit is per scene: the basis without body-4, at the start degree
+    t.refit().unwrap();
+    assert_eq!(t.body4_degree(), None);
+    assert_eq!((t.basis().unwrap().body4, t.basis().unwrap().body4_degree), (false, surrogate::BODY4_DEGREE_START));
+    // the collection's degree-2 fit steps up at its next refit
+    s.refit().unwrap();
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!(s.model().unwrap().basis.body4_degree, 3);
 }
 
 /// A collection reopened by a new provider rebuilds the same fit from what it stored: samples,
@@ -9498,7 +10571,10 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
         r.rmse_force,
         s.untrusted_reason()
     );
-    assert!(!s.trusted() && s.untrusted_reason().is_some_and(|w| w.contains("training energy residual")), "the premise: {:?}", s.untrusted_reason());
+    // (spec 2026-11-13 §4.3: the capped fit's misfit spreads over 568 samples, so its refusal is the
+    // misfit row; the recovery acts on the all-sample residuals, which fail)
+    assert!(!s.trusted() && s.untrusted_check().is_some_and(|(k, _)| k == sim::activity::TrustKey::Misfit), "the premise: {:?}", s.untrusted_reason());
+    assert!(s.residuals_fail(), "the premise: the all-sample training residuals fail");
     assert!(s.training_offenders().0.len() as f64 > QUARANTINE_MAX_FRACTION * 578.0, "the premise: the capped fit names no offender within the cap");
     // the next refit recovers
     let rep = s.refit().unwrap();
@@ -9572,7 +10648,7 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     let h3 = || Some(vec![(1u8, vec![1u8]); 3]);
     let water = || Some(vec![(8u8, vec![1u8]), (1, vec![1, 8]), (1, vec![1, 8])]);
     let key = |z: u8, nb: &[u8]| surrogate::EnvKey { class: 2, z, neighbours: nb.to_vec() };
-    let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49 };
+    let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49, energy_misfits: 0 };
     let mut h = surrogate::AuditHistory::default();
     h.push(three_body_point(416, 5.66, h3()));
     for g in 0..81u64 {
@@ -10195,6 +11271,7 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
 mod refit_cost;
+mod residual_diag;
 
 /// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).
 mod lone;

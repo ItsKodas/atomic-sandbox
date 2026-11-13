@@ -9,7 +9,7 @@ use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, source_tip,
 };
 use crate::scene::model_path;
-use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
+use crate::sim::{last_fit_line, source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
 use egui::{Color32, RichText, Ui};
 use sim::SamplingPlan;
 
@@ -788,7 +788,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         ui.end_row();
         ui.label("last fit");
         match m.fit {
-            Some((n, q, e, f)) => ui.monospace(format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr")),
+            Some(fit) => ui.monospace(last_fit_line(fit, m.body4_degree)),
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();

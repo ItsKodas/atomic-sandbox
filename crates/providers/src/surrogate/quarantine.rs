@@ -125,6 +125,13 @@ pub(super) fn origin_word(tag: SampleTag) -> &'static str {
 /// Never quarantine more than this fraction of the store.
 pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
+/// The note of a trust recovery that restored nothing and left the model untrusted (spec
+/// 2026-11-13 §4.2; [`SurrogateKs::settle_recovery_note`] rewords it when the refit ends trusted).
+const RECOVERY_FAILED_NOTE: &str = "recovery did not restore trust; no samples held";
+/// The settled note's head when the refit ends trusted (followed by "{n} samples the model cannot
+/// reproduce stay in the fit").
+const RECOVERY_SETTLED_NOTE: &str = "recovery did not restore the training residuals; no samples held;";
+
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
 /// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
 #[derive(Clone)]
@@ -574,8 +581,17 @@ impl SurrogateKs {
     /// Ruling S15 (`surrogate` module doc, "Trust recovery"): the degree-cap retry, then quarantine rounds;
     /// and (M8a user-test fix) a cap an earlier recovery set is re-judged against the default basis.
     /// Returns the report of the fit that stands; a failed attempt restores the previous fit.
+    ///
+    /// No ratchet (spec 2026-11-13 §4.2): the recovery ends with `!recoverable_fail()` or with the
+    /// store's fit, quarantine codes, `degree_cap` and `species_dirty` exactly as on entry — a
+    /// recovery that cannot restore the training residuals holds nothing (before it, the samples
+    /// its rounds named stayed held and the next refit's rounds started from them, up to the 10 %
+    /// cap), so the collection gets no status record from it either (`sync_collection_status`
+    /// finds no code changed). The entry report is returned, the note says so.
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
         let body3 = self.basis().is_some_and(|b| b.body3);
+        // the state on entry: what a recovery that does not restore the residuals returns to
+        let (entry_state, entry_flags, entry_dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
         // 1. the bent-molecule setting
         let cap = self.basis().map(|b| (b.body3, b.degree_cap));
         if let Some((true, d)) = cap.filter(|_| self.degree_cap.is_none()) {
@@ -599,8 +615,8 @@ impl SurrogateKs {
         // 1b. a cap set by an earlier recovery is not kept for good (M8a user-test fix, module doc
         // "Trust recovery"): when the capped fit fails, the default basis is tried as step 1 tried
         // the cap — kept if it alone restores the residuals with the trust rule's counts
-        let entry = self.degree_cap.filter(|_| body3).map(|_| (self.save_state(), self.quarantine.clone(), self.species_dirty));
-        if entry.is_some() {
+        let recapped = body3 && self.degree_cap.is_some();
+        if recapped {
             let saved = self.save_state();
             self.degree_cap = None;
             self.species_dirty = true;
@@ -614,23 +630,28 @@ impl SurrogateKs {
                 _ => self.restore_state(saved),
             }
         }
-        // 2. quarantine the worst offenders on the standing basis, round by round
+        // 2. quarantine the worst offenders on the standing basis, round by round (the
+        // leave-one-out ranking first, the training-residual ranking its fallback: spec
+        // 2026-11-12 R1, option A)
         let before = self.quarantined();
-        let (report, worst, ranking) = self.quarantine_rounds(report);
+        // step 3's start (the state on entry: step 1 does not run under a cap, 1b restored its own)
+        let pre_rounds = recapped.then(|| self.save_state());
+        let (rounds, worst, ranking) = self.quarantine_rounds(report.clone());
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
         // stands only if it recovers (the trust rule, its counts included), else step 2's result
-        // does. Run whenever step 2's result is **not recovered** (fix round 2, I1, the
+        // does when it passes the residuals, else the entry state (no ratchet, below). Run
+        // whenever step 2's result is **not recovered** (sample-recovery fix round 2, I1, the
         // coordinator's ruling) — not only while its residuals or noise fail: a step-2 result that
         // passes its residuals but is short of samples (Q′ grows with the cap) must not suppress
         // the default-basis retry, or option A's leave-one-out-first order could be worse than
         // the ranking before it
-        if let Some((saved, flags, dirty)) = entry.filter(|_| !self.recovered()) {
-            let capped = (self.save_state(), self.quarantine.clone(), report.clone(), self.species_dirty, self.recovery.clone());
+        if let Some(saved) = pre_rounds.filter(|_| !self.recovered()) {
+            let capped = (self.save_state(), self.quarantine.clone(), rounds.clone(), self.species_dirty, self.recovery.clone());
             self.restore_state(saved);
-            self.quarantine = flags;
-            self.species_dirty = dirty;
+            self.quarantine = entry_flags.clone();
+            self.species_dirty = entry_dirty;
             let entry_held = self.quarantined();
             self.degree_cap = None;
             self.species_dirty = true;
@@ -649,15 +670,46 @@ impl SurrogateKs {
             self.quarantine = q;
             self.species_dirty = d;
             self.recovery = note;
-            return self.note_quarantined(before, rep, worst, ranking);
+            if !self.recoverable_fail() {
+                return self.note_quarantined(before, rep, worst, ranking);
+            }
+        } else if !self.recoverable_fail() {
+            return self.note_quarantined(before, rounds, worst, ranking);
         }
-        self.note_quarantined(before, report, worst, ranking)
+        // no step restored the residuals (step 2 by both rankings, and step 3 when it ran): back
+        // to the state on entry (no ratchet, spec 2026-11-13 §4.2) — the codes (a forgotten
+        // sample's code 7 among them, untouched: the recovery never writes it), the degree cap and
+        // the fit; whatever still fails is the misfit set M of the entry fit (`trust` module doc)
+        self.restore_state(entry_state);
+        self.quarantine = entry_flags;
+        self.species_dirty = entry_dirty;
+        self.recovery = Some(RECOVERY_FAILED_NOTE.into());
+        report
     }
 
     /// The trust recovery's verdict on a fit (steps 1, 1b, 3 and the rankings' fallback): the
     /// training residuals and the noise pass, and the trust rule's counts hold.
     fn recovered(&self) -> bool {
         !self.recoverable_fail() && !self.trust_needs_samples()
+    }
+
+    /// The failed recovery's note once the refit's verdict is known (spec 2026-11-13 §4.3): a refit
+    /// that ends trusted — its misfit set within its limit — did not restore the training
+    /// residuals, but it did not fail trust either, so the note says what stays in the fit; one
+    /// that ends untrusted keeps [`RECOVERY_FAILED_NOTE`]. Called by `refit` where the trust
+    /// verdict and M of the fit that stands are both final, and by `set_policy` after it re-judged
+    /// them (either way: a policy change can untrust a settled fit or trust a failed one).
+    pub(super) fn settle_recovery_note(&mut self) {
+        let failed = self.recovery.as_deref().is_some_and(|r| r == RECOVERY_FAILED_NOTE || r.starts_with(RECOVERY_SETTLED_NOTE));
+        if !failed {
+            return;
+        }
+        self.recovery = Some(if self.trusted() {
+            let n = self.misfit.as_ref().map_or(0, |m| m.samples.len());
+            format!("{RECOVERY_SETTLED_NOTE} {n} samples the model cannot reproduce stay in the fit")
+        } else {
+            RECOVERY_FAILED_NOTE.into()
+        });
     }
 
     /// Steps 2 and 3 of [`recover_trust`](Self::recover_trust): the quarantine rounds (spec R1, fix
@@ -667,13 +719,16 @@ impl SurrogateKs {
     /// state of this call is restored — the fit, the quarantine codes, `species_dirty`, the note —
     /// and the rounds run again by the **training residual** ([`training_offenders`](Self::training_offenders),
     /// the ranking before 2026-11-12). Their result stands only if it recovers; else the
-    /// leave-one-out result does (a misfit stays untrusted either way). So the recovery is never
-    /// worse than the training ranking's and keeps the leave-one-out ranking's wins, for up to
-    /// [`QUARANTINE_ROUNDS`] more fits on a refit that is failing anyway (with step 3 gated on
-    /// "not recovered", fix round 2). Measured: the stuck-H collection's step 3 needs the fallback
-    /// (leave-one-out 47 held, 1.60×; training 38 held, trusted), a high-leverage outlier the
-    /// first (`tests/recovery_loo.rs`). Returns the report that stands, what its rounds held
-    /// ([`Held`]) and the ranking whose result stands.
+    /// leave-one-out result does — unless it fails the residuals and the training result passes
+    /// them (the open-shell merge, 2026-11-14): `recover_trust` keeps a result that is not
+    /// recovered only when it passes the residuals and noise (no ratchet, spec 2026-11-13 §4.2),
+    /// so preferring the failing one would discard a result the ranking before R1 kept. So the
+    /// recovery is never worse than the training ranking's and keeps the leave-one-out ranking's
+    /// wins, for up to [`QUARANTINE_ROUNDS`] more fits on a refit that is failing anyway (with
+    /// step 3 gated on "not recovered", fix round 2). Measured: the stuck-H collection's step 3
+    /// needs the fallback (leave-one-out 47 held, 1.60×; training 38 held, trusted), a
+    /// high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report that stands,
+    /// what its rounds held ([`Held`]) and the ranking whose result stands.
     pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
         // tests: the training ranking alone, the recovery before spec R1
         #[cfg(test)]
@@ -686,6 +741,7 @@ impl SurrogateKs {
         if self.recovered() {
             return (r, w, Ranking::LeaveOneOut);
         }
+        let loo_fails = self.recoverable_fail();
         let loo = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone(), r, w);
         let (state, flags, dirty, note, report) = entry;
         self.restore_state(state);
@@ -693,7 +749,7 @@ impl SurrogateKs {
         self.species_dirty = dirty;
         self.recovery = note;
         let (r, w) = self.rounds_by(report, Ranking::Training);
-        if self.recovered() {
+        if self.recovered() || (loo_fails && !self.recoverable_fail()) {
             return (r, w, Ranking::Training);
         }
         let (state, flags, dirty, note, r, w) = loo;
@@ -917,6 +973,67 @@ impl SurrogateKs {
         self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
+    /// [`near_misfit_atoms`](Self::near_misfit_atoms) after filling the descriptor cache while M
+    /// has misfit atoms (`ensure_desc_cache`): the step's path (`evaluate`, the audit's judgement),
+    /// which would otherwise describe M's samples afresh at every call.
+    pub(super) fn near_misfit(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
+        if self.misfit_fence_stands() {
+            self.ensure_desc_cache();
+        }
+        self.near_misfit_atoms(pos, z)
+    }
+
+    /// Whether the misfit fence stands (`misfit_fence`: M has misfit atoms, within its limit).
+    pub(super) fn misfit_fence_stands(&self) -> bool {
+        self.misfit_fence().is_some()
+    }
+
+    /// Which query atoms are **near a misfit** (spec 2026-11-13 §4.3; `trust` module doc, "M, the
+    /// misfit set"): one entry per atom of (`pos`, `z`), true when the atom's descriptor is within
+    /// the near-quarantine distance (`QUARANTINE_FRACTION × max_descriptor_distance` training
+    /// spreads, [`spread_distance`] — the per-atom distance the quarantine fence is built from) of a
+    /// misfit atom of its species ([`Misfit::atoms`]). Per atom, not the worst atom: the DFT
+    /// solvers refuse a geometry when **any** atom is near, `atom_verdicts` refuses exactly those.
+    /// Read-only: the misfit atoms are read from the descriptor cache when it covers the model's
+    /// basis (`ensure_desc_cache`), else described on the fly, as
+    /// [`quarantine_distances_cached`](Self::quarantine_distances_cached) does — the same numbers
+    /// either way. All false without a misfit fence (`misfit_fence`: no misfit atom, or M beyond
+    /// its limit — the model is then untrusted as a whole; described nothing), a model or an
+    /// envelope. As in the quarantine fence, a query or misfit sample that cannot be described
+    /// and a NaN envelope unit read as "far" (unreachable for known species on a finite fit).
+    pub(super) fn near_misfit_atoms(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<bool> {
+        let none = vec![false; pos.len()];
+        let Some(m) = self.misfit_fence() else { return none };
+        let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return none };
+        let basis = &model.basis;
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return none };
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        // the misfit atoms as (species index, descriptor), each sample described once
+        let mut targets: Vec<(usize, &[f64])> = Vec::with_capacity(m.atoms.len());
+        let mut owned: Vec<(usize, Vec<(usize, Vec<f64>)>)> = Vec::new();
+        for &i in &m.samples {
+            if !(cached && self.desc_cache.get(i).is_some()) {
+                if let Some(s) = store.samples.get(i) {
+                    owned.push((i, describe_sample(basis, s)));
+                }
+            }
+        }
+        for &(i, j) in &m.atoms {
+            let atoms: Option<&[(usize, Vec<f64>)]> = match self.desc_cache.get(i).filter(|_| cached) {
+                Some(a) => Some(a),
+                None => owned.iter().find(|(k, _)| *k == i).map(|(_, a)| &a[..]),
+            };
+            if let Some((s, d)) = atoms.and_then(|a| a.get(j)) {
+                targets.push((*s, d));
+            }
+        }
+        sp.iter()
+            .zip(&desc)
+            .map(|(qs, qd)| targets.iter().any(|(s, d)| s == qs && spread_distance(env, *s, qd, d) <= limit))
+            .collect()
+    }
+
     /// The recovery's offenders (spec R1, since 2026-11-12): the fitted samples (not excluded — at
     /// the fit or since — and not box-affected) whose **leave-one-out ratio** ([`loo_ratio`]: how far the fit *without* the
     /// sample misses it — the per-atom energy over its threshold or the worst atom's force over
@@ -1132,7 +1249,8 @@ impl SurrogateKs {
     /// Whether a teacher answer becomes a training sample (`surrogate` module doc: box-affected answers,
     /// quarantined neighbourhoods, thinning); when not, the reason goes to `notes`. `model` is the
     /// model's answer at the geometry when it was consulted; `near` the quarantined samples
-    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies. The
+    /// fencing it; `near_misfit` whether an atom is near a misfit (`near_misfit_atoms`); `keep`
+    /// the rule's own verdict; `thin` whether thinning applies. The
     /// [`Admission`] carries the verdict (`kept`) and which branch gave it (`outcome`, activity
     /// spec A3) — each return below is one branch; the outcome is read off it, never decides.
     #[allow(clippy::too_many_arguments)]
@@ -1145,6 +1263,7 @@ impl SurrogateKs {
         face: Option<f64>,
         model: Option<(f64, &[[f64; 3]])>,
         near: &[usize],
+        near_misfit: bool,
         keep: bool,
         thin: bool,
         dedup: bool,
@@ -1267,6 +1386,20 @@ impl SurrogateKs {
                     if kept_forgotten > 0 { format!(", {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back)") } else { String::new() }
                 ));
                 return yes(TeachOutcome::KeptReleased { released, superseded });
+            }
+        }
+        // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3): the
+        // near-quarantine admission without its votes — kept (on the normal path below) only when
+        // it agrees with the model, so a region the model cannot fit stays refused without a parked
+        // scene growing M; it is learned when a later refit fits M's samples
+        if near_misfit {
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            if !agrees {
+                notes.push(match model {
+                    Some(_) => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the teacher disagrees with the model there (a later refit at more samples or a higher body-4 degree may fit it)".into(),
+                    None => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the model was not consulted here (a later refit at more samples or a higher body-4 degree may fit it)".into(),
+                });
+                return no(TeachOutcome::MisfitDisagrees);
             }
         }
         // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are

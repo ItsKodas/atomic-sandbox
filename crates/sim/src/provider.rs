@@ -1232,6 +1232,9 @@ pub struct TrainableStatus {
     pub epoch: u64,
     /// The last fit: (samples, Q′, rmse E per atom, rmse F).
     pub fit: Option<(usize, usize, f64, f64)>,
+    /// The standing model's body-4 degree D₄ (a shared collection's basis, grown with its samples:
+    /// `providers::surrogate`, spec 2026-11-13 §4.1); `None` without body-4 (per scene) or a model.
+    pub body4_degree: Option<usize>,
     /// Worst training residuals: (energy per atom, force, that atom's force bound).
     pub residuals: Option<(f64, f64, f64)>,
     /// The per-component force bound at the smallest force of `status`'s `forces` (Ha/Bohr).
@@ -1520,6 +1523,12 @@ pub enum ClassKey {
     /// The uncalibrated rule: the leave-one-out per-atom energy error's max as a ratio to the tier
     /// (limit 1).
     Energy,
+    /// Both paths (open-shell model Task 7c, the user's decision 2026-11-13): the leave-one-out
+    /// per-atom energy error's RMS over the class's or key's energy samples, the training samples
+    /// the model cannot reproduce (the misfit set M) included, as a ratio to the tier (limit 1).
+    /// Judged only when an M sample contributes to that energy sum, so with M empty it never
+    /// decides.
+    EnergyRms,
     /// The calibrated verdict, decided by the DFT-measured force error (`ClassLoo::measured`, in
     /// bound units) against its limit (`ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to stay).
     Calibrated,
