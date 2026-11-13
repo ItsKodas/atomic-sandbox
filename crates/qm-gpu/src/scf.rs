@@ -381,7 +381,8 @@ pub(crate) struct DisplayWork<'a> {
 
 /// What a Harris display solve borrows from the solver (`GpuSolver::harris_work`, module doc "Display
 /// access"): no state of the SCF's, only its stateless machinery — kernels, reducer, the Poisson solver
-/// (and its tolerance) and the LOBPCG work space (`None` when no vector is asked for).
+/// (and its tolerance) and the LOBPCG work space with its size (the Harris solve grows it as its block
+/// grows; the SCF re-creates it only when it needs more than `work_k`).
 pub(crate) struct HarrisWork<'a> {
     pub ctx: &'a GpuContext,
     pub k: &'a Kernels,
@@ -390,7 +391,8 @@ pub(crate) struct HarrisWork<'a> {
     pub grid: &'a qm::Grid,
     pub poisson: &'a mut GpuPoisson,
     pub poisson_tol: f64,
-    pub work: Option<&'a mut LobpcgWork>,
+    pub work: &'a mut Option<LobpcgWork>,
+    pub work_k: &'a mut usize,
 }
 
 /// A pool of padded fields reused across solves (never shrinks). Every consumer overwrites the
@@ -1279,16 +1281,12 @@ impl GpuSolver {
 
     /// What a Harris display solve borrows (module doc, "Display access"; `crate::harris`): the
     /// kernels, the reducer, the Poisson solver at this solver's `poisson_tol`, and this solver's
-    /// `LobpcgWork` grown to at least `k` vectors (`None` for `k` = 0). No converged state is needed
-    /// and none of the SCF's state (warm start, parked densities, the ionic cache, the pool) is lent.
-    pub(crate) fn harris_work(&mut self, k: usize) -> HarrisWork<'_> {
+    /// `LobpcgWork` slot with its size (grown by the Harris solve as its block needs). No converged
+    /// state is needed and none of the SCF's state (warm start, parked densities, the ionic cache,
+    /// the pool) is lent.
+    pub(crate) fn harris_work(&mut self) -> HarrisWork<'_> {
         let GpuSolver { ctx, k: kernels, r, g, grid, poisson, work, work_k, poisson_tol, .. } = self;
-        if k > 0 && (work.is_none() || *work_k < k) {
-            *work = Some(LobpcgWork::new(ctx, g, k));
-            *work_k = k;
-        }
-        let work = if k > 0 { work.as_mut() } else { None };
-        HarrisWork { ctx, k: kernels, r, g, grid, poisson, poisson_tol: *poisson_tol, work }
+        HarrisWork { ctx, k: kernels, r, g, grid, poisson, poisson_tol: *poisson_tol, work, work_k }
     }
 
     /// The vectors the LOBPCG work space holds now (tests: the display solve grows it).
