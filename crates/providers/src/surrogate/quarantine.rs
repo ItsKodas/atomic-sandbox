@@ -83,6 +83,9 @@ pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 /// The note of a trust recovery that restored nothing and left the model untrusted (spec
 /// 2026-11-13 §4.2; [`SurrogateKs::settle_recovery_note`] rewords it when the refit ends trusted).
 const RECOVERY_FAILED_NOTE: &str = "recovery did not restore trust; no samples held";
+/// The settled note's head when the refit ends trusted (followed by "{n} samples the model cannot
+/// reproduce stay in the fit").
+const RECOVERY_SETTLED_NOTE: &str = "recovery did not restore the training residuals; no samples held;";
 
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
 /// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
@@ -397,12 +400,19 @@ impl SurrogateKs {
     /// that ends trusted — its misfit set within its limit — did not restore the training
     /// residuals, but it did not fail trust either, so the note says what stays in the fit; one
     /// that ends untrusted keeps [`RECOVERY_FAILED_NOTE`]. Called by `refit` where the trust
-    /// verdict and M of the fit that stands are both final.
+    /// verdict and M of the fit that stands are both final, and by `set_policy` after it re-judged
+    /// them (either way: a policy change can untrust a settled fit or trust a failed one).
     pub(super) fn settle_recovery_note(&mut self) {
-        if self.recovery.as_deref() == Some(RECOVERY_FAILED_NOTE) && self.trusted() {
-            let n = self.misfit.as_ref().map_or(0, |m| m.samples.len());
-            self.recovery = Some(format!("recovery did not restore the training residuals; no samples held; {n} samples the model cannot reproduce stay in the fit"));
+        let failed = self.recovery.as_deref().is_some_and(|r| r == RECOVERY_FAILED_NOTE || r.starts_with(RECOVERY_SETTLED_NOTE));
+        if !failed {
+            return;
         }
+        self.recovery = Some(if self.trusted() {
+            let n = self.misfit.as_ref().map_or(0, |m| m.samples.len());
+            format!("{RECOVERY_SETTLED_NOTE} {n} samples the model cannot reproduce stay in the fit")
+        } else {
+            RECOVERY_FAILED_NOTE.into()
+        });
     }
 
     /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits

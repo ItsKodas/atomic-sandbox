@@ -342,6 +342,8 @@ impl SurrogateKs {
         (self.training_residuals, self.misfit) = self.compute_residuals().unzip();
         self.refresh_class_loo();
         self.commit_class_memory();
+        // the re-judged verdict and M: a failed recovery's note says which (spec 2026-11-13 §4.3)
+        self.settle_recovery_note();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.

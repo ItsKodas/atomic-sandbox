@@ -1211,6 +1211,66 @@ fn a_key_held_only_by_misfits_is_refused() {
     assert_eq!(s.class_loo()[1].samples, 0, "{:?}", s.class_loo()[1]);
 }
 
+/// Review ruling 6 (fix round 2): a key's column floor q_k counts every fitted sample, M included —
+/// M is in the fit, so a column only M touches is set by data the fit cannot reproduce; only its
+/// sample count n_k leaves M out. The key: the middle H of He–H–He (many-body, neighbours {He}).
+/// Its members are symmetric linear He–H–He on a coordinate axis: the two He sit at ±d exactly, so
+/// every odd-l He channel of the middle atom cancels to 0.0 exactly and those body-3 columns are
+/// untouched. M is one bent He–H–He moved rigidly three times with contradictory labels (+0.02,
+/// −0.02, +0.02 Ha): its middle H touches the odd-l columns too. So q_k over every fitted sample
+/// is strictly above the members' count, and the members — enough for the members-only floor —
+/// are refused on the key's own sample floor.
+#[test]
+fn a_key_column_floor_counts_the_misfit_samples() {
+    // measured: q_k 29 over every fitted sample, 21 over the members (the odd-l (He, He) body-3
+    // columns) — 25 members sit between the two floors
+    const N: usize = 25;
+    let mut s = SurrogateKs::new(Box::new(SpeciesMorse::new()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, SpeciesMorse::atom(1));
+    s.set_reference_energy(2, SpeciesMorse::atom(2));
+    s.skip_recovery = true;
+    let add = |s: &mut SurrogateKs, pos: Vec<[f64; 3]>, off: f64| {
+        let z = vec![2, 1, 2];
+        let mut sc = h2(1.4);
+        sc.nuclei = pos.iter().zip(&z).map(|(&p, &zi)| Nucleus::new(zi, p)).collect();
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        s.add_sample(Sample { pos, z, energy: e + off, forces: f, tag: SampleTag::Scan, weight: 1.0, force_mask: None, use_energy: true }, &sc).unwrap();
+    };
+    for i in 0..N {
+        let d = 2.2 + 0.8 * i as f64 / (N - 1) as f64;
+        let mut u = [0.0; 3];
+        u[i % 3] = d;
+        add(&mut s, vec![u.map(|x| -x), [0.0; 3], u], 0.0);
+    }
+    let bent = |k: usize| {
+        let o = [0.1 * k as f64, 0.05 * k as f64, 0.0];
+        let t = 110f64.to_radians();
+        vec![[o[0] + 2.5, o[1], 0.0], o, [o[0] + 2.5 * t.cos(), o[1] + 2.5 * t.sin(), 0.0]]
+    };
+    for (k, off) in [0.02, -0.02, 0.02].into_iter().enumerate() {
+        add(&mut s, bent(k), off);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap().samples.clone();
+    let key = surrogate::EnvKey { class: 2, z: 1, neighbours: vec![2] };
+    let basis = &s.model.as_ref().unwrap().basis;
+    let fitted: Vec<(usize, &Sample)> = s.store().unwrap().samples.iter().enumerate().filter(|(i, _)| !s.excluded(*i)).collect();
+    let all = super::trust::key_column_counts(basis, fitted.iter().map(|&(_, x)| x));
+    let members = super::trust::key_column_counts(basis, fitted.iter().filter(|(i, _)| !m.contains(i)).map(|&(_, x)| x));
+    let (q_all, q_mem, n_mem) = (all.per_key[&key].1, members.per_key[&key].1, members.per_key[&key].0);
+    let v = s.class_loo()[1].species.iter().find(|v| v.z == 1 && v.neighbours == vec![2]).cloned();
+    println!("M {m:?}; key H{{He}}: q over every fitted sample {q_all}, over the members {q_mem}, members n_k {n_mem}; verdict {v:?}");
+    assert!([N, N + 1, N + 2].iter().all(|i| m.contains(i)), "the premise: the three bent samples are in M: {m:?}");
+    assert!(q_mem <= n_mem && n_mem < q_all, "the premise: enough members for the members-only floor, not for the all-fitted one");
+    let j = s.class_judge.as_ref().unwrap();
+    assert_eq!(j.key_q[&key], q_all, "q_k over every fitted sample, M included");
+    assert!(j.key_q[&key] > q_mem);
+    assert_eq!(j.key_stats[&key].samples, n_mem, "n_k over the members");
+    let refused = s.class_untrusted(&[Some(key.clone())]);
+    println!("the class rule for the key: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, true))), "refused on its sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+}
+
 /// Review Focus 1: a NaN residual is never a misfit — it stays with the samples the residual rows
 /// judge, and fails them (activity Task 3b), with M empty.
 #[test]
@@ -1999,6 +2059,14 @@ fn box_affected_samples_never_fence_and_leave_the_fit_at_the_trust_floor() {
         "{:?}",
         s.recovery_note()
     );
+    // a policy change re-judges the note with the verdict it produces (review fix round 2)
+    let p = s.policy;
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..p });
+    assert!(!s.trusted());
+    assert_eq!(s.recovery_note(), Some("recovery did not restore trust; no samples held"));
+    s.set_policy(p);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.recovery_note().is_some_and(|n| n.starts_with("recovery did not restore the training residuals; no samples held; ")), "{:?}", s.recovery_note());
     // 30 more: the floor is met without them — they leave the fit, never quarantined
     add(&mut s, 30);
     let rep = s.refit().unwrap();
