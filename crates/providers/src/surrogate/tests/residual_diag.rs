@@ -668,10 +668,10 @@ fn c2_near_misfit(s: &mut SurrogateKs, meta: &[Meta], label: &str) {
 /// and the leave-one-out force RMS at the converged D₄ = 3 fit are ≤ those of a D₄ = 2 provider's
 /// attach fit on its own fresh copy, or both below 1e-4 Ha/Bohr — except HO's LOO, accepted by the
 /// user (one sample whose keys the class rule refuses at both degrees; checked, not assumed). The
-/// convergence and §5.2 failures are asserted together at the end. Also printed, not asserted:
-/// D₄ = 2 fitted on the D₄ = 3 codes (no recovery) — the same samples on both sides — and the Task
-/// 7 review's C1 (the class rule as built) and C2 (rejected; kept as the record) on the attach
-/// and on a variant whose M is populated.
+/// §5.2 is asserted twice: on each degree's own fitted set, and on the same samples (D₄ = 2
+/// fitted on the D₄ = 3 codes, no recovery). The convergence and §5.2 failures are asserted
+/// together at the end. Printed, not asserted: the Task 7 review's C1 (the class rule as built)
+/// and C2 (rejected; kept as the record) on the attach and on a variant whose M is populated.
 #[test]
 #[ignore]
 fn acceptance_on_the_collection() {
@@ -726,6 +726,7 @@ fn acceptance_on_the_collection() {
     assert!(s.trusted(), "§5.1: the attach leaves the model trusted: {:?}", s.untrusted_reason());
     assert!(held_after <= held_before, "§5.1: the attach holds no more than it started with: {held_before} → {held_after}");
     assert!(released >= 68, "§5.1: at least the 68 releases of 2026-11-12 recur: {released}");
+    assert!(s.fits > 0, "the attach fitted: {} fit_store calls", s.fits);
     // the Task 7 review's C1 / C2 measurements on the attach's refit (printed, not asserted)
     c1_class_keys(&s, "D₄ = 3, the attach's refit");
     c2_near_misfit(&mut s, &meta, "D₄ = 3, the attach's refit");
@@ -756,6 +757,10 @@ fn acceptance_on_the_collection() {
             s.fits - fits
         );
         println!("   refit {k}: {:?}; recovery {:?}", s.untrusted_reason(), s.recovery_note());
+        // a refit that did not fit would repeat the codes and M vacuously
+        if s.fits <= fits {
+            failures.push(format!("refit {k} ran no fit_store ({} → {}): the fixed point would be vacuous", fits, s.fits));
+        }
         if s.quarantined() > held(&prev_q) {
             failures.push(format!("ruling 11: the held count rose at refit {k}: {} → {}", held(&prev_q), s.quarantined()));
         }
@@ -803,22 +808,24 @@ fn acceptance_on_the_collection() {
     );
     let rms2 = scene_rms(&s2, &meta);
     // The one accepted exception (the user's decision 2026-11-13; references.md "Acceptance
-    // (2026-11-13)"): HO's LOO force RMS. HO is one sample (#1804, O–H 1.311 Bohr, the store's only
+    // (2026-11-14)"): HO's LOO force RMS. HO is one sample (#1804, O–H 1.311 Bohr, the store's only
     // pair-class O–H geometry), so its LOO is the pair term's extrapolation to a distance no other
     // sample covers. The exception holds only while that stays true: one fitted sample at both
-    // degrees, and every key of its atoms refused by the class rule at both. Its in-sample force
-    // rms is still asserted; every other scene is asserted in full
-    let lone_and_refused = |k: &str| {
-        let refused = |p: &SurrogateKs| {
-            let keys = scene_keys(p, &meta, k);
-            !keys.is_empty() && keys.iter().all(|key| matches!(key_verdict(p, key), Some(Some(_))))
-        };
-        rms3.get(k).is_some_and(|r| r.samples == 1) && rms2.get(k).is_some_and(|r| r.samples == 1) && refused(&s) && refused(&s2)
+    // degrees, and every key of its atoms with n_k = 1 (`key_stats`) and refused by the class rule,
+    // at both. Its in-sample force rms is still asserted; every other scene is asserted in full
+    let lone_and_refused = |p: &SurrogateKs| {
+        let keys = scene_keys(p, &meta, "HO");
+        let stats = p.compute_class_loo_full().0.map(|(_, j)| j.key_stats).unwrap_or_default();
+        !keys.is_empty() && keys.iter().all(|key| stats.get(key).is_some_and(|st| st.samples == 1) && matches!(key_verdict(p, key), Some(Some(_))))
     };
-    let loo_exception = |k: &str| k == "HO" && lone_and_refused(k);
+    let ho_exception = rms3.get("HO").is_some_and(|r| r.samples == 1) && rms2.get("HO").is_some_and(|r| r.samples == 1) && lone_and_refused(&s) && lone_and_refused(&s2);
+    let loo_exception = |k: &str| k == "HO" && ho_exception;
     if rms3.contains_key("HO") {
-        let v = |p: &SurrogateKs| scene_keys(p, &meta, "HO").iter().map(|key| format!("{} {:?}", key_name(key), key_verdict(p, key))).collect::<Vec<_>>();
-        println!("\nHO keys: D₄ = 3 {:?}; D₄ = 2 {:?}; the LOO exception applies: {}", v(&s), v(&s2), loo_exception("HO"));
+        let v = |p: &SurrogateKs| {
+            let stats = p.compute_class_loo_full().0.map(|(_, j)| j.key_stats).unwrap_or_default();
+            scene_keys(p, &meta, "HO").iter().map(|key| format!("{} n_k {:?} {:?}", key_name(key), stats.get(key).map(|st| st.samples), key_verdict(p, key))).collect::<Vec<_>>()
+        };
+        println!("\nHO keys: D₄ = 3 {:?}; D₄ = 2 {:?}; the LOO exception applies: {ho_exception}", v(&s), v(&s2));
     }
     println!("\n§5.2 | scene | samples D₄3/D₄2 | atoms D₄3/D₄2 | rms D₄=3 | rms D₄=2 | LOO D₄=3 | LOO D₄=2 | LOO undefined 3/2 | verdict |");
     let ok = |a: f64, b: f64| a <= b || (a < FLOOR && b < FLOOR);
@@ -856,7 +863,8 @@ fn acceptance_on_the_collection() {
         failures.push(format!("{k}: fitted at D₄ = 2, no fitted sample at D₄ = 3"));
     }
 
-    // printed, not asserted: D₄ = 2 fitted on the D₄ = 3 fixed point's codes, no recovery
+    // §5.2 on the same samples (spec §5 item 2, "same-sample comparison"): D₄ = 2 fitted on the
+    // D₄ = 3 fixed point's codes, no recovery
     s2.quarantine = s.quarantine.clone();
     s2.species_dirty = true;
     let t = Instant::now();
@@ -864,10 +872,29 @@ fn acceptance_on_the_collection() {
     println!("\nD₄ = 2 on the D₄ = 3 codes (fit_store, no recovery, {:.2} s): training residuals {:?}", t.elapsed().as_secs_f64(), s2.training_residuals());
     let same = scene_rms(&s2, &meta);
     println!("same samples | scene | samples 3/2 | rms D₄=3 | rms D₄=2 | LOO D₄=3 | LOO D₄=2 | verdict |");
+    // Asserted with the same condition and the same HO exception as the own-set comparison above.
+    // A weak comparator: this D₄ = 2 fit is untrusted and unrecovered (it fits the samples D₄ = 2's
+    // own recovery holds; max force residual 6.4e-3 Ha/Bohr, measured 2026-11-14), so passing it
+    // says less than the own-set assertion does
     for (k, r3) in &rms3 {
-        if let Some(r2) = same.get(k) {
-            let v = if ok(r3.rms, r2.rms) && ok(r3.loo, r2.loo) { "ok" } else { "ROSE" };
-            println!("| {k} | {}/{} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {v} |", r3.samples, r2.samples, r3.rms, r2.rms, r3.loo, r2.loo);
+        let Some(r2) = same.get(k) else {
+            failures.push(format!("same samples, {k}: no fitted sample at D₄ = 2 on the D₄ = 3 codes"));
+            continue;
+        };
+        let (ok_rms, ok_loo) = (ok(r3.rms, r2.rms), ok(r3.loo, r2.loo));
+        let v = if ok_rms && ok_loo {
+            "ok"
+        } else if ok_rms && loo_exception(k) {
+            "LOO ROSE: EXCEPTION (as above)"
+        } else {
+            "ROSE"
+        };
+        println!("| {k} | {}/{} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {v} |", r3.samples, r2.samples, r3.rms, r2.rms, r3.loo, r2.loo);
+        if !ok_rms {
+            failures.push(format!("same samples, {k}: force rms {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.rms, r2.rms));
+        }
+        if !ok_loo && !loo_exception(k) {
+            failures.push(format!("same samples, {k}: LOO force RMS {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.loo, r2.loo));
         }
     }
     // C1 / C2 again on a test-only variant whose M is populated (the attach's M is empty on

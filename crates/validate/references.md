@@ -4400,7 +4400,7 @@ Findings:
    The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
 4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.
 
-### Acceptance (2026-11-13; `providers` `surrogate::tests::residual_diag::acceptance_on_the_collection`, `#[ignore]`d; spec `2026-11-13-open-shell-model-design.md` §5.1–5.2; release, Ryzen 7 9800X3D, CPU, BelowNormal, alone)
+### Acceptance (2026-11-14, the recorded run; the user's decisions 2026-11-13; `providers` `surrogate::tests::residual_diag::acceptance_on_the_collection`, `#[ignore]`d; spec `2026-11-13-open-shell-model-design.md` §5.1–5.2; release, Ryzen 7 9800X3D, CPU, BelowNormal, alone)
 
 This runs the build with all of the open-shell model:
 - the D₄ growth rule;
@@ -4410,7 +4410,7 @@ This runs the build with all of the open-shell model:
 
 It runs on a fresh copy of the user's 181-hold collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`: 1 805 samples; on disk 180 held (H₃O 144, H₃ 30, H₂O 4, H₂ 2) and 1 superseded. The test copies the folder again, before anything writes, for the D₄ = 2 provider.
 
-Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib acceptance_on_the_collection -- --ignored --nocapture --test-threads 1`. It took 301 s. Four runs on four fresh copies, three before C1 and one after, gave the same fit numbers to the last printed digit. C1 changes no verdict here: M is empty on the real refits. The wall times below are from the last run.
+Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib acceptance_on_the_collection -- --ignored --nocapture --test-threads 1`. The recorded run (2026-11-14, after fix round 1) took 339 s. Five runs on five fresh copies — three before C1, two after — gave the same fit numbers to the last printed digit. C1 changes no verdict here: M is empty on the real refits. The wall times below are from the recorded run; they vary by ≈ 15 % from run to run (BelowNormal, the machine shared with the user's app).
 
 **Result: PASS**, under the user's decisions of 2026-11-13:
 - (a) no refit-count bound on the convergence; 20 refits are only the test's runtime bound;
@@ -4424,9 +4424,11 @@ Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib ac
 | attach: held after ≤ held before | 180 → 112 (0 newly held) | pass |
 | attach: ≥ 68 released | 68 (H₃O 54, H₃ 9, H₂O 4, H₂ 1) | pass |
 | refits: the held count never rises | 112 → 88 → 71 → 54 → 45 → 44 → 43 → 42 → 42 | pass |
+| refits: every refit fits (`fit_store` runs), so the fixed point is not vacuous | 2, 2, 2, 2, 2, 2, 2, 1 fits | pass |
 | refits: a fixed point (the same codes and the same M at two successive refits) | refit 8 repeats refit 7 | pass (decision a) |
 | §5.2, per scene: the force rms at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 Ha/Bohr | every scene | pass |
 | §5.2, per scene: the LOO force RMS at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 Ha/Bohr | every scene but HO; HO is the accepted exception | pass (decision b) |
+| §5.2 on the same samples (D₄ = 2 fitted on the D₄ = 3 codes): the force rms and the LOO force RMS, the same condition and exception | every scene, HO included | pass |
 
 **M by scene: empty.** |M| = 0 at the attach and at every refit after it, and at D₄ = 2. The model holds its unreproducible samples (H₃O 23, H₃ 18, H₂ 1 at the fixed point) rather than fitting them as misfits. The `Misfit` row, `NearMisfit` and the C1 terms are therefore not exercised by this collection's own refits. The populated test variant below exercises them.
 
@@ -4434,23 +4436,23 @@ Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib ac
 
 | refit | held | released | newly held | \|M\| | trusted | fit_store calls | wall (s) |
 |---|---|---|---|---|---|---|---|
-| attach | 112 | 68 | 0 | 0 | yes | 2 | 32.64 |
-| 1 | 88 | 24 | 0 | 0 | yes | 2 | 24.95 |
-| 2 | 71 | 17 | 0 | 0 | yes | 2 | 24.55 |
-| 3 | 54 | 17 | 0 | 0 | yes | 2 | 24.59 |
-| 4 | 45 | 9 | 0 | 0 | yes | 2 | 24.31 |
-| 5 | 44 | 1 | 0 | 0 | yes | 2 | 27.54 |
-| 6 | 43 | 1 | 0 | 0 | yes | 2 | 28.21 |
-| 7 | 42 | 1 | 0 | 0 | yes | 2 | 26.94 |
-| 8 | 42 | 0 | 0 | 0 | yes | 1 | 14.29 |
+| attach | 112 | 68 | 0 | 0 | yes | 2 | 37.62 |
+| 1 | 88 | 24 | 0 | 0 | yes | 2 | 29.29 |
+| 2 | 71 | 17 | 0 | 0 | yes | 2 | 27.20 |
+| 3 | 54 | 17 | 0 | 0 | yes | 2 | 27.63 |
+| 4 | 45 | 9 | 0 | 0 | yes | 2 | 27.61 |
+| 5 | 44 | 1 | 0 | 0 | yes | 2 | 31.31 |
+| 6 | 43 | 1 | 0 | 0 | yes | 2 | 30.40 |
+| 7 | 42 | 1 | 0 | 0 | yes | 2 | 28.80 |
+| 8 | 42 | 0 | 0 | 0 | yes | 1 | 12.90 |
 
 At the fixed point, 42 samples are held: H₃O 23, H₃ 18, H₂ 1, plus the H₂ sample superseded on disk. 138 of the 180 holds have been released. The training residuals there are energy 9.01e-4 Ha/atom and force 1.88e-3 ≤ 2.0e-3 Ha/Bohr.
 
 **Why 8 refits.** `refit_fits` runs one release pass per refit (`release_reproduced`): it fits, releases what that fit reproduces, and refits once. Each refit's fit, with the samples it just released, then reproduces the next band of held samples. This is the banded structure the 2026-11-12 diagnosis found, peeled the other way. The sequence is monotone and stays trusted throughout; it is not a ratchet.
 
-Ruling 11 had expected a fixed point within 5 refits. The user dropped that bound (decision a). Until the fixed point, each refit (about 21–28 s at S = 3) releases a few more samples.
+Ruling 11 had expected a fixed point within 5 refits. The user dropped that bound (decision a). Until the fixed point, each refit (about 21–31 s at S = 3 over the runs) releases a few more samples.
 
-**§5.2 per scene.** The D₄ = 3 side is the fixed point. The D₄ = 2 side is a forced-D₄ = 2 provider's attach refit on its own fresh copy: trusted, held 180 → 170 (H₃O 139, H₃ 29, H₂ 2), Q′ 1 032, 4 fits, 18.92 s. The rms values are per Cartesian component over the trained atoms of the fitted samples, in Ha/Bohr (`loo_rms`'s definition, per scene). No sample had an undefined LOO.
+**§5.2 per scene.** The D₄ = 3 side is the fixed point. The D₄ = 2 side is a forced-D₄ = 2 provider's attach refit on its own fresh copy: trusted, held 180 → 170 (H₃O 139, H₃ 29, H₂ 2), Q′ 1 032, 4 fits, 18.79 s. The rms values are per Cartesian component over the trained atoms of the fitted samples, in Ha/Bohr (`loo_rms`'s definition, per scene). No sample had an undefined LOO.
 
 | scene | samples fitted D₄ 3 / 2 | force rms D₄ = 3 | D₄ = 2 | LOO force RMS D₄ = 3 | D₄ = 2 | verdict |
 |---|---|---|---|---|---|---|
@@ -4461,7 +4463,7 @@ Ruling 11 had expected a fixed point within 5 refits. The user dropped that boun
 | **HO** | 1 / 1 | 8.12e-5 | 2.75e-4 | **2.12e-1** | **1.87e-1** | LOO rose: **the accepted exception** |
 | N₂ | 261 / 261 | 1.36e-5 | 1.44e-5 | 4.62e-5 | 5.63e-5 | ok (both < 1e-4) |
 
-The two sides do not fit the same samples: D₄ = 3 fits 116 more H₃O samples, the hard ones. The test also prints the comparison on the same samples (not asserted): D₄ = 2 refitted on the D₄ = 3 fixed point's codes, with no recovery. That D₄ = 2 fit is itself untrusted (force 6.4e-3 > 2.35e-3 Ha/Bohr, energy 1.16e-3 Ha/atom). On those samples D₄ = 3 is lower in every scene, HO included.
+The two sides do not fit the same samples: D₄ = 3 fits 116 more H₃O samples, the hard ones. The test therefore also asserts the comparison on the same samples (spec §5 item 2, "same-sample comparison"; fix round 1): D₄ = 2 refitted on the D₄ = 3 fixed point's codes, with no recovery, under the same condition and the same HO exception. It is a weak comparator: that D₄ = 2 fit is itself untrusted and unrecovered (force 6.4e-3 > 2.35e-3 Ha/Bohr, energy 1.16e-3 Ha/atom), because it fits the samples D₄ = 2's own recovery holds. On those samples D₄ = 3 is lower in every scene, HO included, so the exception is not needed there.
 
 | scene | force rms D₄ = 3 | D₄ = 2 | LOO D₄ = 3 | D₄ = 2 |
 |---|---|---|---|---|
@@ -4477,7 +4479,7 @@ The two sides do not fit the same samples: D₄ = 3 fits 116 more H₃O samples,
 - It is the store's only pair-class O–H geometry. A diatomic has no three- or four-body terms, so its LOO is the pair term's extrapolation to a distance no other sample covers. That error is 0.19–0.21 Ha/Bohr per component, about 30 % of the force, at either degree.
 - Its keys, O{H} and H{O} (pair class), are refused by the class rule at both degrees on the sample floor (`ClassKey::Samples`): n_k = 1 against a column floor q_k of 52 at D₄ = 3 and 38 at D₄ = 2. Their LOO ratio RMS at D₄ = 3 is 8.1 (force) and 108 (energy).
 
-The test does not assume the exception; it checks its conditions. It exempts HO's LOO only while HO has one fitted sample at both degrees and every key of its atoms is refused at both. HO's in-sample force rms stays asserted. Every other scene is asserted in full. The gap is real: one sample of a compressed OH radical teaches the model nothing it can transfer to that geometry.
+The test does not assume the exception; it checks its conditions. It exempts HO's LOO only while HO has one fitted sample at both degrees and every key of its atoms has n_k = 1 (`key_stats`) and is refused by the class rule, at both. HO's in-sample force rms stays asserted. Every other scene is asserted in full. The gap is real: one sample of a compressed OH radical teaches the model nothing it can transfer to that geometry.
 
 **C1 on the class rule as built** (the Task 7 review, landed in 22553fd and e0f15ac). For each class key, the table gives the provider's own statistics from `compute_class_loo_full` (R_c and R_E,c with M in the RMS terms; n_k without M; M's energy samples in the sum) and the standing verdict from `class_loo`. The test recomputes the M-in numbers independently; they match the provider's in every row.
 
@@ -4517,7 +4519,7 @@ At 0.75 the fence would refuse two thirds of the H₂ scene's own geometries. A 
 1. On the user's collection M is empty at every refit. The local-misfit path (G3) and C1 are not what make this collection trusted. D₄ = 3 plus the releases does that, and 42 samples stay held.
 2. The releases settle at refit 8. Until then each refit releases a few more samples.
 3. HO's LOO rise is accepted, not cured: one extrapolated geometry whose keys the sample floor refuses at both degrees.
-4. The §5.2 comparison is over each degree's own fitted set (the brief's). D₄ = 2 holds 116 more H₃O samples. On the same samples, D₄ = 3 is lower in every scene.
+4. §5.2 is asserted both ways: over each degree's own fitted set (the brief's; D₄ = 2 holds 116 more H₃O samples) and on the same samples (a weak comparator: that D₄ = 2 fit is untrusted and unrecovered). D₄ = 3 passes both, HO's own-set LOO the one accepted exception.
 
 ## Local misfit (2026-11-13; spec 2026-11-13-open-shell-model §4.3, Task 7 physics review)
 
@@ -4527,7 +4529,7 @@ At 0.75 the fence would refuse two thirds of the H₂ scene's own geometries. A 
 - *Left out:* the max terms (`force_max`, `energy_max`), the worst-sample and blocker readouts (the teach-around targets), the sample counts and n_k (the sample floor), and the energy-bearing count of the capped-segment rule. So M never helps a class or key reach an evidence floor. Also left out: the calibration's keys and the aleatoric level ā_c. Without M, ā_c is lower, so λ is larger: conservative.
 - A key held only by M's atoms is not judged: n_k = 0, refused on the sample floor, as before. A sample of M whose LOO is undefined makes the force RMS ∞ (it counts as infinitely off; its max is not kept). q_k still counts every fitted sample, M included (ruling 6, unchanged). Held samples stay out of everything.
 - *Effect:* a key with a fraction f of its atoms in M at LOO ratio RMS r_M has R ≥ √f·r_M. It is refused by the uncalibrated rule (rms ≤ 1) when f·r_M² > 1, and cannot enter the calibrated verdict (floor R ≤ `ENTER` = 1/√2) when f·r_M² > ½. No new constant. The max terms stay without M because M's ratios are above 1 by construction: in a max they would refuse every atom sharing its key (§4.3's objection, which holds for the max and not for the RMS).
-- *The energy half (Task 7c; the user's decision 2026-11-13, "Yes, add it").* Before it, R_E,c decided no verdict: the uncalibrated rule read the energy max outside M (`class_refusal`), the calibrated one the DFT-measured energy (`calibrate::verdict`), so an energy misfit had no class-rule guard. Now, in both paths, a class or key is refused (`ClassKey::EnergyRms`, words "LOO energy error RMS …× the tier (training samples the model cannot reproduce included)") when its energy LOO RMS, M included, exceeds 1 **and** an M sample contributes to that energy sum (`ClassStats::energy_misfits` > 0). Any M sample with a fitted energy engages the check, whatever kind of misfit it is: a force misfit's energy enters the sum as an energy misfit's does. Roughly, the key is refused when f·r_E² > 1, where — for the energy, here and below — f is the share of the key's energy samples that are in M and r_E their LOO energy ratio RMS (R_E,c² ≥ f·r_E²). The guard bites only when M contributes, so with M empty no verdict changes (uncalibrated, the RMS is at most the max, already ≤ 1; calibrated, the verdict never read the energy LOO). The limit is the bound, 1, in both paths, with no hysteresis at 1 for energy (the same limit to enter and to stay): the calibrated path has no ½ entry threshold for energy, because its energy check is the measured audit energy. NaN or ∞ with M contributing refuses. No new constant. On the Task 8 populated variant ("Acceptance (2026-11-13)" above, read on this code path), H{H} many-body has R_E,c = 0.773 ≤ 1 with 21 M energy samples, and R_c = 0.645 < 1/√2: it is trusted, not refused.
+- *The energy half (Task 7c; the user's decision 2026-11-13, "Yes, add it").* Before it, R_E,c decided no verdict: the uncalibrated rule read the energy max outside M (`class_refusal`), the calibrated one the DFT-measured energy (`calibrate::verdict`), so an energy misfit had no class-rule guard. Now, in both paths, a class or key is refused (`ClassKey::EnergyRms`, words "LOO energy error RMS …× the tier (training samples the model cannot reproduce included)") when its energy LOO RMS, M included, exceeds 1 **and** an M sample contributes to that energy sum (`ClassStats::energy_misfits` > 0). Any M sample with a fitted energy engages the check, whatever kind of misfit it is: a force misfit's energy enters the sum as an energy misfit's does. Roughly, the key is refused when f·r_E² > 1, where — for the energy, here and below — f is the share of the key's energy samples that are in M and r_E their LOO energy ratio RMS (R_E,c² ≥ f·r_E²). The guard bites only when M contributes, so with M empty no verdict changes (uncalibrated, the RMS is at most the max, already ≤ 1; calibrated, the verdict never read the energy LOO). The limit is the bound, 1, in both paths, with no hysteresis at 1 for energy (the same limit to enter and to stay): the calibrated path has no ½ entry threshold for energy, because its energy check is the measured audit energy. NaN or ∞ with M contributing refuses. No new constant. On the Task 8 populated variant ("Acceptance (2026-11-14)" above, read on this code path), H{H} many-body has R_E,c = 0.773 ≤ 1 with 21 M energy samples, and R_c = 0.645 < 1/√2: it is trusted, not refused.
 
 Pinned by `providers` tests:
 
