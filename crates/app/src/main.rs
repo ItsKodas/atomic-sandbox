@@ -653,6 +653,11 @@ fn main() {
     if let Some(n) = speed {
         viewer.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
     }
+    // `--backend estimated` on a preset: the estimated solver's box (`ui::estimated_box`), before the
+    // record's start actions are read off the panel (a replay grows it again at `action backend`)
+    if backend == sim::Backend::Estimated && !resumed {
+        viewer.fit_estimated_box();
+    }
     if let Some(list) = &detach {
         match ui::panels_named(list) {
             Ok(tabs) => {

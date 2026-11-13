@@ -2701,9 +2701,13 @@ fn superscripts_are_drawn_raised() {
 /// Review I2: a scene or quality change over the GPU memory budget is refused with a message
 /// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
 /// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
-/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³, two GPU solvers —
-/// teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
-/// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
+/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³ for its own 14 Bohr
+/// box, two GPU solvers — teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
+/// through — on the estimated solver's own box since 2026-11-14 (`ui::estimated_box`): H₂O's span
+/// 2.86 Bohr + 2 × (the provisional 5.98 Bohr cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the
+/// largest grid (201³), over the budget, so it falls back to the largest grid the guard passes
+/// (189³ under the 12 GB default). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here,
+/// and the card's memory when a viewer test reported it: the expected grid is the guard's own.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
@@ -2739,7 +2743,18 @@ fn a_change_over_the_vram_budget_is_refused() {
     (st.backend, st.gpu_available) = (Backend::Estimated, true);
     let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
     assert!(out.error.is_none(), "{:?}", out.error);
-    assert!(matches!(out.commands.as_slice(), [Command::SetGrid { n: 177, h }] if *h == 0.08), "{:?}", out.commands);
+    let solvers = gpu_solvers(Backend::Estimated, true);
+    let w8r = &w8;
+    let fits = |b: VramBudget| move |n: usize| vram_check(&Scene { grid_n: n, ..w8r.clone() }, solvers, b).is_ok();
+    let default = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(budget));
+    assert_eq!((default.want_n, default.n, default.capped), (201, 189, true), "under the 12 GB default");
+    let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
+    assert!((177..201).contains(&n), "{n}");
+    assert!(
+        matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
+        "{:?}",
+        out.commands
+    );
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----
@@ -11910,4 +11925,168 @@ mod selection_redesign {
         }
         assert!(checked > 20, "{checked} texts checked");
     }
+}
+
+// ---- the estimated solver's box (user decision 2026-11-14; `ui::estimated_box`) ----
+
+/// `action` written as a script line and read back: what `--record` writes is what a replay runs.
+fn round_trip(a: &Action) {
+    let line = a.describe().expect("recorded");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(Action::parse(&words).as_ref(), Ok(a), "{line}");
+}
+
+/// A preset under a DFT solver keeps today's 81³ × 0.15 (12 Bohr); switching to the estimated
+/// solver grows it through the Action path to the estimated box — H₂'s 1.45 Bohr span + 2 × (the
+/// provisional 5.35 Bohr cloud + 2 Bohr of room) = 16.1 Bohr → 109³ (16.2 Bohr) — as the new
+/// worker's scene (`switch_scene`), the container following the cell (1.5 Bohr inside the face);
+/// a Quality change in it stays on the estimated box; leaving it returns to the preset's box; a
+/// preset loaded under it grows at once.
+#[test]
+fn the_estimated_solver_grows_a_preset_box_through_the_action_path() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let out = act(&mut st, &input(&Scene::preset("h2").unwrap(), None, &cam), Action::Preset("h2".into()));
+    let Some(Command::SetScene(mut scene)) = out.commands.first().cloned() else { panic!("{:?}", out.commands) };
+    assert_eq!((scene.grid_n, scene.grid_h, st.estimated_grid), (81, 0.15, None), "a DFT solver keeps 81³");
+    assert!((st.wall_half_width - 4.5).abs() < 1e-12);
+    // to the estimated solver: the grown scene is the new worker's
+    let a = Action::Backend(Backend::Estimated);
+    round_trip(&a);
+    let out = act(&mut st, &input(&scene, None, &cam), a);
+    let grown = out.switch_scene.clone().expect("the box grows");
+    assert_eq!((grown.grid_n, grown.grid_h), (109, 0.15));
+    assert_eq!(grown.nuclei, scene.nuclei, "the nuclei stay where they are");
+    assert!(crate::quality::box_len(&grown) >= 16.1 && crate::quality::box_len(&grown) >= 12.0);
+    assert_eq!((st.backend, st.grid_n, st.estimated_grid, st.box_len), (Backend::Estimated, 109, Some((109, 0.15)), 12.0));
+    assert!((st.wall_half_width - (8.1 - 1.5)).abs() < 1e-9, "walls: 1.5 Bohr inside the new face, {}", st.wall_half_width);
+    assert!(st.status.contains("the box grows to 16.2 Bohr (109³ × 0.15)"), "{}", st.status);
+    assert!(out.commands.is_empty(), "the respawned worker gets the walls with its run settings: {:?}", out.commands);
+    scene = grown;
+    // the same level again: nothing; another level stays on the estimated box (1.45 + 2 (4.84 + 2) at 0.25 → 63³)
+    assert!(act(&mut st, &input(&scene, None, &cam), Action::Quality(0.15)).commands.is_empty());
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Quality(0.25));
+    assert!(
+        matches!(out.commands.as_slice(), [Command::SetGrid { n: 63, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.25),
+        "{:?}",
+        out.commands
+    );
+    out.commands[0].apply(&mut scene);
+    assert_eq!(st.estimated_grid, Some((63, 0.25)));
+    // back to a DFT solver: the preset's own box at this spacing (49³ × 0.25)
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Gpu));
+    let back = out.switch_scene.expect("the box returns");
+    assert_eq!((back.grid_n, back.grid_h, st.estimated_grid), (49, 0.25, None));
+    assert!((st.wall_half_width - 4.5).abs() < 1e-9);
+    scene = back;
+    // a preset loaded under the estimated solver grows at once (SetScene); under a DFT one it does not
+    st.backend = Backend::Estimated;
+    st.quality_h = 0.15;
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Preset("h2".into()));
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if (s.grid_n, s.grid_h) == (109, 0.15)), "{:?}", out.commands);
+    assert_eq!((st.grid_n, st.box_len, st.estimated_grid), (109, 12.0, Some((109, 0.15))));
+    // the menu's grids per level follow the estimated box
+    assert!((super::estimated_box::quality_box(&st, &scene, 0.15) - 16.147).abs() < 1e-3);
+    st.backend = Backend::Gpu;
+    assert_eq!(super::estimated_box::quality_box(&st, &scene, 0.15), 12.0);
+}
+
+/// A nucleus that would sit outside the preset's box keeps the estimated one on the way out (and
+/// says so); a preset's own grid never grows on a switch between DFT solvers.
+#[test]
+fn leaving_the_estimated_solver_keeps_a_box_a_nucleus_needs() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let scene = crate::quality::preset("h2", 0.15).unwrap();
+    assert!(act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Cpu)).switch_scene.is_none(), "DFT to DFT: no change");
+    let grown = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated)).switch_scene.unwrap();
+    let mut far = grown.clone();
+    far.nuclei[0].pos = [5.5, 0.0, 0.0];
+    let out = act(&mut st, &input(&far, None, &cam), Action::Backend(Backend::Gpu));
+    assert!(out.switch_scene.is_none());
+    assert!(st.status.contains("box is kept"), "{}", st.status);
+    // and Scene ▸ Quality still returns to the preset's box
+    let out = act(&mut st, &input(&far, None, &cam), Action::Quality(0.15));
+    assert!(matches!(out.commands.first(), Some(Command::SetGrid { n: 81, .. })), "{:?}", out.commands);
+}
+
+/// A scene file keeps its own grid under the estimated solver (no regrid on the switch); the note
+/// says its box is short — "box is 12.0 Bohr; … (≈ 15.1 Bohr)" for H₂ at h = 0.25 — and its button
+/// (clicked as a user would) emits `Action::Quality` at the file's spacing, which regrids to the
+/// estimated box (63³). Another solver, or a box big enough, shows no note.
+#[test]
+fn a_scene_file_keeps_its_grid_and_the_note_offers_the_regrid() {
+    let cam = camera();
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    st.gpu_available = true;
+    st.adopt_file("h2.scene", &scene);
+    assert_eq!(super::estimated_box::note(&mut st, &scene), None, "not the estimated solver");
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated));
+    assert!(out.switch_scene.is_none() && out.commands.is_empty(), "a file's grid is its own");
+    assert_eq!((st.backend, st.grid_n), (Backend::Estimated, 49));
+    let note = super::estimated_box::note(&mut st, &scene).expect("the box is short");
+    assert!(note.text.starts_with("box is 12.0 Bohr; samples near the walls can't be learned — a bigger grid (≈ 15.1 Bohr) avoids it"), "{}", note.text);
+    assert!(note.tip.contains("provisional") && note.tip.contains("R_cloud 4.84 Bohr of H"), "{}", note.tip);
+    assert_eq!(note.regrid, Some((63, 0.25)));
+    // the button, clicked in the Readouts panel
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    alone(&mut st, DockTab::Readouts);
+    let outs = click_widget(&ctx, &mut st, &inp, "estimated-box-regrid");
+    let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+    assert_eq!(acts, [&Action::Quality(0.25)], "the regrid is the recorded Quality action");
+    round_trip(&Action::Quality(0.25));
+    let grids: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetGrid { .. })).collect();
+    assert!(matches!(grids.as_slice(), [Command::SetGrid { n: 63, h }] if *h == 0.25), "{grids:?}");
+    // regridded: no note
+    let mut big = scene.clone();
+    big.grid_n = 63;
+    assert_eq!(super::estimated_box::note(&mut st, &big), None);
+}
+
+/// Atoms placed or dragged later never regrid by themselves: the note appears once the geometry's
+/// box exceeds the current one by more than h, and a solved profile refines R_cloud (a slower
+/// tail asks for more).
+#[test]
+fn a_geometry_that_outgrows_the_box_shows_the_note() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let scene = crate::quality::preset("h2", 0.15).unwrap();
+    let grown = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated)).switch_scene.unwrap();
+    assert_eq!(super::estimated_box::note(&mut st, &grown), None, "the grown box fits");
+    let mut placed = grown.clone();
+    placed.nuclei.push(crate::scene::SceneNucleus { z: 1, a: None, pos: [0.0, 0.1, 0.0], vel: [0.0; 3] });
+    assert_eq!(super::estimated_box::note(&mut st, &placed), None, "within h");
+    placed.nuclei[2].pos = [0.0, 3.0, 0.0];
+    let n = super::estimated_box::note(&mut st, &placed).expect("3 Bohr more span");
+    assert!(n.text.starts_with("box is 16.2 Bohr;") && n.regrid.is_some_and(|(g, _)| g > 109), "{n:?}");
+    // a profile: an LSDA-like H tail (κ ≈ 0.73) reaches the rule farther out than the provisional bound
+    let half = 6.0;
+    let (nn, h) = (81, 0.15);
+    let kappa = (2.0f64 * 0.269).sqrt();
+    let mut rho = vec![0.0f32; nn * nn * nn];
+    for k in 0..nn {
+        for j in 0..nn {
+            for i in 0..nn {
+                let p = [i, j, k].map(|c| -half + c as f64 * h);
+                let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                rho[i + nn * (j + nn * k)] = (kappa.powi(3) / std::f64::consts::PI * (-2.0 * kappa * r).exp()) as f32;
+            }
+        }
+    }
+    let mut snap = snapshot(&grown, Backend::Estimated, None);
+    snap.atom_profiles = std::sync::Arc::new(vec![crate::cloud::radial_profile(1, &rho, nn, h, [-half; 3], None, grown.ionic)]);
+    super::estimated_box::refresh_profiles(&mut st, &input(&grown, Some(&snap), &cam));
+    assert_eq!(st.cloud_profiles.len(), 1);
+    let n = super::estimated_box::note(&mut st, &grown).expect("the solved tail asks for more");
+    assert!(!n.tip.contains("provisional"), "{}", n.tip);
 }

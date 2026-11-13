@@ -251,7 +251,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             theme::note(ui, line);
         }
     });
-    status_line(ui, st, input, s);
+    status_line(ui, st, input, s, acts);
     // the folds
     let model_work = if estimated { d.work_refit + d.work_mismatch } else { 0.0 };
     let tools = d.total - d.energy_conserved - model_work;
@@ -416,7 +416,7 @@ fn chart_card(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
 /// The time-and-cost line ("t 180.25 fs · 3.3 ms/step · model, no SCF"; its detail on hover) with
 /// the health checks as dots on the right; a check that is not ok also prints its text under it,
 /// then the newest dynamics notes.
-fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate::sim::Snapshot) {
+fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate::sim::Snapshot, acts: &mut Vec<super::super::Action>) {
     let d = &s.dynamics;
     let per_step = match d.source {
         Source::Surrogate => "model, no SCF".to_string(),
@@ -472,7 +472,7 @@ fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate:
             });
         });
     });
-    super::group(ui, st, "d-health", |ui, _| {
+    super::group(ui, st, "d-health", |ui, st| {
         for (k, (c, text)) in checks.iter().enumerate().filter(|(_, (c, _))| *c != GREEN) {
             let r = ui.horizontal_wrapped(|ui| {
                 theme::light(ui, *c);
@@ -480,6 +480,8 @@ fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate:
             });
             probe_rect(&format!("readouts-warning-{k}"), r.response.rect);
         }
+        // the estimated solver's box when it is short (`ui::estimated_box`): a line and its regrid
+        crate::ui::estimated_box::show_note(ui, st, input, acts);
         for n in d.notes.iter().rev().take(3) {
             ui.add(egui::Label::new(RichText::new(n).size(11.0).color(theme::INK_FAINT)).wrap());
         }

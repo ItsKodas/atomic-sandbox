@@ -26,6 +26,7 @@ pub mod actions;
 pub mod activity;
 mod capture;
 mod dock;
+pub mod estimated_box;
 mod files;
 pub mod profile;
 mod icons;
@@ -569,6 +570,17 @@ pub struct UiState {
     pub box_len: f64,
     /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
     pub last_solve: Option<(usize, f64)>,
+    /// The estimated box (`crate::quality::estimated_box`, `estimated_box`): the latest isolated-atom
+    /// profile seen per (Z, ionic policy) — the estimated solver's own solves, kept across grids
+    /// so R_cloud is known when the next scene is built — and the snapshot list they came from.
+    pub cloud_profiles: Vec<crate::cloud::AtomProfile>,
+    pub cloud_profiles_from: usize,
+    /// The grid (n, h) the estimated box rule last gave the scene: leaving the estimated solver
+    /// returns such a grid to the base box (`box_len`), an explicit grid is never touched.
+    pub estimated_grid: Option<(usize, f64)>,
+    /// The note's GPU memory verdict, cached by (wanted n, h, scene key): the guard is not
+    /// re-run every frame.
+    pub estimated_note_cache: Option<((usize, f64, usize, sim::IonicPolicy, u64), usize)>,
     /// A new scene is loading (a scene or preset, a grid or ionic change, a solver switch; user
     /// request 2026-10-19): since when, and the estimated seconds. The old cloud, dots, labels and
     /// bonds hide until its first solve lands; the Activity tab shows the job.
@@ -940,6 +952,10 @@ impl UiState {
             quality_slider: crate::quality::DEFAULT_H,
             box_len: crate::quality::box_len(scene),
             last_solve: None,
+            cloud_profiles: Vec::new(),
+            cloud_profiles_from: 0,
+            estimated_grid: None,
+            estimated_note_cache: None,
             volume_mode: 0,
             gamma: 0.5,
             opacity: 2.0,
@@ -1094,6 +1110,8 @@ impl UiState {
     pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
         self.source = SceneSource::File(path.to_string());
         self.scene_path = path.to_string();
+        // a file's grid is its own: never the estimated box rule's (`estimated_box`)
+        self.estimated_grid = None;
         // a file keeps its own policy (no key: all-electron, the physics it was written for)
         self.ionic = scene.ionic;
         self.adopt(scene);
@@ -1368,6 +1386,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     poll_import(st);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
+    // the estimated solver's isolated-atom profiles: its box's R_cloud (`estimated_box`)
+    estimated_box::refresh_profiles(st, input);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));

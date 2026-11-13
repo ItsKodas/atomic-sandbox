@@ -617,6 +617,11 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         viewer.ui.audit_every = n;
     }
     let mut shot = Shot::new(w, h).ok_or("no GPU adapter")?;
+    if backend == Backend::Estimated {
+        // the estimated solver's box, as the window starts it (`Viewer::fit_estimated_box`)
+        crate::quality::set_adapter_memory(shot.hl.ctx.device_local_memory_bytes());
+        viewer.fit_estimated_box();
+    }
     viewer.start(backend, Some(shot.hl.ctx.clone()));
     let (hl, painter) = (&shot.hl, &mut shot.painter);
     if o.ui.wait_sampling {

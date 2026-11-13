@@ -16,9 +16,10 @@ pub struct RowCtx {
 }
 
 /// `box_advice`'s distance: where a hydrogen-like tail e^(−2r)/π falls to the box rule's face
-/// density (5.35 Bohr at h = 0.15) — the stated estimate, unchanged.
+/// density (5.35 Bohr at h = 0.15) — the stated estimate, unchanged
+/// (`crate::quality::provisional_cloud_radius`, the estimated box's bound before a profile).
 pub fn d_box(h: f64) -> f64 {
-    (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0
+    crate::quality::provisional_cloud_radius(h)
 }
 
 /// Distance (Bohr) from `p` to the nearest face of `scene`'s cell.
