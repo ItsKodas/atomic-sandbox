@@ -1154,6 +1154,24 @@ fn the_class_rule_leaves_misfits_out() {
     assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
     assert!(s.class_worst.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_worst);
     assert!(s.class_blockers.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_blockers);
+    // review fix 1: a key's sample count n_k leaves M out, its column floor q_k and the whole-model
+    // union do not (M is in the fit: a column only M touched would otherwise look spanned by
+    // data the fit cannot reproduce, and the floor would drop)
+    let j = s.class_judge.as_ref().unwrap();
+    let basis = &s.model.as_ref().unwrap().basis;
+    let fitted: Vec<(usize, &Sample)> = s.store().unwrap().samples.iter().enumerate().filter(|(i, _)| !s.excluded(*i)).collect();
+    let all = super::trust::key_column_counts(basis, fitted.iter().map(|&(_, x)| x));
+    let members = super::trust::key_column_counts(basis, fitted.iter().filter(|(i, _)| !m.contains(i)).map(|&(_, x)| x));
+    println!("key counts over every fitted sample {:?}, over the members {:?}; judged q_k {:?}", all.per_key, members.per_key, j.key_q);
+    assert!(!j.key_q.is_empty());
+    for (k, &q) in &j.key_q {
+        assert_eq!(q, all.per_key[k].1, "q_k over every fitted sample, M included: {k:?}");
+    }
+    for (k, st) in &j.key_stats {
+        assert_eq!(st.samples, members.per_key[k].0, "n_k over the members, M left out: {k:?}");
+    }
+    assert_eq!(j.key_stats[&hk_pair()].samples, 120, "the three strays are not the pair key's samples");
+    assert_eq!(j.fit_columns, all.union);
 }
 
 /// Review Focus 2: an environment key whose only samples are misfits has no samples of its own in
@@ -1188,6 +1206,9 @@ fn a_key_held_only_by_misfits_is_refused() {
     let refused = s.class_untrusted(&env_keys(&pos, &z, rc * rc));
     println!("the class rule at an H₃ geometry: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
     assert!(matches!(refused, Some((_, true))), "refused on the sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+    // the member filter, not a small-sample floor: the many-body class (only the H₃ atoms are
+    // many-body) counts none of the three
+    assert_eq!(s.class_loo()[1].samples, 0, "{:?}", s.class_loo()[1]);
 }
 
 /// Review Focus 1: a NaN residual is never a misfit — it stays with the samples the residual rows
@@ -1968,7 +1989,16 @@ fn box_affected_samples_never_fence_and_leave_the_fit_at_the_trust_floor() {
     s.refit().unwrap();
     println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}, M {:?}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded(), s.misfit().map(|m| &m.samples));
     assert!(s.residuals_fail() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let n_m = s.misfit().map_or(0, |m| m.samples.len());
     assert!(s.misfit().is_some_and(|m| (0..3).all(|i| m.samples.contains(&i))), "{:?}", s.misfit());
+    // the recovery restored nothing, but the refit ends trusted: the note says what stays (review fix 2)
+    assert_eq!(
+        s.recovery_note(),
+        Some(format!("recovery did not restore the training residuals; no samples held; {n_m} samples the model cannot reproduce stay in the fit").as_str()),
+        "{:?}",
+        s.recovery_note()
+    );
     // 30 more: the floor is met without them — they leave the fit, never quarantined
     add(&mut s, 30);
     let rep = s.refit().unwrap();

@@ -751,14 +751,20 @@ impl SurrogateKs {
         // every member's leave-one-out on threads (each depends on the model and its sample alone:
         // the same numbers as one at a time), then the sums below in sample order, as before
         let members: Vec<(usize, &Sample)> = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i) && !self.in_misfit(*i)).collect();
-        // per key: the members holding an atom of the key against the columns its atoms touch (M8a
-        // user-fix 3 and its review: not the class's count against the whole basis's Q′, which a
-        // species added elsewhere raised for every key); the whole-model union stays over every
-        // fitted sample, M included (it is in the fit: `fit_column_union`, the sample floor)
-        let mut counts = key_column_counts(&model.basis, members.iter().map(|&(_, s)| s));
-        if self.misfit.as_ref().is_some_and(|m| !m.samples.is_empty()) {
-            counts.union = key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
-        }
+        // per key: the members holding an atom of the key (n_k, M left out) against the columns
+        // the key's atoms touch (M8a user-fix 3 and its review: not the class's count against the
+        // whole basis's Q′, which a species added elsewhere raised for every key). The column
+        // counts — each key's floor q_k and the whole-model union — stay over every fitted sample,
+        // M included: M is in the fit, so a column only M touches is set by data the fit cannot
+        // reproduce, and leaving M out of q_k would lower the floor it is held to (the union is
+        // `fit_column_union`'s, the sample floor)
+        let counts = key_column_counts(&model.basis, members.iter().map(|&(_, s)| s));
+        let all_fitted = self
+            .misfit
+            .as_ref()
+            .is_some_and(|m| !m.samples.is_empty())
+            .then(|| key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)));
+        let columns = all_fitted.as_ref().unwrap_or(&counts);
         let loos = surrogate::loo::leave_one_out_many(model, &members.iter().map(|&(_, s)| s).collect::<Vec<_>>());
         for ((i, s), l) in members.into_iter().zip(loos) {
             // only the fitted (interior) atoms of a masked sample describe a class or a key
@@ -870,9 +876,10 @@ impl SurrogateKs {
             super::calibrate::ClassStats { samples, force_rms, force_max, energy_rms, energy_max }
         };
         let stats: [super::calibrate::ClassStats; 2] = std::array::from_fn(|c| stats_of(acc[c]));
-        // per key: its own leave-one-out numbers and its member counts (above; `key_column_counts`
-        // counts the fitted atoms of masked samples only)
-        let key_q: BTreeMap<surrogate::EnvKey, usize> = counts.per_key.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
+        // per key: its own leave-one-out numbers, its member count n_k and its column floor q_k over
+        // every fitted sample (above; `key_column_counts` counts the fitted atoms of masked samples
+        // only)
+        let key_q: BTreeMap<surrogate::EnvKey, usize> = columns.per_key.iter().filter(|(k, _)| key_acc.contains_key(*k)).map(|(k, &(_, q))| (k.clone(), q)).collect();
         let key_stats = key_acc
             .into_iter()
             .map(|(k, a)| {
@@ -881,7 +888,7 @@ impl SurrogateKs {
                 (k, super::calibrate::ClassStats { samples, ..stats_of(a) })
             })
             .collect();
-        let judge = ClassJudge { stats, key_stats, key_q, aleatoric, q_prime: report.q_prime, fit_columns: counts.union, keys, refit_cal: cal.clone(), cal, between_refits: false };
+        let judge = ClassJudge { stats, key_stats, key_q, aleatoric, q_prime: report.q_prime, fit_columns: columns.union, keys, refit_cal: cal.clone(), cal, between_refits: false };
         // the hysteresis memory is the verdict that stood when this refit, install or policy
         // change began (`class_memory`; reset by a forget or an install)
         let loo = self.judge_classes(&judge);
@@ -1088,6 +1095,8 @@ impl SurrogateKs {
         self.ensure_trust_passes();
         let report = fitted?;
         self.rejudge_failed_audits(true);
+        // the trust verdict and the misfit set are final: a failed recovery's note says which
+        self.settle_recovery_note();
         // the verdicts that stand now are the next refit's hysteresis memory (M8a Task 2)
         self.commit_class_memory();
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;

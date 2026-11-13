@@ -80,6 +80,10 @@ pub const QUARANTINE_ROUNDS: usize = 5;
 /// Never quarantine more than this fraction of the store.
 pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 
+/// The note of a trust recovery that restored nothing and left the model untrusted (spec
+/// 2026-11-13 §4.2; [`SurrogateKs::settle_recovery_note`] rewords it when the refit ends trusted).
+const RECOVERY_FAILED_NOTE: &str = "recovery did not restore trust; no samples held";
+
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting):
 /// the answer and, when the model predicted there, its residual teacher − model (energy, forces).
 #[derive(Clone)]
@@ -385,8 +389,20 @@ impl SurrogateKs {
             self.quarantine = flags;
             self.species_dirty = entry_dirty;
         }
-        self.recovery = Some("recovery did not restore trust; no samples held".into());
+        self.recovery = Some(RECOVERY_FAILED_NOTE.into());
         report
+    }
+
+    /// The failed recovery's note once the refit's verdict is known (spec 2026-11-13 §4.3): a refit
+    /// that ends trusted — its misfit set within its limit — did not restore the training
+    /// residuals, but it did not fail trust either, so the note says what stays in the fit; one
+    /// that ends untrusted keeps [`RECOVERY_FAILED_NOTE`]. Called by `refit` where the trust
+    /// verdict and M of the fit that stands are both final.
+    pub(super) fn settle_recovery_note(&mut self) {
+        if self.recovery.as_deref() == Some(RECOVERY_FAILED_NOTE) && self.trusted() {
+            let n = self.misfit.as_ref().map_or(0, |m| m.samples.len());
+            self.recovery = Some(format!("recovery did not restore the training residuals; no samples held; {n} samples the model cannot reproduce stay in the fit"));
+        }
     }
 
     /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits
