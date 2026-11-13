@@ -23,7 +23,6 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let chip = status_chip(ctx, view, st, input, acts);
     st.chip_rect = Some(chip);
     let corner = bonds_now(ctx, view, st, input, acts);
-    auto_refresh_bonds(ctx, st, input, acts);
     // the capture buttons at the top right; the atom card and the offer cards stack under them
     let mut right_y = super::capture::show(ctx, view, st, input.camera, acts) + 10.0;
     if st.show_atom_card {
@@ -769,16 +768,6 @@ struct Corner {
 /// The widest the stale bonds' line over "Bonds now" gets (points): inside the 280-point margin
 /// the bottom-centre label leaves at each side, so the two never meet on a wide view.
 pub const STALE_LINE_WIDTH: f32 = 260.0;
-
-/// "Bonds now" after a drag (`auto_bonds`): one frame of the debounce; asks for the frame that
-/// fires it, so an idle window still does.
-fn auto_refresh_bonds(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    match super::auto_bonds::step(st, input, std::time::Instant::now()) {
-        super::auto_bonds::Poll::Fire => acts.push(Action::RefreshBonds),
-        super::auto_bonds::Poll::Wait(d) => ctx.request_repaint_after(d),
-        super::auto_bonds::Poll::Idle => {}
-    }
-}
 
 /// The estimated view's "Bonds now" (bottom right; user request 2026-10-19): the surrogate's steps
 /// carry no density, so the bonds and angles are an earlier DFT step's; this asks for one teacher

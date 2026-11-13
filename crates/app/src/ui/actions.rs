@@ -701,14 +701,9 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::NameStyle(s) => st.name_style = s,
         Action::RefreshBonds => {
             out.commands.push(dyn_(DynCommand::RefreshBonds));
-            // the button shows everything it solved for; the refresh after a drag (`auto_bonds`,
-            // only with the bonds shown) leaves the lengths and angles as the user set them
-            if std::mem::take(&mut st.auto_bonds.fired) {
-                st.set_status("solving the density once for the bonds after the drag");
-            } else {
-                (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
-                st.set_status("solving the density once for the bonds and angles");
-            }
+            // the button shows everything it solved for
+            (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+            st.set_status("solving the density once for the bonds and angles");
             st.bonds_refresh = Some(Instant::now());
         }
         Action::Relax => {
