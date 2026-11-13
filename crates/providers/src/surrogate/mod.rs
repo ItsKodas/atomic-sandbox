@@ -2319,10 +2319,7 @@ impl ForceProvider for SurrogateKs {
         let by_fence = reason.is_none() && !near.is_empty();
         if by_fence {
             reason = Some(Refusal::new(
-                format!(
-                    "surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)",
-                    QUARANTINE_FRACTION * self.policy.max_descriptor_distance
-                ),
+                self.fence_refusal_text(&near),
                 TeachRule::NearQuarantine,
                 None,
             ));

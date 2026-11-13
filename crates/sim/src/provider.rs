@@ -1423,6 +1423,10 @@ pub struct Readiness {
     /// composition survived into the fit that stands (box-excluded, quarantined …), in words —
     /// the model has not learned this scene, whatever the policy says about this one geometry.
     pub unlearned: Option<String>,
+    /// The refusal is the quarantine fence (`TeachRule::NearQuarantine`) of samples the user forgot
+    /// alone (no quarantined one among them): the Model tab says "near samples you forgot" and how
+    /// the fence lifts (2026-11-14).
+    pub forgotten_fence: bool,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class

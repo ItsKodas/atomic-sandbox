@@ -252,3 +252,22 @@ fn a_forgotten_band_stops_falling_back_after_three_steps() {
     assert!(lifted_at <= 2, "at the third fallback at the latest: {outcomes:?}");
     assert!(sources[lifted_at + 1..].iter().all(|&x| x == Source::Surrogate), "the model answers after the lift: {sources:?} {outcomes:?}");
 }
+
+/// The Model tab's words (2026-11-14): the readiness at a geometry fenced by forgotten samples
+/// alone says so (`Readiness::forgotten_fence`, the refusal text names how it lifts); with a
+/// quarantined sample among the fence it does not.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_readiness_tells_a_forgotten_fence_apart() {
+    let k = 17;
+    let (mut s, _) = window_without(k);
+    let sc = near_sample(&s, k, 0.0);
+    s.ensure_desc_cache();
+    let r = s.readiness(&sc).unwrap();
+    assert_eq!((r.answers, r.rule, r.forgotten_fence), (false, Some(TeachRule::NearQuarantine), true), "{r:?}");
+    assert!(r.text.contains("samples you forgot") && r.text.contains("3 fresh teacher answers in a row agree"), "{}", r.text);
+    s.quarantine[k + 1] = Q_HELD;
+    let r = s.readiness(&sc).unwrap();
+    assert_eq!((r.rule, r.forgotten_fence), (Some(TeachRule::NearQuarantine), false), "{r:?}");
+    assert!(r.text.contains("held out of the fit"), "{}", r.text);
+}

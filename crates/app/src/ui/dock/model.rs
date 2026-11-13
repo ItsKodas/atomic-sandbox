@@ -226,6 +226,16 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
     if d.map(|d| d.source) == Some(Source::Reference) {
         return v(Tone::Good, "Atom references answering", "No atom has a neighbour within the model's cutoff: the isolated-atom references answer.", source_tip(Source::Reference).to_string());
     }
+    // the recent fallbacks here touch the box edge: their answers cannot be learned, whatever rule
+    // sent them to DFT — the cure is the box, so it leads (2026-11-14)
+    let falling_back = match t.kind {
+        TrustKind::NotHere | TrustKind::ClassUntrusted | TrustKind::Stuck => true,
+        TrustKind::Trusted | TrustKind::Quarantined => matches!(d.map(|d| d.source), Some(Source::Fallback | Source::Dft)),
+        TrustKind::Untrusted | TrustKind::NoModel => false,
+    };
+    if falling_back && box_edge_fallbacks(st) {
+        return Verdict { tone: Tone::Warn, headline: BOX_EDGE_HEADLINE.into(), reason: BOX_EDGE_REASON.into(), tip };
+    }
     match t.kind {
         TrustKind::Untrusted => {
             let reason = if crate::sim::box_blocks_trust(m).is_some() {
@@ -238,7 +248,7 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
         TrustKind::Stuck => v(Tone::Warn, "Falling back to DFT here", "Trusted, but it has not answered at this geometry for a while.", tip),
         TrustKind::NotHere | TrustKind::ClassUntrusted if near(m).is_some() => {
             let (headline, reason) = near(m).unwrap_or_default();
-            Verdict { tone: Tone::Warn, headline: headline.into(), reason: reason.into(), tip }
+            Verdict { tone: Tone::Warn, headline, reason, tip }
         }
         TrustKind::NotHere | TrustKind::ClassUntrusted => {
             let reason = if !here.is_empty() {
@@ -266,16 +276,50 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
     }
 }
 
+/// The verdict's headline when the recent fallbacks here touched the box edge (2026-11-14).
+pub const BOX_EDGE_HEADLINE: &str = "Falling back to DFT here · touching the box edge";
+/// Its reason.
+pub const BOX_EDGE_REASON: &str = "The electron cloud reaches the grid's edge, so DFT answers here can't be learned. Move the molecule toward the centre or use a bigger grid.";
+/// The verdict's headline next to samples the user forgot (2026-11-14).
+pub const FORGOTTEN_FENCE_HEADLINE: &str = "Falling back to DFT here · near samples you forgot";
+
+/// The reason next to samples the user forgot: how the fence lifts.
+pub fn forgotten_fence_reason() -> String {
+    format!("The model answers again once {} fresh DFT answers here agree with it — or Restore the samples.", providers::surrogate::FENCE_VOTES)
+}
+
+/// The fallbacks this many back the box-edge verdict reads (the newest first).
+const BOX_EDGE_RECENT: usize = 3;
+
+/// Whether the recent fallbacks here are "not kept: box" (`TeachOutcome::BoxNotKept`: the teacher's
+/// face density above the box rule): the newest solve-log row is a fallback, and it and every
+/// other fallback among the last [`BOX_EDGE_RECENT`] were not kept for the box. Read from the
+/// Activity log the panel already holds.
+pub fn box_edge_fallbacks(st: &UiState) -> bool {
+    use sim::activity::{TeachOrigin, TeachOutcome};
+    let Some(newest) = st.activity.rows.back() else { return false };
+    if newest.event.origin != TeachOrigin::Fallback {
+        return false;
+    }
+    st.activity.rows.iter().rev().filter(|r| r.event.origin == TeachOrigin::Fallback).take(BOX_EDGE_RECENT).all(|r| r.event.outcome == TeachOutcome::BoxNotKept)
+}
+
 /// A local refusal next to a sample the fit does not stand on (open-shell trust, spec 2026-11-13
 /// §4.3): the strict policy refuses here by the misfit fence (`NearMisfit`) or the quarantine
-/// fence (`NearQuarantine`) — the headline and the short reason.
-fn near(m: &ModelStatus) -> Option<(&'static str, &'static str)> {
+/// fence (`NearQuarantine`; next to forgotten samples alone, its own words — 2026-11-14) — the
+/// headline and the short reason.
+fn near(m: &ModelStatus) -> Option<(String, String)> {
     let r = m.readiness.as_ref().filter(|r| !r.answers)?;
     match r.rule? {
-        sim::activity::TeachRule::NearMisfit => {
-            Some(("Falling back to DFT here · near a misfit", "This geometry is next to a training sample the model can't reproduce: DFT answers here."))
-        }
-        sim::activity::TeachRule::NearQuarantine => Some(("Falling back to DFT here · near a quarantined sample", "This geometry is next to one the model could not learn: DFT answers here.")),
+        sim::activity::TeachRule::NearMisfit => Some((
+            "Falling back to DFT here · near a misfit".into(),
+            "This geometry is next to a training sample the model can't reproduce: DFT answers here.".into(),
+        )),
+        sim::activity::TeachRule::NearQuarantine if r.forgotten_fence => Some((FORGOTTEN_FENCE_HEADLINE.into(), forgotten_fence_reason())),
+        sim::activity::TeachRule::NearQuarantine => Some((
+            "Falling back to DFT here · near a quarantined sample".into(),
+            "This geometry is next to one the model could not learn: DFT answers here.".into(),
+        )),
         _ => None,
     }
 }

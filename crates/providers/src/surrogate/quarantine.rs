@@ -461,6 +461,17 @@ impl SurrogateKs {
         !near.is_empty() && near.iter().all(|&i| self.quarantine.get(i) == Some(&Q_FORGOTTEN))
     }
 
+    /// The quarantine fence's refusal text at a geometry fenced by `near` (rule "quarantine"): the
+    /// forgotten-only fence says how it lifts.
+    pub(super) fn fence_refusal_text(&self, near: &[usize]) -> String {
+        let d = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        if self.fence_is_forgotten(near) {
+            format!("surrogate: within {d:.2} training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once {FENCE_VOTES} fresh teacher answers in a row agree with it, or Restore the samples")
+        } else {
+            format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)")
+        }
+    }
+
     /// How many stored samples fence ([`fences`](Self::fences)).
     pub(super) fn fencing(&self) -> usize {
         self.quarantine.iter().filter(|&&q| q == Q_HELD || q == Q_FORGOTTEN).count()

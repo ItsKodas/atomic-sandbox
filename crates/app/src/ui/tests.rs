@@ -154,7 +154,7 @@ pub(crate) fn model() -> ModelStatus {
         teacher: "GpuKs",
         fitted: true,
         trusted: true,
-        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
+        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false }),
         teach_offer: None,
         untrusted_reason: None,
         samples: 273,
@@ -2953,6 +2953,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
         atom: None,
         text: "this kind of environment isn't learned well enough yet (many-body: LOO force error 12.0× the bound, RMS 0.10×, 587 samples) — worst leave-one-out sample #345".into(),
         unlearned: None,
+        forgotten_fence: false,
     };
     let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
     let t = trust(Some(&m), &scene, &st);
@@ -2968,7 +2969,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
     let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
     assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");
     // the scene's own pass is not in the fit: "not this scene", even where the policy answers
-    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()) };
+    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()), forgotten_fence: false };
     let t = trust(Some(&ModelStatus { readiness: Some(unlearned), quarantined: 0, ..model() }), &scene, &st);
     assert_eq!(t.kind, TrustKind::NotHere);
     assert!(t.text.starts_with("not this scene — this scene is not learned"), "{}", t.text);
@@ -9821,6 +9822,7 @@ mod model_panel {
             atom: Some(1),
             text: "rule 4b: pair environment around S, with H not learned well enough yet (12 of 60 samples)".into(),
             unlearned: None,
+            forgotten_fence: false,
         };
         ModelStatus { class_loo: vec![pair], readiness: Some(readiness), ..model() }
     }
@@ -10421,12 +10423,62 @@ mod model_panel_misfit {
         sim::activity::TrustCheck { key: sim::activity::TrustKey::Misfit, met: true, value, limit: 27.1, worst: None }
     }
 
+    /// 2026-11-14: the verdict next to samples the user forgot names them and how the fence lifts;
+    /// a quarantined fence keeps its words; when the recent fallbacks were "not kept: box" the box
+    /// edge leads, whatever refused; the long text stays in the "why?".
+    #[test]
+    fn the_verdict_names_a_forgotten_fence_and_the_box_edge() {
+        use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+        let scene = Scene::preset("h2").unwrap();
+        let long = "within 0.30 training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once 3 fresh teacher answers in a row agree with it, or Restore the samples";
+        let fence = |forgotten: bool| sim::Readiness { answers: false, rule: Some(TeachRule::NearQuarantine), atom: None, text: long.into(), unlearned: None, forgotten_fence: forgotten };
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        let cam = camera();
+        let verdict_with = |st: &UiState, r: sim::Readiness, source: sim::Source| {
+            let m = ModelStatus { readiness: Some(r), ..model() };
+            let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+            snap.dynamics.source = source;
+            let inp = input(&scene, Some(&snap), &cam);
+            verdict(st, &inp)
+        };
+        let v = verdict_with(&st, fence(true), sim::Source::Fallback);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · near samples you forgot"));
+        assert_eq!(v.reason, "The model answers again once 3 fresh DFT answers here agree with it — or Restore the samples.");
+        assert!(v.tip.contains(long), "{v:?}");
+        let v = verdict_with(&st, fence(false), sim::Source::Fallback);
+        assert_eq!(v.headline, "Falling back to DFT here · near a quarantined sample", "only quarantined: today's words");
+        // the recent fallbacks touched the box edge
+        let push = |st: &mut UiState, outcome| {
+            let e = sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, outcome);
+            st.activity.rows.push_back(crate::ui::activity::LogRow { at: std::time::Duration::ZERO, event: e, near_face: true });
+        };
+        push(&mut st, TeachOutcome::Kept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(!crate::ui::dock::model::box_edge_fallbacks(&st), "a kept fallback among the last three");
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(crate::ui::dock::model::box_edge_fallbacks(&st));
+        for r in [fence(true), sim::Readiness { rule: Some(TeachRule::Spread), text: "variance".into(), ..fence(false) }] {
+            let v = verdict_with(&st, r, sim::Source::Fallback);
+            assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · touching the box edge"));
+            assert_eq!(v.reason, "The electron cloud reaches the grid's edge, so DFT answers here can't be learned. Move the molecule toward the centre or use a bigger grid.");
+        }
+        // trusted and answering here: the box words only while this step is DFT
+        let answers = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false };
+        assert_eq!(verdict_with(&st, answers.clone(), sim::Source::Surrogate).headline, "Model answering · trusted here");
+        assert_eq!(verdict_with(&st, answers, sim::Source::Fallback).headline, "Falling back to DFT here · touching the box edge");
+        // a newer fallback that was kept ends it
+        push(&mut st, TeachOutcome::Kept);
+        assert_eq!(verdict_with(&st, fence(true), sim::Source::Fallback).headline, "Falling back to DFT here · near samples you forgot");
+    }
+
     #[test]
     fn a_misfit_refusal_and_count_are_placed() {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let long = "rule misfit: atom 1 is next to training sample #350, which the model cannot reproduce";
-        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None };
+        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None, forgotten_fence: false };
         let m = ModelStatus { readiness: Some(readiness), trust_checks: vec![misfit_check(3.0)], body4_degree: Some(3), ..model() };
         let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
         snap.dynamics.source = sim::Source::Fallback;
