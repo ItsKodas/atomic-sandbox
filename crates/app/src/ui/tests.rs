@@ -1415,7 +1415,7 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(None)]), "{c:?}");
     // the View panel's What you see (the panel alone: the Model panel, and its "draft", go)
-    view_panel(&mut st, &[dock::view::Section::What]);
+    view_panel(&mut st, &[]); // the estimated cloud card
     let outs = click_widget(&ctx, &mut st, &inp, "cloud-refresh");
     let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
     assert_eq!(clouds.len(), 1);
@@ -2354,7 +2354,7 @@ fn clicking_the_m6_controls_sends_their_commands() {
     // View ▸ Display aids ▸ show what training is solving: on by default, display only (no command,
     // no recorded action), and found by Ctrl K
     assert!(st.show_ghost);
-    view_panel(&mut st, &[dock::view::Section::Aids]);
+    view_panel(&mut st, &[]); // the Display aids card
     let outs = click_widget(&ctx, &mut st, &inp, "show-ghost");
     assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
     assert!(!st.show_ghost);
@@ -3065,11 +3065,9 @@ mod orbital_viewer {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.close_panel(DockTab::Orbitals);
-        assert!(!st.tab_shown(DockTab::Orbitals));
-        // the View panel's What you see (on screen in the default layout)
-        assert!(st.tab_shown(DockTab::View) && st.view_sections.is_open(crate::ui::dock::view::Section::What));
-        let outs = click_widget(&ctx, &mut st, &inp, "menu-show-orbitals");
+        // the Orbitals panel's show selector (the View panel's until 2026-11-14)
+        alone(&mut st, DockTab::Orbitals);
+        let outs = click_widget(&ctx, &mut st, &inp, "show-orbitals");
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "one request");
         assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: crate::ui::HOMO_TRACK, squared: false });
@@ -3701,7 +3699,7 @@ mod orbital_viewer {
         assert_eq!(search::results("all orbitals", 1)[0].name, "All orbitals coloured");
         assert_eq!(search::results("density", 1)[0].name, "Density");
         for name in ["Density", "Orbitals", "All orbitals coloured", "Spin density"] {
-            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::Orbitals) && e.anchor == "d-orb-mode"), "{name}: the Orbitals panel's show selector");
         }
         assert_eq!(search::results("unoccupied", 1)[0].place, search::Place::Dock(DockTab::Orbitals));
     }
@@ -7673,7 +7671,7 @@ mod knowledge_map {
         assert!(!st.show_knowledge, "off by default");
         assert!(knowledge::overlay_coverage(&st, &scene.nuclei).is_empty(), "off: no tint");
         // View ▸ Display aids ▸ knowledge overlay: no command, no recorded action
-        super::view_panel(&mut st, &[crate::ui::dock::view::Section::Aids]);
+        super::view_panel(&mut st, &[]);
         let outs = click_widget(&ctx, &mut st, &inp, "show-knowledge");
         assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
         assert!(st.show_knowledge);
@@ -7993,13 +7991,17 @@ mod view_panel {
     use super::super::dock::view::{Section, Sections};
     use super::*;
 
-    /// The View menu's Ctrl K entries before the panel (27): each lives in the View panel now.
-    const FORMER: [&str; 27] = [
-        "Density", "Orbitals", "All orbitals coloured", "Spin density", "Colour dots by density / orbital", "Density: volume / isosurface", "Gamma",
+    /// The View menu's Ctrl K entries before the panel (27): each lives in the View panel now but
+    /// the four show modes, whose selector heads the Orbitals panel since 2026-11-14 ([`MODES`]).
+    const FORMER: [&str; 23] = [
+        "Colour dots by density / orbital", "Density: volume / isosurface", "Gamma",
         "Opacity", "Iso level (× ρ max)", "Refresh cloud every", "Atomic superposition between DFT clouds", "Cell box", "Floor grid", "Axes",
         "Placement plane", "Grid spacing 1 Bohr / 1 Å", "Partial core density", "Smooth motion", "Show what training is solving",
         "Knowledge overlay", "Trails", "Bonds", "Molecule names", "Name style", "Composition badge on hover", "Bond angles", "Partial charges",
     ];
+
+    /// The show modes, the View menu's other four entries.
+    const MODES: [&str; 4] = ["Density", "Orbitals", "All orbitals coloured", "Spin density"];
 
     /// Ctrl K: every View-panel entry — the 27 former View-menu ones and the panel's own — shows the
     /// View panel (from behind another tab, every section folded), unfolds the section holding its
@@ -8008,6 +8010,9 @@ mod view_panel {
     fn every_former_view_menu_entry_reveals_inside_the_view_panel() {
         for name in FORMER {
             assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
+        }
+        for name in MODES {
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::Orbitals)), "{name}: the Orbitals panel's selector");
         }
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
@@ -8085,24 +8090,26 @@ mod view_panel {
         st.volume_mode = VOLUME_VOLUME;
         st.bloom = 0.0;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("gamma") && !t.contains("iso (× ρ max)") && !t.contains("dot size"), "{t}");
-        assert!(!t.contains("refresh cloud every") && t.contains("cloud options apply to the estimated solver"), "{t}");
+        assert!(t.contains("gamma") && t.contains("opacity") && !t.contains("iso (× ρ max)") && !t.contains("dot size") && t.contains("Fine-tune volume"), "{t}");
+        assert!(!t.contains("refresh every") && !t.contains("ESTIMATED MODE CLOUD") && t.contains("fields follow the atoms"), "the cloud card only under the estimated solver:\n{t}");
         assert!(!t.contains("exposure") && !t.contains("bloom from"), "{t}");
+        assert!(!t.contains("Density") || !t.contains("Spin density"), "no show selector here:\n{t}");
         st.volume_mode = VOLUME_ISO;
         st.camera_view = true;
         st.backend = Backend::Estimated;
         st.bloom = 0.5;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(!t.contains("gamma") && t.contains("iso (× ρ max)") && t.contains("exposure") && t.contains("refresh cloud every") && t.contains("bloom from"), "{t}");
+        assert!(!t.contains("gamma") && t.contains("iso (× ρ max)") && t.contains("exposure") && t.contains("refresh every") && t.contains("bloom from") && t.contains("Fine-tune isosurface"), "{t}");
         st.volume_mode = VOLUME_DOTS;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("dot size") && !t.contains("colour dots by"), "{t}");
+        assert!(t.contains("amount") && t.contains("brightness") && t.contains("dot size") && t.contains("shimmer") && !t.contains("colour by") && t.contains("Fine-tune dots"), "{t}");
         st.show = ShowMode::Coloured;
-        assert!(texts(&ctx, &mut st, &inp).contains("colour dots by"));
-        // a folded section draws nothing of its own
+        assert!(texts(&ctx, &mut st, &inp).contains("colour by"));
+        // a folded section draws nothing of its own; the cards stay
         st.view_sections = Sections::all(false);
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("What you see") && t.contains("Display aids") && !t.contains("dot size") && !t.contains("partial charges"), "{t}");
+        // (the view's own overlays — the view switch, the camera view's chip — still draw their looks)
+        assert!(t.contains("LOOK") && t.contains("DISPLAY AIDS") && t.contains("Camera") && !t.contains("with partial core") && !t.contains("partial charges") && !t.contains("label opacity") && !t.contains("field of view"), "{t}");
     }
 
     /// Drawing the panel never rewrites a stored value outside a slider's range (the review of
@@ -8128,7 +8135,7 @@ mod view_panel {
     }
 
     /// The sections fold and unfold by their headers; their open state is kept in the profile
-    /// (`view_sections`), What you see and How it looks open in a profile without it.
+    /// (`view_sections`), every fold closed in a profile without it.
     #[test]
     fn sections_fold_and_the_profile_keeps_them() {
         let scene = Scene::preset("h2").unwrap();
@@ -8138,20 +8145,24 @@ mod view_panel {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         assert_eq!(st.view_sections, Sections::default());
-        assert!(profile::capture(&st).contains("\nview_sections = what,looks\n"));
+        assert!(profile::capture(&st).contains("\nview_sections = \n"));
         alone(&mut st, DockTab::View);
         let outs = click_widget(&ctx, &mut st, &inp, "view-bonds");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        click_widget(&ctx, &mut st, &inp, "view-looks");
-        assert_eq!(st.view_sections.encode(), "what,bonds");
+        click_widget(&ctx, &mut st, &inp, "view-bonds");
+        click_widget(&ctx, &mut st, &inp, "view-finetune");
+        click_widget(&ctx, &mut st, &inp, "view-camera");
+        click_widget(&ctx, &mut st, &inp, "view-finetune");
+        click_widget(&ctx, &mut st, &inp, "view-bonds");
+        assert_eq!(st.view_sections.encode(), "camera,bonds");
         let text = profile::capture(&st);
         let mut fresh = UiState::new("h2", &scene);
         profile::apply(&mut fresh, &text);
-        assert_eq!(fresh.view_sections.encode(), "what,bonds");
+        assert_eq!(fresh.view_sections.encode(), "camera,bonds");
         profile::apply(&mut fresh, "gamma = 0.5\n");
-        assert_eq!(fresh.view_sections, Sections::default(), "absent: the default two");
-        profile::apply(&mut fresh, "view_sections = \n");
-        assert_eq!(fresh.view_sections, Sections::all(false), "empty: every section folded");
+        assert_eq!(fresh.view_sections, Sections::default(), "absent: every fold closed");
+        profile::apply(&mut fresh, "view_sections = what,looks\n");
+        assert_eq!(fresh.view_sections, Sections::all(false), "an old profile's sections (now cards): every fold closed");
     }
 
     /// Reset view settings: the look, Camera, Bonds & labels and Display aids back to their
@@ -8177,6 +8188,287 @@ mod view_panel {
         assert_eq!(st.show_bonds, d.show_bonds);
         assert!(st.hide_cloud, "What you see stays");
         assert_eq!(st.view_sections, Sections::all(false), "the folds stay");
+    }
+
+    // ---- the redesigned panel (user's approved mockup, 2026-11-14) ----
+
+    fn probes_now(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> std::collections::BTreeSet<String> {
+        for _ in 0..2 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, 1400.0, vec![]);
+        PROBES.with(|p| p.borrow().keys().cloned().collect())
+    }
+
+    /// Each preset button puts its bundle in force (the render mode by its action) and is the one
+    /// highlighted; touching a setting afterwards shows "custom".
+    #[test]
+    fn look_presets_apply_their_bundles() {
+        use super::super::dock::view::{active_preset, Look, LookPreset};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        assert_eq!(active_preset(&st), None, "the app's defaults are none of them (Clean drops the shimmer and bloom)");
+        for p in [LookPreset::Glow, LookPreset::Scientific, LookPreset::Present, LookPreset::Clean, LookPreset::Glow] {
+            let before = st.volume_mode;
+            let outs = click_widget(&ctx, &mut st, &inp, &format!("look-{}", p.word()));
+            let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+            if before != p.look().volume_mode {
+                assert_eq!(acts, [&Action::VolumeMode(p.look().volume_mode)], "{p:?}");
+            } else {
+                assert!(acts.is_empty(), "{p:?}: {acts:?}");
+            }
+            assert_eq!(Look::of(&st), p.look(), "{p:?}");
+            assert_eq!(active_preset(&st), Some(p));
+            assert!(!probes_now(&ctx, &mut st, &inp).contains("look-custom"), "{p:?}");
+        }
+        // a touched setting: custom, no preset highlighted
+        st.dots_amount = 0.9;
+        assert_eq!(active_preset(&st), None);
+        assert!(probes_now(&ctx, &mut st, &inp).contains("look-custom"));
+        // the card's ↺: the app's defaults
+        let d = UiState::new("h2", &scene);
+        click_widget(&ctx, &mut st, &inp, "view-look-reset");
+        assert_eq!(Look::of(&st), Look::of(&d));
+    }
+
+    /// Only the render mode's own controls are drawn: two in the card, the rest in "Fine-tune
+    /// <mode>" (folded by default).
+    #[test]
+    fn only_the_render_modes_controls_are_drawn() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        let all = ["look-opacity", "look-gamma", "look-iso", "look-bloom", "look-amount", "look-brightness", "look-size"];
+        for (mode, want) in [(VOLUME_VOLUME, &["look-opacity", "look-gamma"][..]), (VOLUME_ISO, &["look-iso", "look-bloom"][..]), (VOLUME_DOTS, &["look-amount", "look-brightness"][..])] {
+            st.volume_mode = mode;
+            st.view_sections = Sections::all(false);
+            let p = probes_now(&ctx, &mut st, &inp);
+            for n in all {
+                assert_eq!(p.contains(n), want.contains(&n), "mode {mode}: {n}");
+            }
+            assert!(p.contains("view-finetune") && !p.contains("show-partial-core"), "mode {mode}: the rest folded");
+            st.view_sections.set(Section::FineTune, true);
+            let p = probes_now(&ctx, &mut st, &inp);
+            assert!(p.contains("show-partial-core"), "mode {mode}: Fine-tune holds the rest");
+            if mode == VOLUME_VOLUME {
+                assert!(p.contains("look-bloom"), "bloom is fine-tuning for a volume");
+            }
+        }
+        // dots without glow: the dot size takes brightness's place (brightness acts on glowing dots only)
+        st.dots_glow = false;
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("look-size") && !p.contains("look-brightness"));
+    }
+
+    /// The show selector is not in the View panel any more; Ctrl K's mode entries find the
+    /// Orbitals panel's.
+    #[test]
+    fn the_show_selector_lives_in_the_orbitals_panel() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &Section::ALL);
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(!p.iter().any(|k| k.starts_with("menu-show") || k.starts_with("show-spin")), "{p:?}");
+        let e = search::results("spin density", 1)[0];
+        assert_eq!((e.name, e.place, e.anchor), ("Spin density", search::Place::Dock(DockTab::Orbitals), "d-orb-mode"));
+        search::pick(&ctx, &mut st, e);
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(st.tab_shown(DockTab::Orbitals) && p.contains("show-spin") && p.contains("anchor-d-orb-mode"));
+    }
+
+    /// The Display aids chips toggle the same state as the old checkboxes (the actions where those
+    /// were actions); the placement plane's and the trails' ▾ open their settings row; the
+    /// estimated cloud card only under the estimated solver.
+    #[test]
+    fn the_display_aid_chips_toggle_the_old_settings() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        let flips: [(&str, fn(&UiState) -> bool); 6] = [
+            ("aid-cell", |s| s.show_cell),
+            ("aid-floor", |s| s.show_floor),
+            ("aid-axes", |s| s.show_axes),
+            ("aid-place", |s| s.show_place_grid),
+            ("show-knowledge", |s| s.show_knowledge),
+            ("show-ghost", |s| s.show_ghost),
+        ];
+        for (probe, get) in flips {
+            let was = get(&st);
+            let outs = click_widget(&ctx, &mut st, &inp, probe);
+            assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "{probe}: display only");
+            assert_eq!(get(&st), !was, "{probe}");
+        }
+        let was = st.smooth_motion;
+        let outs = click_widget(&ctx, &mut st, &inp, "aid-smooth");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), [&Action::SmoothMotion(!was)]);
+        let was = st.warp_fields;
+        let outs = click_widget(&ctx, &mut st, &inp, "aid-warp");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), [&Action::WarpFields(!was)], "the warp is a Display aid off the estimated solver");
+        assert_eq!(st.nucleus_scale, None);
+        click_widget(&ctx, &mut st, &inp, "nucleus-auto");
+        assert_eq!(st.nucleus_scale, Some(1.0));
+        assert!(probes_now(&ctx, &mut st, &inp).contains("nucleus-scale"), "its slider while not automatic");
+        click_widget(&ctx, &mut st, &inp, "nucleus-auto");
+        assert_eq!(st.nucleus_scale, None);
+        // the placement plane's spacing and the trails' length and opacity, in a row under the chips
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(!p.contains("aid-place-angstrom") && !p.contains("trail-length"));
+        click_widget(&ctx, &mut st, &inp, "aid-place-more");
+        click_widget(&ctx, &mut st, &inp, "aid-place-angstrom");
+        assert!(st.grid_in_angstrom);
+        st.show_trails = true;
+        click_widget(&ctx, &mut st, &inp, "aid-trails-more");
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("trail-length") && p.contains("trail-opacity") && !p.contains("aid-place-angstrom"), "one row at a time");
+        let texts: String = {
+            let mut out = String::new();
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            fn walk(s: &egui::epaint::Shape, out: &mut String) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            out
+        };
+        assert!(texts.contains(&format!("trails {}", crate::trails::length_text(st.trail_fs))), "the chip names the length:\n{texts}");
+        // the trail length: a press at the slider's left end sets it near its 5 fs minimum
+        let r = probed_rect("trail-length");
+        press_at(&ctx, &mut st, &inp, r.left_center() + egui::vec2(2.0, 0.0));
+        assert!(st.trail_fs < 100.0, "edited: {}", st.trail_fs);
+        // the estimated cloud card: its chips only under that solver
+        assert!(!probes_now(&ctx, &mut st, &inp).contains("cloud-refresh"));
+        st.backend = Backend::Estimated;
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("cloud-refresh") && p.contains("cloud-superposition") && p.contains("aid-warp"));
+    }
+
+    /// A press and release at `at`.
+    fn press_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, at: egui::Pos2) {
+        for ev in [vec![egui::Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)], vec![egui::Event::PointerGone]] {
+            frame(ctx, st, inp, 1400.0, ev);
+        }
+    }
+
+    /// Each section's ↺ resets its own settings only; Reset all view settings still resets every one.
+    #[test]
+    fn each_sections_reset_is_its_own() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let d = UiState::new("h2", &scene);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &Section::ALL);
+        let touch = |st: &mut UiState| {
+            (st.gamma, st.show_cell, st.camera_view, st.label_opacity) = (0.3, !d.show_cell, true, 0.2);
+        };
+        let now = |st: &UiState| (st.gamma, st.show_cell, st.camera_view, st.label_opacity);
+        touch(&mut st);
+        click_widget(&ctx, &mut st, &inp, "view-aids-reset");
+        assert_eq!(now(&st), (0.3, d.show_cell, true, 0.2), "Display aids only");
+        click_widget(&ctx, &mut st, &inp, "view-look-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, true, 0.2), "the look only");
+        view_panel(&mut st, &[Section::Camera]); // (each fold on screen in its turn)
+        click_widget(&ctx, &mut st, &inp, "view-camera-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, 0.2), "Camera only");
+        view_panel(&mut st, &[Section::Bonds]);
+        click_widget(&ctx, &mut st, &inp, "view-bonds-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, d.label_opacity), "Bonds and labels");
+        touch(&mut st);
+        click_widget(&ctx, &mut st, &inp, "view-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, d.label_opacity), "all of them");
+    }
+
+    /// At about 320 pt, every fold open, dots with the trails row and the estimated cloud card: the
+    /// parts stack inside the panel and no text runs past its right edge.
+    #[test]
+    fn the_view_panel_fits_320_pt() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for mode in [VOLUME_DOTS, VOLUME_VOLUME, VOLUME_ISO] {
+            let mut st = UiState::new("h2", &scene);
+            st.backend = Backend::Estimated;
+            st.volume_mode = mode;
+            st.show = ShowMode::Coloured;
+            st.show_trails = true;
+            st.camera_view = true;
+            st.nucleus_scale = Some(1.2);
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[View*])").unwrap());
+            st.view_sections = Sections::all(true);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("view-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["view-look", "view-aids", "anchor-m-density", "view-bonds", "view-camera", "view-reset"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{mode} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{mode} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            let presets: Vec<egui::Rect> = ["clean", "glow", "scientific", "present"].iter().map(|w| probed_rect(&format!("look-{w}"))).collect();
+            assert!(presets.windows(2).all(|w| w[0].right() <= w[1].left() && (w[0].width() - w[1].width()).abs() < 0.5), "four equal buttons in a row: {presets:?}");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{mode}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
     }
 
     /// The Window menu (spec D-7): one row per panel, a click shows it (a closed one comes back);

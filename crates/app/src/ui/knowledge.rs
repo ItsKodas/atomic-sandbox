@@ -21,7 +21,7 @@
 //!   A wide panel (a wide leaf, or a detached window) lays the map out in two columns. Its old
 //!   pop-out window is gone (docking spec D-5): detaching the panel to an OS window (docking D3)
 //!   does that job;
-//! - the **3D overlay** (View ▸ Display aids ▸ knowledge overlay, [`overlay_toggle`]): each atom
+//! - the **3D overlay** (the View panel's Display aids ▸ knowledge overlay, [`OVERLAY_TIP`]): each atom
 //!   tinted by `sim::atom_coverage` ([`overlay_coverage`], [`tint_srgb`]: grey 0 never seen → amber
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).
 //!
@@ -259,13 +259,9 @@ pub fn peek(st: &UiState) -> String {
     }
 }
 
-/// View ▸ Display aids ▸ knowledge overlay (the View panel, `dock::view`; display only, not
+/// The knowledge overlay's chip's tooltip (the View panel's Display aids; display only, not
 /// recorded; kept in the profile).
-pub fn overlay_toggle(ui: &mut Ui, st: &mut UiState) {
-    super::probed("show-knowledge", ui.checkbox(&mut st.show_knowledge, "knowledge overlay")).on_hover_text(
-        "tints each atom by how well the estimated solver's model knows its surroundings: 0 never seen (grey) … 0.5 thin (amber) … 1 well known (green), the knowledge map's colours. Per atom it is its least-known neighbour within the model's cutoff — that pair's verdict and how many distances like this one were taught. Needs the estimated solver's map (the Knowledge panel). Display only, not recorded",
-    );
-}
+pub const OVERLAY_TIP: &str = "tints each atom by how well the estimated solver's model knows its surroundings: 0 never seen (grey) … 0.5 thin (amber) … 1 well known (green), the knowledge map's colours. Per atom it is its least-known neighbour within the model's cutoff — that pair's verdict and how many distances like this one were taught. Needs the estimated solver's map (the Knowledge panel). Display only, not recorded";
 
 /// The panel at least this wide draws the map in two columns (the old pop-out window's layout).
 const WIDE: f32 = 760.0;

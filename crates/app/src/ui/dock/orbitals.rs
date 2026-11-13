@@ -987,15 +987,11 @@ pub const KS_SHORT: &str = "Kohn–Sham orbitals: auxiliary objects of DFT, not 
 /// The one-line note in Spin density mode.
 pub const SPIN_SHORT: &str = "Spin is intrinsic, not a rotation; orbitals are stationary";
 
-/// The `show` selector: one button per mode, probed as `{prefix}-{word}`; returns the picked mode.
+/// The `show` selector (the panel's head; the View panel's until 2026-11-14): one button per mode,
+/// probed as `{prefix}-{word}`, each button's rect collected in `rects`; returns the picked mode.
 /// "None" (first) hides the electron cloud altogether (`hidden`, `UiState::hide_cloud`); picking a
 /// mode shows it again.
-pub fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str) -> Option<ShowMode> {
-    show_selector_at(ui, current, hidden, prefix, &mut Vec::new())
-}
-
-/// [`show_selector`], collecting each mode button's rect in `rects`.
-fn show_selector_at(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str, rects: &mut Vec<(ShowMode, egui::Rect)>) -> Option<ShowMode> {
+fn show_selector(ui: &mut Ui, current: ShowMode, hidden: &mut bool, prefix: &str, rects: &mut Vec<(ShowMode, egui::Rect)>) -> Option<ShowMode> {
     let mut picked = None;
     egui::Frame::new()
         .fill(theme::APP)
@@ -1126,7 +1122,7 @@ fn view_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, payload: Opt
     egui::Frame::new().fill(theme::PANEL_2).stroke(egui::Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         let mut rects = Vec::new();
-        if let Some(m) = show_selector_at(ui, st.show, &mut st.hide_cloud, "show", &mut rects) {
+        if let Some(m) = show_selector(ui, st.show, &mut st.hide_cloud, "show", &mut rects) {
             acts.push(Action::Show(m));
         }
         ui.add_space(4.0);
