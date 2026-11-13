@@ -980,6 +980,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
             st.search.open = false;
         }
     }
+    // a wide window too: the toolbar's Thermostat group needs ≈ 1590 pt
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &input(&scene, None, &cam), 1700.0, vec![]);
+    }
     // every search entry's anchor is marked by a widget group in some layout (a misspelt anchor
     // would silently stop revealing)
     let marked = search::MARKED.with(|m| m.borrow().clone());
@@ -1050,7 +1054,12 @@ fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, nam
     press_widget_w(ctx, st, inp, 1400.0, name, drag)
 }
 
-/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact layout).
+/// A window wide enough for the toolbar's full layout (it needs `toolbar::full_width`, ≈ 1584
+/// pt since the Thermostat group: the default 1400 gets the compact bar).
+const WIDE: f32 = 1700.0;
+
+/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact top bar, below
+/// `toolbar::full_width` the compact toolbar).
 fn press_widget_w(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, name: &str, drag: f32) -> Vec<PanelOutput> {
     for _ in 0..3 {
         frame(ctx, st, inp, w, vec![]);
@@ -1114,29 +1123,29 @@ fn clicking_the_toolbar_sends_the_old_commands() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.gpu_available = true;
-    let outs = click_widget(&ctx, &mut st, &inp, "play");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "play", 0.0);
     assert_eq!(outs.iter().filter(|o| o.toggle_play).count(), 1, "Play clicked once");
     st.speed = 50;
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "watchable"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "watchable", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::SetSpeed(1)]), "{c:?}");
     let dt = st.dt_fs;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "speed", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetSpeed(n) if *n > 1)), "{c:?}");
     assert!(st.speed > 1 && st.dt_fs == dt, "speed {} dt {}", st.speed, st.dt_fs);
     let speed = st.speed;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "dt", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "dt", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetDt(x) if *x > 0.25)), "{c:?}");
     assert_eq!(st.speed, speed);
-    let outs = click_widget(&ctx, &mut st, &inp, "element-8");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "element-8", 0.0);
     assert!(outs.iter().all(|o| o.commands.is_empty()));
     assert_eq!((st.element, st.mode), (8, ToolMode::Place));
-    click_widget(&ctx, &mut st, &inp, "solver-estimated");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-estimated", 0.0);
     assert_eq!(st.backend, Backend::Estimated);
-    click_widget(&ctx, &mut st, &inp, "solver-cpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-cpu", 0.0);
     assert_eq!(st.backend, Backend::Cpu);
-    click_widget(&ctx, &mut st, &inp, "solver-gpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-gpu", 0.0);
     assert_eq!(st.backend, Backend::Gpu);
-    let outs = click_widget(&ctx, &mut st, &inp, "delete");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "delete", 0.0);
     let removes: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::RemoveNucleus(1))).collect();
     assert_eq!(removes.len(), 1, "Delete removes the selected nucleus once");
 }
@@ -1877,8 +1886,11 @@ fn fs_per_s_shows_three_figures_in_five_characters_at_most() {
 /// Every toolbar group keeps its rect (to 0.5 pt) whatever the live values — fs/s 1 vs 999 999,
 /// this tick's rate, fallbacks 0 vs 100 %, epoch 1 vs 9999, the solver line long (untrusted,
 /// sampling) vs short (DFT) vs absent, the selection, the dt warning, the pull, the speed and
-/// dt fields, the element — in the full layout and the compact one; and no group outgrows the
-/// width it was given (`toolbar::Widths`), nor the window.
+/// dt fields, the element, the thermostat (on / off, 0 K … 20 000 K) — in the full layout and the
+/// compact one; and no group outgrows the width it was given (`toolbar::Widths`), nor the
+/// window. The Thermostat group sits between dt and Tool where the window has room for it: in
+/// the full layout (1600), in the compact one at 1400 (its short slider) and 1240 (its two boxes
+/// alone), not at 1000.
 #[test]
 fn the_toolbar_groups_hold_still_when_live_values_change() {
     use toolbar::GROUPS;
@@ -1918,29 +1930,39 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         target: None,
     });
     let dft = snapshot(&scene, Backend::Gpu, None);
-    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
-    let states: [(Option<&Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool); 5] = [
-        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false),
-        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true),
-        (None, None, Some(0), 37, 0.25, 8, 0.0125, false),
-        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true),
-        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true),
+    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing, thermostat on / T)
+    type State<'a> = (Option<&'a Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool, bool, f64);
+    let states: [State; 5] = [
+        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false, false, 0.0),
+        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true, true, 20_000.0),
+        (None, None, Some(0), 37, 0.25, 8, 0.0125, false, true, 300.0),
+        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true, false, 4999.5),
+        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true, true, 1.0),
     ];
     for w in [1600.0, 1400.0, 1240.0, 1000.0] {
         let mut first: Option<std::collections::BTreeMap<&'static str, (egui::Rect, f32)>> = None;
-        for (k, &(snap, rate, selected, speed, dt, element, pull, playing)) in states.iter().enumerate() {
+        for (k, &(snap, rate, selected, speed, dt, element, pull, playing, on, t)) in states.iter().enumerate() {
             let mut st = UiState::new("h2o", &scene);
             st.gpu_available = true;
             st.backend = snap.map_or(Backend::Estimated, |s| s.backend);
             st.mode = ToolMode::Select;
             (st.speed, st.dt_fs, st.element, st.drag_force) = (speed, dt, element, pull);
+            (st.thermostat_on, st.thermostat_t) = (on, t);
             let inp = PanelInput { selected, playing, measured_fs_per_s: rate, ..input(&scene, snap, &cam) };
             for _ in 0..2 {
                 GROUPS.with(|g| g.borrow_mut().clear());
                 frame(&ctx, &mut st, &inp, w, vec![]);
             }
             let groups = GROUPS.with(|g| g.borrow().clone());
-            assert_eq!(groups.len(), 7, "{w}: {:?}", groups.keys());
+            let thermostat = w != 1000.0;
+            assert_eq!(groups.len(), if thermostat { 8 } else { 7 }, "{w}: {:?}", groups.keys());
+            if thermostat {
+                // after dt, before Tool, overlapping neither
+                let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+                assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+            }
+            assert_eq!(PROBES.with(|p| p.borrow().contains_key("tb-thermostat-slider")), w >= 1400.0, "{w}: the slider");
+            PROBES.with(|p| p.borrow_mut().clear());
             for (anchor, (rect, width)) in &groups {
                 assert!(rect.width() <= width + 0.5, "{w} state {k}: {anchor} is {} wide, given {width}", rect.width());
                 assert!(rect.right() <= w, "{w} state {k}: {anchor} ends at {} past the window", rect.right());
@@ -1958,9 +1980,259 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         }
         let f = first.unwrap();
         let compact = f["tb-time"].0.height() < 40.0;
-        assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
+        assert_eq!(compact, w < 1600.0, "{w}: the full layout fits 1600, not 1400 (it needs {:.0})", toolbar::full_width(&ctx));
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
     }
+}
+
+// ---- the toolbar's Thermostat group (user request 2026-11-14) ----
+
+/// User ruling 2026-11-14: the toolbar is compact below the width its full layout needs with the
+/// Thermostat group (`toolbar::full_width`, measured from the groups' widths); at that width it
+/// is the full layout. The default 1400-pt window is compact and still holds the Thermostat slot
+/// (its short slider) between dt and Tool, overlapping neither.
+#[test]
+fn the_toolbar_is_full_from_the_width_its_groups_need() {
+    use toolbar::GROUPS;
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let full = toolbar::full_width(&ctx);
+    assert!((1400.0..1700.0).contains(&full), "the full layout's width: {full}");
+    let mut st = UiState::new("h2o", &scene);
+    st.backend = Backend::Estimated;
+    for (w, compact) in [(1400.0, true), (full.floor() - 1.0, true), (full.ceil(), false), (WIDE, false)] {
+        GROUPS.with(|g| g.borrow_mut().clear());
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..2 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let groups = GROUPS.with(|g| g.borrow().clone());
+        assert_eq!(groups["tb-time"].0.height() < 40.0, compact, "{w}: compact {compact}");
+        let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+        assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+        for (anchor, (rect, width)) in &groups {
+            assert!(rect.width() <= width + 0.5 && rect.right() <= w, "{w}: {anchor} {rect:?} given {width}");
+        }
+        for probe in ["tb-thermostat-on", "tb-thermostat-slider", "tb-thermostat-t"] {
+            let r = probed_rect(probe);
+            assert!(th.expand(0.5).contains_rect(r), "{w}: {probe} {r:?} inside the group {th:?}");
+        }
+    }
+}
+
+/// The thermostat slider's travel: T = 5000 K · u³ — monotone, 0–1000 K beyond half the travel,
+/// whole kelvin back from the travel, and a target above the top pins the slider at its end.
+#[test]
+fn the_thermostat_slider_favours_low_temperatures() {
+    use toolbar::{thermostat_from_travel as from, thermostat_travel as travel, THERMOSTAT_SLIDER_MAX_K as TOP};
+    assert_eq!((travel(0.0), travel(TOP), from(0.0), from(1.0)), (0.0, 1.0, 0.0, TOP));
+    assert!(travel(1000.0) > 0.5, "0–1000 K takes more than half the travel: {}", travel(1000.0));
+    assert!((travel(1000.0) - 0.2f64.cbrt()).abs() < 1e-12 && (travel(300.0) - 0.06f64.cbrt()).abs() < 1e-12);
+    assert_eq!(from(0.5), 625.0);
+    let mut last = -1.0;
+    for k in 0..=5000 {
+        let t = k as f64;
+        let u = travel(t);
+        assert!(u > last, "monotone at {t} K");
+        last = u;
+        assert_eq!(from(u), t, "{t} K survives the round trip");
+    }
+    for t in [5000.5, 20_000.0, 1e6] {
+        assert_eq!(travel(t), 1.0, "{t} K pins the slider at its end");
+    }
+    assert_eq!(travel(-5.0), 0.0);
+}
+
+/// The text shapes painted inside `rect` in one frame `w` wide, in paint order.
+fn texts_in(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, rect: egui::Rect) -> String {
+    fn walk(s: &egui::epaint::Shape, rect: egui::Rect, out: &mut String) {
+        match s {
+            egui::epaint::Shape::Text(t) if rect.expand(2.0).contains(t.pos) => out.push_str(t.galley.text()),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, rect, out)),
+            _ => {}
+        }
+    }
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0))), ..Default::default() };
+    let mut full = ctx.run_ui(raw, |root| {
+        show(root, st, inp);
+    });
+    full.textures_delta.clear();
+    let mut out = String::new();
+    full.shapes.iter().for_each(|c| walk(&c.shape, rect, &mut out));
+    out
+}
+
+fn actions(outs: &[PanelOutput]) -> Vec<Action> {
+    outs.iter().flat_map(|o| o.actions.iter().cloned()).collect()
+}
+
+/// The toolbar's Thermostat group sends the Physics menu's own `Action::Thermostat`: its box is the
+/// menu's checkbox (the same action, the same driver command); its slider and its value set the
+/// target in kelvin whatever the scale shown and leave the thermostat off when it is off (no
+/// driver command then); the compact slot's shorter slider maps the same.
+#[test]
+fn the_toolbar_thermostat_sends_the_menus_action() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    // the menu's checkbox, for comparison
+    let mut menu = UiState::new("h2", &scene);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let from_menu = actions(&click_widget(&ctx, &mut menu, &inp, "thermostat"));
+    egui::Popup::close_all(&ctx);
+    assert_eq!(from_menu, vec![Action::Thermostat { on: true, t: 300.0, tau: 10.0 }]);
+    // full, and compact with its short slider (at 1240 the compact slot has the boxes alone)
+    for w in [1600.0, 1300.0] {
+        let mut st = UiState::new("h2", &scene);
+        st.temp_units = TempUnits::C;
+        // the slider's middle: half the travel, 5000 K / 8, in kelvin although °C is shown
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(dyn_commands(&outs).is_empty() && !st.thermostat_on && st.thermostat_t == 625.0, "{w}: off stays off");
+        // dragged right: hotter, still off
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 12.0);
+        assert!(st.thermostat_t > 625.0 && !st.thermostat_on, "{w}: {}", st.thermostat_t);
+        assert!(actions(&outs).iter().all(|a| matches!(a, Action::Thermostat { on: false, .. })));
+        // the box: the menu's action, the menu's command
+        st.thermostat_t = 300.0;
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), from_menu, "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(Some((t, tau)))] if *t == 300.0 && *tau == 10.0), "{w}");
+        // on: a new target is sent to the driver
+        let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0));
+        assert!(matches!(c.as_slice(), [DynCommand::SetThermostat(Some((t, _)))] if *t == 625.0), "{w}: {c:?}");
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(None)]), "{w}");
+    }
+}
+
+/// The target box shows the target in the chosen scale and takes a typed value in it, any value
+/// from absolute zero up: 20 000 K typed is kept — the slider pinned at its end, and neither it
+/// nor the Physics menu's own box (no top either now) pulls it back to 5000 K.
+#[test]
+fn the_toolbar_thermostat_box_shows_the_scale_and_keeps_any_target() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+    }
+    let rect = probed_rect("tb-thermostat-t");
+    for (u, shown) in [(TempUnits::K, "300 K"), (TempUnits::C, "26.9 °C"), (TempUnits::F, "80.3 °F")] {
+        st.temp_units = u;
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+        assert_eq!(texts_in(&ctx, &mut st, &inp, 1600.0, rect), shown);
+    }
+    // typed in °F: 100 °F is 310.93 K
+    let type_in = |st: &mut UiState, text: &str| {
+        let mut outs = press_widget_w(&ctx, st, &inp, 1600.0, "tb-thermostat-t", 0.0);
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![egui::Event::Text(text.into())]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![]));
+        actions(&outs)
+    };
+    let a = type_in(&mut st, "100");
+    assert!(matches!(a.as_slice(), [Action::Thermostat { on: false, t, tau }] if (*t - units::fahrenheit_to_kelvin(100.0)).abs() < 1e-9 && *tau == 10.0), "{a:?}");
+    // above the slider's top, in kelvin
+    st.temp_units = TempUnits::K;
+    let a = type_in(&mut st, "20000");
+    assert_eq!(a, vec![Action::Thermostat { on: false, t: 20_000.0, tau: 10.0 }]);
+    assert_eq!(st.thermostat_t, 20_000.0);
+    // drawn again, toolbar and Physics menu open: nothing changes it
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1600.0, vec![]).actions.is_empty());
+    }
+    egui::Popup::close_all(&ctx);
+    assert_eq!(st.thermostat_t, 20_000.0, "kept above the slider's top");
+    assert!(texts_in(&ctx, &mut st, &inp, 1600.0, probed_rect("tb-thermostat-t")).starts_with("20000"));
+    assert!(probed_rect("tb-thermostat-slider").width() > 70.0, "the full slider");
+}
+
+// ---- the tool keys (user request 2026-11-14) ----
+
+/// Keys 1–4 pick the Tool segments in the group's order through the segments' own
+/// `Action::Tool` (so `--record` writes them): Inspect, Place, Grab, Edit. The numpad's digits
+/// arrive as the same egui keys (egui-winit maps `Numpad1` and `Digit1` to `Key::Num1`; the
+/// logical "1" too). Nothing with Ctrl / Alt / Shift held, for an auto-repeat, while a text box
+/// has the keyboard (the digit goes into the box), or with Ctrl K's search open.
+#[test]
+fn keys_1_to_4_pick_the_tools() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let digit = |key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers, repeat: bool| {
+        egui::Event::Key { key, physical_key: physical, pressed: true, repeat, modifiers }
+    };
+    let press = |st: &mut UiState, key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers| {
+        let repeat = false;
+        let text = key.symbol_or_name().to_string();
+        let out = frame(&ctx, st, &inp, WIDE, vec![digit(key, physical, modifiers, repeat), egui::Event::Text(text)]);
+        // released (egui marks a press of a key it holds down as a repeat)
+        let up = egui::Event::Key { key, physical_key: physical, pressed: false, repeat: false, modifiers };
+        frame(&ctx, st, &inp, WIDE, vec![up]);
+        out.actions
+    };
+    use egui::Key::{Num1, Num2, Num3, Num4};
+    use egui::Modifiers as M;
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    }
+    assert_eq!(st.mode, ToolMode::Orbit);
+    // the top row (logical and physical key), in an order where each one changes the tool
+    for (key, mode) in [(Num4, ToolMode::Edit), (Num3, ToolMode::Select), (Num2, ToolMode::Place), (Num1, ToolMode::Orbit)] {
+        assert_eq!(press(&mut st, key, Some(key), M::NONE), vec![Action::Tool(mode)], "{key:?}");
+        assert_eq!(st.mode, mode, "{key:?}");
+    }
+    // the numpad as egui-winit hands it over, and a layout giving only the logical digit
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)]);
+    assert_eq!(press(&mut st, Num3, None, M::NONE), vec![Action::Tool(ToolMode::Select)]);
+    // the segments' own click sends the same action
+    assert_eq!(actions(&press_widget_w(&ctx, &mut st, &inp, WIDE, "tool-Edit", 0.0)), vec![Action::Tool(ToolMode::Edit)]);
+    // modifiers and auto-repeats: nothing
+    for m in [M::CTRL, M::COMMAND, M::ALT, M::SHIFT] {
+        assert!(press(&mut st, Num1, Some(Num1), m).is_empty(), "{m:?}+1");
+    }
+    assert_eq!(st.mode, ToolMode::Edit);
+    // held: egui marks the next press of a key still down an auto-repeat, which does nothing
+    let held = digit(Num1, Some(Num1), M::NONE, false);
+    assert_eq!(frame(&ctx, &mut st, &inp, WIDE, vec![held.clone(), egui::Event::Text("1".into())]).actions, vec![Action::Tool(ToolMode::Orbit)]);
+    st.mode = ToolMode::Edit;
+    assert!(frame(&ctx, &mut st, &inp, WIDE, vec![held, egui::Event::Text("1".into())]).actions.is_empty(), "a repeat");
+    frame(&ctx, &mut st, &inp, WIDE, vec![egui::Event::Key { key: Num1, physical_key: Some(Num1), pressed: false, repeat: false, modifiers: M::NONE }]);
+    assert_eq!(st.mode, ToolMode::Edit);
+    // a text box with the keyboard (the speed box, clicked into its text): the digit is typed
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 0.0);
+    assert!(ctx.egui_wants_keyboard_input(), "the speed box is being typed in");
+    let typed = press(&mut st, Num1, Some(Num1), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "typed, not a tool: {typed:?}");
+    assert_eq!(st.mode, ToolMode::Edit);
+    frame(&ctx, &mut st, &inp, WIDE, vec![key(egui::Key::Escape, M::NONE)]);
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    assert!(!ctx.egui_wants_keyboard_input());
+    // Ctrl K's search open (its field has the keyboard; the gate holds without it too)
+    st.search.toggle();
+    let typed = press(&mut st, Num2, Some(Num2), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "the search is open: {typed:?}");
+    st.search.toggle();
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)], "and back");
 }
 
 // ---- M6 Task 10: bonds, molecules, badge, relax, isotopes, the periodic table ----
@@ -2057,12 +2329,12 @@ fn clicking_the_m6_controls_sends_their_commands() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
     let mut relaxing = snapshot(&scene, Backend::Gpu, None);
     relaxing.dynamics.relax = Some(relax_progress(None));
     let inp_r = PanelInput { selected: Some(0), ..input(&scene, Some(&relaxing), &cam) };
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp_r, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp_r, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
     let in_menu = |st: &mut UiState, inp: &PanelInput<'_>, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
@@ -6787,6 +7059,222 @@ mod knowledge_map {
         let snap = with_map(&scene, untrusted);
         let t = texts(&ctx, &mut st, &input(&scene, Some(&snap), &cam));
         assert!(t.contains("the model as a whole is not trusted yet (max training energy residual"), "{t}");
+    }
+
+    // ---- the graph's zoom, pan and Fit (user request 2026-11-14) ----
+
+    /// The Knowledge panel's screenshot map: O and H, with O–O (never seen), O–H and H–H.
+    fn oh_map() -> sim::KnowledgeMap {
+        let mut m = knowledge::fixture_map();
+        m.elements.retain(|e| e.z != 6);
+        m.pairs.retain(|p| p.z.0 != 6 && p.z.1 != 6);
+        for p in m.pairs.iter_mut().filter(|p| p.z == (8, 8)) {
+            (p.samples, p.confidence) = (0, sim::Confidence::Unseen);
+        }
+        m
+    }
+
+    fn oh_snapshot(scene: &Scene) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(oh_map()));
+        snap
+    }
+
+    /// One frame of the panel (1400 wide), checked display only.
+    fn step(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>) {
+        let out = frame(ctx, st, inp, 1400.0, events);
+        assert!(out.commands.is_empty() && out.actions.is_empty(), "the map is display only");
+    }
+
+    fn wheel(lines: f32) -> egui::Event {
+        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, lines), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// A disc's centre and radius from its probed square.
+    fn disc(z: u8) -> (egui::Pos2, f32) {
+        let r = probed_rect(&format!("knowledge-node-{z}"));
+        (r.center(), r.width() / 2.0)
+    }
+
+    /// Presses at `from`, moves by `by` in four steps, releases.
+    fn drag(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, from: egui::Pos2, by: egui::Vec2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(from), pointer(from, true)]);
+        for k in 1..=4 {
+            step(ctx, st, inp, vec![egui::Event::PointerMoved(from + by * (k as f32 / 4.0))]);
+        }
+        step(ctx, st, inp, vec![pointer(from + by, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    fn click_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, at: egui::Pos2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        step(ctx, st, inp, vec![pointer(at, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    /// The wheel over the map zooms about the cursor (the point under it stays put, within 1 pt)
+    /// and the panel does not scroll; elsewhere it leaves the zoom alone. A drag on empty space pans
+    /// and picks nothing; a click on a line still picks it after the pan and the zoom. Fit (and a
+    /// double-click on empty space, and the first frame) frames every node inside the map.
+    #[test]
+    fn the_knowledge_graph_zooms_pans_and_fits() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let map = probed_rect("knowledge-map");
+        let inside = |st: &UiState| {
+            for z in [1, 8] {
+                let (c, r) = disc(z);
+                assert!(map.contains_rect(egui::Rect::from_center_size(c, egui::Vec2::splat(2.0 * r))), "{z} inside {map:?} at zoom {}", st.knowledge.zoom);
+            }
+        };
+        inside(&st);
+        assert!(st.knowledge.fitted.is_some(), "fitted when first shown");
+        // the wheel, near the O node
+        let (o0, _) = disc(8);
+        let at = o0 + egui::vec2(6.0, -4.0);
+        assert!(map.contains(at));
+        let z0 = st.knowledge.zoom;
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at)]);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at), wheel(2.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        let k = st.knowledge.zoom / z0;
+        assert!((k - 1.44).abs() < 1e-3, "two lines of 1.2×: {k}");
+        let (o1, _) = disc(8);
+        let want = at + (o0 - at) * k;
+        assert!(o1.distance(want) < 1.0, "the point under the cursor stays: O at {o1:?}, want {want:?}");
+        assert_eq!(probed_rect("knowledge-map"), map, "the panel did not scroll");
+        // the wheel elsewhere: the zoom stays
+        let away = egui::pos2(map.center().x, map.bottom() + 40.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(away), wheel(-1.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert!((st.knowledge.zoom / z0 - 1.44).abs() < 1e-3, "not over the map: {}", st.knowledge.zoom / z0);
+        // a drag on empty space (the map's bottom-left corner) pans and picks nothing
+        let pick = st.knowledge.pick;
+        let pan0 = st.knowledge.pan;
+        let (o1, _) = disc(8);
+        drag(&ctx, &mut st, &inp, map.left_bottom() + egui::vec2(10.0, -10.0), egui::vec2(-40.0, 0.0));
+        let moved = st.knowledge.pan - pan0;
+        assert!((moved.x + 40.0).abs() < 1.0 && moved.y.abs() < 1.0, "panned by the drag: {moved:?}");
+        assert_eq!(st.knowledge.pick, pick, "a pan picks nothing");
+        let (o2, _) = disc(8);
+        assert!((o2 - o1 - egui::vec2(-40.0, 0.0)).length() < 1.0, "O moved with it");
+        // after the pan and the zoom, a click on the O–H line (between the two nodes, off its label) picks it
+        let ((h, rh), (o, ro)) = (disc(1), disc(8));
+        let label = probed_rect("knowledge-pair-1-8");
+        let on_line = (1..20)
+            .map(|k| h + (o - h) * (k as f32 / 20.0))
+            .find(|q| map.contains(*q) && q.distance(h) > rh + 4.0 && q.distance(o) > ro + 4.0 && !label.expand(2.0).contains(*q))
+            .expect("a free point of the line in the map");
+        click_at(&ctx, &mut st, &inp, on_line);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "the line is still clickable");
+        // Fit, from far out and panned away
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(260.0, -90.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        click_widget(&ctx, &mut st, &inp, "knowledge-fit");
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "Fit keeps the pick");
+        // a double-click on empty space fits too (zoomed out, the nodes pushed off to the right)
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(300.0, 0.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        let corner = map.left_bottom() + egui::vec2(10.0, -10.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(corner), pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        // not refitted on a refresh of the same map; refitted when an element joins; reset with a new scene
+        st.knowledge.zoom = 2.0;
+        st.activity.absorb(&snap);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert_eq!(st.knowledge.zoom, 2.0, "the same elements: no refit");
+        let full = with_map(&scene, model());
+        st.activity.absorb(&full);
+        step(&ctx, &mut st, &input(&scene, Some(&full), &cam), vec![]);
+        assert!(st.knowledge.zoom != 2.0 && st.knowledge.fitted.as_deref() == Some(&[1, 6, 8][..]), "C joined: fitted again");
+        st.knowledge.zoom = 3.0;
+        act(&mut st, &inp, Action::Preset("h2".into()));
+        assert_eq!((st.knowledge.zoom, st.knowledge.pan, st.knowledge.fitted.clone()), (1.0, egui::Vec2::ZERO, None), "a new scene resets the view");
+    }
+
+    /// Every text the map paints (its painter clips to the map): (text, font size).
+    fn map_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, map: egui::Rect) -> Vec<(String, f32)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.job.sections[0].format.font_id.size)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        full.shapes.iter().filter(|c| map.expand(1.0).contains_rect(c.clip_rect)).for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// The pair labels sit clear of every node disc (the screenshot's map: "O–O · never" sat on
+    /// the O node, the loop labels on their loops), and the text keeps its size at 0.5× and 4×.
+    #[test]
+    fn the_knowledge_graph_labels_clear_the_nodes_and_keep_their_size() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let discs = [disc(1), disc(8)];
+        for (a, b) in [(1, 1), (1, 8), (8, 8)] {
+            let r = probed_rect(&format!("knowledge-pair-{a}-{b}"));
+            for (z, (c, rad)) in [1, 8].into_iter().zip(discs) {
+                assert!(r.distance_to_pos(c) > rad, "the {a}–{b} label {r:?} clears node {z} ({c:?}, r {rad})");
+            }
+        }
+        let map = probed_rect("knowledge-map");
+        let at_1 = map_texts(&ctx, &mut st, &inp, map);
+        for want in ["O", "H", "O–H · trusted", "O–O · never", "H–H · thin", "880 atoms"] {
+            assert!(at_1.iter().any(|t| t.0 == want), "{want:?} in {at_1:?}");
+        }
+        for zoom in [0.5, 4.0] {
+            st.knowledge.zoom = zoom;
+            st.knowledge.pan = egui::Vec2::ZERO;
+            for _ in 0..2 {
+                step(&ctx, &mut st, &inp, vec![]);
+            }
+            let now = map_texts(&ctx, &mut st, &inp, map);
+            for (text, size) in &at_1 {
+                if let Some((_, s)) = now.iter().find(|t| &t.0 == text) {
+                    assert_eq!(s, size, "{text:?} at {zoom}×");
+                } else {
+                    assert!(zoom < 1.0 && text.contains('·'), "{text:?} drawn at {zoom}× (only crowded pair labels may fade out)");
+                }
+            }
+            assert!(now.iter().any(|t| t.0 == "O") && now.iter().any(|t| t.0 == "H"), "the node letters stay at {zoom}×");
+        }
     }
 
     #[test]
