@@ -422,7 +422,9 @@ pub enum EnvClass {
 /// The trust rule's conditions, in the order `trust_checks` lists them and `untrusted_check`
 /// tests them (`providers::surrogate`). The audit condition is `Audit` (the per-atom energy gap,
 /// or no failed audit since the refit) or `AuditForces` (the failed audit's worst atom force
-/// residual): plan review M1.
+/// residual): plan review M1. `EnergyResidual` and `ForceResidual` judge the fitted samples
+/// outside the misfit set M; `Misfit` counts M, the fitted samples the fit cannot reproduce,
+/// against 10 % of the fitted samples (spec 2026-11-13 §4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustKey {
     Samples,
@@ -430,6 +432,7 @@ pub enum TrustKey {
     ResidualDofF,
     EnergyResidual,
     ForceResidual,
+    Misfit,
     ForceNoise,
     Audit,
     AuditForces,

@@ -130,6 +130,7 @@ impl SurrogateKs {
         self.active_set = None;
         self.audit_force = None;
         self.training_residuals = None;
+        self.misfit = None;
         self.class_loo = Vec::new();
         self.class_memory = BTreeMap::new();
         self.class_judge = None;
@@ -446,7 +447,7 @@ impl SurrogateKs {
         self.model_gen = self.model_gen.max(newest) + 1;
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
-        self.training_residuals = self.compute_training_residuals();
+        (self.training_residuals, self.misfit) = self.compute_residuals().unzip();
         // the hysteresis memory is the file's own, saved with the model (M8a Task 2 fix round 2,
         // the task review's M4): a reload, the worker's re-spawn with its carried model and a
         // resumed training keep a verdict that sat inside the band (ENTER, LEAVE]; a file without

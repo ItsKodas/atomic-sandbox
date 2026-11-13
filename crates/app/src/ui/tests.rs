@@ -2200,7 +2200,7 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
     use sim::activity::{TrustCheck, TrustKey as K};
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
-    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise, audit]
         .into_iter()
         .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0 })
         .collect()
@@ -4165,6 +4165,7 @@ mod activity_words {
             "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
         );
         assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Misfit), None, RowCtx::default()), "the model was not trusted then: too many training samples it could not reproduce");
     }
 
     /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
@@ -4528,6 +4529,16 @@ mod activity_trust {
         assert_eq!(mha(0.0), "0");
     }
 
+    /// Spec 2026-11-13 §4.3: the misfit row reads as the training samples the model cannot
+    /// reproduce, the count against 10 % of the fitted samples.
+    #[test]
+    fn the_misfit_line_counts_the_samples_it_cannot_reproduce() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3 };
+        assert_eq!(trust_line(&c, AuditSeen::Never, 20), "Few training samples it cannot reproduce — 3 of at most 12.3 (10 % of the fitted samples)");
+    }
+
     /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
     /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
     /// by default.
@@ -4651,7 +4662,8 @@ mod activity_trust {
     fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
         use sim::activity::TrustKey as K;
         let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+        // the misfit row too (spec 2026-11-13 §4.3): before it, those samples failed the residual rows
+        for key in [K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise] {
             assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
         }
         for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {

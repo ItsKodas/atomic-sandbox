@@ -296,11 +296,14 @@ fn misspecified_fit_is_untrusted_by_its_training_residuals() {
     assert!(rep.n_samples >= rep.q_prime && rep.residual_dof_e >= MIN_RESIDUAL_DOF && rep.residual_dof_f >= MIN_RESIDUAL_DOF, "{rep:?}: the sample-count conditions pass; only the residuals can refuse");
     assert!(!s.trusted(), "the misspecified fit must not be trusted");
     assert!(tr.energy_per_atom > 3e-3, "{tr:?}: max training energy residual ≥ 3× energy_std_per_atom");
-    assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"), "{:?}", s.untrusted_reason());
+    // every sample is beyond its bound, so the misfit set is the whole store and the misfit row
+    // refuses (spec 2026-11-13 §4.3); the recovery's all-sample residuals fail
+    assert!(s.residuals_fail());
+    assert!(s.untrusted_reason().unwrap().contains("training samples the model cannot reproduce"), "{:?}", s.untrusted_reason());
     let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
     assert_eq!(r.stats.energy_surface(), Surface::Teacher);
-    assert!(r.stats.notes.iter().any(|n| n.contains("surrogate untrusted: max training energy residual")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.starts_with("surrogate untrusted: ") && n.contains("training samples the model cannot reproduce")), "{:?}", r.stats.notes);
     assert_eq!(calls(&h), 1);
     // the epistemic energy criterion alone (the floor N·s_E excluded, as the provider does)
     // would not have caught it at an in-window geometry: the point of the rule
@@ -887,7 +890,9 @@ fn thinning_keeps_one_in_ten_near_identical_fallbacks_and_every_far_one() {
     assert!(s.trusted());
     // untrusted by its residuals (an impossible energy threshold), not by its sample count
     s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
-    assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"));
+    // (every sample is then a misfit: the misfit row refuses, spec 2026-11-13 §4.3)
+    assert!(s.residuals_fail() && !s.trust_needs_samples());
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "{:?}", s.untrusted_reason());
     let n0 = s.samples();
     let mut copies = 0;
     for _ in 0..25 {
@@ -1063,6 +1068,146 @@ fn a_failed_recovery_leaves_the_collection_codes_as_they_were() {
     drop(s);
     let (c, _) = surrogate::Collection::open(&dir, &key).unwrap();
     assert_eq!(c.quarantine, codes, "no status record written");
+}
+
+// ---- Spec 2026-11-13 §4.3 (open-shell model Task 5): the misfit set M ----
+
+/// Adds an H₂ sample at bond length `r` whose energy is off by `off` Ha (the forces exact).
+fn add_stray(s: &mut SurrogateKs, r: f64, off: f64) {
+    let sc = dimer(r, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+    bad.energy += off;
+    s.add_sample(bad, &sc).unwrap();
+}
+
+/// "The Task 5 store": 120 good H₂ samples and three strays (+0.01 Ha, 5× the per-atom bound, at
+/// r = 1.55, 1.63, 1.71: indices 120–122), refitted without the trust recovery (`skip_recovery`),
+/// so M is the fit's own.
+fn task5_store() -> SurrogateKs {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.skip_recovery = true;
+    for r in [1.55, 1.63, 1.71] {
+        add_stray(&mut s, r, 0.01);
+    }
+    s.refit().unwrap();
+    s
+}
+
+/// §4.3: a few training samples the fit cannot reproduce leave the model trusted — they are counted
+/// (the `Misfit` row, against 10 % of the fitted samples) and the residual rows judge the rest;
+/// `training_residuals` still means every fitted sample.
+#[test]
+fn a_small_misfit_leaves_the_model_trusted() {
+    use sim::activity::TrustKey;
+    let s = task5_store();
+    let m = s.misfit().expect("a misfit record after the refit");
+    println!("M: samples {:?}; atoms {:?}; fitted {}; outside {:?}; all-sample {:?}", m.samples, m.atoms, m.fitted, m.outside, s.training_residuals());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    for i in [120, 121, 122] {
+        assert!(m.samples.contains(&i), "stray {i} in M: {:?}", m.samples);
+        assert!(m.atoms.contains(&(i, 0)) && m.atoms.contains(&(i, 1)), "an energy misfit blames every trained atom: {:?}", m.atoms);
+    }
+    let checks = s.trust_checks();
+    let row = |k: TrustKey| *checks.iter().find(|c| c.key == k).unwrap_or_else(|| panic!("{k:?} row: {checks:?}"));
+    let keys: Vec<TrustKey> = checks.iter().map(|c| c.key).collect();
+    let at = keys.iter().position(|&k| k == TrustKey::Misfit).unwrap();
+    assert_eq!(keys[at - 1], TrustKey::ForceResidual, "the misfit row follows the force residual row: {keys:?}");
+    let mis = row(TrustKey::Misfit);
+    println!("Misfit row: {} of {:.2} (fitted {}, store {})", mis.value, mis.limit, m.fitted, s.samples());
+    assert!(mis.met && mis.value == m.samples.len() as f64, "{mis:?}");
+    assert_eq!(mis.limit, QUARANTINE_MAX_FRACTION * m.fitted as f64, "10 % of the fitted samples");
+    let e = row(TrustKey::EnergyResidual);
+    assert!(e.met && e.value <= 1e-3, "the energy row judges the samples outside M: {e:?}");
+    assert_eq!(e.value, m.outside.energy_per_atom);
+    assert!(s.training_residuals().unwrap().energy_per_atom > 1e-3, "the all-sample residual keeps its meaning");
+}
+
+/// §4.3: when M is more than 10 % of the fitted samples the model is untrusted by the misfit row,
+/// and its refusal counts M and names its scenes. 40 good + 6 equal strays (+0.1 Ha, distinct r):
+/// 6 > 4.6, so the quarantine rounds hold nothing (§4.2, Task 1) and the strays stay in M.
+#[test]
+fn a_large_misfit_untrusts_the_model() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    for k in 0..6 {
+        add_stray(&mut s, 1.3 + 0.15 * k as f64, 0.1);
+    }
+    s.refit().unwrap();
+    let m = s.misfit().expect("a misfit record");
+    println!("M: {:?} of {} fitted; held {}; note {:?}; refusal {:?}", m.samples, m.fitted, s.quarantined(), s.recovery_note(), s.untrusted_check());
+    assert_eq!(s.quarantined(), 0, "the premise: the rounds held nothing");
+    assert!(!s.trusted());
+    let (key, text) = s.untrusted_check().unwrap();
+    assert_eq!(key, TrustKey::Misfit, "{text}");
+    assert!(text.contains("training samples the model cannot reproduce"), "{text}");
+    assert!(text.contains(&format!("{} ×", super::shared::formula(&[1, 1]))), "the scenes are named: {text}");
+    assert!(m.samples.len() >= 6 && (40..46).all(|i| m.samples.contains(&i)), "{:?}", m.samples);
+}
+
+/// §4.3: M is left out of the class rule's statistics — on the Task 5 store the pair class is
+/// trusted, and no sample of M is the class's worst or a blocker.
+#[test]
+fn the_class_rule_leaves_misfits_out() {
+    let s = task5_store();
+    let m = s.misfit().unwrap().samples.clone();
+    println!("M {m:?}; pair class {:?}; worst {:?}; blockers {:?}", s.class_loo()[0], s.class_worst, s.class_blockers);
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.class_worst.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_worst);
+    assert!(s.class_blockers.iter().flatten().all(|(i, _)| !m.contains(i)), "{:?}", s.class_blockers);
+}
+
+/// Review Focus 2: an environment key whose only samples are misfits has no samples of its own in
+/// the class statistics — the class rule refuses it on the sample floor. 120 good H₂ + three H₃
+/// samples the fit cannot reproduce (`skip_recovery`): one H₃ geometry, moved rigidly (the same
+/// descriptors), labelled +0.02, −0.02 and +0.02 Ha off — contradictory labels. (Three distinct
+/// H₃ geometries all +0.01 Ha off, the plan's store, are fitted: only they touch the many-body
+/// columns, which absorb the offset; measured M = [] on this store.)
+#[test]
+fn a_key_held_only_by_misfits_is_refused() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.skip_recovery = true;
+    let h3 = |k: usize| {
+        let o = [0.1 * k as f64, 0.0, 0.0];
+        let mut sc = dimer(1.45, [1.0, 0.0, 0.0], o, 1, 1);
+        sc.nuclei.push(Nucleus::new(1, [o[0] + 0.15, 1.8, 0.0]));
+        sc
+    };
+    for (k, off) in [0.02, -0.02, 0.02].into_iter().enumerate() {
+        let sc = h3(k);
+        let mut bad = pair_morse_sample(&sc);
+        bad.energy += off;
+        s.add_sample(bad, &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let m = s.misfit().unwrap();
+    println!("M {:?} of {} fitted; trusted {} {:?}", m.samples, m.fitted, s.trusted(), s.untrusted_reason());
+    assert!([120, 121, 122].iter().all(|i| m.samples.contains(i)), "the premise: the three H₃ samples are misfits: {:?}", m.samples);
+    let sc = h3(1);
+    let (pos, z) = pos_z(&sc);
+    let rc = s.model.as_ref().unwrap().basis.r_cut;
+    let refused = s.class_untrusted(&env_keys(&pos, &z, rc * rc));
+    println!("the class rule at an H₃ geometry: {:?}", refused.as_ref().map(|(r, short)| (&r.text, short)));
+    assert!(matches!(refused, Some((_, true))), "refused on the sample floor: {:?}", refused.map(|(r, s)| (r.text, s)));
+}
+
+/// Review Focus 1: a NaN residual is never a misfit — it stays with the samples the residual rows
+/// judge, and fails them (activity Task 3b), with M empty.
+#[test]
+fn a_nan_residual_is_not_a_misfit() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted());
+    poison_the_model(&mut s);
+    let (t, m) = s.compute_residuals().expect("a model and a store");
+    assert!(m.samples.is_empty() && m.atoms.is_empty(), "NaN ratios are not misfits: {m:?}");
+    assert_eq!(m.fitted, 120);
+    assert!(m.outside.energy_per_atom.is_nan() && m.outside.force.is_nan() && t.energy_per_atom.is_nan(), "{m:?} {t:?}");
+    (s.training_residuals, s.misfit) = (Some(t), Some(m));
+    assert!(!s.trusted());
+    let checks = s.trust_checks();
+    let first = checks.iter().find(|c| !c.met).unwrap();
+    assert!(matches!(first.key, TrustKey::EnergyResidual | TrustKey::ForceResidual) && first.value.is_nan(), "{checks:?}");
+    assert!(checks.iter().any(|c| c.key == TrustKey::Misfit && c.met && c.value == 0.0), "{checks:?}");
 }
 
 /// A long-range Morse teacher (a = 0.3: at R = 8 the pair still binds by 4.4e-2 Ha, while
@@ -1817,11 +1962,13 @@ fn box_affected_samples_never_fence_and_leave_the_fit_at_the_trust_floor() {
         }
     };
     // 40 clean samples: below the floor (29 + 30), the confined ones stay in the fit; the
-    // residuals fail but none of them may be quarantined
+    // residuals fail but none of them may be quarantined (since spec 2026-11-13 §4.3 the three
+    // are the misfit set, 3 ≤ 4.3: the model is trusted with them in the fit)
     add(&mut s, 40);
     s.refit().unwrap();
-    println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded());
-    assert!(!s.trusted() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+    println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}, M {:?}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded(), s.misfit().map(|m| &m.samples));
+    assert!(s.residuals_fail() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+    assert!(s.misfit().is_some_and(|m| (0..3).all(|i| m.samples.contains(&i))), "{:?}", s.misfit());
     // 30 more: the floor is met without them — they leave the fit, never quarantined
     add(&mut s, 30);
     let rep = s.refit().unwrap();
@@ -4333,9 +4480,11 @@ fn the_first_unmet_trust_check_is_the_refusal() {
     assert_eq!(first_unmet(&s), key(&s));
     assert!(matches!(key(&s), Some(TrustKey::ResidualDofE | TrustKey::ResidualDofF)), "{:?}", s.untrusted_reason());
     // training residuals (the misspecified fit of `misspecified_fit_is_untrusted_by_its_training_residuals`)
+    // (every sample is beyond its bound: the misfit row, spec 2026-11-13 §4.3)
     let (s, _) = trained_oscillatory(1.2, 2.2, 120, 0.02, 6.0);
     assert_eq!(first_unmet(&s), key(&s));
-    assert!(matches!(key(&s), Some(TrustKey::EnergyResidual | TrustKey::ForceResidual)), "{:?}", s.untrusted_reason());
+    assert_eq!(key(&s), Some(TrustKey::Misfit), "{:?}", s.untrusted_reason());
+    assert!(s.residuals_fail());
     // a failed audit, on the energy and on the forces
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     s.audit_failed = Some(0.5);
@@ -4366,11 +4515,22 @@ fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
     let tier = s.policy.energy_std_per_atom;
     s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF;
     s.training_residuals.as_mut().unwrap().energy_per_atom = tier;
+    // the residual rows read the samples outside M (spec 2026-11-13 §4.3)
+    s.misfit.as_mut().unwrap().outside.energy_per_atom = tier;
+    // |M| at its limit: 12 of 120 fitted
+    s.misfit.as_mut().unwrap().fitted = 120;
+    s.misfit.as_mut().unwrap().samples = (0..12).collect();
     let checks = s.trust_checks();
     let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
-    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "at the limit: {checks:?}");
+    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual) && met(TrustKey::Misfit), "at the limit: {checks:?}");
     assert_eq!(s.untrusted_check(), None);
     assert!(s.trusted());
+    // one over the misfit limit: unmet, and the refusal names the same key
+    s.misfit.as_mut().unwrap().samples = (0..13).collect();
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::Misfit));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::Misfit));
+    assert!(!s.trusted());
+    s.misfit.as_mut().unwrap().samples = (0..12).collect();
     // NaN: unmet, and the refusal names the same key
     s.report.as_mut().unwrap().residual_dof_e = f64::NAN;
     assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
@@ -4569,6 +4729,10 @@ fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
             }
             t
         });
+        // the residual rows read the samples outside M (spec 2026-11-13 §4.3): here M is empty, so
+        // they judge every fitted sample as the pre-Task-3 rule did (the misfit row's own
+        // decisions: `the_trust_checks_and_the_refusal_agree_at_equality_and_nan`)
+        s.misfit = s.training_residuals.map(|t| Misfit { samples: Vec::new(), atoms: Vec::new(), outside: t, fitted: report.n_samples });
         s.audit_failed = rng.gen_bool(0.3).then(|| around(&mut rng, s.policy.energy_std_per_atom) * if rng.gen_bool(0.5) { -1.0 } else { 3.0 });
         s.audit_force = rng.gen_bool(0.4).then(|| (around(&mut rng, 2e-3), 2e-3));
         s.audit_atoms = rng.gen_range(0..4);
@@ -4738,12 +4902,28 @@ fn a_nan_in_any_trust_input_refuses_trust() {
     let (base, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(base.trusted());
     type Poke = fn(&mut SurrogateKs);
-    let cases: [(&str, Poke, TrustKey); 6] = [
+    // the residual rows read the samples outside M (spec 2026-11-13 §4.3): each residual poke
+    // sets the all-sample field and the same field of `misfit.outside`
+    let cases: [(&str, Poke, TrustKey); 7] = [
         ("residual_dof_e", |s| s.report.as_mut().unwrap().residual_dof_e = f64::NAN, TrustKey::ResidualDofE),
         ("residual_dof_f", |s| s.report.as_mut().unwrap().residual_dof_f = f64::NAN, TrustKey::ResidualDofF),
-        ("energy residual", |s| s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN, TrustKey::EnergyResidual),
-        ("force residual", |s| s.training_residuals.as_mut().unwrap().force = f64::NAN, TrustKey::ForceResidual),
-        ("force bound", |s| s.training_residuals.as_mut().unwrap().force_bound = f64::NAN, TrustKey::ForceResidual),
+        ("energy residual", |s| {
+            s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.energy_per_atom = f64::NAN;
+        }, TrustKey::EnergyResidual),
+        ("force residual", |s| {
+            s.training_residuals.as_mut().unwrap().force = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.force = f64::NAN;
+        }, TrustKey::ForceResidual),
+        ("force bound", |s| {
+            s.training_residuals.as_mut().unwrap().force_bound = f64::NAN;
+            s.misfit.as_mut().unwrap().outside.force_bound = f64::NAN;
+        }, TrustKey::ForceResidual),
+        // |M| is a count (never NaN): one over its limit refuses with the misfit row
+        ("misfit count", |s| {
+            let m = s.misfit.as_mut().unwrap();
+            m.samples = (0..(QUARANTINE_MAX_FRACTION * m.fitted as f64).floor() as usize + 1).collect();
+        }, TrustKey::Misfit),
         ("σ_f", |s| s.report.as_mut().unwrap().sigma_f = f64::NAN, TrustKey::ForceNoise),
     ];
     for (name, poke, key) in cases {
@@ -4782,9 +4962,9 @@ fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.trusted() && s.class_loo()[0].trusted);
     poison_the_model(&mut s);
-    let t = s.compute_training_residuals().expect("a model and a store");
+    let (t, m) = s.compute_residuals().expect("a model and a store");
     assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
-    s.training_residuals = Some(t);
+    (s.training_residuals, s.misfit) = (Some(t), Some(m));
     assert!(!s.trusted());
     let classes = s.compute_class_loo_full().0.unwrap().0;
     let pair = &classes[0];
@@ -5325,7 +5505,7 @@ fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     s.accumulator = Some(acc);
     s.model = Some(model);
     s.report = Some(report);
-    s.training_residuals = s.compute_training_residuals();
+    (s.training_residuals, s.misfit) = s.compute_residuals().unzip();
     s.class_loo = s.compute_class_loo_full().0.map(|l| l.0).unwrap_or_default();
     s.rebuild_active_set();
     eprintln!(
@@ -6384,7 +6564,9 @@ fn a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery() {
     s.refit().unwrap();
     println!("after the refit: cap {:?}, Q′ {}, trusted {} {:?}, quarantined {}", s.degree_cap, s.report().unwrap().q_prime, s.trusted(), s.untrusted_reason(), s.quarantined());
     assert_eq!(s.degree_cap, None, "the cap-6 retry is not kept");
-    assert!(s.untrusted_reason().is_some_and(|r| r.contains("training energy residual")), "the reason that is true: {:?}", s.untrusted_reason());
+    // (the cap-4 fit's misfit spreads over the store: the misfit row, spec 2026-11-13 §4.3)
+    assert!(s.residuals_fail() && !s.trust_needs_samples());
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "the reason that is true: {:?}", s.untrusted_reason());
     // with enough samples for cap 6 the retry is kept and trusted
     let mut big = dimer_model_three_atom_teacher();
     let mut sc = in_cell_65(h2(1.4));
@@ -6895,8 +7077,8 @@ fn kabsch_recovers_a_rotation() {
 
 /// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
 /// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
-/// follow has its blockers refused as structural ("the model cannot represent it"), and nothing
-/// is started for them.
+/// follow offers nothing and starts nothing: since spec 2026-11-13 §4.3 its samples (in-sample
+/// beyond their bounds) are the misfit set, out of the class statistics, so they block no class.
 #[test]
 fn teach_diagnosis_separates_leverage_from_structure() {
     let (s, _h) = tail_blocked();
@@ -6912,25 +7094,18 @@ fn teach_diagnosis_separates_leverage_from_structure() {
     for (i, _, ins, _) in &o.refused {
         assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
     }
-    // structure: the basis cannot follow 12 extrema on 1 Bohr
+    // structure: the basis cannot follow 12 extrema on 1 Bohr. Every sample is beyond its bound
+    // in-sample, so it is in the misfit set and out of the class statistics (spec 2026-11-13
+    // §4.3): no blocker is offered (before §4.3 they were listed refused as "cannot represent")
     let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
     let d = m.teach_diagnosis();
-    let structural = d.iter().filter(|b| !b.teachable()).count();
-    println!("Morse + sinusoid: {} blockers, {structural} structural; worst {:?}", d.len(), d.first());
-    assert!(structural > 0, "{d:?}");
-    let o = m.teach_offer().expect("an offer naming the refused blockers");
-    for (i, _, ins, why) in &o.refused {
-        if *ins > 1.0 {
-            assert!(why.contains("cannot represent"), "#{i}: {why}");
-        }
-    }
-    for b in &o.blockers {
-        assert!(b.3 <= 1.0, "an offered blocker is a leverage one: {b:?}");
-    }
-    if o.blockers.is_empty() {
-        let e = m.start_teach(&h2(1.6)).unwrap_err();
-        assert!(e.starts_with("nothing to teach"), "{e}");
-    }
+    println!("Morse + sinusoid: {} blockers; M {:?}", d.len(), m.misfit().map(|x| x.samples.len()));
+    assert!(m.misfit().is_some_and(|x| x.samples.len() == 40), "{:?}", m.misfit());
+    assert!(d.is_empty(), "{d:?}");
+    let o = m.teach_offer();
+    assert!(o.as_ref().is_none_or(|o| o.blockers.is_empty()), "nothing offered: {o:?}");
+    let e = m.start_teach(&h2(1.6)).unwrap_err();
+    assert!(e.starts_with("nothing to teach") || e.starts_with("no environment class is blocked"), "{e}");
     // hand-made verdicts
     assert!(teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 0.9 }.teachable());
     assert!(!teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 1.1 }.teachable());
@@ -7110,8 +7285,9 @@ fn a_cancelled_teach_round_is_not_spent() {
 /// sampled (out to 5.4 Bohr) the fit matches the forces and shifts every energy by the tail value
 /// (all residuals +1.9× the energy tier per atom, measured), so the pass is not accepted, both
 /// held-out checks fail (failed audits of origin "teach check", kept with their samples' indices),
-/// the outcome and the reason say so, and the next offer
-/// refuses #60 as structural ("the model cannot represent it") instead of a second round.
+/// the outcome and the reason say so, and no second round is offered. Since spec 2026-11-13 §4.3
+/// every sample is then in the misfit set (the reason: "N training samples the model cannot
+/// reproduce"), out of the class statistics, so no blocker is left to refuse as structural.
 #[test]
 fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     let (mut s, _h) = tail_blocked();
@@ -7120,17 +7296,20 @@ fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
     let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
     println!("{outcome}");
     assert!(outcome.contains(": not accepted"), "{outcome}");
-    assert!(outcome.contains("cannot represent it"), "{outcome}");
+    // (since spec 2026-11-13 §4.3 the structure is told by the misfit row below: every sample is in
+    // M, so the class keeps no member and no class line says "cannot represent it")
     assert!(outcome.contains("2 off, so the model is untrusted until it predicts those geometries"), "{outcome}");
     assert!(!s.trusted());
     assert!(s.failed_audits.iter().all(|c| c.origin == AuditOrigin::TeachCheck && c.index.is_some()), "failed checks keep their samples' indices");
-    assert!(outcome.contains("– the model as a whole: untrusted — max training energy residual"), "the first unmet trust condition, named: {outcome}");
-    let o = s.teach_offer().expect("the offer names the refused blocker");
-    println!("{} refused (listed {}): {:?}", o.refused_total, o.refused.len(), o.refused);
-    assert!(o.blockers.is_empty(), "no second round on a structural class: {o:?}");
-    assert!(o.refused.len() <= TEACH_MAX_BLOCKERS && o.refused_total >= o.refused.len());
-    assert!(o.refused.iter().all(|r| r.2 > 1.0 && r.3.contains("cannot represent")), "{o:?}");
-    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+    // every residual is beyond the tier: the whole store is the misfit set (spec 2026-11-13 §4.3),
+    // named as the first unmet condition, and left out of the class statistics — no blocker is
+    // offered (before §4.3 the offer listed them refused as "cannot represent")
+    assert!(outcome.contains("– the model as a whole: untrusted — ") && outcome.contains("training samples the model cannot reproduce"), "the first unmet trust condition, named: {outcome}");
+    let o = s.teach_offer();
+    println!("the offer after the round: {o:?}");
+    assert!(o.as_ref().is_none_or(|o| o.blockers.is_empty()), "no second round on a structural class: {o:?}");
+    let e = s.start_teach(&in_big_cell(h2(1.6))).unwrap_err();
+    assert!(e.starts_with("nothing to teach") || e.starts_with("no environment class is blocked"), "{e}");
 }
 
 /// `DynCommand::StartTeaching` through the driver (the app's "Teach around N blockers"): the
@@ -9748,7 +9927,10 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
         r.rmse_force,
         s.untrusted_reason()
     );
-    assert!(!s.trusted() && s.untrusted_reason().is_some_and(|w| w.contains("training energy residual")), "the premise: {:?}", s.untrusted_reason());
+    // (spec 2026-11-13 §4.3: the capped fit's misfit spreads over 568 samples, so its refusal is the
+    // misfit row; the recovery acts on the all-sample residuals, which fail)
+    assert!(!s.trusted() && s.untrusted_check().is_some_and(|(k, _)| k == sim::activity::TrustKey::Misfit), "the premise: {:?}", s.untrusted_reason());
+    assert!(s.residuals_fail(), "the premise: the all-sample training residuals fail");
     assert!(s.worst_offenders().len() as f64 > QUARANTINE_MAX_FRACTION * 578.0, "the premise: the capped fit names no offender within the cap");
     // the next refit recovers
     let rep = s.refit().unwrap();

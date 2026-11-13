@@ -934,7 +934,7 @@
 //!   samples only is judged as before. `loo_rms` and `loo_force_errors` likewise.
 //! - **Sample floors** (`trust::key_column_counts`, the whole-model union floor, `fit_floor`'s
 //!   cache key): only interior atoms touch a key's columns and count as its samples.
-//! - **Training residuals, recovery and release** (`compute_training_residuals`, `worst_offenders`,
+//! - **Training residuals, misfit set, recovery and release** (`compute_residuals`, `worst_offenders`,
 //!   `reproduces_sample`): the fitted rows only, so a cap's force never quarantines a segment.
 //! - **Teach-around**: a masked sample is never a blocker (its geometry is a cut-out the segment
 //!   scene's own pass teaches); the failed-audit re-judgement (`judge_case`) of a masked sample —
@@ -1026,7 +1026,7 @@ pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
-pub use trust::{atom_class, env_class, LooRms, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use trust::{atom_class, env_class, LooRms, Misfit, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use background::BackgroundPoll;
 pub use views::Verdict;
 pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
@@ -1115,6 +1115,9 @@ pub struct SurrogateKs {
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
+    /// The misfit set M of the fit that stands (`trust` module doc; spec 2026-11-13 §4.3): set
+    /// with `training_residuals` at every fit, never persisted.
+    misfit: Option<Misfit>,
     /// Per environment class (pair, many-body): the fit's leave-one-out numbers and verdict
     /// (module doc, "Class-wise trust"); empty before the first fit.
     class_loo: Vec<ClassLoo>,
@@ -1138,6 +1141,10 @@ pub struct SurrogateKs {
     /// the reference the deferred refit is compared with (`refit_cost` tests).
     #[cfg(test)]
     eager_trust_passes: bool,
+    /// Tests only: a refit runs no trust recovery, so the misfit set is tested on the fit as it
+    /// comes (`refit_fits`).
+    #[cfg(test)]
+    pub(super) skip_recovery: bool,
     /// A failed audit's teacher − model gap: untrusted until a refit passes it (rule 8, "A failed
     /// audit stays failed").
     audit_failed: Option<f64>,
@@ -1420,6 +1427,7 @@ impl SurrogateKs {
             null_space: None,
             active_set: None,
             training_residuals: None,
+            misfit: None,
             class_loo: Vec::new(),
             class_memory: BTreeMap::new(),
             class_judge: None,
@@ -1499,6 +1507,8 @@ impl SurrogateKs {
             deferred_trust: None,
             #[cfg(test)]
             eager_trust_passes: false,
+            #[cfg(test)]
+            skip_recovery: false,
             teach_rounds: BTreeMap::new(),
             teach_classes: Vec::new(),
             teach_start: None,

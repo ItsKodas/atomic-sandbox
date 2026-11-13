@@ -240,7 +240,8 @@ pub const IMPORT_REFERENCES_NOTE: &str = "imported species are fitted only after
 ///
 /// **Only for a condition of the fit the box samples are in** (activity plan review S15): the
 /// first unmet [`TrustKey`](sim::activity::TrustKey) must be the training energies, the training
-/// forces or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
+/// forces, the training samples the fit cannot reproduce (`Misfit`: before it, those samples
+/// failed the residual rows) or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
 /// Sample more cures it, whatever the box does, M6 final re-review), nor for a failed audit
 /// (`Audit`, `AuditForces`: judged against a fresh teacher answer that is not box-affected).
 /// Keyed on the check list the provider exports, no longer on the refusal's wording.
@@ -253,7 +254,7 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
         .trust_checks
         .iter()
         .find(|c| !c.met)
-        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::ForceNoise));
+        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::Misfit | TrustKey::ForceNoise));
     (m.fitted && !m.trusted && fit_condition && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
 

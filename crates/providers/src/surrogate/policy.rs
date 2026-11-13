@@ -339,7 +339,7 @@ impl SurrogateKs {
         self.model_gen += 1; // the views' cache key: the verdicts read the policy
         self.consults = 0;
         self.last_variance = None;
-        self.training_residuals = self.compute_training_residuals();
+        (self.training_residuals, self.misfit) = self.compute_residuals().unzip();
         self.refresh_class_loo();
         self.commit_class_memory();
     }

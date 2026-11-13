@@ -100,6 +100,7 @@ pub fn untrusted_title(key: TrustKey) -> &'static str {
         TrustKey::ResidualDofE | TrustKey::ResidualDofF => "too little data beyond the fit's own parameters",
         TrustKey::EnergyResidual => "it did not reproduce its own training energies",
         TrustKey::ForceResidual => "it did not reproduce its own training forces",
+        TrustKey::Misfit => "too many training samples it could not reproduce",
         TrustKey::ForceNoise => "its forces did not fit the data to within the force tier",
         TrustKey::Audit | TrustKey::AuditForces => "the last check against DFT had failed",
     }
@@ -264,6 +265,8 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::ResidualDofF => format!("Enough data beyond the fit's own parameters to measure its noise — forces {:.0} of {:.0}", c.value, c.limit),
         TrustKey::EnergyResidual => format!("Reproduces its own training energies to the accuracy it claims — worst {} mHa/atom, allowed {} mHa/atom", mha(c.value), mha(c.limit)),
         TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
+        // M: fitted samples over their bound, judged apart from the two lines above (spec 2026-11-13 §4.3)
+        TrustKey::Misfit => format!("Few training samples it cannot reproduce — {} of at most {:.1} (10 % of the fitted samples)", c.value as usize, c.limit),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
         TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),

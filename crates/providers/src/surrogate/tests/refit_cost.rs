@@ -112,7 +112,7 @@ fn phases(s: &mut SurrogateKs, label: &str) {
 
     // the provider side: each pass of `fit_store` after the solve
     let t = Instant::now();
-    let _ = s.compute_training_residuals();
+    let _ = s.compute_residuals();
     rows.push(("training residuals (predict every member)".into(), secs(t)));
     let model = s.model.as_ref().unwrap();
     let store = s.store.as_ref().unwrap();

@@ -147,6 +147,7 @@ impl SurrogateKs {
         f.null_space = self.null_space.clone();
         f.active_set = self.active_set.clone();
         f.training_residuals = self.training_residuals;
+        f.misfit = self.misfit.clone();
         f.class_loo = self.class_loo.clone();
         f.class_memory = self.class_memory.clone();
         f.class_judge = self.class_judge.clone();
@@ -188,6 +189,7 @@ impl SurrogateKs {
             f.body4_off = self.body4_off;
             f.body4_force = self.body4_force;
             f.eager_trust_passes = self.eager_trust_passes;
+            f.skip_recovery = self.skip_recovery;
         }
         f
     }
@@ -352,6 +354,7 @@ impl SurrogateKs {
         self.null_space = f.null_space.take();
         self.active_set = f.active_set.take();
         self.training_residuals = f.training_residuals;
+        self.misfit = f.misfit.take();
         self.class_loo = std::mem::take(&mut f.class_loo);
         // the hysteresis memory: the copy's, except that a key the live provider's between-refit
         // evidence made leave since the start stays out (a synchronous refit followed by that
