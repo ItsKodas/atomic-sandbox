@@ -5606,7 +5606,7 @@ impl ForceProvider for Producer {
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
                 field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
             });
         }
         Ok(r)

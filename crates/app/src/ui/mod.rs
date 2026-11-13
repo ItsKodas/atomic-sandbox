@@ -1715,6 +1715,7 @@ pub fn charges_label(d: &sim::DynSnapshot) -> Option<String> {
         sim::ChargeSource::Step => "a DFT step",
         sim::ChargeSource::Side(sim::SideKind::Audit) => "an audit's DFT density",
         sim::ChargeSource::Side(sim::SideKind::Refresh) => "a DFT display refresh",
+        sim::ChargeSource::Side(sim::SideKind::Harris) => unreachable!("a Harris job carries no density"),
     };
     Some(format!("charges from t = {:.2} fs ({from}) — faded until the next DFT density", c.t_fs()))
 }

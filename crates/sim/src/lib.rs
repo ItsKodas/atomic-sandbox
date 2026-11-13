@@ -10,6 +10,7 @@ pub mod charges;
 pub mod dynamics;
 pub mod integrator;
 pub mod knowledge;
+pub mod profiles;
 pub mod provider;
 pub mod references;
 pub mod relax;
@@ -19,17 +20,18 @@ pub mod test_providers;
 pub mod thermostat;
 
 pub use activity::{ActivityProbe, DisplaySolve, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
-pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
+pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls, HARRIS_SAME_GEOMETRY};
 pub use integrator::{Integrator, StepStats};
 pub use knowledge::{atom_coverage, Confidence, ElementKnowledge, KnowledgeMap, PairKnowledge};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
     AuditRecord, AuditVerdict, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, ModelSource, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
-    ColourLook, LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
+    ColourLook, ExperienceUse, HarrisAnswer, HarrisAtoms, LoneAtomLabels, OrbitalDisplay, OrbitalKind, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
     RefitPoll, SampleId, SampleSuspect, ShareTables, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, SharedShell, CORE_OVERLAP_WARNING, OCCUPATION_CHANGE_WARNING, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
 pub use charges::{orbital_shares, orbital_shares_many, set_average, share_sum, ChargeSource, PartialCharges, Weights};
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
+pub use profiles::{radial_profile, AtomProfile};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};
 pub use sampling::{allowed_multiplicities, GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost, ReferenceCache, SamplingPlan, SamplingProgress};
 pub use scene::{Cell, IonicPolicy, Nucleus, Scene, CELL_MARGIN_H};

@@ -606,6 +606,7 @@ impl ViewState {
             what: pick.what,
             lone_atom: lone_atom_out(out.lone_atom),
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 
@@ -626,6 +627,7 @@ impl ViewState {
             what: self.req.what.clone(),
             lone_atom: LoneAtomLabels::NotLoneAtom,
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 }
@@ -975,6 +977,7 @@ mod tests {
             what: OrbitalRequest::List,
             lone_atom: LoneAtomLabels::NotLoneAtom,
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 

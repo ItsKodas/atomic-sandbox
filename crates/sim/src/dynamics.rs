@@ -285,7 +285,11 @@
 //! The driver stamps every new side job with the simulated time of the geometry it was dispatched
 //! at — checked at the start of each tick (a refresh the worker asked for between ticks is at the
 //! current positions) and after every evaluation (an audit is dispatched inside the evaluation of
-//! the step's new positions, t + dt) — and polls for an arrived density at the end of each tick.
+//! the step's new positions, t + dt) — and polls for arrived payloads at the end of each tick,
+//! taking every one the provider holds (it may hold a density job's and a Harris job's at once).
+//! A payload's orbitals go to the orbital display ("Orbital display" below); its density — an
+//! Audit's or a Refresh's, never a Harris job's, which solves none (`SideDisplay::display` is
+//! `None`) — becomes the side density.
 //! The newest one is the snapshot's `side_display` ([`SideDensity`]: the density, who solved it,
 //! when, at which positions, and a sequence number that changes with each new one) until an edit
 //! (the positions it was solved at no longer exist) clears it. Display only: nothing here enters
@@ -318,6 +322,14 @@
 //! the selection fallback) and is not from an older job than the shown one's (Task 3 review M2:
 //! an audit in flight across a view change, or a held audit judged after a newer refresh, would
 //! otherwise snap the view back for a solve).
+//!
+//! **Harris display payloads** (live-orbitals spec §4.2–4.3): a side job of kind
+//! `SideKind::Harris` carries orbitals only (`OrbitalKind::Harris`: one diagonalisation in the
+//! potential of superposed atoms, not self-consistent) and no density, so it never becomes the
+//! side density nor reaches the side charges. Precedence between side payloads: at the same
+//! geometry (the same nuclei, each within [`HARRIS_SAME_GEOMETRY`]) a converged (DFT) payload
+//! replaces a Harris one whatever the job order, and a Harris one never replaces a converged one
+//! — the DFT one is self-consistent; otherwise, and within one kind, the newer job wins.
 //!
 //! # Container walls (user request 2026-10-14)
 //! `SetWalls(Some(Walls { half_width: L, k }))` puts a smooth repulsive wall on each of the six
@@ -520,7 +532,7 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::charges::{ChargeSource, PartialCharges};
 use crate::integrator::Integrator;
-use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, ShareTables, SideKind, Source};
+use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalKind, OrbitalViewRequest, ProviderError, ShareTables, SideKind, Source};
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, RadialDensity, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
@@ -563,10 +575,16 @@ pub const WALL_LAYER: f64 = 1.0;
 /// Depth over which the walls' curvature ramps from 0 to k (Bohr; module doc, "Container walls").
 pub const WALL_ONSET: f64 = 0.5;
 
+/// Two payloads are at the same geometry when no nucleus differs by more than this (Bohr, |ΔR|
+/// per nucleus): the precedence of a converged payload over a Harris one (module doc, "Orbital
+/// display"), and a Harris payload counts as current (not faded) at the scene's positions.
+pub const HARRIS_SAME_GEOMETRY: f64 = 1e-6;
+
 /// A density solved off the stepping path (module doc, "Side densities").
 #[derive(Clone, Debug)]
 pub struct SideDensity {
     pub display: Display,
+    /// Who solved it: an Audit or a Refresh — never `Harris` (a Harris job carries no density).
     pub kind: SideKind,
     /// Simulated time (a.u.) of the geometry it was solved at.
     pub t: f64,
@@ -816,7 +834,8 @@ pub struct DynSnapshot {
     pub orbitals_t: f64,
     /// Changes with every new orbital payload (and when it is dropped).
     pub orbitals_seq: u64,
-    /// `Some(kind)` when `orbitals` came from a side job (estimated mode's only producer).
+    /// `Some(kind)` when `orbitals` came from a side job (estimated mode's only producer):
+    /// `Harris` for a Harris display solve (`orbitals.kind` then says `Harris` too).
     pub orbitals_side: Option<SideKind>,
     /// The orbital view as the app last set it (`SetOrbitalView`; rebuilt drivers re-apply it).
     pub orbital_view: OrbitalViewRequest,
@@ -1796,23 +1815,29 @@ impl Dynamics {
         self.side_jobs_seen = jobs;
     }
 
-    /// Takes an arrived side density (module doc, "Side densities").
+    /// Takes the arrived side payloads (module doc, "Side densities" and "Orbital display"): all
+    /// of them, since a provider may hold a density job's and a Harris job's at once.
     fn poll_side_display(&mut self) {
-        let Some(sd) = self.provider.take_side_display() else { return };
-        let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
-        self.side_seq += 1;
-        self.seq += 1;
-        // a side payload replaces the shown one only if it answers the current view and is not
-        // from an older job than the one shown (Task 3 review M2: an audit in flight across a view
-        // change, or a held audit judged after a newer refresh, would snap the view back)
-        if let Some(o) = sd.orbitals {
-            let older = self.orbitals_job.is_some_and(|j| sd.job < j);
-            if !older && answers_view(&self.orbital_view, &o) {
-                self.set_orbitals(o, t, Some(sd.kind));
-                self.orbitals_job = Some(sd.job);
+        while let Some(sd) = self.provider.take_side_display() {
+            let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
+            // a side payload replaces the shown one only if it answers the current view and wins
+            // the precedence (`side_replaces`): never an older job's (Task 3 review M2: an audit in
+            // flight across a view change, or a held audit judged after a newer refresh, would
+            // snap the view back), never a Harris one over a converged one at its geometry
+            if let Some(o) = sd.orbitals {
+                let shown = self.orbitals.as_ref().zip(self.orbitals_job);
+                if side_replaces(shown, &o, sd.job) && answers_view(&self.orbital_view, &o) {
+                    self.set_orbitals(o, t, Some(sd.kind));
+                    self.orbitals_job = Some(sd.job);
+                }
+            }
+            // the density: an Audit's or a Refresh's (a Harris job solves none)
+            if let Some(display) = sd.display {
+                self.side_seq += 1;
+                self.seq += 1;
+                self.side_display = Some(SideDensity { display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
             }
         }
-        self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
 
     /// The teaching events since the last call, oldest first, each stamped with the step whose
@@ -3242,6 +3267,25 @@ impl Tools<'_> {
         }
         damping
     }
+}
+
+/// Whether a side job's orbital payload (`incoming`, job `job`) may replace the shown one (`shown`
+/// with its job; `None`: nothing from a side job is shown) — spec §4.2 "Precedence". At the same
+/// geometry (the same nucleus count, every nucleus within [`HARRIS_SAME_GEOMETRY`]) a converged
+/// (DFT) payload beats a Harris one whatever the job order, since it is self-consistent; within
+/// one kind, and at another geometry, the newer job wins (an older one never replaces: Task 3
+/// review M2). [`answers_view`] still applies on top.
+fn side_replaces(shown: Option<(&OrbitalDisplay, u64)>, incoming: &OrbitalDisplay, job: u64) -> bool {
+    let Some((o, shown_job)) = shown else { return true };
+    let harris = |k: &OrbitalKind| matches!(k, OrbitalKind::Harris { .. });
+    let same_geometry = o.positions.len() == incoming.positions.len()
+        && o.positions.iter().zip(&incoming.positions).all(|(a, b)| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() <= HARRIS_SAME_GEOMETRY
+        });
+    if same_geometry && harris(&o.kind) != harris(&incoming.kind) {
+        return harris(&o.kind);
+    }
+    job >= shown_job
 }
 
 /// Whether a side job's orbital payload answers the view the app asks for now (Task 3 review M2).

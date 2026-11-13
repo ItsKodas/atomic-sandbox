@@ -726,7 +726,7 @@ impl SurrogateKs {
         match (ans.job.kind, ans.result) {
             (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
             (JobKind::Refresh, Ok(Solved { display: Some(d), orbitals, .. })) => {
-                self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
+                self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
                 return;
             }
             (JobKind::Reference(z), _) => {
@@ -753,7 +753,7 @@ impl SurrogateKs {
             }
             (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
                 if let Some(d) = display {
-                    self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
+                    self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
                 self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps);
             }

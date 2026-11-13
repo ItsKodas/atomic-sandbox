@@ -33,6 +33,16 @@
 //! none. `sim` never interprets a payload: the driver only keeps the newest
 //! (`DynSnapshot::orbitals`) and drops it when the view is switched off.
 //!
+//! # Harris display orbitals (live-orbitals spec §4)
+//! Between DFT solves an orbital view can show **display-only** orbitals: one diagonalisation in
+//! the potential of the superposed isolated-atom densities ([`HarrisAtoms`]), not self-consistent.
+//! A payload says which it is ([`OrbitalDisplay::kind`]: [`OrbitalKind::Converged`] or
+//! [`OrbitalKind::Harris`]). It is asked for through [`ForceProvider::harris_display`] — the one
+//! entry point, default `None` — and a Kohn-Sham provider answers now ([`HarrisAnswer::Solved`])
+//! while a provider with a background teacher queues it ([`HarrisAnswer::Queued`]; it arrives as a
+//! [`SideKind::Harris`] [`SideDisplay`], which carries no density). It is never a solve of the
+//! energy and never a sample.
+//!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
 //!   state as its warm start).
@@ -60,6 +70,7 @@
 //! the other callers.
 use crate::references::{AtomReference, AtomReferences, RadialDensity};
 use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
+use crate::profiles::AtomProfile;
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
 use std::sync::Arc;
@@ -393,6 +404,51 @@ pub struct OrbitalDisplay {
     pub what: OrbitalRequest,
     pub lone_atom: LoneAtomLabels,
     pub share_z: Option<Vec<u8>>,
+    /// What solved it: the provider's converged state or a Harris display solve (module doc,
+    /// "Harris display orbitals").
+    pub kind: OrbitalKind,
+}
+
+/// What an [`OrbitalDisplay`] was solved from (live-orbitals spec §4.3).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum OrbitalKind {
+    /// The provider's self-consistent (converged) Kohn-Sham state — every payload before the
+    /// Harris display.
+    #[default]
+    Converged,
+    /// One diagonalisation in the potential of the superposed isolated-atom densities
+    /// ([`HarrisAtoms`]; spec §4.1): display only, not self-consistent. `experience`: the density
+    /// experience used, if any (Phase B; always `None` in Phase A). `rescale`: the factor the
+    /// superposition was scaled by to the scene's electron count (≠ 1 for a charged scene).
+    /// `wall_s`: the solve's wall time (s).
+    Harris { experience: Option<ExperienceUse>, rescale: f64, wall_s: f64 },
+}
+
+/// Which atoms of a Harris display solve's input density came from the density experience
+/// rather than the bare superposition: the indices `atoms` (scene order) of `of` nuclei.
+/// Phase B (live-orbitals spec §5) fills it; Phase A never makes one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExperienceUse {
+    pub atoms: Vec<usize>,
+    pub of: usize,
+}
+
+/// The isolated-atom density profiles a Harris display solve superposes (spec §4.1): one per
+/// species of the scene, solved on the scene's surface (grid, smearing, ionic policy) without the
+/// partial core. Shared (`Arc`) between the caller and the provider's background job.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarrisAtoms {
+    pub profiles: Vec<AtomProfile>,
+}
+
+/// A provider's answer to [`ForceProvider::harris_display`].
+#[derive(Debug)]
+pub enum HarrisAnswer {
+    /// Solved now (a Kohn-Sham provider): the payload, or why not.
+    Solved(Result<OrbitalDisplay, ProviderError>),
+    /// Queued on a background teacher as side job `job`; the payload arrives later as a
+    /// [`SideKind::Harris`] [`SideDisplay`] with that job number.
+    Queued { job: u64 },
 }
 
 /// The converged total density ρ↑ + ρ↓ (e/Bohr³) on the evaluation's grid, for display only.
@@ -786,7 +842,9 @@ pub trait ForceProvider: Send {
     fn side_jobs(&self) -> u64 {
         0
     }
-    /// The newest density a side job produced since the last call (older ones are dropped).
+    /// A side job's payload produced since the last call (older ones of its kind are dropped).
+    /// A provider may hold a density job's ([`SideKind::Audit`]/[`SideKind::Refresh`]) and a
+    /// [`SideKind::Harris`] one at once; the driver takes them until `None`.
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         None
     }
@@ -868,6 +926,17 @@ pub trait ForceProvider: Send {
     /// force or sample. No-op by default: a provider without orbitals (a surrogate forwards them
     /// to its teachers).
     fn set_share_tables(&mut self, _tables: Option<Arc<ShareTables>>) {}
+    /// Display-only orbitals at `scene`'s positions in the potential of the superposed `atoms`
+    /// (live-orbitals spec §4; module doc, "Harris display orbitals"): one diagonalisation, not
+    /// self-consistent, the payload's kind [`OrbitalKind::Harris`]. A Kohn-Sham provider solves
+    /// now ([`HarrisAnswer::Solved`]); a provider with a background teacher queues it
+    /// ([`HarrisAnswer::Queued`]: the payload arrives as a [`SideKind::Harris`] [`SideDisplay`]
+    /// with that job number); `None`: no orbitals here (the default — analytic providers).
+    /// Never a solve of the energy, never a sample: it touches no warm state the stepping or
+    /// audit solves read. `should_abort` cancels a solve made now.
+    fn harris_display(&mut self, _scene: &Scene, _atoms: &Arc<HarrisAtoms>, _should_abort: &mut dyn FnMut() -> bool) -> Option<HarrisAnswer> {
+        None
+    }
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task
@@ -884,16 +953,20 @@ pub enum SideKind {
     Audit,
     /// A display-only refresh the app asked for (`Trainable::request_display`).
     Refresh,
+    /// A Harris display solve ([`ForceProvider::harris_display`]): orbitals only, no density.
+    Harris,
 }
 
 /// A real Kohn-Sham density solved off the stepping path (M5b, "Density in estimated mode"): at
 /// `positions`, by side job number `job` ([`ForceProvider::side_jobs`]). Display only — the step
 /// it arrives with was answered by someone else. `orbitals`: the side solver's orbital payload
 /// when an orbital view is on (module doc, "Orbital display": in estimated mode the only
-/// producer).
+/// producer). `display` is the density: `Some` for an [`Audit`](SideKind::Audit) or a
+/// [`Refresh`](SideKind::Refresh), `None` for a [`Harris`](SideKind::Harris) job (it solves no
+/// density; its `orbitals` are the payload).
 #[derive(Clone, Debug)]
 pub struct SideDisplay {
-    pub display: Display,
+    pub display: Option<Display>,
     pub orbitals: Option<OrbitalDisplay>,
     pub kind: SideKind,
     pub job: u64,
