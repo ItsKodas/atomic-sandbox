@@ -2595,16 +2595,17 @@ pub(crate) mod tests {
     }
 
     /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions; codes 0–3,
-    /// 3 = box-affected since Task 9 fix round 1, and 7 = forgotten by the user since 2026-11-12);
-    /// a file with nothing quarantined is byte-identical to the plain writer's and reads as empty
-    /// flags; a flag other than 0–3 or 7 is refused (on read, an integral one as a newer build's;
+    /// 3 = box-affected since Task 9 fix round 1, 7 = forgotten by the user since 2026-11-12, and 8 =
+    /// forgotten with its fence lifted since 2026-11-14); a file with nothing quarantined is
+    /// byte-identical to the plain writer's and reads as empty flags; a flag other than 0–3, 7 or 8
+    /// is refused (on read, an integral one as a newer build's;
     /// on write, the provider-only codes 4–6); a flag count that does not match is refused on write.
     #[test]
     fn quarantine_flags_round_trip_and_stay_optional() {
         for (seed, body3) in [(23u64, false), (29, true)] {
             let orig = random_sidecar(seed, body3);
-            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 7, 1, 0, 2, 3][i % 7]).collect();
-            assert!(flags.contains(&7), "the forgotten code is exercised");
+            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 7, 1, 0, 2, 3, 8][i % 8]).collect();
+            assert!(flags.contains(&7) && flags.contains(&8), "the forgotten codes are exercised");
             let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
             write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
             assert_eq!(read(&with).unwrap().quarantine, flags);
@@ -2621,10 +2622,10 @@ pub(crate) mod tests {
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err();
             assert!(e.to_string().contains("sample_quarantine"), "{e}");
-            bytes[at..at + 8].copy_from_slice(&8.0f64.to_le_bytes());
+            bytes[at..at + 8].copy_from_slice(&9.0f64.to_le_bytes());
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err().to_string();
-            assert!(e.contains("is not 0, 1, 2, 3 or 7 (a code of a newer build?)"), "{e}");
+            assert!(e.contains("is not 0, 1, 2, 3, 7 or 8 (a code of a newer build?)"), "{e}");
             for q in [4u8, 5, 6] {
                 let mut bad = flags.clone();
                 bad[0] = q;
