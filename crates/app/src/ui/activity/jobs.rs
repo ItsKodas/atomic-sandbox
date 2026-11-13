@@ -474,7 +474,7 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
         };
         ui.horizontal_top(|ui| {
             theme::light(ui, c);
-            let cw = r.control.as_ref().map_or(0.0, |(l, _)| ui.painter().layout_no_wrap(l.clone(), egui::FontId::proportional(13.0), theme::INK).size().x + 24.0);
+            let cw = control_width(ui, r);
             let w = (ui.available_width() - cw).max(80.0);
             ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(w);
@@ -518,6 +518,17 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
         }
     });
     crate::ui::probe_rect("activity-job-card", resp.response.rect);
+}
+
+/// The room [`control`] takes on the right, with the gap before it.
+fn control_width(ui: &Ui, r: &JobRow) -> f32 {
+    let w = |text: &str, size: f32| ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), theme::INK).size().x;
+    let gap = ui.spacing().item_spacing.x;
+    match (&r.control, r.no_control_why) {
+        (Some((label, _)), _) => w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap,
+        (None, Some(_)) => w("can't be cancelled", 10.5) + gap,
+        (None, None) => 0.0,
+    }
 }
 
 /// A row's control on the right ("Cancel", "Pause", …), or "can't be cancelled" with why.
@@ -600,7 +611,7 @@ pub fn compact(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         theme::light(ui, c);
         let words = progress_words(r);
-        let cw = r.control.as_ref().map_or(0.0, |(l, _)| ui.painter().layout_no_wrap(l.clone(), egui::FontId::proportional(13.0), theme::INK).size().x + 20.0);
+        let cw = if r.control.is_some() { control_width(ui, r) } else { 0.0 };
         let w = (ui.available_width() - cw).max(60.0);
         let line = if words.is_empty() { format!("{} · {}", r.title, r.detail) } else { format!("{} · {} · {words}", r.title, r.detail) };
         let mut job = egui::text::LayoutJob::single_section(line, egui::TextFormat { font_id: egui::FontId::proportional(11.5), color: theme::INK, ..Default::default() });

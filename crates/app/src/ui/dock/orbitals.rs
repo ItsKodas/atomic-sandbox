@@ -1007,7 +1007,9 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, wai
     super::group(ui, st, "d-orb-unocc", |ui, st| {
         ui.add_enabled_ui(matches!(st.show, ShowMode::Orbitals | ShowMode::Coloured), |ui| {
             let mut m = st.unoccupied;
-            let r = ui.add(egui::Slider::new(&mut m, 0..=UNOCCUPIED_MAX).text("show unoccupied (m per spin)")).on_hover_text(UNOCCUPIED_TIP);
+            // the name above the slider: beside it, it ran past a narrow panel's edge
+            ui.label("show unoccupied (m per spin)").on_hover_text(UNOCCUPIED_TIP);
+            let r = ui.add(egui::Slider::new(&mut m, 0..=UNOCCUPIED_MAX)).on_hover_text(UNOCCUPIED_TIP);
             super::super::probe("unoccupied", &r);
             // one request when the slider is let go (or clicked), not one per step of a drag
             if m != st.unoccupied && (r.drag_stopped() || !r.dragged()) {

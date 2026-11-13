@@ -2029,7 +2029,9 @@ fn box_advice_with(scene: &Scene, solvers: u64, budget: crate::quality::VramBudg
 }
 
 /// An energy's two grid cells in the chosen units (Ha and eV; the unused one blank).
-fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
+/// An energy's two grid cells in `units`; `stacked`: both units in the first cell, one under the
+/// other (a narrow panel: side by side they ran past its right edge).
+fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool, stacked: bool) {
     let t = |s: String| {
         let r = egui::RichText::new(s).monospace();
         if strong {
@@ -2046,6 +2048,14 @@ fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
         }
         EnergyUnits::Ev => {
             ui.label(t(format!("{ev:+.3} eV")));
+            ui.label("");
+        }
+        EnergyUnits::Both if stacked => {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(t(format!("{x:+.6} Ha")));
+                ui.label(t(format!("{ev:+.3} eV")));
+            });
             ui.label("");
         }
         EnergyUnits::Both => {
