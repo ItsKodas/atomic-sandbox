@@ -960,7 +960,7 @@ fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
     let r = s.evaluate(&stray, &mut never()).unwrap();
     println!("at the stray geometry: {:?}, notes {:?}", r.stats.source, r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("quarantined geometry")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("of a sample held out of the fit (quarantined")), "{:?}", r.stats.notes);
     assert!(r.stats.notes.iter().any(|n| n.contains("0 released, 1 superseded")), "{:?}", r.stats.notes);
     assert_eq!((s.samples(), calls(&h), s.quarantined(), s.superseded()), (42, calls0 + 1, 0, 1));
     s.refit().unwrap();
@@ -997,7 +997,7 @@ fn a_recovery_that_cannot_restore_trust_holds_nothing() {
     }
     let rep = s.refit().unwrap();
     // the entry fit's first round names these (the rounds' machinery engages on this store)
-    let named = s.worst_offenders().len();
+    let named = s.worst_offenders().0.len();
     println!(
         "after the strays: {} samples fitted; holds the rounds left {}; the entry fit's first round names {named} (cap {:.1}); trusted {} {:?}; note {:?}",
         rep.n_samples,
@@ -1056,7 +1056,7 @@ fn a_failed_recovery_leaves_the_collection_codes_as_they_were() {
         "after the strays: {} samples fitted; held {}; the entry fit's first round names {}; trusted {} {:?}; note {:?}",
         rep.n_samples,
         s.quarantined(),
-        s.worst_offenders().len(),
+        s.worst_offenders().0.len(),
         s.trusted(),
         s.untrusted_reason(),
         s.recovery_note()
@@ -1108,7 +1108,7 @@ fn a_small_misfit_leaves_the_model_trusted() {
         assert!(m.atoms.contains(&(i, 0)) && m.atoms.contains(&(i, 1)), "an energy misfit blames every trained atom: {:?}", m.atoms);
     }
     let checks = s.trust_checks();
-    let row = |k: TrustKey| *checks.iter().find(|c| c.key == k).unwrap_or_else(|| panic!("{k:?} row: {checks:?}"));
+    let row = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap_or_else(|| panic!("{k:?} row: {checks:?}")).clone();
     let keys: Vec<TrustKey> = checks.iter().map(|c| c.key).collect();
     let at = keys.iter().position(|&k| k == TrustKey::Misfit).unwrap();
     assert_eq!(keys[at - 1], TrustKey::ForceResidual, "the misfit row follows the force residual row: {keys:?}");
@@ -1120,6 +1120,13 @@ fn a_small_misfit_leaves_the_model_trusted() {
     assert!(e.met && e.value <= 1e-3, "the energy row judges the samples outside M: {e:?}");
     assert_eq!(e.value, m.outside.energy_per_atom);
     assert!(s.training_residuals().unwrap().energy_per_atom > 1e-3, "the all-sample residual keeps its meaning");
+    // where each row's value sits (trust-worst, merged 2026-11-14): the residual rows name a sample
+    // outside M (the one holding their value), the misfit row M's worst sample
+    let w = mis.worst.as_ref().expect("the misfit row names M's worst sample");
+    assert!(m.samples.contains(&w.id.index), "{w:?} in M {:?}", m.samples);
+    assert_eq!(Some(w.id), m.worst.map(|x| x.0));
+    let ew = e.worst.as_ref().expect("the energy row names where its value sits");
+    assert!(!m.samples.contains(&ew.id.index) && Some(ew.id) == m.outside.energy_at, "{ew:?} outside M");
 }
 
 /// §4.3: when M is more than 10 % of the fitted samples the model is untrusted by the misfit row,
@@ -3455,8 +3462,8 @@ fn a_surrogate_driven_dimer_heated_apart_pauses_at_the_face_and_walls_keep_it_in
 /// bulk's, so an atom with NO neighbour was "inside" the envelope (half a spread out) and was
 /// answered with Σ E_ref and zero force. Now: an atom with no neighbour within r_cut in a scene
 /// of more than one atom is refused (5a), and a coordination more than 3× below the training
-/// minimum is outside (5b); a one-atom scene is still the model's (its answer is the reference
-/// itself).
+/// minimum is outside (5b); a one-atom scene is still answered, with the reference itself (by
+/// rule 0b since 2026-11-12: the same E_ref the model gives there).
 #[test]
 fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     let teacher = Shared::new(MorseDimer::h2());
@@ -3510,12 +3517,15 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair around H, with H: LOO force error")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
-    // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
-    // the isolated class is exempt from the class rule)
+    // a one-atom scene: E_ref exactly (no neighbour is its training state; the isolated class is
+    // exempt from the class rule) — since rule 0b (2026-11-12) answered from the reference itself,
+    // the same number the model gives there, without consulting it
     let mut one = in_big_cell(h2(1.6));
     one.nuclei.truncate(1);
     let r = s.evaluate(&one, &mut never()).unwrap();
-    assert_eq!((r.stats.source, r.energy), (Source::Surrogate, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
+    assert_eq!((r.stats.source, r.energy), (Source::Reference, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
+    let p = s.model().unwrap().predict(&[one.nuclei[0].pos], &[1], false).unwrap();
+    assert_eq!(p.energy.to_bits(), r.energy.to_bits(), "the model's own answer there");
 }
 
 /// One excursion run of the Requirement-3 tests: a window-trained dimer (1.2–2.2) swinging from
@@ -3574,7 +3584,7 @@ fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f
                 assert_eq!(snap.energy_ks, e_t, "step {i}: the reported energy is the teacher's");
                 on_teacher += 1;
             }
-            Source::Dft => unreachable!(),
+            Source::Dft | Source::Reference => unreachable!(),
         }
         if surface != last_surface {
             assert!(snap.eval.refit_jump.is_some(), "step {i}: a surface change without a booked jump");
@@ -4401,7 +4411,34 @@ fn fnv1a(text: &str) -> u64 {
 /// reads "3 of 29 samples needed" instead of "3 samples < Q′ 29" (steps 92–94; one species, so the
 /// key's column floor is the whole Q′ and no decision moves). Diffed against HEAD 07e8315: those 3
 /// lines, nothing else; with the old wording substituted back the trace hashes to the old pin.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x49de_dced_28e4_5113;
+/// **Re-pinned for rule 0b, lone atoms answered from the references** (0x49de_dced_28e4_5113 → below;
+/// the traces of this tree with the rule switched off and on, diffed: with it off the trace hashes to
+/// the old pin exactly): one line differs, step 61's H₂ at R = 6.3 Bohr (both atoms lone, automatic
+/// multiplicity 1) — the rule stands aside (1 is not the parallel-spin product 3) and its note says
+/// so after the step's own notes. Every source, answer, sample, refit and the auditor's section are
+/// unchanged.
+/// **Re-pinned for the leave-one-out recovery ranking** (spec 2026-11-12 R1; 0x5962_e7e3_cd31_1f35 →
+/// below; diffed against HEAD 4061321): one line differs, the refit after step 85's glitched label —
+/// the same one sample quarantined, only the note's words ("the model cannot represent them" → "the
+/// fit without each predicts it at up to 49× its bound, and keeping them breaks the fit of their
+/// neighbours"); with the old wording substituted back the trace hashes to the old pin exactly.
+/// **Re-pinned for the note's fix round 2 wording** (0xd180_e6f1_231a_cb8f → below): the same one
+/// line, now "1 samples quarantined this refit (1 held in all) — the fit without each of them
+/// predicts it at up to 49× its bound, …"; with the round-1 words substituted back the trace hashes
+/// to the round-1 pin exactly.
+/// **Re-pinned for the fence's refusal wording** (plan 2026-11-12 Task 2, re-review N3;
+/// 0xdd8a_dc25_aa37_49e3 → below): one string, at step 86 (the fence at the quarantined glitch),
+/// "of a quarantined geometry the model cannot represent" → "of a sample held out of the fit
+/// (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or
+/// forgotten by the user)"; with the old words substituted back the trace hashes to the old pin
+/// exactly (checked on the GOLDEN_TRACE output).
+/// **Re-pinned for the recovered note's last clause** (Task 2 fix round 1, the coordinator's ruling
+/// on concern 1; 0xfcf7_5e47_a07c_7000 → below): one string in one line (line 644, the refit after
+/// step 85's glitched label, a recovered result), ", and keeping them breaks the fit of their
+/// neighbours" → ", and the fit without them recovers"; the 907 lines are otherwise identical
+/// (diffed against the previous GOLDEN_TRACE), and with the old clause substituted back the trace
+/// hashes to the previous pin exactly.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xfeaa_fe54_5608_3db3;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -5153,7 +5190,7 @@ fn the_refusal_strings_are_unchanged() {
 fn the_audit_check_is_per_atom_and_names_forces() {
     use sim::activity::TrustKey;
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
-    let audit = |s: &SurrogateKs| *s.trust_checks().last().unwrap();
+    let audit = |s: &SurrogateKs| s.trust_checks().last().unwrap().clone();
     assert!(s.last_audit().is_none());
     let c = audit(&s);
     assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::Audit, true, 0.0, s.policy.energy_std_per_atom));
@@ -5317,7 +5354,7 @@ fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
         // the residual rows read the samples outside M (spec 2026-11-13 §4.3): here M is empty, so
         // they judge every fitted sample as the pre-Task-3 rule did (the misfit row's own
         // decisions: `the_trust_checks_and_the_refusal_agree_at_equality_and_nan`)
-        s.misfit = s.training_residuals.map(|t| Misfit { samples: Vec::new(), atoms: Vec::new(), outside: t, fitted: report.n_samples });
+        s.misfit = s.training_residuals.map(|t| Misfit { samples: Vec::new(), atoms: Vec::new(), outside: t, fitted: report.n_samples, worst: None });
         s.audit_failed = rng.gen_bool(0.3).then(|| around(&mut rng, s.policy.energy_std_per_atom) * if rng.gen_bool(0.5) { -1.0 } else { 3.0 });
         s.audit_force = rng.gen_bool(0.4).then(|| (around(&mut rng, 2e-3), 2e-3));
         s.audit_atoms = rng.gen_range(0..4);
@@ -5471,7 +5508,7 @@ fn a_refit_leaves_the_last_audit_to_an_earlier_fit() {
     assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed), "the record stays, for the Log");
     assert!(!s.last_audit_this_fit(), "no audit judged this fit yet");
     assert!(!Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
-    let c = *s.trust_checks().last().unwrap();
+    let c = s.trust_checks().last().unwrap().clone();
     assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0));
     audit_now(&mut s);
     assert!(s.last_audit_this_fit(), "the next audit judges this fit");
@@ -7131,11 +7168,13 @@ fn dimers_and_a_tight_triangle(n: usize) -> SurrogateKs {
 /// retry kept at n 333 < Q′ 344, every step DFT). Here: 50 samples, one tight H₃ triangle the
 /// cap-4 fit cannot reproduce. The premise, on a twin store: at cap 6 the residuals pass but the
 /// model is short of samples (50 < Q′ 51; one dimer fewer and the cap-6 residuals fail too, one more and
-/// it is trusted) — the old rule kept exactly that. Now the retry is not kept:
-/// the cap stays 4 and the model reports the residual that actually fails (the quarantine cannot
-/// take the triangle out within its 10 % cap on this small store — untrusted either way, but for
-/// the reason that is true). On the 80-dimer store, where cap 6 leaves enough samples, the retry
-/// is kept and the model trusted.
+/// it is trusted) — the old rule kept exactly that. Now the retry is not kept: the cap stays 4.
+/// Ranked by their training residual (before 2026-11-12) the quarantine could not take the triangle
+/// out within its 10 % cap on this small store (the misfit spread over the dimers names more than 5)
+/// and the model reported the residual that actually fails; ranked by the leave-one-out ratio
+/// (spec 2026-11-12 R1) the triangle is named alone, held, and the cap-4 fit without it is trusted —
+/// both pinned. On the 80-dimer store, where cap 6 leaves enough samples, the retry is kept and the
+/// model trusted.
 #[test]
 fn a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery() {
     const N_DIMERS: usize = 49;
@@ -7146,13 +7185,23 @@ fn a_degree_cap_retry_that_leaves_too_few_samples_is_not_a_recovery() {
     twin.fit_store().unwrap();
     println!("twin at cap 6: Q′ {}, residuals fail {}, short of samples {} ({:?})", twin.report().unwrap().q_prime, twin.recoverable_fail(), twin.trust_needs_samples(), twin.untrusted_reason());
     assert!(!twin.recoverable_fail() && twin.trust_needs_samples(), "the premise: the old rule would keep cap 6 with too few samples");
+    // the training-residual ranking (before spec R1): no offender within the cap, the true reason
+    let mut old = dimers_and_a_tight_triangle(N_DIMERS);
+    old.training_ranking = true;
+    old.refit().unwrap();
+    println!("training ranking: cap {:?}, trusted {} {:?}, quarantined {}", old.degree_cap, old.trusted(), old.untrusted_reason(), old.quarantined());
+    assert_eq!(old.degree_cap, None, "the cap-6 retry is not kept");
+    // (the cap-4 fit's misfit spreads over the store: the recovery holds nothing — no ratchet —
+    // and the refusal is the misfit row, spec 2026-11-13 §4.2–4.3; adapted at the open-shell merge
+    // from main's "training energy residual", the row M's samples no longer reach)
+    assert!(old.residuals_fail() && !old.trust_needs_samples() && old.quarantined() == 0, "{:?}", old.recovery_note());
+    assert_eq!(old.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "the reason that is true: {:?}", old.untrusted_reason());
+    // the leave-one-out ranking: the triangle alone, then trusted at cap 4
     let mut s = dimers_and_a_tight_triangle(N_DIMERS);
     s.refit().unwrap();
-    println!("after the refit: cap {:?}, Q′ {}, trusted {} {:?}, quarantined {}", s.degree_cap, s.report().unwrap().q_prime, s.trusted(), s.untrusted_reason(), s.quarantined());
+    println!("after the refit: cap {:?}, Q′ {}, trusted {} {:?}, quarantined {}; {:?}", s.degree_cap, s.report().unwrap().q_prime, s.trusted(), s.untrusted_reason(), s.quarantined(), s.recovery_note());
     assert_eq!(s.degree_cap, None, "the cap-6 retry is not kept");
-    // (the cap-4 fit's misfit spreads over the store: the misfit row, spec 2026-11-13 §4.3)
-    assert!(s.residuals_fail() && !s.trust_needs_samples());
-    assert_eq!(s.untrusted_check().map(|c| c.0), Some(sim::activity::TrustKey::Misfit), "the reason that is true: {:?}", s.untrusted_reason());
+    assert!(s.trusted() && s.quarantined() == 1 && s.is_quarantined(N_DIMERS), "the triangle alone is held: {:?}", s.untrusted_reason());
     // with enough samples for cap 6 the retry is kept and trusted
     let mut big = dimer_model_three_atom_teacher();
     let mut sc = in_cell_65(h2(1.4));
@@ -10236,7 +10285,7 @@ fn class_loo_cost_at_collection_sizes() {
         let rep = s.refit().expect("refit");
         let t_refit = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
-        let (loo, _, _) = s.compute_class_loo_full();
+        let (loo, _, _, _) = s.compute_class_loo_full();
         let t_loo = t2.elapsed().as_secs_f64();
         println!(
             "S = {} (Q′ {}), {n} samples: store {t_add:.2} s, refit {t_refit:.2} s (its LOO pass included), class LOO alone {t_loo:.2} s = {:.2} ms/sample; classes {:?}",
@@ -10468,11 +10517,15 @@ impl ForceProvider for StubKsGpu {
 /// earlier recovery had set. Under the cap one sample (H₂ at 5.585 Bohr in the 101³ box, its
 /// restricted-spin label 40 mHa above two atoms) drives the energy noise to 2e-2 Ha/atom and the
 /// misfit spreads over every H₂ sample (−25 mHa/atom each, the sample itself −6 mHa/atom): the
-/// worst offenders are 380 samples, past the quarantine's 10 % cap, so the old recovery did
+/// worst offenders are 379 samples (re-measured 2026-11-12, `recovery_loo::stuck_collection_rounds_under_both_rankings`,
+/// by either ranking; 380 when first recorded on 2026-10-21), past the quarantine's 10 % cap, so the old recovery did
 /// nothing — untrusted at every refit, and (every fallback a copy of a stored sample) no refit
 /// changed it. The recovery now re-judges the cap against the default basis (steps 1b/3): the
 /// refit ends trusted, every held sample is written to the collection as a status record, and a
-/// reopened collection holds the same codes.
+/// reopened collection holds the same codes. Since spec 2026-11-12 R1 (fix round 1, option A) step
+/// 3 gets there through the **fallback**: its leave-one-out rounds do not recover (47 held, 1.60×)
+/// and the training-residual rounds from the same state do — this test exercises that path
+/// (`recovery_loo::the_stuck_collection_recovers_through_the_training_fallback` pins the note).
 #[test]
 fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() {
     const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
@@ -10519,7 +10572,7 @@ fn a_recovery_cap_that_spreads_the_misfit_does_not_leave_the_collection_stuck() 
     // misfit row; the recovery acts on the all-sample residuals, which fail)
     assert!(!s.trusted() && s.untrusted_check().is_some_and(|(k, _)| k == sim::activity::TrustKey::Misfit), "the premise: {:?}", s.untrusted_reason());
     assert!(s.residuals_fail(), "the premise: the all-sample training residuals fail");
-    assert!(s.worst_offenders().len() as f64 > QUARANTINE_MAX_FRACTION * 578.0, "the premise: the capped fit names no offender within the cap");
+    assert!(s.training_offenders().0.len() as f64 > QUARANTINE_MAX_FRACTION * 578.0, "the premise: the capped fit names no offender within the cap");
     // the next refit recovers
     let rep = s.refit().unwrap();
     let t = s.training_residuals().unwrap();
@@ -11216,6 +11269,19 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 mod knowledge;
 mod refit_cost;
 mod residual_diag;
+
+/// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).
+mod lone;
+
+/// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
+mod recovery_loo;
+
+/// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
+mod forget;
+
+/// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
+/// the stored scenes, a measurement only (`scope_measure.rs`).
+mod scope_measure;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

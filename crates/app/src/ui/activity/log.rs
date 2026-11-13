@@ -42,6 +42,17 @@ pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelSta
             ),
         );
     }
+    // lone-atom steps answered from the references (rule 0b): their own kind — no solve, not a
+    // fallback, not a model answer, nothing learned
+    if let Some(n) = m.map(|m| m.solves.reference).filter(|&n| n > 0) {
+        line(
+            ui,
+            "lone-atom steps from the references",
+            n.to_string(),
+            None,
+            "steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten".into(),
+        );
+    }
     // teaching solves only: a plain DFT step is not one (plan review S16)
     line(
         ui,

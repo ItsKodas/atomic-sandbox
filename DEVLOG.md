@@ -559,6 +559,100 @@ The per-refit trust pass grows linearly: an exact leave-one-out over every sampl
 Both are fixed, with tests. The second test fails without its fix. The merged tree's app suite then caught a third: a background refit in flight when the user paused waited for the next command, because the idle worker blocked on its inbox. A pause now keeps polling until the new model stands.
 - **Gate:** unit crates, `providers`, `app` and validate `surrogate` on the merged tree before the merge.
 
+### One bad sample, and a Forget button (Nov 12–13; branch `sample-recovery`, two tasks)
+
+The user's shared collection went untrusted after a session of play. A debug agent replayed the collection's own
+history from snapshots and found the cause:
+- **The cause.** One sample, #1804, a lone OH radical squeezed to O–H 1.31 Bohr with 0.72 Ha/Bohr on each atom.
+  The fit reproduced it within its own (large) bound, but it bent the shared O–H pair term, so 34 water and H₃O
+  samples failed: the worst ratio went from 1.00 to 2.36.
+- **Why recovery missed it.** Recovery ranked samples by their own training residual, so it never named #1804. It
+  quarantined the victims instead, round after round, and ran out of rounds at exactly the user's 3.7e-3. The
+  leave-one-out residual, which the class rule already computes every fit, put #1804 first at 38× its bound.
+
+**What landed:**
+- **Task 1:** recovery rounds rank by the leave-one-out ratio.
+- **Task 2:** a Model-tab list of the worst-fitting samples, with Forget and Restore (code 7, written to the
+  collection at once).
+
+**It took more rounds than planned:**
+- **Stuck-H regression.** The leave-one-out ranking alone made the stuck-H test (the user's earlier H collection)
+  worse: trusted at 0.961 became untrusted at 1.60, because after the right sample it kept holding samples that
+  fit fine. The ruling: leave-one-out rounds first; if they do not recover, the old rounds from the same entry
+  state, kept only if they recover. The recovery is never worse than before.
+- **A plan expectation that was wrong.** The plan expected the user's pre-1805 snapshot to end trusted with under
+  110 held. The debug number had skipped the release step that runs first. Measured: the first refit ends just
+  untrusted (1.0185×, 128 held; the old ranking 1.46×, 165 held), and the next refit is trusted (0.995, 122
+  held). Both are pinned in `references.md`.
+- **Reviews caught three safety holes before merge:**
+  - forgetting a failed audit's own sample let the next refit drop the audit unjudged, so one click could make
+    the model trusted;
+  - a step could be skipped when the leave-one-out result passed its residuals but lacked samples;
+  - next to a forgotten sample every agreeing DFT answer was kept unthinned, for as long as it stayed forgotten.
+
+  Each has a test that fails without its fix.
+- **Honest wording, more than once.** Notes that said "the model cannot represent them" or "breaks the fit of
+  their neighbours" claimed more than a leave-one-out ratio shows; they now say what was measured.
+
+**Gate (Nov 13, before merge):**
+
+| Suite | Passed | Failed |
+|---|---|---|
+| providers | 358 | 0 |
+| validate `surrogate` | 7 | 0 |
+| app | 554 | 0 |
+| surrogate | 95 | 0 |
+| sim | 142 | 0 |
+
+Parked: one diagnostic count (`box_blocks_trust`) double-subtracts a forgotten box-affected sample.
+
+### Bonds between solves, from experience (Nov 12–13; branches `stale-bonds`, `bond-experience`)
+
+In estimated mode the density-based bond graph is only as fresh as the last DFT solve, so a stretched H₃ kept
+showing its bonds after it came apart. First, stale bonds were drawn dashed with a label, and a bond refresh
+ran about 1 s after a drag. Then the user asked for bonds "guessed from experience":
+- **How it works.** Every fresh DFT graph is recorded pair by pair: the two Z, each end's crowding (the number of
+  neighbours within 8 Bohr, capped at 6), the distance and the verdict. The examples go into
+  `bond_experience.txt` in the collection's folder. Over a stale graph, a pair is shown bonded or not bonded only
+  when at least 3 examples of the same key within 0.1 Bohr all agree. Otherwise it stays dashed.
+- **Within rule 1.** It is learned from the app's own DFT, not typed-in chemistry. It is also display only:
+  names, charges and the Selection panel keep the DFT graph.
+- **The review found the speed problem.** The first version scanned every stored example near each pair, on the
+  render thread, even with the setting off: 8 ms per frame at 300 atoms. With per-key running counts each lookup
+  became two binary searches (0.29 ms for all the lookups at 300 atoms on a full store). Nothing is computed when
+  the setting is off, and the result is reused while nothing moves. The timing test is a measurement
+  (`#[ignore]`), not a gate.
+
+### The Windows installer and the in-app updater (Nov 12–13; branch `installer`, six tasks)
+
+The user asked for a real installer: download it, click Next, and it opens on H₂. They also asked for in-app
+updates, with a way to pick older versions and betas, all over GitHub Releases. Linux was dropped because the
+user can't test it.
+- **What landed:**
+  - **Installer.** A per-user Inno Setup installer.
+  - **Data folders.** Three modes: dev, portable and installed. Data lives in `%LOCALAPPDATA%\atomic-sandbox`,
+    seeded from `bundled\`, and re-seeded add-missing-only at the first launch of each version.
+  - **Version panel.** A chip and panel showing stable and beta builds, with downgrade warnings driven by a
+    format manifest.
+  - **Downloads.** Fetched from GitHub hosts only (an exact four-host allowlist, manual redirects), then checked
+    against SHA-256 and a minisign signature whose trusted comment names the tag.
+  - **Restart now.** It never interrupts a solve, refit, pass, relax or audit without the user's click. It
+    resumes the session after the update.
+  - **CI.** GitHub Actions builds every tag, signs in a tag-only job behind the `release` Environment, and opens
+    a draft release.
+- **Security review changed the CI design.** The first workflow could sign from a branch build. The signing
+  key now lives only in a tag-only job, and that job downloads nothing but `SHA256SUMS.txt`.
+- **CI's first three runs failed on one line.** Inno Setup's compiler has no version resource, its banner shows
+  only the major version, and `ISCC /?` exits non-zero. Run 4 compiled the `.iss` for the first time.
+- **The final review caught a restart that didn't wait.** Restart now didn't wait for a paused solve. The
+  re-review then found three more solves (Bonds now, the drag refresh, the estimated graph solve) that run while
+  the worker reports idle; the guard now also reads the probe's Main slot. It also corrected the record: the
+  app exits through `process::exit`, so a CPU solve can never hold the installer's 120 s wait.
+- **Not yet run:** the sign job, the release job and the uninstaller's `[Code]`. No key is committed and no tag
+  is pushed. These wait for the user to set up the `release` Environment and to hand-test the first beta draft.
+
+**Gate (Nov 13, merged tree):** app 673 passed, 0 failed, 4 ignored; `surface_reconfigure` 1 passed.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

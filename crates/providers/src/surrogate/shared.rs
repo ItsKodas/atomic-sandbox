@@ -205,7 +205,7 @@ pub(super) fn shared_provenance(key: &SurfaceKey) -> Provenance {
 /// surface is the collection's for every session — or, while the collection stores none of `z`
 /// (none solved yet, or a read-only collection), the largest box's this session uses; a stored one
 /// replaces it when it arrives (a rebase, booked like any reference arrival). `None` without any.
-fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
+pub(super) fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
     let species = (z, 0)..=(z, usize::MAX);
     sh.coll.references.range(species.clone()).next_back().map(|(_, r)| r.energy).or_else(|| sh.box_refs.range(species).next_back().map(|(_, &e)| e))
 }
@@ -581,7 +581,28 @@ impl SurrogateKs {
         }
     }
 
-    fn note_write_failure(&mut self, e: &str) {
+    /// Writes stored sample `i`'s current code to the attached collection at once (the user's
+    /// Forget and Restore, spec R2), when the collection holds it and its status differs: `Ok(true)`
+    /// when the collection holds it (written, or already that code), `Ok(false)` when there is no
+    /// collection or it does not hold the sample (a session-only one: the code lives in the store,
+    /// and the session autosave), `Err` when the write failed or cannot be made: a read-only
+    /// collection is refused **before** the comparison (Task 2 fix round 1, M2: a failed Forget
+    /// leaves the collection at the old code, so a later Restore would otherwise "match" it and
+    /// read as written).
+    pub(super) fn write_status_now(&mut self, i: usize) -> Result<bool, String> {
+        let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
+        let Some(sh) = self.shared.as_mut() else { return Ok(false) };
+        let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
+        if sh.coll.read_only {
+            return Err("the collection is read-only (another process holds its lock)".into());
+        }
+        if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
+            sh.coll.set_status(k, code)?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn note_write_failure(&mut self, e: &str) {
         if let Some(sh) = self.shared.as_mut().filter(|s| !s.write_noted) {
             sh.write_noted = true;
             let slug = sh.coll.key.slug();
@@ -665,6 +686,9 @@ impl SurrogateKs {
         if self.shared.is_none() {
             return self.set_reference_energy(z, e);
         }
+        // the last report's offset before anything changes — the collection's stored references
+        // (the canonical ones) change in `offer_reference` already
+        let before = self.last_report_offset();
         let sh = self.shared.as_mut().expect("collection mode");
         let limit = box_affected_face_density(sh.coll.key.h);
         let slug = sh.coll.key.slug();
@@ -679,7 +703,6 @@ impl SurrogateKs {
             Ok(ReferenceOutcome::Refused(why)) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box is not stored ({why}) — used for this box in this session only"))),
             Err(w) => (e, Some(format!("shared collection {slug}: the {name} reference of the {grid_n}³ box could not be written ({w}) — used for this session only"))),
         };
-        let before = self.last_report_offset();
         let sh = self.shared.as_mut().expect("collection mode");
         let changed = sh.box_refs.insert((z, grid_n), value).is_none_or(|old| old.to_bits() != value.to_bits());
         self.user_notes.extend(note);
@@ -694,9 +717,23 @@ impl SurrogateKs {
     /// The canonical shift Σ(ref_own − ref_canonical) of the last report, when it was on the
     /// teacher's surface (0 for a box without its references: the report was the raw answer);
     /// `None` without a report or after a model-surface one (the model's answers do not move until
-    /// the refit, whose jump books them).
+    /// the refit, whose jump books them). A lone-atom reference answer (`lone`) from the provider's
+    /// references reported Σ ref_canonical, which moves with the canonical references at once: its
+    /// "offset" is −Σ ref_canonical, so an arrival books Σ Δref_canonical (`None` when one is
+    /// missing); one from the model's own references moves with the refit, like a model answer.
     fn last_report_offset(&self) -> Option<f64> {
-        let l = self.last.as_ref().filter(|l| !l.on_model)?;
+        let l = self.last.as_ref()?;
+        match l.reference {
+            Some(LastReference::Provider) => {
+                let sh = self.shared.as_ref()?;
+                return l.z.iter().try_fold(0.0, |acc, &z| canonical_ref(sh, z).map(|e| acc - e));
+            }
+            Some(LastReference::Model) => return None,
+            None => {}
+        }
+        if l.on_model {
+            return None;
+        }
         Some(self.box_offset(&l.z, l.provenance.grid_n).unwrap_or(0.0))
     }
 
@@ -810,6 +847,16 @@ impl SurrogateKs {
                 Some(o) => {
                     let e = raw[i] - o;
                     let st = self.store.as_mut().expect("stored");
+                    // the label moves without the fit (no `model_gen` bump; a refit is pending):
+                    // the leave-one-out ratios cached for the fit stay its own, but a recompute
+                    // before the next fit (`ensure_loo_ratios` after a restore whose cache was not
+                    // that fit's) would pair these new labels' residuals with the old fit's hat
+                    // matrix — not a leave-one-out. Harmless inside a refit (its next fit replaces
+                    // it). The between-refit display (the Model tab's "Worst-fitting samples",
+                    // `sample_suspects`, plan Task 2) never recomputes: it reads the fit's own
+                    // cache (`fresh_loo_ratios`) or shows nothing — so the rebase keeps
+                    // `model_gen` (a bump would also void every fence vote and view cache keyed on
+                    // it, for a label change the pending refit takes anyway).
                     if st.samples[i].energy.to_bits() != e.to_bits() {
                         st.samples[i].energy = e;
                         changed = true;

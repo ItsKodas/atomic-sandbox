@@ -493,7 +493,8 @@
 //! so they are reported as verified without another solve) is checked by one teacher solve at the result
 //! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
 //! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
-//! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
+//! answer's max|F_i| (none after a lone-atom `Source::Reference` answer: no model was consulted, and the
+//! teacher's force there is the grid box's confinement, an artefact); the positions did not move, so only a surface flip at fixed positions
 //! (teacher − model energy, when the model could not answer) is booked, exactly like a refit
 //! jump. If it exceeds F_TOL the note says so, and a second `Relax` continues from there.
 //! # Thermostat (rulings R7, R10)
@@ -671,6 +672,12 @@ pub enum DynCommand {
     Pin(usize, bool),
     /// Paused only: a new scene, time restarts.
     ReplaceScene(Scene),
+    /// The clock a resumed session goes on from (atomic time units; the app's
+    /// `--resume-session` after an update): accepted only before this driver's first step
+    /// (`step` = 0) and for a finite t ≥ 0, else rejected. It sets `sim_time` alone — the step
+    /// count, the energy history and its drift fit start afresh, as for any new driver — so
+    /// nothing physical changes.
+    SetClock(f64),
     /// Paused only: teleport, velocity zeroed, provider reset.
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
     /// Paused only (the Edit tool, user request 2026-10-20): each listed nucleus to its new
@@ -1352,6 +1359,15 @@ impl Dynamics {
                 self.work += self.scene.kinetic_energy() - k0;
             }
             DynCommand::SetComCorrection(on) => self.com_correction = on,
+            DynCommand::SetClock(t) => {
+                if !(t.is_finite() && t >= 0.0) {
+                    return self.reject(format!("clock {t} a.u.: must be finite and ≥ 0"));
+                }
+                if self.step != 0 {
+                    return self.reject(format!("the clock is set only before the first step (this run is at step {})", self.step));
+                }
+                self.sim_time = t;
+            }
             DynCommand::SetWalls(w) => {
                 if let Some(w) = w {
                     let max = Walls::max_half_width(&self.scene.cell);
@@ -2311,6 +2327,10 @@ impl Dynamics {
         // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
         // last answer's forces were the teacher's already (a fallback step, review M5)
         if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
+            // a lone-atom reference answer (`Source::Reference`) consulted no model: there is nothing
+            // to verify, and the teacher's force there is the grid box's confinement (its Dirichlet
+            // boundary — an artefact, ~1e-3 Ha/Bohr a few Bohr off-centre), which would read as
+            // "not converged" for an atom at rest. Converged, unverified (no `verified_max_force`)
             if self.eval.source == Source::Surrogate {
                 self.provider.as_trainable().expect("checked").force_teacher_next();
                 let r = self.provider.evaluate(&self.scene, should_abort);
@@ -2344,7 +2364,7 @@ impl Dynamics {
                     Err(ProviderError::Cancelled) => progress.note = Some("verification by the teacher cancelled: the result is the model's".into()),
                     Err(e) => progress.note = Some(format!("verification by the teacher failed ({e}): the result is the model's")),
                 }
-            } else {
+            } else if self.eval.source != Source::Reference {
                 progress.verified_max_force = Some(progress.max_force);
             }
         }
@@ -2614,7 +2634,7 @@ impl Dynamics {
     /// of its kind (`DynSnapshot::ms_per_step_model` / `_dft`), by the latest evaluation's source.
     fn record_step_cost(&mut self, ts: Instant) {
         let ms = ts.elapsed().as_secs_f64() * 1e3;
-        let model = self.eval.source == Source::Surrogate;
+        let model = matches!(self.eval.source, Source::Surrogate | Source::Reference);
         let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
         *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
         self.last_step_model = model;

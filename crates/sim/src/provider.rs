@@ -430,6 +430,12 @@ pub enum Source {
     /// is the model's when a trusted model exists (`teacher_gap` is `Some`) and the teacher's
     /// otherwise (`teacher_gap` is `None`) — see [`EvalStats::energy_surface`].
     Fallback,
+    /// Lone atoms (no atom has a neighbour within the model's cutoff) answered from the
+    /// isolated-atom references (`providers::surrogate`, the lone-atom rule): E = Σ_i E_ref(Z_i),
+    /// every force zero — what the model itself answers there, by construction, so its energy is
+    /// on the model's surface. Neither a model answer (nothing was consulted or learned) nor a
+    /// fallback (no solve).
+    Reference,
 }
 
 /// Which potential-energy surface an evaluation's `energy` is on (the surrogate's one-surface
@@ -441,7 +447,8 @@ pub enum Surface {
     /// at a geometry the model may not answer (out of its envelope, M6 Task 11), on the first
     /// evaluation after an edit, or after a failed audit (no `teacher_gap`).
     Teacher,
-    /// The surrogate model's surface: `Source::Surrogate`, or a `Fallback` whose energy is the
+    /// The surrogate model's surface: `Source::Surrogate`, `Source::Reference` (the model's own
+    /// answer at lone atoms, Σ E_ref), or a `Fallback` whose energy is the
     /// model's (`teacher_gap` present).
     Model,
 }
@@ -655,7 +662,7 @@ impl EvalStats {
     pub fn energy_surface(&self) -> Surface {
         match self.source {
             Source::Dft => Surface::Teacher,
-            Source::Surrogate => Surface::Model,
+            Source::Surrogate | Source::Reference => Surface::Model,
             Source::Fallback => if self.teacher_gap.is_some() { Surface::Model } else { Surface::Teacher },
         }
     }
@@ -912,6 +919,38 @@ pub enum RefitPoll {
     Discarded(String),
 }
 
+/// One stored sample as the Model tab's "Worst-fitting samples" lists it
+/// ([`Trainable::sample_suspects`], [`Trainable::forgotten_samples`]; spec
+/// `2026-11-12-sample-recovery-design.md` R2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SampleSuspect {
+    /// Which stored sample: what `forget_sample` / `restore_sample` take.
+    pub id: SampleId,
+    /// Its formula from Z in Hill order ("HO", "H2O").
+    pub formula: String,
+    /// Where it came from, in a word or two ("fallback", "pass perturbation", "audit").
+    pub origin: String,
+    /// Its leave-one-out ratio in the fit that stands: how far the fit *without* it misses it,
+    /// over its own bound (∞ when undefined: it alone spans a direction of the fit). `None` when
+    /// it is not in that fit.
+    pub loo_ratio: Option<f64>,
+}
+
+/// A stored sample's identity as the Model tab's Forget / Restore carry it (Task 2 fix round 1,
+/// M8): its index in the provider's store and a check value of the sample itself (the surrogate's
+/// hash of its Z and the exact bits of its positions, energy and forces). The provider refuses an id whose index now holds another sample
+/// (a model switch, attach or load queued before the click) with "the sample list changed — pick
+/// it again".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleId {
+    /// The index in the provider's store — the "#N" the Model tab shows. With a shared collection
+    /// attached it is the collection's own sample index only for the samples loaded at attach:
+    /// session-only samples interleave after them (M9).
+    pub index: usize,
+    /// The check value of the sample at `index`.
+    pub key: u64,
+}
+
 pub trait Trainable {
     /// Plans a sampling pass over `scene` (module doc of `providers::sampling`); `refs` seeds its
     /// isolated-atom reference cache (a reference found there costs no solve). Err with the
@@ -1070,6 +1109,33 @@ pub trait Trainable {
     fn pending_refit(&self) -> bool;
     /// The audit cadence (answered steps per audit; 0 disables).
     fn set_audit_every(&mut self, n: usize);
+    /// **Forgets** stored sample `id` (the Model tab's "Worst-fitting samples" › Forget; spec
+    /// R2): held out of the fit for good — and fencing — until [`restore_sample`](Self::restore_sample),
+    /// never released by a refit. Only a sample in the fit can be forgotten. The status is written
+    /// at once (the shared collection's status record when the sample is in one; else the model's
+    /// store, saved with the model file) and a refit is due (`pending_refit`); the caller starts
+    /// it. `Err` with the reason, nothing changed — also when `id` no longer names the sample. The
+    /// default: unsupported.
+    fn forget_sample(&mut self, _id: SampleId) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
+    /// Puts a [`forget_sample`](Self::forget_sample)'d sample back into the fit (written at once,
+    /// a refit due). `Err` with the reason, nothing changed. The default: unsupported.
+    fn restore_sample(&mut self, _id: SampleId) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
+    /// The worst-fitting samples of the fit that stands, worst first (at most 8): ranked by their
+    /// leave-one-out ratio from that fit's own cache, only the samples fitted now (a sample held or
+    /// forgotten since is left out). Empty without a model or before a ranking exists. The default:
+    /// empty.
+    fn sample_suspects(&self) -> Vec<SampleSuspect> {
+        Vec::new()
+    }
+    /// The samples the user forgot, in store order (each with its leave-one-out ratio when the fit
+    /// that stands still holds it). The default: empty.
+    fn forgotten_samples(&self) -> Vec<SampleSuspect> {
+        Vec::new()
+    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1186,6 +1252,11 @@ pub struct TrainableStatus {
     pub quarantined: usize,
     /// Quarantined samples a fresh answer contradicted (held, excluded, no longer fencing).
     pub superseded: usize,
+    /// Samples the user forgot ([`Trainable::forget_sample`]): excluded, fencing, never released.
+    pub forgotten: usize,
+    /// Of `forgotten`, those the last fit still holds (forgotten since it, or during the background
+    /// refit that installed it): counted in the fit until the next refit, not beside it.
+    pub forgotten_in_fit: usize,
     /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
     pub box_excluded: usize,
     /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit
@@ -1202,7 +1273,7 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `lone` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// What the last refit's trust recovery did.

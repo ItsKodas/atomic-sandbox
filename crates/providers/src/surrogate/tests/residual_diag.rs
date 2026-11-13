@@ -554,7 +554,7 @@ fn c1_class_keys(s: &SurrogateKs, label: &str) {
             }
         }
     }
-    let (judged, _, _) = s.compute_class_loo_full();
+    let (judged, _, _, _) = s.compute_class_loo_full();
     let provider = judged.map(|(_, j)| j.key_stats).unwrap_or_default();
     let m_n = s.misfit().map_or(0, |m| m.samples.len());
     println!("\nC1 [{label}] (|M| = {m_n}): per class key, the provider's statistics and standing verdict (C1 + the energy guard, as built)");

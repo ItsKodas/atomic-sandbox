@@ -67,6 +67,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
     match code {
         Some(Q_HELD) => "quarantined",
         Some(Q_SUPERSEDED) => "superseded",
+        Some(Q_FORGOTTEN) => "forgotten (by the user)",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
@@ -151,7 +152,7 @@ impl SurrogateKs {
         }
         if !self.near_quarantined_cached(pos, z).is_empty() {
             return Some(Refusal::new(
-                format!("surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent", QUARANTINE_FRACTION * self.policy.max_descriptor_distance),
+                format!("surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)", QUARANTINE_FRACTION * self.policy.max_descriptor_distance),
                 TeachRule::NearQuarantine,
                 None,
             ));
@@ -172,10 +173,31 @@ impl SurrogateKs {
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let prov = self.scene_provenance(scene);
+        // `evaluate`'s order: a capped segment is the teacher's before any rule (review M6)
+        if scene.train_mask().is_some() {
+            return Some(Readiness {
+                answers: false,
+                rule: Some(TeachRule::Segment),
+                atom: None,
+                text: "a capped segment teaches its interior atoms — the model does not answer here".into(),
+                unlearned: None,
+            });
+        }
+        // rule 0b: strict mode answers lone atoms from the references, whatever the trust; a lone
+        // scene it declines is the teacher's once rules 1–4 pass (review I1)
+        let lone = self.lone_reference(scene, &prov);
+        if let Lone::Answer { .. } = lone {
+            return Some(Readiness { answers: true, rule: None, atom: None, text: "lone atoms: answered from the atom references".into(), unlearned: None });
+        }
         let key = self.verdict_key();
         let refusal = match &self.strict_verdict {
             Some(v) if v.key == key && v.pos == pos && v.z == z => v.refusal.clone(),
-            _ => self.first_refusal(&pos, &z, &self.scene_provenance(scene)),
+            _ => match (self.first_refusal(&pos, &z, &prov), lone) {
+                // the gate passes and rule 5a has not already refused: 0b's refusal (as `evaluate`)
+                (r, Lone::StandAside(why)) if self.gate(&z, &prov).is_ok() && r.as_ref().is_none_or(|r| r.rule != TeachRule::IsolatedAtom) => Some(Self::lone_refusal(&why)),
+                (r, _) => r,
+            },
         };
         // fix (e): the scene's own last pass, none of it in the fit
         let mut species = z.clone();
@@ -258,6 +280,7 @@ impl SurrogateKs {
             d.iter().map(|(i, j, r)| format!("{i}-{j} {r:.3}")).collect::<Vec<_>>().join(", ")
         );
         let _ = writeln!(o, "    would_answer: {:?}", self.would_answer(&pos, &z, &prov));
+        let _ = writeln!(o, "    lone-atom rule (0b, strict mode): {:?}", self.lone_reference(scene, &prov));
         if let Err(g) = self.gate(&z, &prov) {
             let _ = writeln!(o, "    REFUSED by the gate ({:?}): {}", g.reason.rule, g.reason.text);
             return o;
@@ -523,7 +546,7 @@ impl SurrogateKs {
                 c.f_ratio
             );
         }
-        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.lone_held_out(), self.unfitted());
+        let _ = writeln!(o, "  trust floor (box exclusion waits for it): {:?}; box-excluded {}, box-affected {}, quarantined {}, superseded {}, forgotten {}, lone atoms {}, unfitted {}", self.trust_floor(), self.box_excluded(), self.box_affected(), self.quarantined(), self.superseded(), self.forgotten(), self.lone_held_out(), self.unfitted());
         // references and atomisation energies (an outlier flags a reference mix-up)
         let _ = writeln!(
             o,

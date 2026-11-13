@@ -126,6 +126,14 @@ pub enum Action {
     SaveSpecialised(std::path::PathBuf),
     /// "Forget it and sample this scene" (after a refused autoload).
     SampleAfterRefusal,
+    /// The Model tab's "Worst-fitting samples" › Forget (spec 2026-11-12 R2): the stored sample
+    /// this id names (its index and check value — fix round 1, M8: a sample list that changed
+    /// before the click is refused, never another sample forgotten) leaves the fit until Restore
+    /// (`Command::ForgetSample`). Recorded, not replayable (it writes the shared collection's
+    /// status record).
+    ForgetSample(sim::SampleId),
+    /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
+    RestoreSample(sim::SampleId),
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -137,6 +145,11 @@ pub enum Action {
     Cloud { superposition: bool, refresh: bool, refresh_s: f64 },
     /// Draft mode: the model answers every step (unsafe).
     Draft(bool),
+    /// The toolbar's ⚠ Model only (user request 2026-11-12): on = draft on and audits off (the
+    /// previous two kept in `UiState::model_only`), off = those two restored exactly. One action,
+    /// not a Draft + SetAudit pair, so a replay re-saves and restores its own values and a hand
+    /// change of either (which turns Model only off) stays distinguishable. Script word `model-only`.
+    ModelOnly(bool),
     /// The drag pull (Ha/Bohr): Physics ▸ Drag pull's slider and Reset; clamped to the driver's
     /// range, sent only when it changes.
     DragForce(f64),
@@ -226,10 +239,76 @@ pub enum Action {
     Screenshot,
     /// The capture's Record (true) / Stop (false) button (display only, not replayable).
     Record(bool),
+    /// File ▸ Import data from a folder… (installer spec; the installed build only): the folder's
+    /// `models`, `profiles` and `scenes` copied into the per-user root on a thread
+    /// (`paths::import_into`: nothing overwritten, nothing moved), the folder recorded in
+    /// `migrated_from.txt`, the counts and failures on the status line. Recorded as `# not
+    /// replayable: import-data` (a replay touches only its script); a replay skips it (it changes
+    /// no run).
+    ImportData(std::path::PathBuf),
+    /// Help ▸ Version…'s "Check for updates now" (installer Task 4, `ui::version`): GitHub's
+    /// releases list fetched on a thread of its own; a failure is one quiet line and the last list
+    /// stays. Any build (a build from source lists only). Recorded as `# not replayable: update`;
+    /// a replay skips it (it never touches the network).
+    CheckUpdates,
+    /// An entry's "Install and restart" (or an older one's "Install … anyway", after its downgrade
+    /// warnings): that release's installer downloaded and verified in the background, cancelling
+    /// another download. The installed build only. Recorded as `# not replayable: update`.
+    InstallVersion(String),
+    /// "Restart now" once the download is verified, through the restart guard (an unsaved model
+    /// first, then a playing run, then a background job: `ui::version`): refused while another copy
+    /// runs, else the session saved, the installer handed off, the app closed. Recorded as
+    /// `# not replayable: update`.
+    RestartToUpdate,
+    /// The download's Cancel ("Cancelling…" until it has stopped; a waiting restart is called off).
+    /// Recorded as `# not replayable: update`.
+    CancelUpdateDownload,
 }
 
-/// Applies one action: the `UiState` change and the commands, as the old panel did.
+/// Applies one action: the `UiState` change and the commands, as the old panel did. ⚠ Model only
+/// lasts only on the estimated solver (user request 2026-11-12): whatever moved the solver off it
+/// (the toolbar, Back to the scene) turns it off and restores what it replaced.
 pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
+    apply_action(st, input, a, out);
+    if st.model_only.is_some() && st.backend != Backend::Estimated {
+        model_only_off(st, out);
+        st.set_status("model only is off (the solver left Estimated): draft mode and the audits are as they were before");
+    }
+}
+
+/// ⚠ Model only on (user request 2026-11-12): keeps the draft mode and audit cadence it replaces,
+/// then draft on and audits off. The "audits on" switch would bring back the cadence it replaced.
+fn model_only_on(st: &mut UiState, out: &mut PanelOutput) {
+    if st.model_only.is_some() {
+        return;
+    }
+    st.model_only = Some(super::ModelOnlySaved { draft: st.draft, audit_every: st.audit_every });
+    if st.audit_every > 0 {
+        st.audit_every_on = st.audit_every;
+    }
+    (st.draft, st.audit_every) = (true, 0);
+    out.commands.push(Command::SetDraft(true));
+    out.commands.push(Command::SetAudit(0));
+}
+
+/// ⚠ Model only off: the draft mode and audit cadence it replaced, exactly.
+fn model_only_off(st: &mut UiState, out: &mut PanelOutput) {
+    let Some(saved) = st.model_only.take() else { return };
+    (st.draft, st.audit_every) = (saved.draft, saved.audit_every);
+    out.commands.push(Command::SetDraft(saved.draft));
+    out.commands.push(Command::SetAudit(saved.audit_every));
+}
+
+/// A hand change of draft mode or the audit cadence while ⚠ Model only is on (user request
+/// 2026-11-12): the user's choice wins — Model only turns itself off and restores nothing over it
+/// (the other setting stays as Model only left it), and the status line says so.
+fn model_only_by_hand(st: &mut UiState, what: &str) {
+    if st.model_only.take().is_some() {
+        st.set_status(format!("model only is off: you changed {what} by hand, so nothing was restored over it"));
+    }
+}
+
+fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut PanelOutput) {
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
         Action::TogglePlay => {
@@ -428,6 +507,8 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
             st.set_status(format!("saving the model to {}", path.display()));
+            // what it holds now is in a file: Restart now asks only about samples learned after this
+            st.update.note_saved(input);
         }
         Action::LoadModel => {
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
@@ -537,6 +618,24 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 out.commands.push(Command::ImportModel(path));
             }
         }
+        Action::ImportData(folder) => {
+            // the mode and the root are `UiState`'s (the process's; a test sets them)
+            if st.import_data.is_some() {
+                out.error = Some("import data: an import is already running".into());
+            } else {
+                match crate::paths::start_import(st.data_mode, st.data_root.as_deref(), folder.clone()) {
+                    Ok(rx) => {
+                        st.set_status(format!("importing models, profiles and scenes from {}…", folder.display()));
+                        st.import_data = Some(rx);
+                    }
+                    Err(why) => out.error = Some(why),
+                }
+            }
+        }
+        Action::CheckUpdates => super::version::check_now(st),
+        Action::InstallVersion(tag) => super::version::install(st, &tag, out),
+        Action::RestartToUpdate => super::version::restart(st, input, out),
+        Action::CancelUpdateDownload => super::version::cancel_download(st),
         Action::DiscardTraining => {
             if st.resume.take().is_some() {
                 out.training = Some(false);
@@ -547,7 +646,16 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             out.commands.push(dyn_(DynCommand::StartSampling(st.plan.clone())));
             st.plan.seed += 1;
         }
+        Action::ForgetSample(id) => {
+            st.set_status(format!("forgetting sample #{}: held out of the fit until Restore; refitting", id.index));
+            out.commands.push(Command::ForgetSample(id));
+        }
+        Action::RestoreSample(id) => {
+            st.set_status(format!("restoring sample #{}; refitting", id.index));
+            out.commands.push(Command::RestoreSample(id));
+        }
         Action::SetAudit(n) => {
+            model_only_by_hand(st, "the audit cadence");
             st.audit_every = n;
             out.commands.push(Command::SetAudit(n));
         }
@@ -571,8 +679,18 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             out.commands.push(st.cloud_command());
         }
         Action::Draft(on) => {
+            model_only_by_hand(st, "draft mode");
             st.draft = on;
             out.commands.push(Command::SetDraft(on));
+        }
+        Action::ModelOnly(on) => {
+            if !on {
+                model_only_off(st, out);
+            } else if st.backend != Backend::Estimated {
+                out.error = Some("model only is the estimated solver's: pick Estimated in the toolbar's Solver group first".into());
+            } else {
+                model_only_on(st, out);
+            }
         }
         Action::DragForce(f) => set_drag_force(st, f.clamp(F_DRAG_LO, F_DRAG_HI), out),
         Action::DragForceWheel(lines) => set_drag_force(st, super::wheel_pull(st.drag_force, lines), out),
@@ -583,9 +701,15 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::NameStyle(s) => st.name_style = s,
         Action::RefreshBonds => {
             out.commands.push(dyn_(DynCommand::RefreshBonds));
-            (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+            // the button shows everything it solved for; the refresh after a drag (`auto_bonds`,
+            // only with the bonds shown) leaves the lengths and angles as the user set them
+            if std::mem::take(&mut st.auto_bonds.fired) {
+                st.set_status("solving the density once for the bonds after the drag");
+            } else {
+                (st.show_bonds, st.show_bond_lengths, st.show_angles) = (true, true, true);
+                st.set_status("solving the density once for the bonds and angles");
+            }
             st.bonds_refresh = Some(Instant::now());
-            st.set_status("solving the density once for the bonds and angles");
         }
         Action::Relax => {
             if input.sampling() {
@@ -1011,6 +1135,7 @@ impl Action {
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
             Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
             Draft(b) => format!("draft {b}"),
+            ModelOnly(b) => format!("model-only {b}"),
             DragForce(f) => format!("drag-force {f}"),
             DragForceWheel(l) => format!("drag-force-wheel {l}"),
             ShowBonds(b) => format!("bonds {b}"),
@@ -1052,7 +1177,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 
@@ -1165,7 +1290,7 @@ impl Action {
                 want(1)?;
                 Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores, accepted or all, got '{}'", args[0]))?)
             }
-            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
+            "gravity" | "com-correction" | "draft" | "model-only" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
                 want(1)?;
                 let b = flag(args[0])?;
                 match head {
@@ -1173,6 +1298,7 @@ impl Action {
                     "gravity" => Gravity(b),
                     "com-correction" => ComCorrection(b),
                     "draft" => Draft(b),
+                    "model-only" => ModelOnly(b),
                     "bonds" => ShowBonds(b),
                     "labels" => ShowLabels(b),
                     "badge" => ShowBadge(b),

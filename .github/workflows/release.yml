@@ -1,0 +1,480 @@
+# Atomic Sandbox's release build (installer plan Task 6; spec
+# docs/superpowers/specs/2026-11-12-installer-updater-design.md; the checklist and the one-time
+# setup are docs/dev-reference.md "Releasing").
+#
+# Jobs:
+#
+# - build (every run; read-only token; no secret is referenced in it): the tag check, the app build,
+#   the packaging (portable zip and installer, through scripts\package.ps1), SHA256SUMS.txt and
+#   manifest.json. The files are kept as a workflow artifact for 7 days.
+# - sign (pushed v* tags only): runs in the GitHub Environment "release", which holds the two signing
+#   secrets, only lets v* tags deploy and waits for its required reviewer. It downloads only
+#   SHA256SUMS.txt, signs it with minisign (prehashed, trusted comment "atomic-sandbox <tag>",
+#   which the app checks against the release it installs), and uploads the .minisig. It never
+#   checks out or builds repository code and has no repository token.
+# - release (pushed v* tags only; the only job that can write to the repository, and it never sees a
+#   secret): checks the signature against the committed crates/app/release-key.pub and the sums
+#   against the files, then creates a DRAFT GitHub release with the five assets (pre-release for
+#   -beta.N). Publishing the draft is a person's click on GitHub, after the physics suites ran
+#   locally on the tagged commit.
+#
+# workflow_dispatch (on any ref, a tag included) is build-only: it runs the build job alone (the
+# installer compile included), never signs, never sees a secret and never creates a release. (A
+# push to the installer branch did the same for the installer's first compile; that trigger was
+# removed in the branch's final merge.)
+#
+# Tools are pinned: Inno Setup 6.6.1 (the 6.6.x that installer/AtomicSandbox.iss targets) and
+# minisign 0.12, each a fixed download checked against its SHA-256 (the runner image's own Inno
+# Setup is not used); actions are pinned to commit SHAs.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  # a newer dispatch on the same ref supersedes a build-only run; a tag run is never cancelled
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref_type == 'tag') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # https://github.com/jrsoftware/issrc/releases/tag/is-6_6_1 (the SHA-256 is GitHub's asset digest)
+  INNO_VERSION: '6.6.1'
+  INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_6_1/innosetup-6.6.1.exe
+  INNO_SHA256: d243ce440c02705530699554fb9612b9b2bd7a2a90629cdb7f41e66f5faeb91f
+  # https://github.com/jedisct1/minisign/releases/tag/0.12 (the SHA-256 is the one Scoop's main
+  # bucket pins for this zip; GitHub records no digest for assets this old)
+  MINISIGN_VERSION: '0.12'
+  MINISIGN_URL: https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip
+  MINISIGN_SHA256: 37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479
+
+jobs:
+  build:
+    name: Build and package
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version (and, for a tag, the tag check)
+        id: version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # the root Cargo.toml's  version = "x.y.z"  (the [workspace.package] one), read as scripts\package.ps1 reads it
+          $m = Select-String -LiteralPath Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $m) { Write-Output '::error::Could not read the version from the root Cargo.toml.'; exit 1 }
+          $version = $m.Matches[0].Groups[1].Value
+          if ($version -cnotmatch '^\d+\.\d+\.\d+(-beta\.\d+)?$') {
+            Write-Output "::error::The workspace version '$version' is neither X.Y.Z nor X.Y.Z-beta.N."
+            exit 1
+          }
+          # a release run is a pushed tag (a dispatch on a tag ref is build-only, like any dispatch)
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -cnotmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
+              Write-Output "::error::The tag '$tag' is neither vX.Y.Z (a release) nor vX.Y.Z-beta.N (a pre-release)."
+              exit 1
+            }
+            if ($tag.Substring(1) -cne $version) {
+              Write-Output "::error::The tag '$tag' does not match the root Cargo.toml's workspace version '$version' (it must be 'v$version')."
+              exit 1
+            }
+          }
+          $pre = if ($version -clike '*-beta.*') { 'true' } else { 'false' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          Write-Output "Version $version (pre-release: $pre; ref $env:GITHUB_REF, commit $env:GITHUB_SHA)"
+
+      - name: A release needs the real public key
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          # the key the app compiles in (crates/app/src/update/verify.rs reads its first line that is
+          # neither blank, a # comment nor minisign's "untrusted comment:")
+          $key = Get-Content -LiteralPath crates\app\release-key.pub | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith('#') -and -not $_.StartsWith('untrusted comment:') }
+          if (-not $key) {
+            Write-Output '::error::crates/app/release-key.pub is still the placeholder: a build without the real public key can install no update. Commit the public key first (docs/dev-reference.md "Releasing").'
+            exit 1
+          }
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      - name: Build the app
+        run: |
+          cargo build -p app --release --locked
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Install Inno Setup ${{ env.INNO_VERSION }} (pinned)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
+          Invoke-WebRequest -Uri $env:INNO_URL -OutFile $setup
+          $sha = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne $env:INNO_SHA256) {
+            Write-Output "::error::innosetup-$env:INNO_VERSION.exe has SHA-256 $sha, expected $env:INNO_SHA256."
+            exit 1
+          }
+          # Inno Setup's own portable mode (/PORTABLE=1: its own AppId, no uninstaller, no registry),
+          # for the current user, into a folder of our own: nothing of the runner image's copy is used
+          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup-$env:INNO_VERSION"
+          $log = Join-Path $env:RUNNER_TEMP 'innosetup-install.log'
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/PORTABLE=1', '/CURRENTUSER',
+            "/DIR=`"$dir`"", "/LOG=`"$log`"")
+          $iscc = Join-Path $dir 'ISCC.exe'
+          if ($p.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log | Select-Object -Last 40 }
+            Write-Output "::error::The Inno Setup install failed (exit $($p.ExitCode)); no $iscc."
+            exit 1
+          }
+          # ISCC.exe carries no version resource (0.0.0.0) and its banner names only the major
+          # version ("Inno Setup 6 Command-Line Compiler"): the installer's SHA-256 above is what pins
+          # 6.6.1; this only confirms the copy installed is an Inno Setup 6 compiler
+          $banner = (& $iscc '/?' 2>&1 | Out-String)
+          # `ISCC /?` exits non-zero after printing its usage; Actions' pwsh wrapper would end the
+          # step with that code, so it is cleared once the banner is read
+          $global:LASTEXITCODE = 0
+          Write-Output "ISCC.exe: $iscc"
+          if ($banner -notmatch 'Inno Setup 6') {
+            Write-Output "::error::$iscc is not an Inno Setup 6 compiler. Its banner: $($banner.Trim() -split "`n" | Select-Object -First 3)"
+            exit 1
+          }
+          # first on PATH for the later steps, ahead of any ISCC.exe the image has (scripts\package.ps1
+          # takes the ISCC.exe on PATH first)
+          $dir >> $env:GITHUB_PATH
+
+      - name: Package (portable folder and zip, installer)
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          $want = Join-Path $env:RUNNER_TEMP "InnoSetup-$env:INNO_VERSION\ISCC.exe"
+          if (-not $iscc -or $iscc.Source -ne $want) {
+            Write-Output "::error::ISCC.exe on PATH is '$($iscc.Source)', not the pinned $want."
+            exit 1
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1 -RequireInstaller
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::scripts\package.ps1 failed (exit $LASTEXITCODE)."; exit 1 }
+
+      - name: SHA256SUMS.txt
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = foreach ($name in @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip")) {
+            $f = Join-Path 'dist' $name
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Write-Output "::error::dist\$name was not built."; exit 1 }
+            # sha256sum's text form, LF line ends (crates/app/src/update/verify.rs reads either form)
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant(), $name
+          }
+          $dist = (Resolve-Path 'dist').Path
+          [System.IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), (($lines -join "`n") + "`n"), (New-Object System.Text.ASCIIEncoding))
+          Get-Content -LiteralPath (Join-Path $dist 'SHA256SUMS.txt')
+          # the sign job gets this file alone, in a folder of its own
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'sums') | Out-Null
+          Copy-Item -LiteralPath (Join-Path $dist 'SHA256SUMS.txt') -Destination (Join-Path $dist 'sums\SHA256SUMS.txt')
+          # the release job checks the signature against the key this commit compiles in
+          Copy-Item -LiteralPath crates\app\release-key.pub -Destination (Join-Path $dist 'release-key.pub')
+
+      - name: manifest.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = (Resolve-Path 'dist').Path
+          $exe = Join-Path $dist "AtomicSandbox-$env:VERSION-windows-x64\AtomicSandbox.exe"
+          $out = Join-Path $dist 'manifest.json'
+          # the shipped exe writes its own version, channel and data formats (update::write_manifest).
+          # A windowed exe: Start-Process -Wait, or the shell wouldn't wait for it.
+          $p = Start-Process -FilePath $exe -ArgumentList @('--write-manifest', "`"$out`"") -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out -PathType Leaf)) {
+            Write-Output "::error::AtomicSandbox.exe --write-manifest failed (exit $($p.ExitCode))."
+            exit 1
+          }
+          $m = Get-Content -LiteralPath $out -Raw | ConvertFrom-Json
+          if ($m.version -cne $env:VERSION) { Write-Output "::error::The exe says version '$($m.version)', the build is '$env:VERSION'."; exit 1 }
+          $assets = @(foreach ($name in @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip")) {
+            $f = Get-Item -LiteralPath (Join-Path $dist $name)
+            [ordered]@{ name = $name; size = $f.Length; sha256 = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          })
+          $m | Add-Member -NotePropertyName assets -NotePropertyValue $assets -Force
+          $json = $m | ConvertTo-Json -Depth 8
+          [System.IO.File]::WriteAllText($out, $json + "`n", (New-Object System.Text.UTF8Encoding $false))
+          # read back: the fields crates/app/src/update/manifest.rs requires
+          $back = Get-Content -LiteralPath $out -Raw | ConvertFrom-Json
+          if (@($back.assets).Count -ne 2 -or -not $back.formats -or -not $back.channel) { Write-Output '::error::manifest.json lost a field.'; exit 1 }
+          Get-Content -LiteralPath $out
+
+      - name: Keep the files (workflow artifact, 7 days)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atomic-sandbox-${{ steps.version.outputs.version }}
+          path: |
+            dist/AtomicSandbox-Setup-${{ steps.version.outputs.version }}.exe
+            dist/AtomicSandbox-${{ steps.version.outputs.version }}-windows-x64.zip
+            dist/SHA256SUMS.txt
+            dist/manifest.json
+            dist/release-key.pub
+          if-no-files-found: error
+          retention-days: 7
+          # a re-run of the job replaces its own earlier upload
+          overwrite: true
+          # the installer and the zip are compressed already
+          compression-level: 0
+
+      - name: Keep SHA256SUMS.txt alone for the sign job
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sums-${{ steps.version.outputs.version }}
+          path: dist/sums/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  sign:
+    name: Sign SHA256SUMS.txt
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: windows-latest
+    # the signing secrets are Environment secrets of "release" (deployment rule: v[0-9]* tags only;
+    # a required reviewer approves each run); no repository token is needed here
+    environment: release
+    permissions: {}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Install minisign ${{ env.MINISIGN_VERSION }} (pinned)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP "minisign-$env:MINISIGN_VERSION-win64.zip"
+          Invoke-WebRequest -Uri $env:MINISIGN_URL -OutFile $zip
+          $sha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne $env:MINISIGN_SHA256) {
+            Write-Output "::error::minisign-$env:MINISIGN_VERSION-win64.zip has SHA-256 $sha, expected $env:MINISIGN_SHA256."
+            exit 1
+          }
+          $dir = Join-Path $env:RUNNER_TEMP "minisign-$env:MINISIGN_VERSION"
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Join-Path $dir 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Output '::error::The minisign zip has no minisign-win64\x86_64\minisign.exe.'
+            exit 1
+          }
+          & $exe -v
+          "MINISIGN_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Fetch SHA256SUMS.txt
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sums-${{ needs.build.outputs.version }}
+          path: sums
+
+      - name: Sign (minisign, prehashed, trusted comment "atomic-sandbox <tag>")
+        # the job is tag-only already; the step that touches the secrets says so too
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:MINISIGN_SECRET_KEY) {
+            Write-Output '::error::The release Environment has no MINISIGN_SECRET_KEY secret (docs/dev-reference.md "Releasing").'
+            exit 1
+          }
+          # sign only what this release is: exactly its installer and its zip, each with a SHA-256
+          $sums = 'sums\SHA256SUMS.txt'
+          $lines = @(Get-Content -LiteralPath $sums)
+          $names = @($lines | ForEach-Object { if ($_ -cmatch '^[0-9a-f]{64}  (\S+)$') { $Matches[1] } else { "<bad line: $_>" } })
+          $want = @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip")
+          if (($names -join '|') -cne ($want -join '|')) {
+            Write-Output "::error::SHA256SUMS.txt lists '$($names -join ', ')', not exactly '$($want -join ', ')'."
+            exit 1
+          }
+          $sec = Join-Path $env:RUNNER_TEMP 'release.sec'
+          try {
+            [System.IO.File]::WriteAllText($sec, $env:MINISIGN_SECRET_KEY.Trim() + "`n", (New-Object System.Text.ASCIIEncoding))
+            # -H: prehashed (the app's verify refuses legacy signatures; 0.12 signs prehashed unless
+            # -l is given, and -H keeps that explicit). -t: the trusted comment, covered by the
+            # signature, which the app requires to be "atomic-sandbox <the tag it installs>".
+            # minisign reads the key's password as one line from stdin.
+            $env:MINISIGN_PASSWORD | & $env:MINISIGN_EXE -S -H -s $sec -m $sums -x "$sums.minisig" -t "atomic-sandbox $env:TAG"
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::minisign -S failed (exit $LASTEXITCODE): is MINISIGN_PASSWORD the key's password?"; exit 1 }
+          } finally {
+            Remove-Item -LiteralPath $sec -Force -ErrorAction SilentlyContinue
+          }
+          Get-Content -LiteralPath "$sums.minisig"
+
+      - name: Keep the signature
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signature-${{ needs.build.outputs.version }}
+          path: sums/SHA256SUMS.txt.minisig
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  release:
+    name: Draft release
+    needs: [build, sign]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Install minisign ${{ env.MINISIGN_VERSION }} (pinned)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP "minisign-$env:MINISIGN_VERSION-win64.zip"
+          Invoke-WebRequest -Uri $env:MINISIGN_URL -OutFile $zip
+          $sha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne $env:MINISIGN_SHA256) {
+            Write-Output "::error::minisign-$env:MINISIGN_VERSION-win64.zip has SHA-256 $sha, expected $env:MINISIGN_SHA256."
+            exit 1
+          }
+          $dir = Join-Path $env:RUNNER_TEMP "minisign-$env:MINISIGN_VERSION"
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Join-Path $dir 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Output '::error::The minisign zip has no minisign-win64\x86_64\minisign.exe.'
+            exit 1
+          }
+          "MINISIGN_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Fetch the build's files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: atomic-sandbox-${{ needs.build.outputs.version }}
+          path: assets
+
+      - name: Fetch the signature
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signature-${{ needs.build.outputs.version }}
+          path: assets
+
+      - name: Check the files and the signature
+        working-directory: assets
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem | Format-Table Name, Length
+          $files = @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip", 'SHA256SUMS.txt', 'SHA256SUMS.txt.minisig', 'manifest.json', 'release-key.pub')
+          foreach ($f in $files) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Write-Output "::error::$f is missing from the build's files"; exit 1 }
+          }
+          # the signature, under the key the tagged commit compiles in, for this tag
+          & $env:MINISIGN_EXE -V -H -p release-key.pub -m SHA256SUMS.txt -x SHA256SUMS.txt.minisig
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output '::error::SHA256SUMS.txt.minisig does not verify under crates/app/release-key.pub: the release Environment''s MINISIGN_SECRET_KEY is not the committed key''s pair.'
+            exit 1
+          }
+          $tc = @(Get-Content -LiteralPath SHA256SUMS.txt.minisig | Where-Object { $_.StartsWith('trusted comment: ') })
+          if ($tc.Count -ne 1 -or $tc[0] -cne "trusted comment: atomic-sandbox $env:TAG") {
+            Write-Output "::error::The signature's trusted comment is '$tc', not 'atomic-sandbox $env:TAG': the app would refuse it."
+            exit 1
+          }
+          # the sums against the files they list
+          foreach ($line in Get-Content -LiteralPath SHA256SUMS.txt) {
+            $sum, $name = $line -split '  ', 2
+            $got = (Get-FileHash -LiteralPath $name -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -cne $sum) { Write-Output "::error::$name has SHA-256 $got, SHA256SUMS.txt says $sum."; exit 1 }
+            Write-Output "$name OK"
+          }
+          # manifest.json (unsigned; it drives the downgrade warnings): this version, and the very
+          # files attached, by name, size and SHA-256
+          $m = Get-Content -LiteralPath manifest.json -Raw | ConvertFrom-Json
+          if ("v$($m.version)" -cne $env:TAG) { Write-Output "::error::manifest.json says version '$($m.version)', the tag is $env:TAG."; exit 1 }
+          $want = @("AtomicSandbox-Setup-$env:VERSION.exe", "AtomicSandbox-$env:VERSION-windows-x64.zip")
+          $listed = @($m.assets)
+          if ((@($listed | ForEach-Object { $_.name }) -join '|') -cne ($want -join '|')) {
+            Write-Output "::error::manifest.json lists the assets '$(@($listed | ForEach-Object { $_.name }) -join ', ')', not '$($want -join ', ')'."
+            exit 1
+          }
+          foreach ($a in $listed) {
+            $f = Get-Item -LiteralPath $a.name
+            $got = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ([int64]$a.size -ne $f.Length -or $a.sha256 -cne $got) {
+              Write-Output "::error::manifest.json says $($a.name) is $($a.size) bytes, SHA-256 $($a.sha256); the file is $($f.Length) bytes, $got."
+              exit 1
+            }
+            Write-Output "manifest.json: $($a.name) OK"
+          }
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $notes = @"
+          ## Install
+
+          Download **AtomicSandbox-Setup-$env:VERSION.exe** and run it: a per-user install (no administrator rights), with a Start-menu shortcut and an uninstaller in Windows' Apps list. It opens on H₂, paused.
+
+          Windows may show 'Windows protected your PC' — the installer isn't code-signed yet: More info → Run anyway.
+
+          **Portable:** AtomicSandbox-$env:VERSION-windows-x64.zip runs from wherever you unzip it, and keeps its data beside the exe.
+
+          An installed copy updates itself from Help ▸ Version…: every download is checked against SHA256SUMS.txt and its minisign signature (SHA256SUMS.txt.minisig) before anything is installed. manifest.json lists the assets and the data formats this version reads and writes.
+
+          The physics validation suites were run locally on the tagged commit ($env:GITHUB_SHA) before this release was published; the GitHub runner that built it has no GPU.
+
+          Needs Windows 10 or 11 (x64) and a GPU with Vulkan or DirectX 12.
+          "@
+          [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'notes.md'), $notes.Replace("`r`n", "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
+          Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'notes.md') -Encoding utf8
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          # no second draft for one tag: a re-run after a create that failed part-way would add one
+          $view = & gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "::error::A release for $env:TAG already exists — delete the stale draft first (gh release delete $env:TAG), then re-run this job. ($view)"
+            exit 1
+          }
+          if ("$view" -notmatch 'release not found') {
+            Write-Output "::error::gh release view $env:TAG failed: $view"
+            exit 1
+          }
+          $ghArgs = @('release', 'create', $env:TAG, '--repo', $env:GITHUB_REPOSITORY, '--draft', '--verify-tag',
+            '--title', "Atomic Sandbox $env:VERSION", '--notes-file', (Join-Path $env:RUNNER_TEMP 'notes.md'))
+          if ($env:PRERELEASE -eq 'true') { $ghArgs += '--prerelease' }
+          $ghArgs += @("assets/AtomicSandbox-Setup-$env:VERSION.exe", "assets/AtomicSandbox-$env:VERSION-windows-x64.zip",
+            'assets/SHA256SUMS.txt', 'assets/SHA256SUMS.txt.minisig', 'assets/manifest.json')
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::gh release create failed (exit $LASTEXITCODE)."; exit 1 }
+          Write-Output "Draft release $env:TAG created: check it on GitHub, then publish it there."

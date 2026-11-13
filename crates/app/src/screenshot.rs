@@ -117,6 +117,12 @@ pub struct ShotUi {
     pub names: Option<crate::names::NameStyle>,
     /// `angles=on|off`: the bond-angle overlay (View ▸ Bonds and molecules ▸ bond angles).
     pub angles: Option<bool>,
+    /// `autobonds=on|off`: View ▸ Bonds & labels ▸ refresh bonds after a drag (estimated solver;
+    /// default on).
+    pub auto_bonds: Option<bool>,
+    /// `bondguess=on|off`: View ▸ Bonds & labels ▸ guess bonds from experience (estimated solver;
+    /// default on; `crate::bond_experience`).
+    pub bond_guess: Option<bool>,
     /// Camera yaw / pitch (radians) and distance
     /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
     /// `dotcolour=orbital`, `nuclei=<scale>`.
@@ -223,6 +229,20 @@ impl ShotUi {
                         "on" => true,
                         "off" => false,
                         other => return Err(format!("--ui: angles=on|off, got {other}")),
+                    })
+                }
+                "autobonds" => {
+                    s.auto_bonds = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: autobonds=on|off, got {other}")),
+                    })
+                }
+                "bondguess" => {
+                    s.bond_guess = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: bondguess=on|off, got {other}")),
                     })
                 }
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -458,6 +478,12 @@ impl ShotUi {
         }
         if let Some(on) = self.angles {
             viewer.ui.show_angles = on;
+        }
+        if let Some(on) = self.auto_bonds {
+            viewer.ui.auto_refresh_bonds = on;
+        }
+        if let Some(on) = self.bond_guess {
+            viewer.ui.guess_bonds = on;
         }
         if let Some(q) = &self.ptable {
             viewer.ui.ptable_query = q.clone();
@@ -1024,6 +1050,14 @@ mod tests {
         assert_eq!(ShotUi::parse("angles=on;select=0").unwrap().angles, Some(true));
         assert_eq!(ShotUi::parse("select=0").unwrap().angles, None);
         assert!(ShotUi::parse("angles=maybe").is_err());
+        assert_eq!(ShotUi::parse("autobonds=off").unwrap().auto_bonds, Some(false));
+        assert_eq!(ShotUi::parse("autobonds=on").unwrap().auto_bonds, Some(true));
+        assert_eq!(ShotUi::parse("select=0").unwrap().auto_bonds, None);
+        assert!(ShotUi::parse("autobonds=maybe").is_err());
+        assert_eq!(ShotUi::parse("bondguess=off").unwrap().bond_guess, Some(false));
+        assert_eq!(ShotUi::parse("bondguess=on").unwrap().bond_guess, Some(true));
+        assert_eq!(ShotUi::parse("select=0").unwrap().bond_guess, None);
+        assert!(ShotUi::parse("bondguess=maybe").is_err());
     }
 
     /// `layout=<preset>` names a built-in layout (docking spec D-13); `dock=closed`, the docks'

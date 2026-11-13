@@ -134,7 +134,7 @@ pub fn sparkline(
     if legend {
         ui.horizontal_wrapped(|ui| {
             ui.weak("E total by step:");
-            for s in [Source::Surrogate, Source::Fallback, Source::Dft] {
+            for s in [Source::Surrogate, Source::Fallback, Source::Dft, Source::Reference] {
                 ui.colored_label(source_colour(s), source_label(s));
             }
             if any_guess {

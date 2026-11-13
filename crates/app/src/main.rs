@@ -6,17 +6,20 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 mod atom_card;
 mod badge;
+mod bond_experience;
 mod builder;
 mod capture;
 mod cloud;
 mod detached;
 mod frame;
 mod icon;
+mod instance;
 mod timings;
 mod gfx;
 mod ghost;
 mod names;
 mod overlay;
+mod paths;
 mod progress;
 mod quality;
 mod reference;
@@ -28,6 +31,9 @@ mod sim;
 mod tools;
 mod trails;
 mod ui;
+// the in-app updater: release logic (installer Task 2), the fetch, download, session and hand-off
+// (Task 3; `--resume-session` uses the session); the Version panel (Task 4) uses the rest
+mod update;
 mod viewer;
 mod worker;
 
@@ -257,9 +263,38 @@ impl StartFlags {
     }
 }
 
+/// The status line after `--update-failed`: the installer's relaunch after a silent update that
+/// got past its wait but did not finish (`installer/AtomicSandbox.iss`, `DeinitializeSetup`).
+/// Inno's rollback removes the files it added but doesn't restore the ones it replaced or
+/// deleted, so the install may be part old, part new; the user's data is untouched.
+const UPDATE_FAILED: &str =
+    "The update did not finish: the installed files may be mixed. Run the installer again from the Version panel, or download it from GitHub.";
+
+/// Says [`UPDATE_FAILED`] on the status line (and stderr) when the flag was given.
+fn note_update_failed(ui: &mut ui::UiState, update_failed: bool) {
+    if update_failed {
+        eprintln!("{UPDATE_FAILED}");
+        ui.set_status(UPDATE_FAILED);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--update-failed` (installer Task 5 fix round 1, M4) puts its line on the status, as a new
+    /// message; without the flag the status is left alone.
+    #[test]
+    fn the_update_failed_flag_sets_the_status() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.set_status("restored the session from before the update (paused)");
+        let seq = v.ui.status_seq;
+        note_update_failed(&mut v.ui, false);
+        assert_eq!((v.ui.status.as_str(), v.ui.status_seq), ("restored the session from before the update (paused)", seq));
+        note_update_failed(&mut v.ui, true);
+        assert_eq!((v.ui.status.as_str(), v.ui.status_seq), (UPDATE_FAILED, seq + 1));
+        assert!(UPDATE_FAILED.starts_with("The update did not finish: the installed files may be mixed."));
+    }
 
     /// `--scene` loads the file the way File ▸ Load does (final review app I1/I3): the chip
     /// names it, Save / Load point at it, its spacing is the quality, the walls follow its cell.
@@ -365,6 +400,34 @@ fn attach_console() {
 fn main() {
     #[cfg(windows)]
     attach_console();
+    // hidden, for CI (installer Task 6): `--write-manifest <path>` writes this build's release
+    // manifest (version, channel, data formats; no asset entries, `update::manifest`) and exits
+    // before anything else starts
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--write-manifest") {
+        let Some(path) = argv.get(i + 1) else {
+            eprintln!("--write-manifest needs a path");
+            std::process::exit(2);
+        };
+        if let Err(e) = update::write_manifest(std::path::Path::new(path)) {
+            eprintln!("--write-manifest {path}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // hidden, for packaging (installer Task 5, `scripts/package.ps1`): `--write-icon <path>` writes
+    // the app's `.ico` (the one `build.rs` embeds in the exe) for the installer's own icon, and exits
+    if let Some(i) = argv.iter().position(|a| a == "--write-icon") {
+        let Some(path) = argv.get(i + 1) else {
+            eprintln!("--write-icon needs a path");
+            std::process::exit(2);
+        };
+        if let Err(e) = std::fs::write(path, icon::ico(&icon::ICO_SIZES)) {
+            eprintln!("--write-icon {path}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // our own taskbar identity: Windows then takes the button's icon from the window (`frame::exe_icon`)
     // instead of resolving one for the exe path (it showed the generic icon)
     #[cfg(windows)]
@@ -375,6 +438,15 @@ fn main() {
     // the dimer gate's derived verdicts are kept per species identity in the cache directory, so pseudo-H/He cost their
     // minute once per recipe, not per launch (M7 Task 11 fix round; `providers::pseudo` "The disk cache")
     providers::pseudo::set_disk_cache(providers::pseudo::default_disk_cache_dir());
+    // an installed build's first launch: the shipped models and scenes copied into the per-user
+    // root, once (`paths`; dev and portable builds keep their folders beside the exe)
+    if paths::mode() == paths::DataMode::Installed {
+        paths::seed_installed();
+        // the updater's leftovers in `updates\` only: stale downloads, installers of other versions
+        if let (Some(dir), Ok(current)) = (update::apply::updates_dir(), semver::Version::parse(env!("CARGO_PKG_VERSION"))) {
+            update::clean_updates(&dir, &current);
+        }
+    }
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
@@ -387,6 +459,12 @@ fn main() {
     let mut start_layout = None;
     // input replay (M6 spec §8): record the window's session, or run a script headlessly
     let (mut record, mut replay_path) = (None, None);
+    // hidden, the installer's relaunch after an update (`update::apply`): the session saved
+    // before it, reopened paused (the window only)
+    let mut resume_session: Option<PathBuf> = None;
+    // hidden, the installer's relaunch after a silent update that did not finish (installer Task 5
+    // fix round 1, M4): said on the status line (`note_update_failed`)
+    let mut update_failed = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -440,6 +518,8 @@ fn main() {
                     .unwrap_or_else(|e| panic!("{e}"))
             }
             "--scene" => flags.scene = Some(args.next().expect("--scene needs a file")),
+            "--resume-session" => resume_session = Some(PathBuf::from(args.next().expect("--resume-session needs a session file"))),
+            "--update-failed" => update_failed = true,
             "--walls" => {
                 flags.walls = Some(
                     args.next()
@@ -518,6 +598,16 @@ fn main() {
         }
         return;
     }
+    // the session from before an update: its backend is the one the window starts on. A session
+    // that can't be read is said and skipped — the app opens as at any start, never not at all
+    let (session, session_error) = match resume_session.as_deref().map(update::load_session) {
+        Some(Ok(s)) => (Some(s), None),
+        Some(Err(e)) => (None, Some(format!("couldn't restore the session from before the update: {e}"))),
+        None => (None, None),
+    };
+    if let Some(s) = &session {
+        backend = s.backend;
+    }
     let mut viewer = Viewer::new(&preset)
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
     // the window never starts a sampling pass by itself: Start sampling does (user request 2026-10-19)
@@ -528,17 +618,35 @@ fn main() {
         eprintln!("note: no models folder beside the exe or in the working directory: the estimated solver keeps this session's model only (no shared collection)");
     }
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));
+    // (`%LOCALAPPDATA%\atomic-sandbox`, `paths::user_root`: the same in every mode)
+    if let Some(root) = paths::user_root() {
+        viewer.ui.profiles.current_file = Some(root.join("current.profile"));
         ui::profile::load_current(&mut viewer.ui);
-        viewer.ui.timings = timings::Timings::load(Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("timings.txt")));
+        viewer.ui.timings = timings::Timings::load(Some(root.join("timings.txt")));
         // a running sampling pass is kept resumable there (`worker::checkpoint`), and offered at the next start
-        viewer.training_dir = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("training"));
+        viewer.training_dir = Some(root.join("training"));
     }
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    // the window's automatic update checks (at launch, then every 6 hours; never in a build from
+    // source, nor headless: `ui::version`)
+    viewer.ui.update.background = true;
+    // this window's hold on its install's name: Restart now refuses while another copy holds it too
+    instance::claim();
+    // after the profile and the flags: the session's scene and settings win, paused
+    let resumed = session.is_some();
+    if let Some(s) = session {
+        s.apply(&mut viewer);
+        viewer.ui.set_status("restored the session from before the update (paused)");
+    }
+    if let Some(e) = session_error {
+        eprintln!("{e}");
+        viewer.ui.set_status(e);
+    }
+    // last, so it is the line the window opens on
+    note_update_failed(&mut viewer.ui, update_failed);
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
@@ -562,7 +670,7 @@ fn main() {
         // grid; a preset is recorded with the quality it was loaded at (the quality first, so the
         // preset loads at it), so a replay does not depend on the app's default quality
         let mut start = match u.source.preset() {
-            Some(p) if flags.scene.is_none() => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
+            Some(p) if flags.scene.is_none() && !resumed => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
             _ => vec![],
         };
         // the ionic policy first (M7): a preset loads under the policy in force, so the pin precedes it — and
@@ -585,7 +693,9 @@ fn main() {
         if u.cloud_refresh {
             start.push(ui::Action::Cloud { superposition: u.cloud_superposition, refresh: true, refresh_s: u.cloud_refresh_s });
         }
-        let scene = flags.scene.as_ref().map(|f| std::path::absolute(f).map_or(f.clone(), |p| p.display().to_string()));
+        // a resumed session is recorded as its file, which reads as a plain scene file
+        let resumed_file = resume_session.as_ref().filter(|_| resumed).map(|p| p.display().to_string());
+        let scene = flags.scene.as_ref().or(resumed_file.as_ref()).map(|f| std::path::absolute(f).map_or(f.clone(), |p| p.display().to_string()));
         Record { path, start, scene, recorder: None, was_idle: false }
     });
     let event_loop = EventLoop::new().expect("event loop");
@@ -1050,7 +1160,9 @@ impl App {
         // the detached windows' panels are drawn in the same frame, from the same state (spec D-12)
         let windows = self.detached.iter_mut().map(|d| (d.id, d.egui.clone(), d.take_input())).collect();
         let (mut out, detached_out) = self.viewer.run_ui_with(raw, windows);
-        match frame::take_cmd() {
+        // Restart now handed off to the installer (`Viewer::close_for_update`): the close button's path
+        let cmd = frame::take_cmd().or_else(|| self.viewer.close_for_update.take().map(|_installer_waits| frame::Cmd::Close));
+        match cmd {
             Some(frame::Cmd::Minimise) => window.set_minimized(true),
             Some(frame::Cmd::ToggleMaximise) => window.set_maximized(!window.is_maximized()),
             Some(frame::Cmd::Close) => {

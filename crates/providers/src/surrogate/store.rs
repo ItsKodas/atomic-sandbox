@@ -137,6 +137,7 @@ impl SurrogateKs {
         self.class_worst = Vec::new();
         self.class_blockers = Vec::new();
         self.deferred_trust = None;
+        self.loo_ratios = None;
         self.teach_rounds.clear();
         self.teach_classes.clear();
         self.teach_start = None;
@@ -289,8 +290,8 @@ impl SurrogateKs {
         self.refs_dirty = true;
         self.pending_refit = true;
         self.ledger.counts = match teacher_solves {
-            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete },
-            None => SolveCounts { unrecorded_before: true, ..SolveCounts::default() },
+            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete, reference: self.ledger.counts.reference },
+            None => SolveCounts { unrecorded_before: true, reference: self.ledger.counts.reference, ..SolveCounts::default() },
         };
         if let Some(n) = teacher_solves_note {
             self.user_notes.push(format!("surrogate: {n}"));
@@ -543,8 +544,8 @@ impl SurrogateKs {
         // the state above is therefore never left half-installed (review m7).
         self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())?;
         self.ledger.counts = match teacher_solves {
-            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete },
-            None => SolveCounts { unrecorded_before: true, ..SolveCounts::default() },
+            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete, reference: self.ledger.counts.reference },
+            None => SolveCounts { unrecorded_before: true, reference: self.ledger.counts.reference, ..SolveCounts::default() },
         };
         if let Some(n) = teacher_solves_note {
             self.user_notes.push(format!("surrogate: {n}"));

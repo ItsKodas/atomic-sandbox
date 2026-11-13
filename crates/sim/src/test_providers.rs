@@ -427,6 +427,22 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().import_model(path)
     }
 
+    fn forget_sample(&mut self, id: crate::provider::SampleId) -> Result<(), String> {
+        self.lock().forget_sample(id)
+    }
+
+    fn restore_sample(&mut self, id: crate::provider::SampleId) -> Result<(), String> {
+        self.lock().restore_sample(id)
+    }
+
+    fn sample_suspects(&self) -> Vec<crate::provider::SampleSuspect> {
+        self.lock().sample_suspects()
+    }
+
+    fn forgotten_samples(&self) -> Vec<crate::provider::SampleSuspect> {
+        self.lock().forgotten_samples()
+    }
+
     fn fitted(&self) -> bool {
         Trainable::fitted(&*self.lock())
     }

@@ -50,8 +50,11 @@ pub fn rgba(size: u32) -> Vec<u8> {
     out
 }
 
+/// The sizes in the `.ico`: the one embedded in `app.exe` (`build.rs`) and the installer's
+/// (`--write-icon`, installer Task 5), so the two cannot drift apart.
+pub const ICO_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
+
 /// A Windows `.ico` holding the mark at `sizes` (32-bit BMP entries, alpha in the colour data).
-#[allow(dead_code)] // build.rs only
 pub fn ico(sizes: &[u32]) -> Vec<u8> {
     let mut images: Vec<Vec<u8>> = Vec::new();
     for &s in sizes {

@@ -63,6 +63,8 @@ pub const ENTRIES: &[Entry] = &[
     e("Delete selected", "remove nucleus atom", Toolbar, "tb-selection"),
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
+    // user request 2026-11-12: shown beside Estimated; with another solver the anchor is Estimated
+    e("⚠ Model only (no DFT checks)", "model only draft audits off hands-off unchecked surrogate estimated", Toolbar, "tb-model-only"),
     // the scene chip (since the File windows, 2026-10-19, the full layout's File menu holds only
     // Open… / Save… / Profiles…; the compact layout's File submenu keeps the inline rows too)
     e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", SceneChip, "m-presets"),
@@ -74,6 +76,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Load model", "estimated surrogate .model", Menu(M::File), "m-files"),
     e("Profiles", "layout look save load reset user", Menu(M::File), "m-files"),
+    e("Import data from a folder", "installed migrate copy older models profiles scenes localappdata", Menu(M::File), "m-files"),
     e("Molecule builder", "builder draw sketch 2D structural formula molecule bonds hydrogens benzene ethanol insert replace", Menu(M::File), "m-files"),
     e("Forget model", "drop samples estimated", Dock(D::Model), "d-model-file"),
     // Scene
@@ -120,6 +123,8 @@ pub const ENTRIES: &[Entry] = &[
     e("Bond angles", "angle degrees geometry bonds HOH water", Dock(D::View), "m-bonds"),
     e("Bond lengths", "distance Å angstrom label", Dock(D::View), "m-bonds"),
     e("Partial charges", "atomic charge Hirshfeld stockholder δ+ δ− polar polarity ionic electronegativity labels", Dock(D::View), "m-bonds"),
+    e("Refresh bonds after a drag", "solve bonds now automatic auto stale dashed faded estimated surrogate drag move", Dock(D::View), "m-bonds"),
+    e("Guess bonds from experience", "bond experience learned remembered stale dashed faded estimated surrogate broken pulled apart guess", Dock(D::View), "m-bonds"),
     e("Label opacity", "labels transparent faint names lengths angles charges", Dock(D::View), "m-bonds"),
     e("Reset view settings", "defaults look display aids camera bonds restore", Dock(D::View), "m-view-reset"),
     // Physics
@@ -137,6 +142,7 @@ pub const ENTRIES: &[Entry] = &[
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
+    e("Version and updates", "version update upgrade downgrade install release channel stable beta check restart", Menu(M::Help), "m-version"),
     // Window (docking spec D-7)
     e("Show a panel", "window panels open reopen closed tab Model Knowledge Selection Readouts View Orbitals Log Activity Graph", Menu(M::Window), "m-panels"),
     e("Layout: One monitor", "layouts workspace arrangement preset default single screen", Menu(M::Window), "m-layout"),
@@ -187,6 +193,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Save a specialised model", "specialised smaller faster export species subset shared collection", Dock(D::Model), "d-model-source"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    e("Worst-fitting samples (forget / restore one)", "leave-one-out outlier bad sample forget restore estimated", Dock(D::Model), "d-suspects"),
     // Knowledge (M8a Task 9)
     e("Knowledge map", "what the model knows shared collection elements pairs graph distances histogram angles coordination trusted thin never seen", Dock(D::Knowledge), "d-knowledge"),
     // Activity

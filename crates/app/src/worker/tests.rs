@@ -1075,6 +1075,47 @@ fn after_a_far_drag_the_surrogate_answers_again() {
     );
 }
 
+/// Spec 2026-11-12 R2: the Model tab's Forget and Restore reach the provider through the worker
+/// (`Command::ForgetSample` → `Trainable::forget_sample`) and start a refit — paused, in the tick
+/// (`refit_if_pending`, not throttled): the snapshot after it counts the sample as forgotten, the
+/// refit as run, and the list no longer names it; Restore brings it back with another refit. A
+/// sample that does not exist is the error line, nothing changed.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn forget_and_restore_a_sample_refit_the_model() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let (w, trained, _) = taught(h2_49(), ctx, None);
+    let m0 = model(&trained).clone();
+    let id = m0.suspects.first().map(|x| x.id).expect("a trained model ranks its samples");
+    let k = id.index;
+    assert!(m0.suspects.len() <= 8 && m0.forgotten == 0 && m0.forgotten_samples.is_empty(), "{:?}", m0.suspects);
+    w.send(Command::ForgetSample(id));
+    let s = snapshot_until(&w, "the refit after the forget", |s| model(s).forgotten == 1 && model(s).refits > m0.refits && !model(s).pending_refit);
+    let m = model(&s);
+    eprintln!("forgot #{k}: refits {} → {}, fit {:?} → {:?}; {:?}", m0.refits, m.refits, m0.fit, m.fit, m.fit_vs_held);
+    assert!(!m.suspects.iter().any(|x| x.id.index == k), "{:?}", m.suspects);
+    assert_eq!(m.forgotten_samples.iter().map(|x| x.id).collect::<Vec<_>>(), vec![id]);
+    assert_eq!(m.fit.map(|f| f.0), m0.fit.map(|f| f.0 - 1), "fitted without it");
+    assert!(m.fit_vs_held.as_deref().is_some_and(|t| t.contains("1 forgotten")), "{:?}", m.fit_vs_held);
+    assert!(s.dynamics.notes.iter().any(|n| n.contains(&format!("sample #{k} forgotten"))), "{:?}", s.dynamics.notes);
+    w.send(Command::RestoreSample(id));
+    let s = snapshot_until(&w, "the refit after the restore", |s| model(s).forgotten == 0 && model(s).refits > m.refits && !model(s).pending_refit);
+    assert_eq!(model(&s).fit.map(|f| f.0), m0.fit.map(|f| f.0), "fitted with it again");
+    w.send(Command::RestoreSample(id));
+    let deadline = Instant::now() + WAIT;
+    let error = loop {
+        assert!(Instant::now() < deadline, "no error line for a restore of a sample that is not forgotten");
+        if let Some(Event::Error(e)) = w.recv_timeout(Duration::from_secs(1)) {
+            break e;
+        }
+    };
+    assert!(error.contains(&format!("restore sample #{k}")) && error.contains("not forgotten"), "{error}");
+}
+
 /// Fix round 4: a far geometry in a small box (R = 8 at 41³: the density reaches the faces)
 /// is answered by DFT and never trained on — the model stays trusted, R = 1.6 stays the
 /// model's, and R = 8 again is a fallback, the store unchanged.
@@ -2170,6 +2211,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         pseudo_generating: None,
         draft_banner: None,
         bonds_label: None,
+        stale_bonds_line: None,
         probe: None,
     };
     let mut out = crate::ui::PanelOutput::default();

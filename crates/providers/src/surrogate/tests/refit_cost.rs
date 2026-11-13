@@ -775,8 +775,8 @@ fn a_background_refit_carries_its_body4_degree() {
     assert!(!s.user_notes.iter().any(|n| n.contains("discarded")), "{:?}", s.user_notes);
     // a refit that started at degree 2 against the live provider at 3
     let mut snap = s.snapshot();
-    assert_eq!(s.background_conflict(&snap), None);
+    assert_eq!(s.background_conflict(&snap, &BTreeMap::new()), None);
     snap.body4_degree = 2;
-    let why = s.background_conflict(&snap).expect("a conflict");
+    let why = s.background_conflict(&snap, &BTreeMap::new()).expect("a conflict");
     assert!(why.contains("the body-4 degree"), "{why}");
 }

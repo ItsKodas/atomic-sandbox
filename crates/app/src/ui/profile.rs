@@ -5,7 +5,9 @@
 //! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
 //! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
 //! `workspace::detached`), the view and density-look settings and which
-//! of the View panel's sections are open (`view_sections = what,looks`), the units — as a small
+//! of the View panel's sections are open (`view_sections = what,looks`), the units, the Version
+//! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
+//! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
 //! or reaches the worker, so a profile never changes the physics or a recording.
 //!
@@ -45,9 +47,16 @@ fn tabs_of(v: &str) -> Vec<DockTab> {
 fn pick<T: Copy + std::fmt::Debug>(all: &[T], w: &str) -> Option<T> {
     all.iter().copied().find(|t| format!("{t:?}") == w)
 }
+/// The profile format this build reads and writes, recorded in a release's `manifest.json`
+/// (`update::formats`). A profile carries no version line: this number is code-only. Bump it when a
+/// profile this build writes would lose or change settings in the previous release — a renamed or
+/// re-meant key, a changed value grammar (`layout`, `hidden`, `window`). A new key alone does not
+/// bump it when older builds skip unknown keys.
+pub const PROFILE_FORMAT: u32 = 1;
 const NAME_STYLES: [NameStyle; 4] = [NameStyle::Common, NameStyle::Stoichiometric, NameStyle::Hydride, NameStyle::FormulaOnly];
 const ENERGY_UNITS: [EnergyUnits; 3] = [EnergyUnits::Ha, EnergyUnits::Ev, EnergyUnits::Both];
 const TEMP_UNITS: [TempUnits; 3] = [TempUnits::K, TempUnits::C, TempUnits::F];
+const UPDATE_CHANNELS: [crate::update::Channel; 2] = [crate::update::Channel::Stable, crate::update::Channel::Beta];
 
 /// The profile of `st`, as text.
 pub fn capture(st: &UiState) -> String {
@@ -59,6 +68,8 @@ pub fn capture(st: &UiState) -> String {
         };
     }
     fields!(put);
+    out += &format!("auto_refresh_bonds = {}\n", st.auto_refresh_bonds);
+    out += &format!("guess_bonds = {}\n", st.guess_bonds);
     out += &format!("nucleus_scale = {}\n", st.nucleus_scale.map_or("auto".into(), |x| x.to_string()));
     out += &format!("background = {}\n", st.background.map_or("default".into(), |c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])));
     out += &format!("name_style = {:?}\n", st.name_style);
@@ -70,6 +81,9 @@ pub fn capture(st: &UiState) -> String {
         out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
     }
     out += &format!("view_sections = {}\n", st.view_sections.encode());
+    // the Version panel's display settings (installer Task 4)
+    out += &format!("update_channel = {:?}\n", st.update.channel);
+    out += &format!("update_auto_check = {}\n", st.update.auto_check);
     out
 }
 
@@ -98,6 +112,9 @@ pub fn apply(st: &mut UiState, text: &str) {
         };
     }
     fields!(get);
+    // added 2026-11-13: a profile from before it (or an unreadable value) reads as on, its default
+    st.auto_refresh_bonds = kv.get("auto_refresh_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
+    st.guess_bonds = kv.get("guess_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
     if let Some(v) = kv.get("nucleus_scale") {
         st.nucleus_scale = v.parse().ok();
     }
@@ -115,6 +132,12 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
+    }
+    if let Some(v) = kv.get("update_channel").and_then(|w| pick(&UPDATE_CHANNELS, w)) {
+        st.update.channel = v;
+    }
+    if let Some(v) = kv.get("update_auto_check").and_then(|v| v.parse().ok()) {
+        st.update.auto_check = v;
     }
     // the View panel's open sections (docking Task 4); a profile from before it opens the default two
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
@@ -322,8 +345,10 @@ pub fn show(ctx: &egui::Context, st: &mut UiState) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let (mine, shipped) = st.timings.counts();
-                ui.label(RichText::new(format!("completion times: {mine} yours · {shipped} in the repo")).size(12.5).color(theme::INK_DIM));
-                if ui.add_enabled(mine > 0, egui::Button::new("Save mine into timings/")).on_hover_text("merge your measured times (loading scenes, …) into timings/timings.txt — commit it to ship them as everyone's starting ETAs").clicked() {
+                // the installed build's shipped times are read-only in its install folder: nothing to save into
+                let installed = st.data_mode == crate::paths::DataMode::Installed;
+                ui.label(RichText::new(format!("completion times: {mine} yours · {shipped} {}", if installed { "shipped" } else { "in the repo" })).size(12.5).color(theme::INK_DIM));
+                if !installed && ui.add_enabled(mine > 0, egui::Button::new("Save mine into timings/")).on_hover_text("merge your measured times (loading scenes, …) into timings/timings.txt — commit it to ship them as everyone's starting ETAs").clicked() {
                     st.profiles.note = match st.timings.publish() {
                         Ok(p) => format!("saved to {}", p.display()),
                         Err(e) => format!("timings: {e}"),

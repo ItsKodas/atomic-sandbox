@@ -45,6 +45,13 @@ pub(crate) fn canonical_a(z: u8, a: u16) -> Option<u16> {
 /// ([`Scene::drop_deferred_train_mask`]).
 pub const TRAIN_MASK_IGNORED: &str = "train_mask ignored: Train this segment is deferred";
 
+/// The scene file format this build reads and writes, recorded in a release's `manifest.json`
+/// (`update::formats`). A scene file carries no version line (the parser refuses unknown lines, so
+/// a marker would itself break every older build): this number is code-only. Bump it when a scene
+/// file this build writes would not parse, or would mean something else, in the previous release:
+/// a new line or field, a changed meaning or unit. Adding a reader for an older form does not bump it.
+pub const SCENE_FORMAT: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub nuclei: Vec<SceneNucleus>,
@@ -340,42 +347,38 @@ pub fn model_path(scene_path: &str) -> std::path::PathBuf {
     std::path::Path::new(scene_path).with_extension("model")
 }
 
-/// The `models` folder: next to the running executable (`build.bat`'s dist folder), else in the
-/// working directory (the repository's `models/` when run from the root, as `start.bat` does).
-/// The model Save/Open dialogs start there unless a model file was already chosen.
+/// The `models` folder ([`crate::paths`]): dev and portable builds look next to the running
+/// executable (`build.bat`'s dist folder), else in the working directory (the repository's
+/// `models/` when run from the root, as `start.bat` does); an installed build keeps it under
+/// `%LOCALAPPDATA%\atomic-sandbox`. The model Save/Open dialogs start there unless a model file
+/// was already chosen.
 pub fn models_dir() -> Option<std::path::PathBuf> {
-    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("models")));
-    let in_cwd = std::env::current_dir().ok().map(|d| d.join("models"));
-    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+    crate::paths::dir(crate::paths::DataDir::Models)
 }
 
 /// The shared collections' folder (M8a Task 4b; ruling P6): `collections` inside [`models_dir`],
-/// created on first use (by the collection's own open, `surrogate::Collection::open`, not here);
-/// `None` without a `models` folder. Only the window sets it (`Viewer::collections_dir`): headless
-/// runs keep per-scene models.
+/// created on first use (by the collection's own open, `surrogate::Collection::open`, not here —
+/// an installed build creates it with the root's folders); `None` without a `models` folder. Only
+/// the window sets it (`Viewer::collections_dir`): headless runs keep per-scene models.
 pub fn collections_dir() -> Option<std::path::PathBuf> {
-    Some(models_dir()?.join("collections"))
+    crate::paths::dir(crate::paths::DataDir::Collections)
 }
 
 /// The `scenes` folder, found like [`models_dir`] (the dist folder's has the presets as files).
 pub fn scenes_dir() -> Option<std::path::PathBuf> {
-    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("scenes")));
-    let in_cwd = std::env::current_dir().ok().map(|d| d.join("scenes"));
-    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+    crate::paths::dir(crate::paths::DataDir::Scenes)
 }
 
 /// The `profiles` folder (saved profiles, to share), found like [`models_dir`].
 pub fn profiles_dir() -> Option<std::path::PathBuf> {
-    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("profiles")));
-    let in_cwd = std::env::current_dir().ok().map(|d| d.join("profiles"));
-    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+    crate::paths::dir(crate::paths::DataDir::Profiles)
 }
 
-/// The `timings` folder (completion times shipped with the repository), found like [`models_dir`].
+/// The `timings` folder (completion times shipped with the repository), found like [`models_dir`]
+/// (an installed build: the install folder's read-only `bundled\timings`, absent while the
+/// repository commits none; the user's own `timings.txt` stays at the root).
 pub fn timings_dir() -> Option<std::path::PathBuf> {
-    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("timings")));
-    let in_cwd = std::env::current_dir().ok().map(|d| d.join("timings"));
-    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+    crate::paths::dir(crate::paths::DataDir::Timings)
 }
 
 /// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).

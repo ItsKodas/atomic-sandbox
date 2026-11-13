@@ -24,6 +24,7 @@
 //! (rule 8).
 pub mod actions;
 pub mod activity;
+pub mod auto_bonds;
 mod capture;
 mod dock;
 mod files;
@@ -41,6 +42,7 @@ mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
+pub mod version;
 mod workspace;
 
 pub use actions::Action;
@@ -73,13 +75,17 @@ const FORGET_CONFIRM: Duration = Duration::from_secs(4);
 /// Below this width (points) the toolbar and the top bar switch to their compact layouts.
 const COMPACT_WIDTH: f32 = 1240.0;
 
+/// The colour of a step answered from the isolated-atom references (lone atoms, `Source::Reference`).
+pub const TEAL: Color32 = Color32::from_rgb(110, 205, 200);
+
 /// Who answered a step, as a colour: surrogate green, fallback amber, DFT blue (the sparkline's
-/// E colour, so a Kohn-Sham run looks as before).
+/// E colour, so a Kohn-Sham run looks as before), lone atoms answered from the references teal.
 pub fn source_colour(s: Source) -> Color32 {
     match s {
         Source::Surrogate => GREEN,
         Source::Fallback => AMBER,
         Source::Dft => SPARK_E,
+        Source::Reference => TEAL,
     }
 }
 
@@ -88,6 +94,16 @@ pub fn source_label(s: Source) -> &'static str {
         Source::Surrogate => "surrogate",
         Source::Fallback => "fallback (DFT)",
         Source::Dft => "DFT",
+        Source::Reference => "atom references",
+    }
+}
+
+/// The hover of a source label: [`REFERENCE_TIP`] for a lone-atom reference answer, else
+/// [`SOURCE_TIP`].
+pub fn source_tip(s: Source) -> &'static str {
+    match s {
+        Source::Reference => REFERENCE_TIP,
+        _ => SOURCE_TIP,
     }
 }
 
@@ -144,6 +160,14 @@ pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decima
     }
 }
 
+/// What ⚠ Model only replaced (`UiState::model_only`): the draft mode and the audit cadence it
+/// restores when it is turned off (user request 2026-11-12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelOnlySaved {
+    pub draft: bool,
+    pub audit_every: usize,
+}
+
 /// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
 pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
 /// The auto cadence's bounds (answered steps): never more often than every 2000 steps (user request 2026-10-19; was 200), never
@@ -172,7 +196,10 @@ pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits)
 }
 
 /// The source tooltip (the old "this step" readout's).
-const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
+const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step; atom references (teal): lone atoms answered from the isolated-atom references";
+
+/// The hover of a step answered from the atom references (`providers::surrogate`, rule 0b).
+pub const REFERENCE_TIP: &str = "lone atoms: answered from the atom references. No atom has a neighbour within the model's cutoff, so the energy is the sum of the isolated-atom reference energies and every force is zero — exactly what the model answers there, whatever its trust; no DFT solve runs. DFT in this box would differ by its grid and box artefacts, which no model can learn — measured for a lone H in the default 12-Bohr box: the grid's egg-box ripple, about a µHa, and the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces: a finite-box artefact, not the container walls, which still act), about 2 mHa 4 Bohr from the nearest face and 35 mHa at 2 Bohr; the references are free atoms, the more physical answer there. Nothing is learned from these steps and none is audited. DFT answers instead for a charged scene, a reference not solved yet, mixed species, two or more atoms whose shell may be open (their copies can exchange charge in the box), a pair a shell check found still interacting, or a multiplicity other than the atoms' own spins aligned; draft mode answers lone atoms with the model, the same number.";
 
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten
 /// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
@@ -513,6 +540,18 @@ pub struct UiState {
     /// as a small label on it, blue + / red −, also in Dock ▸ Selection and the badge. Display only,
     /// not recorded; on by default.
     pub show_charges: bool,
+    /// View ▸ Bonds & labels ▸ refresh bonds after a drag (user request 2026-11-13): under the
+    /// estimated solver, a drag that leaves the bonds stale sends one "Bonds now" a second after it
+    /// ends (`auto_bonds`). Display only, not recorded (the `RefreshBonds` it sends is); on by
+    /// default, and a profile without the key reads as on.
+    pub auto_refresh_bonds: bool,
+    /// That refresh's debounce (`auto_bonds::AutoBonds`).
+    pub auto_bonds: auto_bonds::AutoBonds,
+    /// View ▸ Bonds & labels ▸ guess bonds from experience (user request 2026-11-13): while the
+    /// bonds are stale (estimated solver), each pair is drawn as the app's own earlier DFT graphs
+    /// called it at the same distance and surroundings (`crate::bond_experience`). Display only,
+    /// not recorded; on by default, and a profile without the key reads as on.
+    pub guess_bonds: bool,
     /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
     /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
     pub follow_selected: bool,
@@ -727,6 +766,11 @@ pub struct UiState {
     pub audit_every: usize,
     /// Draft mode (`Command::SetDraft`): per session, off by default.
     pub draft: bool,
+    /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
+    /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored
+    /// exactly when it is turned off or the solver leaves Estimated; a hand change of either turns
+    /// it off without restoring. Per session, off at start (never in a profile).
+    pub model_only: Option<ModelOnlySaved>,
     /// The drag spring's force cap ("pull", Ha/Bohr; `DynCommand::SetDragForce`): the wheel while
     /// dragging scales it by [`DRAG_WHEEL_STEP`] per line within the driver's range. Per session;
     /// it outlives the drag (the next one uses it).
@@ -781,6 +825,18 @@ pub struct UiState {
     /// (the card over the view, the rings on the scene), and the way back from an opened segment.
     pub segment_preview: Option<crate::segment::Segment>,
     pub segment_back: Option<SegmentBack>,
+    /// File ▸ Import data from a folder… in flight (`Action::ImportData`, `paths::spawn_import`):
+    /// its status line arrives here when the copy is done.
+    pub import_data: Option<std::sync::mpsc::Receiver<String>>,
+    /// Where the data lives (`crate::paths`): the process's mode and per-user root, read once at
+    /// start. The Import item, its action and the Profiles window's timings row follow these, so a
+    /// test can stand in an installed build with a temporary root.
+    pub data_mode: crate::paths::DataMode,
+    pub data_root: Option<std::path::PathBuf>,
+    /// Help ▸ Version… and the top bar's chip (`version`, installer Task 4): the releases list,
+    /// the check, the one download, the restart guard; the channel and Check automatically are
+    /// kept in the profile.
+    pub update: version::UpdateState,
 }
 
 /// The scene a segment was cut from, saved to a temp file when the segment opened, and what the
@@ -864,6 +920,9 @@ impl UiState {
             show_angles: true,
             show_bond_lengths: true,
             show_charges: true,
+            auto_refresh_bonds: true,
+            auto_bonds: Default::default(),
+            guess_bonds: true,
             follow_selected: false,
             audit_every_on: 2000,
             audit_auto: true,
@@ -955,6 +1014,7 @@ impl UiState {
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
+            model_only: None,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),
             edit_group: Vec::new(),
@@ -985,6 +1045,10 @@ impl UiState {
             compare: Default::default(),
             segment_preview: None,
             segment_back: None,
+            import_data: None,
+            data_mode: crate::paths::mode(),
+            data_root: crate::paths::user_root(),
+            update: version::UpdateState::default(),
         }
     }
 
@@ -1192,6 +1256,9 @@ pub struct PanelInput<'a> {
     /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
     /// the surrogate has no electrons"), under the density's.
     pub bonds_label: Option<String>,
+    /// The stale bonds' line while experience draws over them (`viewer::stale_bonds_line`: "bonds
+    /// from experience (N pairs) · last DFT t = … fs"); `None` for the plain `bonds_label` line.
+    pub stale_bonds_line: Option<String>,
     /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
     /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
     /// snapshot still moves on screen.
@@ -1254,6 +1321,9 @@ pub struct PanelOutput {
     /// and "back to the scene". The viewer puts it in place itself — on a new worker when the solver
     /// changes, so the old one never starts solving it.
     pub switch_scene: Option<Scene>,
+    /// Restart now went past its guard (`version::restart`): the viewer saves the session, hands
+    /// the verified installer off and closes the app (`Viewer::restart_for_update`).
+    pub restart_for_update: bool,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report
@@ -1278,6 +1348,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.log.record(&st.status, st.status_seq, input);
     // the reference comparison's results (a helper process on its own thread; never blocks)
     st.compare.poll(input.snapshot);
+    // an import of data folders (its own thread) reports when done
+    poll_import(st);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
     // the latest DFT solve's cost (the quality levels' estimates)
@@ -1312,13 +1384,32 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     files::show_save(root.ctx(), st, input, &mut acts);
     crate::builder::ui::show(root.ctx(), st, input, &mut acts);
     profile::show(root.ctx(), st);
+    version::show(root.ctx(), st, &mut acts);
     profile::autosave(root.ctx(), st);
     out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
+    // the updater's threads (the check, the download, a manifest) and a restart waiting on a job
+    version::tick(root.ctx(), st, input, &mut out);
     window_requests(st, &mut out);
     out
+}
+
+/// File ▸ Import data from a folder…'s result, once its thread is done: the counts and failures on
+/// the status line.
+pub(crate) fn poll_import(st: &mut UiState) {
+    use std::sync::mpsc::TryRecvError;
+    let Some(rx) = &st.import_data else { return };
+    let line = match rx.try_recv() {
+        Ok(line) => line,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => "import data: the copy stopped before it finished (see the console)".into(),
+    };
+    st.import_data = None;
+    st.set_status(line);
+    // the File window shows what came in
+    st.files.refresh_soon();
 }
 
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the
@@ -1793,13 +1884,16 @@ struct TrustView {
     /// The provider's own technical text for what the plain line says (the old refusal or stuck
     /// string): shown on hover after the tip.
     detail: Option<String>,
+    /// The refusal line's Forget link (`activity::trust::Line::forget`): the failed residual
+    /// check's worst sample, when Forget would take it (2026-11-13).
+    forget: Option<sim::SampleId>,
 }
 
 /// The trust readout in plain words (activity spec §5.3): the first unmet line of the checklist
 /// for a refusal, the stuck sentence for a trusted model that keeps falling back; the provider's
 /// own text stays on hover (`detail`).
 fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
-    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None };
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None, forget: None };
     let Some(m) = m.filter(|m| m.fitted) else {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
@@ -1826,7 +1920,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let view = v(kind, AMBER, text, Some(if class { CLASS_UNTRUSTED_TIP } else { NOT_HERE_TIP }));
         TrustView { detail: m.untrusted_reason.clone(), ..view }
     } else if m.trusted && m.quarantined > 0 {
-        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
+        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (held out of the fit: the rest of the data could not predict it, or the fit could not reproduce it)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
     } else {
@@ -1835,7 +1929,7 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
         let tip = if crate::sim::box_blocks_trust(m).is_some() { BOX_TRUST_TIP } else { UNTRUSTED_TIP };
         let reason = m.untrusted_reason.clone();
         match activity::trust::lines(m, scene, st).into_iter().find(|l| l.why) {
-            Some(l) => TrustView { detail: reason, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
+            Some(l) => TrustView { detail: reason, forget: l.forget, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
             None => v(TrustKind::Untrusted, AMBER, format!("no — {}", reason.as_deref().unwrap_or("?")), Some(tip)),
         }
     }

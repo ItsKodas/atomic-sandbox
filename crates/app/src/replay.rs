@@ -371,8 +371,8 @@ fn number<T: std::str::FromStr>(w: &str) -> Result<T, String> {
 
 fn source_word(s: &str) -> Result<String, String> {
     match s {
-        "dft" | "surrogate" | "fallback" => Ok(s.to_string()),
-        _ => Err(format!("source dft, surrogate or fallback, got '{s}'")),
+        "dft" | "surrogate" | "fallback" | "reference" => Ok(s.to_string()),
+        _ => Err(format!("source dft, surrogate, fallback or reference, got '{s}'")),
     }
 }
 
@@ -381,6 +381,7 @@ fn source_name(s: sim::Source) -> &'static str {
         sim::Source::Dft => "dft",
         sim::Source::Surrogate => "surrogate",
         sim::Source::Fallback => "fallback",
+        sim::Source::Reference => "reference",
     }
 }
 
@@ -411,6 +412,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::UseCollection => "use-collection",
         Action::ImportModel(_) => "import-model",
         Action::SaveSpecialised(_) => "specialised",
+        Action::ForgetSample(_) => "forget-sample",
+        Action::RestoreSample(_) => "restore-sample",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
@@ -419,6 +422,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::Builder(_) => "builder",
         Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
         Action::Screenshot | Action::Record(_) => "capture",
+        Action::ImportData(_) => "import-data",
+        Action::CheckUpdates | Action::InstallVersion(_) | Action::RestartToUpdate | Action::CancelUpdateDownload => "update",
         _ => "action",
     })
 }
@@ -427,8 +432,10 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 /// other unreplayable action would make the replay diverge from the session.
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture")
+    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
+    // nor an import of data folders (it copies files into the installed build's root; a replay never does),
+    // nor the updater's check, download and restart (a replay never touches the network or installs)
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

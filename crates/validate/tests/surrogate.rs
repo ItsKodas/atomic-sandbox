@@ -354,17 +354,19 @@ struct MdRun {
     surrogate: usize,
     fallback: usize,
     dft: usize,
+    /// Lone-atom steps answered from the references (rule 0b; `Source::Reference`).
+    reference: usize,
     gaps: Vec<(usize, f64)>,
     wall: Duration,
 }
 
 impl MdRun {
-    fn steps_per_s(&self) -> f64 { (self.surrogate + self.fallback + self.dft) as f64 / self.wall.as_secs_f64() }
+    fn steps_per_s(&self) -> f64 { (self.surrogate + self.fallback + self.dft + self.reference) as f64 / self.wall.as_secs_f64() }
 }
 
 fn run_md(p: &mut dyn ForceProvider, sc: &mut Scene, forces: &mut Vec<[f64; 3]>, steps: usize, coord: &dyn Fn(&Scene) -> f64) -> MdRun {
     let integ = Integrator::new_fs(DT_FS);
-    let mut run = MdRun { x: vec![coord(sc)], t: Vec::with_capacity(steps), e_tot: Vec::with_capacity(steps), surrogate: 0, fallback: 0, dft: 0, gaps: Vec::new(), wall: Duration::ZERO };
+    let mut run = MdRun { x: vec![coord(sc)], t: Vec::with_capacity(steps), e_tot: Vec::with_capacity(steps), surrogate: 0, fallback: 0, dft: 0, reference: 0, gaps: Vec::new(), wall: Duration::ZERO };
     let t0 = Instant::now();
     for i in 1..=steps {
         let (f_new, st) = integ.step(sc, forces, p, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("MD step {i}: {e}"));
@@ -376,6 +378,7 @@ fn run_md(p: &mut dyn ForceProvider, sc: &mut Scene, forces: &mut Vec<[f64; 3]>,
             Source::Surrogate => run.surrogate += 1,
             Source::Fallback => { run.fallback += 1; if let Some(g) = st.eval.teacher_gap { run.gaps.push((i, g)); } }
             Source::Dft => run.dft += 1,
+            Source::Reference => run.reference += 1,
         }
     }
     run.wall = t0.elapsed();
@@ -930,7 +933,7 @@ fn active_learning_run(mut baseline: Option<&mut TrustBaseline>, audit_every: us
     let fraction = n_fb_last as f64 / AL_WINDOW as f64;
     let mut timeline = String::new();
     for (k, chunk) in sources.chunks(25).enumerate() {
-        let _ = write!(timeline, "{}{}", if k > 0 { " " } else { "" }, chunk.iter().map(|x| match x { Source::Surrogate => 'S', Source::Fallback => 'F', Source::Dft => 'D' }).collect::<String>());
+        let _ = write!(timeline, "{}{}", if k > 0 { " " } else { "" }, chunk.iter().map(|x| match x { Source::Surrogate => 'S', Source::Fallback => 'F', Source::Dft => 'D', Source::Reference => 'R' }).collect::<String>());
     }
     let _ = writeln!(out, "  steps: {timeline}");
     out += &refit_log;
@@ -1284,6 +1287,9 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 }
             }
             Source::Dft => unreachable!("a surrogate provider"),
+            // lone atoms answered from the references (rule 0b): the model's own value there, exact
+            // by construction — nothing to judge
+            Source::Reference => {}
         }
     }
     let end = d.snapshot();

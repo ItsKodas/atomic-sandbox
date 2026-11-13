@@ -44,6 +44,9 @@
 //!   with a flag set (below) — it never reads a cap's force as training data.
 //! * kind 2, **status**: `sample index: u64, code: u8` — a later quarantine change of the sample
 //!   with that index ([`crate::quarantine`] codes); the latest record per sample wins on load.
+//!   Code 7 ([`crate::quarantine::Q_FORGOTTEN`], 2026-11-12: forgotten by the user) is new; the
+//!   reader keeps any code, so a build before it reads such a record and holds the sample out of
+//!   its fit (its doc says what else that build does with it).
 //!   A sample enters with [`Q_NONE`] (the admission rules refuse every other code).
 //!
 //! Every record kind is version 1. A record whose checksum holds but whose kind, version or flags
@@ -184,7 +187,12 @@ fn refuse_charge(q: i32) -> String {
 }
 
 fn refuse_quarantined(code: u8) -> String {
-    format!("quarantined sample (code {code})")
+    if code == crate::quarantine::Q_FORGOTTEN {
+        // the user forgot it (Model tab): not a quarantine (Task 2 fix round 1, M4)
+        format!("forgotten sample (code {code})")
+    } else {
+        format!("quarantined sample (code {code})")
+    }
 }
 
 fn refuse_forced(m: u32) -> String {
@@ -203,7 +211,7 @@ const REC_HEADER: u8 = 0;
 const REC_SAMPLE: u8 = 1;
 const REC_STATUS: u8 = 2;
 /// The version every record kind is written at (module doc).
-const RECORD_VERSION: u8 = 1;
+pub const RECORD_VERSION: u8 = 1;
 /// Sample flag bit 0: a force mask follows (module doc, M8a Task 10).
 const FLAG_FORCE_MASK: u16 = 1;
 /// Sample flag bit 1: the energy is not fitted.
@@ -212,7 +220,7 @@ const FLAG_NO_ENERGY: u16 = 2;
 const SAMPLE_FLAGS_KNOWN: u16 = FLAG_FORCE_MASK | FLAG_NO_ENERGY;
 /// The largest record accepted (a hostile or damaged length prefix is not followed past this):
 /// 64 MiB ≈ a 1.3-million-atom sample.
-const MAX_RECORD: usize = 1 << 26;
+pub const MAX_RECORD: usize = 1 << 26;
 
 /// One stored teacher answer and where it came from.
 #[derive(Clone, Debug, PartialEq)]
@@ -1284,12 +1292,13 @@ impl Collection {
         let count = |code: u8| self.quarantine.iter().filter(|&&q| q == code).count();
         let n = self.samples.len();
         t.push_str(&format!(
-            "{n} samples: {} trained on, {} held, {} superseded, {} box-affected, {} draft\n",
+            "{n} samples: {} trained on, {} held, {} superseded, {} box-affected, {} draft, {} forgotten\n",
             count(Q_NONE),
             count(crate::quarantine::Q_HELD),
             count(crate::quarantine::Q_SUPERSEDED),
             count(Q_BOX),
-            count(Q_DRAFT)
+            count(Q_DRAFT),
+            count(crate::quarantine::Q_FORGOTTEN)
         ));
         let mut tags: BTreeMap<String, usize> = BTreeMap::new();
         for s in &self.samples {
@@ -1491,6 +1500,7 @@ mod tests {
         assert_eq!(c.admit(&s, &prov(), Q_BOX), Err("box-affected sample".to_string()));
         assert_eq!(c.admit(&s, &prov(), Q_HELD), Err("quarantined sample (code 1)".to_string()));
         assert_eq!(c.admit(&s, &prov(), Q_SUPERSEDED), Err("quarantined sample (code 2)".to_string()));
+        assert_eq!(c.admit(&s, &prov(), crate::quarantine::Q_FORGOTTEN), Err("forgotten sample (code 7)".to_string()));
         let mut forced = prov();
         forced.multiplicity = Some(3);
         assert_eq!(c.admit(&s, &forced, Q_NONE), Err("the scene forced multiplicity 3".to_string()));
@@ -1523,6 +1533,7 @@ mod tests {
             c.set_status(3, Q_HELD).unwrap();
             c.set_status(1, Q_SUPERSEDED).unwrap();
             c.set_status(3, Q_NONE).unwrap();
+            c.set_status(4, crate::quarantine::Q_FORGOTTEN).unwrap();
             assert!(c.set_status(5, Q_HELD).is_err(), "no sample 5");
             c.set_reference(1, CollectionReference { energy: -0.478_123_456_789_012_3, grid_n: Some(49), face_density: Some(1.25e-9) }).unwrap();
             c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
@@ -1542,7 +1553,7 @@ mod tests {
             assert_eq!(a.sample.energy.to_bits(), b.sample.energy.to_bits());
             assert_eq!(a.sample.forces[0][1].to_bits(), (-0.0f64).to_bits());
         }
-        assert_eq!(c.quarantine, vec![Q_NONE, Q_SUPERSEDED, Q_NONE, Q_NONE, Q_NONE]);
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_SUPERSEDED, Q_NONE, Q_NONE, crate::quarantine::Q_FORGOTTEN], "a forgotten sample's status survives the reopen");
         assert_eq!(c.references.get(&(1, 49)).map(|r| r.energy.to_bits()), Some((-0.478_123_456_789_012_3f64).to_bits()));
         assert_eq!(c.references.get(&(1, 49)).map(|r| (r.grid_n, r.face_density)), Some((Some(49), Some(1.25e-9))));
         assert_eq!(c.history.len(), 1);

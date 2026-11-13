@@ -74,8 +74,53 @@ pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 /// A draft-mode audit's answer held out of the strict fit ([`surrogate::quarantine::Q_DRAFT`]).
 pub(super) const Q_DRAFT: u8 = surrogate::quarantine::Q_DRAFT;
 
+/// A sample the user forgot ([`surrogate::quarantine::Q_FORGOTTEN`], spec R2): excluded and
+/// fencing like [`Q_HELD`], never released or superseded (only [`SurrogateKs::restore_sample`]
+/// clears it), counted with the held samples against [`QUARANTINE_MAX_FRACTION`].
+pub(super) const Q_FORGOTTEN: u8 = surrogate::quarantine::Q_FORGOTTEN;
+
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
+
+/// The Model tab's "Worst-fitting samples" lists this many ([`SurrogateKs::sample_suspects`],
+/// spec R2): a display length, not a physics parameter.
+pub const SUSPECTS_SHOWN: usize = 8;
+
+/// A stored sample's check value for the Model tab's buttons ([`sim::SampleId`], fix round 1 M8):
+/// FNV-1a over its Z and the exact bits of its positions, energy and forces (re-review N1: two
+/// stores built from one preset hold the same geometry at the same index, so positions alone do
+/// not tell their samples apart; the teacher answer almost always does, and a collision only ever
+/// refuses on the safe side or names the same answer).
+pub(super) fn sample_key(s: &Sample) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    for &z in &s.z {
+        eat(z);
+    }
+    for p in s.pos.iter().chain(&s.forces) {
+        for c in p {
+            c.to_bits().to_le_bytes().into_iter().for_each(&mut eat);
+        }
+    }
+    s.energy.to_bits().to_le_bytes().into_iter().for_each(&mut eat);
+    h
+}
+
+/// Where a stored sample came from, in a word or two (the Model tab's row: `#1804 · HO · fallback
+/// · 38× its bound`).
+pub(super) fn origin_word(tag: SampleTag) -> &'static str {
+    match tag {
+        SampleTag::Perturbation => "pass perturbation",
+        SampleTag::Scan => "pass scan",
+        SampleTag::HotBurst => "pass hot burst",
+        SampleTag::Fallback => "fallback",
+        SampleTag::LiveStep => "live step",
+        SampleTag::Reference => "reference",
+        SampleTag::Audit => "audit",
+        SampleTag::DraftAudit => "draft audit",
+        SampleTag::Targeted => "teach-around",
+    }
+}
 
 /// Never quarantine more than this fraction of the store.
 pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
@@ -123,6 +168,205 @@ pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) ->
         }
         _ => SurrogateKs::agree(p, va.n, va.energy, &va.forces, vb.energy, &vb.forces),
     }
+}
+
+/// One fitted sample's **leave-one-out ratio** (spec `2026-11-12-sample-recovery-design.md` R1;
+/// the recovery's offender ranking since then, `worst_offenders`; the Model tab's "worst-fitting
+/// samples"). Atomic units throughout (Hartree, Bohr).
+///
+/// `surrogate::loo` gives the sample's residual under the fit **without it**, at the fit's own
+/// hyperparameters: r = y − ŷ₋ (target minus the prediction of the fit that never saw the
+/// sample) — the energy part r_E (Hartree per atom when the fit is per atom, else Hartree) when
+/// its energy was fitted, and per fitted atom j the force part r_j (Ha/Bohr). The fit without the
+/// sample therefore predicts F_j − r_j at atom j, and with N the sample's atom count:
+///
+/// ```text
+///   ρ_E = |r_E| / energy_std_per_atom            per-atom fit
+///   ρ_E = |r_E| / N / energy_std_per_atom        whole-energy fit   (0 when the energy was not fitted)
+///   d_j = force_residual(F_j − r_j, F_j).0 = ‖r_j‖/√3,   b_j = force_bound(|F_j|) = force_residual(…).1
+///   ρ   = max(ρ_E, max_j d_j / b_j)              each atom against its own bound (the class rule's reading)
+///   ρ_σ = max(ρ_E, max_j d_j / force_std_abs)    the absolute tier (the recovery when only σ_f fails)
+/// ```
+///
+/// exactly the numbers the class pass reads (`trust::compute_class_loo_full`: `e_ratio` and
+/// `force_residual(&[f − r], f)`), over the same fitted rows (a masked sample's interior atoms;
+/// `r_j` is `None` for the others). **Ruling R1a:** an undefined residual (`l` is `None`: the
+/// sample's block I − H_ss is singular — it alone spans a direction of the fit — as the class
+/// rule's `a.3 = ∞`) and a ratio that is not a number are ∞: such a sample ranks first. Returns
+/// (ρ, ρ_σ, the [`Channel`] that attains ρ_σ) — the channel so the noise-only recovery note names
+/// the tier it measured against (Task 1 re-review N1: a high-leverage energy outlier's ρ_σ is its
+/// energy ratio, against 1e-3 Ha/atom, not the force tier). The force channel wins a tie; an
+/// undefined residual reports the force channel (no channel was measured).
+pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64, Channel) {
+    let Some(l) = l else { return (f64::INFINITY, f64::INFINITY, Channel::Force) };
+    let n = s.pos.len().max(1) as f64;
+    let e = if s.use_energy { l.energy.map_or(f64::INFINITY, |e| (if per_atom { e.abs() } else { e.abs() / n }) / p.energy_std_per_atom) } else { 0.0 };
+    let (mut own, mut force_tier) = (e, 0.0f64);
+    for (r, f) in l.forces.iter().zip(&s.forces) {
+        let Some(r) = r else { continue };
+        let (d, b) = p.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+        own = super::trust::max_nan(own, d / b);
+        force_tier = super::trust::max_nan(force_tier, d / p.force_std_abs);
+    }
+    let tier = super::trust::max_nan(e, force_tier);
+    let channel = if e > force_tier { Channel::Energy } else { Channel::Force };
+    let undefined_is_worst = |x: f64| if x.is_nan() { f64::INFINITY } else { x };
+    (undefined_is_worst(own), undefined_is_worst(tier), channel)
+}
+
+/// Which of a leave-one-out ratio's two channels attains it ([`loo_ratio`]'s third number).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Channel {
+    /// The per-atom energy residual over `energy_std_per_atom`.
+    Energy,
+    /// The worst fitted atom's force residual over its bound (or `force_std_abs`).
+    Force,
+}
+
+/// The per-sample leave-one-out ratios ([`loo_ratio`]) of one fit (spec ruling R1b): filled by
+/// the class pass (`refresh_class_loo`), which computes every fitted sample's leave-one-out
+/// anyway, or by [`SurrogateKs::ensure_loo_ratios`] for a fit whose class pass was deferred.
+/// **Keyed to the fit**: valid only while the provider's `model_gen` is still `gen` (bumped by
+/// every fit, restored state, install, attach, forget and policy change) **and** the `rows`' indices
+/// are the standing fit's own members (`fit_members`: the samples that fit was built from). A stale
+/// cache is never read: it is recomputed, over those members. A hold, a release or a forget between
+/// fits changes the quarantine codes but not the fit: the ratios stay the standing fit's — a sample
+/// held since is still listed (the model still holds it), a sample released since is not (the
+/// model never saw it: a leave-one-out "as if fitted" would downdate rows the fit does not hold).
+/// The next fit replaces them.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LooRatios {
+    /// The `model_gen` of the fit they were computed for.
+    pub(super) gen: u64,
+    /// Per fitted sample in store order: (store index, ρ — each atom against its own bound).
+    pub(super) rows: Vec<(usize, f64)>,
+    /// Per row: ρ_σ — the forces against `force_std_abs`.
+    pub(super) tier: Vec<f64>,
+    /// Per row: the channel that attains ρ_σ ([`loo_ratio`]; the noise-only note names it).
+    pub(super) tier_channel: Vec<Channel>,
+}
+
+/// Which offender ranking a quarantine round takes its samples by ([`SurrogateKs::quarantine_rounds`];
+/// spec R1 and its fix round 1, option A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ranking {
+    /// The leave-one-out ratio ([`loo_ratio`], [`SurrogateKs::worst_offenders`]): tried first.
+    LeaveOneOut,
+    /// The in-sample training residual ([`SurrogateKs::training_offenders`], the ranking before
+    /// 2026-11-12): the fallback when the leave-one-out rounds do not recover.
+    Training,
+}
+
+/// What a round's worst ratio was measured against, for the note ([`Held`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Bound {
+    /// Each sample's own bound: the per-atom energy threshold and each atom's force bound (the
+    /// training residuals failed).
+    Own,
+    /// Only the force noise failed: the absolute force tier `force_std_abs` (Ha/Bohr) attained it.
+    ForceTier(f64),
+    /// Only the force noise failed, and the worst leave-one-out ratio is the sample's **energy**
+    /// channel, against `energy_std_per_atom` (Ha/atom; re-review N1).
+    EnergyTier(f64),
+}
+
+/// What a refit's quarantine rounds held, for the note: per bound a held sample was measured
+/// against ([`Bound`]), the largest ratio among the samples held under it (0 / `None` when none;
+/// ∞ for an undefined leave-one-out, ruling R1a). Each held sample's ratio is so stated against the
+/// bound it was held under (fix round 1, M6: one maximum with the bound of the round that attained
+/// it understated an earlier round's samples measured against another bound).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Held {
+    /// Against each sample's own bound.
+    pub(super) own: f64,
+    /// Against the force-noise tier: (ratio, the tier in Ha/Bohr).
+    pub(super) force_tier: Option<(f64, f64)>,
+    /// Against the energy tier: (ratio, the tier in Ha/atom).
+    pub(super) energy_tier: Option<(f64, f64)>,
+}
+
+impl Held {
+    pub(super) const NONE: Held = Held { own: 0.0, force_tier: None, energy_tier: None };
+
+    /// One held sample's `ratio` measured against `bound`.
+    pub(super) fn add(&mut self, ratio: f64, bound: Bound) {
+        let up = |x: f64| if ratio <= x { x } else { ratio };
+        match bound {
+            Bound::Own => self.own = up(self.own),
+            Bound::ForceTier(t) => self.force_tier = Some((up(self.force_tier.map_or(0.0, |x| x.0)), t)),
+            Bound::EnergyTier(t) => self.energy_tier = Some((up(self.energy_tier.map_or(0.0, |x| x.0)), t)),
+        }
+    }
+
+    /// The largest ratio held, whatever its bound (0 when none).
+    pub(super) fn worst(&self) -> f64 {
+        [self.own, self.force_tier.map_or(0.0, |x| x.0), self.energy_tier.map_or(0.0, |x| x.0)].into_iter().fold(0.0, |w, r| if r <= w { w } else { r })
+    }
+}
+
+/// What the fit without the held samples did, for the note's last clause (fix round 1, the
+/// coordinator's ruling on concern 1: the measured fact only — a recovered result does not show
+/// that the failures were the held samples' neighbours, nor which held sample caused them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// Its training residuals or noise still fail: no clause.
+    Fails,
+    /// Its residuals and noise pass, its trust counts do not: ", and the fit without them passes".
+    Passes,
+    /// Residuals, noise and counts pass ([`SurrogateKs::recovered`]): ", and the fit without them
+    /// recovers".
+    Recovers,
+}
+
+/// A ratio as the notes and the Model tab round it: a whole number from 10×, one decimal below,
+/// "∞" when undefined (ruling R1a).
+pub fn ratio_words(r: f64) -> String {
+    if !r.is_finite() {
+        "∞".to_string()
+    } else if r >= 10.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r:.1}")
+    }
+}
+
+/// The recovery note's words for quarantine rounds (spec R1, "The recovery note says what was
+/// done"; fix round 2, M3): `added` samples quarantined **by this refit** — the ones whose ratio
+/// it measured — with `held` in all, and `h` the largest ratio among them by `ranking` (the
+/// ranking whose result stands, fix round 1), against each sample's own bound or, in the
+/// noise-only mode, the absolute tier whose channel attained it ([`Bound`], re-review N1) — each
+/// bound a sample was held under named with its own maximum (fix round 1, M6). Rounded
+/// ([`ratio_words`]). The last clause states what the fit without them measurably did
+/// ([`Outcome`]; re-review N2 and fix round 1: a leave-one-out ratio above 1 says only that the
+/// rest of the data cannot predict the sample).
+pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Ranking, outcome: Outcome) -> String {
+    let worst = h.worst();
+    let mut parts: Vec<String> = Vec::new();
+    if h.own > 0.0 || (h.force_tier.is_none() && h.energy_tier.is_none()) {
+        parts.push(format!("{}× its bound", ratio_words(h.own)));
+    }
+    if let Some((r, t)) = h.force_tier {
+        parts.push(format!("{}× the {t:.0e} Ha/Bohr force-noise tier", ratio_words(r)));
+    }
+    if let Some((r, t)) = h.energy_tier {
+        parts.push(format!("{}× its {t:.0e} Ha/atom energy tier", ratio_words(r)));
+    }
+    let up_to = parts.join(" and ");
+    let clause = match outcome {
+        Outcome::Fails => "",
+        Outcome::Passes => ", and the fit without them passes",
+        Outcome::Recovers => ", and the fit without them recovers",
+    };
+    let why = match ranking {
+        Ranking::LeaveOneOut if worst.is_finite() => {
+            format!("the fit without each of them predicts it at up to {up_to}{clause}")
+        }
+        Ranking::LeaveOneOut => format!("the fit without one of them cannot predict it at all (it alone spans a direction of the fit){clause}"),
+        Ranking::Training => format!(
+            "ranked by their own training residual (the leave-one-out ranking did not recover the fit), the fit misses each by up to {up_to}: the model cannot represent them"
+        ),
+    };
+    format!("{added} samples quarantined this refit ({held} held in all) — {why} (kept, excluded from the fit; geometries near them fall back)")
 }
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
@@ -174,6 +418,35 @@ impl SurrogateKs {
     /// Whether stored sample `i` is quarantined (and fencing).
     pub fn is_quarantined(&self, i: usize) -> bool {
         self.quarantine.get(i) == Some(&Q_HELD)
+    }
+
+    /// Samples the user forgot ([`Q_FORGOTTEN`], spec R2): excluded from the fit and fencing like
+    /// the quarantined ones, never released; the Model tab's "N forgotten".
+    pub fn forgotten(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_FORGOTTEN).count()
+    }
+
+    /// Of the [`forgotten`](Self::forgotten) samples, those the standing fit still holds (forgotten
+    /// since it, or while the background refit that installed it ran): the "fit vs held" line
+    /// counts them in the fit until the next refit, never twice (fix round 1, M5).
+    pub fn forgotten_in_fit(&self) -> usize {
+        self.fit_member_indices().filter(|&i| self.is_forgotten(i)).count()
+    }
+
+    /// Whether stored sample `i` was forgotten by the user ([`Q_FORGOTTEN`]).
+    pub fn is_forgotten(&self, i: usize) -> bool {
+        self.quarantine.get(i) == Some(&Q_FORGOTTEN)
+    }
+
+    /// Whether stored sample `i` fences its neighbourhood (geometries within the quarantine radius
+    /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample.
+    pub(super) fn fences(&self, i: usize) -> bool {
+        matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_FORGOTTEN))
+    }
+
+    /// How many stored samples fence ([`fences`](Self::fences)).
+    pub(super) fn fencing(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_HELD || q == Q_FORGOTTEN).count()
     }
 
     /// Box-affected samples taken while the model was being built and excluded from the fit
@@ -294,7 +567,7 @@ impl SurrogateKs {
     }
 
     /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded, a
-    /// held-out draft guess, waiting for its box's reference, or lone atoms).
+    /// held-out draft guess, waiting for its box's reference, lone atoms, or forgotten by the user).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -357,43 +630,67 @@ impl SurrogateKs {
                 _ => self.restore_state(saved),
             }
         }
-        // 2. quarantine the worst offenders on the standing basis, round by round
+        // 2. quarantine the worst offenders on the standing basis, round by round (the
+        // leave-one-out ranking first, the training-residual ranking its fallback: spec
+        // 2026-11-12 R1, option A)
         let before = self.quarantined();
-        let rounds = self.quarantine_rounds(report.clone());
-        if !self.recoverable_fail() {
-            return self.note_quarantined(before, rounds);
-        }
-        // step 2 did not restore the residuals: back to the state on entry (no ratchet)
-        self.restore_state(entry_state);
-        self.quarantine = entry_flags;
-        self.species_dirty = entry_dirty;
+        // step 3's start (the state on entry: step 1 does not run under a cap, 1b restored its own)
+        let pre_rounds = recapped.then(|| self.save_state());
+        let (rounds, worst, ranking) = self.quarantine_rounds(report.clone());
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
-        // stands only if it recovers (the trust rule, its counts included), else the entry state does
-        if recapped {
-            let entry = (self.save_state(), self.quarantine.clone());
+        // stands only if it recovers (the trust rule, its counts included), else step 2's result
+        // does when it passes the residuals, else the entry state (no ratchet, below). Run
+        // whenever step 2's result is **not recovered** (sample-recovery fix round 2, I1, the
+        // coordinator's ruling) — not only while its residuals or noise fail: a step-2 result that
+        // passes its residuals but is short of samples (Q′ grows with the cap) must not suppress
+        // the default-basis retry, or option A's leave-one-out-first order could be worse than
+        // the ranking before it
+        if let Some(saved) = pre_rounds.filter(|_| !self.recovered()) {
+            let capped = (self.save_state(), self.quarantine.clone(), rounds.clone(), self.species_dirty, self.recovery.clone());
+            self.restore_state(saved);
+            self.quarantine = entry_flags.clone();
+            self.species_dirty = entry_dirty;
             let entry_held = self.quarantined();
             self.degree_cap = None;
             self.species_dirty = true;
             if let Ok(r) = self.fit_store_deferred() {
-                let r = self.quarantine_rounds(r);
-                if !self.recoverable_fail() && !self.trust_needs_samples() {
+                let (r, worst, ranking) = self.quarantine_rounds(r);
+                if self.recovered() {
                     self.recovery = Some(format!(
-                        "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {} samples quarantined — the model cannot represent them ({} this refit; kept, excluded from the fit; geometries near them fall back)",
-                        self.quarantined(),
-                        self.quarantined() - entry_held
+                        "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {}",
+                        quarantine_words(self.quarantined(), self.quarantined() - entry_held, worst, ranking, Outcome::Recovers)
                     ));
                     return r;
                 }
             }
-            let (state, flags) = entry;
+            let (state, q, rep, d, note) = capped;
             self.restore_state(state);
-            self.quarantine = flags;
-            self.species_dirty = entry_dirty;
+            self.quarantine = q;
+            self.species_dirty = d;
+            self.recovery = note;
+            if !self.recoverable_fail() {
+                return self.note_quarantined(before, rep, worst, ranking);
+            }
+        } else if !self.recoverable_fail() {
+            return self.note_quarantined(before, rounds, worst, ranking);
         }
+        // no step restored the residuals (step 2 by both rankings, and step 3 when it ran): back
+        // to the state on entry (no ratchet, spec 2026-11-13 §4.2) — the codes (a forgotten
+        // sample's code 7 among them, untouched: the recovery never writes it), the degree cap and
+        // the fit; whatever still fails is the misfit set M of the entry fit (`trust` module doc)
+        self.restore_state(entry_state);
+        self.quarantine = entry_flags;
+        self.species_dirty = entry_dirty;
         self.recovery = Some(RECOVERY_FAILED_NOTE.into());
         report
+    }
+
+    /// The trust recovery's verdict on a fit (steps 1, 1b, 3 and the rankings' fallback): the
+    /// training residuals and the noise pass, and the trust rule's counts hold.
+    fn recovered(&self) -> bool {
+        !self.recoverable_fail() && !self.trust_needs_samples()
     }
 
     /// The failed recovery's note once the refit's verdict is known (spec 2026-11-13 §4.3): a refit
@@ -415,18 +712,87 @@ impl SurrogateKs {
         });
     }
 
-    /// Step 2 of [`recover_trust`](Self::recover_trust): quarantines the worst offenders and refits
-    /// without them, up to [`QUARANTINE_ROUNDS`] rounds, never past [`QUARANTINE_MAX_FRACTION`] of
-    /// the store; a failed fit restores the previous one and stops.
-    fn quarantine_rounds(&mut self, report: FitReport) -> FitReport {
+    /// Steps 2 and 3 of [`recover_trust`](Self::recover_trust): the quarantine rounds (spec R1, fix
+    /// round 1 — the coordinator's option A). First by the **leave-one-out** ratio
+    /// ([`worst_offenders`](Self::worst_offenders)); when those rounds do not recover the fit
+    /// ([`recovered`](Self::recovered): residuals, noise and the trust rule's counts), the entry
+    /// state of this call is restored — the fit, the quarantine codes, `species_dirty`, the note —
+    /// and the rounds run again by the **training residual** ([`training_offenders`](Self::training_offenders),
+    /// the ranking before 2026-11-12). Their result stands only if it recovers; else the
+    /// leave-one-out result does — unless it fails the residuals and the training result passes
+    /// them (the open-shell merge, 2026-11-14): `recover_trust` keeps a result that is not
+    /// recovered only when it passes the residuals and noise (no ratchet, spec 2026-11-13 §4.2),
+    /// so preferring the failing one would discard a result the ranking before R1 kept. So the
+    /// recovery is never worse than the training ranking's and keeps the leave-one-out ranking's
+    /// wins, for up to [`QUARANTINE_ROUNDS`] more fits on a refit that is failing anyway (with
+    /// step 3 gated on "not recovered", fix round 2). Measured: the stuck-H collection's step 3
+    /// needs the fallback (leave-one-out 47 held, 1.60×; training 38 held, trusted), a
+    /// high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report that stands,
+    /// what its rounds held ([`Held`]) and the ranking whose result stands.
+    pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
+        // tests: the training ranking alone, the recovery before spec R1
+        #[cfg(test)]
+        if self.training_ranking {
+            let (r, w) = self.rounds_by(report, Ranking::Training);
+            return (r, w, Ranking::Training);
+        }
+        let entry = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone(), report.clone());
+        let (r, w) = self.rounds_by(report, Ranking::LeaveOneOut);
+        if self.recovered() {
+            return (r, w, Ranking::LeaveOneOut);
+        }
+        let loo_fails = self.recoverable_fail();
+        let loo = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone(), r, w);
+        let (state, flags, dirty, note, report) = entry;
+        self.restore_state(state);
+        self.quarantine = flags;
+        self.species_dirty = dirty;
+        self.recovery = note;
+        let (r, w) = self.rounds_by(report, Ranking::Training);
+        if self.recovered() || (loo_fails && !self.recoverable_fail()) {
+            return (r, w, Ranking::Training);
+        }
+        let (state, flags, dirty, note, r, w) = loo;
+        self.restore_state(state);
+        self.quarantine = flags;
+        self.species_dirty = dirty;
+        self.recovery = note;
+        (r, w, Ranking::LeaveOneOut)
+    }
+
+    /// The quarantine rounds by one `ranking`: holds the round's offenders and refits without them,
+    /// up to [`QUARANTINE_ROUNDS`] rounds, never past [`QUARANTINE_MAX_FRACTION`] of the store held
+    /// and forgotten together (spec R2) —
+    /// the cap is checked before a round holds anything, so a round whose offenders would cross it
+    /// (many undefined leave-one-out residuals, all ranked ∞, among them) holds none of them and
+    /// ends the rounds; a failed fit restores the previous one and stops. Returns the report that
+    /// stands and what it held ([`Held`]).
+    fn rounds_by(&mut self, report: FitReport, ranking: Ranking) -> (FitReport, Held) {
         let mut report = report;
+        let mut held = Held::NONE;
         let n_store = self.samples();
         for _ in 0..QUARANTINE_ROUNDS {
             if !self.recoverable_fail() {
                 break;
             }
-            let worst = self.worst_offenders();
-            let total = self.quarantined() + worst.len();
+            // the bound both rankings rank against this round (their own `absolute` switch) and,
+            // in the noise-only mode, the channel that attains the worst ratio (re-review N1; the
+            // in-sample energy passes then, so the training ranking's worst is its force channel)
+            // — per held sample, its ratio and the bound it is held under (fix round 1, M6)
+            let (worst, measured): (Vec<usize>, Vec<(f64, Bound)>) = match ranking {
+                Ranking::LeaveOneOut => {
+                    let (rows, _) = self.worst_offenders_bound();
+                    (rows.iter().map(|x| x.0).collect(), rows.iter().map(|x| (x.1, x.2)).collect())
+                }
+                Ranking::Training => {
+                    // every one of them is within the round's worst, against the one bound
+                    let (w, r) = self.training_offenders();
+                    let b = if self.residuals_fail() { Bound::Own } else { Bound::ForceTier(self.policy.force_std_abs) };
+                    (w, vec![(r, b)])
+                }
+            };
+            // forgotten samples count with the held ones (spec R2: forgetting is no way round the cap)
+            let total = self.quarantined() + self.forgotten() + worst.len();
             if worst.is_empty() || total as f64 > QUARANTINE_MAX_FRACTION * n_store as f64 {
                 break;
             }
@@ -438,7 +804,12 @@ impl SurrogateKs {
             }
             self.species_dirty = true; // rebuild without them
             match self.fit_store_deferred() {
-                Ok(r) => report = r,
+                Ok(r) => {
+                    report = r;
+                    for (ratio, bound) in measured {
+                        held.add(ratio, bound);
+                    }
+                }
                 Err(_) => {
                     self.restore_state(saved);
                     self.quarantine = flags;
@@ -446,17 +817,22 @@ impl SurrogateKs {
                 }
             }
         }
-        report
+        (report, held)
     }
 
-    /// The recovery note of quarantine rounds that added samples since `before` held.
-    fn note_quarantined(&mut self, before: usize, report: FitReport) -> FitReport {
+    /// The recovery note of quarantine rounds that added samples since `before` held; `worst` is
+    /// what they held by `ranking`, the one whose result stands.
+    fn note_quarantined(&mut self, before: usize, report: FitReport, worst: Held, ranking: Ranking) -> FitReport {
         let added = self.quarantined().saturating_sub(before);
         if added > 0 {
-            self.recovery = Some(format!(
-                "{} samples quarantined — the model cannot represent them ({added} this refit; kept, excluded from the fit; geometries near them fall back)",
-                self.quarantined()
-            ));
+            let outcome = if self.recovered() {
+                Outcome::Recovers
+            } else if !self.recoverable_fail() {
+                Outcome::Passes
+            } else {
+                Outcome::Fails
+            };
+            self.recovery = Some(quarantine_words(self.quarantined(), added, worst, ranking, outcome));
         }
         report
     }
@@ -540,10 +916,11 @@ impl SurrogateKs {
         self.quarantine_distances(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
-    /// (index, distance) of every held quarantined sample from the geometry (`near_quarantined`).
-    /// Fills the descriptor cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
+    /// (index, distance) of every fencing sample — held quarantined or forgotten by the user
+    /// ([`fences`](Self::fences)) — from the geometry (`near_quarantined`). Fills the descriptor
+    /// cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
     pub(super) fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.quarantined() == 0 {
+        if self.fencing() == 0 {
             return Vec::new();
         }
         self.ensure_desc_cache();
@@ -558,7 +935,7 @@ impl SurrogateKs {
     /// numbers either way, only slower. Without a model there is nothing to fence with (the
     /// filling path's cache basis is the model's, `None` without one).
     pub(super) fn quarantine_distances_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.quarantined() == 0 {
+        if self.fencing() == 0 {
             return Vec::new();
         }
         let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return Vec::new() };
@@ -566,7 +943,7 @@ impl SurrogateKs {
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
         let cached = self.desc_basis.as_ref() == Some(basis);
         (0..store.len())
-            .filter(|&i| self.quarantine.get(i) == Some(&Q_HELD))
+            .filter(|&i| self.fences(i))
             .map(|i| {
                 let owned;
                 let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
@@ -657,14 +1034,126 @@ impl SurrogateKs {
             .collect()
     }
 
-    /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
-    /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
-    /// factor 2 of the worst ratio. The force bound is the policy's per-atom bound while the
-    /// training residuals fail; when only the force noise does (σ_f above `force_std_abs`, the
-    /// trust rule's noise condition) it is the absolute `force_std_abs`: the samples whose force
-    /// residuals put σ_f above the tier are the ones the recovery takes out.
-    pub(super) fn worst_offenders(&self) -> Vec<usize> {
-        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return Vec::new() };
+    /// The recovery's offenders (spec R1, since 2026-11-12): the fitted samples (not excluded — at
+    /// the fit or since — and not box-affected) whose **leave-one-out ratio** ([`loo_ratio`]: how far the fit *without* the
+    /// sample misses it — the per-atom energy over its threshold or the worst atom's force over
+    /// its bound) exceeds 1 and is within a factor 2 of the worst such ratio; and that worst ratio
+    /// (0 without a fit). The force bound is the policy's per-atom bound while the training
+    /// residuals fail; when only the force noise does (σ_f above `force_std_abs`, the trust rule's
+    /// noise condition) it is the absolute `force_std_abs` (ρ_σ). An undefined leave-one-out is ∞
+    /// (ruling R1a): such samples rank first, and only they are taken while one exists.
+    ///
+    /// Why not the training residual first (the ranking before; [`training_offenders`](Self::training_offenders),
+    /// now the fallback of [`quarantine_rounds`](Self::quarantine_rounds)): a high-leverage sample is reproduced at its neighbours'
+    /// expense and sits inside its own bound. The user's collection (2026-11-12): a compressed OH
+    /// at 0.72 Ha/Bohr, inside its 1e-2 cap, bent the shared O–H pair term and 34 H₂O/H₃O samples
+    /// failed; ranked by their own residuals the rounds held those victims, round after round, and
+    /// never the sample. Its leave-one-out ratio (38.5× in force, 962× in energy) is rank 1.
+    ///
+    /// The ratios are the class pass's for the fit that stands when it ran (ruling R1b), else
+    /// computed here once for this fit ([`ensure_loo_ratios`](Self::ensure_loo_ratios); the fits
+    /// inside a refit defer the class pass).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn worst_offenders(&mut self) -> (Vec<usize>, f64) {
+        let (rows, w) = self.worst_offenders_bound();
+        (rows.into_iter().map(|x| x.0).collect(), w)
+    }
+
+    /// [`worst_offenders`](Self::worst_offenders) with each offender's ratio and what it was
+    /// measured against ([`Bound`]: its own bound, or in the noise-only mode the tier of the
+    /// channel that attains its ratio — re-review N1, fix round 1 M6), and the worst ratio.
+    pub(super) fn worst_offenders_bound(&mut self) -> (Vec<(usize, f64, Bound)>, f64) {
+        let absolute = !self.residuals_fail();
+        let (e_tier, f_tier) = (self.policy.energy_std_per_atom, self.policy.force_std_abs);
+        let Some(c) = self.ensure_loo_ratios() else { return (Vec::new(), 0.0) };
+        let ratios: Vec<(usize, f64, Channel)> = c
+            .rows
+            .iter()
+            .zip(&c.tier)
+            .zip(&c.tier_channel)
+            .map(|((&(i, own), &tier), &ch)| if absolute { (i, tier, ch) } else { (i, own, Channel::Force) })
+            .collect();
+        // the standing fit's members, less any sample excluded since that fit (a hold, a forget:
+        // fix round 2, M1 — never named twice, never counted twice against the cap) and the
+        // box-affected ones
+        let ratios: Vec<(usize, f64, Channel)> = ratios.into_iter().filter(|&(i, _, _)| !self.excluded(i) && !self.is_box(i)).collect();
+        // the worst as `f64::max` folds it (a NaN cannot occur: `loo_ratio` maps it to ∞)
+        let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
+        let bound = |ch: Channel| match (absolute, ch) {
+            (false, _) => Bound::Own,
+            (true, Channel::Energy) => Bound::EnergyTier(e_tier),
+            (true, Channel::Force) => Bound::ForceTier(f_tier),
+        };
+        if worst <= 1.0 {
+            return (Vec::new(), worst);
+        }
+        (ratios.into_iter().filter(|&(_, r, _)| r > 1.0 && r >= 0.5 * worst).map(|(i, r, ch)| (i, r, bound(ch))).collect(), worst)
+    }
+
+    /// The standing fit's members in store order (`fit_members`: the accumulated prefix and the
+    /// quarantine codes when it was installed, the samples with no code). Right after a fit they are
+    /// the class pass's and the training residuals' members; between fits a code may move without
+    /// the fit (a hold, a release, a forget), and these stay the fit's.
+    fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        let (n, codes) = (&self.fit_members.0, &self.fit_members.1);
+        let n = self.store.as_ref().map_or(0, |st| (*n).min(st.len()));
+        (0..n).filter(move |&i| codes.get(i).is_none_or(|&q| q == Q_NONE))
+    }
+
+    /// The per-sample leave-one-out ratios of the fit that stands, when the cache holds this fit's
+    /// ([`LooRatios`]: the same model generation and the fit's own members); `None` when stale or
+    /// without a model. Read-only, for a caller that cannot compute (`&self`): every refit leaves
+    /// the cache fresh (`refit_inner`), and it stays fresh until the next fit.
+    pub(super) fn fresh_loo_ratios(&self) -> Option<&LooRatios> {
+        let c = self.loo_ratios.as_ref()?;
+        (self.model.is_some() && c.gen == self.model_gen && c.rows.iter().map(|r| r.0).eq(self.fit_member_indices())).then_some(c)
+    }
+
+    /// [`fresh_loo_ratios`](Self::fresh_loo_ratios), computing them for the fit that stands when the
+    /// cache is stale (`surrogate::loo::leave_one_out_many` over the members, then [`loo_ratio`] —
+    /// the class pass's numbers, bit for bit). `None` without a model or a store.
+    pub(super) fn ensure_loo_ratios(&mut self) -> Option<&LooRatios> {
+        if self.fresh_loo_ratios().is_none() {
+            let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
+            let members: Vec<usize> = self.fit_member_indices().collect();
+            let samples: Vec<&Sample> = members.iter().map(|&i| &store.samples[i]).collect();
+            let loos = surrogate::loo::leave_one_out_many(model, &samples);
+            let (mut rows, mut tier, mut tier_channel) = (Vec::with_capacity(members.len()), Vec::with_capacity(members.len()), Vec::with_capacity(members.len()));
+            for ((&i, s), l) in members.iter().zip(&samples).zip(&loos) {
+                let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+                rows.push((i, own));
+                tier.push(t);
+                tier_channel.push(ch);
+            }
+            self.loo_ratios = Some(LooRatios { gen: self.model_gen, rows, tier, tier_channel });
+        }
+        self.loo_ratios.as_ref()
+    }
+
+    /// **The per-sample leave-one-out ranking's accessor** (spec R1b; the Model tab's
+    /// "Worst-fitting samples", plan Task 2): per fitted sample of the fit that stands, in store
+    /// order, (store index, leave-one-out ratio ρ). ρ is [`loo_ratio`]'s first number: the larger
+    /// of the per-atom energy residual over `energy_std_per_atom` and the worst atom's force
+    /// residual over that atom's own bound `force_bound(|F|)`, both of the fit without the sample.
+    /// `f64::INFINITY` stands for an undefined residual (the sample alone spans a direction of the
+    /// fit, ruling R1a). The rows are the standing fit's members: a sample held or forgotten since
+    /// that fit is still listed until the next fit (filter by its current code), one released since
+    /// is not. Computed when the cache is stale (another fit since); `None` without a model or a
+    /// store. Not sorted: rank by the ratio. ([`fresh_loo_ratios`](Self::fresh_loo_ratios) is the
+    /// read-only form.)
+    pub fn loo_ratios(&mut self) -> Option<&[(usize, f64)]> {
+        self.ensure_loo_ratios().map(|c| &c.rows[..])
+    }
+
+    /// The offender ranking before 2026-11-12 (spec R1): the training samples (not excluded, not
+    /// box-affected) whose **in-sample** residual ratio — the per-atom energy residual over its
+    /// threshold, or the worst atom's force residual over its bound (`force_std_abs` when only the
+    /// force noise fails) — exceeds 1 and is within a factor 2 of the worst, and that worst. The
+    /// fallback ranking of [`quarantine_rounds`](Self::quarantine_rounds) (fix round 1, option A):
+    /// it names the samples that fail, where the leave-one-out ranking, once a label error is out,
+    /// can go on naming high-leverage samples whose own fit is fine (the stuck-H collection).
+    pub(super) fn training_offenders(&self) -> (Vec<usize>, f64) {
+        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return (Vec::new(), 0.0) };
         let p = &self.policy;
         let absolute = !self.residuals_fail();
         let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
@@ -685,9 +1174,9 @@ impl SurrogateKs {
             .collect();
         let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
         if worst <= 1.0 {
-            return Vec::new();
+            return (Vec::new(), worst);
         }
-        ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect()
+        (ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect(), worst)
     }
 
     /// The extrapolation grade's active sets (rule 5e) over the atoms of the samples the current
@@ -814,6 +1303,13 @@ impl SurrogateKs {
         }
         // a quarantined neighbourhood (`surrogate` module doc, "Release")
         if !near.is_empty() {
+            // what fences here, in words (fix round 1, M4: a forgotten sample is not "quarantined")
+            let forgotten_near = near.iter().filter(|&&i| self.is_forgotten(i)).count();
+            let (geometry, samples) = match (forgotten_near, near.len() - forgotten_near) {
+                (0, _) => ("a quarantined geometry", "quarantined samples"),
+                (_, 0) => ("a forgotten sample", "forgotten samples"),
+                _ => ("quarantined and forgotten samples", "quarantined and forgotten samples"),
+            };
             let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
             if !agrees {
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
@@ -843,36 +1339,54 @@ impl SurrogateKs {
                     self.fence_votes.clear();
                     self.vote_pending.push((self.samples(), near.to_vec()));
                     notes.push(format!(
-                        "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers next to a quarantined geometry disagree with the model; the next refit decides"
+                        "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers next to {geometry} disagree with the model; the next refit decides"
                     ));
                     return yes(TeachOutcome::KeptByVote);
                 }
                 // no model answered in a capped segment (`TeachRule::Segment`) or wherever a rule
                 // refused before consulting it: nothing disagreed (Task 10a review, finding 7)
                 notes.push(match (model, mask) {
-                    (Some(_), _) => "surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into(),
-                    (None, Some(_)) => format!("surrogate: sample not kept — a capped segment next to a quarantined geometry (the model does not answer in a segment); a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
-                    (None, None) => format!("surrogate: sample not kept — next to a quarantined geometry, and the model was not consulted here; a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                    (Some(_), _) => format!("surrogate: sample not kept — next to {geometry}, and the teacher still disagrees with the model there"),
+                    (None, Some(_)) => format!("surrogate: sample not kept — a capped segment next to {geometry} (the model does not answer in a segment); a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
+                    (None, None) => format!("surrogate: sample not kept — next to {geometry}, and the model was not consulted here; a fence vote keeps one once {FENCE_VOTES} mutually consistent teacher answers agree here"),
                 });
                 return no(TeachOutcome::FenceDisagrees);
             }
             self.fence_votes.clear();
             let (mut released, mut superseded) = (0, 0);
-            for &i in near {
-                let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
-                if self.reproduces_sample(&s) {
-                    self.quarantine[i] = self.released_code(i);
-                    released += 1;
-                } else {
-                    self.quarantine[i] = Q_SUPERSEDED;
-                    superseded += 1;
+            // a forgotten sample fences but is never released or superseded: only the user's
+            // Restore clears it (spec R2)
+            let movable: Vec<usize> = near.iter().copied().filter(|&i| !self.is_forgotten(i)).collect();
+            let kept_forgotten = near.len() - movable.len();
+            // only forgotten samples fence here (final review I1): nothing is released or
+            // superseded, so the fence stays and the model goes on refusing here for as long as
+            // they stay forgotten — the answer is an ordinary agreeing one and goes to the
+            // thinning and copy checks below (the caller thins and deduplicates a fence's
+            // answers, `evaluate`'s `by_fence`), instead of a new sample at every step
+            if movable.is_empty() {
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); the answer goes to its rule's thinning and copy checks"
+                ));
+            } else {
+                for i in movable {
+                    let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
+                    if self.reproduces_sample(&s) {
+                        self.quarantine[i] = self.released_code(i);
+                        released += 1;
+                    } else {
+                        self.quarantine[i] = Q_SUPERSEDED;
+                        superseded += 1;
+                    }
                 }
+                if released + superseded > 0 {
+                    self.species_dirty = true; // the fit's sample set changed: rebuild
+                }
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near {samples} agrees with the model — {released} released, {superseded} superseded{}",
+                    if kept_forgotten > 0 { format!(", {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back)") } else { String::new() }
+                ));
+                return yes(TeachOutcome::KeptReleased { released, superseded });
             }
-            self.species_dirty = true; // the fit's sample set changed: rebuild
-            notes.push(format!(
-                "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
-            ));
-            return yes(TeachOutcome::KeptReleased { released, superseded });
         }
         // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3): the
         // near-quarantine admission without its votes — kept (on the normal path below) only when
@@ -978,6 +1492,152 @@ impl SurrogateKs {
         let same = (!use_energy || (energy - s.energy).abs() <= s_e)
             && forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| taught(*j)).all(|(_, (a, b))| (mag(a) - mag(b)).abs() <= report.sigma_f);
         same.then_some(i)
+    }
+
+    /// The identity of stored sample `i` the Model tab's buttons carry ([`sim::SampleId`]; fix
+    /// round 1, M8): its index and [`sample_key`] of its Z and the bits of its positions, energy
+    /// and forces. `None` for no such sample.
+    pub fn sample_id(&self, i: usize) -> Option<sim::SampleId> {
+        let s = self.store.as_ref()?.samples.get(i)?;
+        Some(sim::SampleId { index: i, key: sample_key(s) })
+    }
+
+    /// The stored sample `id` names, when it still does (fix round 1, M8: a model switch, attach or
+    /// load queued before the click can put another sample at that index); else the refusal.
+    fn check_id(&self, id: sim::SampleId) -> Result<usize, String> {
+        let n = self.samples();
+        match self.sample_id(id.index) {
+            None => Err(format!("no sample #{} (the model holds {n}) — the sample list changed — pick it again", id.index)),
+            Some(now) if now.key != id.key => Err(format!("sample #{} is another sample now — the sample list changed — pick it again", id.index)),
+            Some(_) => Ok(id.index),
+        }
+    }
+
+    /// **Forgets** stored sample `id` (spec R2; the Model tab's "Worst-fitting samples" › Forget):
+    /// its code becomes [`Q_FORGOTTEN`] — out of the fit, the envelope, the grade and the
+    /// leave-one-out, fencing, never released or superseded. Only a sample whose code is
+    /// [`Q_NONE`] (in the fit, or kept since it) can be forgotten (fix round 1, M3: a held,
+    /// superseded, box-excluded, draft, waiting or lone sample is refused — so Restore, which
+    /// returns it to the fit, restores exactly what it was). The status is written **at once**: a
+    /// status record in the attached collection when it holds the sample
+    /// ([`write_status_now`](Self::write_status_now)), else the store's code, which the model file
+    /// and the session autosave write. A refit is due (`pending_refit`, a rebuild); the caller
+    /// starts it. While a background refit runs, the code is also recorded for its install, which
+    /// re-applies it over the copy's (`background` module doc, "The user's codes"): the refit that
+    /// lands afterwards never brings the sample back. A failed audit whose sample this is stays a
+    /// failed audit (rule 8, fix round 1 I1). `Err`, nothing changed: the id no longer names the
+    /// sample (M8), or its code is not [`Q_NONE`].
+    pub fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        let i = self.check_id(id)?;
+        let n = self.samples();
+        match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
+            Q_NONE => {}
+            Q_FORGOTTEN => return Err(format!("sample #{i} is forgotten already")),
+            q => {
+                return Err(format!(
+                    "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",
+                    match q {
+                        Q_HELD => "quarantined by the trust recovery",
+                        Q_SUPERSEDED => "superseded by a fresh answer",
+                        Q_BOX => "box-excluded",
+                        Q_DRAFT => "a draft guess held out of the strict fit",
+                        Q_REF_WAIT => "waiting for its box's isolated-atom reference",
+                        Q_LONE => "lone atoms, held out for good",
+                        _ => "held out of the fit",
+                    }
+                ))
+            }
+        }
+        let written = self.set_user_code(i, Q_FORGOTTEN);
+        let out = (self.quarantined() + self.forgotten()) as f64;
+        let cap = if out > QUARANTINE_MAX_FRACTION * n as f64 {
+            format!(
+                "; held and forgotten together are now {} of {n} samples, past the {:.0} % the trust recovery may hold out — it holds no more",
+                self.quarantined() + self.forgotten(),
+                100.0 * QUARANTINE_MAX_FRACTION
+            )
+        } else {
+            String::new()
+        };
+        self.user_notes.push(format!(
+            "surrogate: sample #{i} forgotten — held out of the fit until Restore, and geometries near it fall back to DFT{written}; the refit decides without it (if it was the only sample of its kind, the trust rule's sample counts may refuse the model until more are sampled){cap}"
+        ));
+        Ok(())
+    }
+
+    /// Puts a forgotten sample ([`forget_sample`](Self::forget_sample)) back: its code returns to
+    /// [`Q_NONE`], the code every forgotten sample had (M3) — through `released_code`, which in
+    /// collection mode would give `Q_REF_WAIT` if its box had no reference (it had one when it was
+    /// forgotten, and references are never removed); written at once and a refit due, as for a
+    /// forget.
+    /// `Err`, nothing changed: the id no longer names the sample (M8), or it is not forgotten.
+    pub fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
+        let i = self.check_id(id)?;
+        if !self.is_forgotten(i) {
+            return Err(format!("sample #{i} is not forgotten"));
+        }
+        let code = self.released_code(i);
+        let written = self.set_user_code(i, code);
+        self.user_notes.push(format!("surrogate: sample #{i} restored — back in the fit at the refit{written}"));
+        Ok(())
+    }
+
+    /// Sets the user's code `code` of sample `i` (Forget, Restore): the rebuild is due, the status
+    /// written at once, and a running background refit's install told. The note's words on where it
+    /// was written.
+    fn set_user_code(&mut self, i: usize, code: u8) -> String {
+        let n = self.samples();
+        self.quarantine.resize(n, Q_NONE);
+        self.quarantine[i] = code;
+        self.species_dirty = true;
+        self.pending_refit = true;
+        self.note_user_code(i, code);
+        match self.write_status_now(i) {
+            Ok(true) => " (written to the shared collection)".to_string(),
+            Ok(false) if self.shared.is_some() => " (a session-only sample: kept with this session's samples)".to_string(),
+            Ok(false) => " (saved with the model file)".to_string(),
+            Err(e) => {
+                self.note_write_failure(&e);
+                format!(" (not written to the shared collection: {e} — this session only)")
+            }
+        }
+    }
+
+    /// The worst-fitting samples of the fit that stands (spec R2; the Model tab's "Worst-fitting
+    /// samples"): its members ranked by their leave-one-out ratio ([`loo_ratios`](Self::loo_ratios),
+    /// ∞ first), worst first, at most [`SUSPECTS_SHOWN`], **only those fitted now** — a sample held,
+    /// forgotten or otherwise excluded since that fit is left out. Read from **the fit's own cache
+    /// only** ([`fresh_loo_ratios`](Self::fresh_loo_ratios)), never recomputed between refits: a
+    /// recompute after a reference rebase would pair the new labels with the old fit (the
+    /// `rebase_collection` comment). Empty without a model or a fresh cache (every refit, load and
+    /// policy change leaves one). One gap, accepted (fix round 1, M7): a policy change between a
+    /// forget and its refit (`set_policy` → `refresh_class_loo`, e.g. the audit cadence) refills the
+    /// cache from the live codes, which are no longer the fit's members — the list reads "no
+    /// ranking yet" until that refit, the next tick.
+    pub fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {
+        let Some(c) = self.fresh_loo_ratios() else { return Vec::new() };
+        let mut rows: Vec<(usize, f64)> = c.rows.iter().copied().filter(|&(i, _)| !self.excluded(i)).collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows.truncate(SUSPECTS_SHOWN);
+        rows.into_iter().filter_map(|(i, r)| self.suspect(i, Some(r))).collect()
+    }
+
+    /// The samples the user forgot, in store order, each with its leave-one-out ratio when the fit
+    /// that stands still holds it (forgotten since that fit; else `None`).
+    pub fn forgotten_samples(&self) -> Vec<sim::SampleSuspect> {
+        let cache = self.fresh_loo_ratios();
+        (0..self.quarantine.len())
+            .filter(|&i| self.is_forgotten(i))
+            .filter_map(|i| {
+                let r = cache.and_then(|c| c.rows.binary_search_by_key(&i, |x| x.0).ok().map(|k| c.rows[k].1));
+                self.suspect(i, r)
+            })
+            .collect()
+    }
+
+    fn suspect(&self, i: usize, loo_ratio: Option<f64>) -> Option<sim::SampleSuspect> {
+        let s = self.store.as_ref()?.samples.get(i)?;
+        Some(sim::SampleSuspect { id: sim::SampleId { index: i, key: sample_key(s) }, formula: shared::formula(&s.z), origin: origin_word(s.tag).to_string(), loo_ratio })
     }
 
     /// The no-model cap (`surrogate` module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the

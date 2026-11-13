@@ -259,6 +259,21 @@ fn verdict_word(v: sim::AuditVerdict) -> &'static str {
     }
 }
 
+/// Where a residual check's worst value sits, as the trust line names it (2026-11-13):
+/// ` in #1234 · H3O (atom 2, O)` for a force, ` in #1234 · H3O` for an energy — the store index
+/// and formula as the Worst-fitting rows show them, the atom index within the sample (from 0, as
+/// the other atom words count) and its element. Empty when the provider gave no location (an old
+/// status, or the sample changed since), so the line reads as before.
+pub fn worst_at(c: &sim::activity::TrustCheck) -> String {
+    match &c.worst {
+        None => String::new(),
+        Some(w) => {
+            let atom = w.atom.map_or(String::new(), |(j, z)| format!(" (atom {j}, {})", symbol(z)));
+            format!(" in #{} · {}{atom}", w.id.index, w.formula)
+        }
+    }
+}
+
 /// One trust condition as a plain line (spec §5.3). `seen` and `audit_every` word the met audit
 /// line (plan review M1, Task 3 review I1): it says what the last audit was, that none has run
 /// since the refit, or that none ever did — never "passed" by default.
@@ -267,10 +282,15 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::Samples => format!("Enough samples in the fit — {} of {} needed (one per independent direction the model can bend)", c.value as usize, c.limit as usize),
         TrustKey::ResidualDofE => format!("Enough data beyond the fit's own parameters to measure its noise — energies {:.0} of {:.0}", c.value, c.limit),
         TrustKey::ResidualDofF => format!("Enough data beyond the fit's own parameters to measure its noise — forces {:.0} of {:.0}", c.value, c.limit),
-        TrustKey::EnergyResidual => format!("Reproduces its own training energies to the accuracy it claims — worst {} mHa/atom, allowed {} mHa/atom", mha(c.value), mha(c.limit)),
-        TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
+        TrustKey::EnergyResidual => format!("Reproduces its own training energies to the accuracy it claims — worst {} mHa/atom{}, allowed {} mHa/atom", mha(c.value), worst_at(c), mha(c.limit)),
+        TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}{}, allowed {} mHa/Bohr for that atom", mha(c.value), worst_at(c), mha(c.limit)),
         // M: fitted samples over their bound, judged apart from the two lines above (spec 2026-11-13 §4.3)
-        TrustKey::Misfit => format!("Few training samples it cannot reproduce — {} of at most {:.1} (10 % of the fitted samples)", c.value as usize, c.limit),
+        TrustKey::Misfit => format!(
+            "Few training samples it cannot reproduce — {} of at most {:.1} (10 % of the fitted samples){}",
+            c.value as usize,
+            c.limit,
+            c.worst.as_ref().map_or(String::new(), |_| format!("; worst{}", worst_at(c)))
+        ),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
         TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),

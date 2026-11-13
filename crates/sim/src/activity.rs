@@ -634,6 +634,10 @@ pub struct SolveCounts {
     pub kept: u64,
     /// The model came from a file without the record: solves before it are unrecorded.
     pub unrecorded_before: bool,
+    /// Steps answered from the isolated-atom references (lone atoms, `Source::Reference`) since the
+    /// provider was built or the last forget: **not solves** — not in [`total`](Self::total), not a
+    /// fallback, not a model answer; nothing was learned from them. A session count, never saved.
+    pub reference: u64,
 }
 
 impl SolveCounts {
@@ -698,12 +702,34 @@ impl TeachBuffer {
 }
 
 /// One condition of the trust rule (spec §3.3.4, A4).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrustCheck {
     pub key: TrustKey,
     pub met: bool,
     pub value: f64,
     pub limit: f64,
+    /// Where `value` was found, for the training-residual checks (`EnergyResidual`,
+    /// `ForceResidual`), and for `Misfit` the worst sample of the misfit set: display only, never
+    /// read by the rule. `None` for every other check, and when the provider did not record it or
+    /// the sample it names has changed since.
+    pub worst: Option<TrustWorst>,
+}
+
+/// The training sample (and, for a force, the atom) that holds a residual check's worst value
+/// (2026-11-13: the trust line names what blocks trust). Display only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrustWorst {
+    /// Which stored sample, with its check value: what `Trainable::forget_sample` takes.
+    pub id: crate::provider::SampleId,
+    /// Its formula from Z in Hill order ("H2O"), as the Worst-fitting rows show it.
+    pub formula: String,
+    /// Where it came from, in a word or two ("fallback", "pass perturbation").
+    pub origin: String,
+    /// The atom within the sample and its Z (the force residual's worst atom); `None` for a
+    /// per-sample value (the energy residual).
+    pub atom: Option<(usize, u8)>,
+    /// Whether `forget_sample` would take it now (its code is 0: in the fit, not held out).
+    pub forgettable: bool,
 }
 
 /// A trusted model that keeps falling back (spec A5; `SurrogateKs::stuck` in structured form).
@@ -742,6 +768,9 @@ pub enum SampleState {
     /// Lone atoms (no atom with a neighbour within the cutoff) loaded from before the keep rule
     /// refused them: held out of the fit — they teach nothing.
     Lone,
+    /// Forgotten by the user (the Model tab's "Worst-fitting samples" › Forget): held out of the
+    /// fit and fencing, until Restore.
+    Forgotten,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).
@@ -938,7 +967,7 @@ mod tests {
 
     #[test]
     fn solve_counts_total_and_not_kept() {
-        let c = SolveCounts { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, unrecorded_before: false };
+        let c = SolveCounts { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, unrecorded_before: false, reference: 0 };
         assert_eq!(c.total(), 362);
         assert_eq!(c.not_kept(), 19);
     }

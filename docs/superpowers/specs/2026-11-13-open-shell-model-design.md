@@ -95,6 +95,11 @@ that is how genuinely bad labels are found (my call; builder check Q1). Changes:
   ends there; whatever still fails becomes M (§4.3) instead of untrusting the model.
 - Fence votes (`judge_votes`, bounded by `FENCE_VOTE_LIMIT`) are a separate mechanism and are unchanged
   (my call; builder check Q3): G2 is about the recovery.
+- *Merged with main's leave-one-out recovery (2026-11-14):* step 2 is main's two rankings (leave-one-out
+  first, the training residual its fallback) and step 3 is gated on "not recovered"; the restore above
+  wraps all of them — a result stands when it recovers, or passes the residuals and noise short of the
+  counts; else the entry state (a forgotten sample's code 7 untouched). Forgotten samples count against
+  the held cap (main's R2) and are never in M (M is over fitted samples).
 
 ### 4.3 Local misfit (G3)
 
