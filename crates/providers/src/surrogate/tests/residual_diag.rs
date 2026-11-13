@@ -454,14 +454,36 @@ fn key_name(k: &surrogate::EnvKey) -> String {
     format!("{}{{{}}} c{}", sym(k.z), k.neighbours.iter().map(|&z| sym(z)).collect::<Vec<_>>().join(","), k.class)
 }
 
-/// Task 7 review C1 (measurement only): per class key, the leave-one-out force and energy RMS
-/// ratios R_c and R_E,c as `compute_class_loo_full` forms them (members: the fitted samples, M left
-/// out), and the same with M's samples kept in as members — recomputed here, the provider's path
-/// untouched (its own key statistics are printed beside them as the cross-check of the "−M"
-/// columns). Per key also n_k without and with M, f (M's share of the key's atoms), r_M (the RMS
-/// LOO force ratio of M's atoms of the key), and, on the "+M" RMS, whether the uncalibrated
-/// condition refuses the key (an RMS > 1) and whether the calibrated verdict keeps it out
-/// (R > 1/√2): force / energy.
+/// The standing class-rule verdict of environment key `k` (`class_loo`'s per-key verdicts):
+/// `Some(None)` trusted, `Some(Some(refusal))` refused, `None` when the key is not judged (no
+/// sample of its own).
+fn key_verdict(s: &SurrogateKs, k: &surrogate::EnvKey) -> Option<Option<(sim::ClassKey, f64, f64)>> {
+    let c = s.class_loo().get((k.class - 1) as usize)?;
+    c.species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).map(|v| v.refusal)
+}
+
+/// The environment keys of the trained atoms of `scene`'s fitted samples.
+fn scene_keys(s: &SurrogateKs, meta: &[Meta], scene: &str) -> std::collections::BTreeSet<surrogate::EnvKey> {
+    let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    (0..s.accumulated.min(store.len()))
+        .filter(|&i| !s.excluded(i) && meta[i].scene == scene)
+        .flat_map(|i| {
+            let x = &store.samples[i];
+            super::super::trust::trained_keys(x, super::super::policy::env_keys(&x.pos, &x.z, rc2))
+        })
+        .flatten()
+        .collect()
+}
+
+/// Task 7 review C1 as built (22553fd, e0f15ac; measurement only): per class key the provider's
+/// own leave-one-out statistics (`compute_class_loo_full`'s key statistics: M in the RMS terms,
+/// out of n_k and the max terms; `energy_misfits`, M's energy samples in the energy sum) and the
+/// **standing verdict** of the class rule (`class_loo`), with C1's guard and the energy half
+/// (`ClassKey::EnergyRms`) in it. Beside them, recomputed here for comparison: the RMS with M left
+/// out (the rule before C1) and with M in (the cross-check of the provider's numbers), f and r_M
+/// (M's share of the key's atoms and their LOO force ratio RMS), f_E and r_E (M's share of the
+/// key's energy samples and their LOO energy ratio RMS).
 fn c1_class_keys(s: &SurrogateKs, label: &str) {
     use std::collections::BTreeSet;
     #[derive(Default)]
@@ -474,6 +496,8 @@ fn c1_class_keys(s: &SurrogateKs, label: &str) {
         undefined: [bool; 2],
         m_atoms: usize,
         m_ss: f64,
+        m_e: usize,
+        m_e_ss: f64,
     }
     let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
     let rc2 = model.basis.r_cut * model.basis.r_cut;
@@ -492,7 +516,13 @@ fn c1_class_keys(s: &SurrogateKs, label: &str) {
         let present: BTreeSet<&surrogate::EnvKey> = keys.iter().flatten().collect();
         for k in present {
             let a = acc.entry(k.clone()).or_default();
-            // w = 0: M left out (the provider's members); w = 1: M kept in
+            if in_m {
+                if let Some(e) = e_ratio {
+                    a.m_e += 1;
+                    a.m_e_ss += e * e;
+                }
+            }
+            // w = 0: M left out (the rule before C1); w = 1: M kept in (the RMS terms as built)
             for w in [0usize, 1] {
                 if w == 0 && in_m {
                     continue;
@@ -527,35 +557,29 @@ fn c1_class_keys(s: &SurrogateKs, label: &str) {
     let (judged, _, _) = s.compute_class_loo_full();
     let provider = judged.map(|(_, j)| j.key_stats).unwrap_or_default();
     let m_n = s.misfit().map_or(0, |m| m.samples.len());
-    println!("\nC1 [{label}] (|M| = {m_n}): per class key, LOO ratio RMS without M (the provider's members) and with M kept in");
-    println!("| key | n_k −M / +M | R_c −M | R_c +M | R_E −M | R_E +M | f | r_M | provider R_c / R_E / n_k | +M refused (RMS > 1) F/E | +M kept out (R > 1/√2) F/E | −M refused / kept out |");
+    println!("\nC1 [{label}] (|M| = {m_n}): per class key, the provider's statistics and standing verdict (C1 + the energy guard, as built)");
+    println!("| key | n_k | provider R_c / R_E,c / energy M | standing verdict | recomputed R_c, R_E M in | M out (before C1) R_c, R_E | f | r_M | f_E | r_E |");
     let rms = |ss: f64, n: usize, und: bool| if und { f64::INFINITY } else if n > 0 { (ss / n as f64).sqrt() } else { 0.0 };
-    let yn = |b: bool| if b { "yes" } else { "no" };
-    let half = std::f64::consts::FRAC_1_SQRT_2;
     for (k, a) in &acc {
         let rf = [rms(a.f_ss[0], a.f_at[0], a.undefined[0]), rms(a.f_ss[1], a.f_at[1], a.undefined[1])];
         let re = [rms(a.e_ss[0], a.e_n[0], a.undefined[0]), rms(a.e_ss[1], a.e_n[1], a.undefined[1])];
         let f = if a.f_at[1] > 0 { a.m_atoms as f64 / a.f_at[1] as f64 } else { 0.0 };
         let r_m = if a.m_atoms > 0 { (a.m_ss / a.m_atoms as f64).sqrt() } else { 0.0 };
-        let p = provider.get(k).map_or("—".to_string(), |p| format!("{:.3} / {:.3} / {}", p.force_rms, p.energy_rms, p.samples));
-        println!(
-            "| {} | {} / {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.4} | {:.2} | {p} | {}/{} | {}/{} | {}/{} |",
-            key_name(k),
-            a.n[0],
-            a.n[1],
-            rf[0],
-            rf[1],
-            re[0],
-            re[1],
-            f,
-            r_m,
-            yn(rf[1] > 1.0),
-            yn(re[1] > 1.0),
-            yn(rf[1] > half),
-            yn(re[1] > half),
-            yn(rf[0] > 1.0 || re[0] > 1.0),
-            yn(rf[0] > half || re[0] > half)
-        );
+        let f_e = if a.e_n[1] > 0 { a.m_e as f64 / a.e_n[1] as f64 } else { 0.0 };
+        let r_e = if a.m_e > 0 { (a.m_e_ss / a.m_e as f64).sqrt() } else { 0.0 };
+        let p = provider.get(k).map_or("— (not judged)".to_string(), |p| format!("{:.3} / {:.3} / {} (n {})", p.force_rms, p.energy_rms, p.energy_misfits, p.samples));
+        let v = match key_verdict(s, k) {
+            None => "not judged".to_string(),
+            Some(None) => "trusted".to_string(),
+            Some(Some((key, value, limit))) => format!("REFUSED {key:?} {value:.3} > {limit:.3}"),
+        };
+        println!("| {} | {} | {p} | {v} | {:.3}, {:.3} | {:.3}, {:.3} | {:.4} | {:.2} | {:.4} | {:.2} |", key_name(k), a.n[0], rf[1], re[1], rf[0], re[0], f, r_m, f_e, r_e);
+    }
+    for c in s.class_loo() {
+        println!("class {}: {} samples, force rms {:.3}, energy rms {:.3}; {}", c.class, c.samples, c.force_rms, c.energy_rms, match c.refusal {
+            None => "trusted".to_string(),
+            Some((key, value, limit)) => format!("REFUSED {key:?} {value:.3} > {limit:.3}"),
+        });
     }
 }
 
@@ -637,14 +661,17 @@ fn c2_near_misfit(s: &mut SurrogateKs, meta: &[Meta], label: &str) {
 ///
 /// §5.1: the attach (the real growth rule) leaves the model trusted, holding no more than it
 /// started with, with at least the 68 releases of 2026-11-12; M is printed by scene. Refits with
-/// nothing new then converge (ruling 11: each better fit reproduces more held samples, so the
-/// releases continue for a refit or two): the held count never rises, and within 5 refits two
-/// successive ones leave the same codes and the same M (measured on to 12 refits, so a failure
-/// still says where the fixed point lies; the convergence and §5.2 failures are asserted together
-/// at the end). §5.2: per scene, the force rms and the
-/// leave-one-out force RMS at the converged D₄ = 3 fit are ≤ those of a D₄ = 2 provider's attach
-/// fit on its own fresh copy, or both below 1e-4 Ha/Bohr. Also printed, not asserted: D₄ = 2 fitted
-/// on the D₄ = 3 codes (no recovery) — the same samples on both sides.
+/// nothing new then converge (ruling 11: each better fit reproduces more held samples, and one
+/// release pass runs per refit): the held count never rises, and two successive refits leave the
+/// same codes and the same M. The user's decision 2026-11-13: no refit-count bound; 20 refits are
+/// only the runtime bound (the measured fixed point is refit 8). §5.2: per scene, the force rms
+/// and the leave-one-out force RMS at the converged D₄ = 3 fit are ≤ those of a D₄ = 2 provider's
+/// attach fit on its own fresh copy, or both below 1e-4 Ha/Bohr — except HO's LOO, accepted by the
+/// user (one sample whose keys the class rule refuses at both degrees; checked, not assumed). The
+/// convergence and §5.2 failures are asserted together at the end. Also printed, not asserted:
+/// D₄ = 2 fitted on the D₄ = 3 codes (no recovery) — the same samples on both sides — and the Task
+/// 7 review's C1 (the class rule as built) and C2 (rejected; kept as the record) on the attach
+/// and on a variant whose M is populated.
 #[test]
 #[ignore]
 fn acceptance_on_the_collection() {
@@ -703,17 +730,16 @@ fn acceptance_on_the_collection() {
     c1_class_keys(&s, "D₄ = 3, the attach's refit");
     c2_near_misfit(&mut s, &meta, "D₄ = 3, the attach's refit");
 
-    // ---- §5.1 (ruling 11): refits with nothing new converge to a fixed point within `REFITS`;
-    // measured on to `MEASURE` refits so a failure still reports where the fixed point lies, and
-    // the convergence failures are asserted at the end, after §5.2 has been measured too
-    const REFITS: usize = 5;
-    const MEASURE: usize = 12;
+    // ---- §5.1 (ruling 11, the user's decision 2026-11-13): refits with nothing new reach a fixed
+    // point — no refit-count bound; `MAX_REFITS` only keeps the test from looping forever. The
+    // convergence failures are asserted at the end, after §5.2 has been measured too
+    const MAX_REFITS: usize = 20;
     let mut failures: Vec<String> = Vec::new();
     println!("\n| refit | held | released | newly held | |M| | M by scene | trusted | fit_store calls | wall (s) |");
     println!("| attach | {held_after} | {released} | {newly} | {} | {:?} | {} | {} | {attach_wall:.2} |", m0.len(), by_scene(&meta, m0.iter().copied()), s.trusted(), s.fits);
     let (mut prev_q, mut prev_m) = (s.quarantine.clone(), m0);
     let mut fixed_at = None;
-    for k in 1..=MEASURE {
+    for k in 1..=MAX_REFITS {
         let fits = s.fits;
         s.pending_refit = true;
         let t = Instant::now();
@@ -743,10 +769,10 @@ fn acceptance_on_the_collection() {
     }
     match fixed_at {
         Some(k) => println!("FIXED POINT: refit {k} repeats refit {} (codes and M)", k - 1),
-        None => println!("NO FIXED POINT within {MEASURE} refits"),
+        None => println!("NO FIXED POINT within {MAX_REFITS} refits"),
     }
-    if !fixed_at.is_some_and(|k| k <= REFITS) {
-        failures.push(format!("ruling 11: no fixed point (the same codes and M at two successive refits) within {REFITS} refits: reached at {fixed_at:?} (measured to {MEASURE})"));
+    if fixed_at.is_none() {
+        failures.push(format!("ruling 11: no fixed point (the same codes and M at two successive refits) within {MAX_REFITS} refits (the runtime bound)"));
     }
     report(&s, &meta, &format!("D₄ = 3 at the last refit (fixed point {fixed_at:?})"));
     let rms3 = scene_rms(&s, &meta);
@@ -776,6 +802,24 @@ fn acceptance_on_the_collection() {
         s2.recovery_note()
     );
     let rms2 = scene_rms(&s2, &meta);
+    // The one accepted exception (the user's decision 2026-11-13; references.md "Acceptance
+    // (2026-11-13)"): HO's LOO force RMS. HO is one sample (#1804, O–H 1.311 Bohr, the store's only
+    // pair-class O–H geometry), so its LOO is the pair term's extrapolation to a distance no other
+    // sample covers. The exception holds only while that stays true: one fitted sample at both
+    // degrees, and every key of its atoms refused by the class rule at both. Its in-sample force
+    // rms is still asserted; every other scene is asserted in full
+    let lone_and_refused = |k: &str| {
+        let refused = |p: &SurrogateKs| {
+            let keys = scene_keys(p, &meta, k);
+            !keys.is_empty() && keys.iter().all(|key| matches!(key_verdict(p, key), Some(Some(_))))
+        };
+        rms3.get(k).is_some_and(|r| r.samples == 1) && rms2.get(k).is_some_and(|r| r.samples == 1) && refused(&s) && refused(&s2)
+    };
+    let loo_exception = |k: &str| k == "HO" && lone_and_refused(k);
+    if rms3.contains_key("HO") {
+        let v = |p: &SurrogateKs| scene_keys(p, &meta, "HO").iter().map(|key| format!("{} {:?}", key_name(key), key_verdict(p, key))).collect::<Vec<_>>();
+        println!("\nHO keys: D₄ = 3 {:?}; D₄ = 2 {:?}; the LOO exception applies: {}", v(&s), v(&s2), loo_exception("HO"));
+    }
     println!("\n§5.2 | scene | samples D₄3/D₄2 | atoms D₄3/D₄2 | rms D₄=3 | rms D₄=2 | LOO D₄=3 | LOO D₄=2 | LOO undefined 3/2 | verdict |");
     let ok = |a: f64, b: f64| a <= b || (a < FLOOR && b < FLOOR);
     for (k, r3) in &rms3 {
@@ -793,12 +837,18 @@ fn acceptance_on_the_collection() {
             r2.loo,
             r3.loo_undefined,
             r2.loo_undefined,
-            if ok_rms && ok_loo { "ok" } else { "ROSE" }
+            if ok_rms && ok_loo {
+                "ok"
+            } else if ok_rms && loo_exception(k) {
+                "LOO ROSE: EXCEPTION (accepted by the user 2026-11-13: one sample, its keys refused at both degrees)"
+            } else {
+                "ROSE"
+            }
         );
         if !ok_rms {
             failures.push(format!("{k}: force rms {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.rms, r2.rms));
         }
-        if !ok_loo {
+        if !ok_loo && !loo_exception(k) {
             failures.push(format!("{k}: LOO force RMS {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.loo, r2.loo));
         }
     }
@@ -832,8 +882,7 @@ fn acceptance_on_the_collection() {
     s.fit_store().unwrap();
     let mv = misfit_samples(&s);
     println!(
-        "
-VARIANT (every hold cleared, no recovery, fit {:.2} s): body4_degree {:?}; trusted {} ({:?}); held {}; |M| {} samples, {} atoms, limit base {}; M by scene {:?}; training residuals outside M {:?}",
+        "\nVARIANT (every hold cleared, no recovery, fit {:.2} s): body4_degree {:?}; trusted {} ({:?}); held {}; |M| {} samples, {} atoms, limit base {}; M by scene {:?}; training residuals outside M {:?}",
         t.elapsed().as_secs_f64(),
         s.body4_degree(),
         s.trusted(),
