@@ -1224,8 +1224,9 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     }
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
-    // the Activity tab's trust group says the same and retries too
+    // the Activity tab's trust group says the same and retries too (its fold opened)
     st.open_tab(DockTab::Activity);
+    st.activity_sections.trust = true;
     for _ in 0..3 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
@@ -9457,5 +9458,316 @@ mod model_panel {
             });
         }
         assert!(checked > 40, "{checked} texts checked");
+    }
+}
+
+/// The Activity panel's restructuring (user request 2026-11-14, the approved mockup): the job card
+/// with its convergence plot and strip, the session timeline with the counters, the solve log's
+/// chips and folded runs, the trust and training folds.
+mod activity_redesign {
+    use super::*;
+    use activity::jobs::{JobKey, Traces, GHOSTS};
+    use activity::log::{group_text, items, Item, LogView};
+    use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+    use std::time::Duration as D;
+
+    fn live(iteration: u32, first: f32, delta_rho: f64) -> sim::ScfLive {
+        let mut spark = [f32::NAN; sim::activity::SPARK_POINTS];
+        for (k, v) in spark.iter_mut().enumerate().take(iteration as usize) {
+            *v = first - 0.5 * k as f32;
+        }
+        sim::ScfLive {
+            attempt: 1,
+            iteration,
+            max_iter: 200,
+            delta_rho,
+            tol: 1e-6,
+            energy: -1.13,
+            d_energy: -2e-5,
+            ms_per_iteration: 2200.0,
+            since_gain: 1,
+            window: 50,
+            best_delta_rho: delta_rho,
+            stall_level: 8e-3,
+            spark,
+            spark_len: iteration as u8,
+            spark_stride: 1,
+        }
+    }
+
+    fn pass_event(outcome: K, scf: Option<usize>, end: Option<sim::ScfEnd>, ms: f64) -> sim::TeachEvent {
+        let mut e = activity_tab::event(O::Pass, R::Pass(PassJob::Perturbation), outcome, None);
+        e.scf_steps = scf;
+        e.scf_end = end;
+        e.solve_ms = ms;
+        e
+    }
+
+    /// A pass running on H₂ with a live solve at iteration 6.
+    fn running(scene: &Scene) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 39, total: 144, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 1, finished: false, target: None });
+        snap
+    }
+
+    fn probe(l: sim::ScfLive) -> sim::ProbeView {
+        sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: l.iteration, elapsed_s: 13.0, solves: 40, live: Some(l) }, ..Default::default() }
+    }
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2) -> (String, Vec<egui::epaint::ClippedShape>) {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            shapes = full.shapes;
+        }
+        (out, shapes)
+    }
+
+    /// Job card → session timeline → counters → solve log → Trust checklist → Training plots; the
+    /// two folds closed by default; the card's words.
+    #[test]
+    fn the_sections_come_in_order_with_the_folds_closed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = running(&scene);
+        let inp = PanelInput { probe: Some(probe(live(6, -0.17, 0.68))), ..input(&scene, Some(&snap), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        assert!(!st.activity_sections.trust && !st.activity.training_open);
+        st.activity.absorb(&snap);
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        let order = ["activity-job-card", "anchor-d-timeline", "anchor-d-counters", "anchor-d-solve-log", "activity-fold-trust", "activity-fold-training"];
+        let ys: Vec<f32> = order.iter().map(|p| probed_rect(p).top()).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?}: {ys:?}");
+        assert!(t.contains("Sampling pass · bond scan") && t.contains("sample 40 of 144") && t.contains("27 %"), "{t}");
+        assert!(t.contains("iteration 6 · 2.2 s each") && t.contains("Δρ 6.8e-1 → 1e-6") && t.contains("target"), "{t}");
+        assert!(t.contains("THIS SESSION") && t.contains("Trust checklist") && t.contains("Training plots"), "{t}");
+        // the folds draw nothing of their own while closed
+        assert!(!t.contains("Strict mode answers at this geometry"), "{t}");
+    }
+
+    /// The plot's y axis is fixed by the job's first solve — a second solve of another magnitude
+    /// does not rescale it — and a new solve keeps the earlier ones as faint traces (at most 3);
+    /// a solve younger than 0.5 s is not animated: the last finished one is drawn bright.
+    #[test]
+    fn the_convergence_plot_keeps_its_axis_and_the_previous_solves() {
+        let t0 = Instant::now();
+        let mut tr = Traces::default();
+        tr.observe(JobKey::Pass, Some(&live(10, -0.3, 1e-4)), t0);
+        let range = tr.range.unwrap();
+        assert_eq!(range, (-7.0, 0.0), "max(1, first Δρ) down to a decade below 1e-6");
+        tr.observe(JobKey::Pass, Some(&live(2, 1.5, 30.0)), t0 + D::from_secs(2));
+        assert_eq!(tr.range.unwrap(), range, "not rescaled by a bigger solve");
+        assert_eq!(tr.ghosts.len(), 1, "the finished solve is kept");
+        assert_eq!(tr.ghosts[0].iteration, 10);
+        for k in 0..5 {
+            tr.observe(JobKey::Pass, Some(&live(1, -1.0, 0.1)), t0 + D::from_secs(3 + k));
+            tr.observe(JobKey::Pass, Some(&live(4, -1.0, 0.01)), t0 + D::from_secs(3 + k));
+        }
+        assert!(tr.ghosts.len() <= GHOSTS);
+        assert_eq!(tr.range.unwrap(), range);
+        let started = tr.current.as_ref().unwrap().started;
+        let (bright, faint) = tr.shown(started + D::from_millis(100));
+        assert!(std::ptr::eq(bright.unwrap(), tr.ghosts.back().unwrap()), "a young solve: the last finished one is bright");
+        assert_eq!(faint.len(), GHOSTS - 1);
+        let (bright, faint) = tr.shown(started + D::from_secs(1));
+        assert!(std::ptr::eq(bright.unwrap(), tr.current.as_ref().unwrap()) && faint.len() == GHOSTS);
+        // another job starts afresh
+        tr.observe(JobKey::LiveSolve, Some(&live(3, 0.5, 1.0)), t0);
+        assert!(tr.ghosts.is_empty() && tr.range != Some(range));
+    }
+
+    /// The strip has one bar per finished sample of the running pass and the current one; a failed
+    /// sample is drawn full height in the danger colour.
+    #[test]
+    fn the_strip_marks_a_failed_sample_full_height() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = running(&scene);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        st.activity.absorb(&snap);
+        snap.activity.events = vec![pass_event(K::Kept, Some(17), Some(sim::ScfEnd::Converged), 21_000.0), pass_event(K::Failed, Some(61), Some(sim::ScfEnd::Stalled), 98_000.0), pass_event(K::Kept, Some(24), None, 28_000.0)];
+        st.activity.absorb(&snap);
+        let l = live(6, -0.17, 0.68);
+        let bars = activity::strip(&st.activity, Some(&l));
+        assert_eq!(bars.iter().map(|b| (b.iterations, b.danger, b.current)).collect::<Vec<_>>(), vec![(Some(17), false, false), (Some(61), true, false), (Some(24), false, false), (Some(6), false, true)]);
+        assert!(bars[1].words.contains("61 stalled"), "{}", bars[1].words);
+        let inp = PanelInput { probe: Some(probe(l)), ..input(&scene, Some(&snap), &cam) };
+        let (_, shapes) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        let strip = probed_rect("activity-strip");
+        fn rects(s: &egui::epaint::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::epaint::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        shapes.iter().for_each(|c| rects(&c.shape, &mut all));
+        let in_strip: Vec<_> = all.into_iter().filter(|(r, _)| strip.contains_rect(*r)).collect();
+        assert!(in_strip.iter().any(|(r, c)| *c == RED && (r.height() - strip.height()).abs() < 0.5), "{in_strip:?}");
+        assert_eq!(in_strip.iter().filter(|(_, c)| *c == RED).count(), 1);
+        // the failure is pinned over the log while the pass runs, and has a mark on the failures lane
+        assert_eq!(activity::log::pinned_failure(&st.activity), Some(1));
+        assert!(st.activity.timeline.iter().any(|m| matches!(m, activity::Mark::Failure(_))));
+        assert!(activity::plots::LANES.contains(&"failures"));
+    }
+
+    /// Identical consecutive rows fold into one expandable row; failures never fold; the "failed"
+    /// chip shows only them.
+    #[test]
+    fn identical_log_rows_fold_and_failures_do_not() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = vec![
+            pass_event(K::Kept, Some(17), None, 21_000.0),
+            pass_event(K::Kept, Some(24), None, 28_000.0),
+            pass_event(K::Kept, Some(20), None, 25_000.0),
+            pass_event(K::Failed, None, Some(sim::ScfEnd::TimeLimit), 90_000.0),
+            pass_event(K::Failed, None, Some(sim::ScfEnd::TimeLimit), 91_000.0),
+            activity_tab::event(O::Fallback, R::Grade, K::Kept, Some(7)),
+        ];
+        st.activity.absorb(&snap);
+        assert_eq!(items(&st.activity), vec![Item::Group { first: 0, last: 2, n: 3 }, Item::Row(3), Item::Row(4), Item::Row(5)]);
+        let rows: Vec<&sim::TeachEvent> = (0..3).map(|i| &st.activity.rows[i].event).collect();
+        assert_eq!(group_text(&rows), "3 × nudge — kept · 21–28 s · 17–24 it");
+        // expanded by a click on the group's row
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        // the table is wider than the panel (its own horizontal scroll, whose bar floats over the
+        // last row's lower half): click its visible top-left part
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let r = probed_rect("log-group-0");
+        let at = egui::pos2(r.left() + 30.0, r.top() + 4.0);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![pointer(at, false)]);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerGone]);
+        assert_eq!(items(&st.activity), vec![Item::Group { first: 0, last: 2, n: 3 }, Item::Member(0), Item::Member(1), Item::Member(2), Item::Row(3), Item::Row(4), Item::Row(5)]);
+        // the chips
+        click_widget(&ctx, &mut st, &inp, "log-chip-failed");
+        assert_eq!(st.activity.log_view, LogView::Failed);
+        assert_eq!(items(&st.activity), vec![Item::Row(3), Item::Row(4)]);
+        click_widget(&ctx, &mut st, &inp, "log-chip-fallback");
+        assert_eq!(items(&st.activity), vec![Item::Row(5)]);
+    }
+
+    /// The trust fold's summary counts the checklist's lines; its "see Model" shows the Model
+    /// panel; the folds round-trip through the profile.
+    #[test]
+    fn the_trust_fold_counts_the_checklist_and_the_folds_are_kept() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        let ls = activity::trust::lines(&model(), &scene, &st);
+        let met = ls.iter().filter(|l| l.met).count();
+        let want = if met == ls.len() { format!("{met} ✓") } else { format!("{met} ✓ · {} to learn", ls.len() - met) };
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        assert!(t.contains(&want) && t.contains("see Model"), "{want}: {t}");
+        assert!(profile::capture(&st).contains("\nactivity_sections = \n"));
+        let outs = click_widget(&ctx, &mut st, &inp, "activity-fold-trust");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "display state");
+        assert!(st.activity_sections.trust);
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        assert!(t.contains("Strict mode answers at this geometry"), "the checklist inside: {t}");
+        st.activity.training_open = true;
+        let text = profile::capture(&st);
+        assert!(text.contains("\nactivity_sections = trust,training\n"));
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.activity_sections.trust && fresh.activity.training_open);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert!(!fresh.activity_sections.trust && !fresh.activity.training_open, "absent: both closed");
+        // "see Model"
+        st.activity.training_open = false;
+        click_widget(&ctx, &mut st, &inp, "activity-fold-trust-link");
+        assert!(st.tab_shown(DockTab::Model), "see Model shows the Model panel");
+    }
+
+    /// At 320 pt with the folds open and a pass running the sections do not overlap and the panel's
+    /// own text stays inside it (the solve log keeps its own horizontal scroll).
+    #[test]
+    fn a_narrow_panel_keeps_the_sections_apart() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = running(&scene);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Activity*])").unwrap());
+        st.activity_sections.trust = true;
+        st.activity.absorb(&snap);
+        snap.activity.events = activity_tab::every_kind_of_event();
+        snap.activity.fit_points = vec![crate::sim::FitPoint { epoch: 1, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.2e-4, trusted: true, at: Instant::now() }];
+        st.activity.absorb(&snap);
+        let inp = PanelInput { probe: Some(probe(live(6, -0.17, 0.68))), ..input(&scene, Some(&snap), &cam) };
+        let (t, shapes) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 3000.0));
+        assert!(t.contains("rmse 1.2e-4 · 1 refits"), "{t}");
+        let panel = probed_rect("activity-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+        let order = ["activity-job-card", "anchor-d-timeline", "anchor-d-counters", "anchor-d-solve-log", "activity-fold-trust", "activity-fold-training"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.left() >= panel.left() - 1.0 && r.right() <= panel.right() + 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        // the panel's own clip (the solve log's table and the plots clip to their own rects)
+        for c in shapes.iter().filter(|c| (c.clip_rect.left() - panel.left()).abs() < 1.0 && (c.clip_rect.right() - panel.right()).abs() < 1.0) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 15, "{checked} texts checked");
     }
 }

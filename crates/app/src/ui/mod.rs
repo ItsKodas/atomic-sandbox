@@ -785,6 +785,9 @@ pub struct UiState {
     /// The Model panel's folds that are open (`dock::model`; the profile's `model_sections`):
     /// Teach next and Health by default. Display state: not recorded.
     pub model_sections: dock::model::Sections,
+    /// The Activity panel's folds that are open (`activity::Sections`; the profile's
+    /// `activity_sections`, with the Training fold's `activity.training_open`). Display state.
+    pub activity_sections: activity::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -1021,6 +1024,7 @@ impl UiState {
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
             model_sections: dock::model::Sections::default(),
+            activity_sections: activity::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,

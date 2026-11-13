@@ -546,8 +546,29 @@ pub fn training(ui: &mut Ui, st: &mut ActivityState, target_t: Option<f64>, draf
 // ---- the timeline ----
 
 /// The event timeline (spec §3.3.6): five lanes over session time.
+/// The timeline's span: its first mark and now (at least a second later), `None` without marks.
+pub fn timeline_span(st: &ActivityState) -> Option<(std::time::Duration, std::time::Duration)> {
+    let t0 = st.timeline.iter().map(mark_time).min()?;
+    Some((t0, st.clock_now().max(t0 + std::time::Duration::from_secs(1))))
+}
+
+fn mark_time(m: &Mark) -> std::time::Duration {
+    match *m {
+        Mark::Fallback(t) | Mark::Audit(t, _) | Mark::Refit(t, _) | Mark::Quarantine(t, _) | Mark::Pass(t, _, _) | Mark::Snapshot(t, _) | Mark::Restore(t, _) | Mark::Failure(t) => t,
+    }
+}
+
+/// The lanes, top to bottom (the Activity redesign, 2026-11-14: passes first, a failures lane).
+pub const LANES: [&str; 7] = ["passes", "refits", "fallbacks", "audits", "quarantines", "failures", "snapshots"];
+
 pub fn timeline(ui: &mut Ui, st: &ActivityState) {
-    const LANES: [&str; 6] = ["fallbacks", "audits", "refits", "quarantines", "passes", "snapshots"];
+    const PASSES: usize = 0;
+    const REFITS: usize = 1;
+    const FALLBACKS: usize = 2;
+    const AUDITS: usize = 3;
+    const QUARANTINES: usize = 4;
+    const FAILURES: usize = 5;
+    const SNAPSHOTS: usize = 6;
     let lane_h = 15.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), lane_h * LANES.len() as f32 + 14.0), Sense::hover());
     let p = ui.painter_at(rect);
@@ -558,10 +579,8 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
         small(&p, pos2(rect.left() + 4.0, y + lane_h / 2.0), Align2::LEFT_CENTER, name, theme::INK_FAINT);
         p.line_segment([pos2(inner.left(), y + lane_h), pos2(inner.right(), y + lane_h)], Stroke::new(1.0, theme::LINE_SOFT));
     }
-    let start_of = |m: &Mark| match *m {
-        Mark::Fallback(t) | Mark::Audit(t, _) | Mark::Refit(t, _) | Mark::Quarantine(t, _) | Mark::Pass(t, _, _) | Mark::Snapshot(t, _) | Mark::Restore(t, _) => t,
-    };
-    let Some(t0) = st.timeline.iter().map(start_of).min() else {
+    crate::ui::probe_rect("activity-timeline", rect);
+    let Some(t0) = st.timeline.iter().map(mark_time).min() else {
         p.text(inner.center(), Align2::CENTER_CENTER, "events appear here as they happen", FontId::proportional(11.0), theme::INK_FAINT);
         return;
     };
@@ -582,24 +601,30 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
     for (c, &n) in fall.iter().enumerate().filter(|(_, n)| **n > 0) {
         let h = (3.0 + 2.0 * (n as f32).log2()).min(lane_h - 2.0);
         let x = inner.left() + c as f32 + 0.5;
-        p.line_segment([pos2(x, lane_mid(0) + h / 2.0), pos2(x, lane_mid(0) - h / 2.0)], Stroke::new(1.0, AMBER));
+        p.line_segment([pos2(x, lane_mid(FALLBACKS) + h / 2.0), pos2(x, lane_mid(FALLBACKS) - h / 2.0)], Stroke::new(1.0, AMBER));
     }
     let mut spots: Vec<(Pos2, String)> = Vec::new();
     for m in &st.timeline {
         match *m {
             Mark::Fallback(_) => {}
+            Mark::Failure(t) => {
+                let at = pos2(x_of(t), lane_mid(FAILURES));
+                p.line_segment([pos2(at.x - 3.0, at.y - 3.0), pos2(at.x + 3.0, at.y + 3.0)], Stroke::new(1.5, RED));
+                p.line_segment([pos2(at.x - 3.0, at.y + 3.0), pos2(at.x + 3.0, at.y - 3.0)], Stroke::new(1.5, RED));
+                spots.push((at, format!("a teaching solve failed or did not converge at {} (the solve log's \"failed\" chip lists them)", clock(t))));
+            }
             Mark::Audit(t, v) => {
                 let (c, w) = match v {
                     sim::AuditVerdict::Passed => (GREEN, "passed"),
                     sim::AuditVerdict::Failed => (RED, "failed"),
                     sim::AuditVerdict::BoxAffected => (theme::INK_DIM, "box-affected, not judged"),
                 };
-                let at = pos2(x_of(t), lane_mid(1));
+                let at = pos2(x_of(t), lane_mid(AUDITS));
                 p.circle_filled(at, 3.0, c);
                 spots.push((at, format!("audit {w} at {}", clock(t))));
             }
             Mark::Refit(t, trusted) => {
-                let at = pos2(x_of(t), lane_mid(2));
+                let at = pos2(x_of(t), lane_mid(REFITS));
                 let d = [pos2(at.x, at.y - 4.0), pos2(at.x + 4.0, at.y), pos2(at.x, at.y + 4.0), pos2(at.x - 4.0, at.y)];
                 if trusted {
                     p.add(Shape::convex_polygon(d.to_vec(), SPARK_E, Stroke::NONE));
@@ -609,13 +634,13 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
                 spots.push((at, format!("refit at {}: {} afterwards", clock(t), if trusted { "trusted" } else { "not trusted" })));
             }
             Mark::Quarantine(t, n) => {
-                let at = pos2(x_of(t), lane_mid(3));
+                let at = pos2(x_of(t), lane_mid(QUARANTINES));
                 p.rect_filled(Rect::from_center_size(at, vec2(7.0, 7.0)), 1.0, Color32::from_rgb(190, 130, 240));
                 spots.push((at, format!("{n} samples quarantined at {}", clock(t))));
             }
             Mark::Pass(s, e, cancelled) => {
                 let (x0, x1) = (x_of(s), x_of(e.unwrap_or(now)).max(x_of(s) + 2.0));
-                let r = Rect::from_min_max(pos2(x0, lane_mid(4) - 4.0), pos2(x1, lane_mid(4) + 4.0));
+                let r = Rect::from_min_max(pos2(x0, lane_mid(PASSES) - 4.0), pos2(x1, lane_mid(PASSES) + 4.0));
                 if cancelled {
                     p.rect_stroke(r, 1.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
                     let mut x = r.left();
@@ -634,14 +659,14 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
             }
             Mark::Snapshot(t, fs) => {
                 // a flag: Play pressed, the state kept
-                let at = pos2(x_of(t), lane_mid(5));
+                let at = pos2(x_of(t), lane_mid(SNAPSHOTS));
                 p.line_segment([pos2(at.x, at.y + 5.0), pos2(at.x, at.y - 5.0)], Stroke::new(1.0, GREEN));
                 p.add(Shape::convex_polygon(vec![pos2(at.x, at.y - 5.0), pos2(at.x + 5.0, at.y - 2.5), pos2(at.x, at.y)], GREEN, Stroke::NONE));
                 spots.push((at, format!("snapshot at t = {fs:.1} fs (Play pressed at {})", clock(t))));
             }
             Mark::Restore(t, fs) => {
                 // a left arrow: back to a snapshot
-                let at = pos2(x_of(t), lane_mid(5));
+                let at = pos2(x_of(t), lane_mid(SNAPSHOTS));
                 p.add(Shape::convex_polygon(vec![pos2(at.x - 4.0, at.y), pos2(at.x + 3.0, at.y - 4.0), pos2(at.x + 3.0, at.y + 4.0)], AMBER, Stroke::NONE));
                 spots.push((at, format!("rewound to the snapshot at t = {fs:.1} fs (at {})", clock(t))));
             }
@@ -651,7 +676,7 @@ pub fn timeline(ui: &mut Ui, st: &ActivityState) {
     small(&p, pos2(inner.right(), rect.bottom() - 1.0), Align2::RIGHT_BOTTOM, &clock(t1), theme::INK_FAINT);
     if let Some(pos) = resp.hover_pos().filter(|q| inner.expand(3.0).contains(*q)) {
         let lane = (((pos.y - inner.top()) / lane_h) as usize).min(LANES.len() - 1);
-        if lane == 0 {
+        if lane == FALLBACKS {
             let c = ((pos.x - inner.left()) as usize).min(cols - 1);
             if fall[c] > 0 {
                 resp.on_hover_text(format!("{} fallback{} here", fall[c], if fall[c] == 1 { "" } else { "s" }));

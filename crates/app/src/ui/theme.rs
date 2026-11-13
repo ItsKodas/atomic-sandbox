@@ -178,3 +178,53 @@ fn segmented_in<T: Copy + PartialEq>(ui: &mut egui::Ui, current: T, options: &[(
         });
     picked
 }
+
+/// A panel's folding header (the View panel's look: a caret, the title; the Model and Activity
+/// panels' folds): `open` says which caret to draw, `summary` is cut with "…" to the room left of
+/// the title, and `link` is a clickable word at the right end (its own response, drawn over the
+/// header so a click on it does not fold). `sub`: a smaller header for a fold inside a fold. The
+/// header's response is clicked when the fold should toggle; the caller keeps the state.
+pub fn fold_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    open: bool,
+    summary: Option<(String, Color32)>,
+    link: Option<&str>,
+    sub: bool,
+) -> (egui::Response, Option<egui::Response>) {
+    use egui::{pos2, vec2};
+    let (h, size) = if sub { (22.0, 12.5) } else { (26.0, 13.5) };
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), h), egui::Sense::click());
+    let p = ui.painter().clone();
+    if r.hovered() {
+        p.rect_filled(rect, 5.0, PANEL_2);
+    }
+    let ink = if r.hovered() { INK } else { INK_DIM };
+    let c = pos2(rect.left() + 10.0, rect.center().y);
+    let tri = if open { vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)] };
+    p.add(egui::Shape::convex_polygon(tri, ink, Stroke::NONE));
+    let title_ink = if sub { INK_DIM } else { INK };
+    let g = p.layout_no_wrap(title.to_string(), FontId::proportional(size), title_ink);
+    let tw = g.size().x;
+    p.galley(pos2(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, title_ink);
+    let mut right = rect.right() - 6.0;
+    let link_r = link.map(|w| {
+        let g = p.layout_no_wrap(w.to_string(), FontId::proportional(11.5), ACCENT_INK);
+        let lr = egui::Rect::from_min_size(pos2(right - g.size().x, rect.center().y - g.size().y / 2.0), g.size());
+        p.galley(lr.min, g, ACCENT_INK);
+        p.line_segment([pos2(lr.left(), lr.bottom()), pos2(lr.right(), lr.bottom())], Stroke::new(1.0, ACCENT_INK.gamma_multiply(0.6)));
+        right = lr.left() - 8.0;
+        ui.interact(lr.expand(2.0), r.id.with("link"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+    if let Some((text, colour)) = summary {
+        let room = right - (rect.left() + 22.0 + tw + 12.0);
+        if room > 24.0 {
+            let mut job = egui::text::LayoutJob::single_section(text, egui::TextFormat { font_id: FontId::proportional(11.5), color: colour, ..Default::default() });
+            job.wrap = egui::text::TextWrapping { max_width: room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = p.layout_job(job);
+            p.galley(pos2(right - g.size().x, rect.center().y - g.size().y / 2.0), g, colour);
+        }
+    }
+    let r = r.on_hover_text(if open { "fold this section" } else { "unfold this section" });
+    (r, link_r)
+}

@@ -32,7 +32,7 @@ use super::super::{
 };
 use crate::scene::model_path;
 use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
-use egui::{pos2, vec2, Color32, RichText, Sense, Shape, Stroke, Ui};
+use egui::{vec2, Color32, RichText, Sense, Stroke, Ui};
 use sim::{SamplingPlan, Source};
 
 /// One of the tab's folds (`UiState::model_sections`). Teach next and Health start open.
@@ -502,37 +502,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 /// A fold's header row (the View panel's: a caret, its title; a click folds or unfolds it) with a
 /// one-line summary on its right, cut with "…" when the panel is narrow. Returns whether it is open.
 fn header(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<(String, Color32)>) -> bool {
-    let (h, size) = if s.sub() { (22.0, 12.5) } else { (26.0, 13.5) };
-    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
-    probe_rect(&format!("model-fold-{}", s.id()), rect);
+    let (r, _) = theme::fold_header(ui, title, st.model_sections.is_open(s), summary, None, s.sub());
+    probe_rect(&format!("model-fold-{}", s.id()), r.rect);
     if r.clicked() {
         let open = st.model_sections.is_open(s);
         st.model_sections.set(s, !open);
     }
-    let open = st.model_sections.is_open(s);
-    let p = ui.painter();
-    if r.hovered() {
-        p.rect_filled(rect, 5.0, theme::PANEL_2);
-    }
-    let ink = if r.hovered() { theme::INK } else { theme::INK_DIM };
-    let c = pos2(rect.left() + 10.0, rect.center().y);
-    let tri = if open { vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)] } else { vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)] };
-    p.add(Shape::convex_polygon(tri, ink, Stroke::NONE));
-    let title_ink = if s.sub() { theme::INK_DIM } else { theme::INK };
-    let g = p.layout_no_wrap(title.to_string(), egui::FontId::proportional(size), title_ink);
-    let tw = g.size().x;
-    p.galley(pos2(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, title_ink);
-    if let Some((text, colour)) = summary {
-        let room = rect.right() - 6.0 - (rect.left() + 22.0 + tw + 12.0);
-        if room > 24.0 {
-            let mut job = egui::text::LayoutJob::single_section(text, egui::TextFormat { font_id: egui::FontId::proportional(11.5), color: colour, ..Default::default() });
-            job.wrap = egui::text::TextWrapping { max_width: room, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-            let g = p.layout_job(job);
-            p.galley(pos2(rect.right() - 6.0 - g.size().x, rect.center().y - g.size().y / 2.0), g, colour);
-        }
-    }
-    r.on_hover_text(if open { "fold this section" } else { "unfold this section" });
-    open
+    st.model_sections.is_open(s)
 }
 
 /// A fold: its header and, while open, its body (indented); `probe` records the whole fold's rect.

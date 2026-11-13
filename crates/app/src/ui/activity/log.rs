@@ -9,58 +9,40 @@ use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Sense, Ui};
 use sim::activity::{TeachOrigin, TeachOutcome};
 
-/// The three counters (spec §3.3.2), ticking per solve: a dim name, then the number.
+/// The counters in one line under the timeline (the Activity redesign, 2026-11-14; spec §3.3.2):
+/// "1589 samples · 209 teacher solves" on the left, "pass 182 · fallback 26 · audit 0" on the
+/// right; without a model, the teaching solves this session. The full counter texts are the hover.
 pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelStatus>) {
-    let line = |ui: &mut Ui, name: &str, value: String, extra: Option<String>, tip: String| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(name).color(theme::INK_DIM)).on_hover_text(tip.as_str());
-            ui.label(RichText::new(value).strong().monospace()).on_hover_text(tip.as_str());
-            if let Some(x) = extra {
-                ui.label(RichText::new(x).size(11.0).color(theme::INK_DIM)).on_hover_text(tip.as_str());
-            }
-        });
-    };
-    if let Some(m) = m {
-        // held vs fitted (plan review S9): the trust check counts the fit's samples
-        let fitted = m.fit.map_or(String::new(), |f| format!("; {} in the current fit", f.0));
-        line(ui, "samples in the model", m.samples.to_string(), None, format!("held{fitted} (the store; the Model tab shows the same number)"));
-        let c = &m.solves;
-        let total = if c.unrecorded_before { format!("≥ {} (earlier solves unrecorded)", (c.total() as usize).max(m.samples)) } else { c.total().to_string() };
-        line(
-            ui,
-            "teacher solves for this model",
-            total,
-            Some(format!("(pass {} · fallback {} · audit {})", c.pass, c.fallback, c.audit)),
-            format!(
-                "pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted",
+    let mut tips = Vec::new();
+    let (left, right) = match m {
+        Some(m) => {
+            let c = &m.solves;
+            let total = if c.unrecorded_before { format!("≥ {}", (c.total() as usize).max(m.samples)) } else { c.total().to_string() };
+            // held vs fitted (plan review S9): the trust check counts the fit's samples
+            let fitted = m.fit.map_or(String::new(), |f| format!("; {} in the current fit", f.0));
+            tips.push(format!("samples in the model: {} held{fitted} (the store; the Model tab shows the same number)", m.samples));
+            let earlier = if c.unrecorded_before { " (earlier solves unrecorded)" } else { "" };
+            tips.push(format!(
+                "teacher solves for this model: {total}{earlier} — pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted",
                 c.pass,
                 c.fallback,
                 c.audit,
                 c.verification,
                 c.kept,
                 c.not_kept()
-            ),
-        );
-    }
+            ));
+            (format!("{} samples · {total} teacher solves", m.samples), format!("pass {} · fallback {} · audit {}", c.pass, c.fallback, c.audit))
+        }
+        None => (format!("{} teaching solves this session", st.session_solves), String::new()),
+    };
     // lone-atom steps answered from the references (rule 0b): their own kind — no solve, not a
     // fallback, not a model answer, nothing learned
     if let Some(n) = m.map(|m| m.solves.reference).filter(|&n| n > 0) {
-        line(
-            ui,
-            "lone-atom steps from the references",
-            n.to_string(),
-            None,
-            "steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten".into(),
-        );
+        tips.push(format!("lone-atom steps from the references: {n} — steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten"));
     }
     // teaching solves only: a plain DFT step is not one (plan review S16)
-    line(
-        ui,
-        "teaching solves this session",
-        st.session_solves.to_string(),
-        None,
-        "teacher solves offered to a model since the app started, over every solver switch; plain DFT steps are not counted".into(),
-    );
+    tips.push(format!("teaching solves this session: {} — teacher solves offered to a model since the app started, over every solver switch; plain DFT steps are not counted", st.session_solves));
+    super::jobs::two_sides(ui, &left, &right, FontId::monospace(11.0), theme::INK_DIM).on_hover_text(tips.join("\n\n"));
 }
 
 /// The step cell of a log row and its hover (plan review M6): `pass` for a pass solve, else the
@@ -83,6 +65,40 @@ pub fn origin_style(o: TeachOrigin) -> (&'static str, Color32) {
         TeachOrigin::Fallback => ("fallback", AMBER),
         TeachOrigin::Audit => ("audit", GREEN),
         TeachOrigin::Verification => ("check", theme::INK_DIM),
+    }
+}
+
+/// The solve log's view (the chips "all / fallback / audit / failed", 2026-11-14): every row the
+/// filters admit, or only fallbacks, audits or failures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogView {
+    #[default]
+    All,
+    Fallback,
+    Audit,
+    Failed,
+}
+
+/// A solve that failed: the teacher's error, a refused store, or an SCF that did not converge
+/// (stalled, the cap, a non-finite Δρ, the pass's time limit).
+pub fn is_failure(e: &sim::TeachEvent) -> bool {
+    matches!(e.outcome, TeachOutcome::Failed | TeachOutcome::StoreRefused)
+        || matches!(e.scf_end, Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit))
+}
+
+/// A row that may fold into a run of identical ones: kept answers, references and held-out
+/// checks — never a failure or an answer that was not kept.
+pub fn collapsible(e: &sim::TeachEvent) -> bool {
+    !is_failure(e) && (e.outcome.is_kept() || matches!(e.outcome, TeachOutcome::Reference | TeachOutcome::HeldOut))
+}
+
+/// Whether the view chip admits this row.
+pub fn in_view(v: LogView, e: &sim::TeachEvent) -> bool {
+    match v {
+        LogView::All => true,
+        LogView::Fallback => e.origin == TeachOrigin::Fallback,
+        LogView::Audit => e.origin == TeachOrigin::Audit,
+        LogView::Failed => is_failure(e),
     }
 }
 
@@ -164,14 +180,46 @@ pub enum Item {
     Display(usize),
     /// A new run began between the neighbouring rows: steps restart at 0.
     Divider,
+    /// A run of identical rows (same step, origin, rule and outcome; [`collapsible`]): the oldest
+    /// and newest row indices and how many; a click expands it into its [`Item::Member`]s.
+    Group { first: usize, last: usize, n: usize },
+    /// A row of an expanded group.
+    Member(usize),
+}
+
+/// The key two rows must share to fold together.
+fn same(a: &sim::TeachEvent, b: &sim::TeachEvent) -> bool {
+    (a.step, a.origin, a.rule, a.outcome) == (b.step, b.origin, b.rule, b.outcome)
+}
+
+/// The group's words: "12 × nudge — kept · 21–28 s · 17–24 it".
+pub fn group_text(rows: &[&sim::TeachEvent]) -> String {
+    let Some(e) = rows.first() else { return String::new() };
+    let ms: Vec<f64> = rows.iter().filter(|e| e.is_solve()).map(|e| e.solve_ms).collect();
+    let time = if ms.is_empty() {
+        String::new()
+    } else {
+        let (lo, hi) = (ms.iter().copied().fold(f64::INFINITY, f64::min), ms.iter().copied().fold(0.0, f64::max));
+        if hi >= 1000.0 {
+            format!(" · {:.0}–{:.0} s", lo / 1e3, hi / 1e3)
+        } else {
+            format!(" · {lo:.0}–{hi:.0} ms")
+        }
+    };
+    let its: Vec<usize> = rows.iter().filter_map(|e| e.scf_steps).collect();
+    let it = match (its.iter().min(), its.iter().max()) {
+        (Some(a), Some(b)) => format!(" · {a}–{b} it"),
+        _ => String::new(),
+    };
+    format!("{} × {} — {}{time}{it}", rows.len(), rule_cell(e), words::outcome_label(e.outcome))
 }
 
 /// The displayed items, oldest first: the rows the chips admit and the display eigensolves
 /// (the "orbitals" chip), merged by time, with a divider before the first row of each new run
 /// (by event time; none before the first row of the session).
 pub fn items(st: &ActivityState) -> Vec<Item> {
-    let teach = st.rows.iter().enumerate().filter(|(_, r)| admits(&st.filter, &r.event)).map(|(i, r)| (r.at, Item::Row(i)));
-    let display = st.display_rows.iter().enumerate().filter(|_| st.filter.orbitals).map(|(i, r)| (r.at, Item::Display(i)));
+    let teach = st.rows.iter().enumerate().filter(|(_, r)| admits(&st.filter, &r.event) && in_view(st.log_view, &r.event)).map(|(i, r)| (r.at, Item::Row(i)));
+    let display = st.display_rows.iter().enumerate().filter(|_| st.filter.orbitals && st.log_view == LogView::All).map(|(i, r)| (r.at, Item::Display(i)));
     // both are oldest first: a stable sort by time keeps each one's order
     let mut merged: Vec<(std::time::Duration, Item)> = teach.chain(display).collect();
     merged.sort_by_key(|&(at, _)| at);
@@ -187,7 +235,49 @@ pub fn items(st: &ActivityState) -> Vec<Item> {
         prev = Some(at);
         v.push(item);
     }
-    v
+    collapse(st, v)
+}
+
+/// Folds runs of two or more identical [`collapsible`] rows into a [`Item::Group`] (followed by its
+/// members when expanded, `ActivityState::expanded`, keyed by the oldest row's time).
+fn collapse(st: &ActivityState, v: Vec<Item>) -> Vec<Item> {
+    let mut out = Vec::with_capacity(v.len());
+    let mut run: Vec<usize> = Vec::new();
+    let flush = |run: &mut Vec<usize>, out: &mut Vec<Item>| {
+        match run.len() {
+            0 => {}
+            1 => out.push(Item::Row(run[0])),
+            n => {
+                out.push(Item::Group { first: run[0], last: run[n - 1], n });
+                if st.expanded.contains(&st.rows[run[0]].at) {
+                    out.extend(run.iter().map(|&i| Item::Member(i)));
+                }
+            }
+        }
+        run.clear();
+    };
+    for item in v {
+        match item {
+            Item::Row(i) if collapsible(&st.rows[i].event) => {
+                if run.last().is_some_and(|&j| !same(&st.rows[j].event, &st.rows[i].event)) {
+                    flush(&mut run, &mut out);
+                }
+                run.push(i);
+            }
+            other => {
+                flush(&mut run, &mut out);
+                out.push(other);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// The newest failure of the pass running now (pinned over the log while the pass runs).
+pub fn pinned_failure(st: &ActivityState) -> Option<usize> {
+    let since = st.pass_started()?;
+    st.rows.iter().enumerate().rev().take_while(|(_, r)| r.at >= since).find(|(_, r)| is_failure(&r.event)).map(|(i, _)| i)
 }
 
 /// A display eigensolve's solve cell: its wall time, and "stopped" when a command interrupted it.
@@ -217,31 +307,38 @@ fn cell(ui: &Ui, rect: Rect, text: &str, font: FontId, colour: Color32) {
 /// The chips and the table.
 pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
     ui.horizontal_wrapped(|ui| {
-        let f = &mut st.filter;
-        for (on, label, tip) in [
-            (&mut f.pass, "pass", "solves of a sampling pass"),
-            (&mut f.fallback, "fallback", "steps the model did not answer"),
-            (&mut f.audit, "audit", "routine checks of the model against DFT"),
-            (&mut f.check, "check", "the DFT check of a relaxed geometry"),
+        for (v, label, tip) in [
+            (LogView::All, "all", "every row the filters below admit"),
+            (LogView::Fallback, "fallback", "steps the model did not answer"),
+            (LogView::Audit, "audit", "routine checks of the model against DFT"),
+            (LogView::Failed, "failed", "solves that failed or did not converge (stalled, the cap, the pass's time limit)"),
         ] {
-            if ui.add(egui::Button::selectable(*on, label)).on_hover_text(tip).clicked() {
-                *on = !*on;
+            if crate::ui::probed(&format!("log-chip-{label}"), ui.add(egui::Button::selectable(st.log_view == v, label))).on_hover_text(tip).clicked() {
+                st.log_view = v;
             }
         }
-        ui.separator();
-        for (on, label, tip) in [
-            (&mut f.kept, "kept", "answers that went into the store"),
-            (&mut f.not_kept, "not kept", "answers used for the step but not kept (similar, box-affected, other settings, failed, …) and rows that were not solved"),
-        ] {
-            if ui.add(egui::Button::selectable(*on, label)).on_hover_text(tip).clicked() {
-                *on = !*on;
+    });
+    // the finer filters of before, folded away
+    egui::CollapsingHeader::new(RichText::new("more filters").size(11.5).color(theme::INK_DIM)).id_salt("log-more-filters").show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let f = &mut st.filter;
+            for (on, label, tip) in [
+                (&mut f.pass, "pass", "solves of a sampling pass"),
+                (&mut f.fallback, "fallback", "steps the model did not answer"),
+                (&mut f.audit, "audit", "routine checks of the model against DFT"),
+                (&mut f.check, "check", "the DFT check of a relaxed geometry"),
+                (&mut f.kept, "kept", "answers that went into the store"),
+                (&mut f.not_kept, "not kept", "answers used for the step but not kept (similar, box-affected, other settings, failed, …) and rows that were not solved"),
+            ] {
+                if ui.add(egui::Button::selectable(*on, label)).on_hover_text(tip).clicked() {
+                    *on = !*on;
+                }
             }
-        }
-        ui.separator();
-        let f = &mut st.filter.orbitals;
-        if ui.add(egui::Button::selectable(*f, "orbitals")).on_hover_text("the display eigensolve of unoccupied orbitals after a DFT step (Orbitals tab): display only, not a teaching solve").clicked() {
-            *f = !*f;
-        }
+            let f = &mut st.filter.orbitals;
+            if ui.add(egui::Button::selectable(*f, "orbitals")).on_hover_text("the display eigensolve of unoccupied orbitals after a DFT step (Orbitals tab): display only, not a teaching solve").clicked() {
+                *f = !*f;
+            }
+        });
     });
     if st.rows.is_empty() && st.display_rows.is_empty() {
         theme::note(
@@ -255,6 +352,7 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
         return;
     }
     let items = items(st);
+    let pinned = pinned_failure(st);
     if items.is_empty() {
         theme::note(ui, "no row passes the filter chips");
         return;
@@ -270,9 +368,11 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
     // rows are packed (the dock's 6 pt row gap would double their pitch)
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        egui::ScrollArea::both().id_salt("solve-log").max_height(260.0).auto_shrink([false, true]).show_rows(ui, ROW_H, items.len() + 1, |ui, range| {
+        let extra = 1 + pinned.is_some() as usize;
+        let mut toggle: Option<std::time::Duration> = None;
+        egui::ScrollArea::both().id_salt("solve-log").max_height(260.0).auto_shrink([false, true]).show_rows(ui, ROW_H, items.len() + extra, |ui, range| {
         for j in range {
-            let (rect, _) = ui.allocate_exact_size(vec2(total_w, ROW_H), Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(vec2(total_w, ROW_H), Sense::click());
             if j == 0 {
                 // the header
                 let mut x = rect.left();
@@ -282,16 +382,52 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
                 }
                 continue;
             }
+            // the newest failure of the running pass, pinned at the top
+            if let (1, Some(i)) = (j, pinned) {
+                ui.painter().rect_filled(rect, 2.0, RED.gamma_multiply(0.16));
+                let id = ui.id().with(("pinned-row", i));
+                row(ui, id, rect, &st.rows[i], &widths, &mono, &prop);
+                crate::ui::probe_rect("log-pinned", rect);
+                continue;
+            }
             // newest first
-            let item = items[items.len() - j];
+            let item = items[items.len() - (j + 1 - extra)];
             match item {
                 Item::Divider => {
                     ui.painter().line_segment([pos2(rect.left(), rect.center().y), pos2(rect.left() + total_w - 10.0, rect.center().y)], egui::Stroke::new(1.0, theme::LINE));
                     cell(ui, Rect::from_min_size(rect.min, vec2(total_w, ROW_H)), "  new run — steps restart at 0  ", prop.clone(), theme::ACCENT_INK);
                 }
-                Item::Row(i) => {
+                Item::Row(i) | Item::Member(i) => {
+                    let e = &st.rows[i].event;
+                    if is_failure(e) {
+                        ui.painter().rect_filled(rect, 2.0, RED.gamma_multiply(0.10));
+                    } else if !collapsible(e) && e.outcome != TeachOutcome::NotSolved {
+                        ui.painter().rect_filled(rect, 2.0, AMBER.gamma_multiply(0.06));
+                    }
+                    if matches!(item, Item::Member(_)) {
+                        ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(2.0, ROW_H)), 0.0, theme::ACCENT.gamma_multiply(0.6));
+                    }
                     let id = ui.id().with(("solve-row", i));
                     row(ui, id, rect, &st.rows[i], &widths, &mono, &prop);
+                }
+                Item::Group { first, last, n: _ } => {
+                    let open = st.expanded.contains(&st.rows[first].at);
+                    let members: Vec<&sim::TeachEvent> = (first..=last).map(|i| &st.rows[i].event).filter(|e| same(e, &st.rows[first].event)).collect();
+                    let newest = &st.rows[last];
+                    let (step, _) = step_cell(&newest.event);
+                    let (origin, origin_colour) = origin_style(newest.event.origin);
+                    let mut x = rect.left();
+                    for (k, (text, font, colour)) in [(clock(newest.at), &mono, theme::INK_DIM), (step, &mono, theme::INK_DIM), (origin.to_string(), &prop, origin_colour)].into_iter().enumerate() {
+                        cell(ui, Rect::from_min_size(pos2(x, rect.top()), vec2(widths[k], ROW_H)), &text, font.clone(), colour);
+                        x += widths[k];
+                    }
+                    let caret = if open { "▾ " } else { "▸ " };
+                    let rest = Rect::from_min_max(pos2(x, rect.top()), pos2(rect.left() + total_w, rect.bottom()));
+                    cell(ui, rest, &format!("{caret}{}", group_text(&members)), prop.clone(), theme::INK);
+                    crate::ui::probe_rect(&format!("log-group-{first}"), rect);
+                    if resp.on_hover_text(if open { "fold these rows" } else { "show each of these rows" }).clicked() {
+                        toggle = Some(st.rows[first].at);
+                    }
                 }
                 Item::Display(i) => {
                     let id = ui.id().with(("display-row", i));
@@ -300,6 +436,11 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
             }
         }
         });
+        if let Some(at) = toggle {
+            if !st.expanded.remove(&at) {
+                st.expanded.insert(at);
+            }
+        }
     });
 }
 
