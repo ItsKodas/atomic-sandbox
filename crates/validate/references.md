@@ -4617,6 +4617,15 @@ The trust rule bounds how many samples are misfits. Through the RMS it now also 
 
 **C3: carried to the M8b spec** (`2026-10-20-m8-shared-model-and-sandbox-design.md` §5, "Open physics item"). Sandbox's freeze rule must say what replaces the audit for keys holding misfit atoms, and its physics review must sign it off.
 
+## Open-shell gate: trust baseline against main (2026-11-14; `tests/surrogate.rs` `trust_baseline_report`, `#[ignore]`d; release, RX 7900 XTX shared with another worktree's app, BelowNormal, alone)
+
+The open-shell branch at 6a5ea29 (main 7d3cfbe merged in) and main 7d3cfbe itself were both run, in their own worktrees on the same machine.
+- **Cadence 50:** the two reports are identical except one active-learning flip's model generation (44 on the branch, 41 on main). Every decision, count and worst value is the same. This branch adds no missed large error.
+  - Audits beyond 1× or the tier while trusted: pair 0 / 64, many-body 1 / 12, active-learning pair 0 / 5.
+  - The checker's hot run: 513 answers, 269 judged, worst force residual 5.15× its bound, 21 answers beyond 3× or the energy tier.
+- **Cadence 10** (branch only): met. Pair 0 / 157, many-body 0 / 1, active learning 0 / 26; the hot run had 7 answers, worst 0.46×.
+- **Against the fix-round-3 record above (2026-10-21; 442 answers, worst 2.87×), main's cadence-50 hot run has risen.** It now answers 513 steps, including runs of 2–14 consecutive steps between 2.6× and 5.15× the force bound (steps 258–262, 843–856). The audits then catch them (134 rule-8 fallbacks). This was already on main before this branch. Not investigated here: an open item for main.
+
 ## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone at the checks)
 
 Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run with the test hook `body4_force`. `d4` runs on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, 106 held on disk). `s4` runs on a synthetic four-species store, **for cost only**: every N of the even-indexed samples is made C with the labels untouched (they are N₂'s labels, meaningless for carbon), C's references are copied from N's per box, and jittered replicas (`replica(…, 1e-4)`) take it to 10 830 samples, read-only. Command: `REFIT_COST=d4 REFIT_WHOLE=0 COLLECTION_DIR=<copy> cargo test -p providers --release --lib refit_cost_on_a_collection -- --ignored --nocapture --test-threads 1` (then `REFIT_COST=s4` on a fresh copy).
