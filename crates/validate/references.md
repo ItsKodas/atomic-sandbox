@@ -4400,6 +4400,117 @@ Findings:
    The degree-cap-6 recovery basis at D₄ = 3 (Q′ 2 460) was not trusted on these codes (energy 1.03e-3).
 4. **Not measured:** held-out geometries (transfer) at D₄ = 3, and S = 4 (a carbon collection) timing.
 
+### Acceptance (2026-11-13; `providers` `surrogate::tests::residual_diag::acceptance_on_the_collection`, `#[ignore]`d; spec `2026-11-13-open-shell-model-design.md` §5.1–5.2; release, Ryzen 7 9800X3D, CPU, BelowNormal, alone)
+
+The build with all of the open-shell model: the D₄ growth rule, a failed recovery holds nothing, the misfit set M and its `Misfit` row, `NearMisfit`. It runs on a fresh copy of the user's 181-hold collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples; on disk 180 held, 1 superseded; held H₃O 144, H₃ 30, H₂O 4, H₂ 2). The test copies the folder again before anything writes, for the D₄ = 2 provider. Command: `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib acceptance_on_the_collection -- --ignored --nocapture --test-threads 1` (246 s in all). Two runs on two fresh copies gave the same numbers to the last digit; the wall times are from the second.
+
+**Result: FAILS two assertions (both brought to the user), passes the rest.**
+
+| assertion | measured | verdict |
+|---|---|---|
+| attach: the growth rule picks D₄ = 3 | D₄ = 3, Q′ 1 902 | pass |
+| attach: trusted | yes; training residuals energy 8.98e-4 Ha/atom (≤ 1e-3), force 1.76e-3 ≤ 2.0e-3 Ha/Bohr | pass |
+| attach: held after ≤ held before | 180 → 112 (0 newly held) | pass |
+| attach: ≥ 68 released | 68 (H₃O 54, H₃ 9, H₂O 4, H₂ 1) | pass |
+| refits: the held count never rises | 112 → 88 → 71 → 54 → 45 → 44 → 43 → 42 → 42 | pass |
+| refits: fixed point (same codes and same M at two successive refits) within 5 refits | reached at refit **8** | **FAIL** |
+| §5.2, per scene: the force rms at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 | every scene | pass |
+| §5.2, per scene: the LOO force RMS at D₄ = 3 ≤ D₄ = 2's, or both < 1e-4 | every scene but HO | **FAIL (HO)** |
+
+**M by scene: empty.** At the attach and at every refit after it, |M| = 0. The model holds its unreproducible samples (H₃O 23, H₃ 18, H₂ 1 at the fixed point) instead of fitting them as misfits. The `Misfit` row and `NearMisfit` are therefore not exercised on this collection's own refits. They are exercised by the test-only variant below (C1/C2).
+
+**The convergence sequence.** Nothing new is added between refits:
+
+| refit | held | released | newly held | \|M\| | trusted | fit_store calls | wall (s) |
+|---|---|---|---|---|---|---|---|
+| attach | 112 | 68 | 0 | 0 | yes | 2 | 26.89 |
+| 1 | 88 | 24 | 0 | 0 | yes | 2 | 20.51 |
+| 2 | 71 | 17 | 0 | 0 | yes | 2 | 20.41 |
+| 3 | 54 | 17 | 0 | 0 | yes | 2 | 20.58 |
+| 4 | 45 | 9 | 0 | 0 | yes | 2 | 20.62 |
+| 5 | 44 | 1 | 0 | 0 | yes | 2 | 22.79 |
+| 6 | 43 | 1 | 0 | 0 | yes | 2 | 22.93 |
+| 7 | 42 | 1 | 0 | 0 | yes | 2 | 20.81 |
+| 8 | 42 | 0 | 0 | 0 | yes | 1 | 11.41 |
+
+The fixed point holds 42 samples: H₃O 23, H₃ 18, H₂ 1, plus the H₂ sample superseded on disk. In all, 138 of the 180 holds are released. Its training residuals are energy 9.01e-4 Ha/atom and force 1.88e-3 ≤ 2.0e-3 Ha/Bohr.
+
+**Why it takes 8 refits.** `refit_fits` runs one release pass per refit (`release_reproduced`: fit, release what that fit reproduces, refit once). Each refit's fit, with the samples it just released, reproduces the next band of held samples. The 2026-11-12 diagnosis found the same banded structure, peeled the other way. The process is monotone and stays trusted throughout; it is not a ratchet. Ruling 11 expected a fixed point within 5 refits; it took 8. The bound is not met; it has not been loosened.
+
+**§5.2 per scene.** The D₄ = 3 side is the fixed point. The D₄ = 2 side is a forced-D₄ = 2 provider's attach refit on its own fresh copy: trusted, held 180 → 170 (H₃O 139, H₃ 29, H₂ 2), Q′ 1 032, 4 fits, 14.08 s. The rms values are per Cartesian component over the trained atoms of the fitted samples (Ha/Bohr; `loo_rms`'s definition, per scene). No sample had an undefined LOO.
+
+| scene | samples fitted D₄ 3 / 2 | force rms D₄ = 3 | D₄ = 2 | LOO force RMS D₄ = 3 | D₄ = 2 | verdict |
+|---|---|---|---|---|---|---|
+| H₂ | 473 / 472 | 6.06e-4 | 8.76e-4 | 8.67e-4 | 1.10e-3 | ok |
+| H₂O | 408 / 408 | 3.93e-4 | 5.75e-4 | 5.26e-4 | 7.63e-4 | ok |
+| H₃ | 329 / 318 | 4.51e-4 | 7.82e-4 | 5.63e-4 | 1.03e-3 | ok |
+| H₃O | 290 / 174 | 6.90e-4 | 1.24e-3 | 8.04e-4 | 1.39e-3 | ok |
+| **HO** | 1 / 1 | 8.12e-5 | 2.75e-4 | **2.12e-1** | **1.87e-1** | **rose** |
+| N₂ | 261 / 261 | 1.36e-5 | 1.44e-5 | 4.62e-5 | 5.63e-5 | ok (both < 1e-4) |
+
+The two sides do not fit the same samples: D₄ = 3 fits 116 more H₃O samples, the hard ones. The test also prints the same comparison on the same samples (printed, not asserted): D₄ = 2 refitted on the D₄ = 3 fixed point's codes, with no recovery. That D₄ = 2 fit is itself untrusted: force 6.4e-3 > 2.35e-3 Ha/Bohr, energy 1.16e-3 Ha/atom.
+
+| scene | force rms D₄ = 3 | D₄ = 2 | LOO D₄ = 3 | D₄ = 2 |
+|---|---|---|---|---|
+| H₂ | 6.06e-4 | 1.02e-3 | 8.67e-4 | 1.31e-3 |
+| H₂O | 3.93e-4 | 1.11e-3 | 5.26e-4 | 1.50e-3 |
+| H₃ | 4.51e-4 | 9.59e-4 | 5.63e-4 | 1.14e-3 |
+| H₃O | 6.90e-4 | 1.85e-3 | 8.04e-4 | 1.98e-3 |
+| HO | 8.12e-5 | 1.75e-3 | 2.12e-1 | 3.44e-1 |
+| N₂ | 1.36e-5 | 1.40e-5 | 4.62e-5 | 4.98e-5 |
+
+**The HO rise.** HO is one sample: store #1804, a 95³ fallback with O–H = 1.311 Bohr, compressed far inside the bond (≈ 1.83 Bohr at equilibrium), with |F| = 0.718 Ha/Bohr on both atoms. It is the collection's only pair-class O–H geometry, and a diatomic has no three- or four-body terms. Its LOO is therefore the pair term's extrapolation to a distance no other sample covers. The error is 0.19–0.21 Ha/Bohr per component, about 30 % of the force, at either degree. Its key (O{H} and H{O}, pair class, n_k = 1) has a LOO ratio RMS of 8.1 (force) and 108 (energy). The class rule refuses it at D₄ = 3. At D₄ = 2 it would too: a LOO of 0.187 Ha/Bohr at the same bound gives a ratio ≈ 7. That is inferred; the key statistics were not printed at D₄ = 2. On the same samples, D₄ = 3's LOO for HO is lower (0.212 against 0.344). So the asserted rise compares two extrapolations of one geometry, made with different fitted sets. It is not a fit that got worse where the model answers. But the rule as written fails, and the decision belongs to the user. The gap is real either way: one sample of a compressed OH radical teaches the model nothing it can transfer to that geometry.
+
+**The Task 7 review's C1 and C2** (measurements only; nothing changed in the product).
+
+C1 asks for each class key's LOO ratio RMS without M (the provider's members, cross-checked against `compute_class_loo_full`'s own key statistics: identical in every row) and with M kept in as members. f is M's share of the key's atoms; r_M is M's own LOO force ratio RMS there. Each verdict is on the "+M" RMS, force / energy: refused (uncalibrated, RMS > 1) and kept out of the calibrated verdict (R > 1/√2).
+
+On the attach's refit at D₄ = 3, M is empty, so with and without M are the same numbers:
+
+| key | n_k | R_c | R_E,c | refused | kept out |
+|---|---|---|---|---|---|
+| H{H} pair | 613 | 0.181 | 0.246 | no | no |
+| H{O} pair | 1 | 8.077 | 108.2 | yes | yes |
+| N{N} pair | 261 | 0.005 | 0.003 | no | no |
+| O{H} pair | 1 | 8.082 | 108.2 | yes | yes |
+| H{H} many-body | 322 | 0.175 | 0.071 | no | no |
+| H{H,O} many-body | 631 | 0.158 | 0.041 | no | no |
+| O{H} many-body | 631 | 0.122 | 0.041 | no | no |
+
+The test also runs a variant whose M is populated (test-only): D₄ = 3, every held sample back in the fit, no recovery (`fit_store`). It is trusted with |M| = 30 samples, 57 atoms (H₃ 21, H₃O 6, H₂ 3), limit base 1 804. Its training residuals outside M are energy 9.99e-4 Ha/atom and force 2.20e-3 ≤ 2.37e-3 Ha/Bohr.
+
+| key | n_k −M / +M | R_c −M | R_c +M | R_E −M | R_E +M | f | r_M | +M refused F/E | +M kept out F/E |
+|---|---|---|---|---|---|---|---|---|---|
+| H{H} pair | 608 / 615 | 0.186 | 0.293 | 0.170 | 0.206 | 0.011 | 2.13 | no/no | no/no |
+| H{O} pair | 1 / 1 | 22.0 | 22.0 | 40.9 | 40.9 | 0 | — | yes/yes | yes/yes |
+| N{N} pair | 261 / 261 | 0.005 | 0.005 | 0.003 | 0.003 | 0 | — | no/no | no/no |
+| O{H} pair | 1 / 1 | 22.0 | 22.0 | 40.9 | 40.9 | 0 | — | yes/yes | yes/yes |
+| H{H} many-body | 322 / 343 | 0.264 | 0.645 | 0.132 | **0.773** | 0.073 | 2.19 | no/no | no/**yes** |
+| H{H,O} many-body | 715 / 721 | 0.204 | 0.243 | 0.078 | 0.082 | 0.010 | 1.33 | no/no | no/no |
+| O{H} many-body | 715 / 721 | 0.189 | 0.264 | 0.078 | 0.082 | 0.008 | 2.03 | no/no | no/no |
+
+Keeping M in refuses no key that was not already refused (only the one-sample HO keys are refused, with or without M). It keeps H{H} many-body (the H₃ key, f = 7 %) out of the calibrated verdict, on energy: R_E 0.132 → 0.773 > 0.707. Its force R rises 0.264 → 0.645, still under 0.707. The review's lower bound √f·r_M gives 0.59 for the force there; the measured 0.645 is consistent with it.
+
+C2: the share of fitted samples outside M, and of their atoms, that the misfit fence flags at their own geometries. Each atom's L∞ spread distance to the nearest misfit atom of its species is thresholded at the shipped radius, 0.30 spreads (`QUARANTINE_FRACTION × max_descriptor_distance`), and at 0.75 spreads (`THIN_FRACTION ×`). The shipped radius's sample counts match `near_misfit_atoms` itself in every scene. On the attach's refit (M empty), nothing is flagged at either radius. On the variant:
+
+| scene | samples | flagged at 0.30 | at 0.75 | atoms | flagged at 0.30 | at 0.75 |
+|---|---|---|---|---|---|---|
+| H₂ | 471 | 3 (0.6 %) | **316 (67.1 %)** | 942 | 6 (0.6 %) | 632 (67.1 %) |
+| H₂O | 408 | 0 | 0 | 1 224 | 0 | 0 |
+| H₃ | 326 | 140 (42.9 %) | 159 (48.8 %) | 978 | 143 (14.6 %) | 310 (31.7 %) |
+| H₃O | 307 | 1 (0.3 %) | 9 (2.9 %) | 1 228 | 1 (0.1 %) | 9 (0.7 %) |
+| HO | 1 | 0 | 0 | 2 | 0 | 0 |
+| N₂ | 261 | 0 | 0 | 522 | 0 | 0 |
+| all | 1 774 | 144 (8.1 %) | 484 (27.3 %) | 4 896 | 150 (3.1 %) | 951 (19.4 %) |
+
+At 0.75 the fence refuses two thirds of the H₂ scene's own geometries, presumably because M's three H₂ samples and the H₃ misfit atoms with one far neighbour lie in the H₂ pair region (not traced atom by atom). Water is untouched at either radius: its O{H} and H{H,O} atoms stay more than 0.75 spreads from M's six H₃O samples. The review's benefit side was not measured: whether each radius reaches every non-M atom of a misfit key with a LOO ratio above 1.
+
+**Gaps (rule 7).**
+1. On the user's collection, M is empty at every refit. The local-misfit path (G3) is not what makes this collection trusted. Trust comes from D₄ = 3 plus the releases; 42 samples stay held.
+2. The releases settle at refit 8, not 5. Until then each refit (≈ 21 s at S = 3) releases a few more samples.
+3. The HO rise is one extrapolated geometry, refused by the class rule at both degrees. It is still a rise against the rule as written.
+4. The §5.2 comparison is over each degree's own fitted set (the brief's); D₄ = 2 holds 116 more H₃O samples. On the same samples D₄ = 3 is lower in every scene.
+
 ## Refit cost at body-4 degree 3 (2026-11-13; `providers` `surrogate::tests::refit_cost::refit_cost_on_a_collection`, `REFIT_COST=d4,s4`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, BelowNormal, alone at the checks)
 
 Spec `2026-11-13-open-shell-model-design.md` §5.6. The degree is forced per run with the test hook `body4_force`. `d4` runs on a copy of the user's collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (1 805 samples, H/N/O, 106 held on disk). `s4` runs on a synthetic four-species store, **for cost only**: every N of the even-indexed samples is made C with the labels untouched (they are N₂'s labels, meaningless for carbon), C's references are copied from N's per box, and jittered replicas (`replica(…, 1e-4)`) take it to 10 830 samples, read-only. Command: `REFIT_COST=d4 REFIT_WHOLE=0 COLLECTION_DIR=<copy> cargo test -p providers --release --lib refit_cost_on_a_collection -- --ignored --nocapture --test-threads 1` (then `REFIT_COST=s4` on a fresh copy).

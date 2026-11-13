@@ -8,6 +8,10 @@
 //! then fits without recovery from the codes on disk and from the attach's. `DIAG_TESTS=1` adds
 //! the hold-out fits (H₃O held, by multiplicity, H₃O alone, each on the default and the cap-6
 //! basis); `DIAG_SPIKE=1` runs the body-4 measurement's five fits instead; `DIAG_RANGES=a-b,c-d` dumps those samples in store order (distances, per-atom forces).
+//!
+//! `acceptance_on_the_collection` (spec 2026-11-13 §5.1–5.2, Task 8) is the one test here that
+//! asserts: the open-shell model's attach, its refits' fixed point and the D₄ = 3 against D₄ = 2
+//! comparison on a fresh copy of the user's collection (its doc).
 use super::*;
 use std::collections::BTreeMap;
 use surrogate::SampleTag;
@@ -21,10 +25,43 @@ struct Meta {
     mult: Option<u32>,
 }
 
-fn open_copy() -> surrogate::Collection {
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+fn collection_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"))
+}
+
+fn open_at(dir: &std::path::Path) -> surrogate::Collection {
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap().0
+}
+
+fn open_copy() -> surrogate::Collection {
+    open_at(&collection_dir())
+}
+
+/// A fresh copy of the collection folder `dir` (its files, the lock left behind) at
+/// `<dir's parent>_<tag>/<dir's name>`, made before anything writes to `dir`: a second provider's
+/// own copy. Refuses a target that exists (every run copies afresh).
+fn sibling_copy(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let parent = dir.parent().expect("the collection folder has a parent");
+    let root = parent.with_file_name(format!("{}_{tag}", parent.file_name().unwrap().to_string_lossy()));
+    assert!(!root.exists(), "{} exists: copy the collection afresh for every run", root.display());
+    let to = root.join(dir.file_name().unwrap());
+    std::fs::create_dir_all(&to).unwrap();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() && e.file_name() != ".lock" {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+    to
+}
+
+fn metas(c: &surrogate::Collection) -> Vec<Meta> {
+    c.samples
+        .iter()
+        .zip(c.quarantine.iter().copied().chain(std::iter::repeat(0)))
+        .map(|(x, q0)| Meta { scene: x.scene.clone(), grid: x.grid_n, tag: x.sample.tag, n: x.sample.pos.len(), q0, mult: x.multiplicity })
+        .collect()
 }
 
 /// Per stored sample under the current model: (energy ratio, worst force ratio, signed energy
@@ -198,12 +235,7 @@ fn dump(s: &SurrogateKs, meta: &[Meta], range: std::ops::Range<usize>) {
 #[ignore]
 fn residual_failures_on_a_collection() {
     let c = open_copy();
-    let meta: Vec<Meta> = c
-        .samples
-        .iter()
-        .zip(c.quarantine.iter().copied().chain(std::iter::repeat(0)))
-        .map(|(x, q0)| Meta { scene: x.scene.clone(), grid: x.grid_n, tag: x.sample.tag, n: x.sample.pos.len(), q0, mult: x.multiplicity })
-        .collect();
+    let meta = metas(&c);
     let q0: Vec<u8> = c.quarantine.clone();
     println!("collection: {} samples, {} held on disk", meta.len(), q0.iter().filter(|&&q| q != 0).count());
     let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
@@ -335,4 +367,485 @@ fn residual_failures_on_a_collection() {
         *mults.entry(format!("{} {:?}", m.scene, m.mult)).or_default() += 1;
     }
     println!("multiplicities by scene: {mults:?}");
+}
+
+/// Per scene over the fitted samples (the accumulated prefix, excluded samples skipped — M's
+/// samples are fitted and counted): the in-sample force rms and the leave-one-out force RMS, both
+/// per Cartesian component over the trained atoms (Ha/Bohr; `loo_rms`'s definition, by scene), with
+/// the samples and atoms counted and the samples whose LOO is undefined.
+#[derive(Clone, Copy, Debug, Default)]
+struct SceneRms {
+    samples: usize,
+    atoms: usize,
+    rms: f64,
+    loo: f64,
+    loo_undefined: usize,
+}
+
+fn scene_rms(s: &SurrogateKs, meta: &[Meta]) -> BTreeMap<String, SceneRms> {
+    let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
+    let fitted: Vec<usize> = (0..s.accumulated.min(store.len())).filter(|&i| !s.excluded(i)).collect();
+    let refs: Vec<&surrogate::fit::Sample> = fitted.iter().map(|&i| &store.samples[i]).collect();
+    let loo = surrogate::loo::leave_one_out_many(model, &refs);
+    // (samples, atoms, Σ in-sample², in-sample components, Σ LOO², LOO components, undefined)
+    let mut acc: BTreeMap<String, (usize, usize, f64, usize, f64, usize, usize)> = BTreeMap::new();
+    for (&i, l) in fitted.iter().zip(&loo) {
+        let x = &store.samples[i];
+        let pr = model.predict(&x.pos, &x.z, false).expect("a fitted sample predicts");
+        let e = acc.entry(meta[i].scene.clone()).or_default();
+        e.0 += 1;
+        for j in (0..x.pos.len()).filter(|&j| x.trains_atom(j)) {
+            e.1 += 1;
+            e.2 += (0..3).map(|a| (pr.forces[j][a] - x.forces[j][a]).powi(2)).sum::<f64>();
+            e.3 += 3;
+        }
+        match l {
+            None => e.6 += 1,
+            Some(l) => {
+                for r in l.forces.iter().flatten() {
+                    e.4 += r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+                    e.5 += 3;
+                }
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(k, (n, atoms, sq, nc, lsq, lnc, und))| {
+            (k, SceneRms { samples: n, atoms, rms: (sq / nc.max(1) as f64).sqrt(), loo: (lsq / lnc.max(1) as f64).sqrt(), loo_undefined: und })
+        })
+        .collect()
+}
+
+fn by_scene(meta: &[Meta], idx: impl IntoIterator<Item = usize>) -> BTreeMap<String, usize> {
+    let mut m: BTreeMap<String, usize> = BTreeMap::new();
+    for i in idx {
+        *m.entry(meta[i].scene.clone()).or_default() += 1;
+    }
+    m
+}
+
+fn held(q: &[u8]) -> usize {
+    q.iter().filter(|&&c| c == surrogate::quarantine::Q_HELD).count()
+}
+
+/// Samples `from` held that `to` no longer holds, and samples `to` holds that `from` did not.
+fn released_and_new(from: &[u8], to: &[u8]) -> (usize, usize) {
+    use surrogate::quarantine::{Q_HELD, Q_NONE};
+    let at = |q: &[u8], i: usize| q.get(i).copied().unwrap_or(Q_NONE);
+    let n = from.len().max(to.len());
+    let rel = (0..n).filter(|&i| at(from, i) == Q_HELD && at(to, i) != Q_HELD).count();
+    let new = (0..n).filter(|&i| at(from, i) != Q_HELD && at(to, i) == Q_HELD).count();
+    (rel, new)
+}
+
+fn misfit_samples(s: &SurrogateKs) -> Vec<usize> {
+    s.misfit().map(|m| m.samples.clone()).unwrap_or_default()
+}
+
+/// A class key for the tables: the centre, its neighbours, its class (display symbols only).
+fn key_name(k: &surrogate::EnvKey) -> String {
+    let sym = |z: u8| match z {
+        1 => "H".to_string(),
+        6 => "C".to_string(),
+        7 => "N".to_string(),
+        8 => "O".to_string(),
+        z => format!("Z{z}"),
+    };
+    format!("{}{{{}}} c{}", sym(k.z), k.neighbours.iter().map(|&z| sym(z)).collect::<Vec<_>>().join(","), k.class)
+}
+
+/// Task 7 review C1 (measurement only): per class key, the leave-one-out force and energy RMS
+/// ratios R_c and R_E,c as `compute_class_loo_full` forms them (members: the fitted samples, M left
+/// out), and the same with M's samples kept in as members — recomputed here, the provider's path
+/// untouched (its own key statistics are printed beside them as the cross-check of the "−M"
+/// columns). Per key also n_k without and with M, f (M's share of the key's atoms), r_M (the RMS
+/// LOO force ratio of M's atoms of the key), and, on the "+M" RMS, whether the uncalibrated
+/// condition refuses the key (an RMS > 1) and whether the calibrated verdict keeps it out
+/// (R > 1/√2): force / energy.
+fn c1_class_keys(s: &SurrogateKs, label: &str) {
+    use std::collections::BTreeSet;
+    #[derive(Default)]
+    struct K {
+        n: [usize; 2],
+        f_ss: [f64; 2],
+        f_at: [usize; 2],
+        e_ss: [f64; 2],
+        e_n: [usize; 2],
+        undefined: [bool; 2],
+        m_atoms: usize,
+        m_ss: f64,
+    }
+    let (model, store) = (s.model.as_ref().unwrap(), s.store.as_ref().unwrap());
+    let rc2 = model.basis.r_cut * model.basis.r_cut;
+    let fitted: Vec<usize> = (0..s.accumulated.min(store.len())).filter(|&i| !s.excluded(i)).collect();
+    let refs: Vec<&surrogate::fit::Sample> = fitted.iter().map(|&i| &store.samples[i]).collect();
+    let loos = surrogate::loo::leave_one_out_many(model, &refs);
+    let mut acc: BTreeMap<surrogate::EnvKey, K> = BTreeMap::new();
+    for (&i, l) in fitted.iter().zip(&loos) {
+        let x = &store.samples[i];
+        let in_m = s.in_misfit(i);
+        let keys = if x.z.len() == x.pos.len() { super::super::trust::trained_keys(x, super::super::policy::env_keys(&x.pos, &x.z, rc2)) } else { Vec::new() };
+        let n = x.pos.len().max(1) as f64;
+        let e_ratio: Option<f64> = x
+            .use_energy
+            .then(|| l.as_ref().and_then(|l| l.energy).map_or(f64::INFINITY, |e| (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / s.policy.energy_std_per_atom));
+        let present: BTreeSet<&surrogate::EnvKey> = keys.iter().flatten().collect();
+        for k in present {
+            let a = acc.entry(k.clone()).or_default();
+            // w = 0: M left out (the provider's members); w = 1: M kept in
+            for w in [0usize, 1] {
+                if w == 0 && in_m {
+                    continue;
+                }
+                a.n[w] += 1;
+                if let Some(e) = e_ratio {
+                    a.e_ss[w] += e * e;
+                    a.e_n[w] += 1;
+                    if e == f64::INFINITY {
+                        a.undefined[w] = true;
+                    }
+                }
+                match l.as_ref() {
+                    None => a.undefined[w] = true,
+                    Some(l) => {
+                        for ((r, f), kj) in l.forces.iter().zip(&x.forces).zip(&keys) {
+                            let Some(r) = r.filter(|_| kj.as_ref() == Some(k)) else { continue };
+                            let (d, b) = s.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+                            let ratio = d / b;
+                            a.f_ss[w] += ratio * ratio;
+                            a.f_at[w] += 1;
+                            if w == 1 && in_m {
+                                a.m_atoms += 1;
+                                a.m_ss += ratio * ratio;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (judged, _, _) = s.compute_class_loo_full();
+    let provider = judged.map(|(_, j)| j.key_stats).unwrap_or_default();
+    let m_n = s.misfit().map_or(0, |m| m.samples.len());
+    println!("\nC1 [{label}] (|M| = {m_n}): per class key, LOO ratio RMS without M (the provider's members) and with M kept in");
+    println!("| key | n_k −M / +M | R_c −M | R_c +M | R_E −M | R_E +M | f | r_M | provider R_c / R_E / n_k | +M refused (RMS > 1) F/E | +M kept out (R > 1/√2) F/E | −M refused / kept out |");
+    let rms = |ss: f64, n: usize, und: bool| if und { f64::INFINITY } else if n > 0 { (ss / n as f64).sqrt() } else { 0.0 };
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    for (k, a) in &acc {
+        let rf = [rms(a.f_ss[0], a.f_at[0], a.undefined[0]), rms(a.f_ss[1], a.f_at[1], a.undefined[1])];
+        let re = [rms(a.e_ss[0], a.e_n[0], a.undefined[0]), rms(a.e_ss[1], a.e_n[1], a.undefined[1])];
+        let f = if a.f_at[1] > 0 { a.m_atoms as f64 / a.f_at[1] as f64 } else { 0.0 };
+        let r_m = if a.m_atoms > 0 { (a.m_ss / a.m_atoms as f64).sqrt() } else { 0.0 };
+        let p = provider.get(k).map_or("—".to_string(), |p| format!("{:.3} / {:.3} / {}", p.force_rms, p.energy_rms, p.samples));
+        println!(
+            "| {} | {} / {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.4} | {:.2} | {p} | {}/{} | {}/{} | {}/{} |",
+            key_name(k),
+            a.n[0],
+            a.n[1],
+            rf[0],
+            rf[1],
+            re[0],
+            re[1],
+            f,
+            r_m,
+            yn(rf[1] > 1.0),
+            yn(re[1] > 1.0),
+            yn(rf[1] > half),
+            yn(re[1] > half),
+            yn(rf[0] > 1.0 || re[0] > 1.0),
+            yn(rf[0] > half || re[0] > half)
+        );
+    }
+}
+
+/// Task 7 review C2 / Q3 (measurement only): the share of the fitted samples outside M, and of
+/// their atoms, that the misfit fence would flag queried at the samples' own geometries, at the
+/// shipped near distance (`QUARANTINE_FRACTION × max_descriptor_distance`) and at
+/// `THIN_FRACTION × max_descriptor_distance`, by scene. Each atom's L∞ spread distance to the
+/// nearest misfit atom of its species (`spread_distance`, as `near_misfit_atoms` takes it) is
+/// computed here and thresholded at both radii — the product constant untouched; the shipped
+/// radius's sample count is cross-checked against `near_misfit_atoms` itself.
+fn c2_near_misfit(s: &mut SurrogateKs, meta: &[Meta], label: &str) {
+    use super::super::quarantine::{spread_distance, QUARANTINE_FRACTION, THIN_FRACTION};
+    s.ensure_desc_cache();
+    let near = QUARANTINE_FRACTION * s.policy.max_descriptor_distance;
+    let wide = THIN_FRACTION * s.policy.max_descriptor_distance;
+    let m = s.misfit().cloned();
+    let fence = s.misfit_fence().is_some();
+    println!(
+        "\nC2 [{label}]: |M| {} samples, {} atoms; the fence stands: {fence}; radii {near:.2} and {wide:.2} spreads",
+        m.as_ref().map_or(0, |m| m.samples.len()),
+        m.as_ref().map_or(0, |m| m.atoms.len())
+    );
+    let store = s.store.as_ref().unwrap();
+    let env = s.envelope.as_ref().unwrap();
+    let targets: Vec<(usize, &[f64])> = m
+        .as_ref()
+        .map(|m| m.atoms.iter().filter_map(|&(i, j)| s.desc_cache.get(i).and_then(|a| a.get(j)).map(|(sp, d)| (*sp, &d[..]))).collect())
+        .unwrap_or_default();
+    // per scene: samples, flagged at near, at wide, atoms, flagged at near, at wide, near_misfit_atoms's samples
+    let mut by: BTreeMap<String, [usize; 7]> = BTreeMap::new();
+    let fitted: Vec<usize> = (0..s.accumulated.min(store.len())).filter(|&i| !s.excluded(i) && !s.in_misfit(i)).collect();
+    for &i in &fitted {
+        let e = by.entry(meta[i].scene.clone()).or_default();
+        e[0] += 1;
+        let (mut sn, mut sw) = (false, false);
+        for (sp, d) in &s.desc_cache[i] {
+            let dmin = targets.iter().filter(|(t, _)| t == sp).map(|(_, td)| spread_distance(env, *sp, d, td)).fold(f64::INFINITY, f64::min);
+            e[3] += 1;
+            if dmin <= near {
+                e[4] += 1;
+                sn = true;
+            }
+            if dmin <= wide {
+                e[5] += 1;
+                sw = true;
+            }
+        }
+        e[1] += sn as usize;
+        e[2] += sw as usize;
+    }
+    if fence && !targets.is_empty() {
+        for &i in &fitted {
+            let x = &store.samples[i];
+            if s.near_misfit_atoms(&x.pos, &x.z).iter().any(|&b| b) {
+                by.get_mut(&meta[i].scene).unwrap()[6] += 1;
+            }
+        }
+    }
+    println!("| scene | samples | flagged at {near:.2} | at {wide:.2} | atoms | flagged at {near:.2} | at {wide:.2} | `near_misfit_atoms` samples (cross-check) |");
+    let pct = |a: usize, b: usize| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
+    let mut tot = [0usize; 7];
+    for (k, e) in &by {
+        for (t, v) in tot.iter_mut().zip(e) {
+            *t += v;
+        }
+        println!("| {k} | {} | {} ({:.1} %) | {} ({:.1} %) | {} | {} ({:.1} %) | {} ({:.1} %) | {} |", e[0], e[1], pct(e[1], e[0]), e[2], pct(e[2], e[0]), e[3], e[4], pct(e[4], e[3]), e[5], pct(e[5], e[3]), e[6]);
+    }
+    let e = tot;
+    println!("| all | {} | {} ({:.1} %) | {} ({:.1} %) | {} | {} ({:.1} %) | {} ({:.1} %) | {} |", e[0], e[1], pct(e[1], e[0]), e[2], pct(e[2], e[0]), e[3], e[4], pct(e[4], e[3]), e[5], pct(e[5], e[3]), e[6]);
+}
+
+/// Spec 2026-11-13 §5.1–5.2 (Task 8): the open-shell model on a copy of the user's collection (the
+/// 181-hold copy of 2026-11-12: 1 805 samples, 180 held, 1 superseded).
+///
+/// `COLLECTION_DIR=<fresh copy> cargo test -p providers --release --lib acceptance_on_the_collection -- --ignored --nocapture --test-threads 1`
+/// — a **fresh copy** every run: the refits write their codes to it, and the test copies it once
+/// more (before anything writes) to `<copy's parent>_d4_2/` for the D₄ = 2 provider, refusing a
+/// target that exists.
+///
+/// §5.1: the attach (the real growth rule) leaves the model trusted, holding no more than it
+/// started with, with at least the 68 releases of 2026-11-12; M is printed by scene. Refits with
+/// nothing new then converge (ruling 11: each better fit reproduces more held samples, so the
+/// releases continue for a refit or two): the held count never rises, and within 5 refits two
+/// successive ones leave the same codes and the same M (measured on to 12 refits, so a failure
+/// still says where the fixed point lies; the convergence and §5.2 failures are asserted together
+/// at the end). §5.2: per scene, the force rms and the
+/// leave-one-out force RMS at the converged D₄ = 3 fit are ≤ those of a D₄ = 2 provider's attach
+/// fit on its own fresh copy, or both below 1e-4 Ha/Bohr. Also printed, not asserted: D₄ = 2 fitted
+/// on the D₄ = 3 codes (no recovery) — the same samples on both sides.
+#[test]
+#[ignore]
+fn acceptance_on_the_collection() {
+    use std::time::Instant;
+    use surrogate::quarantine::{Q_HELD, Q_SUPERSEDED};
+    const FLOOR: f64 = 1e-4;
+    let dir = collection_dir();
+    let dir2 = sibling_copy(&dir, "d4_2");
+    println!("D₄ = 3 copy {}; D₄ = 2 copy {}", dir.display(), dir2.display());
+
+    // ---- §5.1: the attach at the real growth rule
+    let c = open_at(&dir);
+    let meta = metas(&c);
+    let q_disk = c.quarantine.clone();
+    let held_before = held(&q_disk);
+    println!(
+        "collection: {} samples, {held_before} held, {} superseded on disk; held by scene {:?}",
+        meta.len(),
+        q_disk.iter().filter(|&&q| q == Q_SUPERSEDED).count(),
+        by_scene(&meta, (0..q_disk.len()).filter(|&i| q_disk[i] == Q_HELD))
+    );
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let t = Instant::now();
+    s.attach(c).unwrap();
+    if s.report().is_none() {
+        SurrogateKs::refit(&mut s).unwrap();
+    }
+    let attach_wall = t.elapsed().as_secs_f64();
+    report(&s, &meta, "D₄ growth rule: after the attach's refit (recovery included)");
+    let (released, newly) = released_and_new(&q_disk, &s.quarantine);
+    let held_after = s.quarantined();
+    let m0 = misfit_samples(&s);
+    println!(
+        "\nATTACH: body4_degree {:?}, Q′ {}, {} fit_store calls, {attach_wall:.2} s; trusted {} ({:?}); held {held_before} → {held_after} ({released} released, {newly} newly held); recovery {:?}",
+        s.body4_degree(),
+        s.report().unwrap().q_prime,
+        s.fits,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.recovery_note()
+    );
+    println!(
+        "ATTACH M: {} samples, {} atoms, {} fitted counted; by scene {:?}; outside {:?}",
+        m0.len(),
+        s.misfit().map_or(0, |m| m.atoms.len()),
+        s.misfit().map_or(0, |m| m.fitted),
+        by_scene(&meta, m0.iter().copied()),
+        s.misfit().map(|m| m.outside)
+    );
+    println!("ATTACH held by scene: {:?}", by_scene(&meta, (0..s.quarantine.len()).filter(|&i| s.quarantine[i] == Q_HELD)));
+    assert_eq!(s.body4_degree(), Some(3), "the growth rule takes the collection to D₄ = 3");
+    assert!(s.trusted(), "§5.1: the attach leaves the model trusted: {:?}", s.untrusted_reason());
+    assert!(held_after <= held_before, "§5.1: the attach holds no more than it started with: {held_before} → {held_after}");
+    assert!(released >= 68, "§5.1: at least the 68 releases of 2026-11-12 recur: {released}");
+    // the Task 7 review's C1 / C2 measurements on the attach's refit (printed, not asserted)
+    c1_class_keys(&s, "D₄ = 3, the attach's refit");
+    c2_near_misfit(&mut s, &meta, "D₄ = 3, the attach's refit");
+
+    // ---- §5.1 (ruling 11): refits with nothing new converge to a fixed point within `REFITS`;
+    // measured on to `MEASURE` refits so a failure still reports where the fixed point lies, and
+    // the convergence failures are asserted at the end, after §5.2 has been measured too
+    const REFITS: usize = 5;
+    const MEASURE: usize = 12;
+    let mut failures: Vec<String> = Vec::new();
+    println!("\n| refit | held | released | newly held | |M| | M by scene | trusted | fit_store calls | wall (s) |");
+    println!("| attach | {held_after} | {released} | {newly} | {} | {:?} | {} | {} | {attach_wall:.2} |", m0.len(), by_scene(&meta, m0.iter().copied()), s.trusted(), s.fits);
+    let (mut prev_q, mut prev_m) = (s.quarantine.clone(), m0);
+    let mut fixed_at = None;
+    for k in 1..=MEASURE {
+        let fits = s.fits;
+        s.pending_refit = true;
+        let t = Instant::now();
+        SurrogateKs::refit(&mut s).unwrap();
+        let wall = t.elapsed().as_secs_f64();
+        let (rel, new) = released_and_new(&prev_q, &s.quarantine);
+        let m = misfit_samples(&s);
+        println!(
+            "| {k} | {} | {rel} | {new} | {} | {:?} | {} | {} | {wall:.2} |",
+            s.quarantined(),
+            m.len(),
+            by_scene(&meta, m.iter().copied()),
+            s.trusted(),
+            s.fits - fits
+        );
+        println!("   refit {k}: {:?}; recovery {:?}", s.untrusted_reason(), s.recovery_note());
+        if s.quarantined() > held(&prev_q) {
+            failures.push(format!("ruling 11: the held count rose at refit {k}: {} → {}", held(&prev_q), s.quarantined()));
+        }
+        let same = s.quarantine == prev_q && m == prev_m;
+        prev_q = s.quarantine.clone();
+        prev_m = m;
+        if same {
+            fixed_at = Some(k);
+            break;
+        }
+    }
+    match fixed_at {
+        Some(k) => println!("FIXED POINT: refit {k} repeats refit {} (codes and M)", k - 1),
+        None => println!("NO FIXED POINT within {MEASURE} refits"),
+    }
+    if !fixed_at.is_some_and(|k| k <= REFITS) {
+        failures.push(format!("ruling 11: no fixed point (the same codes and M at two successive refits) within {REFITS} refits: reached at {fixed_at:?} (measured to {MEASURE})"));
+    }
+    report(&s, &meta, &format!("D₄ = 3 at the last refit (fixed point {fixed_at:?})"));
+    let rms3 = scene_rms(&s, &meta);
+
+    // ---- §5.2: a D₄ = 2 provider on its own fresh copy
+    let c2 = open_at(&dir2);
+    let mut s2 = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s2.body4_force = Some(2);
+    let t = Instant::now();
+    s2.attach(c2).unwrap();
+    if s2.report().is_none() {
+        SurrogateKs::refit(&mut s2).unwrap();
+    }
+    let wall2 = t.elapsed().as_secs_f64();
+    report(&s2, &meta, "D₄ = 2 (forced): after the attach's refit");
+    let m2 = misfit_samples(&s2);
+    println!(
+        "D₄ = 2 ATTACH: body4_degree {:?}, Q′ {}, {} fit_store calls, {wall2:.2} s; trusted {} ({:?}); held {held_before} → {}; |M| {} by scene {:?}; recovery {:?}",
+        s2.body4_degree(),
+        s2.report().unwrap().q_prime,
+        s2.fits,
+        s2.trusted(),
+        s2.untrusted_reason(),
+        s2.quarantined(),
+        m2.len(),
+        by_scene(&meta, m2.iter().copied()),
+        s2.recovery_note()
+    );
+    let rms2 = scene_rms(&s2, &meta);
+    println!("\n§5.2 | scene | samples D₄3/D₄2 | atoms D₄3/D₄2 | rms D₄=3 | rms D₄=2 | LOO D₄=3 | LOO D₄=2 | LOO undefined 3/2 | verdict |");
+    let ok = |a: f64, b: f64| a <= b || (a < FLOOR && b < FLOOR);
+    for (k, r3) in &rms3 {
+        let r2 = rms2.get(k).unwrap_or_else(|| panic!("scene {k} has no fitted sample at D₄ = 2"));
+        let (ok_rms, ok_loo) = (ok(r3.rms, r2.rms), ok(r3.loo, r2.loo));
+        println!(
+            "| {k} | {}/{} | {}/{} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {}/{} | {} |",
+            r3.samples,
+            r2.samples,
+            r3.atoms,
+            r2.atoms,
+            r3.rms,
+            r2.rms,
+            r3.loo,
+            r2.loo,
+            r3.loo_undefined,
+            r2.loo_undefined,
+            if ok_rms && ok_loo { "ok" } else { "ROSE" }
+        );
+        if !ok_rms {
+            failures.push(format!("{k}: force rms {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.rms, r2.rms));
+        }
+        if !ok_loo {
+            failures.push(format!("{k}: LOO force RMS {:.3e} at D₄ = 3 > {:.3e} at D₄ = 2", r3.loo, r2.loo));
+        }
+    }
+    for k in rms2.keys().filter(|k| !rms3.contains_key(*k)) {
+        failures.push(format!("{k}: fitted at D₄ = 2, no fitted sample at D₄ = 3"));
+    }
+
+    // printed, not asserted: D₄ = 2 fitted on the D₄ = 3 fixed point's codes, no recovery
+    s2.quarantine = s.quarantine.clone();
+    s2.species_dirty = true;
+    let t = Instant::now();
+    s2.fit_store().unwrap();
+    println!("\nD₄ = 2 on the D₄ = 3 codes (fit_store, no recovery, {:.2} s): training residuals {:?}", t.elapsed().as_secs_f64(), s2.training_residuals());
+    let same = scene_rms(&s2, &meta);
+    println!("same samples | scene | samples 3/2 | rms D₄=3 | rms D₄=2 | LOO D₄=3 | LOO D₄=2 | verdict |");
+    for (k, r3) in &rms3 {
+        if let Some(r2) = same.get(k) {
+            let v = if ok(r3.rms, r2.rms) && ok(r3.loo, r2.loo) { "ok" } else { "ROSE" };
+            println!("| {k} | {}/{} | {:.3e} | {:.3e} | {:.3e} | {:.3e} | {v} |", r3.samples, r2.samples, r3.rms, r2.rms, r3.loo, r2.loo);
+        }
+    }
+    // C1 / C2 again on a test-only variant whose M is populated (the attach's M is empty on
+    // this collection): D₄ = 3, every held sample back in the fit, no recovery (`fit_store`)
+    for c in s.quarantine.iter_mut() {
+        if *c == Q_HELD {
+            *c = surrogate::quarantine::Q_NONE;
+        }
+    }
+    s.species_dirty = true;
+    let t = Instant::now();
+    s.fit_store().unwrap();
+    let mv = misfit_samples(&s);
+    println!(
+        "
+VARIANT (every hold cleared, no recovery, fit {:.2} s): body4_degree {:?}; trusted {} ({:?}); held {}; |M| {} samples, {} atoms, limit base {}; M by scene {:?}; training residuals outside M {:?}",
+        t.elapsed().as_secs_f64(),
+        s.body4_degree(),
+        s.trusted(),
+        s.untrusted_reason(),
+        s.quarantined(),
+        mv.len(),
+        s.misfit().map_or(0, |m| m.atoms.len()),
+        s.misfit().map_or(0, |m| m.fitted),
+        by_scene(&meta, mv.iter().copied()),
+        s.misfit().map(|m| m.outside)
+    );
+    c1_class_keys(&s, "variant: every hold cleared, no recovery");
+    c2_near_misfit(&mut s, &meta, "variant: every hold cleared, no recovery");
+    assert!(failures.is_empty(), "§5.1 convergence / §5.2: {failures:#?}");
 }
