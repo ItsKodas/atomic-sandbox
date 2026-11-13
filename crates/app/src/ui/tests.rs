@@ -4993,7 +4993,7 @@ mod activity_trust {
     fn the_misfit_line_counts_the_samples_it_cannot_reproduce() {
         use activity::words::{trust_line, AuditSeen};
         use sim::activity::{TrustCheck, TrustKey as K};
-        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3 };
+        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3, worst: None };
         assert_eq!(trust_line(&c, AuditSeen::Never, 20), "Few training samples it cannot reproduce — 3 of at most 12.3 (10 % of the fitted samples)");
     }
 

@@ -678,6 +678,18 @@ Measured before the spec: degree 3 fits the collection and releases 68 holds; de
 
 **The main merge** composed main's leave-one-out recovery ranking and Forget (code 7) with the no-ratchet restore. One change was made to main's rounds so that "never worse than before" still holds under the restore. Main's pre-1805 snapshot numbers in `references.md` (128 and 122 held) were measured before the merge and not re-run.
 
+**Gate (Nov 14, merged tree, each suite alone):**
+
+| Suite | Passed | Failed |
+|---|---|---|
+| units, qm, sim, surrogate | 486 | 0 |
+| providers | 384 | 0 |
+| validate `--test surrogate` | 7 | 0 |
+| `trust_baseline_report`, cadences 50 and 10 | identical to main at 50; met at 10 | — |
+| app (incl. replays) | 675 + 1 | 0 |
+
+The trust baseline's cadence-50 hot run had risen against its Oct 21 record (worst 5.15× against 2.87×). Main gave the identical report on the same machine, so the rise is main's, not this branch's. It is an open item for main. The app suite first failed to compile: the merge had added a field that one of this branch's tests did not set.
+
 
 ## Failures and dead ends
 
