@@ -56,6 +56,13 @@
 //! started with, as a fit does between a forget and the next refit. Pinned by
 //! `a_forget_during_a_background_refit_survives_its_install`.
 //!
+//! The misfit set M (`trust` module doc) is the copy's too: a sample forgotten while the copy ran
+//! and in the copy's M stays in the installed M — its `NearMisfit` refusal, its count against M's
+//! limit and its share of the class rule's RMS terms — until the next refit, which `pending_refit`
+//! makes due; that refit fits without it and leaves it out of M (a forgotten sample is excluded).
+//! Conservative meanwhile: it can only refuse more (its geometry is fenced as forgotten anyway),
+//! never answer more. (Final whole-branch review M3, 2026-11-14; documented, not changed.)
+//!
 //! What a background refit changes is *when* the new model stands (a refit's wall later, as the
 //! refit throttle already delays it by up to `REFIT_INTERVAL`), never what any verdict is: the
 //! model that answers meanwhile is judged by its own verdicts, exactly as between two refits.

@@ -7170,8 +7170,11 @@ fn dimers_and_a_tight_triangle(n: usize) -> SurrogateKs {
 /// model is short of samples (50 < Q′ 51; one dimer fewer and the cap-6 residuals fail too, one more and
 /// it is trusted) — the old rule kept exactly that. Now the retry is not kept: the cap stays 4.
 /// Ranked by their training residual (before 2026-11-12) the quarantine could not take the triangle
-/// out within its 10 % cap on this small store (the misfit spread over the dimers names more than 5)
-/// and the model reported the residual that actually fails; ranked by the leave-one-out ratio
+/// out within its 10 % cap on this small store (the misfit spread over the dimers names more than 5):
+/// it holds nothing, the all-sample residuals still fail, the counts hold, and since the open-shell
+/// merge the model ends untrusted on the misfit row (`TrustKey::Misfit`: the samples the residual
+/// rows judged before are in M, more of them than its 10 % limit) — before the merge it reported
+/// the training energy residual; ranked by the leave-one-out ratio
 /// (spec 2026-11-12 R1) the triangle is named alone, held, and the cap-4 fit without it is trusted —
 /// both pinned. On the 80-dimer store, where cap 6 leaves enough samples, the retry is kept and the
 /// model trusted.

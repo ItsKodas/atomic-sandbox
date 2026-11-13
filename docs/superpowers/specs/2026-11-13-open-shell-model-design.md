@@ -35,6 +35,10 @@ rejected 2026-11-12/13 with the user.)
    it. A recovery adds holds only when it restores trust, and never past the held cap (10 %); release (the
    model now reproduces a held sample) works as today. Holds reaching the cap no longer untrust the model
    for good: what is left over becomes local misfit (G3).
+   *Clarified 2026-11-14 (final whole-branch review M1), as built:* "does not end trusted" reads "does
+   not restore the training residuals" — a recovery that does not restore the training residuals gives
+   back what it held; one that restores the residuals and the noise but is short of the trust rule's
+   sample counts keeps its holds and ends untrusted (§4.2's merge note).
 3. **G3 — a misfit is local.** When, after recovery, some fitted samples are still beyond the training
    residual bounds, the model is not untrusted as a whole: it answers everywhere else and refuses the
    atoms near the samples it misfits (a new refusal, like today's near-quarantine refusal,
@@ -87,7 +91,9 @@ rejected 2026-11-12/13 with the user.)
 `recover_trust` (quarantine.rs) keeps its steps and order and keeps judging on **today's all-sample
 conditions** (`recoverable_fail`: energy and force residuals over every fitted sample, the force noise):
 that is how genuinely bad labels are found (my call; builder check Q1). Changes:
-- If no step ends trusted, the store's quarantine codes, the degree cap and the collection's persisted
+- If no step ends trusted (*clarified 2026-11-14, final review M1: as built, if no step restores the
+  training residuals and noise — a result that passes them short of the sample counts is kept, held and
+  untrusted*), the store's quarantine codes, the degree cap and the collection's persisted
   codes are restored to the entry state before the refit returns (`note_quarantined` /
   `sync_collection_status` write nothing new). The note says so ("recovery did not restore trust; no
   samples held").

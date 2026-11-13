@@ -665,7 +665,7 @@ Measured before the spec: degree 3 fits the collection and releases 68 holds; de
 
 **What landed:**
 - **G1:** the four-body degree is recorded per basis and grows from 2 to 3 with the store. The user accepted the cost: 1.1–1.4× a degree-2 refit at three species, ≈ 18 min for a cold attach at four species and 10,000 samples, over the spec's 5-minute stop line.
-- **G2:** a recovery that does not end trusted holds nothing.
+- **G2:** a recovery that does not restore the training residuals holds nothing (one that restores them short of samples keeps its holds, untrusted).
 - **G3:** the samples the model still cannot reproduce (M, at most 10 %) are refused locally (`NearMisfit`) instead of untrusting the whole model.
 
 **What the reviews changed:**

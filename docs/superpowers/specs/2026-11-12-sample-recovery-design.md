@@ -56,6 +56,14 @@ No tolerance moves.
   - fewer than 110 samples are held.
 
   Record the numbers in `references.md`.
+
+  *Note 2026-11-14 (after the merge with the open-shell model; final whole-branch review I1):* the
+  "#1804 is held in round 1" outcome was measured before that merge (Amendments below). At HEAD it is
+  not expected: a recovery that does not restore the residuals now gives back every hold, #1804's
+  round-1 hold included (the entry state comes after the release step, #1804 in the fit), and the
+  growth rule attaches this snapshot at body-4 degree 3, where a pre-merge build measured it trusted with no
+  recovery (the open-shell Task 4 cost run), #1804 in the fit and refused only by its one-sample O{H} / H{O} keys. Not re-measured;
+  `references.md` "Leave-one-out recovery ranking", the merge paragraph.
 - **Existing recovery tests.** A test whose pinned held set or count changes is investigated, not re-pinned blindly:
   - re-pin only if the new result is still trusted and the new held set is explained;
   - otherwise it is a finding.

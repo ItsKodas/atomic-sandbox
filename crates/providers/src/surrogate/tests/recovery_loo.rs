@@ -495,6 +495,17 @@ fn report_line(s: &SurrogateKs, label: &str, wall: f64) {
 /// the fit #1804 still bends, puts #1455 back, and the fit without #1804 but with #1455 is at
 /// 1.0070×, against 0.9991× without both — the collection debug measured the latter).
 ///
+/// **Measured before the open-shell merge** (6057835, on main's code: body-4 degree 2, holds of a
+/// failed recovery kept). The `held_1804` assertion is the **pre-merge expectation; not re-measured
+/// at HEAD; expected to fail at HEAD because** (a) the no-ratchet restore gives back every hold of a
+/// recovery that does not restore the residuals — the whole entry code vector, taken after the
+/// release step (104 held, #1804 in the fit), so round 1's hold of #1804 goes back with the other
+/// 23 — and (b) the growth rule attaches this snapshot at D₄ = 3, where Task 4's `refit_cost` d4 run
+/// (pre-merge, the same 1 805 samples) measured the attach trusted in 2 fits with no recovery:
+/// #1804 stays in the fit, refused only by the class rule's O{H} / H{O} pair keys on the sample
+/// floor (`references.md` "Acceptance", the HO exception). Left as it was measured, not re-pinned
+/// blind (final whole-branch review I1, 2026-11-14).
+///
 /// `SURROGATE_RECOVERY_SNAPSHOT=<copy>/<slug> cargo test -p providers --release --lib recovery_on_a_collection_snapshot -- --ignored --nocapture`
 #[test]
 #[ignore = "measurement on a copy of a collection snapshot (SURROGATE_RECOVERY_SNAPSHOT)"]
@@ -517,6 +528,7 @@ fn recovery_on_a_collection_snapshot() {
     SurrogateKs::refit(&mut s).unwrap();
     report_line(&s, &format!("the next refit ({} fits)", s.fits - fits), t1.elapsed().as_secs_f64());
     if s.samples() == 1805 {
+        // the pre-merge expectation; not re-measured at HEAD, expected to fail there (doc above)
         assert!(held_1804, "#1804 is held");
     }
 }
@@ -600,6 +612,115 @@ fn step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples() {
     assert!(s.is_quarantined(glitch));
     assert_eq!(held, vec![49, 50], "the triangle and the glitch, as the doc says (re-review N3)");
     assert!(s.recovery_note().is_some_and(|n| n.starts_with("back to the default basis")), "{:?}", s.recovery_note());
+}
+
+/// The open-shell merge's one change to `quarantine_rounds` (decision D2, 2026-11-14; `references.md`
+/// "Leave-one-out recovery ranking", the merge paragraph): when neither ranking recovers, a
+/// leave-one-out result that **fails** the residuals gives way to a training-ranking result that
+/// **passes** them, short of samples — `recover_trust` keeps a result that is not recovered only
+/// when it passes the residuals and noise, so main's choice would discard what the ranking before
+/// R1 kept. The store: [`step_3_runs_when_step_2_passes_its_residuals_but_is_short_of_samples`]'s
+/// (49 H₂, one tight H₃, an energy glitch, at cap 6): the training rounds hold what they name, the
+/// residuals pass, and 50 fitted samples are short of Q′ 51. The leave-one-out rounds are made to
+/// fail the residuals as [`undefined_leave_one_out_ranks_first_and_never_crosses_the_cap`] does:
+/// more undefined ratios (ruling R1a: ∞, ranked first, only they are taken) than the 10 % cap
+/// allows (5.1 of 51), so their first round holds nothing and the entry fit, failing, is their
+/// result. (A store whose real leave-one-out rounds fail where the training rounds pass — the
+/// stuck-H collection's shape — was not found small enough for a unit test; the injection is the
+/// R1a test's device.)
+///
+/// RED (2026-11-14, final-review fix M2a): with the `|| (loo_fails && !self.recoverable_fail())`
+/// clause removed from `quarantine_rounds` this test fails on the ranking (main's leave-one-out
+/// result, nothing held, stands).
+#[test]
+fn a_residual_failing_leave_one_out_result_gives_way_to_a_passing_training_result() {
+    let make = || {
+        let mut s = dimers_and_a_tight_triangle(49);
+        let glitch = in_cell_65(dimer(1.7, [0.0, 0.6, 0.8], [0.0; 3], 1, 1));
+        let mut bad = morse_sample(&MorseDimer::h2(), &glitch);
+        bad.energy += 0.05;
+        s.add_sample(bad, &glitch).unwrap();
+        s.degree_cap = Some(RECOVERY_DEGREE_CAP);
+        s.fit_store().unwrap();
+        assert!(s.recoverable_fail(), "the premise: the entry fit fails its residuals: {:?}", s.untrusted_reason());
+        s
+    };
+    let codes = |s: &SurrogateKs| (0..s.samples()).map(|i| s.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect::<Vec<u8>>();
+    // the training ranking's rounds alone, from the same entry fit: they pass the residuals, short
+    // of samples
+    let mut old = make();
+    old.training_ranking = true;
+    let report = old.report().unwrap().clone();
+    let (_, _, ranking) = old.quarantine_rounds(report);
+    let training = codes(&old);
+    println!(
+        "training rounds: held {:?}, residuals fail {}, short of samples {} ({:?})",
+        (0..old.samples()).filter(|&i| old.is_quarantined(i)).collect::<Vec<_>>(),
+        old.recoverable_fail(),
+        old.trust_needs_samples(),
+        old.untrusted_reason()
+    );
+    assert_eq!(ranking, Ranking::Training);
+    assert!(old.quarantined() > 0 && !old.recoverable_fail() && old.trust_needs_samples(), "the premise: the training rounds pass the residuals, short of samples");
+    // both rankings, the leave-one-out rounds made to hold nothing
+    let mut s = make();
+    let gen = s.model_gen;
+    let rows = s.loo_ratios().unwrap().to_vec();
+    let undefined: Vec<usize> = (0..6).collect();
+    assert!(undefined.len() as f64 > QUARANTINE_MAX_FRACTION * s.samples() as f64, "more than the cap allows");
+    let rows: Vec<(usize, f64)> = rows.iter().map(|&(i, r)| (i, if undefined.contains(&i) { f64::INFINITY } else { r })).collect();
+    let tier = rows.iter().map(|r| r.1).collect();
+    let tier_channel = vec![Channel::Force; rows.len()];
+    s.loo_ratios = Some(LooRatios { gen, rows, tier, tier_channel });
+    assert_eq!(s.worst_offenders(), (undefined.clone(), f64::INFINITY), "the premise: the leave-one-out round names more than the cap");
+    let report = s.report().unwrap().clone();
+    let (_, _, ranking) = s.quarantine_rounds(report);
+    println!("both rankings: {ranking:?}, held {}, residuals fail {}", s.quarantined(), s.recoverable_fail());
+    assert_eq!(ranking, Ranking::Training, "the training result stands over the residual-failing leave-one-out one");
+    assert_eq!(codes(&s), training, "with the training ranking's codes");
+    assert!(!s.recoverable_fail() && s.trust_needs_samples(), "passing the residuals, short of samples");
+}
+
+/// The open-shell merge's restore (no ratchet, spec 2026-11-13 §4.2) and main's Forget (code 7,
+/// spec 2026-11-12 R2) together: a sample forgotten before a recovery that fails keeps its code 7
+/// through the restore, and every other code is the one the recovery entered with — the rounds'
+/// holds given back. The store: [`outlier_store`] ranked by the training residual alone
+/// (`training_ranking`), whose rounds hold victims and never restore the residuals
+/// ([`a_high_leverage_outlier_is_held_alone_and_trust_returns`]), with H₃ #5 forgotten through
+/// `forget_sample` (the Model tab's button) after a fit and fitted without it.
+///
+/// RED (2026-11-14, final-review fix M2b): with the final restore's `self.quarantine = entry_flags`
+/// mapping code 7 to 0 this test fails on the forgotten code; with the restore of the codes left
+/// out it fails on the entry codes (the rounds' holds kept).
+#[test]
+fn a_failed_recovery_gives_its_holds_back_and_keeps_a_forgotten_sample() {
+    const FORGOTTEN: usize = 5;
+    let make = || {
+        let mut s = outlier_store();
+        s.training_ranking = true;
+        s.fit_store().unwrap();
+        let id = s.sample_id(FORGOTTEN).unwrap();
+        s.forget_sample(id).unwrap();
+        s.species_dirty = true;
+        let report = s.fit_store_deferred().unwrap();
+        assert!(s.recoverable_fail(), "the premise: the fit without #5 fails its residuals: {:?}", s.untrusted_reason());
+        (s, report)
+    };
+    let codes = |s: &SurrogateKs| (0..s.samples()).map(|i| s.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect::<Vec<u8>>();
+    // the premise, on a twin: the rounds hold samples and the residuals still fail
+    let (mut twin, report) = make();
+    let _ = twin.quarantine_rounds(report);
+    println!("the rounds alone: held {}, forgotten {}, residuals fail {}", twin.quarantined(), twin.forgotten(), twin.recoverable_fail());
+    assert!(twin.quarantined() >= 5 && twin.recoverable_fail(), "the premise: the rounds hold victims and fail");
+    // the recovery: entered with #5 forgotten, nothing held
+    let (mut s, report) = make();
+    let entry = codes(&s);
+    assert_eq!((entry[FORGOTTEN], s.forgotten(), s.quarantined()), (Q_FORGOTTEN, 1, 0));
+    let _ = s.recover_trust(report);
+    println!("after the recovery: held {}, forgotten {}; {:?}", s.quarantined(), s.forgotten(), s.recovery_note());
+    assert_eq!(s.recovery_note(), Some("recovery did not restore trust; no samples held"));
+    assert_eq!(s.quarantine[FORGOTTEN], Q_FORGOTTEN, "the forgotten sample stays forgotten");
+    assert_eq!(codes(&s), entry, "every other code is the entry state's: the rounds' holds given back");
 }
 
 /// Fix round 1 (option A): where the leave-one-out rounds do not recover, the training-residual
