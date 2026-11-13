@@ -2,7 +2,8 @@
 
 Status: design. The user approved the fix and the collection option on 2026-11-13 (section 2); everything else here
 is a ruling of mine and is listed in section 13. The design has been amended for the physics review of 682960e
-(MUST 6, SHOULD 10, NOTE 9). Each finding is applied where its section is; the review IDs appear in brackets, e.g.
+(MUST 6, SHOULD 10, NOTE 9), and again for its re-review of 3be0b63 (the κ̂ estimator, V3's third step, V5's work
+bound and cases, the M = 1 threshold, two notes; tagged "re-review"). Each finding is applied where its section is; the review IDs appear in brackets, e.g.
 [MUST-1], and section 13 lists the rulings. Evidence: `docs/superpowers/notes/2026-11-13-scf-stall-diagnosis.md`
 ("the diagnosis" below; its section numbers are cited as D§n). Implementation starts only **after the trust rework
 on branch `claude/charming-keller-0bc26b` has merged to `main`** and `scf-stall` has been rebased onto it (section 11).
@@ -297,10 +298,15 @@ d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level cro
       - The charge-like mode (the same pattern in both channels) has U_c = U↑↑ + U↑↓. The measured M = 1 integer
         behaviour (the occupied pair's oblate density pushes the empty p *below* an occupied one) says this mode is
         anti-aufbau, U_c < 0, and stable.
-      - The spin-like mode (opposite patterns) has U_s = U↑↑ − U↑↓, with kT*_s = (2/9)·U_s. If the opposite-spin cross
-        term favours the swap (U↑↓ < 0), then U_s > U↑↑ and kT*_s exceeds the M = 3 value.
-      - So "symmetric at M = 3, polarised at M = 1" is an anticipated outcome, not a surprise. V0 extracts U↑↑, U_c and
-        U_s from the integer states' splittings and checks them against the observed state at each M.
+      - The spin-like mode (opposite patterns) has U_s = U↑↑ − U↑↓, with kT*_s = (2/9)·U_s.
+      - **The two premises together fix the sign** (re-review R-SHOULD-D). U↑↑ > 0 (from M = 3) and U_c < 0 imply
+        U↑↓ < −U↑↑. So U_s > 2U↑↑ and kT*_s ≳ (4/9)·U↑↑ ≈ 5 mHa, if M = 1's U↑↑ matches M = 3's (it could be smaller:
+        M = 1's minority is a hole in three p, not a single electron).
+      - **So the M = 1 symmetric ensemble is predicted to be a saddle at kT = 1e-3, with gain ≳ 5.** This is the
+        expected outcome of the spec's own premises, not a side risk. V0 may well fail at M = 1 with kT = 1e-3, and
+        option (i)'s kT would then be set by the M = 1 spin mode (≈ 5 mHa), not by M = 3 (≈ 2.6 mHa).
+      - "Symmetric at M = 3, polarised at M = 1" is therefore anticipated. V0 extracts U↑↑, U_c and U_s from the
+        integer states' splittings and checks them against the observed state at each M.
     - *GPU occupation jitter:* FD turns f32 eigenvalue noise into density noise, at up to 1/(4kT) = 250 Ha⁻¹; the
       equal share of `DegenerateShells` was exactly flat. V0 records the per-iteration jitter δε of the shell's
       eigenvalues near convergence on the GPU. It must keep the implied Δρ floor, ≈ 2δε/(4kT)·∫ ||ψ_i|² − |ψ_j|²|, a
@@ -384,7 +390,7 @@ d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level cro
   - 1e-6 corresponds to |ε − μ| ≤ 13.8 kT, so "no partial level" means a gap of at least 28 mHa around μ in every
     channel. Section 6.4 relies on that.
 - **`Aufbau`** stays in `qm` only as the kT → 0 reference. One equivalence test uses it: FD and Aufbau agree on H₂ and
-  H₂O within the SCF tolerance. Nothing in `providers` can select it.
+  H₂O within |ΔE| ≤ 1e-8 Ha (CPU f64, tol = eig_tol = 1e-9; V1) (re-review SHOULD-6). Nothing in `providers` can select it.
   - `ScfSettings::for_grid` defaults to `FermiDirac { kt: ELECTRON_KT }`, so the oracles test the path the app runs.
 
 **Unchanged**
@@ -455,18 +461,37 @@ Every scene gets `FermiDirac { kt: ELECTRON_KT }`, whatever the ionic policy, so
   b  = 3·(√2·σ_E + ‖ΔR‖·σ_F/√2) + 3·κ̂·‖ΔR‖³
   ```
 
-  - **σ_E and σ_F** are the surface's measured per-solve path scatters of the energy and of a force component. On the
-    pseudo surface: 1.87e-6 Ha (H₂O warm vs cold) and `PSEUDO_FORCE_NOISE` = 5e-5 Ha/Bohr. On the all-electron
-    surface: its measured values (`references.md`; 5.4e-6 Ha for all-electron H₂O). They are taken from the
-    references, not fitted per scene.
+  - **σ_E and σ_F** are the surface's measured per-solve path scatters of the energy and of a force component, **at
+    the tolerance the evaluation was solved at** (re-review R-MUST-A).
+    - At the sample tolerance 1e-6 on the pseudo surface: 1.87e-6 Ha (H₂O warm vs cold) and `PSEUDO_FORCE_NOISE` =
+      5e-5 Ha/Bohr. On the all-electron surface: its measured values (`references.md`; 5.4e-6 Ha for all-electron
+      H₂O).
+    - Live MD runs at the app tolerance raised by `effective_gpu_tol`. Its scatters are measured once in Task A4 and
+      recorded in `references.md`. The guard picks the tier from `EvalStats::scf_tol_used`.
+    - They are taken from the references, not fitted per scene.
   - **‖ΔR‖** is the Euclidean norm of the 3N-vector of displacements.
-  - **κ̂** stands in for the trapezoid's third-order term, (1/12)|E‴| along the step. It is the running median of
-    m/‖ΔR‖³ over the last 8 judged steps (0 before there are 8), so on a smooth branch the bound tracks the integrator
-    error and the noise. A branch jump is an O(mHa) mismatch at a step where both terms are ~1e-5 Ha. At a typical
-    0.02 Bohr MD step on the pseudo surface, b ≈ 1.2e-5 Ha.
+  - **κ̂** stands in for the trapezoid's third-order term, (1/12)|E‴| along the step (re-review R-MUST-A).
+    - κ̂ = min(κ_med, κ_max).
+    - κ_med is the running median of m/‖ΔR‖³ over the last 8 judged, **unflagged** steps whose third-order term would
+      dominate the noise term (3κ_max‖ΔR‖³ ≥ the noise term 3(√2σ_E + ‖ΔR‖σ_F/√2)).
+    - Steps where the noise dominates are judged, but never enter the window. A run of 1e-3 Bohr relax steps, where m
+      is pure noise and m/‖ΔR‖³ ≈ 3e3, therefore cannot inflate κ̂ and blind the guard.
+    - A flagged step never enters the window either, so a trajectory that flips branches repeatedly cannot calibrate
+      its own jumps away.
+    - **κ_max = 1 Ha/Bohr³** is a global constant, not per element: (1/12)·6Da³ for a Morse bond with D = 0.2 Ha and
+      a = 1.5 Bohr⁻¹, rounded up. The "M7 forces" OH gives (1/12)·E‴ ≈ 0.18, below it. The plan's physics review
+      confirms it against measured E‴ of the stiffest app bonds (O–H and N–H at short range).
+    - κ_max is used alone until the window fills, so after a reset a 0.1 Bohr drag step on a stiff bond is not falsely
+      flagged.
+    - **With κ̂ ≤ κ_max, b at a 0.1 Bohr step is ≤ 3e-3 Ha**, below every jump section 4.7(e) documents (12–24 mHa).
+      At a typical 0.02 Bohr MD step on the pseudo surface, b ≈ 1.2e-5 Ha + 3κ̂·8e-6 ≤ 4e-5 Ha.
   - **The step is judged** only when the largest single-atom displacement since the previous evaluation is ≤ 0.1 Bohr:
     consecutive MD, relax or drag steps, and consecutive teacher calls during a fallback streak. Otherwise
-    `branch_jump` is `None` (not judged). An edit that resets the provider restarts the history.
+    `branch_jump` is `None` (not judged).
+  - **The history restarts** (the window is emptied and the next evaluation is not judged) on:
+    - an edit that resets the provider;
+    - an evaluation on a different grid, box or box placement than the previous one. A box change alters the discrete
+      surface by egg-box and wall terms, and would otherwise be flagged (re-review R-MUST-A).
   - **On m > b:** `branch_jump = Some(m)`, a warning in `EvalStats` ("F changed by m more than the forces' work: the
     SCF moved to another stationary state"), and **the surrogate refuses to train on that step**. That is exactly the
     role the occupation-pattern watch had.
@@ -474,8 +499,12 @@ Every scene gets `FermiDirac { kt: ELECTRON_KT }`, whatever the ionic policy, so
     restricted ↔ broken-symmetry switch shows there.
   - **The constants' derivation** (the factor 3, the window of 8, the 0.1 Bohr reach) is reviewed by the physics
     reviewer in the plan. None of them may be loosened to make a test pass.
-  - **Coverage, stated honestly.** Sampling-pass solves are of unrelated perturbed geometries (displacement > 0.1 Bohr
-    from the previous solve), so the guard does not judge them. Those labels rely on the leave-one-out machinery, as
+  - **Coverage, stated honestly.** The guard does not judge:
+    - sampling-pass solves, which are of unrelated perturbed geometries (displacement > 0.1 Bohr from the previous
+      solve);
+    - the surrogate's sparse audits, whose teacher calls are usually more than 0.1 Bohr apart (re-review R-NOTE-b).
+
+    Under the surrogate, only fallback streaks are judged. Every other label relies on the leave-one-out machinery, as
     today.
 
 ### 6.4 The lone-atom composition rule (`providers::surrogate`, lone atoms)
@@ -814,16 +843,22 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 | V1 | `cargo test -p units -p qm -p sim -p surrogate --release` | **FD unit tests:**<br>• two levels with N = 1, degenerate (f = ½, μ = ε, S = 2 ln 2);<br>• a gap Δ (f = 1/(1 + e^{±Δ/2kT}) at the symmetric μ);<br>• a gap ≥ 74 kT [SHOULD-5]: f below μ exactly 1.0, f above μ ≤ e^{−36}, S ≤ 1e-14, μ the plateau midpoint of section 4.1 (both bisections) [MUST-1];<br>• N_σ = 0; the bracket's validity;<br>• a NaN eigenvalue → `QmError::Numerical` before bisecting [SHOULD-1];<br>• the worst-case halving count near μ = 0 stays under the backstop;<br>• determinism (same bits twice);<br>• s(f) against the direct formula on a grid of f, plus the 0 ln 0 limit.<br>**Witness rule**, both arms. **Energy invariant** (total = internal − ts).<br>**CPU H₄ square a = 1.8** (41³ × 0.30, axes-aligned, exactly degenerate, tol 1e-9): TS = 4 kT ln 2 within 1e-8 Ha, and E equal to the DS-era E within 1e-8 Ha (same f by symmetry) [SHOULD-6].<br>**FD ≡ Aufbau** on H₂ and H₂O (CPU f64, tol = eig_tol = 1e-9): \|ΔE\| ≤ 1e-8 Ha, since the f agree to e^{−100} [SHOULD-6].<br>The DIIS-reset test (section 5). The collection: v2 records, code 8, the read-only open leaving every file byte-identical. |
 | V2 | **Regression (new; `cargo test -p providers --release`, GPU, release-only).** The diagnosis harness reduced and committed. Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, the app's tolerance raised by `effective_gpu_tol`, stall stop on. | See "V2 cases" below. |
 | V3 | `cargo test -p validate --release --test oracles` | **σ → 0 oracles** (H, He, H₂): numbers unchanged within the existing tolerances, and **TS ≤ 1e-12** asserted on every oracle system (they are gapped or single-electron).<br>**New FD-consistency oracle** (CPU f64, 41³ × 0.30, tol 1e-9): see "V3 force oracle" below. |
-| V4 | `cargo test -p validate --release --test gpu_vs_cpu` | Existing cases within existing bounds. New cases at the suite's fixed σ = h = 0.25, 49³: H₄ square (degenerate), and a lone pseudo-O at each M V0 settled on [MUST-5]. Each case checks:<br>• \|F_gpu − F_cpu\| and \|TS_gpu − TS_cpu\| within the suite's energy bounds (TS is second order in Δε: \|ΔTS\| ≲ Δε²/(16kT) per pair);<br>• μ_σ within `EPS_BOUND_PSEUDO` (1e-5 Ha) where a partial level exists, and not compared in gapped channels (section 4.1);<br>• per-level \|Δf\| ≤ `EPS_BOUND_PSEUDO`/(4kT) = 2.5e-3;<br>• the sum of f over each degenerate cluster within 1e-9;<br>• **both solvers in the same state class** (symmetric vs polarised, by TS against the closed form), so that an f32-vs-f64 split onto different stationary states is detected, not averaged over.<br>Forces are checked against the existing force bounds. |
+| V4 | `cargo test -p validate --release --test gpu_vs_cpu` | Existing cases within existing bounds. New cases at the suite's fixed σ = h = 0.25, 49³: H₄ square (degenerate), and a lone pseudo-O at each M V0 settled on [MUST-5]. Each case checks:<br>• \|F_gpu − F_cpu\| and \|TS_gpu − TS_cpu\| within the suite's energy bounds (TS is second order in Δε: \|ΔTS\| ≲ Δε²/(16kT) per pair);<br>• μ_σ within `EPS_BOUND_PSEUDO` (1e-5 Ha) where a partial level exists, and not compared in gapped channels (section 4.1);<br>• per-level \|Δf\| ≤ 2·`EPS_BOUND_PSEUDO`·max f(1−f)/kT = `EPS_BOUND_PSEUDO`/(2kT) = 5e-3 (re-review R-NOTE-a). The earlier EPS/(4kT) was exact only for a pair; a three-level shell at f = ⅓ can reach 0.30·EPS/kT under an adversarial error pattern. The measured \|Δε\| = 2.2e-6 gives \|Δf\| ≤ 6.5e-4;<br>• the sum of f over each degenerate cluster within 1e-9. A cluster is the levels the CPU finds within 1e-6 Ha of each other;<br>• **both solvers in the same state class** (symmetric vs polarised, by TS against the closed form), so that an f32-vs-f64 split onto different stationary states is detected, not averaged over.<br>Forces are checked against the existing force bounds. |
 | V5 | `cargo test -p validate --release --test dynamics` | Existing tests unchanged (gapped H₂ and H₃⁺: the conserved quantity is F = E). See "V5 new tests" below. |
 | V6 | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | **Generation records:** bitwise unchanged, with `recipe_hash` moved by `DIMER_PROCEDURE` only.<br>**Dimer-gate verdicts and R_e / ω:** reproduce within the backend margin.<br>**Lone-atom references and the O multiplicity scan** (`pseudo_o_triplet_matches_cpu`, `gpu_oxygen_reference_multiplicity`; `degenerate_spread_at_low_symmetry_sites` repurposed as V0's site study): these move by the measured −TS. Each moved reference is stated in `references.md` with its TS and, for an exactly degenerate shell, the closed-form value (section 4.3). The scan keeps the same M (lowest F). |
 | V7 | `cargo test -p validate --release --test surrogate` | Passes, with labels now F; the H₂ and H₃⁺ tests are gapped, so their pins hold.<br>A model file or collection with a legacy tag is refused, and its collection is found as the predecessor.<br>**Migration integration test** (GPU, small): a collection of H₂ samples (U), linear OH samples (T: ΔF = −2 kT ln 2, E and forces unchanged) and one near-square H₄ (S, reviewed). It checks the counts, the codes, the review's release, and the old folder hashing identical before and after.<br>**Branch-jump refusal** [MUST-3]: a teacher answer stream with a synthetic stationary-state switch (the same geometry path, F shifted by 12 mHa from one step on) is warned and not trained on; the steps before and after it are trained on. |
-| V8 | `cargo test -p providers --release` | The provider unit tests.<br>The tag strings (`none/fd1e-3`, `…/fd1e-3/stop2x…`). `legacy_tag_of` pinned against the recorded strings. The re-pinned bitwise tests, each with its reason.<br>The lone-rule test on a polarised-or-partial O (declined).<br>**`branch_jump`** [MUST-3]: a synthetic jump is flagged; a smooth analytic path (a Morse dimer stepped at MD-sized displacements) is never flagged; a displacement > 0.1 Bohr is not judged.<br>**Witness cap** [NOTE-6]: all-electron H⁻ at the app's largest box. |
+| V8 | `cargo test -p providers --release` | The provider unit tests.<br>The tag strings (`none/fd1e-3`, `…/fd1e-3/stop2x…`). `legacy_tag_of` pinned against the recorded strings. The re-pinned bitwise tests, each with its reason.<br>The lone-rule test on a polarised-or-partial O (declined).<br>**`branch_jump`** [MUST-3]: a synthetic jump is flagged; a smooth analytic path (a Morse dimer stepped at MD-sized displacements) is never flagged; a displacement > 0.1 Bohr is not judged; a relax-like sequence of 1e-3 Bohr steps followed by a 0.02 Bohr step carrying a synthetic 12 mHa jump is flagged; a stream of alternating jumps stays flagged at every jump; a grid or box change restarts the history and is not flagged (re-review R-MUST-A).<br>**Witness cap** [NOTE-6]: all-electron H⁻ at the app's largest box. |
 | V9 | `--test tools`, `--test charges`, `--test orbitals` | Density and orbital consumers. Gapped systems leave the numbers unchanged. The orbital display shows per-level f. |
 | V10 | `cargo test -p app --release` (incl. replays) | Label tests (`energy_label` → the F wording).<br>Formats (`collection` = 2, the sidecar bumped, the downgrade line for a migrated folder).<br>The offer / progress / summary text from a fixture predecessor.<br>The replay scripts (they pin quality, walls and ionic; any energy expectation is gapped). |
 | V11 | **Dry run on a copy of the user's collection** (measurement, `#[ignore]`d, never on the original) | Counts per class, the class U maximum deviations, the time per sample, and the review outcome (released / kept out). Then the refit's trust verdict against the pre-migration one, recorded in `references.md` "Fermi–Dirac migration".<br>**The false-S estimate** [SHOULD-7]: the fraction of class S whose only failing test is \|ΔE\| ∈ (ε_E, 3ε_E].<br>**Must:** the source copy is byte-identical afterwards, and no sample changes code without a logged reason.<br>**Reported, not gated:** whether the migrated collection is trusted as before. If it is not, the reason is investigated before merge. |
 
 **V0 in detail** [MUST-2, SHOULD-6, SHOULD-9].
+
+**Stated up front: V0 may well fail at M = 1 with kT = 1e-3** (section 4.7(d), re-review R-SHOULD-D). On the spec's own
+premises, the M = 1 spin-like occupation mode of an open p shell has a stability threshold of kT*_s ≳ 5 mHa, five
+times the user's kT. The symmetric M = 1 ensemble is then a saddle of F, and the SCF may polarise, become
+site-dependent, or fail to settle. kT stays at 1e-3 Ha in this spec (the user's decision). If V0 fails, the
+pre-registered stop below applies and the user chooses among (i)–(iii).
 
 - **Cases.**
   - Every species the recipe accepts with an open-shell ground state: pseudo C, O and F, and B if accepted, with N as
@@ -849,11 +884,12 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
   - the GPU eigenvalue jitter and its implied Δρ floor, which must sit a factor 3 below the GPU stop rule (otherwise
     V0 fails);
   - the lopsided-tetrahedron seeding of section 4.7(e) [SHOULD-2].
-- **If any species fails, stop and ask the user.** The user rules on one global kT for all species (rule 1). None of
-  these options is chosen by me:
-  - **(i)** Raise kT to the measured stability threshold of the worst species (predicted ≈ 3 mHa for O by pseudo spec
-    §5.7; higher for F). It is measured as the smallest kT that passes every rule above. It costs a larger F bias on
-    stretched and pinned states.
+- **If any species or multiplicity fails, stop and ask the user.** As stated above, M = 1 is the expected place for a
+  failure. The user rules on one global kT for all species (rule 1). None of these options is chosen by me:
+  - **(i)** Raise kT to the measured stability threshold of the worst species and multiplicity. The predictions are
+    ≈ 3 mHa for O at M = 3 (pseudo spec §5.7), ≈ 5 mHa for the M = 1 spin mode, and higher for F. It is measured as
+    the smallest kT that passes every rule above. It costs a larger F bias on stretched and pinned states (TS and the
+    stretched-bond energies scale with kT).
   - **(ii)** Keep 1e-3 and document the site dependence of the failing open-shell species as an LSDA symmetry-dilemma
     artefact, with the lone-atom rule already declining such atoms in pairs.
     - Option (ii) still requires the reference scan to converge at every M at every site [SHOULD-9]. A lone-atom
@@ -890,12 +926,20 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 
 **V3 force oracle** [MUST-4].
 - **Geometry.** A near-square H₄ rectangle whose frontier gap is a few kT. Task A1 picks the aspect from a short scan
-  so that |d(TS)/dx| ≥ 2 mHa/Bohr. It also checks that the whole 4δ span of the stencil lies where the ratio test below
-  passes.
-- **Method.** Central differences at δ = 0.01 and 0.02 Bohr along one atom's in-plane coordinate, combined by
-  Richardson as in `oh_hf_force_matches_fd`.
-- **The δ-scaling check.** The test asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5]: the plain FD error is the δ² term, so
-  δ resolves the TS swing.
+  so that:
+  - |d(TS)/dx| ≥ 2 mHa/Bohr;
+  - the plain |FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr.
+
+  The two pull in opposite directions: d(TS)/dx ≤ 0.45·c while F‴ ~ 0.2·c³/(kT)², with c = dΔ/dx. Any c between 5e-3
+  and 5e-2 Ha/Bohr meets both. A1 also checks that the whole 4δ span of the stencil lies in that regime.
+- **Method.** Central differences at δ/2 = 0.005, δ = 0.01 and 2δ = 0.02 Bohr along one atom's in-plane coordinate,
+  combined by Richardson as in `oh_hf_force_matches_fd`. The reported value is R(δ/2, δ).
+- **Certifying the Richardson value** (re-review R-SHOULD-B).
+  - The two Richardson values R(δ/2, δ) and R(δ, 2δ) must agree within 2.5e-5 Ha/Bohr. Their difference is 3.75× the
+    δ⁴ remainder of the finer one, so this bounds that remainder independently of HF.
+  - A ratio window alone does not do it: at r = 5 the Richardson residual is still a third of the plain error.
+- **The δ-scaling check** asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5], i.e. that the plain FD error is the δ² term, so
+  that δ resolves the TS swing. It is asserted only when |FD(δ) − HF| ≥ 1e-5 Ha/Bohr; below that the ratio is noise.
   - Near a pinned pair, F contains −kT ln(2 cosh(Δ/2kT)) per channel. Its third derivative scales as c³/(kT)², so a
     plain FD(0.01) can be off by ~2e-3, 20× the bound, on truncation alone.
 - **Must show both, on the Richardson value:**
@@ -911,10 +955,25 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 The two tests that replace it:
 1. **Work-integral oracle** (CPU f64, the V3 geometry). Move one atom along a prescribed 0.2 Bohr path crossing the TS
    swing, in 40 steps, and integrate W = −∫F_HF·dx by Simpson.
-   - Assert |W + ΔF| ≤ the Simpson bound plus 40× the per-point force scatter.
-   - Assert |W + ΔE| ≥ 5× that.
-2. **NVE** on a case whose released energy keeps h²/4·E_mode ≤ 1e-4 Ha, chosen by Task A1. Examples: a near-square H₄
-   at larger a, or a stretched-H₂ geometry whose σg/σu gap crosses a few kT, started at its turning point.
+   - Assert |W + ΔF| ≤ (Simpson error, estimated as |S₄₀ − S₂₀|/15) + 3(L·σ_F + √2·σ_E) (re-review R-SHOULD-C).
+     - L = 0.2 Bohr is the path length.
+     - σ_F and σ_E are the CPU f64 path scatters at tol 1e-9, measured in the test.
+     - The noise of a Simpson W over the path is at most Σ|w_i|·σ_F = L·σ_F, and ΔF carries √2·σ_E.
+     - (The earlier "40× the per-point force scatter" added Ha/Bohr to Ha.)
+   - Assert |W + ΔE| = |ΔTS| ≥ 5× that bound. It is easily met: ΔTS ≈ 0.4 mHa over 0.2 Bohr at
+     |d(TS)/dx| ≥ 2 mHa/Bohr.
+2. **NVE** on a case whose released energy keeps h²/4·E_mode ≤ 1e-4 Ha, chosen by Task A1. For example, the bending
+   vibration of a linear ²Π radical, started from a bend that splits the π pair by about 10 kT (re-review R-SHOULD-C).
+   - **The proposed case is N₃**, all pseudo-N (N is accepted). It is linear with a ²Π_g ground state.
+   - At linearity the π pair holds one hole, so TS = 2 kT ln 2 = 1.39 mHa. Bending splits the pair (∝ θ²), so the bend
+     sweeps TS between 1.39 mHa and ≈ 0.
+   - The bend is soft (h ≈ ω_bend·dt ≈ 0.02) with a few mHa in it, so h²/4·E_mode ≲ 1e-6 Ha. Only the initial bend
+     energy is released, so nothing leaves the box.
+   - Task A1 confirms that LSDA keeps N₃ linear, with that ground state, on the pseudo surface at h_req. If it does not,
+     A1 substitutes another linear ²Π radical with the same properties.
+   - **Withdrawn:** the earlier examples. A near-square H₄ at larger a still falls to 2 H₂, releasing ≈ 0.24 Ha
+     (h²/4·E ≈ 2.6e-3 Ha). A stretched H₂ needs R ≳ 6–8 Bohr to bring its gap to a few kT, which does not fit the box
+     under the face-density rule.
    - The box must keep the face density below the box rule throughout.
    - The drift and fluctuation bounds are re-derived for that trajectory by the suite's own rule (the
      `nve_energy_drift_is_bounded` method), not scaled per atom.
@@ -998,7 +1057,9 @@ Model tags are per CLAUDE.md. All are dispatched on Opus, per the 2026-10-21 rul
    includes the U↑↑/U_c/U_s extraction, the GPU jitter floor, and the seeding of the lopsided tetrahedron with its
    α = 0.1 and α = 0.05 broken-symmetry densities (SHOULD-2). A1 also:
    - chooses V3's aspect and checks its 4δ span;
-   - chooses V5's NVE case (h²/4·E_mode ≤ 1e-4 Ha, the face density within the box rule);
+   - chooses V5's NVE case (h²/4·E_mode ≤ 1e-4 Ha, the face density within the box rule). It confirms that LSDA keeps
+     N₃ linear with a ²Π_g ground state on the pseudo surface at h_req, or substitutes another linear ²Π radical;
+   - checks V3's plain-FD condition (|FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr);
    - measures the all-electron witness cost.
 
    **Stop here if V0 fails.**
@@ -1024,7 +1085,8 @@ key.
 ## 12. Risks
 
 1. **Open-shell atoms at kT = 1e-3** (section 4.7(d)): every accepted open-shell species, both M, both surfaces, and
-   the GPU jitter floor. Gated by V0, and the user rules on one global kT if any fails.
+   the GPU jitter floor. Gated by V0, and the user rules on one global kT if any fails. **A failure at M = 1 is the
+   expected outcome on the spec's own premises** (kT*_s ≳ 5 mHa, section 4.7(d)).
 2. **All-electron per-solve cost goes up** (witness vectors). Measured and reported, not hidden. The default policy
    already pays it.
 3. **The migration takes about 1–2 h of GPU time.** It is optional to start, pausable and resumable, and live use is
@@ -1070,7 +1132,10 @@ key.
 11. **`occupation_changed` is replaced by `branch_jump`** (amended for MUST-3), a stricter guard.
     - It compares ΔF with the trapezoid work of the forces between consecutive evaluations of one provider (largest
       atom displacement ≤ 0.1 Bohr).
-    - The bound is 3× the path-scatter noise, plus 3× a running-median third-order term over 8 judged steps.
+    - The bound is 3× the path-scatter noise at the evaluation's own tolerance, plus 3κ̂‖ΔR‖³. Here κ̂ = min(running
+      median over the last 8 judged, unflagged, curvature-dominated steps; κ_max = 1 Ha/Bohr³), with κ_max used alone
+      until the window fills (re-review).
+    - A grid, box or placement change restarts the history.
     - On a failure: a warning, and no surrogate training on that step.
     - For N↑ = N↓ the change of ∫|ρ↑ − ρ↓| is reported with it.
     - The constants are physics-reviewed in the plan.
@@ -1109,8 +1174,11 @@ key.
     - The scan's winning M must be the same at every site.
     - The M = 1 two-channel predictions, the GPU jitter floor and the convergence precondition of option (ii) are
       pre-registered.
-    - If any species fails, the user rules on one global kT: (i) raise kT, (ii) document the site dependence, or
-      (iii) Marzari–Vanderbilt cold smearing (offered only). I do not pick.
+    - The spec states up front that V0 may well fail at M = 1, where the spin-mode threshold is ≳ 5 mHa by the spec's
+      own premises (re-review).
+    - If any species or multiplicity fails, the user rules on one global kT: (i) raise kT (≈ 3 mHa for O at M = 3,
+      ≈ 5 mHa for the M = 1 spin mode, more for F), (ii) keep 1e-3 and document the site dependence, or (iii)
+      Marzari–Vanderbilt cold smearing (offered only). kT stays 1e-3 here. I do not pick.
 29. **V2 budgets are about 1.5× the prototype's iteration counts**, and F and TS are pinned to D§6 within 1e-5 Ha.
     The controls are pinned at 3 × max(achieved, path scatter): H₂ 2e-6, H₂O 6e-6 [SHOULD-6]. Bitwise pins are
     re-pinned with a reason, never deleted.
@@ -1125,23 +1193,31 @@ key.
 
 **Added after the physics review of 682960e** (each is my call on how to apply the finding):
 
-32. **V3** [MUST-4] uses Richardson on δ = 0.01 / 0.02 Bohr against the "M7 forces" Richardson bound, 1e-4 Ha/Bohr.
-    - It asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5].
+32. **V3** [MUST-4] uses Richardson on δ/2, δ and 2δ (0.005 / 0.01 / 0.02 Bohr) against the "M7 forces" Richardson
+    bound, 1e-4 Ha/Bohr.
+    - R(δ/2, δ) and R(δ, 2δ) must agree within 2.5e-5 Ha/Bohr, which certifies the δ⁴ remainder (re-review).
+    - It asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5] only when |FD(δ) − HF| ≥ 1e-5 Ha/Bohr.
+    - A1 picks the aspect so that the plain |FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr.
     - Its discrimination threshold is |HF + dE/dx|_Rich ≥ 5e-4 Ha/Bohr.
 33. **The shared-seed spin-restricted auto surface** [SHOULD-2] is written into section 4.7(e) as an alternative for
     the user, not adopted. Task A1 seeds the tetrahedron with its broken-symmetry densities, to test the 12–24 mHa
     "LSDA broken symmetry" claim under F.
 34. **V4** [MUST-5]:
     - μ is compared within `EPS_BOUND_PSEUDO` only where a partial level exists;
-    - per-level |Δf| ≤ `EPS_BOUND_PSEUDO`/(4kT);
-    - the sum of f per degenerate cluster within 1e-9;
+    - per-level |Δf| ≤ `EPS_BOUND_PSEUDO`/(2kT) = 5e-3. This is 2·EPS·max f(1−f)/kT, which also covers a three-level
+      shell at f = ⅓; EPS/(4kT) was exact only for pairs (re-review).
+    - the sum of f per degenerate cluster within 1e-9, a cluster being the levels the CPU finds within 1e-6 Ha of each
+      other;
     - TS against the energy bounds;
     - the same state class required on both solvers.
 35. **V5** [MUST-6]: the H₄-square NVE run is withdrawn. In its place:
-    - a CPU work-integral oracle: Simpson over 40 steps on the V3 geometry, |W + ΔF| ≤ the Simpson bound plus 40× the
-      force scatter, and |W + ΔE| ≥ 5× that;
-    - an NVE run on a low-release case chosen by A1, with bounds re-derived by the suite's own rule (never scaled per
-      atom), and a TS swing ≥ 1 mHa along it.
+    - a CPU work-integral oracle: Simpson over 40 steps on the V3 geometry, with
+      |W + ΔF| ≤ |S₄₀ − S₂₀|/15 + 3(L·σ_F + √2·σ_E) (L = 0.2 Bohr; the units are corrected in the re-review), and
+      |W + ΔE| ≥ 5× that;
+    - an NVE run on a low-release case chosen by A1, e.g. the Renner–Teller bend of linear ²Π N₃ (A1 confirms LSDA
+      keeps it linear, or substitutes another linear ²Π radical). The bounds are re-derived by the suite's own rule
+      (never scaled per atom), and TS must swing ≥ 1 mHa along it. The near-square H₄ and stretched-H₂ examples are
+      withdrawn.
 36. **Wording and documentation fixes:**
     - "minimises" becomes "makes stationary on the branch reached" [SHOULD-3];
     - "a real T_el effect" becomes "the Mermin–Kohn–Sham functional with ground-state xc; S is the KS-occupation
@@ -1155,3 +1231,18 @@ key.
     V11 reports the false-S estimate. I kept the value rather than raising it, because a false S costs only one review,
     while a larger ε_E would carry real changes of up to that size as "unchanged".
 38. **Every SHOULD is applied; none is declined.** All NOTEs are applied, NOTE-3 as option (iii) for the user only.
+
+**Added after the physics re-review of 3be0b63:**
+
+39. **The branch-jump bound** (R-MUST-A):
+    - **κ̂** = min(κ_med, κ_max). κ_med skips noise-dominated and flagged steps. κ_max = 1 Ha/Bohr³ is global and is
+      confirmed by the plan's physics review against measured E‴.
+    - **Noise tier:** σ_E and σ_F are those of the evaluation's own tolerance; the app-tolerance tier is measured in A4.
+    - **History restart:** on any grid, box or placement change.
+    - **Coverage:** the guard is stated not to judge sparse surrogate audits (R-NOTE-b).
+    - **V8 gains:** the relax-then-jump case and the alternating-jump case.
+40. **The §5 `Aufbau` equivalence** is stated in Ha (|ΔE| ≤ 1e-8, CPU f64, tol 1e-9) (SHOULD-6 remainder).
+41. **The M = 1 prediction is stated as expected, not as an "if".** On the spec's premises kT*_s ≳ 5 mHa, so V0 may well
+    fail at M = 1 with kT = 1e-3, and option (i) would be set by it. This is stated up front in V0, and the
+    pre-registered stop is unchanged in form: the user chooses (i) raise kT, (ii) keep 1e-3 and document the site
+    dependence, or (iii) cold smearing. kT is not changed by me.
