@@ -131,7 +131,8 @@ impl SurrogateKs {
     /// 4. the novelty (5d);
     /// 5. the environment class (4b);
     /// 6. the variance (rules 6, then 7);
-    /// 7. the fences: a quarantined geometry, the shell fence, an audit fence (`evaluate`'s order).
+    /// 7. the fences: a quarantined geometry, an atom near a misfit, the shell fence, an audit
+    ///    fence (`evaluate`'s order).
     ///
     /// `evaluate` computes 3–6 and takes the first refusal (`envelope.or(novel).or(class)
     /// .or(variance)`, then the fence); returning at the first refusal in the same order gives the
@@ -200,7 +201,8 @@ impl SurrogateKs {
     }
 
     /// The last rule of the order: the fences, in `evaluate`'s order — a quarantined geometry,
-    /// then the shell fence (the band [5/6 r_cut, r_cut) of a pair a shell check fenced), then an
+    /// then an atom near a misfit (`NearMisfit`, naming the first such atom; spec 2026-11-13
+    /// §4.3), then the shell fence (the band [5/6 r_cut, r_cut) of a pair a shell check fenced), then an
     /// audit fence (`audit_fence_refusal` is the last two). Before the M7 leftovers (final review
     /// M1) this read `near_audit_fence` alone, so the curves drew a fenced shell band as answered
     /// while strict mode refused it.
@@ -208,16 +210,19 @@ impl SurrogateKs {
         if !self.near_quarantined_cached(pos, z).is_empty() {
             return Err((TeachRule::NearQuarantine, None));
         }
+        if let Some(r) = self.near_misfit_refusal(pos, z) {
+            return Err((r.rule, r.atom));
+        }
         match self.audit_fence_refusal(pos, z) {
             Some(r) => Err((r.rule, r.atom)),
             None => Ok(()),
         }
     }
 
-    /// Whether any fence can refuse (a quarantined sample, an audit or a shell fence): the views
-    /// re-judge the cached answered points only then.
+    /// Whether any fence can refuse (a quarantined sample, a misfit atom, an audit or a shell
+    /// fence): the views re-judge the cached answered points only then.
     fn any_fence(&self) -> bool {
-        self.fencing() > 0 || !self.audit_fences.is_empty()
+        self.fencing() > 0 || self.misfit_fence_stands() || !self.audit_fences.is_empty()
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
@@ -228,11 +233,12 @@ impl SurrogateKs {
 
     /// The training views (module doc); `None` without a fitted model and a store. Rebuilds the
     /// curve cache when the model generation moved, fills the fence's descriptor cache while
-    /// samples are quarantined (review m4: the fence works without it otherwise), then reads only.
+    /// samples are quarantined or M has misfit atoms (review m4: the fences work without it
+    /// otherwise), then reads only.
     /// Both caches decide nothing.
     pub fn training_views(&mut self) -> Option<TrainingViews> {
         let t0 = Instant::now();
-        if self.fencing() > 0 {
+        if self.fencing() > 0 || self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
         if self.curve_cache.as_ref().is_none_or(|c| c.model_gen != self.model_gen) {

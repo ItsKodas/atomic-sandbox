@@ -161,6 +161,7 @@ pub(crate) fn model() -> ModelStatus {
         pending_refit: false,
         epoch: 3,
         fit: Some((271, 40, 2.1e-6, 1.6e-5)),
+        body4_degree: None,
         residuals: None,
         force_bound: 2e-3,
         provenance_mismatch: None,
@@ -2548,7 +2549,7 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
     use sim::activity::{TrustCheck, TrustKey as K};
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
-    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise, audit]
         .into_iter()
         .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0, worst: None })
         .collect()
@@ -4513,6 +4514,7 @@ mod activity_words {
             "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
         );
         assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Misfit), None, RowCtx::default()), "the model was not trusted then: too many training samples it could not reproduce");
     }
 
     /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
@@ -4554,12 +4556,16 @@ mod activity_words {
     #[test]
     fn every_rule_and_outcome_is_worded() {
         use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
-        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::NearMisfit, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
             assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
         }
-        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }, sim::activity::TeachOutcome::MisfitDisagrees] {
             assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
         }
+        // the misfit fence's words (spec 2026-11-13 §4.3): the refusal is never silent
+        assert_eq!(rule_label(sim::activity::TeachRule::NearMisfit, None), "misfit");
+        assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
+        assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
     }
 }
 
@@ -4876,6 +4882,16 @@ mod activity_trust {
         assert_eq!(mha(0.0), "0");
     }
 
+    /// Spec 2026-11-13 §4.3: the misfit row reads as the training samples the model cannot
+    /// reproduce, the count against 10 % of the fitted samples.
+    #[test]
+    fn the_misfit_line_counts_the_samples_it_cannot_reproduce() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3, worst: None };
+        assert_eq!(trust_line(&c, AuditSeen::Never, 20), "Few training samples it cannot reproduce — 3 of at most 12.3 (10 % of the fitted samples)");
+    }
+
     /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
     /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
     /// by default.
@@ -4974,6 +4990,8 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // open-shell model (the energy half of C1): the energy RMS with the misfits counted
+        assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
         // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
@@ -5049,7 +5067,8 @@ mod activity_trust {
     fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
         use sim::activity::TrustKey as K;
         let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+        // the misfit row too (spec 2026-11-13 §4.3): before it, those samples failed the residual rows
+        for key in [K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise] {
             assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
         }
         for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {
@@ -9769,5 +9788,74 @@ mod activity_redesign {
             });
         }
         assert!(checked > 15, "{checked} texts checked");
+    }
+}
+
+/// The open-shell trust work in the restructured Model panel (merge of main, 2026-11-14): a local
+/// refusal next to a misfit sample is the verdict's reason (the long text on hover); the misfit count
+/// is in Health while it is not zero, always in Details; the last fit names a collection's body-4
+/// degree.
+mod model_panel_misfit {
+    use super::super::dock::model::{verdict, Section, Tone};
+    use super::*;
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out.replace('\n', " ")
+    }
+
+    fn misfit_check(value: f64) -> sim::activity::TrustCheck {
+        sim::activity::TrustCheck { key: sim::activity::TrustKey::Misfit, met: true, value, limit: 27.1, worst: None }
+    }
+
+    #[test]
+    fn a_misfit_refusal_and_count_are_placed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let long = "rule misfit: atom 1 is next to training sample #350, which the model cannot reproduce";
+        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None };
+        let m = ModelStatus { readiness: Some(readiness), trust_checks: vec![misfit_check(3.0)], body4_degree: Some(3), ..model() };
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+        snap.dynamics.source = sim::Source::Fallback;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        let v = verdict(&st, &inp);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · near a misfit"));
+        assert!(v.reason.contains("training sample the model can't reproduce") && v.tip.contains(long), "{v:?}");
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("near a misfit") && !t.contains(long), "the long text on hover: {t}");
+        assert!(t.contains("3 of at most 27.1 training samples it can't reproduce"), "Health shows a non-zero count: {t}");
+        // none: not in Health; Details has it, and the body-4 degree on the last fit
+        let m = ModelStatus { trust_checks: vec![misfit_check(0.0)], body4_degree: Some(3), ..model() };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(!t.contains("training samples it can't reproduce"), "{t}");
+        st.model_sections.set(Section::Details, true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("0 of at most 27.1 training samples it can't reproduce") && t.contains("body-4 degree 3"), "{t}");
     }
 }

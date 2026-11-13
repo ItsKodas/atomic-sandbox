@@ -66,6 +66,9 @@ pub struct ModelStatus {
     pub epoch: u64,
     /// The last fit: samples, Q′, rmse E (Ha/atom), rmse F (Ha/Bohr per component).
     pub fit: Option<(usize, usize, f64, f64)>,
+    /// The standing model's body-4 degree D₄ (`sim::TrainableStatus::body4_degree`: a shared
+    /// collection's, grown with its samples); `None` per scene.
+    pub body4_degree: Option<usize>,
     /// The worst training residuals (Ha/atom; Ha/Bohr per component, and that atom's bound).
     pub residuals: Option<(f64, f64, f64)>,
     /// The tightest per-atom force-uncertainty bound at the current forces (Ha/Bohr per
@@ -246,7 +249,8 @@ pub const IMPORT_REFERENCES_NOTE: &str = "imported species are fitted only after
 ///
 /// **Only for a condition of the fit the box samples are in** (activity plan review S15): the
 /// first unmet [`TrustKey`](sim::activity::TrustKey) must be the training energies, the training
-/// forces or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
+/// forces, the training samples the fit cannot reproduce (`Misfit`: before it, those samples
+/// failed the residual rows) or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
 /// Sample more cures it, whatever the box does, M6 final re-review), nor for a failed audit
 /// (`Audit`, `AuditForces`: judged against a fresh teacher answer that is not box-affected).
 /// Keyed on the check list the provider exports, no longer on the refusal's wording.
@@ -260,7 +264,7 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
         .trust_checks
         .iter()
         .find(|c| !c.met)
-        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::ForceNoise));
+        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::Misfit | TrustKey::ForceNoise));
     (m.fitted && !m.trusted && fit_condition && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
 
@@ -283,6 +287,13 @@ pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: us
     } else {
         line
     }
+}
+
+/// The Model tab's "last fit" line: "N samples, Q′ q: rmse e Ha/atom, f Ha/Bohr", and
+/// ", body-4 degree d" for a collection's basis (spec 2026-11-13 §4.1).
+pub fn last_fit_line((n, q, e, f): (usize, usize, f64, f64), body4_degree: Option<usize>) -> String {
+    let d4 = body4_degree.map_or(String::new(), |d| format!(", body-4 degree {d}"));
+    format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr{d4}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,6 +799,7 @@ impl Worker {
             pending_refit: st.pending_refit,
             epoch: st.epoch,
             fit: st.fit,
+            body4_degree: st.body4_degree,
             residuals: st.residuals,
             force_bound: st.force_bound,
             provenance_mismatch: st.provenance_mismatch,
@@ -874,7 +886,14 @@ impl Worker {
 
 #[cfg(test)]
 mod fit_vs_held_tests {
-    use super::fit_vs_held;
+    use super::{fit_vs_held, last_fit_line};
+
+    /// Spec 2026-11-13 §4.1: a collection's fit line names its body-4 degree; a per-scene one does not.
+    #[test]
+    fn the_last_fit_line_names_a_collections_body4_degree() {
+        assert_eq!(last_fit_line((271, 40, 2.1e-6, 1.6e-5), None), "271 samples, Q′ 40: rmse 2.1e-6 Ha/atom, 1.6e-5 Ha/Bohr");
+        assert_eq!(last_fit_line((612, 468, 2.1e-6, 1.6e-5), Some(3)), "612 samples, Q′ 468: rmse 2.1e-6 Ha/atom, 1.6e-5 Ha/Bohr, body-4 degree 3");
+    }
 
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]

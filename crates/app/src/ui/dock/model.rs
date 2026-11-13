@@ -31,7 +31,7 @@ use super::super::{
     duration_label, probe_rect, search, source_colour, source_label, theme, trust, Action, PanelInput, TrustKind, UiState, AMBER, GREEN, RED, source_tip,
 };
 use crate::scene::model_path;
-use crate::sim::{source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
+use crate::sim::{last_fit_line, source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
 use egui::{vec2, Color32, RichText, Sense, Stroke, Ui};
 use sim::{SamplingPlan, Source};
 
@@ -236,6 +236,10 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
             Verdict { tone: Tone::Warn, headline: "Falling back to DFT · model untrusted".into(), reason, tip }
         }
         TrustKind::Stuck => v(Tone::Warn, "Falling back to DFT here", "Trusted, but it has not answered at this geometry for a while.", tip),
+        TrustKind::NotHere | TrustKind::ClassUntrusted if near(m).is_some() => {
+            let (headline, reason) = near(m).unwrap_or_default();
+            Verdict { tone: Tone::Warn, headline: headline.into(), reason: reason.into(), tip }
+        }
         TrustKind::NotHere | TrustKind::ClassUntrusted => {
             let reason = if !here.is_empty() {
                 format!("This scene has {} the model hasn't learned yet. Everything else here is trusted.", gap_list(&here))
@@ -261,6 +265,30 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
         }
     }
 }
+
+/// A local refusal next to a sample the fit does not stand on (open-shell trust, spec 2026-11-13
+/// §4.3): the strict policy refuses here by the misfit fence (`NearMisfit`) or the quarantine
+/// fence (`NearQuarantine`) — the headline and the short reason.
+fn near(m: &ModelStatus) -> Option<(&'static str, &'static str)> {
+    let r = m.readiness.as_ref().filter(|r| !r.answers)?;
+    match r.rule? {
+        sim::activity::TeachRule::NearMisfit => {
+            Some(("Falling back to DFT here · near a misfit", "This geometry is next to a training sample the model can't reproduce: DFT answers here."))
+        }
+        sim::activity::TeachRule::NearQuarantine => Some(("Falling back to DFT here · near a quarantined sample", "This geometry is next to one the model could not learn: DFT answers here.")),
+        _ => None,
+    }
+}
+
+/// The misfit check (`TrustKey::Misfit`): the check and its line, "3 of at most 12.3 training
+/// samples it can't reproduce"; `None` before a fit.
+fn misfit(m: &ModelStatus) -> Option<(&sim::activity::TrustCheck, String)> {
+    let c = m.trust_checks.iter().find(|c| c.key == sim::activity::TrustKey::Misfit)?;
+    Some((c, format!("{} of at most {:.1} training samples it can't reproduce", c.value as usize, c.limit)))
+}
+
+/// The misfit row's hover.
+const MISFIT_TIP: &str = "the misfit set: fitted training samples the model cannot reproduce within their bound. They stay in the fit; geometries next to one are refused locally (DFT answers there, rule \"misfit\"), and the model stays trusted while they are at most 10 % of the fitted samples. The trust checklist's misfit line names the worst";
 
 /// The untrusted model's rule, for the "no model yet" verdict's hover.
 const ABOUT_UNTRUSTED: &str = "An untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust.";
@@ -337,6 +365,7 @@ fn refusal_words(refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, col
         Some((K::Calibrated, x, _)) => (samples, columns, format!("DFT checks {x:.2}×")),
         Some((K::LooFloor, x, _)) => (samples, columns, format!("left-out {x:.2}×")),
         Some((K::MeasuredEnergy, x, _)) => (samples, columns, format!("DFT energy {x:.2}×")),
+        Some((K::EnergyRms, x, _)) => (samples, columns, format!("energy {x:.1}× avg")),
         None => (samples, columns, format!("{samples} / {columns}")),
     }
 }
@@ -823,7 +852,7 @@ fn health(ui: &mut Ui, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>) {
             Err(_) => " · last refit failed".to_string(),
         });
         match m.fit {
-            Some((_, _, e, f)) => ui.label(RichText::new(format!("rmse {f:.1e} Ha/Bohr{refit}")).monospace().size(11.5)).on_hover_text(format!("rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr per component")),
+            Some(fit @ (_, _, _, f)) => ui.label(RichText::new(format!("rmse {f:.1e} Ha/Bohr{refit}")).monospace().size(11.5)).on_hover_text(last_fit_line(fit, m.body4_degree)),
             None => ui.colored_label(Color32::GRAY, "—"),
         };
     });
@@ -831,6 +860,10 @@ fn health(ui: &mut Ui, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>) {
         let (c, full, short) = audit_words(m);
         ui.colored_label(c, RichText::new(short).size(11.5)).on_hover_text(format!("{full}\n\n{}", audit_tip(m)));
     });
+    // samples the fit cannot reproduce: here only when there are some (else in Details)
+    if let Some((c, line)) = misfit(m).filter(|(c, _)| c.value > 0.0) {
+        row(ui, "misfit", |ui| ui.colored_label(if c.met { theme::INK_DIM } else { AMBER }, RichText::new(line).size(11.5)).on_hover_text(MISFIT_TIP));
+    }
 }
 
 /// The Learned fold: one row per learned environment key (its samples on the right, its verdict
@@ -1478,9 +1511,13 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
     row(ui, "samples", |ui| ui.label(mono(format!("{}{}", m.samples, if m.pending_refit { " (refit pending)" } else { "" }))));
     row(ui, "model epoch", |ui| ui.label(mono(m.epoch.to_string())).on_hover_text("bumped whenever a refit moves the energy surface (the jump is booked into E conserved)"));
     row(ui, "last fit", |ui| match m.fit {
-        Some((n, q, e, f)) => ui.label(mono(format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr"))),
+        Some(fit) => ui.label(mono(last_fit_line(fit, m.body4_degree))),
         None => ui.colored_label(Color32::GRAY, "—"),
     });
+    // the training samples the fit cannot reproduce (the misfit set M, spec 2026-11-13 §4.3)
+    if let Some((c, line)) = misfit(m) {
+        row(ui, "misfit", |ui| ui.colored_label(if c.met { theme::INK } else { AMBER }, mono(line)).on_hover_text(MISFIT_TIP));
+    }
     if let Some(r) = &m.readiness {
         row(ui, "strict here", |ui| {
             let text = if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) };

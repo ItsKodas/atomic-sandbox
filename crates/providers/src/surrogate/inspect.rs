@@ -157,6 +157,9 @@ impl SurrogateKs {
                 None,
             ));
         }
+        if let Some(r) = self.near_misfit_refusal(pos, z) {
+            return Some(r);
+        }
         self.audit_fence_refusal(pos, z)
     }
 
@@ -332,6 +335,11 @@ impl SurrogateKs {
         }
         if !self.near_quarantined_cached(&pos, &z).is_empty() {
             refusals.push("NearQuarantine: within the quarantine radius of a held sample".into());
+        }
+        let near_misfit = self.near_misfit_atoms(&pos, &z);
+        if near_misfit.contains(&true) {
+            let atoms: Vec<usize> = near_misfit.iter().enumerate().filter(|(_, &b)| b).map(|(i, _)| i).collect();
+            refusals.push(format!("NearMisfit: atoms {atoms:?} within the quarantine radius of a training sample the model cannot reproduce"));
         }
         if refusals.is_empty() {
             let _ = writeln!(o, "    → the strict policy ANSWERS here");
