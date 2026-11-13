@@ -6996,6 +6996,222 @@ mod knowledge_map {
         assert!(t.contains("the model as a whole is not trusted yet (max training energy residual"), "{t}");
     }
 
+    // ---- the graph's zoom, pan and Fit (user request 2026-11-14) ----
+
+    /// The Knowledge panel's screenshot map: O and H, with O–O (never seen), O–H and H–H.
+    fn oh_map() -> sim::KnowledgeMap {
+        let mut m = knowledge::fixture_map();
+        m.elements.retain(|e| e.z != 6);
+        m.pairs.retain(|p| p.z.0 != 6 && p.z.1 != 6);
+        for p in m.pairs.iter_mut().filter(|p| p.z == (8, 8)) {
+            (p.samples, p.confidence) = (0, sim::Confidence::Unseen);
+        }
+        m
+    }
+
+    fn oh_snapshot(scene: &Scene) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(oh_map()));
+        snap
+    }
+
+    /// One frame of the panel (1400 wide), checked display only.
+    fn step(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>) {
+        let out = frame(ctx, st, inp, 1400.0, events);
+        assert!(out.commands.is_empty() && out.actions.is_empty(), "the map is display only");
+    }
+
+    fn wheel(lines: f32) -> egui::Event {
+        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, lines), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// A disc's centre and radius from its probed square.
+    fn disc(z: u8) -> (egui::Pos2, f32) {
+        let r = probed_rect(&format!("knowledge-node-{z}"));
+        (r.center(), r.width() / 2.0)
+    }
+
+    /// Presses at `from`, moves by `by` in four steps, releases.
+    fn drag(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, from: egui::Pos2, by: egui::Vec2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(from), pointer(from, true)]);
+        for k in 1..=4 {
+            step(ctx, st, inp, vec![egui::Event::PointerMoved(from + by * (k as f32 / 4.0))]);
+        }
+        step(ctx, st, inp, vec![pointer(from + by, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    fn click_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, at: egui::Pos2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        step(ctx, st, inp, vec![pointer(at, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    /// The wheel over the map zooms about the cursor (the point under it stays put, within 1 pt)
+    /// and the panel does not scroll; elsewhere it leaves the zoom alone. A drag on empty space pans
+    /// and picks nothing; a click on a line still picks it after the pan and the zoom. Fit (and a
+    /// double-click on empty space, and the first frame) frames every node inside the map.
+    #[test]
+    fn the_knowledge_graph_zooms_pans_and_fits() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let map = probed_rect("knowledge-map");
+        let inside = |st: &UiState| {
+            for z in [1, 8] {
+                let (c, r) = disc(z);
+                assert!(map.contains_rect(egui::Rect::from_center_size(c, egui::Vec2::splat(2.0 * r))), "{z} inside {map:?} at zoom {}", st.knowledge.zoom);
+            }
+        };
+        inside(&st);
+        assert!(st.knowledge.fitted.is_some(), "fitted when first shown");
+        // the wheel, near the O node
+        let (o0, _) = disc(8);
+        let at = o0 + egui::vec2(6.0, -4.0);
+        assert!(map.contains(at));
+        let z0 = st.knowledge.zoom;
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at)]);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at), wheel(2.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        let k = st.knowledge.zoom / z0;
+        assert!((k - 1.44).abs() < 1e-3, "two lines of 1.2×: {k}");
+        let (o1, _) = disc(8);
+        let want = at + (o0 - at) * k;
+        assert!(o1.distance(want) < 1.0, "the point under the cursor stays: O at {o1:?}, want {want:?}");
+        assert_eq!(probed_rect("knowledge-map"), map, "the panel did not scroll");
+        // the wheel elsewhere: the zoom stays
+        let away = egui::pos2(map.center().x, map.bottom() + 40.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(away), wheel(-1.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert!((st.knowledge.zoom / z0 - 1.44).abs() < 1e-3, "not over the map: {}", st.knowledge.zoom / z0);
+        // a drag on empty space (the map's bottom-left corner) pans and picks nothing
+        let pick = st.knowledge.pick;
+        let pan0 = st.knowledge.pan;
+        let (o1, _) = disc(8);
+        drag(&ctx, &mut st, &inp, map.left_bottom() + egui::vec2(10.0, -10.0), egui::vec2(-40.0, 0.0));
+        let moved = st.knowledge.pan - pan0;
+        assert!((moved.x + 40.0).abs() < 1.0 && moved.y.abs() < 1.0, "panned by the drag: {moved:?}");
+        assert_eq!(st.knowledge.pick, pick, "a pan picks nothing");
+        let (o2, _) = disc(8);
+        assert!((o2 - o1 - egui::vec2(-40.0, 0.0)).length() < 1.0, "O moved with it");
+        // after the pan and the zoom, a click on the O–H line (between the two nodes, off its label) picks it
+        let ((h, rh), (o, ro)) = (disc(1), disc(8));
+        let label = probed_rect("knowledge-pair-1-8");
+        let on_line = (1..20)
+            .map(|k| h + (o - h) * (k as f32 / 20.0))
+            .find(|q| map.contains(*q) && q.distance(h) > rh + 4.0 && q.distance(o) > ro + 4.0 && !label.expand(2.0).contains(*q))
+            .expect("a free point of the line in the map");
+        click_at(&ctx, &mut st, &inp, on_line);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "the line is still clickable");
+        // Fit, from far out and panned away
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(260.0, -90.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        click_widget(&ctx, &mut st, &inp, "knowledge-fit");
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "Fit keeps the pick");
+        // a double-click on empty space fits too (zoomed out, the nodes pushed off to the right)
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(300.0, 0.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        let corner = map.left_bottom() + egui::vec2(10.0, -10.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(corner), pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        // not refitted on a refresh of the same map; refitted when an element joins; reset with a new scene
+        st.knowledge.zoom = 2.0;
+        st.activity.absorb(&snap);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert_eq!(st.knowledge.zoom, 2.0, "the same elements: no refit");
+        let full = with_map(&scene, model());
+        st.activity.absorb(&full);
+        step(&ctx, &mut st, &input(&scene, Some(&full), &cam), vec![]);
+        assert!(st.knowledge.zoom != 2.0 && st.knowledge.fitted.as_deref() == Some(&[1, 6, 8][..]), "C joined: fitted again");
+        st.knowledge.zoom = 3.0;
+        act(&mut st, &inp, Action::Preset("h2".into()));
+        assert_eq!((st.knowledge.zoom, st.knowledge.pan, st.knowledge.fitted.clone()), (1.0, egui::Vec2::ZERO, None), "a new scene resets the view");
+    }
+
+    /// Every text the map paints (its painter clips to the map): (text, font size).
+    fn map_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, map: egui::Rect) -> Vec<(String, f32)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.job.sections[0].format.font_id.size)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        full.shapes.iter().filter(|c| map.expand(1.0).contains_rect(c.clip_rect)).for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// The pair labels sit clear of every node disc (the screenshot's map: "O–O · never" sat on
+    /// the O node, the loop labels on their loops), and the text keeps its size at 0.5× and 4×.
+    #[test]
+    fn the_knowledge_graph_labels_clear_the_nodes_and_keep_their_size() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let discs = [disc(1), disc(8)];
+        for (a, b) in [(1, 1), (1, 8), (8, 8)] {
+            let r = probed_rect(&format!("knowledge-pair-{a}-{b}"));
+            for (z, (c, rad)) in [1, 8].into_iter().zip(discs) {
+                assert!(r.distance_to_pos(c) > rad, "the {a}–{b} label {r:?} clears node {z} ({c:?}, r {rad})");
+            }
+        }
+        let map = probed_rect("knowledge-map");
+        let at_1 = map_texts(&ctx, &mut st, &inp, map);
+        for want in ["O", "H", "O–H · trusted", "O–O · never", "H–H · thin", "880 atoms"] {
+            assert!(at_1.iter().any(|t| t.0 == want), "{want:?} in {at_1:?}");
+        }
+        for zoom in [0.5, 4.0] {
+            st.knowledge.zoom = zoom;
+            st.knowledge.pan = egui::Vec2::ZERO;
+            for _ in 0..2 {
+                step(&ctx, &mut st, &inp, vec![]);
+            }
+            let now = map_texts(&ctx, &mut st, &inp, map);
+            for (text, size) in &at_1 {
+                if let Some((_, s)) = now.iter().find(|t| &t.0 == text) {
+                    assert_eq!(s, size, "{text:?} at {zoom}×");
+                } else {
+                    assert!(zoom < 1.0 && text.contains('·'), "{text:?} drawn at {zoom}× (only crowded pair labels may fade out)");
+                }
+            }
+            assert!(now.iter().any(|t| t.0 == "O") && now.iter().any(|t| t.0 == "H"), "the node letters stay at {zoom}×");
+        }
+    }
+
     #[test]
     fn the_knowledge_overlay_is_display_only_and_kept_in_the_profile() {
         let scene = chain();

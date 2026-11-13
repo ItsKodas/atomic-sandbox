@@ -674,7 +674,7 @@ pub struct UiState {
     /// default; display only, not recorded; kept in the profile.
     pub show_knowledge: bool,
     /// The knowledge map's own view state (`knowledge::KnowledgeView`: the picked pair or element,
-    /// the pop-out window). Display only.
+    /// the graph's zoom and pan). Display only.
     pub knowledge: knowledge::KnowledgeView,
     /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
     pub motion_blur: f32,
@@ -1064,6 +1064,8 @@ impl UiState {
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
     /// Takes a new scene's grid as the pending grid and its box as the one quality changes keep.
     pub(crate) fn adopt(&mut self, scene: &Scene) {
+        // the knowledge map's zoom and pan belong to the scene shown
+        self.knowledge.reset_view();
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
         self.box_len = crate::quality::box_len(scene);

@@ -10,6 +10,9 @@
 //!   what the open scene asks (each pair within r_cut, its distances taught / thinly / never), and
 //!   the detail of the picked pair (its distance histogram with the "asked now" ticks and the
 //!   environment keys behind its verdict) or element (its neighbour counts and bond angles).
+//!   The graph zooms (wheel, about the cursor), pans (drag) and fits (its Fit button, a
+//!   double-click on empty space, by itself when an element joins); its text keeps its size and
+//!   its pair labels sit beside their lines, clear of the nodes ([`graph`]).
 //!   A wide panel (a wide leaf, or a detached window) lays the map out in two columns. Its old
 //!   pop-out window is gone (docking spec D-5): detaching the panel to an OS window (docking D3)
 //!   does that job;
@@ -49,10 +52,31 @@ pub enum Pick {
     Element(u8),
 }
 
-/// The map's own view state (display only): the pick.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// The map's own view state (display only, not an `Action`, not recorded): the pick, and the
+/// graph's zoom and pan (user request 2026-11-14; reset on a new scene, `UiState::adopt`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct KnowledgeView {
     pub pick: Pick,
+    /// × the base layout, [`ZOOM_MIN`]–[`ZOOM_MAX`]; about the map's centre, then `pan` (points).
+    pub zoom: f32,
+    pub pan: Vec2,
+    /// The elements the view was last fitted to (it fits again when that set changes) and the
+    /// zoom that fit gave (zoomed out past it, crowded pair labels fade).
+    pub fitted: Option<Vec<u8>>,
+    pub fit_zoom: f32,
+}
+
+impl Default for KnowledgeView {
+    fn default() -> Self {
+        KnowledgeView { pick: Pick::None, zoom: 1.0, pan: Vec2::ZERO, fitted: None, fit_zoom: 1.0 }
+    }
+}
+
+impl KnowledgeView {
+    /// A new scene: the graph fits itself again on its next frame (the pick is kept).
+    pub fn reset_view(&mut self) {
+        *self = KnowledgeView { pick: self.pick, ..Default::default() };
+    }
 }
 
 /// How a distance is covered (module doc, "Bins and asked distances").
@@ -361,21 +385,169 @@ fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (a + ab * t).distance(p)
 }
 
+/// The graph's zoom range (× the base layout).
+pub const ZOOM_MIN: f32 = 0.25;
+pub const ZOOM_MAX: f32 = 8.0;
+/// The zoom factor per wheel line (a pixel wheel's 50 points count as a line).
+const WHEEL_STEP: f32 = 1.2;
+/// Room (points) Fit leaves round the nodes, and below them for their "atoms" line.
+const FIT_MARGIN: f32 = 14.0;
+const FIT_BELOW: f32 = 16.0;
+/// Fit never magnifies past this (one element alone would fill the map).
+const FIT_MAX: f32 = 1.25;
+/// The Fit button (top right of the map).
+const FIT_BUTTON: Vec2 = vec2(30.0, 18.0);
+
+/// The view's transform: a base-layout point on screen (zoom about the map's centre `o`, then pan).
+fn to_screen(v: &KnowledgeView, o: Pos2, q: Pos2) -> Pos2 {
+    o + v.pan + (q - o) * v.zoom
+}
+
+/// Zooms by `factor` about the screen point `at` (it stays where it is), within the zoom range.
+pub(crate) fn zoom_about(v: &mut KnowledgeView, o: Pos2, at: Pos2, factor: f32) {
+    let zoom = (v.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+    let ratio = zoom / v.zoom;
+    v.pan = (at - o) - (at - o - v.pan) * ratio;
+    v.zoom = zoom;
+}
+
+/// What Fit frames, in base-layout coordinates: every node disc and every same-element loop.
+fn extent(map: &KnowledgeMap, base: &[(u8, Pos2, f32)], middle: Pos2) -> Rect {
+    let mut r = Rect::NOTHING;
+    for &(_, at, rad) in base {
+        r = r.union(Rect::from_center_size(at, Vec2::splat(2.0 * rad)));
+    }
+    for q in map.pairs.iter().filter(|q| q.z.0 == q.z.1) {
+        if let Some(&(_, at, rad)) = base.iter().find(|n| n.0 == q.z.0) {
+            let (c, lr) = loop_of(at, rad, middle);
+            r = r.union(Rect::from_center_size(c, Vec2::splat(2.0 * lr)));
+        }
+    }
+    r
+}
+
+/// Fit: the zoom and pan that frame [`extent`] inside `rect` (its margins, the "atoms" line under
+/// the nodes), at most [`FIT_MAX`].
+fn fit(v: &mut KnowledgeView, ext: Rect, rect: Rect) {
+    let o = rect.center();
+    let room = vec2(rect.width() - 2.0 * FIT_MARGIN, rect.height() - 2.0 * FIT_MARGIN - FIT_BELOW).max(Vec2::splat(1.0));
+    let zoom = (room.x / ext.width().max(1.0)).min(room.y / ext.height().max(1.0)).clamp(ZOOM_MIN, FIT_MAX);
+    let target = o - vec2(0.0, FIT_BELOW / 2.0);
+    v.zoom = zoom;
+    v.pan = target - o - (ext.center() - o) * zoom;
+    v.fit_zoom = zoom;
+}
+
+/// A pair label's place beside its line `a`–`b`: the first of a few spots along it (the middle
+/// first), on either side, whose rect (`size`, moved inside `bounds`) is clear of every disc in
+/// `avoid` and every label already placed; else the middle of the line. Deterministic; no force
+/// layout. Returns the rect and whether it is clear.
+fn beside(a: Pos2, b: Pos2, size: Vec2, bounds: Rect, avoid: &[(Pos2, f32)], placed: &[Rect]) -> (Rect, bool) {
+    let d = (b - a).normalized();
+    let n = d.rot90();
+    let half = size / 2.0;
+    let off = n.x.abs() * half.x + n.y.abs() * half.y + 3.0;
+    for t in [0.5, 0.38, 0.62, 0.26, 0.74] {
+        for side in [1.0, -1.0] {
+            let r = within(Rect::from_center_size(a + (b - a) * t + n * side * off, size), bounds);
+            if clear(r, avoid, placed) {
+                return (r, true);
+            }
+        }
+    }
+    (within(Rect::from_center_size(a + (b - a) * 0.5, size), bounds), false)
+}
+
+/// A loop's label: outside the loop (`c`, radius `lr`), along `out` (away from its node) or, where
+/// that meets a disc or a label, turned from it by 45°, 90°, 135° either way, then a little
+/// farther out — the first that is clear; else along `out`. Each spot is moved inside `bounds` first (a loop at the map's edge).
+fn outside(c: Pos2, lr: f32, out: Vec2, size: Vec2, bounds: Rect, avoid: &[(Pos2, f32)], placed: &[Rect]) -> (Rect, bool) {
+    let half = size / 2.0;
+    let at = |d: Vec2, gap: f32| Rect::from_center_size(c + d * (lr + gap + d.x.abs() * half.x + d.y.abs() * half.y), size);
+    let turn = |deg: f32| {
+        let (s, k) = deg.to_radians().sin_cos();
+        vec2(out.x * k - out.y * s, out.x * s + out.y * k)
+    };
+    for gap in [4.0, 14.0, 24.0] {
+        for deg in [0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0] {
+            let r = within(at(turn(deg), gap), bounds);
+            if clear(r, avoid, placed) {
+                return (r, true);
+            }
+        }
+    }
+    (within(at(out, 4.0), bounds), false)
+}
+
+/// `r` moved (not resized) to lie inside `bounds` where it fits.
+fn within(r: Rect, bounds: Rect) -> Rect {
+    let dx = (bounds.left() - r.left()).max(0.0) + (bounds.right() - r.right()).min(0.0);
+    let dy = (bounds.top() - r.top()).max(0.0) + (bounds.bottom() - r.bottom()).min(0.0);
+    r.translate(vec2(dx, dy))
+}
+
+fn clear(r: Rect, avoid: &[(Pos2, f32)], placed: &[Rect]) -> bool {
+    avoid.iter().all(|&(c, rad)| r.distance_to_pos(c) > rad + 2.0) && placed.iter().all(|p| !p.expand(2.0).intersects(r))
+}
+
 /// The graph (module doc): nodes, lines and loops, labels; a click on a line, a label or a node
-/// picks it.
+/// picks it. The view zooms with the wheel about the cursor (only while the pointer is over the
+/// map: elsewhere the panel scrolls), pans with a drag (a click without moving still picks), and
+/// Fit (its button, a double-click on empty space; by itself when first shown and when an element
+/// joins) frames every node. Geometry scales with the zoom; the text keeps its size, and pair
+/// labels fade out when zoomed out past the fit so far that they would overlap.
 fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
-    let (rect, bg) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, bg) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    super::probe("knowledge-map", &bg);
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, Color32::from_black_alpha(50));
-    let nodes = layout(map, rect);
-    let middle = rect.center() + vec2(0.0, 6.0);
+    let o = rect.center();
+    let base = layout(map, rect);
+    let base_middle = rect.center() + vec2(0.0, 6.0);
+    let ext = extent(map, &base, base_middle);
+    // auto-fit: first shown, or a new set of elements (not on every refresh of the same map)
+    let zs: Vec<u8> = base.iter().map(|n| n.0).collect();
+    if st.knowledge.fitted.as_deref() != Some(&zs[..]) {
+        fit(&mut st.knowledge, ext, rect);
+        st.knowledge.fitted = Some(zs);
+    }
+    // the wheel, over the map only (taken from the panel's scroll then)
+    if ui.rect_contains_pointer(rect) {
+        let (lines, at) = ui.input_mut(|i| {
+            let lines: f32 = i
+                .events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Point => delta.y / 50.0,
+                        egui::MouseWheelUnit::Page => delta.y * 10.0,
+                    },
+                    _ => 0.0,
+                })
+                .sum();
+            i.smooth_scroll_delta = Vec2::ZERO;
+            (lines, i.pointer.hover_pos())
+        });
+        if let (true, Some(at)) = (lines != 0.0, at) {
+            zoom_about(&mut st.knowledge, o, at, WHEEL_STEP.powf(lines));
+        }
+    }
+    // a drag pans (a click, which moves less than egui's drag threshold, still picks below)
+    if bg.dragged() {
+        st.knowledge.pan += bg.drag_delta();
+    }
+    let v = st.knowledge.clone();
+    let nodes: Vec<(u8, Pos2, f32, f32)> = base.iter().map(|&(z, at, r)| (z, to_screen(&v, o, at), r * v.zoom, r)).collect();
+    let middle = to_screen(&v, o, base_middle);
     let node = |z: u8| nodes.iter().find(|n| n.0 == z).map(|n| (n.1, n.2));
     let most = map.pairs.iter().map(|q| q.samples).max().unwrap_or(1).max(1) as f32;
-    let picked = st.knowledge.pick;
+    let picked = v.pick;
     let font = FontId::monospace(10.0);
-    // the lines (and loops) under the nodes; each with its label's place
-    let mut labels: Vec<((u8, u8), Pos2, String, Color32)> = Vec::new();
+    // the lines (and loops) under the nodes; each with its label
+    let mut labels: Vec<((u8, u8), String, Color32, Option<(Pos2, Pos2)>, Option<(Pos2, f32, Vec2)>)> = Vec::new();
     let mut shapes: Vec<(u8, u8, Option<(Pos2, Pos2)>, Option<(Pos2, f32)>)> = Vec::new();
+    let mut avoid: Vec<(Pos2, f32)> = nodes.iter().map(|n| (n.1, n.2)).collect();
     for q in &map.pairs {
         let (Some((a, ra)), Some((b, _))) = (node(q.z.0), node(q.z.1)) else { continue };
         let colour = confidence_colour(q.confidence);
@@ -403,8 +575,9 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
                 p.add(Shape::line(pts, stroke));
             }
             let out = (c - a).normalized();
-            labels.push((q.z, c + out * (lr + 10.0), label, colour));
+            labels.push((q.z, label, colour, None, Some((c, lr, out))));
             shapes.push((q.z.0, q.z.1, None, Some((c, lr))));
+            avoid.push((c, lr));
         } else {
             if on {
                 p.line_segment([a, b], halo);
@@ -414,13 +587,13 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
             } else {
                 p.line_segment([a, b], stroke);
             }
-            labels.push((q.z, a + (b - a) * 0.5, label, colour));
+            labels.push((q.z, label, colour, Some((a, b)), None));
             shapes.push((q.z.0, q.z.1, Some((a, b)), None));
         }
     }
-    // the nodes
+    // the nodes (their letters and counts at a fixed size: the base radius's, not the zoom's)
     let mut hits: Vec<(Pick, egui::Response)> = Vec::new();
-    for &(z, at, r) in &nodes {
+    for &(z, at, r, r0) in &nodes {
         let [cr, cg, cb] = render::elements::colour_srgb(z);
         let fill = Color32::from_rgb(cr, cg, cb);
         if picked == Pick::Element(z) {
@@ -428,46 +601,78 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
         }
         p.circle(at, r, fill, Stroke::new(1.0, Color32::from_white_alpha(64)));
         let light = 0.299 * cr as f32 + 0.587 * cg as f32 + 0.114 * cb as f32 > 150.0;
-        p.text(at, Align2::CENTER_CENTER, sym(z), FontId::proportional((r * 0.9).clamp(11.0, 17.0)), if light { Color32::from_rgb(23, 17, 42) } else { Color32::WHITE });
+        p.text(at, Align2::CENTER_CENTER, sym(z), FontId::proportional((r0 * 0.9).clamp(11.0, 17.0)), if light { Color32::from_rgb(23, 17, 42) } else { Color32::WHITE });
         let seen = map.element(z).map_or(0, |e| e.atoms_seen);
         p.text(at + vec2(0.0, r + 3.0), Align2::CENTER_TOP, format!("{seen} atoms"), font.clone(), theme::INK_DIM);
-        let resp = ui.interact(Rect::from_center_size(at, Vec2::splat(2.0 * r)), ui.id().with(("knowledge-node", z)), Sense::click());
+        let resp = ui.interact(Rect::from_center_size(at, Vec2::splat(2.0 * r)).intersect(rect), ui.id().with(("knowledge-node", z)), Sense::click());
         super::probe(&format!("knowledge-element-{z}"), &resp);
+        super::probe_rect(&format!("knowledge-node-{z}"), Rect::from_center_size(at, Vec2::splat(2.0 * r)));
         hits.push((Pick::Element(z), resp.on_hover_text(format!("{}: {seen} atoms in the fitted samples — click for its neighbours and bond angles", sym(z)))));
     }
-    // the labels, over the nodes
-    for (z, at, text, colour) in labels {
+    // the labels, clear of the nodes and loops where they can be; zoomed out past the fit so far
+    // that they would overlap, they fade out (the lines and the node letters stay)
+    let mut placed: Vec<(Rect, (u8, u8), std::sync::Arc<egui::Galley>, Color32)> = Vec::new();
+    let mut crowded = false;
+    for (z, text, colour, seg, lp) in labels {
         let g = p.layout_no_wrap(text, font.clone(), colour);
-        let r = Rect::from_center_size(at, g.size() + vec2(8.0, 4.0));
-        p.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(13, 12, 18, 215));
-        p.galley(r.min + vec2(4.0, 2.0), g, colour);
-        let resp = ui.interact(r, ui.id().with(("knowledge-pair", z)), Sense::click());
-        super::probe(&format!("knowledge-pair-{}-{}", z.0, z.1), &resp);
-        hits.push((Pick::Pair(z.0, z.1), resp));
+        let size = g.size() + vec2(8.0, 4.0);
+        let rects: Vec<Rect> = placed.iter().map(|l| l.0).collect();
+        let (r, ok) = match (seg, lp) {
+            (Some((a, b)), _) => beside(a, b, size, rect.shrink(2.0), &avoid, &rects),
+            (_, Some((c, lr, out))) => outside(c, lr, out, size, rect.shrink(2.0), &avoid, &rects),
+            _ => continue,
+        };
+        crowded |= !ok && rects.iter().any(|q| q.intersects(r));
+        placed.push((r, z, g, colour));
+    }
+    let fade = crowded && v.zoom < v.fit_zoom - 1e-3;
+    let alpha = ui.ctx().animate_bool_with_time(ui.id().with("knowledge-labels"), !fade, 0.15);
+    if alpha > 0.05 {
+        for (r, z, g, colour) in placed {
+            p.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(13, 12, 18, 215).gamma_multiply(alpha));
+            p.galley(r.min + vec2(4.0, 2.0), g, colour.gamma_multiply(alpha));
+            let resp = ui.interact(r.intersect(rect), ui.id().with(("knowledge-pair", z)), Sense::click());
+            super::probe(&format!("knowledge-pair-{}-{}", z.0, z.1), &resp);
+            hits.push((Pick::Pair(z.0, z.1), resp));
+        }
+    }
+    // Fit: a small button in the top-right corner
+    let fit_rect = Rect::from_min_size(pos2(rect.right() - FIT_BUTTON.x - 4.0, rect.top() + 4.0), FIT_BUTTON);
+    let fit_resp = ui.interact(fit_rect, ui.id().with("knowledge-fit"), Sense::click());
+    super::probe("knowledge-fit", &fit_resp);
+    p.rect(fit_rect, 4.0, if fit_resp.hovered() { theme::PANEL_3 } else { theme::PANEL_2 }, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+    p.text(fit_rect.center(), Align2::CENTER_CENTER, "Fit", FontId::proportional(10.5), theme::INK_DIM);
+    if fit_resp.on_hover_text("frame every element (also: double-click empty space); wheel zooms about the cursor, drag pans").clicked() {
+        fit(&mut st.knowledge, ext, rect);
     }
     for (pick, r) in &hits {
         if r.clicked() {
             st.knowledge.pick = *pick;
         }
     }
-    // a click on a line itself (not its label)
+    // a click on a line itself (not its label); a double-click away from every line fits
+    let near_line = |at: Pos2| {
+        shapes
+            .iter()
+            .map(|&(a, b, seg, lp)| {
+                let d = match (seg, lp) {
+                    (Some((p0, p1)), _) => seg_dist(at, p0, p1),
+                    (_, Some((c, lr))) => (at.distance(c) - lr).abs(),
+                    _ => f32::INFINITY,
+                };
+                (d, a, b)
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .filter(|x| x.0 < 8.0)
+    };
     if bg.clicked() {
-        if let Some(at) = bg.interact_pointer_pos() {
-            let best = shapes
-                .iter()
-                .map(|&(a, b, seg, lp)| {
-                    let d = match (seg, lp) {
-                        (Some((p0, p1)), _) => seg_dist(at, p0, p1),
-                        (_, Some((c, lr))) => (at.distance(c) - lr).abs(),
-                        _ => f32::INFINITY,
-                    };
-                    (d, a, b)
-                })
-                .min_by(|x, y| x.0.total_cmp(&y.0));
-            if let Some((_, a, b)) = best.filter(|x| x.0 < 8.0) {
-                st.knowledge.pick = Pick::Pair(a, b);
-            }
+        if let Some((_, a, b)) = bg.interact_pointer_pos().and_then(near_line) {
+            st.knowledge.pick = Pick::Pair(a, b);
         }
+    }
+    // (a third quick click counts too: egui reports it as a triple)
+    if (bg.double_clicked() || bg.triple_clicked()) && bg.interact_pointer_pos().is_some_and(|at| near_line(at).is_none()) {
+        fit(&mut st.knowledge, ext, rect);
     }
 }
 
