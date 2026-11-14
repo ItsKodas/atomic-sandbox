@@ -1106,9 +1106,10 @@ printed six-decimal E and F, so it carries ±1e-6 of rounding. The two lopsided 
   - |d(TS)/dx| ≥ 2 mHa/Bohr;
   - the plain |FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr.
   - [kT-5] At kT = 5 mHa the admissible window of c = dΔ/dx widens to about [4.4e-3, 0.13] Ha/Bohr (the TS condition
-    does not depend on kT; F‴ ~ 0.2c³/(kT)² is 25× smaller at a given c). The near-square aspect moves accordingly.
+    does not depend on kT; F‴ ≤ 0.048·c³/(kT)² is 25× smaller at a given c). The near-square aspect moves accordingly.
 
-  The two pull in opposite directions: d(TS)/dx ≤ 0.45·c while F‴ ~ 0.2·c³/(kT)², with c = dΔ/dx. At kT = 1e-3 any c
+  The two pull in opposite directions: d(TS)/dx ≤ 0.45·c while F‴ ≤ 0.048·c³/(kT)² (the earlier 0.2 was the canonical
+  two-state form, 4× conservative; the pre-registered window [5e-3, 1e-1] is unchanged), with c = dΔ/dx. At kT = 1e-3 any c
   between 5e-3 and 5e-2 Ha/Bohr met both; at 5 mHa the scan and its fallback use c ∈ [5e-3, 1e-1] Ha/Bohr (preflight
   F15; plan Tasks 3 and 6), inside the window above with margin below 0.13. A1 also checks that the whole 4δ span of the stencil lies in that regime.
 - **Method.** Central differences at δ/2 = 0.005, δ = 0.01 and 2δ = 0.02 Bohr along one atom's in-plane coordinate,
@@ -1119,13 +1120,15 @@ printed six-decimal E and F, so it carries ±1e-6 of rounding. The two lopsided 
   - A ratio window alone does not do it: at r = 5 the Richardson residual is still a third of the plain error.
 - **The δ-scaling check** asserts (FD(2δ) − HF)/(FD(δ) − HF) ∈ [3, 5], i.e. that the plain FD error is the δ² term, so
   that δ resolves the TS swing. It is asserted only when |FD(δ) − HF| ≥ 1e-5 Ha/Bohr; below that the ratio is noise.
-  - Near a pinned pair, F contains −kT ln(2 cosh(Δ/2kT)) per channel. Its third derivative scales as c³/(kT)², so a
-    plain FD(0.01) can be off by ~2e-3, 20× the bound, on truncation alone.
+  - Near a pinned pair, F contains −2kT ln(2 cosh(Δ/4kT)) per channel (FD occupations); its third derivative is
+    sech²u·tanh u·c³/(8kT²) for two channels (u = Δ/4kT), at most 0.048·c³/(kT)². (Historical: the earlier example,
+    a plain FD(0.01) off by ~2e-3 on truncation alone, was computed with the 4× canonical form at kT = 1e-3; with
+    0.048 it is ~5e-4, still 5× the bound.)
   - **[A1, review fix round 1] Pre-registered for the A1 candidate** (H₄ 1.8 × 1.95, measured F‴ ≈ 0.58 Ha/Bohr³ on the
     GPU): the plain truncation e = F‴δ²/6 ≈ 1e-5 Ha/Bohr, so the δ-scaling check sits at its own 1e-5 gate. Task 6
     records e (= FD_F(δ) − R_F(δ/2, δ)) and the offset b = HF − R_F(δ/2, δ) separately. With them the ratio is
-    (4e − b)/(e − b), which stays in [3, 5] only while |b| ≲ 3e-6 (for e ≈ 1e-5: −e/2 ≤ b ≤ e/4). **If |b| > 3e-6,
-    that is a spec decision for the user, never a re-pin** of the window or the gate.
+    (4e − b)/(e − b), which stays in [3, 5] exactly when −e/2 ≤ b ≤ e/4 (for e > b). **If the ratio check is asserted and b lies outside [−e/2, e/4], stop and report:** that is a spec decision
+    for the user, never a re-pin of the window or the gate.
 - **Must show both, on the Richardson value:**
   - |HF_x + dF/dx|_Rich ≤ 1e-4 Ha/Bohr (the "M7 forces" bound, which is defined on Richardson);
   - |HF_x + dE/dx|_Rich ≥ 5e-4 Ha/Bohr, so the test tells F's derivative from E's.

@@ -4481,8 +4481,8 @@ displaced along x.** Frontier splitting Δ = 12.93 mHa (u = Δ/4kT = 0.65); c = 
 d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over the 4δ span (= −u sech²u · c to 3 digits); plain |FD(0.01) − FD(0.02)| =
 2.9e-5 Ha/Bohr; HF − R_E(δ/2, δ) = −2.27e-2 Ha/Bohr. The GPU Richardson pair (|R(δ/2, δ) − R(δ, 2δ)| = 2.3e-5) is at the
 f32 floor; the CPU test certifies it. Pre-registered (spec §9 V3): the measured F‴ ≈ 0.58 Ha/Bohr³ puts the plain
-truncation e ≈ 1e-5 at the δ-scaling check's own gate; Task 6 records e and b = HF − R_F separately, and |b| > 3e-6
-is a spec decision, never a re-pin.
+truncation e ≈ 1e-5 at the δ-scaling check's own gate; Task 6 records e and b = HF − R_F separately; if the ratio check
+is asserted and b lies outside [−e/2, e/4], that is a spec decision, never a re-pin.
 
 **V5 NVE case: CO₂⁺, not N₃.** Pseudised N₃ (71³ × 0.20) is linear ²Π_g (R_e 2.224 Bohr, TS = 2 kT ln 2 within 1e-9,
 k_β = 0.128 Ha/rad², ω_b 543 cm⁻¹), but its ↓ π split grows only to 39 mHa at a 60° bend, after which the ↑ channel

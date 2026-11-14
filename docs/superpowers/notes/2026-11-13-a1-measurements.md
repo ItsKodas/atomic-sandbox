@@ -133,17 +133,18 @@ at a = 1.8), and it sits inside the window [5e-3, 1e-1] everywhere; b − a sets
 1.8 × 1.90 ran the same stencil but its +δ warm solve stopped at Δρ 2.1e-6 (tol 1e-6): the f32 floor again, not a
 property of the aspect (its quick scan converged at the same point).
 
-**F‴ (corrected in review fix round 1).** The spec's window estimate 0.2c³/(kT)² is **1.12** Ha/Bohr³ at c = 0.052
-(this note first misstated it as 0.57). That estimate is an upper bound: it comes from −kT ln(2 cosh(Δ/2kT)) per
-channel. The pair's exact free energy, the same F whose temperature derivative reproduces the measured d(TS)/dx to
+**F‴ (corrected in review fix rounds 1 and 2).** The spec's earlier window estimate 0.2c³/(kT)² is **1.12** Ha/Bohr³
+at c = 0.052 (this note first misstated it as 0.57). That estimate used the wrong functional: −kT ln(2 cosh(Δ/2kT))
+per channel is the canonical two-state free energy, not the FD (grand-canonical, μ at mid-gap) one, so it is not
+an FD upper bound but a different function that happens to be 4× larger. The pair's FD free energy, the same F whose temperature derivative reproduces the measured d(TS)/dx to
 3 digits above, is −2kT ln(2 cosh u) per channel with u = Δ/(4kT), whose third derivative in x is
 sech²u·tanh u·c³/(8(kT)²) for the two channels (maximum coefficient 0.048, a quarter of 0.2). At u = 0.65 and
 c = 0.052 that is **0.27** Ha/Bohr³ (checked numerically against a finite difference of the closed form), and 0.07
 for 1.8 × 1.85. The measured 0.58 and 0.49 therefore also hold the bonds' own anharmonicity along x (≈ 0.3–0.4 on
 both aspects), and the GPU plain-FD differences (2.5–2.9e-5) carry ~1e-5 of f32 noise, so the split is not
 resolved here. The measured total, 0.58, is what sets the δ-scaling truncation e = F‴δ²/6 ≈ 1e-5 (spec §9 V3,
-pre-registered in fix round 1). The reviewer's figure "≈ 0.62 at u = 0.65" disagrees with the closed form
-(0.27); flagged in the task report.
+pre-registered in fix round 1). The re-review agreed (0.27); the spec now states F‴ ≤ 0.048·c³/(kT)², and the pre-registered window
+[5e-3, 1e-1] Ha/Bohr is unchanged.
 
 **Candidate (for Task 6 to confirm on the CPU at tol 1e-9): a × b = 1.8 × 1.95 Bohr, atom 0 at (−0.9, −0.975, 0),
 displaced along x** (toward atom 1, which shortens the 1.8 side and widens Δ; c > 0). Centred coordinates:
