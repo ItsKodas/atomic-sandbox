@@ -824,10 +824,15 @@
 //! |ΔE| ≈ 0.9 mHa — inside the model's bound — and was thinned, forever). The mirror of fence voting:
 //! a fresh teacher answer near a geometry whose fencing samples are **all forgotten** that **agrees**
 //! with the model (`agree`, the same test a release uses) is an agreeing vote (`lift_votes`, the
-//! answer with its residual teacher − model and the model generation). When [`FENCE_VOTES`]
-//! consecutive agreeing votes have the same atom count, the same model generation, overlap in the
-//! forgotten samples they were next to and agree with each other (`votes_agree`, on their residuals),
-//! the fence of every forgotten sample those votes were next to is **lifted**: code
+//! answer with its residual teacher − model and the model generation) — but only from a model
+//! fitted **without** them (review Critical 1, 2026-11-14: a Forget sets the code at once while the
+//! refit runs later, and a model still trained on the sample agrees next to it by construction):
+//! no vote is cast, and the run starts over, while a refit is due (`pending_refit`), a background
+//! refit runs, or any of the fencing samples is still a member of the standing fit
+//! (`in_standing_fit`). When [`FENCE_VOTES`] consecutive agreeing votes have the same atom count, the
+//! same model generation, a forgotten sample **every one of them** was next to, and agree with each
+//! other (`votes_agree`, on their residuals), the fence of the forgotten samples all of them were
+//! next to (the intersection — review Important 2: never one a single vote was near) is **lifted**: code
 //! `Q_FORGOTTEN_UNFENCED` (8, persisted like 7 — a collection status record written at once, the
 //! sidecar's `sample_quarantine`; files from before read as not lifted), and the last answer is
 //! kept (`TeachOutcome::FenceLifted`, not thinned) so the region has fresh data; the model answers
@@ -837,7 +842,7 @@
 //! [`FENCE_VOTES`] consistent disagreeing answers keep one, `KeptByVote`); a refit, an install or a
 //! load clears it too (the residuals were the old model's). A fence that also holds a quarantined
 //! sample behaves as before — the agreeing answer releases or supersedes the quarantined part, the
-//! forgotten part keeps fencing, and no lift vote is cast. Rule 8 is untouched: a failed audit is
+//! forgotten part keeps fencing, no lift vote is cast and the run starts over. Rule 8 is untouched: a failed audit is
 //! re-judged at every refit, whatever its sample's code.
 //! **Purge** (2026-11-14, `purge_forgotten`, the `purge` module doc): deletes the forgotten samples
 //! for good — from the store and the shared collection's file — once the refit after the last
@@ -3287,6 +3292,10 @@ impl Trainable for SurrogateKs {
 
     fn purge_refusal(&self) -> Option<String> {
         SurrogateKs::purge_refusal(self)
+    }
+
+    fn forgotten_in_collection(&self) -> usize {
+        SurrogateKs::forgotten_in_collection(self)
     }
 
     fn set_audit_every(&mut self, n: usize) {

@@ -1,10 +1,15 @@
 //! 2026-11-14 (user-approved trust change): a forgotten sample's fence can lift (`surrogate` module
 //! doc, "Lifting a forgotten sample's fence"). `FENCE_VOTES` consecutive, mutually consistent fresh
-//! teacher answers near only-forgotten fencing samples that agree with the model lift the fence of
-//! those samples (code `Q_FORGOTTEN_UNFENCED`): the last answer is kept (`FenceLifted`), the model
-//! answers there again, the samples stay forgotten (Restore still brings them back, and clears the
-//! lift), the state persists, a disagreeing answer breaks the run, a quarantined neighbour behaves as
-//! before, and a purge drops the votes of purged samples. Atomic units throughout.
+//! teacher answers near only-forgotten fencing samples that agree with a model fitted **without**
+//! them lift the fence of the samples every one of those answers was next to (code
+//! `Q_FORGOTTEN_UNFENCED`): the last answer is kept (`FenceLifted`), the model answers there again,
+//! the samples stay forgotten (Restore still brings them back, and clears the lift), the state
+//! persists, a disagreeing answer or a mixed fence breaks the run, no vote is cast while the model
+//! may still hold them (review Critical 1), and a purge drops the votes of purged samples. Atomic
+//! units throughout.
+//!
+//! The steps refit whenever a refit is due, as the paused app's worker does at its next tick
+//! ([`step`]): a kept answer makes one due, and no vote counts until it has run.
 
 use super::*;
 
@@ -31,21 +36,33 @@ fn near_sample(s: &SurrogateKs, k: usize, stretch: f64) -> Scene {
     sc
 }
 
-/// One evaluation at `sc` after an edit: its source and its activity row's outcome.
-fn visit(s: &mut SurrogateKs, sc: &Scene) -> (Source, Option<TeachOutcome>, Vec<String>) {
+/// One evaluation at `sc` after an edit, then the refit a kept answer made due (the paused
+/// worker's next tick): its source, its activity row's outcome and its notes.
+fn step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Option<TeachOutcome>, Vec<String>) {
     s.discontinuity();
     let r = s.evaluate(sc, &mut never()).unwrap();
     let outcome = s.take_events().into_iter().last().map(|e| e.outcome);
+    if s.pending_refit() {
+        s.refit().unwrap();
+    }
     (r.stats.source, outcome, r.stats.notes)
 }
 
-/// The window of exact H₂ Morse samples with sample `k` forgotten and refitted without it.
-fn window_without(k: usize) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+/// The window of exact H₂ Morse samples with `ks` forgotten and refitted without them, and one
+/// agreeing answer next to the first already taken (it is kept — the thinning's first — and
+/// refitted), so the next agreeing answers there are thinned votes, as in the user's session.
+fn window_without(ks: &[usize]) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
-    forget(&mut s, k);
+    for &k in ks {
+        forget(&mut s, k);
+    }
     s.refit().unwrap();
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let sc = near_sample(&s, ks[0], -1e-3);
+    step(&mut s, &sc);
+    assert!(!s.pending_refit() && s.lift_votes.len() <= 1);
+    s.lift_votes.clear();
     (s, h)
 }
 
@@ -55,23 +72,26 @@ fn fence_at(s: &mut SurrogateKs, sc: &Scene) -> Vec<usize> {
     s.near_quarantined(&pos, &z)
 }
 
-/// Three agreeing answers next to a forgotten sample lift its fence: the first two are the
-/// ordinary agreeing answers of before (kept or thinned, the fence stands), the third is kept with
-/// `FenceLifted`; the sample is still forgotten (out of the fit, listed) but fences nothing, and
-/// the model answers there again. Restore then clears the lift.
+fn lifted(o: &Option<TeachOutcome>) -> bool {
+    matches!(o, Some(TeachOutcome::FenceLifted { .. }))
+}
+
+/// Three agreeing answers next to a forgotten sample lift its fence: the first two are thinned
+/// votes (the fence stands), the third is kept with `FenceLifted`; the sample is still forgotten
+/// (out of the fit, listed) but fences nothing, and the model answers there again. Restore then
+/// clears the lift.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn three_agreeing_answers_lift_a_forgotten_fence() {
     let k = 17;
-    let (mut s, _) = window_without(k);
-    let stretches = [0.0, 2e-3, 4e-3];
-    for (j, &x) in stretches.iter().enumerate() {
+    let (mut s, _) = window_without(&[k]);
+    for (j, x) in [0.0, 1e-3, 2e-3].into_iter().enumerate() {
         let sc = near_sample(&s, k, x);
-        assert_eq!(fence_at(&mut s, &sc), vec![k], "the forgotten sample fences (visit {j})");
+        assert_eq!(fence_at(&mut s, &sc), vec![k], "the forgotten sample fences (vote {j})");
         let before = s.samples();
-        let (src, out, notes) = visit(&mut s, &sc);
+        let (src, out, notes) = step(&mut s, &sc);
         assert_eq!(src, Source::Fallback, "{notes:?}");
-        if j + 1 < stretches.len() {
+        if j < 2 {
             assert!(notes.iter().any(|n| n.contains(&format!("agreeing answer {} of {FENCE_VOTES} toward lifting their fence", j + 1))), "{notes:?}");
             assert_eq!(s.quarantine[k], Q_FORGOTTEN);
         } else {
@@ -85,92 +105,180 @@ fn three_agreeing_answers_lift_a_forgotten_fence() {
     assert_eq!(s.forgotten_samples().len(), 1, "still listed for Restore");
     let sc = near_sample(&s, k, 1e-3);
     assert!(!s.fences(k) && fence_at(&mut s, &sc).is_empty(), "no longer fencing");
-    // the model answers there again (a step after the edit's first)
     s.discontinuity();
     s.evaluate(&sc, &mut never()).unwrap();
     let r = s.evaluate(&sc, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
-    // the lift stays out of the fit: a refit does not fit it
     s.refit().unwrap();
     assert_eq!(s.quarantine[k], Q_FORGOTTEN_UNFENCED, "never released by a refit");
     assert_eq!(s.forgotten_in_fit(), 0);
-    // Restore clears the lift with the forget
     let id = s.sample_id(k).unwrap();
     s.restore_sample(id).unwrap();
     assert_eq!((s.quarantine[k], s.forgotten()), (Q_NONE, 0));
 }
 
+/// Review Critical 1: between a Forget and the refit after it the model still holds the sample and
+/// agrees next to it by construction — no vote is cast (a refit is due, or running in the
+/// background, or the sample is still a member of the standing fit), so the fence never lifts in
+/// that window; once the refit has run, the votes count.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn no_vote_while_the_model_may_still_hold_the_forgotten_sample() {
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let k = 17;
+    forget(&mut s, k);
+    assert!(s.pending_refit() && s.in_standing_fit(k), "the premise: the fit still holds it");
+    for x in [0.0, 1e-3, 2e-3, 3e-3] {
+        let sc = near_sample(&s, k, x);
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        let out = s.take_events().into_iter().last().map(|e| e.outcome);
+        assert!(!lifted(&out), "no lift before the refit: {:?}", r.stats.notes);
+        assert!(r.stats.notes.iter().any(|n| n.contains("no vote toward lifting their fence")), "{:?}", r.stats.notes);
+        assert!(s.lift_votes.is_empty());
+    }
+    assert_eq!(s.quarantine[k], Q_FORGOTTEN);
+    // the standing fit's membership alone blocks too (a due refit cleared by hand)
+    s.pending_refit = false;
+    let sc = near_sample(&s, k, 0.0);
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("fitted with them")), "{:?}", r.stats.notes);
+    assert!(s.lift_votes.is_empty());
+    // a background refit running blocks too
+    s.pending_refit = true;
+    s.refit().unwrap();
+    assert!(!s.in_standing_fit(k));
+    s.pending_refit = true;
+    assert!(s.begin_refit_background(), "a background refit starts");
+    let sc = near_sample(&s, k, 0.0);
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("no vote toward lifting their fence")), "{:?}", r.stats.notes);
+    assert!(s.lift_votes.is_empty());
+    s.finish_background_refit();
+}
+
 /// A disagreeing answer breaks the run: two agreeing, one disagreeing (the teacher moved), then two
 /// agreeing again do not lift; a third does. Disagreeing answers alone never lift (they vote as
-/// before, `KeptByVote`), and the forgotten sample stays fencing meanwhile.
+/// before), and the forgotten sample stays fencing meanwhile.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_disagreeing_answer_breaks_the_run() {
     let k = 17;
-    let (mut s, teacher) = window_without(k);
-    let stretch = |j: usize| 1e-3 * j as f64;
+    let (mut s, teacher) = window_without(&[k]);
     let mut j = 0;
-    let mut step = |s: &mut SurrogateKs| {
+    let mut go = |s: &mut SurrogateKs| {
         j += 1;
-        let sc = near_sample(s, k, stretch(j));
-        visit(s, &sc)
+        let sc = near_sample(s, k, 1e-3 * j as f64);
+        step(s, &sc)
     };
-    step(&mut s);
-    step(&mut s);
-    // the teacher disagrees (its well 5 mHa deeper): the run is broken
+    assert!(!lifted(&go(&mut s).1));
+    assert!(!lifted(&go(&mut s).1));
     teacher.lock().unwrap().d += 5e-3;
-    let (_, out, notes) = step(&mut s);
+    let (_, out, notes) = go(&mut s);
     assert_eq!(out, Some(TeachOutcome::FenceDisagrees), "{notes:?}");
     teacher.lock().unwrap().d -= 5e-3;
-    let (_, out, _) = step(&mut s);
-    assert_ne!(out, Some(TeachOutcome::FenceLifted { lifted: 1 }));
-    let (_, out, _) = step(&mut s);
-    assert_ne!(out, Some(TeachOutcome::FenceLifted { lifted: 1 }), "two agreeing since the break");
+    assert!(!lifted(&go(&mut s).1));
+    assert!(!lifted(&go(&mut s).1), "two agreeing since the break");
     assert_eq!(s.quarantine[k], Q_FORGOTTEN, "still fencing");
-    let (_, out, notes) = step(&mut s);
+    let (_, out, notes) = go(&mut s);
     assert_eq!(out, Some(TeachOutcome::FenceLifted { lifted: 1 }), "{notes:?}");
-    // disagreeing answers alone vote as before and never lift
-    let (mut d, teacher) = window_without(k);
+    let (mut d, teacher) = window_without(&[k]);
     teacher.lock().unwrap().d += 5e-3;
-    let mut outs = Vec::new();
     for j in 0..3 {
         let sc = near_sample(&d, k, 1e-3 * j as f64);
-        outs.push(visit(&mut d, &sc).1);
+        assert!(!lifted(&step(&mut d, &sc).1));
     }
-    assert!(!outs.contains(&Some(TeachOutcome::FenceLifted { lifted: 1 })), "{outs:?}");
     assert_eq!(d.quarantine[k], Q_FORGOTTEN);
 }
 
+/// Votes combine only with the same atom count, the same model generation, and a forgotten
+/// sample every one of them was next to — and only that sample's fence lifts (review Important 2:
+/// never one a single vote was near).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn votes_combine_only_on_their_rule() {
+    let (k, j) = (17, 30);
+    let at = |s: &SurrogateKs, x: f64| near_sample(s, k, x);
+    // another atom count, another generation, a fence another vote was not near: no lift
+    for spoil in 0..3 {
+        let (mut s, _) = window_without(&[k, j]);
+        for x in [0.0, 1e-3] {
+            let sc = at(&s, x);
+            assert!(!lifted(&step(&mut s, &sc).1));
+        }
+        assert_eq!(s.lift_votes.len(), 2);
+        match spoil {
+            0 => s.lift_votes[0].n = 3,
+            1 => s.lift_votes[0].gen -= 1,
+            _ => s.lift_votes[0].near = vec![j], // a vote next to j only
+        }
+        let sc = at(&s, 2e-3);
+        let (_, out, notes) = step(&mut s, &sc);
+        assert!(!lifted(&out), "spoil {spoil}: {notes:?}");
+        assert_eq!((s.quarantine[k], s.quarantine[j]), (Q_FORGOTTEN, Q_FORGOTTEN), "spoil {spoil}");
+    }
+    // two forgotten samples next to the geometry, one vote next to only one of them: only that one
+    // (the one every vote was near) lifts
+    let (mut s, _) = window_without(&[k, k + 1]);
+    let sc0 = at(&s, 0.0);
+    let near = fence_at(&mut s, &sc0);
+    assert!(near.contains(&k) && near.contains(&(k + 1)), "the premise: both fence here {near:?}");
+    for x in [0.0, 1e-3] {
+        let sc = at(&s, x);
+        step(&mut s, &sc);
+    }
+    s.lift_votes[0].near = vec![k];
+    let sc = at(&s, 2e-3);
+    let (_, out, notes) = step(&mut s, &sc);
+    assert_eq!(out, Some(TeachOutcome::FenceLifted { lifted: 1 }), "{notes:?}");
+    assert_eq!((s.quarantine[k], s.quarantine[k + 1]), (Q_FORGOTTEN_UNFENCED, Q_FORGOTTEN), "only the sample every vote was near");
+}
+
 /// A forgotten and a quarantined sample fencing together: an agreeing answer releases (or
-/// supersedes) the quarantined one as before and casts no lift vote; the forgotten one keeps
-/// fencing.
+/// supersedes) the quarantined one as before, casts no lift vote and ends the run; the forgotten
+/// one keeps fencing.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_quarantined_neighbour_behaves_as_before() {
     let k = 17;
-    let (mut s, _) = window_without(k);
+    let (mut s, _) = window_without(&[k]);
+    let sc = near_sample(&s, k, 1e-3);
+    step(&mut s, &sc);
+    assert_eq!(s.lift_votes.len(), 1, "a vote of the forgotten fence alone");
     s.quarantine[k + 1] = Q_HELD; // held since the fit: fences
     let sc = near_sample(&s, k, 0.0);
     let near = fence_at(&mut s, &sc);
     assert!(near.contains(&k) && near.contains(&(k + 1)), "{near:?}");
-    let (_, out, notes) = visit(&mut s, &sc);
-    assert!(matches!(out, Some(TeachOutcome::KeptReleased { .. })), "{out:?} {notes:?}");
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    let out = s.take_events().into_iter().last().map(|e| e.outcome);
+    assert!(matches!(out, Some(TeachOutcome::KeptReleased { .. })), "{out:?} {:?}", r.stats.notes);
     assert_ne!(s.quarantine[k + 1], Q_HELD, "released or superseded as before");
     assert_eq!(s.quarantine[k], Q_FORGOTTEN, "the forgotten one is not lifted by it");
-    assert!(s.lift_votes.is_empty(), "no lift vote from a mixed fence");
+    assert!(s.lift_votes.is_empty(), "a mixed fence casts no vote and ends the run");
+}
+
+/// Steps next to `k` until the fence lifts (at most 3 votes); panics otherwise.
+fn lift(s: &mut SurrogateKs, k: usize) {
+    for x in [0.0, 1e-3, 2e-3] {
+        let sc = near_sample(s, k, x);
+        if lifted(&step(s, &sc).1) {
+            return;
+        }
+    }
+    panic!("the fence of #{k} did not lift");
 }
 
 /// The lift persists: a sidecar round trip and a collection reopen read code 8 back (not
-/// fencing, still forgotten); a file without the code reads as before (not lifted).
+/// fencing, still forgotten).
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_lifted_fence_survives_a_reload() {
     let k = 17;
-    let (mut s, _) = window_without(k);
-    for x in [0.0, 2e-3, 4e-3] {
-        let sc = near_sample(&s, k, x);
-        visit(&mut s, &sc);
-    }
+    let (mut s, _) = window_without(&[k]);
+    lift(&mut s, k);
     assert_eq!(s.quarantine[k], Q_FORGOTTEN_UNFENCED);
     let path = std::env::temp_dir().join(format!("fence-lift-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -186,15 +294,10 @@ fn a_lifted_fence_survives_a_reload() {
     let k = 20;
     forget(&mut c, k);
     c.refit().unwrap();
-    let mut lifted = false;
-    for x in [0.0, 2e-3, 4e-3] {
-        let sc = near_sample(&c, k, x);
-        if fence_at(&mut c, &sc).is_empty() {
-            break;
-        }
-        lifted |= visit(&mut c, &sc).1 == Some(TeachOutcome::FenceLifted { lifted: 1 });
-    }
-    assert!(lifted, "the collection-mode run lifts too");
+    let sc = near_sample(&c, k, -1e-3);
+    step(&mut c, &sc);
+    c.lift_votes.clear();
+    lift(&mut c, k);
     assert_eq!(c.collection().unwrap().quarantine[k], Q_FORGOTTEN_UNFENCED, "written at once");
     drop(c);
     let (coll, _) = surrogate::Collection::open(&dir, &key).unwrap();
@@ -210,10 +313,10 @@ fn a_lifted_fence_survives_a_reload() {
 #[cfg_attr(debug_assertions, ignore)]
 fn a_purge_drops_the_fence_state_of_purged_samples() {
     let k = 17;
-    let (mut s, _) = window_without(k);
-    for x in [0.0, 2e-3] {
+    let (mut s, _) = window_without(&[k]);
+    for x in [0.0, 1e-3] {
         let sc = near_sample(&s, k, x);
-        visit(&mut s, &sc);
+        step(&mut s, &sc);
     }
     assert_eq!(s.lift_votes.len(), 2, "two agreeing votes toward the lift");
     let sc = near_sample(&s, k, 1e-3);
@@ -224,7 +327,8 @@ fn a_purge_drops_the_fence_state_of_purged_samples() {
 
 /// The user's scenario (2026-11-14): a band of forgotten samples fences ordinary H₂ geometries and
 /// every agreeing DFT answer there was thinned, forever. Now a slow trajectory through the band
-/// falls back for three steps, the third lifts the fence, and the model answers from then on.
+/// (the thinning mid-cycle, as in the user's log) falls back for three steps, the third lifts the
+/// fence, and the model answers from then on.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_forgotten_band_stops_falling_back_after_three_steps() {
@@ -235,20 +339,25 @@ fn a_forgotten_band_stops_falling_back_after_three_steps() {
     s.refit().unwrap();
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
     let k = 32;
-    let mut sources = Vec::new();
-    let mut outcomes = Vec::new();
+    let warm = near_sample(&s, k, -2e-3);
+    step(&mut s, &warm);
     let sc0 = near_sample(&s, k, 0.0);
     assert!(!fence_at(&mut s, &sc0).is_empty(), "the band fences");
     s.discontinuity();
     s.evaluate(&sc0, &mut never()).unwrap();
     s.take_events();
+    s.lift_votes.clear();
+    let (mut sources, mut outcomes) = (Vec::new(), Vec::new());
     for j in 1..=8 {
         let sc = near_sample(&s, k, 5e-4 * j as f64);
         let r = s.evaluate(&sc, &mut never()).unwrap();
         sources.push(r.stats.source);
         outcomes.push(s.take_events().into_iter().last().map(|e| e.outcome));
+        if s.pending_refit() {
+            s.refit().unwrap();
+        }
     }
-    let lifted_at = outcomes.iter().position(|o| matches!(o, Some(TeachOutcome::FenceLifted { .. }))).expect("the fence lifts");
+    let lifted_at = outcomes.iter().position(lifted).expect("the fence lifts");
     assert!(lifted_at <= 2, "at the third fallback at the latest: {outcomes:?}");
     assert!(sources[lifted_at + 1..].iter().all(|&x| x == Source::Surrogate), "the model answers after the lift: {sources:?} {outcomes:?}");
 }
@@ -260,7 +369,7 @@ fn a_forgotten_band_stops_falling_back_after_three_steps() {
 #[cfg_attr(debug_assertions, ignore)]
 fn the_readiness_tells_a_forgotten_fence_apart() {
     let k = 17;
-    let (mut s, _) = window_without(k);
+    let (mut s, _) = window_without(&[k]);
     let sc = near_sample(&s, k, 0.0);
     s.ensure_desc_cache();
     let r = s.readiness(&sc).unwrap();
