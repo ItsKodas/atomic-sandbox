@@ -466,7 +466,7 @@ fn strip(ui: &mut Ui, bars: &[StripBar]) {
 /// 1e-6"), the convergence plot and (a pass) the iterations strip.
 pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut Vec<Action>) {
     let c = colour_of(r.key);
-    let resp = egui::Frame::new().fill(theme::PANEL_2).stroke(egui::Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    let resp = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
         let title = match &r.stage {
             Some(s) => format!("{} · {s}", r.title),

@@ -582,7 +582,7 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
         Tone::Neutral => (theme::PANEL_2, theme::LINE),
         _ => (c.gamma_multiply(0.06), c.gamma_multiply(0.55)),
     };
-    let r = egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, stroke)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    let r = theme::panel_card(ui, theme::panel_card_frame().fill(fill).stroke(Stroke::new(1.0, stroke)), |ui| {
         ui.set_width(ui.available_width());
         let pct = d.filter(|_| st.backend == Backend::Estimated && m.is_some()).map(|d| format!("{:.0} % DFT", 100.0 * d.fallback_fraction_100));
         ui.horizontal_top(|ui| {
