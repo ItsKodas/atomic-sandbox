@@ -214,6 +214,9 @@ pub(crate) fn model() -> ModelStatus {
         collections: false,
         last_import: None,
         purge_refusal: None,
+        user_changes_pending: 0,
+        refit_due: None,
+        refit_running: false,
         forgotten_in_collection: 0,
         last_purge: None,
         use_collection: false,
@@ -12342,4 +12345,134 @@ fn widgets_inside_cards_keep_their_contrast() {
     st.show = ShowMode::Coloured;
     let all = draw(&mut st);
     rail_reads(&all, "orbitals-enclosed");
+}
+
+/// Whether a frame drawn now probes `name` (the probes cleared first).
+fn drawn(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> bool {
+    PROBES.with(|p| p.borrow_mut().clear());
+    frame(ctx, st, inp, 1400.0, vec![]);
+    PROBES.with(|p| p.borrow().contains_key(name))
+}
+
+/// 2026-11-14, the batched forget: a checkbox per Worst-fitting row and per forgotten row; checking
+/// rows shows "Forget N selected" / "Restore N selected", which emit one `Action::ForgetSamples` /
+/// `RestoreSamples` with the checked ids (→ `Command::ForgetSamples` / `RestoreSamples`, recorded
+/// as not replayable) and clear the selection; unchecking takes a row out; a row that leaves the
+/// list leaves the selection.
+#[test]
+fn checked_rows_forget_and_restore_as_one_batch() {
+    let suspect = |index, formula: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: "fallback".into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus {
+        suspects: vec![suspect(1804, "HO", Some(38.46)), suspect(1133, "H2O", Some(5.23)), suspect(77, "H2", Some(1.2))],
+        forgotten_samples: vec![suspect(40, "H2", None), suspect(41, "H2", None)],
+        forgotten: 2,
+        ..model()
+    };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    search::pick(&ctx, &mut st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+    for _ in 0..40 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    assert!(!drawn(&ctx, &mut st, &inp, "forget-selected"), "no batch button with nothing checked");
+    for name in ["select-sample-1804", "select-sample-1133", "select-sample-77"] {
+        assert!(sent(&click_widget(&ctx, &mut st, &inp, name)).is_empty(), "a checkbox sends nothing");
+    }
+    // uncheck one
+    click_widget(&ctx, &mut st, &inp, "select-sample-77");
+    assert_eq!(st.forget_selection.iter().map(|x| x.index).collect::<Vec<_>>(), vec![1804, 1133]);
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "forget-selected"));
+    assert!(
+        matches!(c.as_slice(), [Command::ForgetSamples(ids)] if ids.iter().map(|x| (x.index, x.key)).collect::<Vec<_>>() == vec![(1804, 0xabc0 + 1804), (1133, 0xabc0 + 1133)]),
+        "{c:?}"
+    );
+    assert!(st.forget_selection.is_empty(), "sent: the selection clears");
+    // the forgotten list: Restore 2 selected
+    click_widget(&ctx, &mut st, &inp, "select-forgotten-40");
+    click_widget(&ctx, &mut st, &inp, "select-forgotten-41");
+    for _ in 0..3 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let c = sent(&click_widget(&ctx, &mut st, &inp, "restore-selected"));
+    assert!(matches!(c.as_slice(), [Command::RestoreSamples(ids)] if ids.iter().map(|x| x.index).collect::<Vec<_>>() == vec![40, 41]), "{c:?}");
+    assert!(st.restore_selection.is_empty());
+    // a checked row that leaves the list (forgotten meanwhile) leaves the selection
+    click_widget(&ctx, &mut st, &inp, "select-sample-1133");
+    assert_eq!(st.forget_selection.len(), 1);
+    let gone = ModelStatus { suspects: vec![suspect(1804, "HO", Some(38.46))], ..m.clone() };
+    let snap2 = snapshot(&scene, Backend::Estimated, Some(gone));
+    let inp2 = input(&scene, Some(&snap2), &cam);
+    frame(&ctx, &mut st, &inp2, 1400.0, vec![]);
+    assert!(st.forget_selection.is_empty());
+    let ids = vec![sim::SampleId { index: 1, key: 1 }];
+    assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSamples(ids.clone())), Some("forget-samples"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSamples(ids)), Some("restore-samples"));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::RefitNow), Some("refit-now"));
+    for k in ["forget-samples", "restore-samples", "refit-now"] {
+        assert!(!crate::replay::is_harmless(k), "{k}: a replay refuses it, as Forget");
+    }
+}
+
+/// 2026-11-14, the batched forget: the pending-refit banner's words — "N changes pending · refit in
+/// 8 s" while the debounce waits, "· refit starting" once due, "· the sampling pass's fit takes
+/// them" during a pass, "refitting · N more pending after this one" while a refit runs, nothing with
+/// nothing pending; drawn in the verdict card with Refit now (→ `Command::RefitNow`), not while a
+/// refit runs; and the Activity job list's "Refit pending" row with the same words and Refit now.
+#[test]
+fn the_pending_refit_banner_and_refit_now() {
+    use super::activity::jobs::{rows, JobKey, JobProgress};
+    use super::dock::model::refit_banner;
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let pending = |n, due: Option<Instant>, running| ModelStatus { user_changes_pending: n, refit_due: due, refit_running: running, ..model() };
+    assert_eq!(refit_banner(&pending(0, None, false), false, now), None);
+    assert_eq!(refit_banner(&pending(0, None, true), false, now), None);
+    assert_eq!(refit_banner(&pending(2, Some(now + Duration::from_millis(7400)), false), false, now).as_deref(), Some("2 changes pending · refit in 8 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(3)), false), false, now).as_deref(), Some("1 change pending · refit in 3 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now), false), false, now).as_deref(), Some("1 change pending · refit starting"));
+    assert_eq!(refit_banner(&pending(3, Some(now), false), true, now).as_deref(), Some("3 changes pending · the sampling pass's fit takes them"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(9)), true), false, now).as_deref(), Some("refitting · 1 more pending after this one"));
+    assert_eq!(refit_banner(&pending(2, None, false), false, now).as_deref(), Some("2 changes pending · refit due"));
+    // drawn: the verdict card's banner and Refit now
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let snap = snapshot(&scene, Backend::Estimated, Some(pending(2, Some(Instant::now() + Duration::from_secs(60)), false)));
+    let inp = input(&scene, Some(&snap), &cam);
+    assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+    let c: Vec<Command> = click_widget(&ctx, &mut st, &inp, "refit-now").iter().flat_map(|o| o.commands.clone()).collect();
+    assert!(matches!(c.as_slice(), [Command::RefitNow]), "{c:?}");
+    // the Activity job list
+    let r = rows(&inp, None);
+    let row = r.iter().find(|r| r.key == JobKey::PendingRefit).expect("a Refit pending row");
+    assert!(row.detail.starts_with("2 changes pending · refit in "), "{}", row.detail);
+    assert!(matches!(row.progress, JobProgress::Waiting));
+    assert!(matches!(&row.control, Some((l, Action::RefitNow)) if l == "Refit now"));
+    // running with more queued: no Refit now in the card, the Refitting row says what follows
+    let snap = snapshot(&scene, Backend::Estimated, Some(pending(1, Some(Instant::now() + Duration::from_secs(60)), true)));
+    let inp = PanelInput { probe: Some(sim::ProbeView { refit: Some((12.0, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner") && !PROBES.with(|p| p.borrow().contains_key("refit-now")));
+    let r = rows(&inp, inp.probe.as_ref());
+    assert!(r.iter().all(|r| r.key != JobKey::PendingRefit));
+    assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · 1 more pending after this one"), "{:?}", r.iter().map(|r| &r.detail).collect::<Vec<_>>());
+    // nothing pending: no banner, no row
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    assert!(!drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+    assert!(rows(&inp, None).iter().all(|r| r.key != JobKey::PendingRefit));
 }

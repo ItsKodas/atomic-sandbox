@@ -1075,11 +1075,13 @@ fn after_a_far_drag_the_surrogate_answers_again() {
     );
 }
 
-/// Spec 2026-11-12 R2: the Model tab's Forget and Restore reach the provider through the worker
-/// (`Command::ForgetSample` → `Trainable::forget_sample`) and start a refit — paused, in the tick
-/// (`refit_if_pending`, not throttled): the snapshot after it counts the sample as forgotten, the
-/// refit as run, and the list no longer names it; Restore brings it back with another refit. A
-/// sample that does not exist is the error line, nothing changed.
+/// Spec 2026-11-12 R2, the batched forget (2026-11-14): the Model tab's Forget and Restore reach
+/// the provider through the worker (`Command::ForgetSample` → `Trainable::forget_samples`) and
+/// apply at once — the next snapshot counts the sample as forgotten, before any refit — and the
+/// refit is debounced: two quick Forgets refit **once**, `FORGET_REFIT_DELAY` after the last
+/// (paused: in the background), fitted without both; a batch Restore of both with **Refit now**
+/// refits at once, fitted with them again. A sample that is not forgotten is the error line,
+/// nothing changed.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -1090,21 +1092,41 @@ fn forget_and_restore_a_sample_refit_the_model() {
     let Some(ctx) = gpu_ctx() else { return };
     let (w, trained, _) = taught(h2_49(), ctx, None);
     let m0 = model(&trained).clone();
-    let id = m0.suspects.first().map(|x| x.id).expect("a trained model ranks its samples");
+    let (id, id2) = match m0.suspects.as_slice() {
+        [a, b, ..] => (a.id, b.id),
+        _ => panic!("a trained model ranks its samples: {:?}", m0.suspects),
+    };
     let k = id.index;
     assert!(m0.suspects.len() <= 8 && m0.forgotten == 0 && m0.forgotten_samples.is_empty(), "{:?}", m0.suspects);
     w.send(Command::ForgetSample(id));
-    let s = snapshot_until(&w, "the refit after the forget", |s| model(s).forgotten == 1 && model(s).refits > m0.refits && !model(s).pending_refit);
+    let s = snapshot_until(&w, "the forget applied", |s| model(s).forgotten == 1);
     let m = model(&s);
-    eprintln!("forgot #{k}: refits {} → {}, fit {:?} → {:?}; {:?}", m0.refits, m.refits, m0.fit, m.fit, m.fit_vs_held);
-    assert!(!m.suspects.iter().any(|x| x.id.index == k), "{:?}", m.suspects);
-    assert_eq!(m.forgotten_samples.iter().map(|x| x.id).collect::<Vec<_>>(), vec![id]);
-    assert_eq!(m.fit.map(|f| f.0), m0.fit.map(|f| f.0 - 1), "fitted without it");
-    assert!(m.fit_vs_held.as_deref().is_some_and(|t| t.contains("1 forgotten")), "{:?}", m.fit_vs_held);
+    assert_eq!(m.refits, m0.refits, "no refit yet: it waits for more changes");
+    assert!(m.user_changes_pending == 1 && m.refit_due.is_some() && m.pending_refit, "{:?} {:?}", m.user_changes_pending, m.refit_due);
+    assert!(!m.suspects.iter().any(|x| x.id.index == k), "out of the list at once: {:?}", m.suspects);
+    w.send(Command::ForgetSample(id2));
+    let s = snapshot_until(&w, "the second forget applied", |s| model(s).forgotten == 2);
+    let applied = Instant::now();
+    assert_eq!((model(&s).refits, model(&s).user_changes_pending), (m0.refits, 2));
+    let s = snapshot_until(&w, "the refit after the forgets", |s| model(s).refits > m0.refits && !model(s).pending_refit && !model(s).refit_running);
+    let waited = applied.elapsed();
+    let m = model(&s);
+    eprintln!("forgot #{k} and #{}: refits {} → {} after {waited:?}, fit {:?} → {:?}; {:?}", id2.index, m0.refits, m.refits, m0.fit, m.fit, m.fit_vs_held);
+    assert_eq!(m.refits, m0.refits + 1, "one refit for both");
+    assert!(waited + Duration::from_millis(500) >= crate::sim::FORGET_REFIT_DELAY, "it waited for the delay: {waited:?}");
+    assert_eq!((m.user_changes_pending, m.refit_due), (0, None));
+    assert_eq!(m.forgotten_samples.iter().map(|x| x.id).collect::<Vec<_>>().len(), 2);
+    assert_eq!(m.fit.map(|f| f.0), m0.fit.map(|f| f.0 - 2), "fitted without both");
+    assert!(m.fit_vs_held.as_deref().is_some_and(|t| t.contains("2 forgotten")), "{:?}", m.fit_vs_held);
     assert!(s.dynamics.notes.iter().any(|n| n.contains(&format!("sample #{k} forgotten"))), "{:?}", s.dynamics.notes);
-    w.send(Command::RestoreSample(id));
-    let s = snapshot_until(&w, "the refit after the restore", |s| model(s).forgotten == 0 && model(s).refits > m.refits && !model(s).pending_refit);
-    assert_eq!(model(&s).fit.map(|f| f.0), m0.fit.map(|f| f.0), "fitted with it again");
+    // a batch Restore of both, then Refit now: at once
+    w.send(Command::RestoreSamples(vec![id, id2]));
+    w.send(Command::RefitNow);
+    let asked = Instant::now();
+    let s = snapshot_until(&w, "the refit after the restore", |s| model(s).forgotten == 0 && model(s).refits > m.refits && !model(s).pending_refit && !model(s).refit_running);
+    assert!(asked.elapsed() < crate::sim::FORGET_REFIT_DELAY, "Refit now did not wait: {:?}", asked.elapsed());
+    assert_eq!(model(&s).refits, m.refits + 1);
+    assert_eq!(model(&s).fit.map(|f| f.0), m0.fit.map(|f| f.0), "fitted with them again");
     w.send(Command::RestoreSample(id));
     let deadline = Instant::now() + WAIT;
     let error = loop {

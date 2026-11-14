@@ -64,8 +64,16 @@
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
 //!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
 //!   then quarantine rounds — `providers::surrogate` module doc). The Model tab's Forget / Restore
-//!   of one sample (`Command::ForgetSample`, spec 2026-11-12 R2) asks for a refit at the next tick,
-//!   not throttled.
+//!   (`Command::ForgetSample`, spec 2026-11-12 R2, and the batches `Command::ForgetSamples` /
+//!   `RestoreSamples`, 2026-11-14) is applied at once — the samples fence at once — and asks for a
+//!   **debounced** refit ([`UserRefit`]): due [`FORGET_REFIT_DELAY`] after the last change (each one
+//!   restarts the wait), or at once on `Command::RefitNow`; until then no refit starts, then one
+//!   starts unthrottled and **in the background, paused too** (a refit with a non-empty misfit set
+//!   can take minutes: the Model tab stays usable). A change while a refit runs is applied at once
+//!   (the provider re-applies it at the install, `providers::surrogate` "background") and makes one
+//!   more refit due after it — coalesced, not cancelled: the running one may be nearly done, and a
+//!   cancel at every click could starve the model of any refit. The worker ticks once a budget
+//!   while the pending refit waits (paused, nothing else would start it).
 //!   A pass that ends — finished or cancelled — with fewer usable samples than its basis's Q′
 //!   is not fitted (M6 Task 3 fix round 2: below Q′ no fit can earn trust) and leaves **no
 //!   model**: its samples are kept, and since this refit needs a fitted model they are not
@@ -604,9 +612,9 @@ struct Worker {
     /// Background refits discarded in a row (a conflict each time): from
     /// [`REFIT_DISCARDS_BEFORE_SYNC`] on, the next refit runs in the tick, so the model still moves.
     refit_discards: u32,
-    /// The user's Forget / Restore of a sample asked for a refit (`user_sample`): the next one is
-    /// not throttled.
-    refit_requested: bool,
+    /// The refit the user's Forget / Restore asked for, debounced (`user_samples`, [`UserRefit`];
+    /// 2026-11-14, the batched forget).
+    user_refit: UserRefit,
     refits: u64,
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
@@ -831,7 +839,7 @@ fn worker(
         last_refit_at: None,
         refit_started: None,
         refit_discards: 0,
-        refit_requested: false,
+        user_refit: UserRefit::default(),
         samples_at_refit: 0,
         refits: 0,
         autoload_refused: None,
@@ -889,7 +897,7 @@ fn worker(
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
         // round's pacing or the wait above was the round's, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && views_wake.is_none()) else {
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && w.user_refit.due().is_none() && views_wake.is_none()) else {
             w.retire();
             return;
         };
@@ -990,8 +998,11 @@ impl Worker {
         // the auditor's channel for the next command (final review I1)
         self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
         // (a background refit in flight is polled once a budget too: paused, nothing else would
-        // wake the worker to install it)
-        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending || self.refit_started.is_some());
+        // wake the worker to install it — and so is the user's pending refit, waiting for its
+        // moment: paused, nothing else would wake the worker to start it. Once a budget, not at
+        // the deadline: a command before a paced deadline is applied without a tick, and an edit
+        // must not wait seconds for its evaluation)
+        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending || self.refit_started.is_some() || self.user_refit.due().is_some());
         if polling && self.pace_until.is_none() {
             self.pace_until = Some(t0 + budget);
         }

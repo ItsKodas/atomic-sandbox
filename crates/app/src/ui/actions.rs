@@ -134,6 +134,17 @@ pub enum Action {
     ForgetSample(sim::SampleId),
     /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
     RestoreSample(sim::SampleId),
+    /// "Forget N selected" (2026-11-14, the batched forget): the checked Worst-fitting rows, forgotten
+    /// as one batch (`Command::ForgetSamples`: all or nothing — a stale id, or a batch past the
+    /// recovery's 10 % cap, is refused whole) with one debounced refit. Recorded, not replayable.
+    ForgetSamples(Vec<sim::SampleId>),
+    /// "Restore N selected": the checked forgotten rows, restored as one batch
+    /// (`Command::RestoreSamples`). Recorded, not replayable.
+    RestoreSamples(Vec<sim::SampleId>),
+    /// The pending-refit banner's "Refit now" (and the Activity job row's): the refit after the
+    /// user's Forget / Restore starts at once instead of after its delay (`Command::RefitNow`).
+    /// Recorded, not replayable (it only exists after a Forget or Restore, which a replay refuses).
+    RefitNow,
     /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
     /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user
     /// confirmed (the worker refuses when the forgotten list changed since). Recorded, not
@@ -669,12 +680,26 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.plan.seed += 1;
         }
         Action::ForgetSample(id) => {
-            st.set_status(format!("forgetting sample #{}: held out of the fit until Restore; refitting", id.index));
+            st.set_status(format!("forgetting sample #{}: held out of the fit until Restore; the refit follows in {} s (Refit now starts it)", id.index, crate::sim::FORGET_REFIT_DELAY.as_secs()));
             out.commands.push(Command::ForgetSample(id));
         }
         Action::RestoreSample(id) => {
-            st.set_status(format!("restoring sample #{}; refitting", id.index));
+            st.set_status(format!("restoring sample #{}; the refit follows in {} s (Refit now starts it)", id.index, crate::sim::FORGET_REFIT_DELAY.as_secs()));
             out.commands.push(Command::RestoreSample(id));
+        }
+        Action::ForgetSamples(ids) => {
+            st.forget_selection.clear();
+            st.set_status(format!("forgetting {} samples: held out of the fit until Restore; the refit follows in {} s (Refit now starts it)", ids.len(), crate::sim::FORGET_REFIT_DELAY.as_secs()));
+            out.commands.push(Command::ForgetSamples(ids));
+        }
+        Action::RestoreSamples(ids) => {
+            st.restore_selection.clear();
+            st.set_status(format!("restoring {} samples; the refit follows in {} s (Refit now starts it)", ids.len(), crate::sim::FORGET_REFIT_DELAY.as_secs()));
+            out.commands.push(Command::RestoreSamples(ids));
+        }
+        Action::RefitNow => {
+            st.set_status("refitting now");
+            out.commands.push(Command::RefitNow);
         }
         Action::PurgeForgotten(n) => {
             st.purge_confirm = false;
@@ -1199,7 +1224,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | ForgetSamples(_) | RestoreSamples(_) | RefitNow | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 
