@@ -17,6 +17,9 @@ pub enum JobKey {
     LiveSolve,
     Pass,
     Refit,
+    /// The refit the user's Forget / Restore asked for, waiting for its moment (2026-11-14, the
+    /// batched forget: the worker's debounce).
+    PendingRefit,
     Audit,
     /// A density refresh or an isolated-atom density on the background teacher (spec A8).
     Background,
@@ -149,16 +152,37 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             count: None,
         });
     }
+    let pending = m.map_or(0, |m| m.user_changes_pending);
     if let Some((s, n)) = probe.and_then(|p| p.refit) {
+        // the user's changes made while it runs: refitted right after it (the worker coalesces them)
+        let more = if pending > 0 { format!(" · {pending} more pending after this one") } else { String::new() };
         v.push(JobRow {
             key: JobKey::Refit,
             title: "Refitting".into(),
-            detail: format!("{n} samples"),
+            detail: format!("{n} samples{more}"),
             progress: JobProgress::Indeterminate,
             elapsed_s: Some(s),
             eta_s: None,
             control: None,
-            no_control_why: Some("a refit takes milliseconds to a few seconds and runs between steps"),
+            no_control_why: Some("a refit takes milliseconds to minutes and runs off the step path; Forget and Restore meanwhile apply at once and are refitted right after it"),
+            scf: None,
+            keeps_block: false,
+            stage: None,
+            count: None,
+        });
+    }
+    // the user's Forget / Restore waiting for their refit (no refit runs: else the row above says so)
+    if let Some(m) = m.filter(|m| m.user_changes_pending > 0 && !m.refit_running && probe.and_then(|p| p.refit).is_none()) {
+        let sampling = input.sampling();
+        v.push(JobRow {
+            key: JobKey::PendingRefit,
+            title: "Refit pending".into(),
+            detail: crate::ui::dock::model::refit_banner(m, sampling, Instant::now()).unwrap_or_default(),
+            progress: JobProgress::Waiting,
+            elapsed_s: None,
+            eta_s: None,
+            control: (!sampling).then(|| ("Refit now".into(), Action::RefitNow)),
+            no_control_why: sampling.then_some("the sampling pass's own fit at its end takes the changes"),
             scf: None,
             keeps_block: false,
             stage: None,
@@ -262,7 +286,7 @@ fn colour_of(key: JobKey) -> Color32 {
     match key {
         JobKey::Audit | JobKey::Background => GREEN,
         JobKey::Orbitals => theme::INK_DIM,
-        JobKey::PassOffer => AMBER,
+        JobKey::PassOffer | JobKey::PendingRefit => AMBER,
         _ => theme::ACCENT,
     }
 }

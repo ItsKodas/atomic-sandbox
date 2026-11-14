@@ -744,6 +744,10 @@ pub struct UiState {
     pub forget_armed: Option<Instant>,
     /// "Purge forgotten (N)…" was clicked: its inline confirmation shows (Purge / Cancel).
     pub purge_confirm: bool,
+    /// The Worst-fitting rows checked for "Forget N selected", and the forgotten rows checked for
+    /// "Restore N selected" (2026-11-14, the batched forget). Kept to the ids the lists show.
+    pub forget_selection: Vec<sim::SampleId>,
+    pub restore_selection: Vec<sim::SampleId>,
     /// The number of the last purge outcome put on the status line (`ModelStatus::last_purge`).
     pub purge_seen: u64,
     /// The first click on a sampling button whose pass would take longer than
@@ -1036,6 +1040,8 @@ impl UiState {
             plan: SamplingPlan::default(),
             forget_armed: None,
             purge_confirm: false,
+            forget_selection: Vec::new(),
+            restore_selection: Vec::new(),
             purge_seen: 0,
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,

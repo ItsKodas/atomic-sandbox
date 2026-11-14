@@ -435,6 +435,18 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().restore_sample(id)
     }
 
+    fn forget_samples(&mut self, ids: &[crate::provider::SampleId]) -> Result<(), String> {
+        self.lock().forget_samples(ids)
+    }
+
+    fn restore_samples(&mut self, ids: &[crate::provider::SampleId]) -> Result<(), String> {
+        self.lock().restore_samples(ids)
+    }
+
+    fn user_changes_pending(&self) -> usize {
+        self.lock().user_changes_pending()
+    }
+
     fn sample_suspects(&self) -> Vec<crate::provider::SampleSuspect> {
         self.lock().sample_suspects()
     }

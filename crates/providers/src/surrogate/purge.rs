@@ -54,7 +54,11 @@ use super::shared::Link;
 use super::*;
 
 /// The refusal while the fit still holds a forgotten sample.
-pub const PURGE_WAIT_REFIT: &str = "the refit after the last Forget has not run yet (the fit still holds a forgotten sample) — purge once it has";
+pub const PURGE_WAIT_REFIT: &str = "Forget / Restore changes are pending — the refit after them has not run yet (the fit still holds a forgotten sample); purge once it has (Refit now starts it)";
+/// Why a purge waits while Forget / Restore changes no fit holds yet are pending (2026-11-14, the
+/// batched forget: the refit after them is debounced) and the fit holds no forgotten sample (a
+/// Restore's, say).
+pub const PURGE_WAIT_CHANGES: &str = "Forget / Restore changes are pending — the refit after them has not run yet; purge once it has (Refit now starts it)";
 
 fn file_name(p: &std::path::Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into_owned())
@@ -84,6 +88,9 @@ impl SurrogateKs {
         }
         if self.forgotten_in_fit() > 0 {
             return Some(PURGE_WAIT_REFIT.into());
+        }
+        if self.user_changes_pending() > 0 {
+            return Some(PURGE_WAIT_CHANGES.into());
         }
         let sh = self.shared.as_ref()?;
         let in_collection = (0..self.quarantine.len()).any(|i| self.is_forgotten(i) && matches!(sh.link.get(i), Some(Link::In(_))));
