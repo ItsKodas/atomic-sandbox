@@ -7,7 +7,7 @@
 **Architecture:**
 - One host f64 function in `qm` (`fermi_dirac`: μ_σ by two tie-directed bisections, f, S) is called by the CPU loop and imported by `qm-gpu`. `Energy.total` becomes F, so every consumer of `total` gets F unchanged.
 - `providers` switches every scene to FD under new provenance tags (`none/fd5e-3/pin1e-5`, `…/fd5e-3/stop2x…/pin1e-5`) and replaces the occupation-pattern watch with a work-consistency guard, `branch_jump`.
-- The collection migration is a pass in `providers::sampling`. It reads the predecessor folder through a strictly read-only open, re-solves every sample cold and classifies it U/T/S. It appends to the new folder, holds S-class samples at status code 8 and reviews them by leave-one-out inside a refit.
+- The collection migration is a pass in `providers::sampling`. It reads the predecessor folder through a strictly read-only open, re-solves every sample cold and classifies it U/T/S. It appends to the new folder, holds S-class samples at status code 9 (`Q_RESOLVED`; code 8 is `purge-forgotten`'s "forgotten, fence lifted") and reviews them by leave-one-out inside a refit.
 
 **Tech Stack:** Rust (workspace crates `qm`, `qm-gpu`, `sim`, `providers`, `surrogate`, `app`, `validate`), wgpu/WGSL (f32 grid), egui.
 
@@ -17,13 +17,14 @@
 
 - **Constants (spec §4, §5, §6.3, §7.4; all global, none per element, rule 1):**
   - `ELECTRON_KT = 5e-3` Ha (T_el = 1 578.9 K, shown as 1579 K; the user's 2026-11-14 ruling, spec §2 item 3). Not exposed in the app, no dev flag. Harnesses set `kt` through `ScfSettings`.
-  - `GPU_PARTIAL_TOL = 1e-5` (qm-gpu): the GPU SCF stops at max(tol_eff, 1e-5) on a step whose occupations have a partial level; gapped GPU solves and the CPU keep their tolerance (spec §5.1).
+  - `GPU_PARTIAL_TOL = 1e-5`, defined once in `qm::occupations` (Task 4), re-exported by `qm-gpu`; the tags (Task 9) and the dimer ledger (Task 10) read this one constant (preflight F11). The GPU SCF stops at max(tol_eff, 1e-5) on a step whose occupations have a partial level; gapped GPU solves and the CPU keep their tolerance (spec §5.1).
   - `WITNESS_GAP = 0.1` Ha (the renamed `CANDIDATE_TAU`); tail arm 36 kT; `MAX_WITNESS_GROWTH = 16`.
   - μ bracket [ε_min − 50 kT, ε_max + 50 kT]; backstop 2 048 halvings.
   - `PARTIAL_OCCUPATION_MIN = 1e-6`.
   - `branch_jump`: factor 3, window 8, reach 0.1 Bohr, κ_max = 1 Ha/Bohr³.
   - Migration: ε_E = 1e-5 Ha per sample, ε_F = 1.5e-4 Ha/Bohr per component.
-  - `Q_RESOLVED = 8`; collection `RECORD_VERSION` 1 → 2; one new sidecar magic.
+  - `Q_RESOLVED = 9` (preflight F1): code 8 is `Q_FORGOTTEN_UNFENCED` ("forgotten, fence lifted"), from branch `purge-forgotten`, which merges to `main` first.
+  - **Formats are symbolic** (F1): collection `RECORD_VERSION` = R + 1 and one new sidecar magic `ASMODEL<K + 1>`, where R and K are the merged `main`'s `RECORD_VERSION` and `MAGICS.len()`, read in Task 2 step 4. Never assume today's values; no task hardcodes them.
 - **Tags:** pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x<floor>/pin1e-5` (`fd{kT:e}`, `pin{GPU_PARTIAL_TOL:e}`); all-electron `none/fd5e-3/pin1e-5`. Every "is this the all-electron surface" comparison goes through `providers::pseudo::is_all_electron_tag`.
 - **Unchanged (anti-goals, spec §3):**
   - the mixer (Pulay/DIIS, α = 0.3, m = 6), the stall stop (W = 50, 1e-3 per electron), the convergence criterion, the cold guess, dt;
@@ -36,6 +37,9 @@
 - **Agents and tags:** every subagent runs on Opus (memory "No Fable"). Each task is tagged **physics** or **engineering**. Physics tasks, and every task whose step says so, get a `physics-reviewer` pass on the diff before their commit.
 - **Heavy jobs one at a time.** Never kill the user's cargo or `app.exe`. With another cargo job running, build at BelowNormal priority with `-j 4`. Heavy tests stay release-only (`#[cfg_attr(debug_assertions, ignore)]`).
 - **Commits:** `git commit -o -m "<message>" -- <paths>` (options before `--`; a new file needs `git add <path>` first). Messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never pipe a gating git command (`git merge … | tail`). Edit files with Edit/Write or Python, never PowerShell `Set-Content`.
+  - **No bare `git stash`** (F6; the stash stack is shared by every worktree). Set work aside with a WIP commit, or `git stash push -u -m "<unique-tag>"` applied by its SHA (`git stash apply <sha>`, never `pop`).
+  - **No diagnostic code is ever committed on `scf-stall`** (F5). The V0/A1 prototype (`SCF_SMEAR`/`SCF_TRACE2` knobs in `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs`, `crates/providers/src/scf_stall_diag.rs` and its `lib.rs` mod line) is committed on the side branch `smearing-prototype` at the end of Task 3 and leaves the tree there. Implementers may read it (`git show smearing-prototype:<path>`); nobody merges it. `git commit -o` commits whole files, so before every commit that touches one of those files, `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing.
+- **Task order** (preflight ruling): Task 1 → **Task 3 → Task 2** → Tasks 4–18. Task 3 (GPU measurements on the prototype, independent of `main`) runs before Task 2. Task 2 waits until `purge-forgotten` (and the trust rework) have merged to `main`.
 - **Docs move with the code:** README (user rule), `crates/validate/references.md`, `docs/dev-reference.md`, and the spec sections each task changes are updated in that task.
 - **It ships as one merge** (spec §11): the solver change and the migration together.
 
@@ -43,9 +47,10 @@
 
 1. **A warm state from another occupation scheme or another kT** (a harness state at kT = 2e-3, an `Aufbau` state, a state restored from before the change). It must never seed the solve: the result must be bitwise the cold solve. Tests: Task 5 (CPU), Task 7 (GPU).
 2. **An edit between two evaluations that adds, removes or reorders atoms.** The branch-jump guard must restart its history, judge nothing and not panic on mismatched ΔR. Test: Task 8.
-3. **A refit while the migration pass is still running.** No code-8 sample may be reviewed or released before the pass completes (spec §7.6). Test: Task 15.
+3. **A refit while the migration pass is still running.** No code-9 sample may be reviewed or released before the pass completes (spec §7.6). Test: Task 15.
 4. **A crash between a migrated sample's append and the cursor write, or an older build still holding the old folder's lock.** Resume reproduces the counts of an uninterrupted run, and the duplicate is counted as done. A live lock refuses with the reason. Tests: Task 14.
 5. **A predecessor `samples.bin` with a damaged tail.** The read-only open reads to the last whole record, reports the damage and leaves every byte of the folder identical. Test: Task 13.
+6. **A purge of forgotten samples around a migration** (F2, F3; spec §8 amendment). A purge is refused while the pass runs; a purge of the new folder afterwards remaps `migration.txt`'s review log through `PurgeOutcome::map`; a source `samples.bin` whose length or hash changed restarts the pass from 0; the read-only open never cleans purge's `samples.bin.new`/`samples.bin.bak.new`; a forgotten-unfenced (code 8) sample in class S returns to 7. Tests: Tasks 13–15.
 
 ## Touch-point map (spec §8; filled in by Task 2 against merged `main`)
 
@@ -59,8 +64,12 @@
 | 6 | shared-collection attach | `SurrogateKs::attach_inner`, `attach_collection_at` (`shared.rs`) | |
 | 7 | label-noise prior | `policy::force_noise_prior` | |
 | 8 | occupation-change training refusal | `EvalStats::untrainable` (`sim/src/provider.rs`) | |
+| 9 | purge's index remap (F3) | `PurgeOutcome::map` (`surrogate/src/collection.rs`, branch `purge-forgotten`) | |
+| 10 | the forgotten fence's lift (F4) | `lift_votes`, `fencing()` (`providers/src/surrogate/quarantine.rs`, branch `purge-forgotten`) | |
 
 Later tasks name these by role. The implementer uses the right-hand column.
+
+Rows 2, 3 and 10 are settled by preflight F4 (spec §8 amendment): a reviewed-and-failed code 9 is in `fences()`, not in `fencing()` or the held cap, purge's lift votes never lift it, and it never joins the misfit set M. Task 2 fills in the names; it does not re-decide this.
 
 ---
 
@@ -75,7 +84,7 @@ name a kT or a stop.
 
 **Files:**
 - Read, then append to (do not rewrite): `docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md`. Another agent may already have written it. Create it if it is absent.
-- Uncommitted measurement code only: `crates/providers/src/scf_stall_diag.rs` and the `SCF_SMEAR`/`SCF_TRACE2` knobs in `crates/qm-gpu/src/scf.rs`. For the CPU cross-check, add a throwaway `SCF_SMEAR` knob in `crates/qm/src/scf.rs`, also uncommitted. Task 4 replaces it.
+- Uncommitted measurement code only: `crates/providers/src/scf_stall_diag.rs` and the `SCF_SMEAR`/`SCF_TRACE2` knobs in `crates/qm-gpu/src/scf.rs`. For the CPU cross-check, add a throwaway `SCF_SMEAR` knob in `crates/qm/src/scf.rs`, also uncommitted. All of it moves to the side branch `smearing-prototype` at the end of Task 3 (F5); Task 4's `fermi_dirac` replaces the knob.
 - Modify: `crates/validate/references.md`. New section "Fermi–Dirac migration", subsection "V0".
 
 **Interfaces:**
@@ -118,8 +127,8 @@ name a kT or a stop.
   - Give options (i), (ii) and (iii) verbatim from spec §9. Do not choose.
   - Do not start Task 2.
   - After the user's ruling: amend the spec, and the "1e-3"/"fd1e-3"/"316 K" constants of this plan if kT moves. Re-run V0 under the ruling, then continue.
-  - **Done 2026-11-14:** the ruling (kT = 5 mHa, 1e-5 scan stop) is applied to the spec and this plan. The re-run passes states, spread and winner everywhere, and still misses: the jitter rule for the non-winning M = 1-type states and the O₂ singlet / NH at auto, and convergence for S at M = 1 on Accurate (61 at one site) and all-electron O at M = 5 (spec §9 V0 "Outcome"). **Task 2 waits for the user to accept these as documented, or to rule otherwise.**
-- [ ] **Step 6: On PASS,** write the V0 subsection of references.md: the study, U↑↑/U_c/U_s, the jitter floors, the seeding. Commit `git commit -o -m "docs(v0): open-shell stability at kT = 5e-3 …" -- docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md crates/validate/references.md`. The diagnostic code stays uncommitted.
+  - **Done 2026-11-14:** the ruling (kT = 5 mHa, 1e-5 scan stop) is applied to the spec and this plan. The re-run passes states, spread and winner everywhere, and still misses: the jitter rule for the non-winning M = 1-type states and the O₂ singlet / NH at auto, and convergence for S at M = 1 on Accurate (61 at one site) and all-electron O at M = 5 (spec §9 V0 "Outcome"). **The user accepted these as documented on 2026-11-14 ("Accept and build")**: the 1e-5 stop applies to every GPU solve with a partly occupied level, gapped GPU solves and the CPU keep their tolerance, the witness is unchanged, and a CPU f64 cross-check at 5 mHa of S at M = 1 and all-electron O at M = 5 joins Task 11's physics review.
+- [ ] **Step 6: On PASS, or on the user's acceptance of the documented failures (2026-11-14, which applies),** write the V0 subsection of references.md: the study, U↑↑/U_c/U_s, the jitter floors, the seeding. Commit `git commit -o -m "docs(v0): open-shell stability at kT = 5e-3 …" -- docs/superpowers/notes/2026-11-13-v0-open-shell-stability.md crates/validate/references.md`. The diagnostic code stays uncommitted on `scf-stall` (Task 3's last step moves it to `smearing-prototype`).
 
 **Gates:** none (a measurement). **Time:** about 30 min if the note covers everything, else about 1–2 h of serial GPU solves.
 
@@ -127,26 +136,28 @@ name a kT or a stop.
 
 ### Task 2: Merge `main` into `scf-stall`; re-read the touch points — **engineering**
 
+**Order:** runs **after Task 3**, and only once `purge-forgotten` has merged to `main` (preflight order ruling).
+
 **Files:**
 - Modify: this plan (the Touch-point map).
 - Modify: `docs/superpowers/specs/2026-11-13-fermi-smearing-design.md` §8, only if a touch point changed meaning, as an "Amendment (plan Task 2)" block.
 
 **Interfaces:**
-- Consumes: Task 1's PASS.
-- Produces: the filled Touch-point map, used by Tasks 8–10 and 13–16.
+- Consumes: Task 1's verdict as the user accepted it on 2026-11-14 ("Accept and build": the documented non-winner jitter/convergence failures stand); Task 3's committed measurements and the `smearing-prototype` branch.
+- Produces: the filled Touch-point map, used by Tasks 8–10 and 13–16; R and K (the merged `RECORD_VERSION` and `MAGICS.len()`), used by Tasks 13–17.
 
-- [ ] **Step 1: Check the precondition.** Run `git merge-base --is-ancestor claude/charming-keller-0bc26b main`. If it fails, the trust rework has not merged: wait, and never merge that branch yourself.
-- [ ] **Step 2: Protect the uncommitted diagnostics.**
-  - Run `git diff > <scratchpad>/scf-stall-diag.patch`.
-  - Run `git stash push -- crates/qm-gpu/src/scf.rs crates/providers/src/lib.rs` (and `crates/qm/src/scf.rs` if Task 1 added a knob there).
-  - Untracked files (`scf_stall_diag.rs`, the review file) stay as they are.
+- [ ] **Step 1: Check the preconditions.**
+  - `git merge-base --is-ancestor claude/charming-keller-0bc26b main` and `git merge-base --is-ancestor purge-forgotten main` both succeed (F1). If either fails, that branch has not merged: wait, and never merge it yourself.
+  - Task 3 is committed, and `git show --stat smearing-prototype` lists the prototype's four files.
+- [ ] **Step 2: Make sure the tree is clean of the prototype** (F5, F6). Task 3's last step already removed it; `git status --short` shows no change to `crates/qm/src/scf.rs`, `crates/qm-gpu/src/scf.rs` or `crates/providers/src/lib.rs`, and no `crates/providers/src/scf_stall_diag.rs`. If any remains, compare it with `smearing-prototype` and stop if they differ; never use a bare `git stash`. Untracked docs (the review file) stay as they are.
 - [ ] **Step 3: Merge.** Run `git merge main` on its own. Resolve conflicts; only docs are expected.
-- [ ] **Step 4: Restore the diagnostics.** Run `git stash pop`. Re-apply any hunk that conflicts by hand from the patch.
-- [ ] **Step 5: Verify the merged tree.** Run `cargo build --workspace --release`, then `cargo test -p units -p qm -p sim -p surrogate --release` and `cargo test -p providers --release`. Expected: PASS, i.e. main's state plus the inert diag knobs.
-- [ ] **Step 6: Re-read the eight touch points on the merged tree.** Fill in the right-hand column of the map with names, files and lines.
-  - Record two facts in particular:
-    - the sidecar's current `MAGICS.len()` (the trust rework may have bumped it; Task 13 needs it);
-    - which mechanism `main` uses for "a stored label the model cannot reproduce": the fence or the misfit set M (Task 15, step 4 of spec §7.6).
+- [ ] **Step 4: Re-check the ancestry and read the format constants** (F1).
+  - `git merge-base --is-ancestor purge-forgotten HEAD` and `git merge-base --is-ancestor claude/charming-keller-0bc26b HEAD` both succeed.
+  - Read R = `surrogate::collection::RECORD_VERSION` and K = `surrogate::sidecar::MAGICS.len()` on the merged tree, and the set of sidecar bodies the merged `MAGICS` reads (R11's old-body set, including any body `purge-forgotten` added). Write them into this plan beside the Global Constraints' format bullet.
+  - Confirm that code 8 is `Q_FORGOTTEN_UNFENCED` and that no persisted code 9 exists in `surrogate::quarantine`. If 9 is taken, STOP and report: `Q_RESOLVED` needs a ruling.
+- [ ] **Step 5: Verify the merged tree.** Run `cargo build --workspace --release`, then `cargo test -p units -p qm -p sim -p surrogate --release` and `cargo test -p providers --release`. Expected: PASS, i.e. main's state (the prototype is off the tree).
+- [ ] **Step 6: Re-read the ten touch points on the merged tree.** Fill in the right-hand column of the map with names, files and lines.
+  - The mechanism for a failed code-9 review is settled (F4: the quarantine fence `fences()`, not the misfit set M; outside `fencing()`, the held cap and purge's lift votes). Record the names it uses on `main`.
   - Where a role's meaning changed, write the mapping into spec §8 as an amendment, never a silent reinterpretation.
 - [ ] **Step 7: Commit.** Run `git commit -o -- docs/superpowers/plans/2026-11-13-fermi-smearing.md docs/superpowers/specs/2026-11-13-fermi-smearing-design.md`.
 
@@ -156,12 +167,16 @@ name a kT or a stop.
 
 ### Task 3: The remaining A1 measurements — **physics**
 
+**Order:** runs **before Task 2**, on the pre-merge tree (it needs only the prototype, not `main`).
+
 **Files:**
 - Create: `docs/superpowers/notes/2026-11-13-a1-measurements.md`.
 - Modify: `crates/validate/references.md` ("Fermi–Dirac migration": witness cost, E‴, the V3 and V5 choices).
-- The measurement code stays uncommitted (the diag harness).
+- Modify: the spec's §9 V2 table (an amendment, Step 0).
+- The measurement code stays uncommitted on `scf-stall` (the diag harness); Step 6 moves it to `smearing-prototype`.
 
 **Interfaces:**
+- Consumes: the uncommitted prototype in the working tree (Task 1's knobs and harness).
 - Produces:
   - **V3 geometry:** a near-square H₄ rectangle (a × b), the displaced atom and its in-plane axis; c = dΔ/dx; |d(TS)/dx|.
   - **V5 NVE case:** the molecule, box n × h, starting bend, dt, step count, h²/4·E_mode.
@@ -187,7 +202,12 @@ name a kT or a stop.
   - O–H (in H₂O) and N–H (in NH₃) on the default pseudo surface at h = 0.15, 7 points from 0.8 R_e to 1.0 R_e; fit (1/12)|E‴|.
   - Expected: below κ_max = 1 Ha/Bohr³ ("M7 forces" OH gives about 0.18).
   - If any value ≥ 1, STOP: κ_max is a spec constant, so it is the user's call.
-- [ ] **Step 5: Commit** the note and references.md (`git commit -o -- …`).
+- [ ] **Step 5: Commit** the note, references.md and the spec (`git commit -o -- docs/superpowers/notes/2026-11-13-a1-measurements.md crates/validate/references.md docs/superpowers/specs/2026-11-13-fermi-smearing-design.md`), on `scf-stall`, with no code.
+- [ ] **Step 6: Preserve the prototype on `smearing-prototype` and take it off the tree** (F5, F6).
+  - `git diff > <scratchpad>/scf-stall-diag.patch` (a second copy).
+  - `git switch -c smearing-prototype`, then `git add crates/providers/src/scf_stall_diag.rs`, then `git commit -o -m "wip(prototype): the V0/A1 smearing prototype (never merge)" -- crates/qm/src/scf.rs crates/qm-gpu/src/scf.rs crates/providers/src/lib.rs crates/providers/src/scf_stall_diag.rs`.
+  - `git switch scf-stall`. The four files return to `scf-stall`'s committed state; untracked docs stay. `git status --short` shows no code change.
+  - Never a bare `git stash`. Never merge `smearing-prototype`.
 
 **Gates:** none (measurement). **Time:** about 1 h GPU, serial.
 
@@ -200,7 +220,7 @@ name a kT or a stop.
 - Modify:
   - `crates/qm/src/lib.rs`: the module, and re-exports of the items below at the crate root as `qm::…`;
   - `crates/qm/src/scf.rs`: `pub use crate::occupations::*` so `qm::scf::fermi_dirac` resolves (spec §5).
-- Remove: Task 1's uncommitted `SCF_SMEAR` knob in `crates/qm/src/scf.rs`, if present.
+- Nothing to remove: Task 1's `SCF_SMEAR` knob left the tree in Task 3 step 6 (`smearing-prototype`). Before committing, `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5).
 
 **Interfaces:**
 - Produces:
@@ -210,6 +230,7 @@ pub const ELECTRON_KT: f64 = 5e-3;          // Ha (spec §2 item 3, 2026-11-14)
 pub const WITNESS_GAP: f64 = 0.1;           // Ha, from ε_{N_σ}
 pub const WITNESS_TAIL_KT: f64 = 36.0;      // ε_k − μ ≥ 36 kT
 pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
+pub const GPU_PARTIAL_TOL: f64 = 1e-5;      // the GPU stop with a partial level (spec §5.1); the one definition (F11)
 pub const MU_BRACKET_KT: f64 = 50.0;
 pub const MAX_MU_HALVINGS: usize = 2048;
 pub struct FdOccupations { pub f: Vec<f64>, pub mu: Option<f64>, pub entropy: f64, pub halvings: usize }
@@ -322,7 +343,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
 
   Fix every MUST before continuing.
 - [ ] **Step 6: Run the gates,** one at a time: `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), then `cargo test -p providers --release` (~5.5 min). Expected: PASS with no pin moved; providers still select `Aufbau`/DS explicitly or by default.
-- [ ] **Step 7: Commit** with `git commit -o --` the files above. Message: `feat(qm): SCF on Fermi–Dirac occupations; Energy.total = F (spec 2026-11-13 §4–5)`.
+- [ ] **Step 7: Commit** with `git commit -o --` the files above. First check that `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing: `-o` commits whole files, and `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs` carried the prototype's knobs (now only on `smearing-prototype`, F5). Message: `feat(qm): SCF on Fermi–Dirac occupations; Energy.total = F (spec 2026-11-13 §4–5)`.
 
 **Time:** about 12 min of gates plus the release-only tests (a few min).
 
@@ -343,7 +364,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
     - |d(TS)/dx| ≥ 2 mHa/Bohr;
     - the plain |FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr;
     - the 4δ span in regime.
-  - If it fails, re-scan within c ∈ [5e-3, 5e-2] Ha/Bohr.
+  - If it fails, re-scan within c ∈ [5e-3, 1e-1] Ha/Bohr (the 5 mHa window, spec §9 V3; F15).
   - Record the result, then delete the scratch scan.
 - [ ] **Step 2: Write the test** `fd_forces_are_minus_df_dx_near_a_pinned_pair` [MUST-4] in `oracles.rs`.
   - Definitions: FD_X(d) = −[X(x+d) − X(x−d)]/(2d), a force, for X = F (`total`) and X = E (`internal`). R_X(a, 2a) = (4·FD_X(a) − FD_X(2a))/3. δ = 0.01 Bohr.
@@ -370,23 +391,29 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
   - F_HF in the progress energy;
   - `ScfStats`;
   - the module paragraph;
-  - **the partial-level stop** (spec §5.1) [kT-5]: `pub const GPU_PARTIAL_TOL: f64 = 1e-5`; the convergence test compares Δρ with `max(settings.tol, GPU_PARTIAL_TOL)` on a step whose occupations have a partial level (`qm::partial_levels` non-empty in either channel), else with `settings.tol`; `ScfStats.tol_used` reports the tolerance the converged step was tested against (also on the CPU, where it is always `settings.tol`). The stall watch and the cap are unchanged;
-  - **revert the `SCF_SMEAR` and `SCF_TRACE2` knobs** (the uncommitted diag hunks).
+  - **the partial-level stop** (spec §5.1) [kT-5]: `pub use qm::GPU_PARTIAL_TOL` (defined once in Task 4; F11); the convergence test compares Δρ with `max(settings.tol, GPU_PARTIAL_TOL)` on a step whose occupations have a partial level (`qm::partial_levels` non-empty in either channel), else with `settings.tol`; it fills `ScfStats.tol_used` with the tolerance the converged step was tested against. The stall watch and the cap are unchanged;
+  - the `SCF_SMEAR` and `SCF_TRACE2` knobs are already gone (they left the tree in Task 3 step 6); `rg "SCF_SMEAR|SCF_TRACE2" crates` returns nothing.
 - Modify `crates/qm-gpu/src/forces.rs`: module doc (−dF/dR, as in Task 5) and the test settings at ~l. 734.
-- Modify `crates/qm/src/scf.rs`: `ScfSettings::for_grid` → `occupations: Occupations::FermiDirac { kt: ELECTRON_KT }`, and its doc.
-- Modify `crates/providers/src/ks.rs`, `problem`: the all-electron branch sets `qm::Occupations::Aufbau` explicitly, with the comment "held until plan Task 9 switches the surface and its tag together". This is the hold.
+- Modify `crates/qm/src/scf.rs`:
+  - `ScfSettings::for_grid` → `occupations: Occupations::FermiDirac { kt: ELECTRON_KT }`, and its doc;
+  - `ScfStats` gains `pub tol_used: f64` (F9): the tolerance the converged step was tested against. On the CPU it is always `settings.tol`.
+- **The hold** (F8): every caller that must keep today's rule sets `qm::Occupations::Aufbau` explicitly, with the comment "held until plan Task <n> switches it":
+  - `crates/providers/src/ks.rs`, `problem`: the all-electron branch, held until Task 9 switches the surface and its tag together;
+  - `crates/providers/src/ks.rs`, test `cpu_provider_matches_qm_directly`: held until Task 9;
+  - `crates/providers/src/pseudo.rs`, `BondForce::settings`: held until Task 10 (the dimer procedure moves with its hash there).
+  - Grep every `ScfSettings::for_grid` caller (`rg "for_grid\(" crates`, about 100 hits) and classify each as: takes FD now; sets its own occupations already; or needs the hold. Record the counts in the commit body.
 - Modify `crates/validate/tests/gpu_vs_cpu.rs` (V4 cases) and `crates/validate/tests/oracles.rs` (the TS assertions).
 - Modify `crates/validate/references.md`, "GPU vs CPU at fixed σ".
 
 **Interfaces:**
-- Consumes: `qm::{fermi_dirac, witness_reached, partial_levels, ELECTRON_KT, WITNESS_GAP, MAX_WITNESS_GROWTH}`.
-- Produces: `GpuSolver` accepts `FermiDirac`, and its `ScfStats`/`Energy` carry the same fields with the same meaning as the CPU's.
+- Consumes: `qm::{fermi_dirac, witness_reached, partial_levels, ELECTRON_KT, GPU_PARTIAL_TOL, WITNESS_GAP, MAX_WITNESS_GROWTH}`.
+- Produces: `GpuSolver` accepts `FermiDirac`, and its `ScfStats`/`Energy` carry the same fields with the same meaning as the CPU's, including `ScfStats.tol_used` (Task 9 wires it into `EvalStats.scf_tol_used`).
 
 - [ ] **Step 1: Write the failing tests.**
   - qm-gpu `diis_reset_mixes_only_new_map_residuals` (spec §5): fill the DIIS history with entries from map A; apply the frozen-orbital reset; push one entry measured on map B. Assert the next mix equals plain α-mixing of B's residual: zero weight on any A entry.
   - qm-gpu `gpu_fd_warm_state_from_other_kt_is_cold` (Review Focus 1): bitwise equal to the cold solve, as in Task 5.
-  - qm-gpu `gpu_partial_stop_only_with_a_partial_level` (spec §5.1) [kT-5]: (a) all-electron H₂ at tol 1e-6 (gapped) converges with `tol_used == 1e-6` and Δρ < 1e-6, bitwise the same stop as before the rule; (b) a lone pseudo-O at M = 3, tol 1e-6, converges with `tol_used == GPU_PARTIAL_TOL` within 60 iterations; (c) the same O on the CPU reports `tol_used == 1e-6`.
-  - gpu_vs_cpu `gpu_fd_h4_square_matches_cpu` and `gpu_fd_pseudo_o_m<M>_matches_cpu`, one per M Task 1 settled on [MUST-5]: **M = 3 (the winner) and M = 1** (both symmetric at every site at 5 mHa; M = 5 is gapped and already covered by `pseudo_o_triplet_matches_cpu`'s family) [kT-5]. σ = h = 0.25, 49³. The GPU side stops at the partial-level 1e-5 (spec §5.1) and the CPU at 1e-6; V0 measured the stop's own error on the pseudo surface at ≤ 1.7 µHa in F and ≤ 3.2e-6 Ha/Bohr per force component, inside `E_BOUND_PSEUDO` = 6e-6 and `F_BOUND_PSEUDO` = 6e-5, so the bounds stay. Each asserts:
+  - qm-gpu `gpu_partial_stop_only_with_a_partial_level` (spec §5.1) [kT-5]: (a) all-electron H₂ at tol 1e-6 (gapped) converges with `tol_used == settings.tol` (asserted exactly, F14) and Δρ < 1e-6, bitwise the same stop as before the rule; (b) a lone pseudo-O at M = 3, tol 1e-6, converges with `tol_used == GPU_PARTIAL_TOL` within 60 iterations; (c) the same O on the CPU reports `tol_used == 1e-6`.
+  - gpu_vs_cpu `gpu_fd_h4_square_matches_cpu` and `gpu_fd_pseudo_o_m<M>_matches_cpu`, one per M Task 1 settled on [MUST-5]: **M = 3 (the winner) and M = 1** (both symmetric at every site at 5 mHa) [kT-5]. M = 5 is gapped (no partial level, FD ≡ Aufbau there) and needs no V4 case. `pseudo_o_triplet_matches_cpu` (qm-gpu) is M = 3 with `DegenerateShells` set explicitly, so it does not move here; Task 10 converts it to FD and re-pins it (F12). **Pre-registered (F15):** if the M = 1 case stalls at the f32 floor (the stall stop or the cap, not a convergence at 1e-5), STOP and report; do not re-budget or drop the case. σ = h = 0.25, 49³. The GPU side stops at the partial-level 1e-5 (spec §5.1) and the CPU at 1e-6; V0 measured the stop's own error on the pseudo surface at ≤ 1.7 µHa in F and ≤ 3.2e-6 Ha/Bohr per force component, inside `E_BOUND_PSEUDO` = 6e-6 and `F_BOUND_PSEUDO` = 6e-5, so the bounds stay. Each asserts:
     - |F_gpu − F_cpu| and |TS_gpu − TS_cpu| within the suite's existing energy bounds (`E_BOUND`/`E_BOUND_PSEUDO`);
     - where a partial level exists, |μ_gpu − μ_cpu| ≤ `EPS_BOUND_PSEUDO`;
     - per level, |Δf| ≤ `EPS_BOUND_PSEUDO / (2.0 * ELECTRON_KT)` (= 1e-3 at kT = 5 mHa; 5e-3 at 1e-3) [kT-5];
@@ -395,8 +422,8 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
     - forces within the existing force bounds.
   - oracles: in each σ → 0 oracle (H, He, H₂), assert `stats.energy.ts <= 1e-12`.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p qm-gpu --release diis_reset gpu_fd` and `cargo test -p validate --release --test gpu_vs_cpu gpu_fd`. Expected: FAIL (the GPU shim returns `Err`).
-- [ ] **Step 3: Implement** the GPU FD path, the `for_grid` flip and the providers hold. Remove the env knobs.
-- [ ] **Step 4: Re-pin the moved pins.** `gpu_none_policy_is_bitwise_today` and `pseudo_o_triplet_matches_cpu` (if its settings come from `for_grid`) each get the one-line reason "all-electron now solves witness vectors (FD, spec 2026-11-13)" or the measured −TS. Never delete one.
+- [ ] **Step 3: Implement** the GPU FD path, `ScfStats.tol_used` on both solvers, the `for_grid` flip and the holds.
+- [ ] **Step 4: Re-pin the moved pins.** `gpu_none_policy_is_bitwise_today` and any other pin whose settings come from `for_grid` without a hold each get the one-line reason "all-electron now solves witness vectors (FD, spec 2026-11-13)" or the measured −TS. Never delete one.
 - [ ] **Step 5: Run the gates,** serially:
   - `cargo test -p qm-gpu --release` (not in CLAUDE.md's table; record its time in dev-reference "Test suites");
   - `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min);
@@ -405,7 +432,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
   - `cargo test -p providers --release` (~5.5 min; the hold keeps its pins).
 
   Expected: PASS, existing numbers within the existing tolerances.
-- [ ] **Step 6: Commit** the files above (`git commit -o --`). Message: `feat(qm-gpu): Fermi–Dirac on the shared host rule; FD is ScfSettings' default (spec 2026-11-13 §5, V3/V4)`.
+- [ ] **Step 6: Commit** the files above (`git commit -o --`), after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5). Message: `feat(qm-gpu): Fermi–Dirac on the shared host rule; FD is ScfSettings' default (spec 2026-11-13 §5, V3/V4)`.
 
 **Time:** about 50 min of gates plus qm-gpu's own suite.
 
@@ -439,9 +466,12 @@ pub struct Judgement { pub judged: bool, pub mismatch: f64, pub bound: f64, pub 
 pub struct BranchJumpGuard { /* previous evaluation, κ window */ }
 impl BranchJumpGuard { pub fn new() -> Self; pub fn reset(&mut self); pub fn judge(&mut self, e: &Evaluation) -> Judgement; }
 // sim:
-pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
+pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";   // the short reason `untrainable` returns
+pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec §6.6), m in Ha shown in mHa, one decimal
 // EvalStats gains: pub branch_jump: Option<f64> /* Some(m) when flagged */, pub spin_change: Option<f64>
 ```
+
+`branch_jump_warning(0.012)` is exactly "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)" (F14; Task 12 asserts this text).
 
 **Algorithm** (spec §6.3, exactly):
 - ΔF = E₁ − E₀ and W = −½ Σ_I (F_I,0 + F_I,1)·ΔR_I. So m = |ΔF − W|, which is 0 on a smooth surface.
@@ -451,9 +481,9 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - **`spin_change`** is |Δ∫|ρ↑ − ρ↓|| when N↑ = N↓. Take it from the adapter's existing spin reduction (`SpinSummary::abs_integral`'s source); `None` otherwise.
 - **Tiers** (ruling R8):
   - Sample tier when `scf_tol_used ≤ SAMPLE_TOL`: pseudo (1.87e-6, 5e-5 = `PSEUDO_FORCE_NOISE`); all-electron (5.4e-6, the all-electron force path scatter from references.md, measured here as warm vs cold ×5 if none is on record).
-  - App tier otherwise: measured in Step 1. Every GPU solve with a partial level stops at 1e-5 (spec §5.1) and reports `scf_tol_used` = 1e-5, so it is judged on this tier even when the provider's tolerance is the sample one [kT-5].
+  - App tier otherwise: measured in Step 1. Every GPU solve with a partial level stops at 1e-5 (spec §5.1) and reports `scf_tol_used` = 1e-5, so it is judged on this tier even when the provider's tolerance is the sample one [kT-5]. (`EvalStats.scf_tol_used` carries the requested tolerance until Task 9 sets it from `ScfStats.tol_used`, F9; this task's tests set the tier directly.)
 
-- [ ] **Step 1: Measure the app tier.** Pseudo and all-electron H₂O at `effective_gpu_tol(INTERACTIVE_TOL)`, warm vs cold, 5 repeats: σ_E and the largest per-component σ_F. Add a pinned case, linear OH at the sample tolerance (it stops at the partial-level 1e-5), because that tier now also holds pinned teacher solves; the tier is the larger of the two cases' scatters. Record them in references.md as the constants `noise_tier` returns [kT-5].
+- [ ] **Step 1: Measure the app tier.** The providers still run the old rule here, so drive `GpuSolver` directly with explicit `FermiDirac { kt: ELECTRON_KT }` settings (F10), on the scenes `providers::ks::problem` builds. Pseudo and all-electron H₂O at `effective_gpu_tol(INTERACTIVE_TOL)`, warm vs cold, 5 repeats: σ_E and the largest per-component σ_F. Add a pinned case, linear OH at the sample tolerance (it stops at the partial-level 1e-5), because that tier now also holds pinned teacher solves; the tier is the larger of the two cases' scatters. Record them in references.md as the constants `noise_tier` returns [kT-5].
 - [ ] **Step 2: Write the failing tests.**
   - `branch_jump.rs`, on an analytic Morse dimer (D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8), pseudo sample tier:
     - `synthetic_jump_is_flagged`: 0.02 Bohr steps; from step 10 on, E shifted by +12 mHa. Flagged at step 10 only.
@@ -463,10 +493,10 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
     - `alternating_jumps_stay_flagged`: ±12 mHa on every other 0.02 Bohr step for 40 steps → every jump flagged, and no flagged step ever enters the window.
     - `cell_or_origin_change_restarts`: the cell n, h or the origin changes → not judged, window emptied.
     - `atom_set_change_restarts` (Review Focus 2): add an atom, remove one, swap two species → not judged, no panic.
-  - sim: `untrainable_reports_branch_jump` → `Some(BRANCH_JUMP_WARNING)`.
+  - sim: `untrainable_reports_branch_jump` → `Some(BRANCH_JUMP_WARNING)`; `untrainable_branch_jump_warning_text`: `branch_jump_warning(0.012)` equals the text above.
   - validate surrogate (V7) `branch_jump_step_is_not_trained_on`: a synthetic teacher (the analytic Morse dimer wrapped in `BranchJumpGuard`) streams a 12 mHa switch. That step is warned and absent from the trained samples; the steps before and after are trained on.
 - [ ] **Step 3: Run them to check they fail.** Run `cargo test -p providers --release branch_jump` and `cargo test -p sim --release untrainable`. Expected: compile FAIL.
-- [ ] **Step 4: Implement.** `untrainable()` order: core overlaps, then `branch_jump`, then the old `occupation_changed`. Task 9 removes the last. The warning text is spec §6.6's: "F changed by m more than the forces' work: the SCF moved to another stationary state (not trained on)".
+- [ ] **Step 4: Implement.** `untrainable()` order: core overlaps, then `branch_jump`, then the old `occupation_changed`. Task 9 removes the last. The warning in `EvalStats` is `branch_jump_warning(m)`, spec §6.6's text with m in mHa.
 - [ ] **Step 5: Run them to check they pass.** Run the commands from Step 3. Expected: PASS.
 - [ ] **Step 6: Physics review.** The reviewer checks:
   - the factor 3, the window of 8, the 0.1 Bohr reach;
@@ -478,7 +508,7 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 
   None of them may be loosened.
 - [ ] **Step 7: Run the gates,** serially: `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), `cargo test -p providers --release` (~5.5 min), `cargo test -p validate --release --test surrogate` (~12–17 min).
-- [ ] **Step 8: Commit** the files above.
+- [ ] **Step 8: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (`crates/providers/src/lib.rs` carried the prototype's mod line; F5).
 
 **Time:** about 35 min of gates plus about 10 min to measure the tier.
 
@@ -488,10 +518,10 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 
 **Files:**
 - Modify `crates/providers/src/ks.rs`:
-  - `problem`: FD for every scene; the Task 7 hold removed;
+  - `problem`: FD for every scene; the Task 7 holds in `problem` and in the test `cpu_provider_matches_qm_directly` removed (`BondForce::settings` keeps its hold until Task 10);
   - the module doc: "nothing pseudised is exactly today's problem" rewritten;
   - `OccupationWatch` deleted;
-  - `eval_stats` maps `partial`, `internal`, `ts`.
+  - `eval_stats` maps `partial`, `internal`, `ts`, and sets `EvalStats.scf_tol_used = Some(stats.tol_used)` (F9), so a partial-level GPU solve reports 1e-5 and Task 8's guard judges it on the app tier.
 - Modify `crates/providers/src/pseudo.rs`: the new tag format; `is_all_electron_tag`; `legacy_tag_of`; module doc.
 - Modify `crates/providers/src/surrogate/policy.rs`: the label-noise prior (touch point 7) reads `is_all_electron_tag`.
 - Modify every other `"none"` literal that means the all-electron surface: `rg '"none"' crates --type rust`, each hit classified as either the scene's policy word (unchanged) or the surface (→ predicate). Record the count in the commit body.
@@ -503,7 +533,7 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - Modify every consumer that rebuilds a total from components (re-grep `kinetic +`, `.xc +`, `components(`): `crates/qm-gpu/src/scf.rs` (energy assembly, done in Task 7; verify), `crates/sim/src/dynamics.rs` (`energy_ks` doc), `crates/validate/tests/gpu_vs_cpu.rs` `components()`, the app breakdown, the sidecar, `sim::references`.
 - Modify `crates/app/src/ui/pseudo.rs`, `occupation_lines`: compile-level change to per-level rows. The wording comes in Task 12.
 - Modify the synthetic teachers in `crates/providers/src/sampling/tests.rs` and `crates/providers/src/surrogate/tests.rs`: they set `branch_jump` instead of `occupation_changed`.
-- Create `crates/providers/src/fd_regression.rs` (V2, `#[cfg(test)]`). Delete the uncommitted `scf_stall_diag.rs` and its `lib.rs` line.
+- Create `crates/providers/src/fd_regression.rs` (V2, `#[cfg(test)]`). The diag harness is not on the tree (it left in Task 3 step 6); read its generators with `git show smearing-prototype:crates/providers/src/scf_stall_diag.rs` and never merge that branch.
 - Modify: references.md and `docs/dev-reference.md` ("Occupations (Fermi–Dirac)": tags, `legacy_tag_of`, re-pins; "SCF stall stop": no release restart).
 
 **Interfaces:**
@@ -521,14 +551,15 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
     - `legacy_tag_of_matches_recorded_ds_strings`: every policy × backend equals the Step 1 literal.
     - `is_all_electron_tag_cases`: `"none"` and `"none/fd5e-3/pin1e-5"` are true; `"cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"` and `""` are false.
   - ks.rs: the Aufbau assert (~l. 3179) becomes `FermiDirac { kt: ELECTRON_KT }`, with the re-pin reason. The stall-stop bitwise pins are re-pinned with the reason.
-  - `fd_regression.rs` (V2, GPU, release-only). Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, at the app tolerance raised by `effective_gpu_tol`, with the stall stop on.
-    - `fd_converges_default_policy_stallers`: H₄ rhombus ≤ 20, lopsided tetra ≤ 50, H₄ seed 1 ≤ 20, H₅ seed 3 ≤ 30, H₈ seed 8 ≤ 25 iterations.
-    - `fd_converges_all_electron_failures`: H₅ ring (radius 1.531, xy plane) ≤ 25, H₆ seed 5 ≤ 75, H₂O + 2 H ≤ 120, lopsided tetra ≤ 45.
-    - Each case: converged, no stall stop and no cap; |F − F_D§6| ≤ 1e-5 and |TS − TS_D§6| ≤ 1e-5. Take the values from the diagnosis's D§6 tables. The seeded geometries are reduced from `scf_stall_diag.rs`'s generators.
-    - `fd_controls_keep_their_energies`: H₂ within 2e-6 and H₂O within 6e-6 of D§6.
+  - ks.rs `scf_tol_used_reports_the_partial_stop` (F9): a lone pseudo-O at M = 3 through the GPU provider at the sample tolerance reports `scf_tol_used == Some(GPU_PARTIAL_TOL)`; gapped H₂ reports the requested tolerance.
+  - `fd_regression.rs` (V2, GPU, release-only). Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, at the app tolerance raised by `effective_gpu_tol`, with the stall stop on. **Budgets and pins come from spec §9's V2 table as amended by Task 3 step 0 (the 5 mHa re-measurement; F7).** The 1e-3 counts and D§6's F/TS values are stale and are not used.
+    - `fd_converges_default_policy_stallers`: H₄ rhombus, lopsided tetra, H₄ seed 1, H₅ seed 3, H₈ seed 8, each within its amended budget.
+    - `fd_converges_all_electron_failures`: H₅ ring (radius 1.531, xy plane), H₆ seed 5, H₂O + 2 H, lopsided tetra, each within its amended budget.
+    - Each case: converged, no stall stop and no cap; |F − F_pin| ≤ 1e-5 and |TS − TS_pin| ≤ 1e-5 against the amended table. The seeded geometries are reduced from the prototype's generators (`smearing-prototype`).
+    - `fd_controls_keep_their_energies`: H₂ within 2e-6 and H₂O within 6e-6 of their amended-table values.
     - A mismatch is investigated, never re-pinned blindly.
   - `all_electron_h_minus_witness_cap` [NOTE-6]: all-electron H⁻ in the largest box the app offers (Accurate, h = 0.15; name the box in the test). Pin the measured outcome: either it converges, or it returns `Err(QmError::Numerical)` whose message names `MAX_WITNESS_GROWTH`.
-- [ ] **Step 3: Run them to check they fail.** Run `cargo test -p providers --release tag_ legacy_tag is_all_electron fd_regression all_electron_h_minus`. Expected: FAIL.
+- [ ] **Step 3: Run them to check they fail.** Run `cargo test -p providers --release tag_ legacy_tag is_all_electron fd_regression all_electron_h_minus scf_tol_used`. Expected: FAIL.
 - [ ] **Step 4: Implement** the switch, the tags, the predicate, the `sim` types, the consumers and the app's compile change. Delete the occupation watch. Run `cargo build --workspace --release`.
 - [ ] **Step 5: Run them to check they pass.** Run the command from Step 3. Expected: PASS.
 - [ ] **Step 6: Run the gates,** serially:
@@ -536,7 +567,7 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
   - `cargo test -p providers --release` (~5.5 min, plus V2's 9 GPU cases, about 10 min);
   - `cargo test -p validate --release --test surrogate` (~12–17 min);
   - `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min).
-- [ ] **Step 7: Commit** the files above. The deleted diag file was never tracked.
+- [ ] **Step 7: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5).
 
 **Time:** about 40 min of gates.
 
@@ -548,7 +579,8 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - Modify `crates/qm/src/radial/ledger.rs`:
   - `DIMER_PROCEDURE` gains the occupation rule and kT among its hashed constants;
   - `DIMER_PROCEDURE_DS`, a frozen copy of the pre-change procedure, is used only by `legacy_tag_of`.
-- Modify `crates/providers/src/pseudo.rs`: the dimer gate's 3-D solves use FD; the legacy hash uses `DIMER_PROCEDURE_DS`.
+- Modify `crates/providers/src/pseudo.rs`: the dimer gate's 3-D solves use FD (Task 7's `Aufbau` hold in `BondForce::settings` removed; F8); the legacy hash uses `DIMER_PROCEDURE_DS`. `DIMER_PROCEDURE`'s stop reads `qm::GPU_PARTIAL_TOL`, never a literal (F11).
+- Modify `crates/qm-gpu/src/scf.rs` tests (F12): `pseudo_o_triplet_matches_cpu` and every other test that sets `DegenerateShells` explicitly are converted to `FermiDirac { kt: ELECTRON_KT }` and re-pinned, each moved bound with its measured −TS or re-pin reason beside it.
 - Delete everywhere:
   - `Occupations::DegenerateShells`, `degenerate_shell_occupations`, `released_occupations`, `decide`, `shared_runs`, `FractionalShell`, `DEGENERACY_TAU`, `CANDIDATE_TAU`;
   - `ScfStats.fractional` and `released`;
@@ -567,14 +599,14 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 **Interfaces:**
 - Produces:
   - `pub(super) fn closed_spin_channels(z: u8, partial: Option<bool>) -> bool`: true iff z == 1, or `partial == Some(false)`.
-  - The V7 fixture file: per case, the geometry, E_DS and the DS forces.
+  - The V7 fixture file: the policy, the grid and the box, then per case the geometry, E_DS and the DS forces. Task 14's V7 test reads the policy, grid and box from it.
 
-- [ ] **Step 1: Capture the DS-era labels for V7 before deleting anything.** H₂ at R = 1.4, linear OH and a near-square H₄ on the V7 test's grid and policy (Task 14), solved under `DegenerateShells` at the sample tolerance: E and forces at full f64 precision. Write them to the fixture.
+- [ ] **Step 1: Capture the DS-era labels for V7 before deleting anything** (F13). H₂ at R = 1.4, linear OH and a near-square H₄, under the default pseudised policy (`Accepted`) on one fixed grid and box chosen here and written into the fixture, solved under `DegenerateShells` at the sample tolerance: E and forces at full f64 precision. Choose the H₄ aspect so that its internal energy moves by |ΔE| ≥ 3ε_E = 3e-5 Ha between the DS solve and an FD solve at `ELECTRON_KT` (so it is class S outside the false-S band); record that |ΔE| in the fixture. Write the labels to the fixture.
 - [ ] **Step 2: Write the failing tests.**
   - lone.rs: `closed_spin_channels(1, None)` is true; `(2, Some(false))` true; `(8, Some(true))` false; `(2, None)` false.
   - `polarised_or_partial_o_is_declined` (V8): an O reference whose winning solve has partial levels → declined.
   - pseudo.rs (providers):
-    - `dimer_procedure_hashes_fd`: `DIMER_PROCEDURE`'s debug text names `FermiDirac`, `5e-3` and the GPU partial stop `1e-5` (the gate's 3-D solves run on the GPU);
+    - `dimer_procedure_hashes_fd`: `DIMER_PROCEDURE`'s debug text names `FermiDirac`, `5e-3` and the GPU partial stop `qm::GPU_PARTIAL_TOL` (1e-5; the gate's 3-D solves run on the GPU);
     - `core_recipe_hash_unchanged`: equal to the literal recorded on the tree before this task.
 - [ ] **Step 3: Run them to check they fail.** Expected: FAIL.
 - [ ] **Step 4: Implement, then delete DS.** `rg "DegenerateShells|degenerate_shell_occupations|released_occupations|DEGENERACY_TAU|CANDIDATE_TAU|FractionalShell|shared_runs|fn decide" crates` must return nothing. Docs may cite them as history.
@@ -587,10 +619,11 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - [ ] **Step 7: Run the gates,** strictly serial:
   - `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min);
   - `cargo test -p providers --release` (~5.5 min plus V2);
+  - `cargo test -p qm-gpu --release` (F12): `pseudo_o_triplet_matches_cpu` and the other converted tests at their new pins;
   - `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min);
   - `--test pseudo_gen` (~9 min): `generation_record_table_matches_references_md` stays bitwise; H and He regenerate once (about 1 min);
   - `--test pseudo` (~1 h);
-  - `--test pseudo_oracles` (~1.5–2 h): the dimer verdicts and R_e/ω reproduce within the backend margin; `pseudo_o_triplet_matches_cpu` and `gpu_oxygen_reference_multiplicity` move by the measured −TS, recorded with the closed form (O at M = 3: 3 kT s(⅓) = 9.5477e-3 Ha at 5 mHa; V0 measured TS within 1e-9 of it at every site) [kT-5]. The scan's winner stays M = 3, and it now converges through the partial-level 1e-5 stop.
+  - `--test pseudo_oracles` (~1.5–2 h): the dimer verdicts and R_e/ω reproduce within the backend margin. The O-reference pins (`gpu_oxygen_reference_multiplicity` in `crates/providers/src/sampling/tests.rs`, run by the providers gate, and qm-gpu's `pseudo_o_triplet_matches_cpu`) move by the measured −TS, recorded with the closed form (O at M = 3: 3 kT s(⅓) = 9.5477e-3 Ha at 5 mHa; V0 measured TS within 1e-9 of it at every site) [kT-5]. The scan's winner stays M = 3, and it now converges through the partial-level 1e-5 stop.
 - [ ] **Step 8: Commit** the files above.
 
 **Time:** about 3–3.5 h of gates.
@@ -623,7 +656,8 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
   - GPU parity;
   - `branch_jump`;
   - the V5 derivations;
-  - that no tolerance moved without its TS reason.
+  - that no tolerance moved without its TS reason;
+  - the CPU f64 cross-check at 5 mHa of pseudo-S at M = 1 and all-electron O at M = 5, V0's two accepted convergence misses (the user's 2026-11-14 ruling; Task 1 step 5): run both on the CPU FD path and record converged or not, iterations and F beside the GPU numbers in references.md.
 - [ ] **Step 5: Commit** `dynamics.rs` and `references.md`.
 
 **Gates:** `--test dynamics` (~6 min, plus the work integral's 41 + 2 CPU solves at 41³, about 30 min, plus the NVE run). **Time:** about 45–60 min.
@@ -632,15 +666,16 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 
 ### Task 12: The UI: readouts, breakdown, Activity, orbitals, Compare — **engineering**
 
-**Files:**
+**Files** (F14: the sites are named now; line numbers are from the pre-merge tree of 2026-11-14, so find each by name after Task 2's merge):
 - Modify:
-  - `crates/app/src/ui/pseudo.rs`: `energy_label`, `ENERGY_TOOLTIP`, `occupation_lines`;
-  - `crates/app/src/ui/dock/readouts.rs`: the breakdown rows; "E total" text;
-  - `crates/app/src/ui/dock/graph.rs`;
-  - `crates/app/src/ui/activity/jobs.rs`: E_HF → F_HF;
-  - the solve-log line, where the worker formats a solve summary (`crates/app/src/worker/commands.rs`);
-  - `crates/app/src/ui/dock/orbitals.rs`: per-level f, with the `DegenerateShells` wording rewritten;
-  - `crates/app/src/ui/dock/compare.rs`: the T_el note.
+  - `crates/app/src/ui/pseudo.rs`: `energy_label` (~l. 111), a new `ENERGY_TOOLTIP`, `occupation_lines` (~l. 118);
+  - `crates/app/src/ui/dock/readouts.rs`: the breakdown rows; the "E total" row (~l. 106, "KE + E_KS: …") and its info text (~l. 88); the warning list (`d.eval.warnings`, ~l. 215);
+  - `crates/app/src/ui/dock/graph.rs`: the "E total = KE + E_KS" texts (~l. 33 and ~l. 123);
+  - `crates/app/src/ui/activity/jobs.rs`: the iteration-energy hover (~l. 240, "(Harris–Foulkes) energy") → F_HF;
+  - the solve-log line: `crates/app/src/ui/activity/log.rs`, `solve_cell` (~l. 130) and `solve_hover` (~l. 144);
+  - `crates/app/src/ui/dock/orbitals.rs`: per-level f, with the `DegenerateShells` wording (~l. 161) rewritten;
+  - `crates/app/src/ui/dock/compare.rs`: the T_el note;
+  - the reference-energy sites (spec §4.7(i)): `crates/app/src/ui/activity/plots.rs` (the module doc ~l. 6, the parity toggle ~l. 238, the axis label ~l. 285, the parity hover ~l. 312: "(E − Σ E_ref)/N"; the dimer-curve label ~l. 398: "E − E_ref(a) − E_ref(b)") and `crates/app/src/ui/activity/log.rs` (the lone-answer text ~l. 53: "E = Σ E_ref").
 - Modify `README.md`:
   - the readouts;
   - "SCF converges on loose hand-built clusters";
@@ -659,8 +694,8 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
   - `solve_log_ts_line`: ts = 9.5477e-3 (a lone O at M = 3 at 5 mHa) → contains `"−TS = 9.5 mHa"`; ts = 9e-7 → no −TS text.
   - `compare_note_when_partial`: ts ≥ 1e-6 → `"ours is at T_el = 1579 K with partly occupied levels; PySCF's is integer-occupied"`; otherwise absent.
   - `orbital_rows_per_level_f`: f < 1e-6 shows as empty; f = ⅓ shows its f.
-  - `branch_jump_warning_shown`: a stats warning with `BRANCH_JUMP_WARNING` reaches the readouts' warning list.
-  - `reference_energies_say_free_energy` (spec §4.7(i)): every place the app shows E − ΣE_ref says the references are free energies at T_el. Find those places with `rg "reference" crates/app/src/ui`.
+  - `branch_jump_warning_shown`: an `EvalStats` carrying `sim::branch_jump_warning(0.012)` puts exactly "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)" into the readouts' warning list (the formatted text, not the `BRANCH_JUMP_WARNING` key; F14).
+  - `reference_energies_say_free_energy` (spec §4.7(i)): each reference-energy site named under Files says the references are free energies at T_el.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p app --release --bin app -- ui::`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run them to check they pass**, then run the gate `cargo test -p app --release` (~10 min, replays included; their energy expectations are gapped).
@@ -670,19 +705,19 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 
 ---
 
-### Task 13: The collection format: read-only open, record v2, code 8, `migration.txt`, the sidecar bump — **engineering**
+### Task 13: The collection format: read-only open, record R + 1, code 9, `migration.txt`, the sidecar bump — **engineering**
 
 **Files:**
 - Modify `crates/surrogate/src/collection.rs`:
-  - `RECORD_VERSION = 2`; the reader takes 1 and 2;
-  - `open_read_only`;
+  - `RECORD_VERSION = R + 1` (R = the merged value, Task 2 step 4; F1); the reader takes 1 ..= R + 1;
+  - `open_read_only`, which never cleans purge's `samples.bin.new`/`samples.bin.bak.new` (F3: it leaves them byte-identical);
   - the layout table gains `migration.txt`;
   - module doc.
 - Modify `crates/surrogate/src/quarantine.rs`:
-  - `Q_RESOLVED = 8`;
+  - `Q_RESOLVED = 9` (code 8 is `purge-forgotten`'s `Q_FORGOTTEN_UNFENCED`, untouched; F1);
   - `is_collection_code` (ruling R12);
-  - the docs paragraph "An older build meeting code 8", in the style of code 7's.
-- Modify `crates/surrogate/src/sidecar.rs`: one new magic `ASMODEL<k>` with k = Task 2's `MAGICS.len()` + 1; its reader; writers emit it and leave code-8 samples out (ruling R11).
+  - the docs paragraph "An older build meeting code 9", in the style of code 7's.
+- Modify `crates/surrogate/src/sidecar.rs`: one new magic `ASMODEL<K + 1>` with K = Task 2's `MAGICS.len()` (F1); its reader; writers emit it and leave code-9 samples out (ruling R11).
 - Create `crates/surrogate/src/migration.rs` (the `migration.txt` model).
 - Modify `crates/surrogate/src/lib.rs`.
 - Modify `crates/app/src/update/formats.rs`: the table doc. The versions follow the constants.
@@ -691,7 +726,7 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 - Produces:
 
 ```rust
-pub const Q_RESOLVED: u8 = 8;
+pub const Q_RESOLVED: u8 = 9;
 pub fn is_collection_code(code: u8) -> bool;   // is_persisted_code(code) || code == Q_RESOLVED
 pub struct ReadOnlyCollection { pub key: SurfaceKey, pub samples: Vec<StoredSample>, pub codes: Vec<u8>,
     pub references: Vec<(u8, usize, CollectionReference)>, pub damaged_tail: Option<String> }
@@ -699,6 +734,7 @@ pub enum ReadOnlyError { LiveWriter { pid: u32 }, Unreadable(String), NewerForma
 impl Collection { pub fn open_read_only(dir: &Path) -> Result<ReadOnlyCollection, ReadOnlyError>; }
 pub enum MigrationState { Running, Complete, Reviewed }
 pub struct MigrationLog { pub source_slug: String, pub source_key: String, pub build: String, pub date: String,
+    pub source_len: u64, pub source_hash: u64 /* the source samples.bin at the pass's start (F3) */,
     pub cursor: usize, pub state: MigrationState, pub counts: [usize; 4] /* U, T, S, not migrated */,
     pub not_migrated: Vec<(usize, String)>, pub references: Vec<(u8, usize, Option<f64>, Option<f64>)>,
     pub class_u_max: (f64, f64), pub review: Vec<(usize, f64, bool)> /* new index, ratio, released */ }
@@ -712,14 +748,15 @@ pub fn write_migration(dir: &Path, log: &MigrationLog) -> Result<(), String>;  /
   - `read_only_open_leaves_every_byte`: hash every file in a fixture folder; `open_read_only`; the hashes are identical; no `.lock` is created.
   - `read_only_open_damaged_tail` (Review Focus 5): truncate the last record mid-payload. Every whole record is read; `damaged_tail.is_some()`; the bytes are identical afterwards.
   - `read_only_open_refuses_live_writer`: a `.lock` holding the test's own pid → `Err(LiveWriter { pid })`. A stale pid → it reads, and the lock file is untouched.
-  - `records_are_v2_and_v1_reads`: new appends carry version 2; a v1 fixture reads; a v3 record is refused as "written by a newer build" with the file untouched.
-  - `code_8_persists_in_collections_not_sidecars`: `is_collection_code(8)` and `!is_persisted_code(8)`; a sidecar written from a store holding a code-8 sample omits it.
-  - `sidecar_new_magic_round_trips` for each old body (6, 7, 8). `MAGICS.len()` is k.
-  - `migration_log_round_trips` and `migration_log_write_is_atomic` (a crash leaves the previous file whole).
-- [ ] **Step 2: Run them to check they fail.** Run `cargo test -p surrogate --release read_only records_are code_8 sidecar_new migration_log`. Expected: FAIL.
+  - `read_only_open_leaves_purge_temporaries` (F3): a fixture folder holding `samples.bin.new` and `samples.bin.bak.new` → `open_read_only` reads `samples.bin`; both temporaries are byte-identical afterwards and still present.
+  - `records_are_new_version_and_older_read`: new appends carry `RECORD_VERSION` (R + 1); a version-R fixture and a version-1 fixture read; a version R + 2 record is refused as "written by a newer build" with the file untouched. The test names the versions through the constant, never as literals.
+  - `code_9_persists_in_collections_not_sidecars`: `is_collection_code(9)` and `!is_persisted_code(9)`; `is_persisted_code(8)` still holds (purge's code); a sidecar written from a store holding a code-9 sample omits it.
+  - `sidecar_new_magic_round_trips` for each old body in R11's set (the bodies the merged `MAGICS` reads from 6 up, including any `purge-forgotten` added; Task 2 step 4). `MAGICS.len()` is K + 1.
+  - `migration_log_round_trips` (including `source_len`/`source_hash`) and `migration_log_write_is_atomic` (a crash leaves the previous file whole).
+- [ ] **Step 2: Run them to check they fail.** Run `cargo test -p surrogate --release read_only records_are code_9 sidecar_new migration_log`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run them to check they pass.**
-- [ ] **Step 5: Run the gates:** `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), `cargo test -p providers --release` (~5.5 min), `cargo test -p app --release` (~10 min; the formats tests now read collection 2 and the new sidecar version).
+- [ ] **Step 5: Run the gates:** `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), `cargo test -p providers --release` (~5.5 min), `cargo test -p app --release` (~10 min; the formats tests now read collection R + 1 and the new sidecar version).
 - [ ] **Step 6: Commit** the files above.
 
 **Time:** about 22 min of gates.
@@ -737,7 +774,8 @@ pub fn write_migration(dir: &Path, log: &MigrationLog) -> Result<(), String>;  /
 
 **Interfaces:**
 - Consumes:
-  - Task 13's `open_read_only`, `MigrationLog`, `Q_RESOLVED`;
+  - Task 13's `open_read_only`, `MigrationLog` (with `source_len`/`source_hash`), `Q_RESOLVED`;
+  - `purge-forgotten`'s purge entry point and `Q_FORGOTTEN_UNFENCED` (Touch-point map rows 9–10);
   - Task 9's `legacy_tag_of` and `is_all_electron_tag`;
   - Task 10's fixture;
   - `PSEUDO_FORCE_NOISE`, `box_affected_face_density`, `Collection::offer_reference`, the multiplicity scan.
@@ -748,7 +786,7 @@ pub const MIGRATION_EPS_E: f64 = 1e-5;
 pub const MIGRATION_EPS_F: f64 = 3.0 * PSEUDO_FORCE_NOISE;   // 1.5e-4
 pub enum MigrationClass { Unchanged, EntropyOnly, StateChanged }
 pub fn classify(old_e: f64, old_f: &[[f64; 3]], new_free: f64, new_internal: f64, new_f: &[[f64; 3]]) -> MigrationClass;
-pub fn migrated_code(old: u8, class: MigrationClass) -> u8;   // U, T: old; S: 8, except 7 → 7 and 2 → 2 (1 → 8)
+pub fn migrated_code(old: u8, class: MigrationClass) -> u8;   // U, T: old (8 stays 8); S: Q_RESOLVED (9), except 7 → 7, 8 → 7 and 2 → 2 (1 → 9)
 pub fn predecessor_of(root: &Path, key: &SurfaceKey) -> Option<PathBuf>;   // exact key.txt match, legacy ionic tag
 // sim::Trainable
 fn migration(&self) -> Option<sim::MigrationStatus>;   // offer / running / complete, with counts and the estimate
@@ -769,6 +807,10 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - Then rewrite the cursor.
 - **References:** re-solved by the scan (lowest F) and offered through `offer_reference`. Old and new values go into the log.
 - **Copied or dropped:** `bond_experience.txt` is copied; `history.bin` is not carried; `README.txt` is regenerated.
+- **Forgotten-unfenced (F2):** a code-8 sample (`Q_FORGOTTEN_UNFENCED`, purge-forgotten) keeps 8 under U and T; under S it goes to 7: the user's Forget survives, and the fence returns, because the lift judged the old label.
+- **Purge interplay (F3):**
+  - the pass records the source `samples.bin`'s length and hash in `migration.txt` at its start; on resume, a mismatch (the old folder was purged or appended to by another build) restarts the pass from cursor 0 with the counts reset, the already-appended records counted as done by the duplicate rule of Review Focus 4;
+  - a purge of forgotten samples is refused on the new folder while the pass is Running, with the reason "a re-solve pass is running".
 - **Lock:** a live lock on the old folder refuses with the spec §7.1 reason.
 - **Estimate:** a count and an estimate before the start, updated from the median after 20 solves.
 
@@ -778,8 +820,8 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
     - F moved by −2·ELECTRON_KT·ln 2 with internal equal → EntropyOnly;
     - internal moved by 2e-5 → StateChanged;
     - one force component off by 1.6e-4 → StateChanged;
-    - `MIGRATION_EPS_F == 1.5e-4`.
-  - `migrated_code_table`: (0,S)→8, (1,S)→8, (2,S)→2, (7,S)→7, (1,U)→1, (1,T)→1, (0,T)→0.
+    - `(MIGRATION_EPS_F - 1.5e-4).abs() <= 1e-18` (it is 3.0 × `PSEUDO_FORCE_NOISE`, so not compared with `==`; F14).
+  - `migrated_code_table`: (0,S)→9, (1,S)→9, (2,S)→2, (7,S)→7, (8,S)→7, (8,U)→8, (8,T)→8, (1,U)→1, (1,T)→1, (0,T)→0 (F2).
   - `predecessor_by_exact_key`: found when key.txt matches with the legacy tag; not found when any other field differs (e.g. h).
   - `old_folder_bytes_identical_after_pass`: hash every file of the old folder before and after.
   - `refuses_while_old_folder_has_a_live_writer` (Review Focus 4): the message says it would be reading a store still being appended to.
@@ -788,9 +830,11 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - `masked_sample_compared_on_all_atoms_and_carried`.
   - `references_resolved_not_carried`: the new references.txt holds only re-solved values; the log holds the old and new values.
   - `not_offered_when_complete`: a complete log → `migration()` reports Complete and no offer.
+  - `source_change_restarts_from_zero` (F3): change the old `samples.bin`'s length (or one byte) between a partial pass and its resume → the pass restarts at cursor 0, and the final counts equal an uninterrupted run on the changed source.
+  - `purge_refused_while_migration_runs` (F3): with the log at Running, a purge of the new folder is refused with its reason and changes no byte.
   - `old_pass_checkpoint_resume_refused` (spec §7.7): a `training/pass.ckpt` carrying the legacy provenance is refused with the reason "started with the previous solver". The file is left byte-identical.
-  - validate surrogate (V7, GPU, small) `migration_classifies_h2_oh_h4`: the old folder is built from Task 10's DS-era fixture labels under the legacy tag. Expected: H₂ → U; linear OH → T (ΔF = −2·ELECTRON_KT·ln 2 within 1e-5, E and forces unchanged within ε); near-square H₄ → S at code 8. The old folder hashes identical. Task 15 adds the review assertions.
-- [ ] **Step 2: Run them to check they fail.** Run `cargo test -p providers --release migrat classify predecessor`. Expected: FAIL.
+  - validate surrogate (V7, GPU, small) `migration_classifies_h2_oh_h4`: the old folder is built from Task 10's DS-era fixture labels under the legacy tag. The policy, grid and box are the fixture's (F13). Expected: H₂ → U; linear OH → T (ΔF = −2·ELECTRON_KT·ln 2 within 1e-5, E and forces unchanged within ε); near-square H₄ → S at code 9 (its |ΔE| ≥ 3ε_E by the fixture's choice). The old folder hashes identical. Task 15 adds the review assertions.
+- [ ] **Step 2: Run them to check they fail.** Run `cargo test -p providers --release migrat classify predecessor source_change purge_refused`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run them to check they pass.**
 - [ ] **Step 5: Physics review.** The reviewer checks:
@@ -805,12 +849,12 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 
 ---
 
-### Task 15: Code 8 in the trust machinery, and the leave-one-out review — **engineering** (physics-reviewed)
+### Task 15: Code 9 in the trust machinery, and the leave-one-out review — **engineering** (physics-reviewed)
 
 **Files:**
-- Modify the providers' surrogate files at touch points 1–4 (the Task 2 map): the excluded predicate, the fence or misfit predicate, the held-cap count, the refit pipeline.
+- Modify the providers' surrogate files at touch points 1–4 and 9–10 (the Task 2 map): the excluded predicate, `fences()` (F4), the held-cap count and `fencing()` (code 9 stays out of both), the refit pipeline, the lift votes (they never lift code 9), and purge's remap of `migration.txt`'s review log.
 - Modify the decision list in `crates/providers/src/surrogate/mod.rs`'s module doc.
-- Modify the Forget/Restore paths: they refuse code 8.
+- Modify the Forget/Restore paths: they refuse code 9.
 - Modify `crates/surrogate/src/quarantine.rs` docs.
 - Tests: providers surrogate tests and `crates/validate/tests/surrogate.rs` (V7's review part).
 
@@ -818,25 +862,28 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 - Consumes: the leave-one-out ratio at touch point 4; `MigrationLog.review`.
 - Produces: `fn review_resolved(&mut self) -> Option<ReviewOutcome>`, where `ReviewOutcome { released: Vec<usize>, kept: Vec<(usize, f64)> }`. It runs inside a refit only when all of the following hold:
   - the migration state is Complete or Reviewed;
-  - a code-8 sample exists;
+  - a code-9 sample exists;
   - the store changed since the last review.
 
   The procedure:
-  1. Fit a candidate on the fit's members plus every code-8 sample.
-  2. A sample whose ratio ≤ 1 goes 8 → 0.
-  3. A sample with ratio > 1 stays at 8. Its verdict is written to `migration.txt`'s review log and read back on attach (ruling R13).
-  4. A reviewed-and-failed code-8 sample joins "a stored label the model cannot reproduce": the fence or M, per the map. It is never converted to code 1.
+  1. Fit a candidate on the fit's members plus every code-9 sample.
+  2. A sample whose ratio ≤ 1 goes 9 → 0.
+  3. A sample with ratio > 1 stays at 9. Its verdict is written to `migration.txt`'s review log and read back on attach (ruling R13).
+  4. A reviewed-and-failed code-9 sample joins the quarantine fence: `fences()` is true for it (F4; spec §7.6 step 4 and §8). It is not counted by `fencing()` or the held cap, purge's lift votes never lift it, it never joins the misfit set M, and it is never converted to code 1.
+  5. A purge of the new folder after the pass remaps the review log's indices through `PurgeOutcome::map` and rewrites `migration.txt` (F3).
 
 - [ ] **Step 1: Write the failing tests:**
-  - `code8_out_of_fit_envelope_grade_loo_and_stats`;
-  - `code8_not_counted_in_the_held_cap`;
-  - `code8_before_review_does_not_fence`;
-  - `review_releases_siblings_its_neighbours_predict`: 10 code-8 samples on a smooth analytic surface, all shifted consistently → all released;
-  - `review_keeps_an_inconsistent_sample_and_it_is_refused_near`: one sample offset by 50 mHa → stays 8; a geometry near it is refused by the map's mechanism; its code is never 1; a later review can still release it;
-  - `no_review_while_the_pass_is_running` (Review Focus 3): a refit with the log at Running leaves every code 8 unchanged;
+  - `code9_out_of_fit_envelope_grade_loo_and_stats`;
+  - `code9_not_counted_in_the_held_cap_or_fencing`;
+  - `code9_before_review_does_not_fence`;
+  - `review_releases_siblings_its_neighbours_predict`: 10 code-9 samples on a smooth analytic surface, all shifted consistently → all released;
+  - `review_keeps_an_inconsistent_sample_and_it_is_refused_near`: one sample offset by 50 mHa → stays 9; `fences()` holds for it and a geometry near it is refused; its code is never 1; a later review can still release it;
+  - `failed_code9_is_not_lifted_by_purge_votes` (F4): three agreeing answers near a failed code-9 sample leave it at 9 and fencing;
+  - `purge_after_review_remaps_the_review_log` (F3): purge forgotten samples that precede reviewed ones → every review-log entry names the same sample at its new index;
+  - `no_review_while_the_pass_is_running` (Review Focus 3): a refit with the log at Running leaves every code 9 unchanged;
   - `review_repeats_only_when_the_store_changed`;
-  - `forget_and_restore_refuse_code8`;
-  - V7: extend `migration_classifies_h2_oh_h4` with the review. Assert the H₄ sample's outcome (released or kept), recorded with its ratio.
+  - `forget_and_restore_refuse_code9`;
+  - V7: extend `migration_classifies_h2_oh_h4` with the review. Assert that the H₄ sample is **released** (ratio ≤ 1; F14), and record its ratio. A kept outcome is a failure to investigate, never a re-pin.
 - [ ] **Step 2: Run them to check they fail.**
 - [ ] **Step 3: Implement** at the mapped touch points.
 - [ ] **Step 4: Run them to check they pass.**
@@ -860,7 +907,7 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - `crates/app/src/update/formats.rs`: the downgrade line;
   - the Load-model refusal path (the sidecar tag check in `providers::surrogate`) and the Load-model card's "apply the model's settings" offer.
 - Modify `README.md` ("Upgrading: collections are re-solved once", with the time estimate and "the old folder is kept").
-- Modify `docs/dev-reference.md` (new section "Collection migration"; "Shared collections": record v2 and code 8).
+- Modify `docs/dev-reference.md` (new section "Collection migration"; "Shared collections": record R + 1 and code 9, beside purge's code 8).
 
 **Interfaces:**
 - Consumes: `Trainable::migration`, `start_migration`, `MigrationLog`.
@@ -960,7 +1007,7 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 
   Expected: all PASS. A failure is debugged, never loosened. Record the times in dev-reference "Test suites".
 - [ ] **Step 3: Whole-branch review** (superpowers:requesting-code-review).
-- [ ] **Step 4: Commit the docs, then merge.** Under the standing hands-off approval: `git checkout main`, then `git merge scf-stall` on its own, then push. The README and DEVLOG are already in the branch.
+- [ ] **Step 4: Commit the docs, then merge.** Under the standing hands-off approval, merge in the main checkout `D:\Projects\Physics` (F6), never by `git checkout main` in this worktree: confirm `git -C D:\Projects\Physics branch --show-current` prints `main` and its tree is clean of tracked changes, then run `git -C D:\Projects\Physics merge scf-stall` on its own, then push. Never merge `smearing-prototype`. The README and DEVLOG are already in the branch.
 
 **Time:** about 5 h.
 
@@ -969,20 +1016,20 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 ## Rulings made in this plan (spec gaps)
 
 - **R1.** `scf-stall` **merges** `main` (the user's instruction) instead of the spec §11 rebase.
-- **R2.** A1 is split. V0 is Task 1, before the merge, consuming the other agent's note. The rest of A1 is Task 3, after the merge. V3's aspect is chosen on the GPU prototype and confirmed on the CPU in Task 6, because no CPU FD prototype exists.
+- **R2.** A1 is split. V0 is Task 1, before the merge, consuming the other agent's note. The rest of A1 is Task 3, also before the merge (preflight order ruling: Task 3 runs before Task 2). V3's aspect is chosen on the GPU prototype and confirmed on the CPU in Task 6, because no CPU FD prototype exists.
 - **R3.** The CPU oracles (V1's H₄ square and FD ≡ Aufbau, V3, V5's work integral) run on the **all-electron surface, σ = h**. Spec §9 names the grid but not the surface. `qm` unit tests have no table cache, and FD-consistency does not depend on the surface.
 - **R4.** `fermi_dirac` returns `Result<FdOccupations, QmError>` and carries `halvings`. With n > 0, a level count ≤ n or a kT that is not finite and > 0 is also `QmError::Numerical`.
 - **R5.** `PartialLevel.index` is the level's ascending rank within its channel.
 - **R6.** `DegenerateShells` is deleted in Task 10, not A2, so the workspace builds at every commit. `for_grid` flips to FD in Task 7, with a one-line `Aufbau` hold on the providers' all-electron path until Task 9. No surface moves under its old tag.
-- **R7.** The `qm-gpu` env knobs go in Task 7 (the GPU rewrite). The harness is reduced into V2 in Task 9, since V2 can only pass once the providers run FD. Spec §11 put both at A2.
+- **R7.** The harness is reduced into V2 in Task 9, since V2 can only pass once the providers run FD. Spec §11 put both at A2. (Superseded in part by R21: the env knobs and the harness leave the tree at the end of Task 3, preserved on `smearing-prototype`.)
 - **R8.** `branch_jump` is built before the surface switch (Task 8), so the occupation watch is replaced, never just removed.
   - The tier is the sample tier iff `scf_tol_used ≤ SAMPLE_TOL`, else the app tier; the surface comes from `is_all_electron_tag`.
   - The history also restarts on a change of atom count, species order or origin.
 - **R9.** V4's "same state class": Symmetric if |TS − TS_cf| ≤ 0.05·TS_cf, Polarised if TS ≤ 0.05·TS_cf. Anything else fails.
 - **R10.** V5's sign. W is the work the forces do, ∫F_HF·dx, so ΔF + W = 0. Spec §9 writes "W = −∫F_HF·dx" together with "|W + ΔF|", which is inconsistent; §6.3's `branch_jump` convention, |ΔF − (−∫F·dR)|, is the same physics.
-- **R11.** The sidecar gets one new magic. Its header names the old body (6, 7 or 8) it carries, which keeps "one more entry in `MAGICS`" for three bodies. Its number is set after the merge, because the trust rework may have bumped `MAGICS`.
-- **R12.** `is_persisted_code` stays the sidecar's predicate. The new `is_collection_code` admits 8.
-- **R13.** A failed code-8 review is persisted in `migration.txt`'s review log; the code stays 8. `Collection::open_read_only` returns a separate read-only type with no write methods.
+- **R11.** The sidecar gets one new magic. Its header names the old body it carries (6, 7 or 8 before the merge, plus any body `purge-forgotten` added), which keeps "one more entry in `MAGICS`" for all of them. Its number is K + 1, set after the merge (F1).
+- **R12.** `is_persisted_code` stays the sidecar's predicate (it keeps purge's 8). The new `is_collection_code` admits 9.
+- **R13.** A failed code-9 review is persisted in `migration.txt`'s review log; the code stays 9. `Collection::open_read_only` returns a separate read-only type with no write methods.
 - **R14.** V7's old-folder fixture uses DS-era labels captured in Task 10, before DS is deleted.
 - **R15.** `legacy_tag_of` hashes with a frozen `DIMER_PROCEDURE_DS` and is pinned to strings recorded in Task 9 before any change.
 - **R16.** Starting a migration is a recorded `ui::Action`, but a replay never starts one, as with the PySCF setup.
@@ -990,3 +1037,4 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 - **R18.** V5 dynamics (Task 11) comes before the UI (Task 12), swapping spec §11's A5/A6. This closes the whole-solver-half review before the UI copy is written.
 - **R19 (2026-11-14, the user's ruling after V0).** kT = 5 mHa, and the reference scan's stop at 1e-5. Spec §2 item 3 and rulings 42–46 apply it: every GPU solve with a partial level stops at max(tol_eff, 1e-5) (Task 7 implements `GPU_PARTIAL_TOL`; Task 9's tags carry `fd5e-3` and `pin1e-5`); the witness stays 36 kT / 16; V2's pins are re-measured at 5 mHa (Task 3, step 0); the FD ≡ Aufbau test runs at an explicit kT = 1e-3 (Task 5). Every "316 K" in Tasks 12 and 16 is 1579 K (`units::hartree_to_kelvin(ELECTRON_KT)`, rounded).
 - **R20.** The V0 re-run at 5 mHa (Task 1) covers B, C, N, O, F, Si, P, S, Cl, all-electron O and the spec's molecules (OH along an axis and off-axis, the O₂ singlet at auto and triplet, H₂O, NH at auto and at M = 3). Its numbers are in the V0 note's 2026-11-14 section; Task 1 step 6 copies the summary into references.md.
+- **R21 (2026-11-14, the controller's preflight rulings F1–F15, ledger "Preflight scan").** `Q_RESOLVED` = 9 (code 8 is `purge-forgotten`'s); the formats are symbolic (R + 1, K + 1); purge's code 8 maps to 7 in class S (F2); purge and the migration exclude each other and the review log follows `PurgeOutcome::map` (F3); a failed code 9 fences but is outside `fencing()`, the held cap and the lift votes, never in M (F4); the prototype lives only on `smearing-prototype` (F5); no bare stash, the final merge in `D:\Projects\Physics` (F6); and the per-task fixes F7–F15. Order: Task 1 → Task 3 → Task 2 (after `purge-forgotten` merges) → Tasks 4–18.

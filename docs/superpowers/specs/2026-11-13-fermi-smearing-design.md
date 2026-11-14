@@ -782,9 +782,11 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
     6.93 mHa for a linear OH at kT = 5 mHa [kT-5], falling to 0 over a range of width ~kT/|dΔ/dR|, a few degrees of bend. The fit sees it
     as any other feature of the surface.
   - The refit after migration judges it like any fitted sample.
-- **S.** The re-solved label is appended with the old metadata and status code **8, `Q_RESOLVED`** ("re-solved for the
-  new solver, awaiting review"). Two exceptions keep their old code: a forgotten sample keeps code 7, because the
-  user's decision outranks the review, and a superseded one keeps code 2, because what superseded it is migrated too.
+- **S.** The re-solved label is appended with the old metadata and status code **9, `Q_RESOLVED`** ("re-solved for the
+  new solver, awaiting review"; code 8 is `purge-forgotten`'s "forgotten, fence lifted", section 8). Two exceptions keep
+  their old code: a forgotten sample keeps code 7, because the user's decision outranks the review, and a superseded one
+  keeps code 2, because what superseded it is migrated too. A forgotten sample whose fence was lifted (code 8) goes to
+  7: the Forget survives, and the fence returns, because the lift judged the old label (under U and T it keeps 8).
   An old hold (code 1) does not survive into class S: it judged the old label, so the sample goes to review instead.
 - **`references.txt`**: the re-solved references only (section 7.3). Old references are never carried.
 - **`history.bin`**: not carried. The audit history measured the model against the old teacher, and a calibration
@@ -810,7 +812,7 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
 The new folder can already hold samples taught before or during the migration. Migrated records are appended after
 them, interleaved in arrival order. Status records name samples by their index in the new file, as today.
 
-### 7.6 Code 8 and its review: automatic, by the leave-one-out rule
+### 7.6 Code 9 and its review: automatic, by the leave-one-out rule
 
 A `Q_RESOLVED` sample is out of the fit, the envelope, the grade, the leave-one-out and the class statistics, like a
 held sample.
@@ -821,19 +823,19 @@ held sample.
   the extrapolation grade and novelty rules already send nearby geometries to DFT.
 
 **The review** runs inside a refit once the migration pass is complete, so every sibling of a sample is present before
-any is judged. It repeats at every later refit while code-8 samples remain and the store has changed since the last
+any is judged. It repeats at every later refit while code-9 samples remain and the store has changed since the last
 review.
 
-1. Fit a candidate on the current fit's members **plus every code-8 sample**.
-2. For each code-8 sample, compute its **leave-one-out ratio in that candidate**: the reading the trust recovery
+1. Fit a candidate on the current fit's members **plus every code-9 sample**.
+2. For each code-9 sample, compute its **leave-one-out ratio in that candidate**: the reading the trust recovery
    already ranks offenders by (`quarantine::loo_ratio` today): how far the fit without the sample misses it, against
    its own energy and force bounds.
-3. A sample with ratio ≤ 1 is **released** (8 → 0). The refit then proceeds with the released samples as ordinary
+3. A sample with ratio ≤ 1 is **released** (9 → 0). The refit then proceeds with the released samples as ordinary
    fitted samples, and the ordinary trust machinery (residuals, recovery, misfit) judges the result as it judges any
    new data.
-4. A sample with ratio > 1 stays at 8. From then on it **is treated as a stored label the model cannot reproduce**:
-   - it fences like a held sample, or, after the trust rework merges, is refused near like a member of its misfit
-     set, whichever mechanism `main` then uses for "a stored label the model cannot reproduce";
+4. A sample with ratio > 1 stays at 9. From then on it **is treated as a stored label the model cannot reproduce**:
+   - it fences like a held sample (the quarantine fence, `fences()`; section 8, preflight F4). It never joins the
+     misfit set M, is not counted by `fencing()`, and `purge-forgotten`'s lift votes never lift it;
    - a later review can still release it;
    - it is never converted to code 1, so it never enters the recovery's holds or its cap. The trust rework's "no
      ratchet" invariant (G2 of its spec) stays intact.
@@ -849,15 +851,16 @@ review.
   solver checks in section 7.3 step 2 guard against that. The released samples then face every check any fitted
   sample faces.
 
-**Cost.** One extra fit plus a leave-one-out pass per refit while code-8 samples remain. That is about 1 s at
+**Cost.** One extra fit plus a leave-one-out pass per refit while code-9 samples remain. That is about 1 s at
 1 700 samples (`references.md`, leave-one-out recovery ranking). There is none once all are reviewed.
 
 ### 7.7 Formats and older builds
 
 - **Collection records: version 1 → 2** (`surrogate::collection::RECORD_VERSION`, the `collection` entry of
-  `app::update::formats`).
+  `app::update::formats`). [F1] The numbers in this section assume `main`'s version 1; they are symbolic: the new
+  version is the merged `main`'s + 1, and the sidecar's new magic is the merged `MAGICS.len()` + 1 (plan Task 2).
   - Every record the new build writes is version 2. That changes the meaning of `energy` (F on an FD surface) and
-    allows status code 8. The byte layout is unchanged.
+    allows status code 9. The byte layout is unchanged.
   - The reader takes 1 and 2. It never writes into a folder holding version-1 records, because every pre-existing
     folder is a predecessor (section 7.1), so no file mixes versions.
   - What an older build does:
@@ -869,8 +872,8 @@ review.
   - The layout is unchanged, but the meaning changes: energies are F and the provenance tag format is new.
   - An older build already refuses such a file by its tag. The bump makes the refusal a clean "newer format" and puts
     `.model` files in the downgrade warnings.
-  - Code 8 is never written into a sidecar: a sidecar writer leaves code-8 samples out, because the collection is the
-    store of record. So `is_persisted_code` admits 8 for collections only.
+  - Code 9 is never written into a sidecar: a sidecar writer leaves code-9 samples out, because the collection is the
+    store of record. So 9 is admitted for collections only (`is_collection_code`); `is_persisted_code` keeps purge's 8.
 - **`history.bin` (`ASAUDIT1`): unchanged.** Same layout, same meaning: the model against the teacher of the folder's
   own surface.
 - **`pseudo_cache`: no format change.** H/He entries are re-keyed by the moved `recipe_hash` (a cache, rebuilt).
@@ -880,8 +883,8 @@ review.
   `migration.txt` names a source folder that still exists:
   "<version> will use <old folder>, the collection as it was before it was re-solved for the Fermi–Dirac solver, without
   what was learned since. Both folders stay on disk."
-- **`surrogate::quarantine` docs** gain "an older build meeting code 8", in the style of code 7's paragraph. Its
-  content is short: no older build can read a version-2 record, and no sidecar holds 8.
+- **`surrogate::quarantine` docs** gain "an older build meeting code 9", in the style of code 7's paragraph. Its
+  content is short: no older build can read a version-2 record, and no sidecar holds 9.
 
 ### 7.8 What the user sees
 
@@ -936,9 +939,10 @@ That branch rewrites `providers::surrogate`'s trust and quarantine code: the mis
 recovery and `NearMisfit`. It merges to `main` first. This spec touches the surrogate provider at the following points
 only, named by role so they survive the merge:
 
-1. **The set of codes excluded from the fit** (today, the store's "excluded" predicate): add code 8.
-2. **The fence / near-misfit refusal predicate**: add a reviewed-and-failed code-8 sample (section 7.6, step 4).
-3. **The held-cap count of the recovery**: confirm that code 8 is not counted.
+1. **The set of codes excluded from the fit** (today, the store's "excluded" predicate): add code 9.
+2. **The fence / near-misfit refusal predicate**: add a reviewed-and-failed code-9 sample (section 7.6, step 4) to the
+   quarantine fence `fences()`, not to the misfit set M (preflight F4, below).
+3. **The held-cap count of the recovery**: confirm that code 9 is not counted.
 4. **The refit pipeline**: one review step (section 7.6), placed before the trust judgement. It reuses the recovery's
    leave-one-out ratio, whatever name it has on `main`.
 5. **The lone-atom rule's "ends at a gap" test** (section 6.4).
@@ -951,6 +955,21 @@ only, named by role so they survive the merge:
 The plan re-reads these against `main` after the merge. If the rework changed what one of them means, the plan records
 the mapping, and this spec is amended rather than reinterpreted silently.
 
+**Amendment (preflight scan, 2026-11-14): `purge-forgotten`.** That branch also merges to `main` first. It takes code 8
+for `Q_FORGOTTEN_UNFENCED` ("forgotten, fence lifted": a forgotten sample whose fence three agreeing answers lifted),
+and it can delete forgotten samples from `samples.bin`, renumbering the rest.
+- **Codes and formats (F1).** `Q_RESOLVED` is **9** everywhere in this spec. The collection record version and the
+  sidecar magic are the merged `main`'s values + 1 (section 7.7).
+- **Code 8 in the migration (F2).** Under U and T a code-8 sample keeps 8. Under S it goes to 7 (section 7.5): the
+  Forget survives, and the fence returns, because the lift judged the old label.
+- **Renumbering (F3).** A purge renumbers the new folder, so `migration.txt`'s review log (section 7.6) is remapped
+  through `PurgeOutcome::map`. A purge is refused while a migration pass runs. `migration.txt` records the source
+  `samples.bin`'s length and hash; on a mismatch at resume the pass restarts from 0. The read-only open (section 7.3)
+  never cleans purge's `samples.bin.new` / `samples.bin.bak.new`.
+- **The fence for a failed review (F4).** A reviewed-and-failed code 9 joins the quarantine fence (`fences()`), like a
+  held sample. It stays out of the held cap and out of `fencing()`, purge's lift votes cannot lift it, and it never
+  joins the misfit set M.
+
 ## 9. Validation (rule 6; one heavy job at a time)
 
 Every gate in CLAUDE.md's table applies, because this change touches the solver, dynamics, the surrogate, pseudo
@@ -960,7 +979,7 @@ pinned number moves, the reason is the TS term or the re-pinned bitwise path, an
 | # | suite / command | what it must show |
 |---|---|---|
 | **V0** | **Task A1 measurement (entry gate)**, before production code. The diagnosis's env-gated `SCF_SMEAR` path on the GPU (1e-3, then 5e-3 after the ruling), plus a CPU f64 cross-check of each species' worst case. | See "V0 in detail" below. |
-| V1 | `cargo test -p units -p qm -p sim -p surrogate --release` | **FD unit tests:**<br>• two levels with N = 1, degenerate (f = ½, μ = ε, S = 2 ln 2);<br>• a gap Δ (f = 1/(1 + e^{±Δ/2kT}) at the symmetric μ);<br>• a gap ≥ 74 kT [SHOULD-5]: f below μ exactly 1.0, f above μ ≤ e^{−36}, S ≤ 1e-14, μ the plateau midpoint of section 4.1 (both bisections) [MUST-1];<br>• N_σ = 0; the bracket's validity;<br>• a NaN eigenvalue → `QmError::Numerical` before bisecting [SHOULD-1];<br>• the worst-case halving count near μ = 0 stays under the backstop;<br>• determinism (same bits twice);<br>• s(f) against the direct formula on a grid of f, plus the 0 ln 0 limit.<br>**Witness rule**, both arms. **Energy invariant** (total = internal − ts).<br>**CPU H₄ square a = 1.8** (41³ × 0.30, axes-aligned, exactly degenerate, tol 1e-9): TS = 4 kT ln 2 within 1e-8 Ha, and E equal to the DS-era E within 1e-8 Ha (same f by symmetry) [SHOULD-6].<br>**FD ≡ Aufbau** on H₂ and H₂O (CPU f64, tol = eig_tol = 1e-9): \|ΔE\| ≤ 1e-8 Ha, since the f agree to e^{−100} [SHOULD-6].<br>The DIIS-reset test (section 5). The collection: v2 records, code 8, the read-only open leaving every file byte-identical. |
+| V1 | `cargo test -p units -p qm -p sim -p surrogate --release` | **FD unit tests:**<br>• two levels with N = 1, degenerate (f = ½, μ = ε, S = 2 ln 2);<br>• a gap Δ (f = 1/(1 + e^{±Δ/2kT}) at the symmetric μ);<br>• a gap ≥ 74 kT [SHOULD-5]: f below μ exactly 1.0, f above μ ≤ e^{−36}, S ≤ 1e-14, μ the plateau midpoint of section 4.1 (both bisections) [MUST-1];<br>• N_σ = 0; the bracket's validity;<br>• a NaN eigenvalue → `QmError::Numerical` before bisecting [SHOULD-1];<br>• the worst-case halving count near μ = 0 stays under the backstop;<br>• determinism (same bits twice);<br>• s(f) against the direct formula on a grid of f, plus the 0 ln 0 limit.<br>**Witness rule**, both arms. **Energy invariant** (total = internal − ts).<br>**CPU H₄ square a = 1.8** (41³ × 0.30, axes-aligned, exactly degenerate, tol 1e-9): TS = 4 kT ln 2 within 1e-8 Ha, and E equal to the DS-era E within 1e-8 Ha (same f by symmetry) [SHOULD-6].<br>**FD ≡ Aufbau** on H₂ and H₂O (CPU f64, tol = eig_tol = 1e-9): \|ΔE\| ≤ 1e-8 Ha, since the f agree to e^{−100} [SHOULD-6].<br>The DIIS-reset test (section 5). The collection: v2 records, code 9, the read-only open leaving every file byte-identical. |
 | V2 | **Regression (new; `cargo test -p providers --release`, GPU, release-only).** The diagnosis harness reduced and committed. Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, the app's tolerance raised by `effective_gpu_tol`, stall stop on. | See "V2 cases" below. |
 | V3 | `cargo test -p validate --release --test oracles` | **σ → 0 oracles** (H, He, H₂): numbers unchanged within the existing tolerances, and **TS ≤ 1e-12** asserted on every oracle system (they are gapped or single-electron).<br>**New FD-consistency oracle** (CPU f64, 41³ × 0.30, tol 1e-9): see "V3 force oracle" below. |
 | V4 | `cargo test -p validate --release --test gpu_vs_cpu` | Existing cases within existing bounds. New cases at the suite's fixed σ = h = 0.25, 49³: H₄ square (degenerate), and a lone pseudo-O at each M V0 settled on [MUST-5]: M = 3 and M = 1 at 5 mHa [kT-5]. The GPU side stops at the section 5.1 partial-level 1e-5 and the CPU at the suite's tol; V0 measured the stop's own error on the pseudo surface at ≤ 1.7 µHa and ≤ 3.2e-6 Ha/Bohr, inside the bounds below, which do not move. Each case checks:<br>• \|F_gpu − F_cpu\| and \|TS_gpu − TS_cpu\| within the suite's energy bounds (TS is second order in Δε: \|ΔTS\| ≲ Δε²/(16kT) per pair);<br>• μ_σ within `EPS_BOUND_PSEUDO` (1e-5 Ha) where a partial level exists, and not compared in gapped channels (section 4.1);<br>• per-level \|Δf\| ≤ 2·`EPS_BOUND_PSEUDO`·max f(1−f)/kT = `EPS_BOUND_PSEUDO`/(2kT) = 1e-3 at kT = 5 mHa (5e-3 at 1e-3) (re-review R-NOTE-a) [kT-5]. The earlier EPS/(4kT) was exact only for a pair; a three-level shell at f = ⅓ can reach 0.30·EPS/kT under an adversarial error pattern. The measured \|Δε\| = 2.2e-6 gives \|Δf\| ≤ 1.3e-4 at 5 mHa;<br>• the sum of f over each degenerate cluster within 1e-9. A cluster is the levels the CPU finds within 1e-6 Ha of each other;<br>• **both solvers in the same state class** (symmetric vs polarised, by TS against the closed form), so that an f32-vs-f64 split onto different stationary states is detected, not averaged over.<br>Forces are checked against the existing force bounds. |
@@ -1076,8 +1095,9 @@ pre-registered stop below applies and the user chooses among (i)–(iii).
   - [kT-5] At kT = 5 mHa the admissible window of c = dΔ/dx widens to about [4.4e-3, 0.13] Ha/Bohr (the TS condition
     does not depend on kT; F‴ ~ 0.2c³/(kT)² is 25× smaller at a given c). The near-square aspect moves accordingly.
 
-  The two pull in opposite directions: d(TS)/dx ≤ 0.45·c while F‴ ~ 0.2·c³/(kT)², with c = dΔ/dx. Any c between 5e-3
-  and 5e-2 Ha/Bohr meets both. A1 also checks that the whole 4δ span of the stencil lies in that regime.
+  The two pull in opposite directions: d(TS)/dx ≤ 0.45·c while F‴ ~ 0.2·c³/(kT)², with c = dΔ/dx. At kT = 1e-3 any c
+  between 5e-3 and 5e-2 Ha/Bohr met both; at 5 mHa the scan and its fallback use c ∈ [5e-3, 1e-1] Ha/Bohr (preflight
+  F15; plan Tasks 3 and 6), inside the window above with margin below 0.13. A1 also checks that the whole 4δ span of the stencil lies in that regime.
 - **Method.** Central differences at δ/2 = 0.005, δ = 0.01 and 2δ = 0.02 Bohr along one atom's in-plane coordinate,
   combined by Richardson as in `oh_hf_force_matches_fd`. The reported value is R(δ/2, δ).
 - **Certifying the Richardson value** (re-review R-SHOULD-B).
@@ -1142,7 +1162,7 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
   - §5.5's provenance-tag text gets the new format.
 - **The main design spec** (`2026-10-12-atomic-sandbox-design.md`).
   - §6 "SCF loop": "Integer aufbau occupations in v1; Fermi smearing later" becomes "Fermi–Dirac occupations at
-    kT = 1 mHa; the SCF converges to a stationary point of F = E − TS (spec 2026-11-13)".
+    kT = 5 mHa; the SCF converges to a stationary point of F = E − TS (spec 2026-11-13)".
   - §11 roadmap item 2: Fermi smearing is done for finite boxes; periodic cells and PBE remain.
 - **The orbital-viewer spec, item 4.** Note that fractional, spherical occupations arrived with this spec, so the
   shared-shell rows are now per-level f.
@@ -1166,9 +1186,9 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
 - **`docs/dev-reference.md`**:
   - New section "Occupations (Fermi–Dirac)": the constants and where they live, the tag format, `legacy_tag_of`, and
     the bitwise re-pins.
-  - New section "Collection migration": the predecessor, the pass, `migration.txt`, the classes, code 8 and its review,
+  - New section "Collection migration": the predecessor, the pass, `migration.txt`, the classes, code 9 and its review,
     record v2, the sidecar bump, the downgrade line.
-  - "Shared collections": record v2 and code 8.
+  - "Shared collections": record v2 and code 9 (beside purge's code 8).
   - "SCF stall stop": no release restart.
   - "Test suites": V2 and the new oracle, the work-integral, NVE, branch-jump and migration tests.
   - The `branch_jump` guard (section 6.3), in the occupations section.
@@ -1181,7 +1201,7 @@ now solves witness vectors (FD, spec 2026-11-13)". They are not deleted.
   - The shipped models' status.
 - **Code docs:**
   - `surrogate::collection` (records v2, the read-only open, the migration files in the layout table);
-  - `surrogate::quarantine` (code 8, and an older build meeting it);
+  - `surrogate::quarantine` (code 9, and an older build meeting it);
   - `providers::pseudo` (the tag);
   - `providers::ks` (no longer "exactly today's problem"; `branch_jump` replaces the occupation watch);
   - the `qm::forces` and `qm_gpu::forces` module docs [SHOULD-8]: the forces are −dF/dR of the Mermin functional,
@@ -1217,9 +1237,9 @@ Model tags are per CLAUDE.md. All are dispatched on Opus, per the 2026-10-21 rul
    reading `total` (the app's breakdown, the sidecar, `sim::references`); the review did not trace these.
 5. **A5 (Opus):** UI readouts, breakdown, orbital rows, Compare note; V10 (labels).
 6. **A6 (Fable-class):** V5 dynamics, plus a physics review of the whole solver half.
-7. **B1 (Opus):** `surrogate::collection`: the read-only open, records v2, code 8, `migration.txt`; the sidecar bump;
+7. **B1 (Opus):** `surrogate::collection`: the read-only open, records v2, code 9, `migration.txt`; the sidecar bump;
    `formats`.
-8. **B2 (Opus, physics-reviewed):** the providers' migration pass and the code-8 review step at section 8's touch
+8. **B2 (Opus, physics-reviewed):** the providers' migration pass and the code-9 review step at section 8's touch
    points; V7.
 9. **B3 (Opus):** app offer, progress and summary; the downgrade line; the Load-model refusal text; V10.
 10. **B4 (Opus):** re-make the shipped models; V11 dry run on a copy; the docs (section 10); full serial gate run; then
@@ -1306,11 +1326,12 @@ key.
 17. **Classification by re-solving every sample** (no stored-data criterion exists), with three classes U / T / S.
     ε_E = 1e-5 Ha per sample, ε_F = 1.5e-4 Ha/Bohr per component.
 18. **Class U carries the old record bit for bit.** Class T takes the new label and keeps its trust state, with the
-    T test as its review. Class S takes the new label at code 8. Codes 7 and 2 carry over; an old code 1 does not
-    survive into S.
-19. **Code 8 `Q_RESOLVED`.** It is out of the fit and outside the held cap. It does not fence before review, and does
-    fence (or is refused near, as the misfit rule) after a failed review. It is never converted to code 1.
-20. **The review** happens in a refit after the pass completes: a candidate fit with all code-8 samples, and release
+    T test as its review. Class S takes the new label at code 9. Codes 7 and 2 carry over, and purge's 8 becomes 7; an old
+    code 1 does not survive into S.
+19. **Code 9 `Q_RESOLVED`** (8 is `purge-forgotten`'s). It is out of the fit and outside the held cap. It does not
+    fence before review, and does fence (`fences()`, never the misfit set M) after a failed review. It is never
+    converted to code 1.
+20. **The review** happens in a refit after the pass completes: a candidate fit with all code-9 samples, and release
     where the leave-one-out ratio is ≤ 1. It repeats at later refits.
 21. **Failed re-solves are not migrated** and stay in the old folder. They are listed in `migration.txt`.
 22. **References are re-solved** (lowest F), never carried. **The audit history is not carried.** `bond_experience.txt`
@@ -1319,7 +1340,8 @@ key.
     reproducibility, and resumes from a cursor in `migration.txt`.
 24. **The migration refuses while an older build holds the old folder's lock.**
 25. **Collection `RECORD_VERSION` 1 → 2** for everything the new build writes. **The sidecar version is bumped.**
-    `history`, `pseudo_cache` and `checkpoint` formats are unchanged. Code 8 is never written to a sidecar.
+    `history`, `pseudo_cache` and `checkpoint` formats are unchanged. Code 9 is never written to a sidecar. (Versions
+    symbolic: the merged `main`'s + 1; section 7.7.)
 26. **A downgrade-warning line** names the pre-migration folder the older version will use.
 27. **The shipped `.model` files are re-made** by the same engine in a headless harness, or re-taught if one fails its
     trust rule. **In-app migration of user `.model` files is a non-goal**; they get a clear refusal reason.
