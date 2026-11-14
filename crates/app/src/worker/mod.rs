@@ -204,7 +204,6 @@ mod model;
 pub use activity::*;
 pub use commands::*;
 // (the notes `Snapshot::harris_note` carries, for the viewer's labels)
-#[allow(unused_imports)]
 pub use harris::{HARRIS_PAUSED_PASS, HARRIS_WAITING_ATOMS};
 pub use model::*;
 
@@ -280,8 +279,7 @@ pub struct Snapshot {
     pub atom_profiles: Arc<Vec<AtomProfile>>,
     /// Why no Harris display solve runs for the orbital view that is on (estimated solver on the
     /// GPU teacher; `harris` module doc): [`HARRIS_WAITING_ATOMS`] or [`HARRIS_PAUSED_PASS`].
-    /// (Read by the Orbitals tab's labels, live-orbitals Task 7.)
-    #[allow(dead_code)]
+    /// The viewer's orbital label says it (`viewer::OrbitalShown::label`).
     pub harris_note: Option<&'static str>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,

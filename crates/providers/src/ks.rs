@@ -1324,6 +1324,8 @@ impl GpuKs {
                 "the superposed atoms carry {carried} electrons: their density was rescaled to the scene's {} (× {:.4}, charge {:+})",
                 n_up + n_dn, rho.rescale, scene.charge));
         }
+        // the per-atom electrons before renormalisation: the app logs this note, never draws it
+        payload.notes.push(crate::harris::per_atom_note(&system.nuclei, &rho.per_atom, &counted));
         // display only: a failed readback is an error, and the view that read the zeros goes
         if let Err(e) = device_fault() {
             self.drop_view_after_fault();

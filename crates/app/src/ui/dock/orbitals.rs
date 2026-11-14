@@ -74,15 +74,87 @@ pub const UNOCC_INCLUDE_TIP: &str = "include this unoccupied orbital: drawn only
 /// §2 item 7: a lone atom's shell is split by the grid, not by physics.
 pub const GRID_SPLIT_TIP: &str = "a lone atom's shell is degenerate in physics; the grid splits it by sampling the smeared nucleus at a position-dependent offset (the egg-box effect), by an amount that depends on where the atom sits relative to the grid. The members shown are eigenfunctions to within half this";
 
+// ---- orbital display solves: the estimated solver's live orbitals (live-orbitals spec §6) ----
+//
+// Between DFT solves the estimated solver (GPU teacher) fills an orbital view with a **Harris
+// display solve**: one diagonalisation in the potential of the superposed isolated-atom densities,
+// not self-consistent. Every place that shows these orbitals says so (rule 7): the label over the
+// view and in the view card (`viewer::OrbitalShown::label`, built from [`harris_label`]), "≈" on
+// every ε, HOMO, LUMO and gap with [`HARRIS_EPS_TIP`], the details line ([`harris_line`]), the
+// unoccupied lines ([`HARRIS_UNOCC_NOTE`]), the spin readout ([`HARRIS_DENSITY_NOTE`]), About
+// orbitals ([`HARRIS_ABOUT`]) and the Activity rows (`activity::jobs`, `activity::log`).
+
+/// The tail of the label: what a Harris display solve is not (pinned: "not self-consistent").
+pub const HARRIS_NOTE: &str = "not self-consistent — a display solve between DFT solves (one diagonalisation, no SCF; nothing learns from it)";
+/// The "≈" of a Harris payload's ε, HOMO, LUMO and gap (pinned: "approximate").
+pub const HARRIS_EPS_TIP: &str = "≈: approximate — these orbitals come from one diagonalisation in the potential of the superposed isolated atoms (an orbital display solve), not from a self-consistent (converged) solve, so every ε, the HOMO, the LUMO and the gap are approximate: their error is second order in how far the superposed atoms' density is from the self-consistent one (no charge transfer, no polarisation of the bonds). A DFT solve at the same geometry replaces them with the self-consistent values";
+/// The shapes (pinned: "qualitative").
+pub const HARRIS_SHAPES: &str = "the shapes and the mixing of these orbitals are qualitative: they are eigenstates of the superposed atoms' potential, which lacks the bonds' charge transfer and polarisation — right in their nodes and symmetry, approximate in how much each atom contributes";
+/// The density and spin views (pinned: "this solve's output, not a DFT density").
+pub const HARRIS_DENSITY_NOTE: &str = "the density and spin views of these orbitals show this solve's output, not a DFT density: the occupied orbitals of one diagonalisation in the superposed atoms' potential, summed — not converged";
+/// Unoccupied rows (pinned: "box states").
+pub const HARRIS_UNOCC_NOTE: &str = "unoccupied orbitals of the display solve are mostly box states, as for a converged solve: LSDA's potential binds few of them in a finite box";
+/// A charged scene (pinned: "rescaled to the scene's").
+pub const HARRIS_RESCALED: &str = "the superposed neutral atoms' density was rescaled to the scene's electron count";
+/// What a Harris display solve is, for About orbitals.
+pub const HARRIS_WHAT: &str = "estimated solver, GPU teacher: the model has no electrons, so between DFT solves an Orbitals, All orbitals coloured or Spin density view is filled by orbital display solves on the background solver — the orbitals solved once in the potential of the teacher's own isolated atoms placed at the current nuclei (the same atoms as the cloud's atomic superposition), not self-consistent, no SCF, never a training sample. A DFT solve at the same geometry (an audit, a refresh) replaces them; the label over the view says which is shown, when it was solved, and whether the atoms have moved since";
+/// About orbitals' entries for the display solves.
+pub const HARRIS_ABOUT: &[&str] = &[HARRIS_WHAT, HARRIS_EPS_TIP, HARRIS_SHAPES, HARRIS_DENSITY_NOTE, HARRIS_UNOCC_NOTE];
+/// The prefix of the payload's per-atom note (`providers::harris::PER_ATOM_NOTE`): logged, not
+/// shown in the panel ([`visible_notes`]).
+pub use providers::harris::PER_ATOM_NOTE;
+
+/// The label of a Harris payload solved at `t_fs` (spec §6): "orbitals solved once at t = … fs in
+/// the potential of superposed atoms[ + experience on k of n atoms], not self-consistent …", the
+/// rescale sentence when the atoms were rescaled to a charged scene's count, "(an earlier
+/// geometry)" when the nuclei moved since.
+pub fn harris_label(t_fs: f64, rescale: f64, experience: Option<&sim::ExperienceUse>, current: bool) -> String {
+    let src = match experience {
+        Some(x) => format!("superposed atoms + experience on {} of {} atoms", x.atoms.len(), x.of),
+        None => "superposed atoms".to_string(),
+    };
+    let mut l = format!("orbitals solved once at t = {t_fs:.2} fs in the potential of {src}, {HARRIS_NOTE}");
+    if (rescale - 1.0).abs() > 1e-9 {
+        l += &format!(". {HARRIS_RESCALED} (× {rescale:.3})");
+    }
+    if !current {
+        l += " (an earlier geometry)";
+    }
+    l
+}
+
+/// The details line of a Harris payload: the solve's wall and the rescale factor (the per-atom
+/// electrons before renormalisation are logged, not shown: `PER_ATOM_NOTE`). `None` for a
+/// converged payload.
+pub fn harris_line(kind: &sim::OrbitalKind) -> Option<String> {
+    let sim::OrbitalKind::Harris { experience, rescale, wall_s } = kind else { return None };
+    let mut l = format!("orbital display solve (not self-consistent) · {wall_s:.2} s");
+    l += &if (rescale - 1.0).abs() > 1e-9 { format!(" · atoms rescaled × {rescale:.4} to the scene's electrons") } else { " · rescale × 1 (neutral)".to_string() };
+    if let Some(x) = experience {
+        l += &format!(" · experience on {} of {} atoms", x.atoms.len(), x.of);
+    }
+    Some(l)
+}
+
+/// Whether a payload is a Harris display solve's.
+pub fn is_harris(o: &OrbitalDisplay) -> bool {
+    matches!(o.kind, sim::OrbitalKind::Harris { .. })
+}
+
 /// The tooltip of a `show` mode's button: what it draws, then the facts of §2 that apply to it.
 pub fn mode_tip(mode: ShowMode) -> String {
+    // live-orbitals spec §6: in estimated mode these modes show display solves between DFT solves
+    let est = "In estimated mode (GPU teacher) these come from orbital display solves between DFT solves — not self-consistent, labelled so";
     match mode {
         ShowMode::Density => "the total electron density ρ = ρ↑ + ρ↓ — the physical observable. Needs no orbitals".into(),
-        ShowMode::Orbitals => format!("one orbital, as a ± phase surface or volume, or its square ψ̃². {KS_NOTE} {SIGN_TIP}. Needs a DFT step"),
-        ShowMode::Coloured => format!("every included orbital in its own colour (the inner shells and the outer lobes together). {KS_NOTE} Each orbital is scaled to its own peak unless 'physical' is chosen. Needs a DFT step"),
-        ShowMode::Spin => format!("the spin density m = ρ↑ − ρ↓ (amber ↑ excess, teal ↓ excess). {SPIN_NOTE} {KS_NOTE} Needs a DFT step"),
+        ShowMode::Orbitals => format!("one orbital, as a ± phase surface or volume, or its square ψ̃². {KS_NOTE} {SIGN_TIP}. Needs a DFT step. {est}"),
+        ShowMode::Coloured => format!("every included orbital in its own colour (the inner shells and the outer lobes together). {KS_NOTE} Each orbital is scaled to its own peak unless 'physical' is chosen. Needs a DFT step. {est}"),
+        ShowMode::Spin => format!("the spin density m = ρ↑ − ρ↓ (amber ↑ excess, teal ↓ excess). {SPIN_NOTE} {KS_NOTE} Needs a DFT step. {est}; then this is {HARRIS_DENSITY_NOTE_SHORT}"),
     }
 }
+
+/// [`HARRIS_DENSITY_NOTE`]'s short form for the Spin density button.
+const HARRIS_DENSITY_NOTE_SHORT: &str = "the display solve's output, not a DFT density";
 
 // ---- number formats (the UI edge of rule 3) ----
 
@@ -166,6 +238,9 @@ pub struct Levels {
     /// `Occupations::DegenerateShells`, M7 — an open shell of a pseudo-atom): there is no gap between
     /// partly filled degenerate orbitals, so none is quoted.
     pub fractional: bool,
+    /// The eigenvalues are a Harris display solve's (live-orbitals spec §6): every ε, the HOMO, the
+    /// LUMO and the gap print with "≈" and carry [`HARRIS_EPS_TIP`].
+    pub approx: bool,
 }
 
 impl Levels {
@@ -175,7 +250,29 @@ impl Levels {
         let at_lumo = |r: &&OrbitalInfo| r.occupation == 0.0 && lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL);
         let (lumo_box, lumo_unconverged) = (rows.iter().filter(at_lumo).any(|r| r.box_state), rows.iter().filter(at_lumo).any(|r| r.not_converged));
         let fractional = rows.iter().any(|r| r.occupation > 1e-9 && r.occupation < 1.0 - 1e-9);
-        Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false, fractional }
+        Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false, fractional, approx: false }
+    }
+
+    /// The payload's levels: its rows, its lone-atom verdict, its unoccupied status and its kind.
+    pub fn of_payload(o: &OrbitalDisplay) -> Levels {
+        let mut l = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+        l.approx = is_harris(o);
+        l
+    }
+
+    /// An energy as this payload prints it: "−0.500", or "≈−0.500" for a display solve's.
+    pub fn ha(&self, e: f64) -> String {
+        format!("{}{}", self.mark(), energy_ha(e))
+    }
+
+    /// "≈" for a display solve's levels, else nothing.
+    pub fn mark(&self) -> &'static str {
+        if self.approx { APPROX } else { "" }
+    }
+
+    /// The tooltip's tail for a display solve's levels ([`HARRIS_EPS_TIP`]), else nothing.
+    pub fn eps_tip(&self) -> String {
+        if self.approx { format!("\n\n{HARRIS_EPS_TIP}") } else { String::new() }
     }
 
     /// With the unoccupied rows' status: rows that are not of the current geometry make the gap stale.
@@ -209,11 +306,16 @@ impl Levels {
     }
 }
 
-/// "HOMO −0.500 Ha (−13.61 eV) · LUMO … · Kohn–Sham gap …" (the tooltip is [`GAP_TIP`]).
+/// The mark of an approximate (display-solve) energy (live-orbitals spec §6).
+pub const APPROX: &str = "≈";
+
+/// "HOMO −0.500 Ha (−13.61 eV) · LUMO … · Kohn–Sham gap …" (the tooltip is [`GAP_TIP`]); every
+/// number "≈" for a display solve's levels.
 pub fn levels_line(l: &Levels) -> Option<String> {
-    let at = |e: f64| format!("{} Ha ({} eV)", energy_ha(e), energy_ev(e));
+    let a = l.mark();
+    let at = |e: f64| format!("{a}{} Ha ({a}{} eV)", energy_ha(e), energy_ev(e));
     let line = match (l.homo, l.lumo, l.gap()) {
-        (Some(h), Some(u), Some(g)) => format!("HOMO {} · LUMO {} · Kohn–Sham gap {} Ha ({} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2)),
+        (Some(h), Some(u), Some(g)) => format!("HOMO {} · LUMO {} · Kohn–Sham gap {a}{} Ha ({a}{} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2)),
         (Some(h), _, _) if l.fractional => format!("HOMO {} (partly filled shell: no HOMO–LUMO gap — the orbitals of a shared shell are one level)", at(h)),
         (Some(h), _, _) => format!("HOMO {}", at(h)),
         _ => return None,
@@ -248,6 +350,8 @@ pub struct RowView {
     pub occupation: String,
     pub occupied: bool,
     pub tags: Vec<Tag>,
+    /// ε is a display solve's (`ha` / `ev` start with "≈"; [`RowView::eps_tip`]).
+    pub approx: bool,
 }
 
 impl RowView {
@@ -302,11 +406,12 @@ impl RowView {
             track: r.track,
             slot: r.slot,
             label: r.label.to_string(),
-            ha: energy_ha(r.energy),
-            ev: energy_ev(r.energy),
+            ha: format!("{}{}", levels.mark(), energy_ha(r.energy)),
+            ev: format!("{}{}", levels.mark(), energy_ev(r.energy)),
             occupation: occupation_text(r.occupation),
             occupied: r.occupation > 0.0,
             tags,
+            approx: levels.approx,
         }
     }
 
@@ -329,7 +434,21 @@ impl RowView {
 
     /// The label's tooltip: what is on screen when this orbital is picked.
     pub fn label_tip(&self) -> String {
-        format!("{KS_NOTE} Click to show it (the selection follows this orbital as the levels reorder). {SIGN_TIP}.")
+        let shapes = if self.approx { format!(" {HARRIS_SHAPES}.") } else { String::new() };
+        format!("{KS_NOTE} Click to show it (the selection follows this orbital as the levels reorder). {SIGN_TIP}.{shapes}")
+    }
+
+    /// The hover of the ε cell: the value in Ha and eV and what it means; for a display solve's,
+    /// [`HARRIS_EPS_TIP`] too.
+    pub fn eps_tip(&self) -> String {
+        let mut t = format!(
+            "ε = {} Ha ({} eV; 1 Ha = 27.2114 eV, converted for display only) · occupation {}: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow",
+            self.ha, self.ev, self.occupation
+        );
+        if self.approx {
+            t += &format!("\n\n{HARRIS_EPS_TIP}");
+        }
+        t
     }
 }
 
@@ -386,9 +505,10 @@ pub fn smeared_molecule_line(lone: LoneAtomLabels, z_sigma: f64) -> Option<Strin
 /// (`UiState::orbital_pick_adopted`) never was the user's selection, so the producer's "selected
 /// orbital no longer exists" note — raised when its tracks restart, e.g. after an isolated-atom job
 /// of the estimated solver — is untrue for it and is dropped; the viewer re-adopts the HOMO. The
-/// note of a pick the user made stays.
+/// note of a pick the user made stays. A Harris payload's per-atom electrons ([`PER_ATOM_NOTE`])
+/// are for the log (`Viewer::log_harris_input`), not the panel.
 pub fn visible_notes<'a>(o: &'a OrbitalDisplay, pick_adopted: bool) -> Vec<&'a String> {
-    o.notes.iter().filter(|n| !(pick_adopted && n.starts_with(NO_LONGER_EXISTS))).collect()
+    o.notes.iter().filter(|n| !(pick_adopted && n.starts_with(NO_LONGER_EXISTS)) && !n.starts_with(PER_ATOM_NOTE)).collect()
 }
 
 /// The provider's note for a selection that vanished (`providers::orbitals::ViewState::pick`).
@@ -1058,7 +1178,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         if !boxed.is_empty() {
             let unbound = boxed.iter().all(|e| e.r.eps_range.1 >= 0.0);
             let summary = (if unbound { "unbound at this box size" } else { "energies box-affected" }.to_string(), super::super::AMBER);
-            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            let levels = Levels::of_payload(o);
             let picked = picked_of(o);
             fold(ui, st, Section::Box, &format!("Box states ({})", boxed.len()), Some(summary), false, "box", |ui, st| {
                 super::group(ui, st, "d-orb-box", |ui, st| {
@@ -1082,6 +1202,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     fold(ui, st, s, "Spin readout", summary, false, "spin", |ui, st| {
         super::group(ui, st, "d-orb-spin", |ui, _| match (in_spin, payload) {
             (true, Some(o)) => {
+                if is_harris(o) {
+                    ui.add(egui::Label::new(RichText::new(HARRIS_DENSITY_NOTE).size(11.0).color(super::super::AMBER)).wrap());
+                }
                 for l in spin_lines(&o.spin) {
                     ui.add(egui::Label::new(RichText::new(l).size(11.5)).wrap());
                 }
@@ -1101,9 +1224,21 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 ui.add(egui::Label::new(RichText::new(*text).size(11.0).color(theme::INK_DIM)).wrap());
                 ui.add_space(3.0);
             }
+            // the estimated solver's display solves (live-orbitals spec §6)
+            ui.label(RichText::new(HARRIS_ABOUT_HEAD).size(11.5).strong().color(theme::INK));
+            for text in HARRIS_ABOUT {
+                ui.add(egui::Label::new(RichText::new(*text).size(11.0).color(theme::INK_DIM)).wrap());
+                ui.add_space(2.0);
+            }
         });
     });
 }
+
+/// About orbitals' heading over [`HARRIS_ABOUT`].
+pub const HARRIS_ABOUT_HEAD: &str = "Orbitals in estimated mode (orbital display solves)";
+
+/// The Density view's line under ⚠ Model only (Task 6 review): no fresh rows come for the list.
+pub const MODEL_ONLY_LIST: &str = "Model only: the list keeps the rows of the last solve — no DFT solve runs for it, and orbital display solves fill only Orbitals, All orbitals coloured and Spin density";
 
 /// The About orbitals fold: every honesty text of the tab in full (rule 7).
 pub const ABOUT: &[(&str, &str)] = &[
@@ -1137,7 +1272,17 @@ fn view_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, payload: Opt
         }
         ui.add_space(2.0);
         let short = if st.show == ShowMode::Spin { SPIN_SHORT } else { KS_SHORT };
-        let r = ui.add(egui::Label::new(RichText::new(short).size(11.0).color(theme::INK_DIM)).truncate()).on_hover_text(format!("{KS_NOTE} {SPIN_NOTE}"));
+        // a display solve's orbitals: the hover says what they are too (spec §6)
+        let harris = if payload.is_some_and(is_harris) { format!("
+
+{HARRIS_WHAT}
+
+{HARRIS_EPS_TIP}
+
+{HARRIS_SHAPES}
+
+{HARRIS_DENSITY_NOTE}") } else { String::new() };
+        let r = ui.add(egui::Label::new(RichText::new(short).size(11.0).color(theme::INK_DIM)).truncate()).on_hover_text(format!("{KS_NOTE} {SPIN_NOTE}{harris}"));
         super::super::probe("orbitals-ks-note", &r);
         if let Some(l) = &input.orbital_label {
             ui.add(egui::Label::new(RichText::new(l).color(super::super::AMBER)).wrap());
@@ -1154,6 +1299,11 @@ fn mode_controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>
     match st.show {
         ShowMode::Density => {
             ui.add(egui::Label::new(RichText::new("the total electron density. Pick Orbitals, All orbitals coloured or Spin density to see the Kohn–Sham orbitals; they need a DFT step").size(11.0).color(theme::INK_DIM)).wrap());
+            if st.model_only.is_some() {
+                // Model only starts no DFT solve, and display solves fill only an orbital view (Task 6 review)
+                let r = ui.add(egui::Label::new(RichText::new(MODEL_ONLY_LIST).size(11.0).color(super::super::AMBER)).wrap());
+                super::super::probe("orbitals-model-only-list", &r);
+            }
         }
         ShowMode::Orbitals => {
             super::group(ui, st, "d-orb-style", |ui, st| {
@@ -1551,6 +1701,9 @@ fn entry_tip(e: &Entry<'_>, v: &RowView, share: Option<&str>) -> String {
         t += &format!("\n{}", tag.text);
     }
     t += "\nClick to show it.";
+    if v.approx {
+        t += &format!("\n\n{HARRIS_EPS_TIP}");
+    }
     t
 }
 
@@ -1586,15 +1739,23 @@ fn levels_section(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay
                 for l in unoccupied_lines(st.orbital_request().unoccupied, status, waiting) {
                     ui.add(egui::Label::new(RichText::new(l).size(11.0).color(theme::INK_DIM)).wrap());
                 }
+                if payload.is_some_and(|o| is_harris(o) && o.unoccupied.is_some()) {
+                    ui.add(egui::Label::new(RichText::new(HARRIS_UNOCC_NOTE).size(11.0).color(theme::INK_DIM)).wrap()).on_hover_text(UNOCCUPIED_TIP);
+                }
             }
             let Some(o) = payload else {
                 theme::note(ui, "needs a DFT step");
                 return;
             };
+            // a display solve's details: its wall and the rescale (the per-atom electrons are logged)
+            if let Some(l) = harris_line(&o.kind) {
+                let r = ui.add(egui::Label::new(RichText::new(l).size(11.0).color(theme::INK_DIM)).wrap()).on_hover_text(format!("{HARRIS_WHAT}\n\n{HARRIS_EPS_TIP}\n\n{HARRIS_SHAPES}"));
+                super::super::probe("orbitals-harris-line", &r);
+            }
             for n in visible_notes(o, st.orbital_pick_adopted) {
                 ui.add(egui::Label::new(RichText::new(n).size(11.0).color(super::super::AMBER)).wrap());
             }
-            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            let levels = Levels::of_payload(o);
             // the warnings that qualify the levels sit above them
             if let Some(l) = lone_atom_line(o.lone_atom) {
                 let r = ui.add(egui::Label::new(RichText::new(l).size(11.0).color(super::super::AMBER)).wrap());
@@ -1711,12 +1872,13 @@ fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>,
     };
     if let (Some(h), Some(hy)) = (levels.homo, lay.homo_y) {
         let warn = levels.inverted;
-        let tip = if warn { format!("{line_text}\n\n{HOMO_INVERTED_TIP}. {HOMO_TIP}") } else { format!("{line_text}\n\n{HOMO_TIP}") };
-        label(hy, format!("HOMO {} Ha", energy_ha(h)), if warn { super::super::AMBER } else { theme::INK_DIM }, tip, "levels-homo");
+        let approx = levels.eps_tip();
+        let tip = if warn { format!("{line_text}\n\n{HOMO_INVERTED_TIP}. {HOMO_TIP}{approx}") } else { format!("{line_text}\n\n{HOMO_TIP}{approx}") };
+        label(hy, format!("HOMO {} Ha", levels.ha(h)), if warn { super::super::AMBER } else { theme::INK_DIM }, tip, "levels-homo");
         match (levels.gap(), levels.lumo, lay.lumo_y) {
             (Some(g), Some(u), Some(uy)) => {
                 let uy_label = uy.min(hy - 26.0).max(6.0);
-                label(uy_label, format!("LUMO {} Ha", energy_ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}"), "levels-lumo");
+                label(uy_label, format!("LUMO {} Ha", levels.ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}{approx}"), "levels-lumo");
                 // the bracket from the HOMO's line to the LUMO's
                 let bx = lx - 5.0;
                 let (ty, by) = (rect.top() + uy, rect.top() + hy);
@@ -1726,14 +1888,15 @@ fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>,
                 p.line_segment([pos2(bx - 3.0, by), pos2(bx, by)], s);
                 // a gap that is the box's, unconverged or stale is not a property of the molecule (rule 7)
                 let caveat = levels.lumo_box || levels.lumo_unconverged || levels.stale;
-                let text = format!("gap {} Ha{}", minus(g, 3), if caveat { " ⚠" } else { "" });
-                let tip = format!("Kohn–Sham gap {} Ha ({} eV).\n{line_text}\n\n{GAP_TIP}", minus(g, 3), minus(units::hartree_to_ev(g), 2));
+                let a = levels.mark();
+                let text = format!("gap {a}{} Ha{}", minus(g, 3), if caveat { " ⚠" } else { "" });
+                let tip = format!("Kohn–Sham gap {a}{} Ha ({a}{} eV).\n{line_text}\n\n{GAP_TIP}{approx}", minus(g, 3), minus(units::hartree_to_ev(g), 2));
                 label((uy_label + hy) / 2.0, text, if caveat { super::super::AMBER } else { theme::INK }, tip, "levels-gap");
             }
             _ if levels.fractional => {
-                label(hy + 13.0, "partly filled: no gap".into(), theme::INK_FAINT, format!("{line_text}\n\n{GAP_TIP}"), "levels-gap");
+                label(hy + 13.0, "partly filled: no gap".into(), theme::INK_FAINT, format!("{line_text}\n\n{GAP_TIP}{approx}"), "levels-gap");
             }
-            (_, Some(u), Some(uy)) => label(uy.min(hy - 14.0).max(6.0), format!("LUMO {} Ha", energy_ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}"), "levels-lumo"),
+            (_, Some(u), Some(uy)) => label(uy.min(hy - 14.0).max(6.0), format!("LUMO {} Ha", levels.ha(u)), theme::INK_DIM, format!("{line_text}\n\n{GAP_TIP}{approx}"), "levels-lumo"),
             _ => {}
         }
     }
@@ -1759,7 +1922,7 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, li: &Li
     let Some(o) = payload.filter(|o| !o.rows.is_empty()) else { return false };
     let r = ui.scope(|ui| {
         super::group(ui, st, "d-orb-list", |ui, st| {
-            let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
+            let levels = Levels::of_payload(o);
             let by_atom = grouped(o, li.scene_z);
             let picked = picked_of(o);
             let unocc_current = o.unoccupied.as_ref().is_none_or(|u| u.current);
@@ -1937,10 +2100,7 @@ fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, picked: boo
                 super::super::probe(&format!("share-{arrows}-{}", r.track), &s);
             }
             let ha = RichText::new(&v.ha).monospace().size(11.5);
-            let h = ui.label(if faint { ha.color(theme::INK_FAINT) } else { ha }).on_hover_text(format!(
-                "ε = {} Ha ({} eV; 1 Ha = 27.2114 eV, converted for display only) · occupation {}: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow",
-                v.ha, v.ev, v.occupation
-            ));
+            let h = ui.label(if faint { ha.color(theme::INK_FAINT) } else { ha }).on_hover_text(v.eps_tip());
             super::super::probe(&format!("eps-{arrows}-{}", r.track), &h);
         });
     });

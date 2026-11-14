@@ -101,6 +101,19 @@ pub struct RhoIn {
     pub notes: Vec<String>,
 }
 
+/// The prefix of the payload note carrying [`RhoIn::per_atom`] (each atom's on-grid electrons
+/// before its renormalisation, against the count it is renormalised to): for the app's log, never
+/// drawn in the Orbitals panel (live-orbitals Task 7).
+pub const PER_ATOM_NOTE: &str = "orbital display solve input — electrons per atom on the grid before renormalisation";
+
+/// The [`PER_ATOM_NOTE`] note: "…: atom 0 H 0.9931 → 1, atom 1 H 0.9928 → 1".
+pub fn per_atom_note(nuclei: &[qm::Nucleus], per_atom: &[f64], counted: &[f64]) -> String {
+    let atoms: Vec<String> = nuclei.iter().zip(per_atom).zip(counted).enumerate()
+        .map(|(a, ((nu, s), c))| format!("atom {a} {} {s:.4} → {c}", units::elements::symbol(nu.z)))
+        .collect();
+    format!("{PER_ATOM_NOTE}: {}", atoms.join(", "))
+}
+
 /// The sanity bound on a profile's own count from above (module doc, "The sanity bound"): an atom
 /// whose profile carries more than c_A·(1 + this) is named in a note (ρ_pc, or an all-electron
 /// profile under a pseudopotential count).
