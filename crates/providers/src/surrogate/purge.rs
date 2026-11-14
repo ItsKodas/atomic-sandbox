@@ -24,11 +24,21 @@
 //! collection's own map, raw energies and boxes), the accumulated prefix and the fit's members,
 //! the training residuals' and the misfit set's sample ids, the leave-one-out rows, the class rule's
 //! worst samples and blockers, failed audits' kept indices, fence votes and the samples they kept,
-//! the pass and teach-around starting counts, and the readiness verdict's recorded codes. A
+//! lift votes, and the pass and teach-around starting counts; the readiness verdict is dropped (it
+//! is recomputed at the next look) and the last pass's coverage recomputed. A
 //! [`sim::SampleId`] taken before the purge carries the old index: its check value no longer
 //! matches (or the index is past the end), so a stale Forget or Restore is refused (`check_id`).
 //! A reference into a purged sample (a fence vote next to it) is dropped — a purged sample no
 //! longer exists, so it fences nothing.
+//!
+//! # What a purge changes besides the store (the user's decision 2026-11-14: "purge lifts, warn")
+//!
+//! A purged sample no longer exists, so it no longer **fences**: geometries near it stop falling
+//! back to DFT and the model answers there again (its fence votes, lift votes and kept-vote counts
+//! go with it). It no longer counts against the trust recovery's 10 % cap on held + forgotten
+//! samples either. The confirmation says so ("if they were bad data, keep them forgotten
+//! instead"). A collection-mode checkpoint of an interrupted pass of this collection names counts
+//! of the samples file as it was: the worker discards it after a purge.
 //!
 //! # When it is refused
 //!
@@ -45,6 +55,10 @@ use super::*;
 
 /// The refusal while the fit still holds a forgotten sample.
 pub const PURGE_WAIT_REFIT: &str = "the refit after the last Forget has not run yet (the fit still holds a forgotten sample) — purge once it has";
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |f| f.to_string_lossy().into_owned())
+}
 
 /// Keeps the entries of `v` whose index `keep` marks (an index past `keep` is kept).
 fn retain_by<T>(v: &mut Vec<T>, keep: &[bool]) {
@@ -101,12 +115,14 @@ impl SurrogateKs {
         for &i in &gone {
             self.write_status_now(i).map_err(|e| format!("the forget of sample #{i} is not in the shared collection yet and cannot be written ({e}) — nothing purged"))?;
         }
-        let (cmap, backup) = match self.shared.as_mut() {
+        // the collection first: an `Err` there changed nothing; an `Ok` — with a warning or not —
+        // is on disk and in the collection's memory, so the provider remaps whatever follows
+        let (cmap, backup, warning) = match self.shared.as_mut() {
             Some(sh) if !in_coll.is_empty() => {
                 let out = sh.coll.purge(&in_coll)?;
-                (Some(out.map), out.backup)
+                (Some(out.map), out.backup, out.warning)
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         let mut keep = vec![true; n];
         for &i in &gone {
@@ -114,13 +130,28 @@ impl SurrogateKs {
         }
         self.remap_after_purge(&keep, cmap.as_deref());
         let purged = gone.len();
-        let wrote = match &backup {
-            Some(b) => format!(" — {} of them from the shared collection's samples file (backup: {})", in_coll.len(), b.file_name().map_or_else(|| b.display().to_string(), |f| f.to_string_lossy().into_owned())),
-            None if self.shared.is_some() => " (session-only samples: the shared collection held none of them)".to_string(),
-            None => " (the model file keeps them until the next Save model)".to_string(),
+        let collection_mode = self.shared.is_some();
+        let where_ = match (&backup, collection_mode) {
+            (Some(b), _) if in_coll.len() == purged => format!(" from the shared collection's samples file (backup: {})", file_name(b)),
+            (Some(b), _) => format!(" — {} from the shared collection's samples file (backup: {}), {} session-only", in_coll.len(), file_name(b), purged - in_coll.len()),
+            (None, true) => " (session-only samples: the shared collection held none of them)".to_string(),
+            (None, false) => " from the model (Save model writes the model file without them)".to_string(),
         };
-        self.user_notes.push(format!("surrogate: purged {purged} forgotten sample{}{wrote}; the fit is unchanged, later samples are renumbered", if purged == 1 { "" } else { "s" }));
-        Ok(sim::PurgeReport { purged, from_collection: in_coll.len(), backup })
+        self.user_notes.push(format!(
+            "surrogate: purged {purged} forgotten sample{}{where_}; the fit is unchanged, later samples are renumbered, and geometries near them no longer fall back to DFT",
+            if purged == 1 { "" } else { "s" }
+        ));
+        if let Some(w) = &warning {
+            self.user_notes.push(format!("surrogate: {w}"));
+        }
+        Ok(sim::PurgeReport { purged, from_collection: in_coll.len(), backup, collection_mode, warning })
+    }
+
+    /// How many of the forgotten samples the attached shared collection holds (the rest are
+    /// session-only, or the model file's): the Model tab's confirmation words.
+    pub fn forgotten_in_collection(&self) -> usize {
+        let Some(sh) = self.shared.as_ref() else { return 0 };
+        (0..self.quarantine.len()).filter(|&i| self.is_forgotten(i) && matches!(sh.link.get(i), Some(Link::In(_)))).count()
     }
 
     /// Rewrites every store index the provider holds after a purge (module doc, "Ids are
@@ -201,8 +232,11 @@ impl SurrogateKs {
         if let Some(t) = self.teach_start.as_mut() {
             t.samples_before = below(t.samples_before);
         }
-        if let Some(v) = self.strict_verdict.as_mut() {
-            v.retain_samples(keep);
+        // the readiness verdict is recomputed (its refusal text may name a purged sample)
+        self.strict_verdict = None;
+        // what the last pass's samples became, over the renumbered store
+        if self.pass_coverage.is_some() {
+            self.pass_coverage = self.compute_pass_coverage();
         }
         if let Some(sh) = self.shared.as_mut() {
             retain_by(&mut sh.link, keep);

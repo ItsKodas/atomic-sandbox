@@ -189,6 +189,9 @@ pub struct ModelStatus {
     /// Why "Purge forgotten (N)…" is disabled now (`sim::Trainable::purge_refusal`), `None` when it
     /// may run.
     pub purge_refusal: Option<String>,
+    /// Of the forgotten samples, those the shared collection holds
+    /// (`sim::Trainable::forgotten_in_collection`): the confirmation's words.
+    pub forgotten_in_collection: usize,
     /// The last [`Command::PurgeForgotten`]'s outcome with its number (each shown once on the
     /// status line: [`purge_line`]).
     pub last_purge: Option<(u64, Result<sim::PurgeReport, String>)>,
@@ -597,18 +600,38 @@ impl Worker {
     /// [`Command::PurgeForgotten`]: every forgotten sample deleted for good
     /// (`Trainable::purge_forgotten`); no refit (the fit stands). The outcome is
     /// `ModelStatus::last_purge`; the provider's note goes to the log.
-    pub(super) fn purge_forgotten(&mut self) {
+    pub(super) fn purge_forgotten(&mut self, confirmed: usize) {
         let Some(t) = trainable(&mut self.dy) else {
             self.error("purge forgotten samples: the estimated solver is not running".into());
             return;
         };
-        let r = t.purge_forgotten();
+        let now = t.forgotten_samples().len();
+        let r = if now != confirmed {
+            Err(format!("the forgotten list changed ({confirmed} confirmed, {now} now) — nothing purged; confirm again"))
+        } else {
+            t.purge_forgotten()
+        };
+        let slug = match t.model_source() {
+            sim::ModelSource::Collection { slug, .. } => Some(slug),
+            _ => None,
+        };
         for n in t.take_notes() {
             self.dy.add_note(n);
         }
-        if r.is_ok() {
+        if let Ok(p) = &r {
             // the model file in use no longer holds what is on disk: the autosave is this worker's
             self.owns_autosave = true;
+            // an interrupted pass's checkpoint of this collection counts its samples file as it was
+            // (`checkpoint` module doc): discarded, never resumed against the renumbered file
+            if let (Some(ck), Some(slug), true) = (self.checkpoints.as_ref(), slug, p.from_collection > 0) {
+                let dir = ck.dir().to_path_buf();
+                if let Some((_, info)) = super::checkpoint::interrupted_pass(&dir) {
+                    if super::checkpoint::is_collection_checkpoint(&info) && info.provenance.starts_with(&format!("{}{slug}:", providers::surrogate::COLLECTION_CHECKPOINT_PREFIX)) {
+                        super::checkpoint::discard_interrupted_pass(&dir);
+                        self.dy.add_note("the interrupted training of this collection was discarded: the purge renumbered its samples, so it cannot resume".into());
+                    }
+                }
+            }
         }
         let k = self.last_purge.as_ref().map_or(1, |(k, _)| k + 1);
         self.last_purge = Some((k, r));
@@ -871,6 +894,7 @@ impl Worker {
             collections,
             last_import,
             purge_refusal: s.purge_refusal(),
+            forgotten_in_collection: s.forgotten_in_collection(),
             last_purge,
             use_collection,
             source_is_autosave,
@@ -947,10 +971,17 @@ mod fit_vs_held_tests {
 pub fn purge_line(r: &Result<sim::PurgeReport, String>) -> String {
     match r {
         Ok(p) => {
-            let what = format!("purged {} forgotten sample{}", p.purged, if p.purged == 1 { "" } else { "s" });
-            match &p.backup {
-                Some(b) => format!("{what} (backup: {})", b.file_name().map_or_else(|| b.display().to_string(), |f| f.to_string_lossy().into_owned())),
-                None => format!("{what} (not in the shared collection: Save model writes the model without them)"),
+            let s = if p.purged == 1 { "" } else { "s" };
+            let name = |b: &std::path::Path| b.file_name().map_or_else(|| b.display().to_string(), |f| f.to_string_lossy().into_owned());
+            let line = match (&p.backup, p.collection_mode) {
+                (Some(b), _) if p.from_collection == p.purged => format!("purged {} forgotten sample{s} (backup: {})", p.purged, name(b)),
+                (Some(b), _) => format!("purged {} forgotten sample{s}: {} from the shared collection (backup: {}), {} session-only", p.purged, p.from_collection, name(b), p.purged - p.from_collection),
+                (None, true) => format!("purged {} forgotten session-only sample{s}", p.purged),
+                (None, false) => format!("purged {} forgotten sample{s} from the model (Save model writes the model file without them)", p.purged),
+            };
+            match &p.warning {
+                Some(w) => format!("{line} — but {w}"),
+                None => line,
             }
         }
         Err(e) => format!("purge forgotten samples refused: {e}"),

@@ -213,6 +213,7 @@ pub(crate) fn model() -> ModelStatus {
         collections: false,
         last_import: None,
         purge_refusal: None,
+        forgotten_in_collection: 0,
         last_purge: None,
         use_collection: false,
         source_is_autosave: false,
@@ -1358,7 +1359,8 @@ fn purge_forgotten_needs_its_inline_confirmation() {
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let base = ModelStatus { suspects: vec![suspect(1804, "HO", "fallback", Some(38.46))], ..model() };
-    let with = ModelStatus { forgotten_samples: vec![suspect(40, "H2", "audit", None), suspect(41, "H2", "audit", None)], forgotten: 2, ..base.clone() };
+    let shared = sim::ModelSource::Collection { slug: "lsda_h0.15".into(), samples: 1805, read_only: false };
+    let with = ModelStatus { forgotten_samples: vec![suspect(40, "H2", "audit", None), suspect(41, "H2", "audit", None)], forgotten: 2, forgotten_in_collection: 2, source: shared, ..base.clone() };
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
@@ -1383,8 +1385,16 @@ fn purge_forgotten_needs_its_inline_confirmation() {
     reveal(&mut st, &inp);
     let t = texts(&ctx, &mut st, &inp);
     assert!(t.contains("Purge forgotten (2)…"), "{t}");
-    let confirm = super::dock::model::purge_confirm_text(2);
+    let confirm = super::dock::model::purge_confirm_text(2, 2, true);
     assert!(confirm.starts_with("Delete 2 forgotten samples from the shared collection for good?") && confirm.contains("samples.bin.bak (replacing an older backup)") && confirm.ends_with("This can't be undone from the app."), "{confirm}");
+    // review findings 4–5 ("purge lifts, warn") and the minor on wording by where the samples are
+    assert!(confirm.contains("Geometries near them will no longer fall back to DFT; if they were bad data, keep them forgotten instead."), "{confirm}");
+    let file = super::dock::model::purge_confirm_text(1, 0, false);
+    assert!(file.starts_with("Delete 1 forgotten sample from this model for good? Save model then writes the model file without it.") && !file.contains("shared collection") && !file.contains("samples.bin.bak"), "{file}");
+    let session = super::dock::model::purge_confirm_text(3, 0, true);
+    assert!(session.starts_with("Delete 3 forgotten session-only samples for good (the shared collection doesn't hold them)?") && !session.contains("samples.bin.bak"), "{session}");
+    let mixed = super::dock::model::purge_confirm_text(3, 2, true);
+    assert!(mixed.starts_with("Delete 3 forgotten samples for good — 2 from the shared collection, 1 session-only?") && mixed.contains("samples.bin.bak"), "{mixed}");
     let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
     assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "the first click sends nothing");
     assert!(st.purge_confirm);
@@ -1397,12 +1407,23 @@ fn purge_forgotten_needs_its_inline_confirmation() {
     // Purge: exactly the command
     click_widget(&ctx, &mut st, &inp, "purge-forgotten");
     let outs = click_widget(&ctx, &mut st, &inp, "purge-confirm");
-    assert!(matches!(sent(&outs).as_slice(), [Command::PurgeForgotten]), "{:?}", sent(&outs));
-    assert!(matches!(acted(&outs).as_slice(), [Action::PurgeForgotten]));
+    assert!(matches!(sent(&outs).as_slice(), [Command::PurgeForgotten(2)]), "{:?}", sent(&outs));
+    assert!(matches!(acted(&outs).as_slice(), [Action::PurgeForgotten(2)]), "the confirmed count");
     assert!(!st.purge_confirm);
-    assert_eq!(crate::replay::unreplayable_kind(&Action::PurgeForgotten), Some("purge-forgotten"));
-    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::PurgeForgotten));
+    assert_eq!(crate::replay::unreplayable_kind(&Action::PurgeForgotten(2)), Some("purge-forgotten"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::PurgeForgotten(2)));
     assert!(line.starts_with("# not replayable: purge-forgotten"), "{line}");
+    assert!(!crate::replay::is_harmless("purge-forgotten"), "a replay refuses it, like Forget (the fences change)");
+    // a refusal that appears while the confirmation is open disables its Purge
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(st.purge_confirm);
+    let busy = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap_busy = snapshot(&scene, Backend::Estimated, Some(busy));
+    let inp_busy = input(&scene, Some(&snap_busy), &cam);
+    let outs = click_widget(&ctx, &mut st, &inp_busy, "purge-confirm");
+    assert!(sent(&outs).is_empty(), "Purge is disabled while refused: {:?}", sent(&outs));
+    click_widget(&ctx, &mut st, &inp_busy, "purge-cancel");
+    assert!(!st.purge_confirm);
     // disabled with the provider's reason: a click opens nothing
     let refused = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
     let snap = snapshot(&scene, Backend::Estimated, Some(refused));
@@ -1411,7 +1432,15 @@ fn purge_forgotten_needs_its_inline_confirmation() {
     let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
     assert!(sent(&outs).is_empty() && !st.purge_confirm, "disabled");
     // the outcome on the status line, once
-    let report = sim::PurgeReport { purged: 2, from_collection: 2, backup: Some(std::path::PathBuf::from("models/collections/x/samples.bin.bak")) };
+    // the status line by where the samples were
+    let line = |p: sim::PurgeReport| crate::sim::purge_line(&Ok(p));
+    assert_eq!(line(sim::PurgeReport { purged: 1, collection_mode: false, ..Default::default() }), "purged 1 forgotten sample from the model (Save model writes the model file without them)");
+    assert_eq!(line(sim::PurgeReport { purged: 2, collection_mode: true, ..Default::default() }), "purged 2 forgotten session-only samples");
+    assert_eq!(
+        line(sim::PurgeReport { purged: 3, from_collection: 2, collection_mode: true, backup: Some("x/samples.bin.bak".into()), warning: None }),
+        "purged 3 forgotten samples: 2 from the shared collection (backup: samples.bin.bak), 1 session-only"
+    );
+    let report = sim::PurgeReport { purged: 2, from_collection: 2, backup: Some(std::path::PathBuf::from("models/collections/x/samples.bin.bak")), collection_mode: true, warning: None };
     let done = ModelStatus { forgotten_samples: Vec::new(), forgotten: 0, last_purge: Some((1, Ok(report))), ..base.clone() };
     let snap = snapshot(&scene, Backend::Estimated, Some(done));
     let inp = input(&scene, Some(&snap), &cam);

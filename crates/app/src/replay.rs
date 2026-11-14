@@ -414,7 +414,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SaveSpecialised(_) => "specialised",
         Action::ForgetSample(_) => "forget-sample",
         Action::RestoreSample(_) => "restore-sample",
-        Action::PurgeForgotten => "purge-forgotten",
+        Action::PurgeForgotten(_) => "purge-forgotten",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
@@ -431,14 +431,21 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
 
 /// A skipped recorded save (or a capture: display only) changes nothing the replay checks; any
 /// other unreplayable action would make the replay diverge from the session.
+/// Whether a replay skips an unreplayable action of this kind (with a warning) rather than refusing
+/// the script (tests).
+#[cfg(test)]
+pub fn is_harmless(kind: &str) -> bool {
+    harmless(kind)
+}
+
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
     // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
     // nor an import of data folders (it copies files into the installed build's root; a replay never does),
-    // nor the updater's check, download and restart (a replay never touches the network or installs),
-    // nor a purge of forgotten samples (like the data import, it rewrites files on disk; the fit and
-    // every prediction stand unchanged, so the replayed run does not diverge)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update" | "purge-forgotten")
+    // nor the updater's check, download and restart (a replay never touches the network or installs);
+    // a purge of forgotten samples is not harmless (refused, like Forget and Restore): the purged
+    // samples stop fencing, so the replayed run would diverge
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).

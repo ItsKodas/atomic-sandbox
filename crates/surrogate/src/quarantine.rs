@@ -71,7 +71,9 @@ pub const Q_FORGOTTEN: u8 = 7;
 /// a shared collection's status record 8 is read as is (the reader keeps any code): that build holds
 /// the sample out of its fit (code ≠ 0), lets the model answer near it (its fence reads 1 and 7),
 /// never releases, supersedes or rewrites it — but does not list it as forgotten (it shows under its
-/// catch-all), so its Restore is this build's.
+/// catch-all), so its Restore is this build's. Its Save model and its session autosave (sidecar
+/// writers that check the codes) **fail** while it holds such a sample ("sidecar: quarantine code
+/// 8 (0, 1, 2, 3 or 7)") rather than write it; the collection itself is untouched.
 pub const Q_FORGOTTEN_UNFENCED: u8 = 8;
 
 /// Whether `code` marks a sample the user forgot ([`Q_FORGOTTEN`], or [`Q_FORGOTTEN_UNFENCED`] once

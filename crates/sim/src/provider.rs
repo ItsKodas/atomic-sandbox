@@ -1153,6 +1153,11 @@ pub trait Trainable {
     fn purge_refusal(&self) -> Option<String> {
         Some("this provider does not learn".into())
     }
+    /// How many of the forgotten samples the attached shared collection holds (the rest are
+    /// session-only, or a model file's): the purge confirmation's words. The default: 0.
+    fn forgotten_in_collection(&self) -> usize {
+        0
+    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1379,6 +1384,11 @@ pub struct PurgeReport {
     /// The collection's backup of its samples file as it was before (`None` without a collection
     /// write).
     pub backup: Option<std::path::PathBuf>,
+    /// A shared collection was attached (the rest were session-only samples), else a model file's.
+    pub collection_mode: bool,
+    /// The purge stands, but something after it went wrong (the collection could not be reopened
+    /// for appending: read-only until reopened).
+    pub warning: Option<String>,
 }
 
 /// A teach-around offer (`TrainableStatus::teach_offer`).

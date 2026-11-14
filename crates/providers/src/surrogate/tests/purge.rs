@@ -56,7 +56,7 @@ fn a_purge_removes_exactly_the_forgotten_samples_and_keeps_the_fit() {
     let fit_n = s.report().unwrap().n_samples;
     let r = s.purge_forgotten().unwrap();
     assert_eq!((r.purged, r.from_collection, r.backup), (2, 0, None));
-    assert!(s.user_notes.iter().any(|n| n.contains("purged 2 forgotten samples") && n.contains("next Save model")), "{:?}", s.user_notes);
+    assert!(s.user_notes.iter().any(|n| n.contains("purged 2 forgotten samples from the model") && n.contains("no longer fall back to DFT")), "{:?}", s.user_notes);
     // exactly the forgotten ones went, the rest in order
     let kept: Vec<Sample> = before_samples.iter().enumerate().filter(|(i, _)| ![5, 17].contains(i)).map(|(_, x)| x.clone()).collect();
     assert_eq!(s.store.as_ref().unwrap().samples, kept);
@@ -164,4 +164,123 @@ fn a_purge_on_a_collection_another_copy_holds_is_refused() {
     assert_eq!(other.purge_forgotten().unwrap_err(), surrogate::collection::REFUSE_PURGE_LOCKED);
     assert_eq!((other.samples(), other.forgotten()), (40, 1), "nothing changed");
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing written");
+}
+
+/// A fence or lift vote next to `near`.
+fn vote(near: Vec<usize>, gen: u64) -> super::super::quarantine::FenceVote {
+    super::super::quarantine::FenceVote { near, n: 2, energy: -1.0, forces: vec![[0.0; 3]; 2], residual: None, gen }
+}
+
+fn case(index: Option<usize>) -> super::super::audit::FailedAudit {
+    super::super::audit::FailedAudit { pos: vec![[0.0; 3], [1.4, 0.0, 0.0]], z: vec![1, 1], energy: -1.0, forces: vec![[0.0; 3]; 2], index, ionic: "none".into(), rejudges: 0, origin: Default::default(), pair: None }
+}
+
+/// Review Important 7: every index the provider holds follows the remap — fence and lift votes,
+/// the kept-vote counts, pending votes, failed audits and audit fences, the class rule's worst
+/// samples and blockers, the lone codes — and a reference into a purged sample is dropped (a
+/// purged sample fences nothing). In collection mode the links follow the collection's own map,
+/// session-only samples (`Link::Out`, `Link::Waiting`) interleaved with collection ones.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_remap_follows_every_index() {
+    use super::super::shared::Link;
+    let (mut s, _) = trained(1.2, 2.2, 10, FallbackPolicy::default());
+    // purge 2 and 5 (old → new: 0 0, 1 1, 3 2, 4 3, 6 4, 7 5, 8 6, 9 7)
+    let keep: Vec<bool> = (0..10).map(|i| i != 2 && i != 5).collect();
+    s.fence_votes = vec![vote(vec![2, 3], 1), vote(vec![5], 1), vote(vec![9], 1)];
+    s.lift_votes = vec![vote(vec![2], 1), vote(vec![4, 5, 6], 1)];
+    s.fence_kept = [(2, 1), (3, 2), (8, 1)].into_iter().collect();
+    s.vote_pending = vec![(4, vec![3, 5]), (5, vec![3]), (7, vec![2])];
+    s.failed_audits = vec![case(Some(6)), case(Some(2)), case(None)];
+    s.audit_fences = vec![case(Some(9))];
+    s.class_worst = vec![Some((7, 3.0)), Some((5, 2.0)), None];
+    s.class_blockers = vec![vec![(1, 4.0), (2, 3.0), (8, 2.0)], vec![]];
+    s.lone_codes = [(5, Q_NONE), (6, Q_HELD)].into_iter().collect();
+    s.remap_after_purge(&keep, None);
+    let near = |v: &[super::super::quarantine::FenceVote]| v.iter().map(|v| v.near.clone()).collect::<Vec<_>>();
+    assert_eq!(near(&s.fence_votes), vec![vec![2], vec![7]], "the vote only next to a purged sample is dropped");
+    assert_eq!(near(&s.lift_votes), vec![vec![3, 4]]);
+    assert_eq!(s.fence_kept, [(2, 2), (6, 1)].into_iter().collect());
+    assert_eq!(s.vote_pending, vec![(3, vec![2])], "a purged kept sample, or one kept next to purged samples only, goes");
+    assert_eq!(s.failed_audits.iter().map(|c| c.index).collect::<Vec<_>>(), vec![Some(4), None, None], "a purged case keeps its labels, not its index");
+    assert_eq!(s.audit_fences[0].index, Some(7));
+    assert_eq!(s.class_worst, vec![Some((5, 3.0)), None, None]);
+    assert_eq!(s.class_blockers, vec![vec![(1, 4.0), (6, 2.0)], vec![]]);
+    assert_eq!(s.lone_codes, [(4, Q_HELD)].into_iter().collect());
+    assert_eq!(s.samples(), 8);
+    // collection mode: session-only samples interleaved with the collection's
+    let dir = collection_root("purge-remap-links");
+    let (mut c, _) = super::forget::small_collection(&dir);
+    {
+        let sh = c.shared.as_mut().unwrap();
+        // store 0..40 ↔ collection 0..40; make 3 and 7 session-only, 11 a waiting draft guess (a remap test: the
+        // collection's own records are not touched)
+        sh.link[3] = Link::Out;
+        sh.link[7] = Link::Waiting { grid_n: 33, multiplicity: None };
+        sh.link[11] = Link::Out;
+        sh.pass_start = Some(20);
+    }
+    // purge store 4 (collection 4) and 7 (session-only): the collection's own map drops only its 4
+    let keep: Vec<bool> = (0..40).map(|i| i != 4 && i != 7).collect();
+    let cmap: Vec<Option<usize>> = (0..40).map(|k| (k != 4).then(|| if k < 4 { k } else { k - 1 })).collect();
+    let raw: Vec<f64> = c.shared.as_ref().unwrap().raw.clone();
+    c.remap_after_purge(&keep, Some(&cmap));
+    let sh = c.shared.as_ref().unwrap();
+    assert_eq!(sh.link.len(), 38);
+    assert_eq!(sh.link[3], Link::Out);
+    assert_eq!(sh.link[4], Link::In(4), "store 5 (collection 5) is now store 4 → collection 4");
+    assert_eq!(sh.link[9], Link::Out, "store 11 is now 9");
+    assert_eq!(sh.link[37], Link::In(38), "store 39 (collection 39) is now 37 → 38");
+    assert_eq!(sh.raw, raw.iter().enumerate().filter(|(i, _)| *i != 4 && *i != 7).map(|(_, x)| *x).collect::<Vec<_>>());
+    assert_eq!(sh.pass_start, Some(19), "the collection's count at the pass start: one of its first 20 went");
+}
+
+/// Review Important 3: a collection failure before the final rename (injected) leaves the provider
+/// exactly as it was; a failure after it (the reopen) is not an `Err` — the purge stands on disk and
+/// in the collection, the provider remaps, and the report carries the warning.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_collection_failure_never_leaves_the_provider_half_purged() {
+    let dir = collection_root("purge-inject");
+    let (mut s, _) = super::forget::small_collection(&dir);
+    forget(&mut s, 4);
+    forget(&mut s, 10);
+    s.refit().unwrap();
+    let (samples, codes, links) = (s.store.as_ref().unwrap().samples.clone(), s.quarantine.clone(), s.shared.as_ref().unwrap().link.clone());
+    s.shared.as_mut().unwrap().coll.inject_purge_failure(3);
+    let e = s.purge_forgotten().unwrap_err();
+    assert!(e.contains("injected") && e.contains("unchanged"), "{e}");
+    assert_eq!((&s.store.as_ref().unwrap().samples, &s.quarantine, &s.shared.as_ref().unwrap().link), (&samples, &codes, &links), "nothing changed");
+    assert_eq!(s.collection().unwrap().samples.len(), 40);
+    s.shared.as_mut().unwrap().coll.inject_purge_failure(6);
+    let r = s.purge_forgotten().unwrap();
+    assert_eq!((r.purged, r.from_collection), (2, 2));
+    assert!(r.warning.as_deref().is_some_and(|w| w.contains("read-only until reopened")), "{r:?}");
+    assert!(s.collection().unwrap().read_only);
+    // disk, collection and provider agree
+    let c = s.collection().unwrap();
+    assert_eq!(c.samples.len(), 38);
+    for (i, l) in s.shared.as_ref().unwrap().link.iter().enumerate() {
+        let super::super::shared::Link::In(k) = l else { panic!("sample {i}") };
+        assert_eq!(c.samples[*k].sample, s.store.as_ref().unwrap().samples[i], "link {i}");
+    }
+    assert!(s.user_notes.iter().any(|n| n.contains("read-only until reopened")), "{:?}", s.user_notes);
+}
+
+/// The purged samples' fences go with them (the user's decision "purge lifts, warn"): a geometry
+/// the forgotten sample fenced is no longer refused by the fence, and the 10 % cap no longer
+/// counts it.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn purged_samples_no_longer_fence_or_count() {
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    forget(&mut s, 17);
+    s.refit().unwrap();
+    let pos = s.store.as_ref().unwrap().samples[17].pos.clone();
+    assert_eq!(s.near_quarantined(&pos, &[1, 1]), vec![17]);
+    assert_eq!(s.quarantined() + s.forgotten(), 1);
+    s.purge_forgotten().unwrap();
+    assert!(s.near_quarantined(&pos, &[1, 1]).is_empty(), "no fence any more");
+    assert_eq!(s.quarantined() + s.forgotten(), 0, "not counted against the cap");
+    assert!(s.strict_verdict.is_none(), "the readiness verdict is recomputed");
 }

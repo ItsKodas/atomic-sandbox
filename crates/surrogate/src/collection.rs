@@ -96,11 +96,14 @@
 //!    `samples.bin.bak` (an older backup is replaced) — a copy, not a rename of `samples.bin`, so
 //!    `samples.bin` exists at every instant: a crash between two renames would leave none, and the
 //!    next open would start an empty collection;
-//! 4. `samples.bin.new` is renamed over `samples.bin` (one atomic replace).
+//! 4. `samples.bin.new` is renamed over `samples.bin` (one atomic replace; on Windows `MoveFileExW`
+//!    with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
 //!
 //! A failure at any step before 4 leaves `samples.bin` exactly as it was (the `.new` files are
 //! removed); after 4 the purge is done. The in-memory samples, codes and fingerprints follow only
-//! when the rename succeeded. A read-only handle of another process that was open meanwhile keeps
+//! when the rename succeeded; a failure after it (the append handle cannot be reopened) leaves the
+//! purge standing and is a warning ([`PurgeOutcome::warning`], the handle read-only), so an `Err`
+//! always means nothing changed. A read-only handle of another process that was open meanwhile keeps
 //! its old view (it never writes) until it reopens.
 //!
 //! # Admission (spec §4.2, controller rulings P3/P5 of Task 3)
@@ -211,6 +214,10 @@ pub struct PurgeOutcome {
     pub map: Vec<Option<usize>>,
     /// The backup of the samples file as it was (`None` when nothing was purged and nothing written).
     pub backup: Option<PathBuf>,
+    /// The purge is on disk and in this handle, but something after it went wrong (the samples file
+    /// could not be reopened for appending: the handle is read-only until the collection is
+    /// reopened). The purge itself stands — an `Err` always means nothing changed.
+    pub warning: Option<String>,
 }
 
 /// One isolated-atom reference of a collection (module doc, "References"): the energy (Hartree),
@@ -318,9 +325,9 @@ pub struct Collection {
     /// Test hook: the next record write stops after this many bytes with an error.
     #[cfg(test)]
     fail_next_write: Option<usize>,
-    /// Test hook: the next purge fails right before this step (2, 3, 4 of the module doc, or 5
-    /// for the final rename itself).
-    #[cfg(test)]
+    /// Test hook: the next purge fails right before this step (2, 3, 4 of the module doc, 5 for
+    /// the final rename itself, 6 for the reopen after it — the purge then stands, with a warning).
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fail_purge_before: Option<u8>,
 }
 
@@ -846,6 +853,34 @@ fn check_shape(s: &Sample) -> Result<(), String> {
     Ok(())
 }
 
+/// Renames `from` over `to` (the purge's final step): on Windows `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, so the call returns once the rename is on
+/// disk; elsewhere `rename(2)` (atomic replace).
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (a, b) = (wide(from), wide(to));
+    // SAFETY: two NUL-terminated UTF-16 paths that live across the call; no memory is shared.
+    let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 /// `bytes` to `path` through `<name>.tmp` renamed into place.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
@@ -1027,7 +1062,7 @@ impl Collection {
             good_len,
             #[cfg(test)]
             fail_next_write: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             fail_purge_before: None,
         };
         Ok((c, report))
@@ -1186,7 +1221,7 @@ impl Collection {
             good_len: self.good_len,
             #[cfg(test)]
             fail_next_write: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             fail_purge_before: None,
         }
     }
@@ -1249,7 +1284,7 @@ impl Collection {
         }
         let purged = n - next;
         if purged == 0 {
-            return Ok(PurgeOutcome { purged: 0, map, backup: None });
+            return Ok(PurgeOutcome { purged: 0, map, backup: None, warning: None });
         }
         let path = self.folder.join("samples.bin");
         let old = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1264,9 +1299,9 @@ impl Collection {
         if check.samples != kept || check.quarantine != kept_codes || check.good_len != new.len() {
             return Err("the rewritten samples file does not hold exactly the kept samples and codes; nothing was changed".into());
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let fail = self.fail_purge_before.take();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-hooks")))]
         let fail: Option<u8> = None;
         let injected = |step: u8| -> io::Result<()> {
             if fail == Some(step) {
@@ -1300,7 +1335,7 @@ impl Collection {
         }
         // 4. the one atomic replace (the append handle is closed first: nothing holds the old file)
         self.file = None;
-        let renamed = injected(5).and_then(|_| std::fs::rename(&tmp, &path));
+        let renamed = injected(5).and_then(|_| replace_file(&tmp, &path));
         if let Err(e) = renamed {
             let _ = std::fs::remove_file(&tmp);
             self.file = OpenOptions::new().write(true).open(&path).ok();
@@ -1309,18 +1344,29 @@ impl Collection {
             }
             return Err(format!("{}: the purge stopped ({e}); samples.bin is unchanged", path.display()));
         }
-        let reopened = OpenOptions::new().write(true).open(&path);
+        let reopened = injected(6).and_then(|_| OpenOptions::new().write(true).open(&path));
         self.apply_purge(kept, kept_codes, new.len());
-        match reopened {
-            Ok(f) => self.file = Some(f),
-            Err(e) => {
-                // the purge is on disk; only further writes need a reopen
-                self.read_only = true;
-                return Err(format!("{}: purged {purged} samples, but the file could not be reopened for appending ({e}): the collection is read-only until reopened", path.display()));
+        let warning = match reopened {
+            Ok(f) => {
+                self.file = Some(f);
+                let _ = self.write_readme();
+                None
             }
-        }
-        let _ = self.write_readme();
-        Ok(PurgeOutcome { purged, map, backup: Some(bak) })
+            // the purge is on disk and in memory: it stands (an `Err` means nothing changed); only
+            // further writes need a reopen
+            Err(e) => {
+                self.read_only = true;
+                Some(format!("{}: the samples file could not be reopened for appending after the purge ({e}): the collection is read-only until reopened", path.display()))
+            }
+        };
+        Ok(PurgeOutcome { purged, map, backup: Some(bak), warning })
+    }
+
+    /// Test hook (the `test-hooks` feature, for the provider's tests): the next purge fails right
+    /// before `step` (module doc steps 2–4, 5 the final rename, 6 the reopen after it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_purge_failure(&mut self, step: u8) {
+        self.fail_purge_before = Some(step);
     }
 
     /// The in-memory side of a purge that reached the disk.
@@ -2133,6 +2179,18 @@ mod tests {
             assert_eq!((r.samples, r.dropped_tail), (8, 0), "step {step}: loadable");
             assert_eq!(c.samples, (0..8).map(cs).collect::<Vec<_>>());
         }
+        // a failure after the rename (the reopen): the purge stands, with a warning, read-only
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        c.inject_purge_failure(6);
+        let out = c.purge_forgotten().unwrap();
+        assert_eq!(out.purged, 2);
+        assert!(out.warning.as_deref().is_some_and(|w| w.contains("read-only until reopened")), "{out:?}");
+        assert!(c.read_only && c.samples.len() == 6);
+        drop(c);
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.samples.len(), 6, "the purge is on disk");
+        drop(c);
+        std::fs::write(&path, &before).unwrap();
         // the handle that failed still appends after its records
         let (mut c, _) = Collection::open(&dir, &key).unwrap();
         c.fail_purge_before = Some(5);

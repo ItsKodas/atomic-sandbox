@@ -88,8 +88,9 @@ pub enum Command {
     /// Estimated solver: the Model tab's "Purge forgotten (N)…" after its confirmation
     /// (`Trainable::purge_forgotten`): every forgotten sample deleted for good — from the shared
     /// collection's samples file too, its old file kept as `samples.bin.bak`. No refit (the fit
-    /// stands unchanged); the outcome is `ModelStatus::last_purge`. Never an edit, never aborts.
-    PurgeForgotten,
+    /// stands unchanged); the outcome is `ModelStatus::last_purge`. The count is the one the user
+    /// confirmed: refused when the forgotten list changed since. Never an edit, never aborts.
+    PurgeForgotten(usize),
     /// Estimated solver: "Save a specialised model…" (M8a Task 7): the attached collection's samples
     /// made only of `species` written to `path` (`Trainable::save_specialised`); noted, an error
     /// when refused. Never an edit (a file write).
@@ -187,7 +188,7 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
-            | Command::PurgeForgotten
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
             | Command::SetAudit(_)
@@ -223,7 +224,7 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
-            | Command::PurgeForgotten
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
             | Command::SetDraft(_)
@@ -265,7 +266,7 @@ impl Command {
                 | Command::ImportModel(_)
                 | Command::ForgetSample(_)
                 | Command::RestoreSample(_)
-                | Command::PurgeForgotten
+                | Command::PurgeForgotten(_)
                 | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
@@ -308,7 +309,7 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
-            | Command::PurgeForgotten
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
@@ -417,7 +418,7 @@ impl Worker {
             Command::ImportModel(path) => self.import_model(&path),
             Command::ForgetSample(i) => self.user_sample(i, true),
             Command::RestoreSample(i) => self.user_sample(i, false),
-            Command::PurgeForgotten => self.purge_forgotten(),
+            Command::PurgeForgotten(n) => self.purge_forgotten(n),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {

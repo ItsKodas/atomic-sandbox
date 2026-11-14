@@ -860,7 +860,7 @@ fn sample_arrays(samples: &[Sample]) -> io::Result<[Vec<f64>; 7]> {
 /// The quarantine codes as array values (checked: 0 to 3, 7 or 8 — `crate::quarantine::is_persisted_code`).
 fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
     if let Some(&q) = quarantine.iter().find(|&&q| !crate::quarantine::is_persisted_code(q)) {
-        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2, 3 or 7)")));
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2, 3, 7 or 8)")));
     }
     Ok(quarantine.iter().map(|&q| q as f64).collect())
 }

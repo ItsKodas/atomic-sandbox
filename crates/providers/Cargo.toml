@@ -15,3 +15,4 @@ nalgebra = { workspace = true }
 
 [dev-dependencies]
 gpu = { path = "../gpu", features = ["fault-injection"] }
+surrogate = { path = "../surrogate", features = ["test-hooks"] }

@@ -1097,15 +1097,24 @@ pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the n
 /// The hover of a row's Forget.
 const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it";
 
-/// "Purge forgotten (N)…"'s inline confirmation (2026-11-14).
-pub fn purge_confirm_text(n: usize) -> String {
-    format!(
-        "Delete {n} forgotten sample{} from the shared collection for good? A backup of its samples file is kept as samples.bin.bak (replacing an older backup). This can't be undone from the app.",
-        if n == 1 { "" } else { "s" }
-    )
+/// "Purge forgotten (N)…"'s inline confirmation (2026-11-14), worded by where the `n` forgotten
+/// samples are: `in_collection` of them in the shared collection (the rest session-only), or — with
+/// `collection` false — a model file's. Purged samples stop fencing (the user's decision "purge
+/// lifts, warn"): the text says so.
+pub fn purge_confirm_text(n: usize, in_collection: usize, collection: bool) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    let them = if n == 1 { "it" } else { "them" };
+    let head = match (collection, in_collection) {
+        (true, k) if k == n => format!("Delete {n} forgotten sample{s} from the shared collection for good?"),
+        (true, 0) => format!("Delete {n} forgotten session-only sample{s} for good (the shared collection doesn't hold {them})?"),
+        (true, k) => format!("Delete {n} forgotten sample{s} for good — {k} from the shared collection, {} session-only?", n - k),
+        (false, _) => format!("Delete {n} forgotten sample{s} from this model for good? Save model then writes the model file without {them}."),
+    };
+    let backup = if collection && in_collection > 0 { " A backup of the collection's samples file is kept as samples.bin.bak (replacing an older backup)." } else { "" };
+    format!("{head} Geometries near {them} will no longer fall back to DFT; if {} bad data, keep {them} forgotten instead.{backup} This can't be undone from the app.", if n == 1 { "it was" } else { "they were" })
 }
 /// The hover of "Purge forgotten (N)…".
-const PURGE_TIP: &str = "delete the forgotten samples for good — from the shared collection's samples file too (its old file is kept as samples.bin.bak), or, with a model file, from the model (Save model then writes it without them). Only the samples you forgot: held, superseded, box-affected and draft samples stay. The fit is unchanged — they are already out of it — and later samples are renumbered";
+const PURGE_TIP: &str = "delete the forgotten samples for good — from the shared collection's samples file too (its old file is kept as samples.bin.bak), or, with a model file, from the model (Save model then writes it without them). Only the samples you forgot: held, superseded, box-affected and draft samples stay. The fit is unchanged — they are already out of it — and later samples are renumbered. Purged samples no longer fence: geometries near them stop falling back to DFT, and they stop counting against the 10 % the trust recovery may hold out";
 
 /// The "Worst-fitting samples" section's body (spec R2): the fit's worst samples by their
 /// leave-one-out ratio (`ModelStatus::suspects`), each with **Forget** (`Action::ForgetSample`),
@@ -1113,7 +1122,8 @@ const PURGE_TIP: &str = "delete the forgotten samples for good — from the shar
 /// model, or no ranking yet, it says why. The forgotten list's header carries **Purge forgotten
 /// (N)…** (2026-11-14; hidden with none forgotten, disabled with the reason during a pass or a
 /// refit or when the provider refuses — `ModelStatus::purge_refusal`): it opens an inline
-/// confirmation whose **Purge** emits `Action::PurgeForgotten` and whose **Cancel** emits nothing.
+/// confirmation whose **Purge** emits `Action::PurgeForgotten(n)` (disabled if a refusal appears
+/// while it is open; the worker refuses when the count changed) and whose **Cancel** emits nothing.
 pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
     match m {
         None => {
@@ -1144,10 +1154,10 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
         return;
     };
     let n = m.forgotten_samples.len();
+    let why = if sampling { Some("a sampling pass is running — purge once it is done") } else { m.purge_refusal.as_deref() };
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("forgotten ({n}): held out of the fit until restored")).size(11.5));
-        let why = if sampling { Some("a sampling pass is running — purge once it is done") } else { m.purge_refusal.as_deref() };
         let b = egui::Button::new(RichText::new(format!("Purge forgotten ({n})…")).color(theme::DANGER_INK));
         let r = super::super::probed("purge-forgotten", ui.add_enabled(why.is_none() && !st.purge_confirm, b)).on_hover_text(PURGE_TIP);
         let r = match why {
@@ -1165,11 +1175,19 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
             .corner_radius(7)
             .inner_margin(egui::Margin::symmetric(9, 7))
             .show(ui, |ui| {
-                ui.label(RichText::new(purge_confirm_text(n)).size(11.5));
+                let collection = matches!(m.source, sim::ModelSource::Collection { .. });
+                ui.label(RichText::new(purge_confirm_text(n, m.forgotten_in_collection, collection)).size(11.5));
                 ui.horizontal(|ui| {
+                    // a refusal that appears while the confirmation is open disables Purge (with why)
                     let purge = egui::Button::new(RichText::new("Purge").strong().color(Color32::WHITE)).fill(RED.gamma_multiply(0.8));
-                    if super::super::probed("purge-confirm", ui.add(purge)).clicked() {
-                        acts.push(Action::PurgeForgotten);
+                    let r = super::super::probed("purge-confirm", ui.add_enabled(why.is_none(), purge));
+                    let r = match why {
+                        Some(w) => r.on_disabled_hover_text(w),
+                        None => r,
+                    };
+                    if r.clicked() {
+                        // the count confirmed: the worker refuses if the list changed meanwhile
+                        acts.push(Action::PurgeForgotten(n));
                         st.purge_confirm = false;
                     }
                     if super::super::probed("purge-cancel", ui.button("Cancel")).clicked() {

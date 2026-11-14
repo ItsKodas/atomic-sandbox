@@ -135,9 +135,11 @@ pub enum Action {
     /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
     RestoreSample(sim::SampleId),
     /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
-    /// every forgotten sample deleted for good (`Command::PurgeForgotten`). Recorded, not
-    /// replayable (`# not replayable: purge-forgotten`: it rewrites the shared collection's file).
-    PurgeForgotten,
+    /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user
+    /// confirmed (the worker refuses when the forgotten list changed since). Recorded, not
+    /// replayable (`# not replayable: purge-forgotten`, a replay refuses it like Forget: it rewrites
+    /// the shared collection's file and the purged samples stop fencing).
+    PurgeForgotten(usize),
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -658,10 +660,10 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.set_status(format!("restoring sample #{}; refitting", id.index));
             out.commands.push(Command::RestoreSample(id));
         }
-        Action::PurgeForgotten => {
+        Action::PurgeForgotten(n) => {
             st.purge_confirm = false;
-            st.set_status("purging the forgotten samples…");
-            out.commands.push(Command::PurgeForgotten);
+            st.set_status(format!("purging {n} forgotten sample{}…", if n == 1 { "" } else { "s" }));
+            out.commands.push(Command::PurgeForgotten(n));
         }
         Action::SetAudit(n) => {
             model_only_by_hand(st, "the audit cadence");
@@ -1181,7 +1183,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | PurgeForgotten | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 
