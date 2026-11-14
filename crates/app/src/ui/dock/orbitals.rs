@@ -87,9 +87,9 @@ pub const GRID_SPLIT_TIP: &str = "a lone atom's shell is degenerate in physics; 
 /// The tail of the label: what a Harris display solve is not (pinned: "not self-consistent").
 pub const HARRIS_NOTE: &str = "not self-consistent — a display solve between DFT solves (one diagonalisation, no SCF; nothing learns from it)";
 /// The "≈" of a Harris payload's ε, HOMO, LUMO and gap (pinned: "approximate").
-pub const HARRIS_EPS_TIP: &str = "≈: approximate — these orbitals come from one diagonalisation in the potential of the superposed isolated atoms (an orbital display solve), not from a self-consistent (converged) solve, so every ε, the HOMO, the LUMO and the gap are approximate: their error is second order in how far the superposed atoms' density is from the self-consistent one (no charge transfer, no polarisation of the bonds). A DFT solve at the same geometry replaces them with the self-consistent values";
+pub const HARRIS_EPS_TIP: &str = "≈: approximate — these orbitals come from one diagonalisation in the potential of the superposed isolated atoms (an orbital display solve), not from a self-consistent (converged) solve, so every ε, the HOMO, the LUMO and the gap are approximate: they are eigenvalues of the superposed atoms' potential, off by roughly how far that density is from the self-consistent one (first order: no charge transfer, no polarisation of the bonds; only the Harris total energy, not shown here, is second order). A DFT solve at the same geometry replaces them with the self-consistent values";
 /// The shapes (pinned: "qualitative").
-pub const HARRIS_SHAPES: &str = "the shapes and the mixing of these orbitals are qualitative: they are eigenstates of the superposed atoms' potential, which lacks the bonds' charge transfer and polarisation — right in their nodes and symmetry, approximate in how much each atom contributes";
+pub const HARRIS_SHAPES: &str = "the shapes and the mixing of these orbitals are qualitative: they are eigenstates of the superposed atoms' potential, which lacks the bonds' charge transfer and polarisation — right in their symmetry and node count, approximate in where the nodes sit and in how much each atom contributes";
 /// The density and spin views (pinned: "this solve's output, not a DFT density").
 pub const HARRIS_DENSITY_NOTE: &str = "the density and spin views of these orbitals show this solve's output, not a DFT density: the occupied orbitals of one diagonalisation in the superposed atoms' potential, summed — not converged";
 /// Unoccupied rows (pinned: "box states").
@@ -934,6 +934,8 @@ struct ListInput<'a> {
     scene_z: &'a [u8],
     selected: &'a [usize],
     refs_pending: bool,
+    /// What stands where there is no payload yet ([`no_orbitals_note`]).
+    none_note: String,
 }
 
 /// How one row is drawn besides its orbital: its share (text and hover; `None` = no share column)
@@ -1102,6 +1104,24 @@ fn fold(ui: &mut Ui, st: &mut UiState, s: Section, title: &str, summary: Option<
 
 // ---- the tab ----
 
+/// Where orbitals come from, for a control that needs them (a static hover).
+pub const NEEDS_ORBITALS: &str = "they need a DFT step — or, in estimated mode with the GPU teacher, an orbital display solve between DFT solves (not self-consistent)";
+/// An orbital view of the estimated solver with nothing yet: a display solve is on its way.
+pub const HARRIS_PENDING: &str = "an orbital display solve fills this shortly (not self-consistent: the estimated solver has no electrons)";
+
+/// What the panel says where there is no payload yet: "needs a DFT step", or in estimated mode with
+/// the GPU teacher and an orbital view on, why no display solve runs (`Snapshot::harris_note`) or
+/// that one is on its way ([`HARRIS_PENDING`]).
+pub fn no_orbitals_note(input: &PanelInput<'_>, st: &UiState) -> String {
+    let estimated_gpu = input.model().is_some_and(|m| m.audits_background);
+    let orbital_view = !st.hide_cloud && st.show != ShowMode::Density;
+    match (estimated_gpu, orbital_view) {
+        (true, true) => input.snapshot.and_then(|s| s.harris_note).unwrap_or(HARRIS_PENDING).to_string(),
+        (true, false) => "pick Orbitals, All orbitals coloured or Spin density: an orbital display solve fills it (not self-consistent)".to_string(),
+        (false, _) => "needs a DFT step".to_string(),
+    }
+}
+
 /// The view card's one-line note (its full text, [`KS_NOTE`] and [`SPIN_NOTE`], on hover and in About orbitals).
 pub const KS_SHORT: &str = "Kohn–Sham orbitals: auxiliary objects of DFT, not measured wavefunctions";
 /// The one-line note in Spin density mode.
@@ -1160,7 +1180,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
     let selected = selected_atoms(input.selected, &st.edit_group, scene_z.len());
     let refs_pending = input.snapshot.is_some_and(|s| !s.dynamics.bonds_pending.is_empty());
-    let li = ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending };
+    let li = ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending, none_note: no_orbitals_note(input, st) };
     let name = crate::names::common_name(&scene_z, input.scene.charge)
         .map(str::to_string)
         .unwrap_or_else(|| crate::names::formula(&scene_z, (input.scene.charge != 0).then_some(input.scene.charge)));
@@ -1210,7 +1230,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 }
             }
             (true, None) => {
-                theme::note(ui, "needs a DFT step");
+                theme::note(ui, &li.none_note);
             }
             (false, _) => {
                 theme::note(ui, "n↑, n↓, ∫m, ∫|m| and max|m|/max ρ appear here in Spin density mode");
@@ -1298,7 +1318,7 @@ fn mode_controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>
     }
     match st.show {
         ShowMode::Density => {
-            ui.add(egui::Label::new(RichText::new("the total electron density. Pick Orbitals, All orbitals coloured or Spin density to see the Kohn–Sham orbitals; they need a DFT step").size(11.0).color(theme::INK_DIM)).wrap());
+            ui.add(egui::Label::new(RichText::new(format!("the total electron density. Pick Orbitals, All orbitals coloured or Spin density to see the Kohn–Sham orbitals; {NEEDS_ORBITALS}")).size(11.0).color(theme::INK_DIM)).wrap());
             if st.model_only.is_some() {
                 // Model only starts no DFT solve, and display solves fill only an orbital view (Task 6 review)
                 let r = ui.add(egui::Label::new(RichText::new(MODEL_ONLY_LIST).size(11.0).color(super::super::AMBER)).wrap());
@@ -1445,7 +1465,7 @@ fn presets(ui: &mut Ui, st: &UiState, payload: Option<&OrbitalDisplay>, acts: &m
                 P::Valence | P::Everything => true,
             };
             let r = ui.add_enabled(enabled, theme::choice_button(active == Some(p), p.title()));
-            let r = if enabled { r.on_hover_text(preset_tip(p)) } else { r.on_disabled_hover_text(if p == P::POnly && !rows.is_empty() { P_ONLY_OFF } else { "needs a DFT step" }) };
+            let r = if enabled { r.on_hover_text(preset_tip(p)) } else { r.on_disabled_hover_text(if p == P::POnly && !rows.is_empty() { P_ONLY_OFF } else { NEEDS_ORBITALS }) };
             super::super::probe(&format!("preset-{}", p.word()), &r);
             if r.clicked() {
                 acts.push(Action::ColourPreset(p));
@@ -1744,7 +1764,7 @@ fn levels_section(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay
                 }
             }
             let Some(o) = payload else {
-                theme::note(ui, "needs a DFT step");
+                theme::note(ui, &li.none_note);
                 return;
             };
             // a display solve's details: its wall and the rescale (the per-atom electrons are logged)

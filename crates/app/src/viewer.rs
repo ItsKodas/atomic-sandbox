@@ -466,8 +466,8 @@ pub struct Viewer {
     orbital_sent: Option<sim::OrbitalViewRequest>,
     orbital_waiting: bool,
     orbital_at: [Option<Instant>; 2],
-    /// When a display solve's per-atom electrons last went to the Log panel ([`Viewer::log_harris_input`]).
-    harris_input_logged: Option<Instant>,
+    /// When a display solve's per-atom electrons were last logged, and the text ([`Viewer::log_harris_input`]).
+    harris_input_logged: Option<(Instant, String)>,
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
     /// last `run_ui`. The renderer and every mouse ↔ world path use it.
     pub viewport: Viewport,
@@ -2053,14 +2053,16 @@ impl Viewer {
 
     /// A display solve's input, per atom: the on-grid electrons of each isolated-atom profile
     /// before its renormalisation (`providers::harris::PER_ATOM_NOTE`; live-orbitals Task 4) — the
-    /// debug readout, never drawn in the panel. stderr on every landing, the Log panel at most once
-    /// per [`HARRIS_INPUT_LOG_EVERY`] (a playing view lands one every few seconds).
+    /// debug readout, never drawn in the panel. stderr and the Log panel at most once per
+    /// [`HARRIS_INPUT_LOG_EVERY`] (a playing view lands one every few seconds), and only when the
+    /// text changed since the last one logged.
     fn log_harris_input(&mut self, o: &sim::OrbitalDisplay) {
         let Some(n) = o.notes.iter().find(|n| n.starts_with(ui::orbital_tab::PER_ATOM_NOTE)) else { return };
-        eprintln!("{n}");
-        if self.harris_input_logged.is_none_or(|t| t.elapsed() >= HARRIS_INPUT_LOG_EVERY) {
-            self.harris_input_logged = Some(Instant::now());
+        let due = self.harris_input_logged.as_ref().is_none_or(|(t, last)| last != n && t.elapsed() >= HARRIS_INPUT_LOG_EVERY);
+        if due {
+            eprintln!("{n}");
             self.ui.log.push(ui::logbook::LogKind::Note, n.clone());
+            self.harris_input_logged = Some((Instant::now(), n.clone()));
         }
     }
 

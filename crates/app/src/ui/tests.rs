@@ -4012,6 +4012,15 @@ mod orbital_viewer {
         assert!(!texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
         st.model_only = Some(super::super::ModelOnlySaved { draft: false, audit_every: 2000 });
         assert!(texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
+        // no payload yet (fix round 1, minor 5): an orbital view of the estimated GPU solver says a
+        // display solve fills it, or why none runs; the DFT solvers still need a DFT step
+        st.show = ShowMode::Orbitals;
+        assert_eq!(orbitals::no_orbitals_note(&inp, &st), orbitals::HARRIS_PENDING);
+        let mut paused = snapshot(&scene, Backend::Estimated, snap.model.clone());
+        paused.harris_note = Some(crate::sim::HARRIS_PAUSED_PASS);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&paused), &cam), &st), crate::sim::HARRIS_PAUSED_PASS);
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&gpu), &cam), &st), "needs a DFT step");
     }
 
     /// Ctrl K finds the modes by their names.

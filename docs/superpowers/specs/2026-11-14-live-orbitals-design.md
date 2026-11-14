@@ -158,7 +158,7 @@ The thresholds (0.1 Bohr, 3 examples, 0.3 spread, 6 Bohr, 50 000 records) are di
 
 ### 5.3 What it buys
 
-The Harris functional's error is second order in ρ_in − ρ_SCF, so a better ρ_in improves the orbitals and their ε quadratically. Phase B is the same Harris solve with a better input. No other display path changes.
+The Harris total energy's error is second order in ρ_in − ρ_SCF (it is stationary there); the orbitals and their ε are eigenstates of H[ρ_in] and differ from the SCF ones at first order (δε_i ≈ ⟨ψ_i|f_Hxc δρ|ψ_i⟩). A better ρ_in therefore still improves both, the orbitals and ε to first order (correction, Task 7 review 2026-11-14: this line said "quadratically"). Phase B is the same Harris solve with a better input. No other display path changes.
 
 ## 6. Honesty labels (rule 7)
 
