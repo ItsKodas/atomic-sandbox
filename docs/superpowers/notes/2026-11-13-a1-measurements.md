@@ -24,7 +24,8 @@ of 1e-5). Prior measurements: `2026-11-13-v0-open-shell-stability.md` (V0) and `
 - **Step 2, the V5 NVE case: N₃ fails, CO₂⁺ qualifies.** N₃ is linear ²Π_g (TS = 2 kT ln 2 to 1e-9) and its bend is
   restoring, but its π split never reaches 10 kT on one state (39 mHa at 60°, then a state change). CO₂⁺ reaches
   47.3 mHa (9.5 kT) at a 70° bend on a smooth, restoring surface, with h²/4·E_mode = 1.4e-5 Ha: CO₂⁺, 71³ × 0.20,
-  β = 70° at R_e = 2.226, dt = 0.25 fs, 300 steps. The spec's NVE text (which names N₃) needs that amendment.
+  β = 70° at R_e = 2.226, dt = 0.25 fs, ≥ 2 bend periods (≈ 600 steps). The spec's NVE text now names CO₂⁺
+  (amended in review fix round 1).
 - **Step 3, the witness cost:** all-electron H₂ / H₃⁺ at 49³ cost 3.1× / 2.2× cold and 1.4× / 1.75× warm (one extra
   vector per channel); pseudised H₂O costs 1.76× / 1.29× cold and 1.31× / 1.09× warm at 57³ × 0.20 / 81³ × 0.15
   (two extra vectors per channel instead of one).
@@ -49,21 +50,22 @@ case here: N ≤ 26 valence electrons), the stall stop at its default W = 50, th
 
 | policy | case | 1e-3 (D§6): iterations, F, TS | **5 mHa: iterations** | **5 mHa: E (Ha)** | **5 mHa: F (Ha)** | **5 mHa: TS (Ha)** | new budget | wall (s) |
 |---|---|---|---|---|---|---|---|---|
-| default | H₄ rhombus | 10, −2.079319, 0 | **12** | −2.079295 | **−2.079322** | **2.67e-5** | ≤ 20 | 21.5 |
-| default | H₄ lopsided tetra | 32, −1.932837, 2.7e-3 | **16** | −1.929941 | **−1.943830** | **1.39e-2** | ≤ 25 | 15.4 |
-| default | H₄ seed 1 | 12, −2.078114, 1e-9 | **13** | −2.076526 | **−2.078602** | **2.08e-3** | ≤ 20 | 8.3 |
-| default | H₅ seed 3 | 18, −2.563330, 2e-7 | **15** | −2.561243 | **−2.564249** | **3.01e-3** | ≤ 25 | 17.6 |
-| default | H₈ seed 8 | 14, −4.220373, 2e-16 | **14** | −4.220231 | **−4.220394** | **1.63e-4** | ≤ 25 | 49.6 |
-| `ionic none` | H₅ ring | 13, −2.465136, 1.39e-3 | **11** | −2.463750 | **−2.470682** | **6.93e-3** | ≤ 20 | 13.7 |
-| `ionic none` | H₆ seed 5 | 47, −2.967311, 6.8e-4 | **15** | −2.963540 | **−2.973255** | **9.71e-3** | ≤ 25 | 24.2 |
-| `ionic none` | H₂O + 2 H | 79, −47.339721, 2.5e-3 | **33** | −47.336856 | **−47.350019** | **1.32e-2** | ≤ 50 | **433.5** |
-| `ionic none` | lopsided tetra | 28, −1.813947, 2.7e-3 | **15** | −1.810974 | **−1.824952** | **1.40e-2** | ≤ 25 | 38.3 |
+| default | H₄ rhombus | 10, −2.079319, 0 | **12** | −2.079295 | **−2.079322** | **0.000027** | ≤ 20 | 21.5 |
+| default | H₄ lopsided tetra | 32, −1.932837, 2.7e-3 | **16** | −1.929941 | **−1.943830** | **0.013889** | ≤ 25 | 15.4 |
+| default | H₄ seed 1 | 12, −2.078114, 1e-9 | **13** | −2.076526 | **−2.078602** | **0.002076** | ≤ 20 | 8.3 |
+| default | H₅ seed 3 | 18, −2.563330, 2e-7 | **15** | −2.561243 | **−2.564249** | **0.003006** | ≤ 25 | 17.6 |
+| default | H₈ seed 8 | 14, −4.220373, 2e-16 | **14** | −4.220231 | **−4.220394** | **0.000163** | ≤ 25 | 49.6 |
+| `ionic none` | H₅ ring | 13, −2.465136, 1.39e-3 | **11** | −2.463750 | **−2.470682** | **0.006932** | ≤ 20 | 13.7 |
+| `ionic none` | H₆ seed 5 | 47, −2.967311, 6.8e-4 | **15** | −2.963540 | **−2.973255** | **0.009715** | ≤ 25 | 24.2 |
+| `ionic none` | H₂O + 2 H | 79, −47.339721, 2.5e-3 | **33** | −47.336856 | **−47.350019** | **0.013163** | ≤ 50 | **433.5** |
+| `ionic none` | lopsided tetra | 28, −1.813947, 2.7e-3 | **15** | −1.810974 | **−1.824952** | **0.013978** | ≤ 25 | 38.3 |
 | default | H₂ control | 9, E −1.136119 | 9 | −1.136119 | −1.136119 | 0 | (control) | 1.3 |
 | default | H₂O control | 13, E −17.476023 | 13 | −17.476023 | −17.476023 | 1.4e-12 | (control) | 24.1 |
 
 - **Budgets.** The spec's rule, unchanged: about 1.5× the measured count, here ⌈1.5 n⌉ rounded up to a multiple of 5.
 - **F/TS pins.** The 5 mHa values above, within 1e-5 Ha (the spec's rule). The harness prints six decimals, so the
-  pins carry a ±5e-7 rounding inside that tolerance.
+  pins carry a ±5e-7 rounding inside that tolerance; TS is written as E − F of those printed values (±1e-6; review
+  fix round 1: two significant figures were coarser than the 1e-5 tolerance).
 - **The controls are unchanged** from D§6 to every printed digit (H₂ −1.136119, H₂O −17.476023; TS 0 and 1.4e-12):
   a gapped solve does not see kT.
 - **What moved, and why.**
@@ -71,7 +73,9 @@ case here: N ≤ 26 valence electrons), the stall stop at its default W = 50, th
     so the occupation feedback is softer); the rhombus and seed 1 take one or two more.
   - TS moves non-linearly where a level is pinned near μ. The exactly degenerate H₅ ring is the closed form
     2 kT ln 2 = 6.931e-3 (E unchanged, −2.463750 at both kT). The lopsided tetrahedra carry a pinned pair in both
-    channels: 1.39e-2 and 1.40e-2, close to 4 kT ln 2 = 1.386e-2, i.e. their pinned pair is now within kT.
+    channels: 0.013889 and 0.013978. Both **exceed 4 kT ln 2 = 0.013863**, the most one pinned pair per channel
+    can give (2 ln 2 of entropy per channel at f = ½), so a third level lies near μ (a second splitting t₂ within a
+    few kT) and carries part of TS. Not resolved further here (the harness prints the totals only).
   - **Three default-policy cases that were gapped at 1e-3 now carry a partial level:** seed 1 (TS 1e-9 → 2.08e-3),
     seed 3 (2e-7 → 3.01e-3) and seed 8 (2e-16 → 1.63e-4). Their frontier gaps are a few kT at 5 mHa, so they are
     pinned states under the 5 mHa rule, and their E is 0.1–2.1 mHa above the 1e-3 E. These are the cases the
@@ -117,7 +121,7 @@ at a = 1.8), and it sits inside the window [5e-3, 1e-1] everywhere; b − a sets
 | c over the 4δ span, per sub-interval (Ha/Bohr) | 0.0393 … 0.0431 | **0.0498 … 0.0540** | ∈ [5e-3, 1e-1] |
 | \|d(TS)/dx\| over the 4δ span (Ha/Bohr) | 6.6e-3 … 9.5e-3 | **2.14e-2 … 2.39e-2** | ≥ 2e-3 |
 | plain \|FD(δ) − FD(2δ)\| (Ha/Bohr) | 2.47e-5 | **2.88e-5** | ≤ 1e-3 |
-| implied F‴ = 2\|FD(δ) − FD(2δ)\|/δ² (Ha/Bohr³) | 0.49 | 0.58 | (0.2c³/(kT)² = 0.57 at c = 0.052) |
+| implied F‴ = 2\|FD(δ) − FD(2δ)\|/δ² (Ha/Bohr³) | 0.49 | 0.58 | (see the F‴ note below) |
 | HF (Ha/Bohr) | −8.18269e-2 | −4.63969e-2 | |
 | R(δ/2, δ), R(δ, 2δ) (Ha/Bohr) | −8.18297e-2, −8.18183e-2 | −4.63777e-2, −4.64004e-2 | (CPU test: agree within 2.5e-5) |
 | \|R(δ/2, δ) − R(δ, 2δ)\| | 1.1e-5 | 2.3e-5 | ≤ 2.5e-5 on the CPU |
@@ -128,6 +132,18 @@ at a = 1.8), and it sits inside the window [5e-3, 1e-1] everywhere; b − a sets
 
 1.8 × 1.90 ran the same stencil but its +δ warm solve stopped at Δρ 2.1e-6 (tol 1e-6): the f32 floor again, not a
 property of the aspect (its quick scan converged at the same point).
+
+**F‴ (corrected in review fix round 1).** The spec's window estimate 0.2c³/(kT)² is **1.12** Ha/Bohr³ at c = 0.052
+(this note first misstated it as 0.57). That estimate is an upper bound: it comes from −kT ln(2 cosh(Δ/2kT)) per
+channel. The pair's exact free energy, the same F whose temperature derivative reproduces the measured d(TS)/dx to
+3 digits above, is −2kT ln(2 cosh u) per channel with u = Δ/(4kT), whose third derivative in x is
+sech²u·tanh u·c³/(8(kT)²) for the two channels (maximum coefficient 0.048, a quarter of 0.2). At u = 0.65 and
+c = 0.052 that is **0.27** Ha/Bohr³ (checked numerically against a finite difference of the closed form), and 0.07
+for 1.8 × 1.85. The measured 0.58 and 0.49 therefore also hold the bonds' own anharmonicity along x (≈ 0.3–0.4 on
+both aspects), and the GPU plain-FD differences (2.5–2.9e-5) carry ~1e-5 of f32 noise, so the split is not
+resolved here. The measured total, 0.58, is what sets the δ-scaling truncation e = F‴δ²/6 ≈ 1e-5 (spec §9 V3,
+pre-registered in fix round 1). The reviewer's figure "≈ 0.62 at u = 0.65" disagrees with the closed form
+(0.27); flagged in the task report.
 
 **Candidate (for Task 6 to confirm on the CPU at tol 1e-9): a × b = 1.8 × 1.95 Bohr, atom 0 at (−0.9, −0.975, 0),
 displaced along x** (toward atom 1, which shortens the 1.8 side and widens Δ; c > 0). Centred coordinates:
@@ -257,18 +273,22 @@ and **TS = 6.931472e-3 Ha = 2 kT ln 2 within 1e-9** at every R. Face density 3.5
 - **Start:** C at a grid node (the origin), O at (∓R_e cos 35°, −R_e sin 35°, 0) with R_e = 2.226 Bohr, i.e. bond angle
   110° (**β = 70°**), at rest. ↓ π split 47.3 mHa (9.5 kT), TS 0.514 mHa.
 - **dt = 0.25 fs** (the suites' `DT_FS`, 10.335 a.u.); h_b = 0.0241; **h_b²/4·E_mode = 1.4e-5 Ha** (E_mode = 98.75 mHa).
-- **Steps: 300**, 1.15 harmonic bend periods (2π/ω_b = 2691 a.u. = 260 steps); the large amplitude lengthens the
-  period, so 300 steps cover about one full period and at least two linear crossings, i.e. two TS swings of 6.4 mHa. **Not measured:** the warm per-step cost at 71³; the bend scan's warm solves took 14–51 s per 10° jump,
-  so an MD step (≤ 1° per step) will be cheaper, but 300 steps may take several minutes of GPU. Task 11 should time
-  the first steps before committing to the count.
+- **Steps: ≥ 2 bend periods, ≈ 600** (review fix round 1; the first draft said 300). The harmonic period is
+  2π/ω_b = 2691 a.u. = 260 steps. The large amplitude **stiffens** the bend: F(70°) − F(0) = 98.75 mHa against
+  ½k_ββ² = 80 mHa, so the period is shorter than harmonic and 600 steps hold more than two. 300 steps = 0.075 ps
+  cannot resolve a drift at `DRIFT_BOUND` = 2e-4 Ha/ps against the Verlet swing. **Not measured:** the warm
+  per-step cost at 71³; the bend scan's warm solves took 14–51 s per 10° jump, and an MD step moves the bend by at
+  most h_b·β₀ ≈ 1.7° (at the linear crossing), so a step is cheaper, but 600 steps may exceed one 15-min GPU batch.
+  Task 11 times the first steps and measures σ_path under the 1e-5 stop before fixing the count and the
+  fluctuation bound 3 × (h²/4·E_mode + 2σ_path), splitting the run into checkpointed batches if needed.
 - The trajectory stays C₂ᵥ by symmetry (up to f32 noise), so the asymmetric stretch is not fed.
 - Not checked here: a run of the trajectory itself (Task 11), and whether 70° at R_e or the bent geometry's own R
   (the stretch force +0.156 Ha/Bohr) is the better start; at R_e the stretch carries 5.8 mHa, which is harmless for
   h_s²/4·E.
 
-**The spec's NVE text needs an amendment** (§9 "V5 new tests" 2, "The proposed case is N₃"): replace N₃ by CO₂⁺ with
-the numbers above; the premises "the bend is soft (h ≈ 0.02) with a few mHa in it, so h²/4·E_mode ≲ 1e-6 Ha" become
-"h_b = 0.024 with ≈ 0.1 Ha in it, h²/4·E_mode = 1.4e-5 Ha". This is the substitution the brief allows ("If N₃ fails,
+**The spec's NVE text is amended** (review fix round 1, §9 "V5 new tests" 2): the case is CO₂⁺ with the numbers
+above, and the premise "the bend is soft (h ≈ 0.02) with a few mHa in it, so h²/4·E_mode ≲ 1e-6 Ha" is gone
+(h_b = 0.024 with ≈ 0.1 Ha in it, h²/4·E_mode = 1.4e-5 Ha). This is the substitution the brief allows ("If N₃ fails,
 substitute another linear ²Π radical (the review suggests CO₂⁺) with the same properties"), so it is not a STOP;
 the reviewer should confirm it.
 

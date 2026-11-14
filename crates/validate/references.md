@@ -4480,7 +4480,9 @@ Task 6 confirms on the CPU at tol 1e-9): **H₄ rectangle 1.8 (x) × 1.95 (y) Bo
 displaced along x.** Frontier splitting Δ = 12.93 mHa (u = Δ/4kT = 0.65); c = dΔ/dx = 0.0498–0.0540 Ha/Bohr and
 d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over the 4δ span (= −u sech²u · c to 3 digits); plain |FD(0.01) − FD(0.02)| =
 2.9e-5 Ha/Bohr; HF − R_E(δ/2, δ) = −2.27e-2 Ha/Bohr. The GPU Richardson pair (|R(δ/2, δ) − R(δ, 2δ)| = 2.3e-5) is at the
-f32 floor; the CPU test certifies it.
+f32 floor; the CPU test certifies it. Pre-registered (spec §9 V3): the measured F‴ ≈ 0.58 Ha/Bohr³ puts the plain
+truncation e ≈ 1e-5 at the δ-scaling check's own gate; Task 6 records e and b = HF − R_F separately, and |b| > 3e-6
+is a spec decision, never a re-pin.
 
 **V5 NVE case: CO₂⁺, not N₃.** Pseudised N₃ (71³ × 0.20) is linear ²Π_g (R_e 2.224 Bohr, TS = 2 kT ln 2 within 1e-9,
 k_β = 0.128 Ha/rad², ω_b 543 cm⁻¹), but its ↓ π split grows only to 39 mHa at a 60° bend, after which the ↑ channel
@@ -4491,5 +4493,7 @@ turns partial and the state changes (75°: split 30.5 mHa, the bend force collap
 TS 0.514 mHa (6.931 at linear: a 6.4 mHa swing), E_mode = F(70°) − F(0) = 98.75 mHa, h_b = ω_b·dt = 0.0241 at
 **dt = 0.25 fs**, **h_b²/4·E_mode = 1.4e-5 Ha** (the symmetric stretch, the only other mode a C₂ᵥ start feeds, holds
 5.8 mHa at the start: h_s²/4·E = 5.6e-6; the whole E_mode there would give 9.5e-5). Face density ≤ 1.1e-6 over
-0°–80° (rule 1.28e-5). **Steps: 300** (1.15 harmonic bend periods; per-step cost not measured). Task 11 pre-registers
-the drift and fluctuation bounds for this trajectory.
+0°–80° (rule 1.28e-5). **Steps: ≥ 2 bend periods, ≈ 600** (harmonic period 260 steps; the large amplitude stiffens
+the bend, F(70°) = 98.75 mHa against ½k_ββ² = 80 mHa; 300 steps = 0.075 ps cannot resolve drift at `DRIFT_BOUND`).
+Task 11 times the per-step cost (not measured here) and measures σ_path under the 1e-5 stop, then pre-registers
+the drift and fluctuation (3 × (h²/4·E_mode + 2σ_path)) bounds for this trajectory.

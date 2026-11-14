@@ -374,6 +374,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
     - `(HF − R_F(δ/2, δ)).abs() <= 1e-4` (the "M7 forces" Richardson bound);
     - `(HF − R_E(δ/2, δ)).abs() >= 5e-4` (it tells F's derivative from E's).
   - HF is the `qm::forces` component of the chosen atom at the unperturbed geometry.
+  - **Pre-registered (review fix round 1, spec §9 V3).** On the A1 candidate the plain truncation e = F‴δ²/6 ≈ 1e-5 (F‴ ≈ 0.58 measured on the GPU), so the δ-scaling check sits at its own 1e-5 gate. Print and record e = FD_F(δ) − R_F(δ/2, δ) and b = HF − R_F(δ/2, δ) separately; the ratio is (4e − b)/(e − b) and stays in [3, 5] only while |b| ≲ 3e-6. **If |b| > 3e-6, stop and report: it is a spec decision, never a re-pin.**
 - [ ] **Step 3: Run it.** Run `cargo test -p validate --release --test oracles fd_forces_are_minus_df_dx -- --nocapture`. Expected: PASS. A failure is investigated (systematic-debugging), never re-thresholded.
 - [ ] **Step 4: Physics review of the test.** Check the stencil, the Richardson combination, the sign convention and that the thresholds are verbatim from spec §9 "V3 force oracle".
 - [ ] **Step 5: Record and commit.** Write R(δ/2, δ), R(δ, 2δ), the ratio and |HF − R_E| into references.md. Commit `oracles.rs`, `common/`, `references.md`.
@@ -554,7 +555,8 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
   - ks.rs `scf_tol_used_reports_the_partial_stop` (F9): a lone pseudo-O at M = 3 through the GPU provider at the sample tolerance reports `scf_tol_used == Some(GPU_PARTIAL_TOL)`; gapped H₂ reports the requested tolerance.
   - `fd_regression.rs` (V2, GPU, release-only). Scenes go through `providers::ks::problem`, cold, at 81³ × 0.15, at the app tolerance raised by `effective_gpu_tol`, with the stall stop on. **Budgets and pins come from spec §9's V2 table as amended by Task 3 step 0 (the 5 mHa re-measurement; F7).** The 1e-3 counts and D§6's F/TS values are stale and are not used.
     - `fd_converges_default_policy_stallers`: H₄ rhombus, lopsided tetra, H₄ seed 1, H₅ seed 3, H₈ seed 8, each within its amended budget.
-    - `fd_converges_all_electron_failures`: H₅ ring (radius 1.531, xy plane), H₆ seed 5, H₂O + 2 H, lopsided tetra, each within its amended budget.
+    - `fd_converges_all_electron_failures`: H₅ ring (radius 1.531, xy plane), H₆ seed 5, lopsided tetra, each within its amended budget.
+    - `fd_converges_all_electron_h2o_plus_2h`: H₂O + 2 H alone (434 s of GPU at 5 mHa in A1), run as its own GPU batch (never in the same `cargo test` invocation as the other GPU cases, with the cool-down between); it logs the extra (witness) vectors each channel grows. Same budget and pins as the table.
     - Each case: converged, no stall stop and no cap; |F − F_pin| ≤ 1e-5 and |TS − TS_pin| ≤ 1e-5 against the amended table. The seeded geometries are reduced from the prototype's generators (`smearing-prototype`).
     - `fd_controls_keep_their_energies`: H₂ within 2e-6 and H₂O within 6e-6 of their amended-table values.
     - A mismatch is investigated, never re-pinned blindly.
@@ -638,7 +640,10 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
 **Interfaces:**
 - Consumes: Task 6's `v3_h4()`; Task 3's NVE case.
 
-- [ ] **Step 1: Pre-register the NVE bounds.** Write the drift and fluctuation bounds for Task 3's trajectory into references.md before the test exists, derived by `nve_energy_drift_is_bounded`'s own method. They are never scaled per atom.
+- [ ] **Step 1: Time the case and pre-register the NVE bounds.** Task 3's case is CO₂⁺ (spec §9 V5 2, amended): 71³ × 0.20, C on a grid node, β = 70° at R = 2.226, at rest, dt = 0.25 fs.
+  - First time a few warm MD steps (the per-step cost at 71³ was not measured in A1) and measure the path scatter σ_path of F for this system under the 1e-5 partial-level stop (warm vs cold at the start geometry).
+  - Steps: ≥ 2 bend periods (≈ 600 steps; 300 steps = 0.075 ps cannot resolve drift at `DRIFT_BOUND` 2e-4 Ha/ps against the Verlet swing). If 600 steps exceed one 15-min GPU batch, split the run into checkpointed batches.
+  - Then write the drift and fluctuation bounds (fluctuation 3 × (h²/4·E_mode + 2σ_path), h²/4·E_mode = 1.4e-5 Ha) into references.md before the test exists, derived by `nve_energy_drift_is_bounded`'s own method. They are never scaled per atom.
 - [ ] **Step 2: Write the tests.**
   - `work_integral_matches_free_energy_change` [MUST-6]. CPU f64, `v3_h4()`, tol = eig_tol = 1e-9.
     - Move the chosen atom 0.2 Bohr along its axis across the TS swing: 41 points.
@@ -646,7 +651,7 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
     - σ_E and σ_F come from warm vs cold solves at the start point.
     - bound = |W₄₀ − W₂₀|/15 + 3·(0.2·σ_F + √2·σ_E).
     - Assert `(ΔF + W₄₀).abs() <= bound` and `(ΔE + W₄₀).abs() >= 5.0 * bound`.
-  - `fd_nve_conserves_f_plus_k_through_the_ts_swing`: Task 3's case, molecule, box, bend, dt and steps.
+  - `fd_nve_conserves_f_plus_k_through_the_ts_swing`: Task 3's case (CO₂⁺, box, bend, dt) with Step 1's step count (≥ 2 bend periods).
     - F + K stays within the Step 1 bounds;
     - max TS − min TS ≥ 1e-3 Ha along the run;
     - the face density stays ≤ `box_affected_face_density(h)` throughout.

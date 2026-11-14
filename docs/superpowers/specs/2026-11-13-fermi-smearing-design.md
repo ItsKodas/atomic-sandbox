@@ -1069,23 +1069,28 @@ on. Every case converged without the stall stop or the cap. The 1e-3 counts and 
 
 | policy | case | measured at 5 mHa (iterations) | budget | F (Ha) | TS (Ha) |
 |---|---|---|---|---|---|
-| default | H₄ rhombus | 12 | ≤ 20 | −2.079322 | 2.67e-5 |
-| default | H₄ lopsided tetra | 16 | ≤ 25 | −1.943830 | 1.39e-2 |
-| default | H₄ seed 1 | 13 | ≤ 20 | −2.078602 | 2.08e-3 |
-| default | H₅ seed 3 | 15 | ≤ 25 | −2.564249 | 3.01e-3 |
-| default | H₈ seed 8 | 14 | ≤ 25 | −4.220394 | 1.63e-4 |
-| `ionic none` | H₅ ring (radius 1.531, xy plane, vertex phase as the harness builds it) | 11 | ≤ 20 | −2.470682 | 6.93e-3 (= 2 kT ln 2) |
-| `ionic none` | H₆ seed 5 | 15 | ≤ 25 | −2.973255 | 9.71e-3 |
-| `ionic none` | H₂O + 2 H | 33 | ≤ 50 | −47.350019 | 1.32e-2 |
-| `ionic none` | lopsided tetra | 15 | ≤ 25 | −1.824952 | 1.40e-2 |
+| default | H₄ rhombus | 12 | ≤ 20 | −2.079322 | 0.000027 |
+| default | H₄ lopsided tetra | 16 | ≤ 25 | −1.943830 | 0.013889 |
+| default | H₄ seed 1 | 13 | ≤ 20 | −2.078602 | 0.002076 |
+| default | H₅ seed 3 | 15 | ≤ 25 | −2.564249 | 0.003006 |
+| default | H₈ seed 8 | 14 | ≤ 25 | −4.220394 | 0.000163 |
+| `ionic none` | H₅ ring (radius 1.531, xy plane, vertex phase as the harness builds it) | 11 | ≤ 20 | −2.470682 | 0.006932 (= 2 kT ln 2) |
+| `ionic none` | H₆ seed 5 | 15 | ≤ 25 | −2.973255 | 0.009715 |
+| `ionic none` | H₂O + 2 H (its own test function, section below) | 33 | ≤ 50 | −47.350019 | 0.013163 |
+| `ionic none` | lopsided tetra | 15 | ≤ 25 | −1.824952 | 0.013978 |
 
-(`ionic none` runs with the witness configuration, `DegenerateShells` + FD, as production will.)
+(`ionic none` runs with the witness configuration, `DegenerateShells` + FD, as production will. TS is E − F of the
+printed six-decimal E and F, so it carries ±1e-6 of rounding. The two lopsided tetrahedra exceed 4 kT ln 2 =
+0.013863, the most one pinned pair per channel can give: a third level lies near μ.)
 
 - Each case must **converge** (no stall stop, no cap) within its budget, ⌈1.5 × the measured count⌉ rounded up to a
   multiple of 5 (the "about 1.5×" rule, unchanged).
 - **F and TS** must match the table within 1e-5 Ha (the values are printed to 6 decimals, a ±5e-7 rounding inside
   that tolerance).
   - Production runs the prototype's witness rule (section 4.2), so this comparison is like with like.
+- **All-electron H₂O + 2 H is its own test function** (review fix round 1): it costs 434 s of GPU at 5 mHa
+  (13 s per iteration), so it runs as a separate GPU batch from the other cases, and it logs the extra (witness)
+  vectors each channel grows, so that its cost can be explained.
 - A mismatch is investigated, never re-pinned blindly. Once checked, the pins are the production values.
 - **The controls** [SHOULD-6]: H₂ and H₂O must keep the D§6 energies within 3 × max(achieved, path scatter): H₂ 2e-6 Ha,
   H₂O 6e-6 Ha (the suite's rule). Production changes the block size (witnesses), and so the bits. At 5 mHa they are
@@ -1116,6 +1121,11 @@ on. Every case converged without the stall stop or the cap. The 1e-3 counts and 
   that δ resolves the TS swing. It is asserted only when |FD(δ) − HF| ≥ 1e-5 Ha/Bohr; below that the ratio is noise.
   - Near a pinned pair, F contains −kT ln(2 cosh(Δ/2kT)) per channel. Its third derivative scales as c³/(kT)², so a
     plain FD(0.01) can be off by ~2e-3, 20× the bound, on truncation alone.
+  - **[A1, review fix round 1] Pre-registered for the A1 candidate** (H₄ 1.8 × 1.95, measured F‴ ≈ 0.58 Ha/Bohr³ on the
+    GPU): the plain truncation e = F‴δ²/6 ≈ 1e-5 Ha/Bohr, so the δ-scaling check sits at its own 1e-5 gate. Task 6
+    records e (= FD_F(δ) − R_F(δ/2, δ)) and the offset b = HF − R_F(δ/2, δ) separately. With them the ratio is
+    (4e − b)/(e − b), which stays in [3, 5] only while |b| ≲ 3e-6 (for e ≈ 1e-5: −e/2 ≤ b ≤ e/4). **If |b| > 3e-6,
+    that is a spec decision for the user, never a re-pin** of the window or the gate.
 - **Must show both, on the Richardson value:**
   - |HF_x + dF/dx|_Rich ≤ 1e-4 Ha/Bohr (the "M7 forces" bound, which is defined on Richardson);
   - |HF_x + dE/dx|_Rich ≥ 5e-4 Ha/Bohr, so the test tells F's derivative from E's.
@@ -1138,13 +1148,21 @@ The two tests that replace it:
      |d(TS)/dx| ≥ 2 mHa/Bohr.
 2. **NVE** on a case whose released energy keeps h²/4·E_mode ≤ 1e-4 Ha, chosen by Task A1. For example, the bending
    vibration of a linear ²Π radical, started from a bend that splits the π pair by about 10 kT (re-review R-SHOULD-C); 50 mHa at kT = 5 mHa, so a larger bend than at 1e-3, which A1 checks against h²/4·E_mode [kT-5].
-   - **The proposed case is N₃**, all pseudo-N (N is accepted). It is linear with a ²Π_g ground state.
+   - **[A1, 2026-11-14] The case is CO₂⁺** (charge +1, auto doublet, `Accepted`: pseudised C and O), 71³ × 0.20.
+     N₃ was measured and failed: its ↓ π split peaks at 39 mHa (7.9 kT) near 60°, then the state changes (A1 note
+     §2.1). CO₂⁺ is linear ²Π_g (R_e = 2.225 Bohr, TS = 2 kT ln 2 within 1e-9), with k_β = 0.107 Ha/rad² and
+     ω_b = 2.335e-3 a.u.
+   - Start: C on a grid node, β = 70° (bond angle 110°) at R = 2.226, at rest. ↓ split 47.3 mHa (9.5 kT), ↑ gap
+     95 mHa, TS 0.514 mHa, so the swing is 6.4 mHa.
+   - dt = 0.25 fs: h_b = 0.024 with E_mode = 98.75 mHa, giving h²/4·E_mode = 1.4e-5 Ha. The stretch holds 5.8 mHa,
+     giving 5.6e-6. Face density ≤ 1.1e-6.
+   - Steps: ≥ 2 bend periods (≈ 600 steps; 300 steps = 0.075 ps cannot resolve drift at DRIFT_BOUND 2e-4 Ha/ps
+     against the Verlet swing). Task 11 times the per-step cost and measures the path scatter σ_path for this
+     system under the 1e-5 stop before fixing the count and the fluctuation bound 3 × (h²/4·E_mode + 2σ_path); if
+     600 steps exceed one 15-min GPU batch, split the run into checkpointed batches.
    - At linearity the π pair holds one hole, so TS = 2 kT ln 2 = 6.93 mHa at 5 mHa (1.39 at 1e-3). Bending splits the
      pair (∝ θ²), so the bend sweeps TS between 6.93 mHa and ≈ 0.
-   - The bend is soft (h ≈ ω_bend·dt ≈ 0.02) with a few mHa in it, so h²/4·E_mode ≲ 1e-6 Ha. Only the initial bend
-     energy is released, so nothing leaves the box.
-   - Task A1 confirms that LSDA keeps N₃ linear, with that ground state, on the pseudo surface at h_req. If it does not,
-     A1 substitutes another linear ²Π radical with the same properties.
+   - Only the initial bend energy is released, so nothing leaves the box.
    - **Withdrawn:** the earlier examples. A near-square H₄ at larger a still falls to 2 H₂, releasing ≈ 0.24 Ha
      (h²/4·E ≈ 2.6e-3 Ha). A stretched H₂ needs R ≳ 6–8 Bohr to bring its gap to a few kT, which does not fit the box
      under the face-density rule.
@@ -1232,7 +1250,8 @@ Model tags are per CLAUDE.md. All are dispatched on Opus, per the 2026-10-21 rul
    α = 0.1 and α = 0.05 broken-symmetry densities (SHOULD-2). A1 also:
    - chooses V3's aspect and checks its 4δ span;
    - chooses V5's NVE case (h²/4·E_mode ≤ 1e-4 Ha, the face density within the box rule). It confirms that LSDA keeps
-     N₃ linear with a ²Π_g ground state on the pseudo surface at h_req, or substitutes another linear ²Π radical;
+     N₃ linear with a ²Π_g ground state on the pseudo surface at h_req, or substitutes another linear ²Π radical
+     (A1 chose CO₂⁺; N₃ failed the split);
    - checks V3's plain-FD condition (|FD(δ) − FD(2δ)| ≤ 1e-3 Ha/Bohr);
    - measures the all-electron witness cost.
 
@@ -1400,8 +1419,7 @@ key.
     - a CPU work-integral oracle: Simpson over 40 steps on the V3 geometry, with
       |W + ΔF| ≤ |S₄₀ − S₂₀|/15 + 3(L·σ_F + √2·σ_E) (L = 0.2 Bohr; the units are corrected in the re-review), and
       |W + ΔE| ≥ 5× that;
-    - an NVE run on a low-release case chosen by A1, e.g. the Renner–Teller bend of linear ²Π N₃ (A1 confirms LSDA
-      keeps it linear, or substitutes another linear ²Π radical). The bounds are re-derived by the suite's own rule
+    - an NVE run on a low-release case chosen by A1, the Renner–Teller bend of linear ²Π_g CO₂⁺ (A1: N₃ failed the 10 kT split). The bounds are re-derived by the suite's own rule
       (never scaled per atom), and TS must swing ≥ 1 mHa along it. The near-square H₄ and stretched-H₂ examples are
       withdrawn.
 36. **Wording and documentation fixes:**
