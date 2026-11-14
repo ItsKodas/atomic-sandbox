@@ -302,7 +302,7 @@ impl SurrogateKs {
                 Q_HELD => SampleState::Quarantined,
                 Q_SUPERSEDED => SampleState::Superseded,
                 // forgotten by the user (spec R2): excluded and fencing, until Restore
-                Q_FORGOTTEN => SampleState::Forgotten,
+                Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => SampleState::Forgotten,
                 Q_BOX => SampleState::BoxExcluded,
                 Q_DRAFT => SampleState::HeldOut,
                 // lone atoms loaded from before the keep rule: held out for good

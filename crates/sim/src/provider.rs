@@ -1136,6 +1136,28 @@ pub trait Trainable {
     fn forgotten_samples(&self) -> Vec<SampleSuspect> {
         Vec::new()
     }
+    /// **Purges** every sample the user forgot, for good (the Model tab's "Purge forgotten (N)…"):
+    /// deleted from the model's samples and, when they are in the attached shared collection, from
+    /// its samples file (rewritten atomically, the old file kept as `samples.bin.bak`). Only
+    /// forgotten samples go — never held, superseded, box-affected or draft ones. The fit stands
+    /// unchanged (forgotten samples are already out of it): no refit. Sample ids are positional, so
+    /// every later sample is renumbered — a [`SampleId`] taken before the purge is refused after it.
+    /// `Err` with the reason, nothing changed ([`purge_refusal`](Self::purge_refusal)'s reasons, a
+    /// failed write). The default refuses.
+    fn purge_forgotten(&mut self) -> Result<PurgeReport, String> {
+        Err("this provider does not learn".into())
+    }
+    /// Why [`purge_forgotten`](Self::purge_forgotten) would be refused now (`None`: it may run):
+    /// nothing forgotten, a pass or a refit running, the refit after a Forget not run yet, another
+    /// copy of the app holding the collection's lock. The default: it does not learn.
+    fn purge_refusal(&self) -> Option<String> {
+        Some("this provider does not learn".into())
+    }
+    /// How many of the forgotten samples the attached shared collection holds (the rest are
+    /// session-only, or a model file's): the purge confirmation's words. The default: 0.
+    fn forgotten_in_collection(&self) -> usize {
+        0
+    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1352,6 +1374,23 @@ pub struct ImportSummary {
     pub notes: Vec<String>,
 }
 
+/// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PurgeReport {
+    /// Forgotten samples deleted in all.
+    pub purged: usize,
+    /// Of them, deleted from the shared collection's samples file.
+    pub from_collection: usize,
+    /// The collection's backup of its samples file as it was before (`None` without a collection
+    /// write).
+    pub backup: Option<std::path::PathBuf>,
+    /// A shared collection was attached (the rest were session-only samples), else a model file's.
+    pub collection_mode: bool,
+    /// The purge stands, but something after it went wrong (the collection could not be reopened
+    /// for appending: read-only until reopened).
+    pub warning: Option<String>,
+}
+
 /// A teach-around offer (`TrainableStatus::teach_offer`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeachOffer {
@@ -1394,6 +1433,10 @@ pub struct Readiness {
     /// composition survived into the fit that stands (box-excluded, quarantined …), in words —
     /// the model has not learned this scene, whatever the policy says about this one geometry.
     pub unlearned: Option<String>,
+    /// The refusal is the quarantine fence (`TeachRule::NearQuarantine`) of samples the user forgot
+    /// alone (no quarantined one among them): the Model tab says "near samples you forgot" and how
+    /// the fence lifts (2026-11-14).
+    pub forgotten_fence: bool,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class

@@ -68,6 +68,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_HELD) => "quarantined",
         Some(Q_SUPERSEDED) => "superseded",
         Some(Q_FORGOTTEN) => "forgotten (by the user)",
+        Some(Q_FORGOTTEN_UNFENCED) => "forgotten (by the user; fence lifted)",
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
@@ -150,12 +151,9 @@ impl SurrogateKs {
                 return v.reason;
             }
         }
-        if !self.near_quarantined_cached(pos, z).is_empty() {
-            return Some(Refusal::new(
-                format!("surrogate: within {:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)", QUARANTINE_FRACTION * self.policy.max_descriptor_distance),
-                TeachRule::NearQuarantine,
-                None,
-            ));
+        let near = self.near_quarantined_cached(pos, z);
+        if !near.is_empty() {
+            return Some(Refusal::new(self.fence_refusal_text(&near), TeachRule::NearQuarantine, None));
         }
         if let Some(r) = self.near_misfit_refusal(pos, z) {
             return Some(r);
@@ -182,13 +180,14 @@ impl SurrogateKs {
                 atom: None,
                 text: "a capped segment teaches its interior atoms — the model does not answer here".into(),
                 unlearned: None,
+                forgotten_fence: false,
             });
         }
         // rule 0b: strict mode answers lone atoms from the references, whatever the trust; a lone
         // scene it declines is the teacher's once rules 1–4 pass (review I1)
         let lone = self.lone_reference(scene, &prov);
         if let Lone::Answer { .. } = lone {
-            return Some(Readiness { answers: true, rule: None, atom: None, text: "lone atoms: answered from the atom references".into(), unlearned: None });
+            return Some(Readiness { answers: true, rule: None, atom: None, text: "lone atoms: answered from the atom references".into(), unlearned: None, forgotten_fence: false });
         }
         let key = self.verdict_key();
         let refusal = match &self.strict_verdict {
@@ -206,7 +205,7 @@ impl SurrogateKs {
             format!("this scene is not learned — {}", c.words().unwrap_or_default())
         });
         Some(match refusal {
-            None => Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned },
+            None => Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned, forgotten_fence: false },
             Some(r) => {
                 let mut text = match r.text.strip_prefix("surrogate: ") {
                     Some(t) => t.to_string(),
@@ -222,7 +221,8 @@ impl SurrogateKs {
                         None => format!("{name} untrusted (everywhere) — {text}"),
                     };
                 }
-                Readiness { answers: false, rule: Some(r.rule), atom: r.atom, text, unlearned }
+                let forgotten_fence = r.rule == TeachRule::NearQuarantine && self.fence_is_forgotten(&self.near_quarantined_cached(&pos, &z));
+                Readiness { answers: false, rule: Some(r.rule), atom: r.atom, text, unlearned, forgotten_fence }
             }
         })
     }

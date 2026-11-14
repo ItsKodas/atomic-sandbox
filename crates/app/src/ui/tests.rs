@@ -155,7 +155,7 @@ pub(crate) fn model() -> ModelStatus {
         teacher: "GpuKs",
         fitted: true,
         trusted: true,
-        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
+        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false }),
         teach_offer: None,
         untrusted_reason: None,
         samples: 273,
@@ -213,6 +213,9 @@ pub(crate) fn model() -> ModelStatus {
         lone_note: None,
         collections: false,
         last_import: None,
+        purge_refusal: None,
+        forgotten_in_collection: 0,
+        last_purge: None,
         use_collection: false,
         source_is_autosave: false,
         specialised: Vec::new(),
@@ -1327,6 +1330,138 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
         assert!(t.contains(why), "{why}: {t}");
         assert!(!t.contains("#1804"), "{t}");
     }
+}
+
+/// 2026-11-14: "Purge forgotten (N)…" in the forgotten list's header — hidden with nothing
+/// forgotten; a click opens the inline confirmation (nothing sent); Cancel closes it and sends
+/// nothing; Purge sends exactly `Command::PurgeForgotten`, recorded as `# not replayable:
+/// purge-forgotten` (a replay skips it); disabled with the provider's reason or during a pass; the
+/// outcome goes to the status line once.
+#[test]
+fn purge_forgotten_needs_its_inline_confirmation() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let base = ModelStatus { suspects: vec![suspect(1804, "HO", "fallback", Some(38.46))], ..model() };
+    let shared = sim::ModelSource::Collection { slug: "lsda_h0.15".into(), samples: 1805, read_only: false };
+    let with = ModelStatus { forgotten_samples: vec![suspect(40, "H2", "audit", None), suspect(41, "H2", "audit", None)], forgotten: 2, forgotten_in_collection: 2, source: shared, ..base.clone() };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let reveal = |st: &mut UiState, inp: &PanelInput<'_>| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, inp, 1400.0, vec![]);
+        }
+    };
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let acted = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.actions.clone()).collect::<Vec<_>>();
+    // nothing forgotten: no button
+    let snap = snapshot(&scene, Backend::Estimated, Some(base.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    assert!(!texts(&ctx, &mut st, &inp).contains("Purge forgotten"), "hidden at N = 0");
+    // two forgotten: the button; its click only opens the confirmation
+    let snap = snapshot(&scene, Backend::Estimated, Some(with.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Purge forgotten (2)…"), "{t}");
+    let confirm = super::dock::model::purge_confirm_text(2, 2, true);
+    assert!(confirm.starts_with("Delete 2 forgotten samples from the shared collection for good?") && confirm.contains("samples.bin.bak (replacing an older backup)") && confirm.ends_with("This can't be undone from the app."), "{confirm}");
+    // review findings 4–5 ("purge lifts, warn") and the minor on wording by where the samples are
+    assert!(confirm.contains("Geometries near them will no longer fall back to DFT; if they were bad data, keep them forgotten instead."), "{confirm}");
+    let file = super::dock::model::purge_confirm_text(1, 0, false);
+    assert!(file.starts_with("Delete 1 forgotten sample from this model for good? Save model then writes the model file without it.") && !file.contains("shared collection") && !file.contains("samples.bin.bak"), "{file}");
+    let session = super::dock::model::purge_confirm_text(3, 0, true);
+    assert!(session.starts_with("Delete 3 forgotten session-only samples for good (the shared collection doesn't hold them)?") && !session.contains("samples.bin.bak"), "{session}");
+    let mixed = super::dock::model::purge_confirm_text(3, 2, true);
+    assert!(mixed.starts_with("Delete 3 forgotten samples for good — 2 from the shared collection, 1 session-only?") && mixed.contains("samples.bin.bak"), "{mixed}");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "the first click sends nothing");
+    assert!(st.purge_confirm);
+    assert!(texts(&ctx, &mut st, &inp).contains(&confirm[..60]), "the confirmation shows");
+    // Cancel: nothing sent, the confirmation closes
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-cancel");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "Cancel sends nothing");
+    assert!(!st.purge_confirm);
+    assert!(!texts(&ctx, &mut st, &inp).contains(&confirm[..60]));
+    // Purge: exactly the command
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-confirm");
+    assert!(matches!(sent(&outs).as_slice(), [Command::PurgeForgotten(2)]), "{:?}", sent(&outs));
+    assert!(matches!(acted(&outs).as_slice(), [Action::PurgeForgotten(2)]), "the confirmed count");
+    assert!(!st.purge_confirm);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::PurgeForgotten(2)), Some("purge-forgotten"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::PurgeForgotten(2)));
+    assert!(line.starts_with("# not replayable: purge-forgotten"), "{line}");
+    assert!(!crate::replay::is_harmless("purge-forgotten"), "a replay refuses it, like Forget (the fences change)");
+    // a refusal that appears while the confirmation is open disables its Purge
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(st.purge_confirm);
+    let busy = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap_busy = snapshot(&scene, Backend::Estimated, Some(busy));
+    let inp_busy = input(&scene, Some(&snap_busy), &cam);
+    let outs = click_widget(&ctx, &mut st, &inp_busy, "purge-confirm");
+    assert!(sent(&outs).is_empty(), "Purge is disabled while refused: {:?}", sent(&outs));
+    click_widget(&ctx, &mut st, &inp_busy, "purge-cancel");
+    assert!(!st.purge_confirm);
+    // disabled with the provider's reason: a click opens nothing
+    let refused = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(refused));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && !st.purge_confirm, "disabled");
+    // the outcome on the status line, once
+    // the status line by where the samples were
+    let line = |p: sim::PurgeReport| crate::sim::purge_line(&Ok(p));
+    assert_eq!(line(sim::PurgeReport { purged: 1, collection_mode: false, ..Default::default() }), "purged 1 forgotten sample from the model (Save model writes the model file without them)");
+    assert_eq!(line(sim::PurgeReport { purged: 2, collection_mode: true, ..Default::default() }), "purged 2 forgotten session-only samples");
+    assert_eq!(
+        line(sim::PurgeReport { purged: 3, from_collection: 2, collection_mode: true, backup: Some("x/samples.bin.bak".into()), warning: None }),
+        "purged 3 forgotten samples: 2 from the shared collection (backup: samples.bin.bak), 1 session-only"
+    );
+    let report = sim::PurgeReport { purged: 2, from_collection: 2, backup: Some(std::path::PathBuf::from("models/collections/x/samples.bin.bak")), collection_mode: true, warning: None };
+    let done = ModelStatus { forgotten_samples: Vec::new(), forgotten: 0, last_purge: Some((1, Ok(report))), ..base.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(done));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "purged 2 forgotten samples (backup: samples.bin.bak)");
+    st.set_status("something else");
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "something else", "shown once");
+    let failed = ModelStatus { last_purge: Some((2, Err(surrogate_refusal()))), ..base };
+    let snap = snapshot(&scene, Backend::Estimated, Some(failed));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, format!("purge forgotten samples refused: {}", surrogate_refusal()));
+}
+
+fn surrogate_refusal() -> String {
+    "another copy of the app has this collection open — close it first".into()
 }
 
 /// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
@@ -2868,6 +3003,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
         atom: None,
         text: "this kind of environment isn't learned well enough yet (many-body: LOO force error 12.0× the bound, RMS 0.10×, 587 samples) — worst leave-one-out sample #345".into(),
         unlearned: None,
+        forgotten_fence: false,
     };
     let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
     let t = trust(Some(&m), &scene, &st);
@@ -2883,7 +3019,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
     let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
     assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");
     // the scene's own pass is not in the fit: "not this scene", even where the policy answers
-    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()) };
+    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()), forgotten_fence: false };
     let t = trust(Some(&ModelStatus { readiness: Some(unlearned), quarantined: 0, ..model() }), &scene, &st);
     assert_eq!(t.kind, TrustKind::NotHere);
     assert!(t.text.starts_with("not this scene — this scene is not learned"), "{}", t.text);
@@ -10675,6 +10811,7 @@ mod model_panel {
             atom: Some(1),
             text: "rule 4b: pair environment around S, with H not learned well enough yet (12 of 60 samples)".into(),
             unlearned: None,
+            forgotten_fence: false,
         };
         ModelStatus { class_loo: vec![pair], readiness: Some(readiness), ..model() }
     }
@@ -11275,12 +11412,62 @@ mod model_panel_misfit {
         sim::activity::TrustCheck { key: sim::activity::TrustKey::Misfit, met: true, value, limit: 27.1, worst: None }
     }
 
+    /// 2026-11-14: the verdict next to samples the user forgot names them and how the fence lifts;
+    /// a quarantined fence keeps its words; when the recent fallbacks were "not kept: box" the box
+    /// edge leads, whatever refused; the long text stays in the "why?".
+    #[test]
+    fn the_verdict_names_a_forgotten_fence_and_the_box_edge() {
+        use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+        let scene = Scene::preset("h2").unwrap();
+        let long = "within 0.30 training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once 3 fresh teacher answers in a row agree with it, or Restore the samples";
+        let fence = |forgotten: bool| sim::Readiness { answers: false, rule: Some(TeachRule::NearQuarantine), atom: None, text: long.into(), unlearned: None, forgotten_fence: forgotten };
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        let cam = camera();
+        let verdict_with = |st: &UiState, r: sim::Readiness, source: sim::Source| {
+            let m = ModelStatus { readiness: Some(r), ..model() };
+            let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+            snap.dynamics.source = source;
+            let inp = input(&scene, Some(&snap), &cam);
+            verdict(st, &inp)
+        };
+        let v = verdict_with(&st, fence(true), sim::Source::Fallback);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · near samples you forgot"));
+        assert_eq!(v.reason, "The model answers again once 3 fresh DFT answers here agree with it — or Restore the samples.");
+        assert!(v.tip.contains(long), "{v:?}");
+        let v = verdict_with(&st, fence(false), sim::Source::Fallback);
+        assert_eq!(v.headline, "Falling back to DFT here · near a quarantined sample", "only quarantined: today's words");
+        // the recent fallbacks touched the box edge
+        let push = |st: &mut UiState, outcome| {
+            let e = sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, outcome);
+            st.activity.rows.push_back(crate::ui::activity::LogRow { at: std::time::Duration::ZERO, event: e, near_face: true });
+        };
+        push(&mut st, TeachOutcome::Kept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(!crate::ui::dock::model::box_edge_fallbacks(&st), "a kept fallback among the last three");
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(crate::ui::dock::model::box_edge_fallbacks(&st));
+        for r in [fence(true), sim::Readiness { rule: Some(TeachRule::Spread), text: "variance".into(), ..fence(false) }] {
+            let v = verdict_with(&st, r, sim::Source::Fallback);
+            assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · touching the box edge"));
+            assert_eq!(v.reason, "The electron cloud reaches the grid's edge, so DFT answers here can't be learned. Move the molecule toward the centre or use a bigger grid.");
+        }
+        // trusted and answering here: the box words only while this step is DFT
+        let answers = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false };
+        assert_eq!(verdict_with(&st, answers.clone(), sim::Source::Surrogate).headline, "Model answering · trusted here");
+        assert_eq!(verdict_with(&st, answers, sim::Source::Fallback).headline, "Falling back to DFT here · touching the box edge");
+        // a newer fallback that was kept ends it
+        push(&mut st, TeachOutcome::Kept);
+        assert_eq!(verdict_with(&st, fence(true), sim::Source::Fallback).headline, "Falling back to DFT here · near samples you forgot");
+    }
+
     #[test]
     fn a_misfit_refusal_and_count_are_placed() {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let long = "rule misfit: atom 1 is next to training sample #350, which the model cannot reproduce";
-        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None };
+        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None, forgotten_fence: false };
         let m = ModelStatus { readiness: Some(readiness), trust_checks: vec![misfit_check(3.0)], body4_degree: Some(3), ..model() };
         let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
         snap.dynamics.source = sim::Source::Fallback;

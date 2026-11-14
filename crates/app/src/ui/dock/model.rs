@@ -226,6 +226,16 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
     if d.map(|d| d.source) == Some(Source::Reference) {
         return v(Tone::Good, "Atom references answering", "No atom has a neighbour within the model's cutoff: the isolated-atom references answer.", source_tip(Source::Reference).to_string());
     }
+    // the recent fallbacks here touch the box edge: their answers cannot be learned, whatever rule
+    // sent them to DFT — the cure is the box, so it leads (2026-11-14)
+    let falling_back = match t.kind {
+        TrustKind::NotHere | TrustKind::ClassUntrusted | TrustKind::Stuck => true,
+        TrustKind::Trusted | TrustKind::Quarantined => matches!(d.map(|d| d.source), Some(Source::Fallback | Source::Dft)),
+        TrustKind::Untrusted | TrustKind::NoModel => false,
+    };
+    if falling_back && box_edge_fallbacks(st) {
+        return Verdict { tone: Tone::Warn, headline: BOX_EDGE_HEADLINE.into(), reason: BOX_EDGE_REASON.into(), tip };
+    }
     match t.kind {
         TrustKind::Untrusted => {
             let reason = if crate::sim::box_blocks_trust(m).is_some() {
@@ -238,7 +248,7 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
         TrustKind::Stuck => v(Tone::Warn, "Falling back to DFT here", "Trusted, but it has not answered at this geometry for a while.", tip),
         TrustKind::NotHere | TrustKind::ClassUntrusted if near(m).is_some() => {
             let (headline, reason) = near(m).unwrap_or_default();
-            Verdict { tone: Tone::Warn, headline: headline.into(), reason: reason.into(), tip }
+            Verdict { tone: Tone::Warn, headline, reason, tip }
         }
         TrustKind::NotHere | TrustKind::ClassUntrusted => {
             let reason = if !here.is_empty() {
@@ -266,16 +276,50 @@ pub fn verdict(st: &UiState, input: &PanelInput<'_>) -> Verdict {
     }
 }
 
+/// The verdict's headline when the recent fallbacks here touched the box edge (2026-11-14).
+pub const BOX_EDGE_HEADLINE: &str = "Falling back to DFT here · touching the box edge";
+/// Its reason.
+pub const BOX_EDGE_REASON: &str = "The electron cloud reaches the grid's edge, so DFT answers here can't be learned. Move the molecule toward the centre or use a bigger grid.";
+/// The verdict's headline next to samples the user forgot (2026-11-14).
+pub const FORGOTTEN_FENCE_HEADLINE: &str = "Falling back to DFT here · near samples you forgot";
+
+/// The reason next to samples the user forgot: how the fence lifts.
+pub fn forgotten_fence_reason() -> String {
+    format!("The model answers again once {} fresh DFT answers here agree with it — or Restore the samples.", providers::surrogate::FENCE_VOTES)
+}
+
+/// The fallbacks this many back the box-edge verdict reads (the newest first).
+const BOX_EDGE_RECENT: usize = 3;
+
+/// Whether the recent fallbacks here are "not kept: box" (`TeachOutcome::BoxNotKept`: the teacher's
+/// face density above the box rule): the newest solve-log row is a fallback, and it and every
+/// other fallback among the last [`BOX_EDGE_RECENT`] were not kept for the box. Read from the
+/// Activity log the panel already holds.
+pub fn box_edge_fallbacks(st: &UiState) -> bool {
+    use sim::activity::{TeachOrigin, TeachOutcome};
+    let Some(newest) = st.activity.rows.back() else { return false };
+    if newest.event.origin != TeachOrigin::Fallback {
+        return false;
+    }
+    st.activity.rows.iter().rev().filter(|r| r.event.origin == TeachOrigin::Fallback).take(BOX_EDGE_RECENT).all(|r| r.event.outcome == TeachOutcome::BoxNotKept)
+}
+
 /// A local refusal next to a sample the fit does not stand on (open-shell trust, spec 2026-11-13
 /// §4.3): the strict policy refuses here by the misfit fence (`NearMisfit`) or the quarantine
-/// fence (`NearQuarantine`) — the headline and the short reason.
-fn near(m: &ModelStatus) -> Option<(&'static str, &'static str)> {
+/// fence (`NearQuarantine`; next to forgotten samples alone, its own words — 2026-11-14) — the
+/// headline and the short reason.
+fn near(m: &ModelStatus) -> Option<(String, String)> {
     let r = m.readiness.as_ref().filter(|r| !r.answers)?;
     match r.rule? {
-        sim::activity::TeachRule::NearMisfit => {
-            Some(("Falling back to DFT here · near a misfit", "This geometry is next to a training sample the model can't reproduce: DFT answers here."))
-        }
-        sim::activity::TeachRule::NearQuarantine => Some(("Falling back to DFT here · near a quarantined sample", "This geometry is next to one the model could not learn: DFT answers here.")),
+        sim::activity::TeachRule::NearMisfit => Some((
+            "Falling back to DFT here · near a misfit".into(),
+            "This geometry is next to a training sample the model can't reproduce: DFT answers here.".into(),
+        )),
+        sim::activity::TeachRule::NearQuarantine if r.forgotten_fence => Some((FORGOTTEN_FENCE_HEADLINE.into(), forgotten_fence_reason())),
+        sim::activity::TeachRule::NearQuarantine => Some((
+            "Falling back to DFT here · near a quarantined sample".into(),
+            "This geometry is next to one the model could not learn: DFT answers here.".into(),
+        )),
         _ => None,
     }
 }
@@ -508,7 +552,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     // spec 2026-11-12 R2: the fit's worst-fitting samples, each with Forget; the forgotten ones with Restore
     fold(ui, st, Section::Suspects, "Worst-fitting samples", worst, None, |ui, st| {
-        super::group(ui, st, "d-suspects", |ui, _| suspects(ui, m, acts));
+        super::group(ui, st, "d-suspects", |ui, st| suspects(ui, st, m, sampling, acts));
     });
     let details_summary = m.map(|m| (format!("epoch {} · {} samples", m.epoch, m.samples), theme::INK_DIM));
     fold(ui, st, Section::Details, "Details", details_summary, None, |ui, st| details(ui, st, input, m, d, sampling));
@@ -1056,11 +1100,34 @@ pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the n
 /// The hover of a row's Forget.
 const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it";
 
+/// "Purge forgotten (N)…"'s inline confirmation (2026-11-14), worded by where the `n` forgotten
+/// samples are: `in_collection` of them in the shared collection (the rest session-only), or — with
+/// `collection` false — a model file's. Purged samples stop fencing (the user's decision "purge
+/// lifts, warn"): the text says so.
+pub fn purge_confirm_text(n: usize, in_collection: usize, collection: bool) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    let them = if n == 1 { "it" } else { "them" };
+    let head = match (collection, in_collection) {
+        (true, k) if k == n => format!("Delete {n} forgotten sample{s} from the shared collection for good?"),
+        (true, 0) => format!("Delete {n} forgotten session-only sample{s} for good (the shared collection doesn't hold {them})?"),
+        (true, k) => format!("Delete {n} forgotten sample{s} for good — {k} from the shared collection, {} session-only?", n - k),
+        (false, _) => format!("Delete {n} forgotten sample{s} from this model for good? Save model then writes the model file without {them}."),
+    };
+    let backup = if collection && in_collection > 0 { " A backup of the collection's samples file is kept as samples.bin.bak (replacing an older backup)." } else { "" };
+    format!("{head} Geometries near {them} will no longer fall back to DFT; if {} bad data, keep {them} forgotten instead.{backup} This can't be undone from the app.", if n == 1 { "it was" } else { "they were" })
+}
+/// The hover of "Purge forgotten (N)…".
+const PURGE_TIP: &str = "delete the forgotten samples for good — from the shared collection's samples file too (its old file is kept as samples.bin.bak), or, with a model file, from the model (Save model then writes it without them). Only the samples you forgot: held, superseded, box-affected and draft samples stay. The fit is unchanged — they are already out of it — and later samples are renumbered. Purged samples no longer fence: geometries near them stop falling back to DFT, and they stop counting against the 10 % the trust recovery may hold out";
+
 /// The "Worst-fitting samples" section's body (spec R2): the fit's worst samples by their
 /// leave-one-out ratio (`ModelStatus::suspects`), each with **Forget** (`Action::ForgetSample`),
 /// the caption, and the forgotten samples, each with **Restore** (`Action::RestoreSample`); with no
-/// model, or no ranking yet, it says why.
-pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
+/// model, or no ranking yet, it says why. The forgotten list's header carries **Purge forgotten
+/// (N)…** (2026-11-14; hidden with none forgotten, disabled with the reason during a pass or a
+/// refit or when the provider refuses — `ModelStatus::purge_refusal`): it opens an inline
+/// confirmation whose **Purge** emits `Action::PurgeForgotten(n)` (disabled if a refusal appears
+/// while it is open; the worker refuses when the count changed) and whose **Cancel** emits nothing.
+pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: bool, acts: &mut Vec<Action>) {
     match m {
         None => {
             ui.weak(SUSPECTS_NO_MODEL);
@@ -1085,9 +1152,53 @@ pub fn suspects(ui: &mut Ui, m: Option<&ModelStatus>, acts: &mut Vec<Action>) {
             ui.label(RichText::new(SUSPECTS_CAPTION).size(11.0).color(theme::INK_DIM));
         }
     }
-    let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else { return };
+    let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else {
+        st.purge_confirm = false;
+        return;
+    };
+    let n = m.forgotten_samples.len();
+    let why = if sampling { Some("a sampling pass is running — purge once it is done") } else { m.purge_refusal.as_deref() };
     ui.add_space(4.0);
-    ui.label(RichText::new(format!("forgotten ({}): held out of the fit until restored", m.forgotten_samples.len())).size(11.5));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("forgotten ({n}): held out of the fit until restored")).size(11.5));
+        let b = egui::Button::new(RichText::new(format!("Purge forgotten ({n})…")).color(theme::DANGER_INK));
+        let r = super::super::probed("purge-forgotten", ui.add_enabled(why.is_none() && !st.purge_confirm, b)).on_hover_text(PURGE_TIP);
+        let r = match why {
+            Some(w) => r.on_disabled_hover_text(w),
+            None => r,
+        };
+        if r.clicked() {
+            st.purge_confirm = true;
+        }
+    });
+    if st.purge_confirm {
+        egui::Frame::new()
+            .fill(RED.gamma_multiply(0.08))
+            .stroke(egui::Stroke::new(1.0, RED.gamma_multiply(0.6)))
+            .corner_radius(7)
+            .inner_margin(egui::Margin::symmetric(9, 7))
+            .show(ui, |ui| {
+                let collection = matches!(m.source, sim::ModelSource::Collection { .. });
+                ui.label(RichText::new(purge_confirm_text(n, m.forgotten_in_collection, collection)).size(11.5));
+                ui.horizontal(|ui| {
+                    // a refusal that appears while the confirmation is open disables Purge (with why)
+                    let purge = egui::Button::new(RichText::new("Purge").strong().color(Color32::WHITE)).fill(RED.gamma_multiply(0.8));
+                    let r = super::super::probed("purge-confirm", ui.add_enabled(why.is_none(), purge));
+                    let r = match why {
+                        Some(w) => r.on_disabled_hover_text(w),
+                        None => r,
+                    };
+                    if r.clicked() {
+                        // the count confirmed: the worker refuses if the list changed meanwhile
+                        acts.push(Action::PurgeForgotten(n));
+                        st.purge_confirm = false;
+                    }
+                    if super::super::probed("purge-cancel", ui.button("Cancel")).clicked() {
+                        st.purge_confirm = false;
+                    }
+                });
+            });
+    }
     for s in &m.forgotten_samples {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));

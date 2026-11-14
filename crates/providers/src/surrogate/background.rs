@@ -447,6 +447,7 @@ impl SurrogateKs {
             *e = (*e).max(v);
         }
         self.fence_votes.clear();
+        self.lift_votes.clear();
         // the refit's notes after the live ones
         self.user_notes.extend(std::mem::take(&mut f.user_notes));
         // what `fit_store` and `refit` do once the fit stands

@@ -1884,8 +1884,9 @@ impl SurrogateKs {
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;
-        // the votes disagreed with the previous model
+        // the votes disagreed (or agreed) with the previous model
         self.fence_votes.clear();
+        self.lift_votes.clear();
         Ok(report)
     }
 

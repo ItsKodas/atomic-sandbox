@@ -79,6 +79,11 @@ pub(super) const Q_DRAFT: u8 = surrogate::quarantine::Q_DRAFT;
 /// clears it), counted with the held samples against [`QUARANTINE_MAX_FRACTION`].
 pub(super) const Q_FORGOTTEN: u8 = surrogate::quarantine::Q_FORGOTTEN;
 
+/// A forgotten sample whose fence was lifted ([`surrogate::quarantine::Q_FORGOTTEN_UNFENCED`];
+/// `surrogate` module doc, "Lifting a forgotten sample's fence"): still forgotten — excluded, never
+/// released or superseded, restorable, purgeable — but no longer fencing.
+pub(super) const Q_FORGOTTEN_UNFENCED: u8 = surrogate::quarantine::Q_FORGOTTEN_UNFENCED;
+
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
 
@@ -423,7 +428,13 @@ impl SurrogateKs {
     /// Samples the user forgot ([`Q_FORGOTTEN`], spec R2): excluded from the fit and fencing like
     /// the quarantined ones, never released; the Model tab's "N forgotten".
     pub fn forgotten(&self) -> usize {
-        self.quarantine.iter().filter(|&&q| q == Q_FORGOTTEN).count()
+        self.quarantine.iter().filter(|&&q| q == Q_FORGOTTEN || q == Q_FORGOTTEN_UNFENCED).count()
+    }
+
+    /// Of the [`forgotten`](Self::forgotten) samples, those whose fence was lifted
+    /// ([`Q_FORGOTTEN_UNFENCED`]).
+    pub fn forgotten_unfenced(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_FORGOTTEN_UNFENCED).count()
     }
 
     /// Of the [`forgotten`](Self::forgotten) samples, those the standing fit still holds (forgotten
@@ -435,13 +446,37 @@ impl SurrogateKs {
 
     /// Whether stored sample `i` was forgotten by the user ([`Q_FORGOTTEN`]).
     pub fn is_forgotten(&self, i: usize) -> bool {
-        self.quarantine.get(i) == Some(&Q_FORGOTTEN)
+        matches!(self.quarantine.get(i), Some(&Q_FORGOTTEN) | Some(&Q_FORGOTTEN_UNFENCED))
     }
 
     /// Whether stored sample `i` fences its neighbourhood (geometries within the quarantine radius
     /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample.
     pub(super) fn fences(&self, i: usize) -> bool {
         matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_FORGOTTEN))
+    }
+
+    /// Whether stored sample `i` is one of the standing fit's members (`fit_members`: below its
+    /// prefix and code 0 when that fit was installed) — a forgotten sample is, until the refit
+    /// after its Forget.
+    pub(super) fn in_standing_fit(&self, i: usize) -> bool {
+        i < self.fit_members.0 && self.fit_members.1.get(i).is_none_or(|&q| q == Q_NONE)
+    }
+
+    /// Whether the fence at a geometry is forgotten samples' alone (`near` = the fencing samples
+    /// near it, `near_quarantined`): the Model tab's "near samples you forgot".
+    pub(super) fn fence_is_forgotten(&self, near: &[usize]) -> bool {
+        !near.is_empty() && near.iter().all(|&i| self.quarantine.get(i) == Some(&Q_FORGOTTEN))
+    }
+
+    /// The quarantine fence's refusal text at a geometry fenced by `near` (rule "quarantine"): the
+    /// forgotten-only fence says how it lifts.
+    pub(super) fn fence_refusal_text(&self, near: &[usize]) -> String {
+        let d = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        if self.fence_is_forgotten(near) {
+            format!("surrogate: within {d:.2} training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once {FENCE_VOTES} fresh teacher answers in a row agree with it, or Restore the samples")
+        } else {
+            format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)")
+        }
     }
 
     /// How many stored samples fence ([`fences`](Self::fences)).
@@ -1312,6 +1347,8 @@ impl SurrogateKs {
             };
             let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
             if !agrees {
+                // a disagreeing answer ends a run of agreeing ones toward lifting a forgotten fence
+                self.lift_votes.clear();
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
                 // other but not with the model are evidence the model is wrong here
                 let n = pos.len();
@@ -1363,11 +1400,77 @@ impl SurrogateKs {
             // they stay forgotten — the answer is an ordinary agreeing one and goes to the
             // thinning and copy checks below (the caller thins and deduplicates a fence's
             // answers, `evaluate`'s `by_fence`), instead of a new sample at every step
-            if movable.is_empty() {
-                notes.push(format!(
-                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); the answer goes to its rule's thinning and copy checks"
-                ));
+            // a vote counts only when the model that agreed was fitted without every forgotten
+            // sample here (review Critical 1: a Forget sets the code at once, the refit runs later
+            // — a model still trained on the sample agrees next to it by construction)
+            let blocked = if !movable.is_empty() {
+                Some("a quarantined sample fences here too")
+            } else if self.pending_refit {
+                Some("a refit is due — the model that agreed may still hold them")
+            } else if self.background.is_some() {
+                Some("a refit is running")
+            } else if near.iter().any(|&i| self.in_standing_fit(i)) {
+                Some("the model that agreed was fitted with them — they leave it at the next refit")
             } else {
+                None
+            };
+            if let Some(why) = blocked {
+                // the run of agreeing answers must be consecutive: anything else starts it over
+                self.lift_votes.clear();
+                if movable.is_empty() {
+                    notes.push(format!(
+                        "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); no vote toward lifting their fence: {why}; the answer goes to its rule's thinning and copy checks"
+                    ));
+                }
+            } else {
+                // lifting the fence (`surrogate` module doc, "Lifting a forgotten sample's fence"):
+                // an agreeing vote; FENCE_VOTES consecutive, mutually consistent ones next to the
+                // same forgotten samples under one model lift the fence of the samples every one
+                // of them was next to, and keep the last answer
+                let n = pos.len();
+                let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
+                self.lift_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
+                if self.lift_votes.len() > FENCE_VOTES {
+                    self.lift_votes.remove(0);
+                }
+                let votes = &self.lift_votes;
+                // the forgotten samples every vote of the run was next to (review Important 2: the
+                // approved rule is "3 answers near it", so never one only a single vote was near)
+                let common: Vec<usize> = near.iter().copied().filter(|i| self.quarantine.get(*i) == Some(&Q_FORGOTTEN) && votes.iter().all(|v| v.near.contains(i))).collect();
+                let consistent = votes.len() == FENCE_VOTES
+                    && !common.is_empty()
+                    && votes.iter().all(|v| v.n == n && v.gen == self.model_gen)
+                    && votes.iter().enumerate().all(|(a, va)| votes[a + 1..].iter().all(|vb| votes_agree(&self.policy, va, vb)));
+                if consistent {
+                    let mut lift = common;
+                    lift.sort_unstable();
+                    lift.dedup();
+                    self.lift_votes.clear();
+                    let mut failed: Option<String> = None;
+                    for &i in &lift {
+                        self.quarantine[i] = Q_FORGOTTEN_UNFENCED;
+                        self.note_user_code(i, Q_FORGOTTEN_UNFENCED);
+                        if let Err(e) = self.write_status_now(i) {
+                            failed.get_or_insert(e);
+                        }
+                    }
+                    if let Some(e) = failed {
+                        self.note_write_failure(&e);
+                    }
+                    let k = lift.len();
+                    notes.push(format!(
+                        "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers near forgotten samples agree with the model: the fence of {k} forgotten sample{} is lifted (still forgotten and out of the fit — Restore brings {} back); the model answers here again",
+                        if k == 1 { "" } else { "s" },
+                        if k == 1 { "it" } else { "them" }
+                    ));
+                    return yes(TeachOutcome::FenceLifted { lifted: k as u32 });
+                }
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near forgotten samples agrees with the model — {kept_forgotten} forgotten kept (only Restore brings a forgotten sample back); agreeing answer {} of {FENCE_VOTES} toward lifting their fence; the answer goes to its rule's thinning and copy checks",
+                    self.lift_votes.len()
+                ));
+            }
+            if !movable.is_empty() {
                 for i in movable {
                     let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
                     if self.reproduces_sample(&s) {
@@ -1532,7 +1635,7 @@ impl SurrogateKs {
         let n = self.samples();
         match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_NONE => {}
-            Q_FORGOTTEN => return Err(format!("sample #{i} is forgotten already")),
+            Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => return Err(format!("sample #{i} is forgotten already")),
             q => {
                 return Err(format!(
                     "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",

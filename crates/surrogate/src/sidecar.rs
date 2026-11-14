@@ -68,12 +68,14 @@
 //!
 //! | name | length | content |
 //! |---|---|---|
-//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded, 7 forgotten by the user (exact integral f64) |
+//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded, 7 forgotten by the user, 8 forgotten with its fence lifted (exact integral f64) |
 //!
 //! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
 //! file with nothing quarantined is written exactly as before. Code 7 (`crate::quarantine::Q_FORGOTTEN`,
 //! 2026-11-12) is new: a build before it refuses a file holding one ("sample_quarantine[i] = 7 is
-//! not 0, 1, 2 or 3"), and a file without one reads in either build as before.
+//! not 0, 1, 2 or 3"), and a file without one reads in either build as before. Code 8
+//! (`crate::quarantine::Q_FORGOTTEN_UNFENCED`, 2026-11-14: forgotten, its fence lifted) likewise: a
+//! build before it refuses a file holding one, and a file without one reads as "not lifted".
 //!
 //! **Optional, both versions** (Task 9 fix round 1, box-affected samples): when the writer marks
 //! any stored sample's teacher answer as box-affected, one more array follows (after
@@ -855,10 +857,10 @@ fn sample_arrays(samples: &[Sample]) -> io::Result<[Vec<f64>; 7]> {
     ])
 }
 
-/// The quarantine codes as array values (checked: 0 to 3, or 7 — `crate::quarantine::is_persisted_code`).
+/// The quarantine codes as array values (checked: 0 to 3, 7 or 8 — `crate::quarantine::is_persisted_code`).
 fn quarantine_values(quarantine: &[u8]) -> io::Result<Vec<f64>> {
     if let Some(&q) = quarantine.iter().find(|&&q| !crate::quarantine::is_persisted_code(q)) {
-        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2, 3 or 7)")));
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2, 3, 7 or 8)")));
     }
     Ok(quarantine.iter().map(|&q| q as f64).collect())
 }
@@ -1609,15 +1611,17 @@ fn read_arrays(bytes: &[u8], declared: &[(String, usize)], fixed: &[(&str, Optio
     Ok(arrays)
 }
 
-/// The `sample_quarantine` array's codes (each 0, 1, 2, 3 or 7 — 7 = forgotten by the user since
-/// 2026-11-12, `crate::quarantine::Q_FORGOTTEN`; a build before it refuses a file holding one).
+/// The `sample_quarantine` array's codes (each 0, 1, 2, 3, 7 or 8 — 7 = forgotten by the user since
+/// 2026-11-12, `crate::quarantine::Q_FORGOTTEN`; 8 = forgotten with its fence lifted since
+/// 2026-11-14, `crate::quarantine::Q_FORGOTTEN_UNFENCED`; a build before either refuses a file
+/// holding one).
 fn decode_quarantine(v: &[f64]) -> Result<Vec<u8>, String> {
     v.iter()
         .enumerate()
         .map(|(i, &q)| match q {
-            0.0 | 1.0 | 2.0 | 3.0 | 7.0 => Ok(q as u8),
-            _ if q.fract() == 0.0 && q > 3.0 && q < 256.0 => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3 or 7 (a code of a newer build?)")),
-            _ => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3 or 7")),
+            0.0 | 1.0 | 2.0 | 3.0 | 7.0 | 8.0 => Ok(q as u8),
+            _ if q.fract() == 0.0 && q > 3.0 && q < 256.0 => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3, 7 or 8 (a code of a newer build?)")),
+            _ => Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2, 3, 7 or 8")),
         })
         .collect()
 }
@@ -2591,16 +2595,17 @@ pub(crate) mod tests {
     }
 
     /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions; codes 0–3,
-    /// 3 = box-affected since Task 9 fix round 1, and 7 = forgotten by the user since 2026-11-12);
-    /// a file with nothing quarantined is byte-identical to the plain writer's and reads as empty
-    /// flags; a flag other than 0–3 or 7 is refused (on read, an integral one as a newer build's;
+    /// 3 = box-affected since Task 9 fix round 1, 7 = forgotten by the user since 2026-11-12, and 8 =
+    /// forgotten with its fence lifted since 2026-11-14); a file with nothing quarantined is
+    /// byte-identical to the plain writer's and reads as empty flags; a flag other than 0–3, 7 or 8
+    /// is refused (on read, an integral one as a newer build's;
     /// on write, the provider-only codes 4–6); a flag count that does not match is refused on write.
     #[test]
     fn quarantine_flags_round_trip_and_stay_optional() {
         for (seed, body3) in [(23u64, false), (29, true)] {
             let orig = random_sidecar(seed, body3);
-            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 7, 1, 0, 2, 3][i % 7]).collect();
-            assert!(flags.contains(&7), "the forgotten code is exercised");
+            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 7, 1, 0, 2, 3, 8][i % 8]).collect();
+            assert!(flags.contains(&7) && flags.contains(&8), "the forgotten codes are exercised");
             let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
             write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
             assert_eq!(read(&with).unwrap().quarantine, flags);
@@ -2617,10 +2622,10 @@ pub(crate) mod tests {
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err();
             assert!(e.to_string().contains("sample_quarantine"), "{e}");
-            bytes[at..at + 8].copy_from_slice(&8.0f64.to_le_bytes());
+            bytes[at..at + 8].copy_from_slice(&9.0f64.to_le_bytes());
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err().to_string();
-            assert!(e.contains("is not 0, 1, 2, 3 or 7 (a code of a newer build?)"), "{e}");
+            assert!(e.contains("is not 0, 1, 2, 3, 7 or 8 (a code of a newer build?)"), "{e}");
             for q in [4u8, 5, 6] {
                 let mut bad = flags.clone();
                 bad[0] = q;

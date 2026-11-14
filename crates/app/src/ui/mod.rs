@@ -742,6 +742,10 @@ pub struct UiState {
     pub plan: SamplingPlan,
     /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
     pub forget_armed: Option<Instant>,
+    /// "Purge forgotten (N)…" was clicked: its inline confirmation shows (Purge / Cancel).
+    pub purge_confirm: bool,
+    /// The number of the last purge outcome put on the status line (`ModelStatus::last_purge`).
+    pub purge_seen: u64,
     /// The first click on a sampling button whose pass would take longer than
     /// `sim::PASS_TARGET_S` (a second within [`FORGET_CONFIRM`] starts it: "Start anyway").
     pub start_armed: Option<Instant>,
@@ -1031,6 +1035,8 @@ impl UiState {
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
+            purge_confirm: false,
+            purge_seen: 0,
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
@@ -1384,6 +1390,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.compare.poll(input.snapshot);
     // an import of data folders (its own thread) reports when done
     poll_import(st);
+    poll_purge(st, input);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
     // the estimated solver's isolated-atom profiles: its box's R_cloud (`estimated_box`)
@@ -1447,6 +1454,15 @@ pub(crate) fn poll_import(st: &mut UiState) {
     st.set_status(line);
     // the File window shows what came in
     st.files.refresh_soon();
+}
+
+/// A purge's outcome (`ModelStatus::last_purge`) on the status line, once per purge.
+pub(crate) fn poll_purge(st: &mut UiState, input: &PanelInput<'_>) {
+    let Some((k, r)) = input.model().and_then(|m| m.last_purge.as_ref()) else { return };
+    if *k != st.purge_seen {
+        st.purge_seen = *k;
+        st.set_status(crate::sim::purge_line(r));
+    }
 }
 
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the

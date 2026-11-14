@@ -186,6 +186,15 @@ pub struct ModelStatus {
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
     pub last_import: Option<Result<sim::ImportSummary, String>>,
+    /// Why "Purge forgotten (N)…" is disabled now (`sim::Trainable::purge_refusal`), `None` when it
+    /// may run.
+    pub purge_refusal: Option<String>,
+    /// Of the forgotten samples, those the shared collection holds
+    /// (`sim::Trainable::forgotten_in_collection`): the confirmation's words.
+    pub forgotten_in_collection: usize,
+    /// The last [`Command::PurgeForgotten`]'s outcome with its number (each shown once on the
+    /// status line: [`purge_line`]).
+    pub last_purge: Option<(u64, Result<sim::PurgeReport, String>)>,
     /// The user's choice is the shared collection (a folder is set, and no model file was picked
     /// since): the Model tab's switch shows it, also while a charged scene learns per-scene.
     pub use_collection: bool,
@@ -588,6 +597,46 @@ impl Worker {
         self.dy.add_note(note);
     }
 
+    /// [`Command::PurgeForgotten`]: every forgotten sample deleted for good
+    /// (`Trainable::purge_forgotten`); no refit (the fit stands). The outcome is
+    /// `ModelStatus::last_purge`; the provider's note goes to the log.
+    pub(super) fn purge_forgotten(&mut self, confirmed: usize) {
+        let Some(t) = trainable(&mut self.dy) else {
+            self.error("purge forgotten samples: the estimated solver is not running".into());
+            return;
+        };
+        let now = t.forgotten_samples().len();
+        let r = if now != confirmed {
+            Err(format!("the forgotten list changed ({confirmed} confirmed, {now} now) — nothing purged; confirm again"))
+        } else {
+            t.purge_forgotten()
+        };
+        let slug = match t.model_source() {
+            sim::ModelSource::Collection { slug, .. } => Some(slug),
+            _ => None,
+        };
+        for n in t.take_notes() {
+            self.dy.add_note(n);
+        }
+        if let Ok(p) = &r {
+            // the model file in use no longer holds what is on disk: the autosave is this worker's
+            self.owns_autosave = true;
+            // an interrupted pass's checkpoint of this collection counts its samples file as it was
+            // (`checkpoint` module doc): discarded, never resumed against the renumbered file
+            if let (Some(ck), Some(slug), true) = (self.checkpoints.as_ref(), slug, p.from_collection > 0) {
+                let dir = ck.dir().to_path_buf();
+                if let Some((_, info)) = super::checkpoint::interrupted_pass(&dir) {
+                    if super::checkpoint::is_collection_checkpoint(&info) && info.provenance.starts_with(&format!("{}{slug}:", providers::surrogate::COLLECTION_CHECKPOINT_PREFIX)) {
+                        super::checkpoint::discard_interrupted_pass(&dir);
+                        self.dy.add_note("the interrupted training of this collection was discarded: the purge renumbered its samples, so it cannot resume".into());
+                    }
+                }
+            }
+        }
+        let k = self.last_purge.as_ref().map_or(1, |(k, _)| k + 1);
+        self.last_purge = Some((k, r));
+    }
+
     /// [`Command::SaveSpecialised`]: the attached collection's samples within `species` to `path`
     /// (`Trainable::save_specialised`); a note when written, an error when refused.
     pub(super) fn save_specialised(&mut self, path: &std::path::Path, species: &[u8]) {
@@ -780,6 +829,7 @@ impl Worker {
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
         let (collections, last_import, use_collection) = (self.collections.is_some(), self.last_import.clone(), self.use_collection && self.collections.is_some());
+        let last_purge = self.last_purge.clone();
         let autosave = self.autosave.clone();
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
@@ -843,6 +893,9 @@ impl Worker {
             lone_note: st.lone_note,
             collections,
             last_import,
+            purge_refusal: s.purge_refusal(),
+            forgotten_in_collection: s.forgotten_in_collection(),
+            last_purge,
             use_collection,
             source_is_autosave,
             specialised: s.specialised(),
@@ -910,5 +963,27 @@ mod fit_vs_held_tests {
             fit_vs_held(1698, 1805, 0, 105, 1, 2, 1, 0, 0, 0),
             "1698 of 1805 held: 105 quarantined, 1 superseded, 1 forgotten; 1 forgotten since this fit (out at the next refit)"
         );
+    }
+}
+
+/// The status line after a purge (`ModelStatus::last_purge`): "purged N forgotten samples (backup:
+/// samples.bin.bak)", or the refusal.
+pub fn purge_line(r: &Result<sim::PurgeReport, String>) -> String {
+    match r {
+        Ok(p) => {
+            let s = if p.purged == 1 { "" } else { "s" };
+            let name = |b: &std::path::Path| b.file_name().map_or_else(|| b.display().to_string(), |f| f.to_string_lossy().into_owned());
+            let line = match (&p.backup, p.collection_mode) {
+                (Some(b), _) if p.from_collection == p.purged => format!("purged {} forgotten sample{s} (backup: {})", p.purged, name(b)),
+                (Some(b), _) => format!("purged {} forgotten sample{s}: {} from the shared collection (backup: {}), {} session-only", p.purged, p.from_collection, name(b), p.purged - p.from_collection),
+                (None, true) => format!("purged {} forgotten session-only sample{s}", p.purged),
+                (None, false) => format!("purged {} forgotten sample{s} from the model (Save model writes the model file without them)", p.purged),
+            };
+            match &p.warning {
+                Some(w) => format!("{line} — but {w}"),
+                None => line,
+            }
+        }
+        Err(e) => format!("purge forgotten samples refused: {e}"),
     }
 }
