@@ -691,6 +691,51 @@ Measured before the spec: degree 3 fits the collection and releases 68 holds; de
 The trust baseline's cadence-50 hot run had risen against its Oct 21 record (worst 5.15× against 2.87×). Main gave the identical report on the same machine, so the rise is main's, not this branch's. It is an open item for main. The app suite first failed to compile: the merge had added a field that one of this branch's tests did not set.
 
 
+### The UI redesign, purge and a box that fits the cloud (Nov 14; branches `thermostat-bar`, `model-tab`, `orbitals-tab`, `purge-forgotten`, `estimated-box`)
+
+All of this came from the user's play-testing in one day. They saw the mockup of each panel inline in the chat and approved it before it was built.
+
+**The panels:**
+- **Model:** a verdict card, Teach next, Health, and folds for the rest. The bookkeeping (every old row) moved into Details.
+- **Activity:** a job card with a convergence plot. The plot has a fixed log scale and keeps the previous three solves as ghosts, so it no longer flashes. The card also has an iterations-per-sample strip, a session timeline with a failures lane, and a solve log that folds repeated rows.
+- **Orbitals:** an energy-level diagram, compact rows, and folds for box states and the honesty texts.
+- **Knowledge:** a summary chip, scene pair chips, and a pair card with a "now" marker and Teach this.
+- **View:** four looks, called Clean, Glow, Scientific and Present. Glow is the user's own style, saved.
+- **Readouts:** it absorbed the Graph tab. Its ΔE axis is in µHa, because the old graph scaled every curve to its own range and drew 1e-6 Ha noise as a full swing.
+- **Selection:** an atom card and one neighbours list that merges distances and bonds.
+- **Also new:** a Thermostat group in the bottom bar, keys 1–4 for the tools, and zoom and pan on the knowledge map.
+
+**What the user caught by eye:**
+- There was no right-hand padding.
+- Inside the new cards, slider rails and preset buttons were invisible, because the cards' fill matched the widget fill. The fix went into the shared card helper, with a contrast test.
+
+**What the reviews caught:**
+- A resize estimate was 31 pt off, because it didn't know the toolbar's new compact height.
+- The full toolbar drew its bottom 3 pt off-screen.
+
+**Purge and the fence lift:**
+- **The bug.** Forgotten samples fenced their geometries forever. Agreeing DFT answers there were thinned as "similar", so H₂ fell back on every step once the thermostat or a drag reached the fenced band, whatever the user trained.
+- **New rule.** A forgotten sample's fence now lifts after three consecutive fresh answers agree with a model fitted without it.
+- **Purge.** It deletes forgotten samples for good, with a one-file backup, under the collection lock, and the swap-in is crash-safe.
+- **The review found a Critical.** A lift could be voted by a model still trained on the forgotten sample, in the window before the refit. It also found:
+  - the lift used the union of the votes' fenced sets instead of their intersection;
+  - a post-rename error that left memory and disk out of step;
+  - a replay that treated purge as harmless.
+
+  All were fixed and re-reviewed.
+- **The user chose "purge lifts, warn".**
+- **Purging their 45 forgotten H₂ samples ended the fallbacks.** The user: "after purging it works amazing".
+
+**The estimated box:** H₂ in the 12 Bohr preset box was box-clean only when centred, because the H tail falls below the face rule only about 5 Bohr out. In Estimated mode the box is now extent + 2 × (cloud reach + 2 Bohr), with the reach taken from the app's own isolated-atom solve. H₂ gets 109³ instead of 81³, and a DFT step costs about 2.4× more.
+
+**Gate (Nov 14, merged tree):**
+- app: 736 passed out of 737.
+- One test hit its 120 s snapshot wait while the user's app shared the GPU. It passed alone.
+- `pause_and_cancel_abort_a_sampling_solve_promptly` failed twice under GPU sharing (Pause took 1.7 s against its bound). Alone it took 681 ms and passed.
+- purge: surrogate 99, providers 399, validate `--test surrogate` 7, all passing.
+
+**Paused once.** The user suspected their GPU was overheating. Everything was stopped, including a measurement script that kept relaunching itself. Since then GPU work has run one job at a time, in batches of 15 min at most, with cool-downs between them.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are
