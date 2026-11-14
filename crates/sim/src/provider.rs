@@ -1124,6 +1124,26 @@ pub trait Trainable {
     fn restore_sample(&mut self, _id: SampleId) -> Result<(), String> {
         Err("this provider does not learn".into())
     }
+    /// **Forgets** every stored sample `ids` names as one batch (2026-11-14, the Model tab's
+    /// "Forget N selected"): all or nothing — each id checked as for
+    /// [`forget_sample`](Self::forget_sample), and a batch that would take the held and forgotten
+    /// samples together past the trust recovery's cap is refused whole. Written at once, one refit
+    /// due. `Err` with the reason, nothing changed. The default: one at a time, stopping at the
+    /// first refusal (a provider without batches).
+    fn forget_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
+        ids.iter().try_for_each(|&id| self.forget_sample(id))
+    }
+    /// Puts every forgotten sample `ids` names back as one batch ("Restore N selected"): all or
+    /// nothing, written at once, one refit due. The default: one at a time.
+    fn restore_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
+        ids.iter().try_for_each(|&id| self.restore_sample(id))
+    }
+    /// The user's Forget / Restore changes no fit holds yet (2026-11-14): made since the fit that
+    /// stands, or — while a background refit runs — since it started. Each made a refit due; the
+    /// worker debounces that refit and the Model tab counts them. The default: 0.
+    fn user_changes_pending(&self) -> usize {
+        0
+    }
     /// The worst-fitting samples of the fit that stands, worst first (at most 8): ranked by their
     /// leave-one-out ratio from that fit's own cache, only the samples fitted now (a sample held or
     /// forgotten since is left out). Empty without a model or before a ranking exists. The default:

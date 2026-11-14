@@ -280,6 +280,8 @@ impl SurrogateKs {
         let lone = self.hold_out_lone(r_cut);
         self.refs_dirty = true;
         self.pending_refit = n > 0;
+        // the collection's codes are its records: nothing of this session's is pending
+        self.user_changes = 0;
         // the collection's audit history (module doc); its generations are the writers', so this
         // provider's generation moves past them (as `install_sidecar` does)
         let newest = c.history.iter().map(|p| p.model_gen).max().unwrap_or(0);

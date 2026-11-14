@@ -1882,6 +1882,8 @@ impl SurrogateKs {
             self.deferred_trust = Some(self.fit_column_union());
         }
         self.pending_refit = false;
+        // the user's Forget / Restore changes are in this fit
+        self.user_changes = 0;
         self.consults = 0;
         self.last_variance = None;
         // the votes disagreed (or agreed) with the previous model

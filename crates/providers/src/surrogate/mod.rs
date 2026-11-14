@@ -814,7 +814,9 @@
 //! sample in the fit (code 0) can be forgotten, so Restore returns it to exactly that; the buttons
 //! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
 //! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
-//! as before (rule 8, Task 2 fix round 1 I1). An agreeing teacher answer next to it — where nothing
+//! as before (rule 8, Task 2 fix round 1 I1). A batch (`forget_samples` / `restore_samples`,
+//! 2026-11-14) is all or nothing, and a batch Forget past the cap is refused whole; every change
+//! counts in `user_changes_pending` until a fit holds it (the worker debounces the refit on it). An agreeing teacher answer next to it — where nothing
 //! is released or superseded — is an ordinary one: thinned and copy-checked like an envelope (rule
 //! 5) fallback's (`admit`; final review I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`),
 //! not a new sample at every step — and a vote toward lifting its fence (below).
@@ -1358,6 +1360,11 @@ pub struct SurrogateKs {
     verdict_counts: Vec<usize>,
     epoch: u64,
     pending_refit: bool,
+    /// The user's Forget / Restore changes since the fit that stands — or since the running
+    /// background refit started, which holds the ones before it (`user_changes_pending`;
+    /// 2026-11-14, the batched forget): counted per sample changed, reset by every fit that
+    /// succeeds, given back by a background refit that is discarded or fails.
+    user_changes: usize,
     pending_jump: Option<f64>,
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
@@ -1642,6 +1649,7 @@ impl SurrogateKs {
             verdict_counts: Vec::new(),
             epoch: 0,
             pending_refit: false,
+            user_changes: 0,
             pending_jump: None,
             last: None,
             consults: 0,
@@ -1795,6 +1803,14 @@ impl SurrogateKs {
     /// Whether a fallback step has been kept since the last refit.
     pub fn pending_refit(&self) -> bool {
         self.pending_refit
+    }
+
+    /// The user's Forget / Restore changes no fit holds yet (2026-11-14, the batched forget): made
+    /// since the fit that stands, or — while a background refit runs — since it started (the ones
+    /// before are its). Each one made a refit due (`pending_refit`); the worker's pending-refit
+    /// debounce starts that refit, and the Model tab's banner counts them.
+    pub fn user_changes_pending(&self) -> usize {
+        self.user_changes
     }
 
     /// How many times the variance (rules 6–7) has been evaluated.
@@ -3276,6 +3292,18 @@ impl Trainable for SurrogateKs {
 
     fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
         SurrogateKs::restore_sample(self, id)
+    }
+
+    fn forget_samples(&mut self, ids: &[sim::SampleId]) -> Result<(), String> {
+        SurrogateKs::forget_samples(self, ids)
+    }
+
+    fn restore_samples(&mut self, ids: &[sim::SampleId]) -> Result<(), String> {
+        SurrogateKs::restore_samples(self, ids)
+    }
+
+    fn user_changes_pending(&self) -> usize {
+        SurrogateKs::user_changes_pending(self)
     }
 
     fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {

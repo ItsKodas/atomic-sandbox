@@ -94,6 +94,9 @@ pub(super) struct BackgroundRefit {
     /// The user's Forget / Restore codes set while it runs (module doc, "The user's codes"): the
     /// last one per sample, re-applied at the install.
     user_codes: BTreeMap<usize, u8>,
+    /// The user's changes no fit held when it started (`SurrogateKs::user_changes_pending`): this
+    /// refit holds them; given back when it is discarded or fails.
+    user_changes: usize,
 }
 
 impl BackgroundRefit {
@@ -239,7 +242,9 @@ impl SurrogateKs {
         if let Some(p) = &probe {
             p.begin_refit(self.samples());
         }
-        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new() });
+        // the user's changes so far are this refit's; the ones made while it runs are the next one's
+        let user_changes = std::mem::take(&mut self.user_changes);
+        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), user_changes });
         true
     }
 
@@ -288,17 +293,25 @@ impl SurrogateKs {
         let handle = done.handle.take().expect("a running refit has its thread");
         let snap = std::mem::replace(&mut done.snap, Snapshot::empty());
         let user = std::mem::take(&mut done.user_codes);
+        let held = done.user_changes;
         // `done` drops at the end: the probe's refit phase ends whatever the outcome
         let (fork, result) = match handle.join() {
             Ok(x) => x,
             Err(_) => {
                 self.pending_refit = true;
+                self.user_changes += held;
                 return BackgroundPoll::Discarded("the background refit panicked; it is due again".into());
             }
         };
         if let Some(why) = self.background_conflict(&snap, &user) {
             self.pending_refit = true;
+            // its user changes are pending again, with the ones made while it ran
+            self.user_changes += held;
             return BackgroundPoll::Discarded(why);
+        }
+        if result.is_err() {
+            // a fit that failed holds nothing: the changes are still pending (`pending_refit`)
+            self.user_changes += held;
         }
         self.install_fork(*fork, &snap, result.is_ok(), &user);
         BackgroundPoll::Installed(result)

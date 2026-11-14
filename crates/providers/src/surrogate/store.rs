@@ -149,6 +149,7 @@ impl SurrogateKs {
         self.failed_audits.clear();
         self.audit_fences.clear();
         self.pending_refit = false;
+        self.user_changes = 0;
         self.pending_jump = None;
         self.consults = 0;
         self.last_variance = None;
@@ -412,6 +413,8 @@ impl SurrogateKs {
         }
         self.accumulated = prefix;
         self.pending_refit = store.len() > self.accumulated;
+        // a loaded model's codes are its file's: nothing of this session's is pending
+        self.user_changes = 0;
         self.envelope = Some(accumulator.envelope.clone());
         self.null_space = Some(NullSpace::of(&accumulator, &model.scale));
         self.accumulator = Some(accumulator);
