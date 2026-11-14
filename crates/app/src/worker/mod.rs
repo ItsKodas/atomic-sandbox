@@ -117,6 +117,16 @@
 //! worker, which gets it through its start-up settings (`UiState::run_settings`:
 //! `DynCommand::SetOrbitalView`).
 //!
+//! **Harris display orbitals** (live-orbitals spec §4.2; `harris` module doc): with the GPU
+//! teacher, an orbital view that draws orbitals (Orbitals, All orbitals coloured, Spin density) is
+//! filled between those DFT solves by display-only Harris solves on the background solver —
+//! paused after each geometry change (debounced), playing at the "refresh orbitals every N s"
+//! cadence ([`Command::SetOrbitalRefresh`]) within a 15 % wall budget — once each species'
+//! isolated atom is in (asked for by `cloud_jobs` while such a view is on). Under ⚠ Model only
+//! ([`Command::SetModelOnly`]) a changed view, and the idle retry, ask for a Harris solve instead
+//! of the refresh, so Model only starts no DFT solve for a view. A pass pauses them (the
+//! snapshot's `harris_note` says why none runs).
+//!
 //! # The empty scene (the `empty` preset)
 //! A scene with no nuclei has nothing to solve: the driver answers it without its provider
 //! (`sim::dynamics`, "The empty scene") — E = 0, no forces, no density — on every backend. Play is
@@ -188,10 +198,14 @@ pub(crate) mod checkpoint;
 pub use checkpoint::{discard_interrupted_pass, interrupted_pass};
 use checkpoint::Checkpoints;
 mod commands;
+mod harris;
 mod model;
 
 pub use activity::*;
 pub use commands::*;
+// (the notes `Snapshot::harris_note` carries, for the viewer's labels)
+#[allow(unused_imports)]
+pub use harris::{HARRIS_PAUSED_PASS, HARRIS_WAITING_ATOMS};
 pub use model::*;
 
 use crate::names::Name;
@@ -264,6 +278,11 @@ pub struct Snapshot {
     /// The isolated-atom radial profiles for the viewer's atomic superposition (estimated solver
     /// with a background auditor; module doc, "The cloud"), for the scene's grid and σ.
     pub atom_profiles: Arc<Vec<AtomProfile>>,
+    /// Why no Harris display solve runs for the orbital view that is on (estimated solver on the
+    /// GPU teacher; `harris` module doc): [`HARRIS_WAITING_ATOMS`] or [`HARRIS_PAUSED_PASS`].
+    /// (Read by the Orbitals tab's labels, live-orbitals Task 7.)
+    #[allow(dead_code)]
+    pub harris_note: Option<&'static str>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,
     /// Every command handed to the driver before this snapshot (edits or not; superseded drag
@@ -676,6 +695,17 @@ struct Worker {
     /// ([`Worker::side_charges`]).
     side_charges_seq: u64,
     side_charges_at: Option<Instant>,
+    /// ⚠ Model only is on ([`Command::SetModelOnly`]): a changed orbital view asks for a Harris
+    /// solve, never a DFT refresh (`harris::view_change_job`).
+    model_only: bool,
+    /// The Harris display solves (`harris` module doc): the schedule, a changed view's request for
+    /// the next round, the last `orbitals_seq` looked at, the profiles they were built from (and
+    /// the species) with the superposition's input, and the eligibility note.
+    harris: harris::HarrisSchedule,
+    harris_view_changed: bool,
+    harris_seen_seq: u64,
+    harris_atoms: Option<(Arc<Vec<AtomProfile>>, Vec<u8>, Arc<sim::HarrisAtoms>)>,
+    harris_note: Option<&'static str>,
 }
 
 /// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
@@ -867,6 +897,12 @@ fn worker(
         orbital_retried: None,
         side_pending: false,
         idle_polling: false,
+        model_only: false,
+        harris: harris::HarrisSchedule::default(),
+        harris_view_changed: false,
+        harris_seen_seq: 0,
+        harris_atoms: None,
+        harris_note: None,
     };
     for c in settings {
         w.dy.apply(c);
@@ -880,11 +916,15 @@ fn worker(
         pending,
     };
     loop {
-        let views_wake = w.views_wake();
+        // a deferred training-view build (`activity` module doc) or a debounced Harris solve
+        // (`harris` module doc): wait for it, not forever
+        let views_wake = match (w.views_wake(), w.harris.wake()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if let Some(d) = w.pace_until {
             inbox.wait_until(d);
         } else if let Some(d) = views_wake {
-            // a deferred training-view build (`activity` module doc): wait for it, not forever
             inbox.wait_until(d);
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
@@ -985,6 +1025,8 @@ impl Worker {
         self.cloud_jobs(&snap);
         self.side_charges(&mut snap);
         self.orbital_retry(&snap);
+        // after the retry: under Model only it asks for a Harris job
+        self.harris_jobs(&snap);
         // paused with a background job in flight (an orbital refresh asked for by a changed view or
         // the retry above): poll it once a budget, like a bond reference — else its answer waits in
         // the auditor's channel for the next command (final review I1)
@@ -1013,14 +1055,28 @@ impl Worker {
     /// driver's own retry, `sim::dynamics` "Orbital display", skips side payloads): a display
     /// eigensolve on the background solver that yielded to a command leaves the earlier unoccupied
     /// rows stamped `interrupted`; once the worker is idle again the refresh is asked for once
-    /// more ([`orbital_retry_due`]).
+    /// more ([`orbital_retry_due`]) — under ⚠ Model only a Harris solve instead, or nothing while
+    /// Harris is not eligible (`harris::view_change_job`).
     fn orbital_retry(&mut self, snap: &DynSnapshot) {
         if !orbital_retry_due(snap, (self.interrupt)(), self.orbital_retried) {
             return;
         }
-        let Some(s) = trainable(&mut self.dy) else { return };
-        if s.request_display(&snap.scene) {
-            self.orbital_retried = Some(snap.orbitals_seq);
+        // under Model only a Harris job instead (`harris::view_change_job`)
+        let harris_ok = self.harris_ok(&snap.orbital_view.what, snap).is_ok();
+        match harris::view_change_job(self.model_only, harris_ok, true) {
+            harris::ViewJob::Refresh => {
+                let Some(s) = trainable(&mut self.dy) else { return };
+                if s.request_display(&snap.scene) {
+                    self.orbital_retried = Some(snap.orbitals_seq);
+                    let here: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
+                    self.harris.covered(&here);
+                }
+            }
+            harris::ViewJob::Harris => {
+                self.harris_view_changed = true;
+                self.orbital_retried = Some(snap.orbitals_seq);
+            }
+            harris::ViewJob::Nothing => {}
         }
     }
 
@@ -1064,7 +1120,10 @@ impl Worker {
         if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2, key.3)) {
             self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2, key.3)).cloned().collect());
         }
-        if self.cloud_superposition && self.atom_pending.is_none() {
+        // the atoms are wanted by the cloud's superposition, and by a Harris display solve while
+        // an orbital view that draws orbitals is on (`harris` module doc)
+        let wanted = self.cloud_superposition || harris::harris_view(&snap.orbital_view.what);
+        if wanted && self.atom_pending.is_none() {
             let mut species: Vec<u8> = snap.scene.nuclei.iter().map(|n| n.z).collect();
             species.sort_unstable();
             species.dedup();
@@ -1148,6 +1207,7 @@ impl Worker {
             engine: self.engine,
             model,
             atom_profiles: self.profiles.clone(),
+            harris_note: self.harris_note,
             edits: self.edits,
             driver_commands: self.driver_commands,
             commands: self.commands,

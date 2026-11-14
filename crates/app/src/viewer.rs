@@ -672,6 +672,11 @@ impl Viewer {
                 },
             });
             teach.push(self.ui.cloud_command());
+            // the Harris display's cadence and ⚠ Model only (`worker::harris`)
+            teach.push(self.ui.orbital_refresh_command());
+            if self.ui.model_only.is_some() {
+                teach.push(Command::SetModelOnly(true));
+            }
             if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
@@ -2997,6 +3002,7 @@ mod tests {
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,
@@ -3043,6 +3049,7 @@ mod tests {
                 engine: Backend::Gpu,
                 model: None,
                 atom_profiles: Default::default(),
+                harris_note: None,
                 edits,
                 driver_commands: 0,
                 commands: 0,
@@ -3109,6 +3116,7 @@ mod tests {
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,
@@ -3545,6 +3553,7 @@ nucleus 1 {a} {} {}
                 engine: Backend::Gpu,
                 model: None,
                 atom_profiles: Default::default(),
+                harris_note: None,
                 edits: 0,
                 driver_commands: 0,
                 commands: 0,
@@ -4392,6 +4401,7 @@ nucleus 1 {a} {} {}
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,

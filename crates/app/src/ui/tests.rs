@@ -104,6 +104,13 @@ fn m5b_actions_send_walls_cloud_and_draft() {
     assert!(matches!(c.commands.as_slice(), [Command::SetCloud { superposition: false, refresh_s: Some(x) }] if *x == 4.0));
     let c = act(&mut st, &inp, Action::Draft(true));
     assert!(matches!(c.commands.as_slice(), [Command::SetDraft(true)]) && st.draft);
+    // "refresh orbitals every N s" (live-orbitals Task 6): 2 s by default, sent as the worker's
+    // Harris cadence, a script's value kept within the slider's 1–10 s
+    assert_eq!(st.orbital_refresh_s, 2.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(3.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(3)) && st.orbital_refresh_s == 3.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(60.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(10)), "{:?}", c.commands);
 }
 
 /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms
@@ -239,6 +246,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         engine: if backend == Backend::Cpu { Backend::Cpu } else { Backend::Gpu },
         model,
         atom_profiles: Default::default(),
+        harris_note: None,
         edits: 0,
         driver_commands: 0,
         commands: 0,
@@ -1592,27 +1600,28 @@ fn model_only_saves_and_restores_draft_and_audits() {
     assert!(st.model_only.is_none() && overlays::model_only_chip(&st).is_none(), "every session starts with it off");
     act(&mut st, &inp, Action::SetAudit(500));
     let out = act(&mut st, &inp, Action::ModelOnly(true));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0)]), "{:?}", out.commands);
+    // (and the worker's Model only: a changed orbital view then asks for a Harris solve, live-orbitals Task 6)
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0), Command::SetModelOnly(true)]), "{:?}", out.commands);
     assert!(st.draft && st.audit_every == 0);
     assert_eq!(st.model_only, Some(ModelOnlySaved { draft: false, audit_every: 500 }));
     assert_eq!(st.audit_every_on, 500, "\"audits on\" would bring back the replaced cadence");
     assert_eq!(overlays::model_only_chip(&st), Some("model only — no DFT checks"));
     assert!(act(&mut st, &inp, Action::ModelOnly(true)).commands.is_empty(), "already on: nothing");
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(!st.draft && st.audit_every == 500 && st.model_only.is_none() && overlays::model_only_chip(&st).is_none());
     assert!(act(&mut st, &inp, Action::ModelOnly(false)).commands.is_empty(), "already off: nothing");
     // draft already on before: it stays on after
     act(&mut st, &inp, Action::Draft(true));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     // the solver leaves Estimated: off, restored
     let mut st = fresh();
     act(&mut st, &inp, Action::SetAudit(700));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Backend(Backend::Gpu));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(st.backend == Backend::Gpu && st.model_only.is_none() && !st.draft && st.audit_every == 700);
     // not on another solver (the toggle is hidden there; a script could still ask)
     let out = act(&mut st, &inp, Action::ModelOnly(true));
@@ -1621,14 +1630,14 @@ fn model_only_saves_and_restores_draft_and_audits() {
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Draft(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetDraft(false)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && !st.draft && st.audit_every == 0);
     assert!(st.status.contains("by hand"), "{}", st.status);
     // a hand change of the cadence: off, the cadence kept, draft left on
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::SetAudit(300));
-    assert!(matches!(out.commands.as_slice(), [Command::SetAudit(300)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetAudit(300)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && st.draft && st.audit_every == 300);
     // Ctrl K finds it by either name
     for q in ["model only", "no DFT checks"] {
@@ -8527,6 +8536,8 @@ mod view_panel {
         st.backend = Backend::Estimated;
         let p = probes_now(&ctx, &mut st, &inp);
         assert!(p.contains("cloud-refresh") && p.contains("cloud-superposition") && p.contains("aid-warp"));
+        // "refresh orbitals every N s" beside them (live-orbitals Task 6)
+        assert!(p.contains("orbital-refresh-s"));
     }
 
     /// A press and release at `at`.

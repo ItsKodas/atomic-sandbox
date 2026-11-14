@@ -653,6 +653,9 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
 /// "fields follow the atoms" (every solver).
 pub const WARP_TIP: &str = "the density and orbitals were solved at one geometry; while the atoms move on (the estimated solver, or between DFT steps) the field is warped with them — each point moves with its nearby atoms — until the next solve. A display approximation: it moves what was solved and cannot make new chemistry (a bond that broke since is drawn stretched until the next solve)";
 
+/// "refresh orbitals every N s" (`worker::harris`).
+pub const ORBITAL_REFRESH_TIP: &str = "estimated solver, while playing, with an Orbitals, All orbitals coloured or Spin density view open: how often the orbitals are re-solved at the current geometry — display-only orbitals in the potential of the teacher's own isolated atoms placed at the nuclei (not self-consistent; labelled so), on the background solver. A slow solve stretches the interval so these take at most 15 % of the time; never below 1 s. Paused, they follow each edit instead. Not a DFT step and not a training sample; separate from \"refresh every\" above, the cloud's DFT refresh. Needs the GPU teacher";
+
 /// ESTIMATED MODE CLOUD (`crate::cloud`; `sim` module doc, "The cloud"): the display warp, atomic
 /// superposition between DFT clouds and the display refresh, as chips.
 fn cloud_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
@@ -686,6 +689,14 @@ fn cloud_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         }
         if changed {
             acts.push(Action::Cloud { superposition: sup, refresh, refresh_s: every });
+        }
+        // the Harris display solves' cadence (`worker::harris`): beside the cloud's, never replacing it
+        let mut orbitals = st.orbital_refresh_s;
+        if probed("orbital-refresh-s", ui.add(egui::Slider::new(&mut orbitals, 1.0..=10.0).suffix(" s").fixed_decimals(0).text("refresh orbitals every")))
+            .on_hover_text(ORBITAL_REFRESH_TIP)
+            .changed()
+        {
+            acts.push(Action::OrbitalRefresh(orbitals));
         }
     });
 }

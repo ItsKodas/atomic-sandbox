@@ -763,6 +763,10 @@ pub struct UiState {
     pub bloom_threshold: f32,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
+    /// The View setting "refresh orbitals every N s" (`Action::OrbitalRefresh`,
+    /// `Command::SetOrbitalRefresh`): the estimated solver's Harris display solves while playing
+    /// (`worker::harris`; default 2 s, the budget may stretch it). Like the cloud's, not persisted.
+    pub orbital_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
     /// `Command::SetAudit`).
     pub audit_every: usize,
@@ -1051,6 +1055,7 @@ impl UiState {
             bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
+            orbital_refresh_s: 2.0,
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
             model_sections: dock::model::Sections::default(),
@@ -1090,6 +1095,13 @@ impl UiState {
             superposition: self.cloud_superposition,
             refresh_s: self.cloud_refresh.then_some(self.cloud_refresh_s),
         }
+    }
+
+    /// "refresh orbitals every N s" as the worker command (`worker::harris`), within the slider's
+    /// 1–10 s (a script's value is clamped likewise).
+    pub fn orbital_refresh_command(&self) -> Command {
+        let s = if self.orbital_refresh_s.is_finite() { self.orbital_refresh_s.clamp(1.0, 10.0) } else { 2.0 };
+        Command::SetOrbitalRefresh(std::time::Duration::from_secs_f64(s))
     }
 
     /// Sets the status line; a repeat of the same text still counts as a new message (toast, log).

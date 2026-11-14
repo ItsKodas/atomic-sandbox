@@ -187,6 +187,8 @@ fn actions_parse_and_describe_symmetrically() {
         Action::VolumeMode(1),
         Action::Walls { on: true, half_width: 3.5 },
         Action::Cloud { superposition: true, refresh: false, refresh_s: 2.0 },
+        Action::OrbitalRefresh(3.0),
+        Action::OrbitalRefresh(2.5),
         Action::Draft(true),
         Action::ModelOnly(true),
         Action::ModelOnly(false),
@@ -221,6 +223,33 @@ fn actions_parse_and_describe_symmetrically() {
     }
     assert!(Action::parse(&["pin", "1", "maybe"]).unwrap_err().contains("true/false"));
     assert!(Action::parse(&["speed"]).unwrap_err().contains("1 argument"));
+}
+
+/// "refresh orbitals every N s" (live-orbitals Task 6) is a script line, `action orbital-refresh
+/// <s>`, both ways; it needs its one argument; and the replay scripts that never name it still
+/// parse.
+#[test]
+fn orbital_refresh_round_trips() {
+    assert_eq!(Action::OrbitalRefresh(3.0).describe().as_deref(), Some("orbital-refresh 3"));
+    assert_eq!(Action::parse(&["orbital-refresh", "3"]).unwrap(), Action::OrbitalRefresh(3.0));
+    assert!(Action::parse(&["orbital-refresh"]).unwrap_err().contains("1 argument"));
+    let lines = parse("view 1280 800
+action orbital-refresh 3
+wait idle
+").unwrap();
+    assert_eq!(lines[1], Line::Action(Action::OrbitalRefresh(3.0)));
+    assert_eq!(parse(&write(&lines)).unwrap(), lines);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("replays");
+    let mut n = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_some_and(|x| x == "replay") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            n += 1;
+        }
+    }
+    assert!(n >= 5, "{n} scripts in {}", dir.display());
 }
 
 /// The recorder (spec §8.2): the header, the view and `action smooth-motion false` first; a gap of
@@ -304,6 +333,7 @@ fn wait_idle_waits_for_a_running_relax_and_the_bond_references() {
         engine: Backend::Gpu,
         model: None,
         atom_profiles: Default::default(),
+        harris_note: None,
         edits: 0,
         driver_commands: 0,
         commands: 0,

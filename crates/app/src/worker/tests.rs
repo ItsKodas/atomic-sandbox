@@ -2983,6 +2983,92 @@ fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
     assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
 }
 
+/// Live-orbitals Task 6 (spec §4.2): under ⚠ Model only (draft on, audits off, `SetModelOnly`) an
+/// orbital view starts no DFT solve. All orbitals coloured, opened paused with no isolated atoms
+/// yet, asks the background solver for the H atom (the cloud's superposition is off here: the
+/// view asks for it) and then for a Harris display solve, not a refresh; a paused edit is
+/// answered by the model and followed, after the debounce, by a Harris payload at the new
+/// geometry. Throughout: no fallback or audit in the Activity events, no new side density (a
+/// refresh's or an audit's), and every orbital payload a Harris one.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn model_only_view_paths_never_request_a_dft_refresh() {
+    use sim::activity::TeachOrigin;
+    use sim::{ColourLook, OrbitalKind, OrbitalRequest, OrbitalViewRequest, SideKind};
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let (w, _, _) = taught(h2_41(), ctx, None);
+    // what `Action::ModelOnly(true)` sends
+    w.send(Command::SetDraft(true));
+    w.send(Command::SetAudit(0));
+    w.send(Command::SetModelOnly(true));
+    let mut base = idle(&w);
+    // quiet: whatever the pass left in flight lands before the baseline
+    loop {
+        match w.recv_timeout(Duration::from_secs(2)) {
+            Some(Event::Snapshot(s)) => base = *s,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let side_seq = |s: &Snapshot| s.dynamics.side_display.as_ref().map(|d| d.seq);
+    let base_side = side_seq(&base);
+    let watch = |s: &Snapshot, events: &mut Vec<TeachOrigin>| {
+        events.extend(s.activity.events.iter().map(|e| e.origin));
+        assert_eq!(side_seq(s), base_side, "a new side density: a DFT refresh or audit ran");
+        if let Some(o) = &s.dynamics.orbitals {
+            assert!(matches!(o.kind, OrbitalKind::Harris { .. }), "a converged payload under Model only: {:?}", o.kind);
+            assert_eq!(s.dynamics.orbitals_side, Some(SideKind::Harris));
+        }
+    };
+    let mut events = Vec::new();
+    let until = |what: &str, events: &mut Vec<TeachOrigin>, f: &dyn Fn(&Snapshot) -> bool| -> Snapshot {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            assert!(Instant::now() < deadline, "no {what} within 90 s");
+            if let Some(Event::Snapshot(s)) = w.recv_timeout(Duration::from_secs(1)) {
+                watch(&s, events);
+                if f(&s) {
+                    return *s;
+                }
+            }
+        }
+    };
+    let coloured = OrbitalRequest::AllColoured { include: None, physical: false, look: ColourLook::default() };
+    let t0 = Instant::now();
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(coloured)));
+    let first = until("a Harris payload", &mut events, &|s| s.dynamics.orbitals.is_some());
+    let wall = match first.dynamics.orbitals.as_ref().unwrap().kind {
+        OrbitalKind::Harris { wall_s, .. } => wall_s,
+        _ => unreachable!(),
+    };
+    eprintln!("first Harris payload {:.2} s after the view (H atom + Harris, solve {wall:.3} s)", t0.elapsed().as_secs_f64());
+    assert_eq!(first.atom_profiles.len(), 1, "the view asked for the H atom");
+    assert_eq!(first.harris_note, None);
+    // a paused edit: the model answers, a Harris payload follows at the new geometry
+    let p = first.dynamics.scene.nuclei[1].pos;
+    let moved = [p[0] + 0.05, p[1], p[2]];
+    let t1 = Instant::now();
+    w.send(Command::MoveNucleus { index: 1, pos: moved });
+    let at_moved = |o: &sim::OrbitalDisplay| dist(o.positions[1], moved) < 1e-9;
+    let s = until("the Harris payload at the moved geometry", &mut events, &|s| s.dynamics.orbitals.as_ref().is_some_and(at_moved));
+    let wall = match s.dynamics.orbitals.as_ref().unwrap().kind {
+        OrbitalKind::Harris { wall_s, .. } => wall_s,
+        _ => unreachable!(),
+    };
+    eprintln!("Harris after the edit: {:.2} s after it (debounce 0.3 s; solve {wall:.3} s)", t1.elapsed().as_secs_f64());
+    assert!(s.dynamics.paused && s.dynamics.source == sim::Source::Surrogate, "{:?}", s.dynamics.source);
+    assert!(t1.elapsed() >= harris::HARRIS_DEBOUNCE, "debounced");
+    // a few quiet seconds: nothing else is solved
+    let end = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < end {
+        if let Some(Event::Snapshot(s)) = w.recv_timeout(Duration::from_millis(500)) {
+            watch(&s, &mut events);
+        }
+    }
+    assert!(!events.iter().any(|o| matches!(o, TeachOrigin::Fallback | TeachOrigin::Audit)), "DFT under Model only: {events:?}");
+}
+
 // ---- pseudopotentials through the worker (M7 Task 9) ----
 
 /// Spec §8 row 9: the worker generates a species' pseudopotential on first use (a note in the
