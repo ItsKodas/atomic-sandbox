@@ -970,6 +970,21 @@ and it can delete forgotten samples from `samples.bin`, renumbering the rest.
   held sample. It stays out of the held cap and out of `fencing()`, purge's lift votes cannot lift it, and it never
   joins the misfit set M.
 
+**Amendment (plan Task 2, 2026-11-14): the touch points on merged `main` (fe30578, merge 97da009).** The names are
+in the plan's Touch-point map. Roles 1 and 3–10 mean what this section says; on `main` code 9 is excluded from the
+fit (`excluded` is "code ≠ 0"), left out of the held cap (`quarantined() + forgotten()` counts codes 1, 7 and 8),
+kept out of M (M is built from fitted samples) and never lifted (the lift takes code 7 only) without a code change.
+The formats: R = 1 and K = 8, so the new collection record version is 2 and the new magic `ASMODEL9`; the old
+sidecar bodies are 6, 7 and 8 (section 7.7's numbers hold as written). Two points of role 2/10 do not read as
+preflight F4 assumed, and need the controller's ruling before plan Task 15 (no meaning is chosen here):
+- **`fencing()` is the fence's on-switch.** Its only readers are the early returns of the quarantine distance scan
+  and the views' "any fence" checks. A failed code 9 in `fences()` but not counted by `fencing()` would fence nothing
+  whenever no code-1 or code-7 sample exists. So "not counted by `fencing()`" (section 7.6 step 4, F4 above)
+  conflicts with "joins the quarantine fence". `fencing()` feeds no cap.
+- **A fresh agreeing answer moves fencing samples.** `admit` releases (when the model reproduces it) or supersedes
+  every non-forgotten fencing sample next to a fresh answer that agrees with the model. Section 7.6 does not say
+  whether a failed code 9 is moved that way (like a held sample) or only by a later review (like a forgotten one).
+
 ## 9. Validation (rule 6; one heavy job at a time)
 
 Every gate in CLAUDE.md's table applies, because this change touches the solver, dynamics, the surrogate, pseudo
