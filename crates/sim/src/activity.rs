@@ -450,7 +450,9 @@ pub enum EnvClass {
 /// The trust rule's conditions, in the order `trust_checks` lists them and `untrusted_check`
 /// tests them (`providers::surrogate`). The audit condition is `Audit` (the per-atom energy gap,
 /// or no failed audit since the refit) or `AuditForces` (the failed audit's worst atom force
-/// residual): plan review M1.
+/// residual): plan review M1. `EnergyResidual` and `ForceResidual` judge the fitted samples
+/// outside the misfit set M; `Misfit` counts M, the fitted samples the fit cannot reproduce,
+/// against 10 % of the fitted samples (spec 2026-11-13 §4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustKey {
     Samples,
@@ -458,6 +460,7 @@ pub enum TrustKey {
     ResidualDofF,
     EnergyResidual,
     ForceResidual,
+    Misfit,
     ForceNoise,
     Audit,
     AuditForces,
@@ -489,6 +492,10 @@ pub enum TeachRule {
     /// answer, draft mode included (activity Task 3b).
     NonFiniteAnswer,
     NearQuarantine,
+    /// An atom's environment is within the near-quarantine distance of a misfit atom — a training
+    /// sample the model cannot reproduce (`providers::surrogate`, spec 2026-11-13 §4.3): the
+    /// geometry is refused when any atom is near; `atom` names the first.
+    NearMisfit,
     Audit,
     RelaxVerification,
     Pass(PassJob),
@@ -505,6 +512,10 @@ pub enum TeachOutcome {
     KeptBoxAffected,
     KeptByVote,
     KeptReleased { released: u32, superseded: u32 },
+    /// Kept: the last of `FENCE_VOTES` consecutive, mutually consistent fresh answers near forgotten
+    /// samples that agree with the model — the fence of `lifted` forgotten samples is lifted
+    /// (`providers::surrogate`, "Lifting a forgotten sample's fence"; 2026-11-14).
+    FenceLifted { lifted: u32 },
     Thinned,
     BoxNotKept,
     /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
@@ -521,6 +532,9 @@ pub enum TeachOutcome {
     /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
     LoneNotKept,
     FenceDisagrees,
+    /// A teacher answer next to a training sample the model cannot reproduce (`NearMisfit`) that
+    /// disagrees with the model: used for its step, not kept, no fence vote (spec 2026-11-13 §4.3).
+    MisfitDisagrees,
     WaitingForPass,
     /// Used for its step, not kept for this model: its settings differ.
     NotOffered,
@@ -539,7 +553,7 @@ pub enum TeachOutcome {
 
 impl TeachOutcome {
     pub fn is_kept(self) -> bool {
-        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. })
+        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. })
     }
 }
 
@@ -727,8 +741,9 @@ pub struct TrustCheck {
     pub value: f64,
     pub limit: f64,
     /// Where `value` was found, for the training-residual checks (`EnergyResidual`,
-    /// `ForceResidual`): display only, never read by the rule. `None` for every other check, and
-    /// when the provider did not record it or the sample it names has changed since.
+    /// `ForceResidual`), and for `Misfit` the worst sample of the misfit set: display only, never
+    /// read by the rule. `None` for every other check, and when the provider did not record it or
+    /// the sample it names has changed since.
     pub worst: Option<TrustWorst>,
 }
 

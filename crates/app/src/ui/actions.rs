@@ -134,6 +134,12 @@ pub enum Action {
     ForgetSample(sim::SampleId),
     /// Its Restore of a forgotten sample (`Command::RestoreSample`). Recorded, not replayable.
     RestoreSample(sim::SampleId),
+    /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
+    /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user
+    /// confirmed (the worker refuses when the forgotten list changed since). Recorded, not
+    /// replayable (`# not replayable: purge-forgotten`, a replay refuses it like Forget: it rewrites
+    /// the shared collection's file and the purged samples stop fencing).
+    PurgeForgotten(usize),
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -365,7 +371,13 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::Pin(i, on) => out.commands.push(dyn_(DynCommand::Pin(i, on))),
         Action::Backend(b) => {
             if b != Backend::Gpu || st.gpu_available {
+                let was = st.backend;
                 st.backend = b;
+                if b != was {
+                    // the estimated solver's box (`ui::estimated_box`): a preset grows on the way in,
+                    // and a grid that rule grew returns on the way out
+                    super::estimated_box::on_switch(st, input, was, out);
+                }
             }
         }
         Action::Preset(name) => {
@@ -373,6 +385,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             if let (Some(file), Some(mut s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
                 // the policy in force (Accepted by default in the app since M7 Task 11): a preset file itself is all-electron
                 s.ionic = st.ionic;
+                // under the estimated solver, its box (`ui::estimated_box`)
+                let s = super::estimated_box::preset(st, s, crate::quality::box_len(&file));
                 if let Err(e) = vram_check(st, &s) {
                     out.error = Some(e);
                     return;
@@ -391,19 +405,25 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::TempUnits(u) => st.temp_units = u,
         Action::Quality(h) => {
             let h = crate::quality::snap(h);
-            let s = crate::quality::regrid(input.scene, st.box_len, h);
+            // the box kept — under the estimated solver its own box (`ui::estimated_box`), the
+            // container following a grid that rule grew or returns
+            let (s, follow) = super::estimated_box::quality(st, input, h);
             if let Err(e) = vram_check(st, &s) {
                 // refused: the slider goes back to the accepted quality
                 st.quality_slider = st.quality_h;
                 out.error = Some(e);
                 return;
             }
+            super::estimated_box::quality_applied(st, &s);
             st.quality_h = h;
             st.quality_slider = h;
             st.grid_n = s.grid_n;
             st.grid_h = s.grid_h;
             if (s.grid_n, s.grid_h) != (input.scene.grid_n, input.scene.grid_h) {
                 out.commands.push(Command::SetGrid { n: s.grid_n, h: s.grid_h });
+                if follow {
+                    super::estimated_box::walls_after_grid(st, input.scene, &s, out);
+                }
             }
         }
         Action::Thermostat { on, t, tau } => {
@@ -461,8 +481,10 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             vram_check(st, &s)
         }) {
             Ok(()) => {
-                // an explicit grid: its box is the one later quality changes keep
+                // an explicit grid: its box is the one later quality changes keep (never the
+                // estimated rule's: a solver switch leaves it alone)
                 st.box_len = (st.grid_n as f64 - 1.0) * st.grid_h;
+                st.estimated_grid = None;
                 out.commands.push(Command::SetGrid { n: st.grid_n, h: st.grid_h });
             }
             Err(e) => out.error = Some(e),
@@ -653,6 +675,11 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::RestoreSample(id) => {
             st.set_status(format!("restoring sample #{}; refitting", id.index));
             out.commands.push(Command::RestoreSample(id));
+        }
+        Action::PurgeForgotten(n) => {
+            st.purge_confirm = false;
+            st.set_status(format!("purging {n} forgotten sample{}…", if n == 1 { "" } else { "s" }));
+            out.commands.push(Command::PurgeForgotten(n));
         }
         Action::SetAudit(n) => {
             model_only_by_hand(st, "the audit cadence");
@@ -1172,7 +1199,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 

@@ -620,6 +620,9 @@ struct Worker {
     collections: Option<PathBuf>,
     use_collection: bool,
     last_import: Option<Result<sim::ImportSummary, String>>,
+    /// The last [`Command::PurgeForgotten`]'s outcome, numbered (the viewer's status line shows each
+    /// once).
+    last_purge: Option<(u64, Result<sim::PurgeReport, String>)>,
     /// The audit cadence set by [`Command::SetAudit`] and draft mode by [`Command::SetDraft`]
     /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
@@ -837,6 +840,7 @@ fn worker(
         collections: None,
         use_collection: true,
         last_import: None,
+        last_purge: None,
         audit_every: None,
         draft: None,
         last_gap: None,

@@ -26,6 +26,7 @@ pub mod actions;
 pub mod activity;
 mod capture;
 mod dock;
+pub mod estimated_box;
 mod files;
 pub mod profile;
 mod icons;
@@ -249,12 +250,17 @@ pub enum ToolMode {
     Edit,
 }
 
+/// The keys that pick the tools, in the Tool group's order (user request 2026-11-14): 1 Inspect,
+/// 2 Place, 3 Grab, 4 Edit.
+pub const TOOL_KEYS: [(egui::Key, ToolMode); 4] =
+    [(egui::Key::Num1, ToolMode::Orbit), (egui::Key::Num2, ToolMode::Place), (egui::Key::Num3, ToolMode::Select), (egui::Key::Num4, ToolMode::Edit)];
+
 /// The workspace's panels (docking spec D-2: "dock tab" now means "panel"); every one is in
 /// [`DockTab::PANELS`]. Where each sits is the workspace tree's (`UiState::workspace`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
+    /// The tiles, the E total / T chart (the old Graph panel, merged 2026-11-14), the energies.
     Readouts,
-    Graph,
     Model,
     /// What runs, what the teacher was asked and why, and how the model learns (activity spec §3.3).
     Activity,
@@ -273,7 +279,7 @@ impl DockTab {
     /// Every panel of the workspace (docking spec D-2), View included (the tests' sweep, the saved
     /// layout's parser, the screenshot harness's `tab=`; the order a migrated layout adds panels
     /// an old profile never listed, `workspace::layout`).
-    pub const PANELS: [DockTab; 9] = [
+    pub const PANELS: [DockTab; 8] = [
         DockTab::Model,
         DockTab::Knowledge,
         DockTab::Selection,
@@ -282,7 +288,6 @@ impl DockTab {
         DockTab::Orbitals,
         DockTab::Log,
         DockTab::Activity,
-        DockTab::Graph,
     ];
     /// The panel's one-word name: its tab's label (docking spec D-4), its word in a saved layout
     /// (spec D-9: `[Model*,Knowledge]`) and in an old profile's `left_tabs` / `right_tabs` lines,
@@ -290,7 +295,6 @@ impl DockTab {
     pub fn name(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
-            DockTab::Graph => "Graph",
             DockTab::Model => "Model",
             DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
@@ -304,7 +308,6 @@ impl DockTab {
     pub fn title(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
-            DockTab::Graph => "Graph",
             DockTab::Model => "Model · estimated solver",
             DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
@@ -472,14 +475,6 @@ impl TempUnits {
     }
 }
 
-/// The Graph tab's curves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GraphSeries {
-    Both,
-    Energy,
-    Temperature,
-}
-
 /// Help windows: the controls, and the "Physics, honestly" topics (long-form text).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelpTopic {
@@ -575,6 +570,17 @@ pub struct UiState {
     pub box_len: f64,
     /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
     pub last_solve: Option<(usize, f64)>,
+    /// The estimated box (`crate::quality::estimated_box`, `estimated_box`): the latest isolated-atom
+    /// profile seen per (Z, ionic policy) — the estimated solver's own solves, kept across grids
+    /// so R_cloud is known when the next scene is built — and the snapshot list they came from.
+    pub cloud_profiles: Vec<crate::cloud::AtomProfile>,
+    pub cloud_profiles_from: usize,
+    /// The grid (n, h) the estimated box rule last gave the scene: leaving the estimated solver
+    /// returns such a grid to the base box (`box_len`), an explicit grid is never touched.
+    pub estimated_grid: Option<(usize, f64)>,
+    /// The note's GPU memory verdict, cached by (wanted n, h, scene key): the guard is not
+    /// re-run every frame.
+    pub estimated_note_cache: Option<((usize, f64, usize, sim::IonicPolicy, u64), usize)>,
     /// A new scene is loading (a scene or preset, a grid or ionic change, a solver switch; user
     /// request 2026-10-19): since when, and the estimated seconds. The old cloud, dots, labels and
     /// bonds hide until its first solve lands; the Activity tab shows the job.
@@ -669,7 +675,7 @@ pub struct UiState {
     /// default; display only, not recorded; kept in the profile.
     pub show_knowledge: bool,
     /// The knowledge map's own view state (`knowledge::KnowledgeView`: the picked pair or element,
-    /// the pop-out window). Display only.
+    /// the graph's zoom and pan). Display only.
     pub knowledge: knowledge::KnowledgeView,
     /// Motion blur strength, 0 (off) to 1 (`Viewer::blur_ghosts`). Display only.
     pub motion_blur: f32,
@@ -736,6 +742,10 @@ pub struct UiState {
     pub plan: SamplingPlan,
     /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
     pub forget_armed: Option<Instant>,
+    /// "Purge forgotten (N)…" was clicked: its inline confirmation shows (Purge / Cancel).
+    pub purge_confirm: bool,
+    /// The number of the last purge outcome put on the status line (`ModelStatus::last_purge`).
+    pub purge_seen: u64,
     /// The first click on a sampling button whose pass would take longer than
     /// `sim::PASS_TARGET_S` (a second within [`FORGET_CONFIRM`] starts it: "Start anyway").
     pub start_armed: Option<Instant>,
@@ -782,6 +792,27 @@ pub struct UiState {
     /// The View panel's folding sections that are open (`dock::view`; the profile's
     /// `view_sections`). Display state: not recorded.
     pub view_sections: dock::view::Sections,
+    /// The Model panel's folds that are open (`dock::model`; the profile's `model_sections`):
+    /// Teach next and Health by default. Display state: not recorded.
+    pub model_sections: dock::model::Sections,
+    /// The width (points) the toolbar's full layout needs, measured by its last frame
+    /// (`toolbar::show`; 0 before it): narrower, it is compact. Read by [`bars_height`].
+    pub toolbar_full_width: f32,
+    /// The Activity panel's folds that are open (`activity::Sections`; the profile's
+    /// `activity_sections`, with the Training fold's `activity.training_open`). Display state.
+    pub activity_sections: activity::Sections,
+    /// The Orbitals panel's folds that are open (`dock::orbitals`; the profile's
+    /// `orbital_sections`): the Spin readout in Spin density mode by default. Display state.
+    pub orbital_sections: dock::orbitals::Sections,
+    /// The Knowledge panel's folds that are open (`knowledge::Sections`; the profile's
+    /// `knowledge_sections`): "Why thin?", closed by default. Display state.
+    pub knowledge_sections: knowledge::Sections,
+    /// The Readouts panel's folds that are open (`dock::readouts`; the profile's
+    /// `readouts_sections`): Work done, Energy breakdown and solver, Compare. Display state.
+    pub readouts_sections: dock::readouts::Sections,
+    /// The Selection panel's folds that are open (`dock::selection`; the profile's
+    /// `selection_sections`): Details, Scene molecules, Partial charges. Display state.
+    pub selection_sections: dock::selection::Sections,
     /// Profiles (`profile`): the state in force kept per user, and the File ▸ Profiles… window.
     pub profiles: profile::Profiles,
     /// Energies in Ha, eV or both (Readouts).
@@ -792,8 +823,7 @@ pub struct UiState {
     pub temp_avg: TempAverage,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
-    /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
-    pub graph_series: GraphSeries,
+    /// The Readouts chart's window: the newest [`SPARK_WINDOW`] points, or all (at most 2000).
     pub graph_all: bool,
     /// The session log (the Log panel and its tab's unread count, toasts) and its filter.
     pub log: LogBook,
@@ -926,6 +956,10 @@ impl UiState {
             quality_slider: crate::quality::DEFAULT_H,
             box_len: crate::quality::box_len(scene),
             last_solve: None,
+            cloud_profiles: Vec::new(),
+            cloud_profiles_from: 0,
+            estimated_grid: None,
+            estimated_note_cache: None,
             volume_mode: 0,
             gamma: 0.5,
             opacity: 2.0,
@@ -1001,6 +1035,8 @@ impl UiState {
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
+            purge_confirm: false,
+            purge_seen: 0,
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
@@ -1017,12 +1053,18 @@ impl UiState {
             cloud_refresh_s: 2.0,
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
+            model_sections: dock::model::Sections::default(),
+            toolbar_full_width: 0.0,
+            activity_sections: activity::Sections::default(),
+            orbital_sections: dock::orbitals::Sections::default(),
+            knowledge_sections: knowledge::Sections::default(),
+            readouts_sections: dock::readouts::Sections::default(),
+            selection_sections: dock::selection::Sections::default(),
             profiles: Default::default(),
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
             temp_avg: TempAverage::default(),
             show_atom_card: true,
-            graph_series: GraphSeries::Both,
             graph_all: false,
             log: LogBook::default(),
             log_filter: LogFilter::All,
@@ -1059,6 +1101,8 @@ impl UiState {
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
     /// Takes a new scene's grid as the pending grid and its box as the one quality changes keep.
     pub(crate) fn adopt(&mut self, scene: &Scene) {
+        // the knowledge map's zoom and pan belong to the scene shown
+        self.knowledge.reset_view();
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
         self.box_len = crate::quality::box_len(scene);
@@ -1072,6 +1116,8 @@ impl UiState {
     pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
         self.source = SceneSource::File(path.to_string());
         self.scene_path = path.to_string();
+        // a file's grid is its own: never the estimated box rule's (`estimated_box`)
+        self.estimated_grid = None;
         // a file keeps its own policy (no key: all-electron, the physics it was written for)
         self.ionic = scene.ionic;
         self.adopt(scene);
@@ -1249,6 +1295,10 @@ pub struct PanelInput<'a> {
     /// The stale bonds' line while experience draws over them (`viewer::stale_bonds_line`: "bonds
     /// from experience (N pairs) · last DFT t = … fs"); `None` for the plain `bonds_label` line.
     pub stale_bonds_line: Option<String>,
+    /// The pairs (lower index first) the guess from experience draws as bonds over a stale graph
+    /// (`viewer::Viewer::experience_shown`, the looks that are `BondLook::Experience`): the
+    /// Selection panel's "guessed" chips. Empty when it draws nothing.
+    pub experience_bonds: Vec<(usize, usize)>,
     /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
     /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
     /// snapshot still moves on screen.
@@ -1340,8 +1390,11 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.compare.poll(input.snapshot);
     // an import of data folders (its own thread) reports when done
     poll_import(st);
+    poll_purge(st, input);
     // Esc during a tab's drag between windows is the drag's (docking spec D-15), before `keys`
     st.workspace.drag_escape(root.ctx(), None);
+    // the estimated solver's isolated-atom profiles: its box's R_cloud (`estimated_box`)
+    estimated_box::refresh_profiles(st, input);
     // the latest DFT solve's cost (the quality levels' estimates)
     if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
@@ -1353,6 +1406,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
     let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
+    probe_rect("toolbar-rect", bar_rect);
     activity::bar(root, st, input, bar_rect);
     let view = workspace::tree::show(root, st, input, &mut acts);
     out.view = Some(view);
@@ -1402,6 +1456,15 @@ pub(crate) fn poll_import(st: &mut UiState) {
     st.files.refresh_soon();
 }
 
+/// A purge's outcome (`ModelStatus::last_purge`) on the status line, once per purge.
+pub(crate) fn poll_purge(st: &mut UiState, input: &PanelInput<'_>) {
+    let Some((k, r)) = input.model().and_then(|m| m.last_purge.as_ref()) else { return };
+    if *k != st.purge_seen {
+        st.purge_seen = *k;
+        st.set_status(crate::sim::purge_line(r));
+    }
+}
+
 /// Draws detached window `id` (docking spec D-12) into its own egui context's root `ui`, in the
 /// same frame as [`show`] and after it, from the same state: its panels' actions are applied as
 /// the main window's are, and the viewer appends them to the frame's (main window first, then
@@ -1419,6 +1482,15 @@ pub fn show_window(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
     out
 }
 
+/// The panel a word names (`DockTab::name`, any case): the screenshot's `--ui tab=` and
+/// [`panels_named`]. "graph" names Readouts, which the Graph panel merged into on 2026-11-14.
+pub fn panel_named(w: &str) -> Option<DockTab> {
+    if w.trim().eq_ignore_ascii_case("graph") {
+        return Some(DockTab::Readouts);
+    }
+    DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w.trim()))
+}
+
 /// The panels a comma-separated list names (`DockTab::name`, any case): the windowed app's
 /// `--detach` and the screenshot's `--ui detach=`. An unknown name or an empty list is an error.
 pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
@@ -1426,7 +1498,7 @@ pub fn panels_named(list: &str) -> Result<Vec<DockTab>, String> {
         .split(',')
         .map(str::trim)
         .filter(|w| !w.is_empty())
-        .map(|w| DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(w)).ok_or_else(|| format!("unknown panel {w}")))
+        .map(|w| panel_named(w).ok_or_else(|| format!("unknown panel {w}")))
         .collect::<Result<Vec<_>, _>>()?;
     if tabs.is_empty() {
         return Err("no panel named".into());
@@ -1759,11 +1831,39 @@ pub fn open_menu(ctx: &egui::Context, st: &mut UiState, name: &str) -> Option<()
     Some(())
 }
 
+/// The top bar's and the toolbar's heights (points) in a window `width` points wide: the layouts
+/// `show` picks at that width (the top bar compact below [`COMPACT_WIDTH`], the toolbar also below
+/// the width its full layout needs). The viewer's resize estimate (`Viewer::resize_viewport`)
+/// keeps the 3D view's margins from them.
+pub fn bars_height(st: &UiState, width: f32) -> (f32, f32) {
+    let compact = width < COMPACT_WIDTH;
+    let top = if compact { menus::TOP_BAR_COMPACT } else { menus::TOP_BAR };
+    let bottom = if compact || width < st.toolbar_full_width { toolbar::HEIGHT_COMPACT } else { toolbar::HEIGHT };
+    (top, bottom)
+}
+
 /// Ctrl K opens the control search; Esc deselects when nothing else wants it (a text field, an
-/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`).
+/// open menu, the search, or an auto-hide flyout, which Esc hides: `workspace::autohide`); 1–4
+/// pick the Tool segments ([`TOOL_KEYS`]).
 fn keys(ctx: &egui::Context, st: &mut UiState, acts: &mut Vec<Action>) {
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
         st.search.toggle();
+    }
+    // the tool keys (user request 2026-11-14): the segments' own action (always enabled, like the
+    // segments), gated as Esc is on a text field, the search and the builder; the digit alone
+    // (Ctrl / Alt / Shift + digit stay free), not an auto-repeat. egui-winit gives the top row's
+    // digit and the numpad's (NumLock on) the same `Key::Num1`…
+    if !st.search.open && !st.builder.open && !ctx.egui_wants_keyboard_input() {
+        // the last one pressed this frame
+        let pressed = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } if modifiers.is_none() => TOOL_KEYS.iter().find(|(k, _)| k == key).map(|&(_, m)| m),
+                _ => None,
+            })
+        });
+        if let Some(mode) = pressed {
+            acts.push(Action::Tool(mode));
+        }
     }
     if !st.search.open
         && !st.builder.open
@@ -1836,7 +1936,7 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String, usize)> {
 
 /// Which of the trust readout's five variants applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TrustKind {
+pub(in crate::ui) enum TrustKind {
     NoModel,
     /// Trusted, but it has not answered at this geometry for a while.
     Stuck,
@@ -1982,7 +2082,9 @@ fn box_advice_with(scene: &Scene, solvers: u64, budget: crate::quality::VramBudg
 }
 
 /// An energy's two grid cells in the chosen units (Ha and eV; the unused one blank).
-fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
+/// An energy's two grid cells in `units`; `stacked`: both units in the first cell, one under the
+/// other (a narrow panel: side by side they ran past its right edge).
+fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool, stacked: bool) {
     let t = |s: String| {
         let r = egui::RichText::new(s).monospace();
         if strong {
@@ -1999,6 +2101,14 @@ fn energy_cells(ui: &mut egui::Ui, x: f64, units: EnergyUnits, strong: bool) {
         }
         EnergyUnits::Ev => {
             ui.label(t(format!("{ev:+.3} eV")));
+            ui.label("");
+        }
+        EnergyUnits::Both if stacked => {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(t(format!("{x:+.6} Ha")));
+                ui.label(t(format!("{ev:+.3} eV")));
+            });
             ui.label("");
         }
         EnergyUnits::Both => {

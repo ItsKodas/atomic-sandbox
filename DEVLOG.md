@@ -653,6 +653,89 @@ user can't test it.
 
 **Gate (Nov 13, merged tree):** app 673 passed, 0 failed, 4 ignored; `surface_reconfigure` 1 passed.
 
+### One model for radicals and closed shells (Nov 12–14; branch `claude/charming-keller-0bc26b`, nine tasks plus two added)
+
+Diagnosis Nov 12 20:58, spec Nov 13 00:40, last task commit Nov 14 00:23. 22 commits on the branch before the main merge, about 4,200 lines added across 31 files against main.
+
+The user's collection failed its training residuals at every refit. The diagnosis found two causes:
+- **A basis that was too small.** At body-4 degree 2 the shared O–H terms could not fit H₂O and H₃O at once (H₃O worst at 1.46× its bound).
+- **A recovery that ratcheted.** Each refit's recovery held more samples, failed anyway and kept them, reaching 180 held.
+
+Measured before the spec: degree 3 fits the collection and releases 68 holds; degree 4 was 46× slower and no better.
+
+**What landed:**
+- **G1:** the four-body degree is recorded per basis and grows from 2 to 3 with the store. The user accepted the cost: 1.1–1.4× a degree-2 refit at three species, ≈ 18 min for a cold attach at four species and 10,000 samples, over the spec's 5-minute stop line.
+- **G2:** a recovery that does not restore the training residuals holds nothing (one that restores them short of samples keeps its holds, untrusted).
+- **G3:** the samples the model still cannot reproduce (M, at most 10 %) are refused locally (`NearMisfit`) instead of untrusting the whole model.
+
+**What the reviews changed:**
+- **The physics review found a hole in G3.** The spec left M out of the class rule entirely. The near-misfit fence covers M's sampled points, not the band between them, so a geometry in the band whose environment key M shares would be answered as trusted. Estimated mode's audits catch that; Sandbox (M8b) has none.
+- **The user chose C1.** M stays in the class rule's average (RMS) terms, so a key with far-off misfits is refused. A wider fence (C2) was measured first and rejected: at 0.75 spreads it flagged 67 % of H₂ atoms on a variant with M populated.
+- **The C1 review found that the energy RMS decided nothing.** The physics review had assumed it did. The user then added the energy half: a key is refused when its energy RMS, misfits included, exceeds 1 — only when a misfit contributes, so with M empty nothing changes.
+- **Task reviews caught:** a loosened column floor, a recovery note that contradicted the trust badge, and answers near M kept on every step.
+
+**Acceptance on the user's collection (a copy):** trusted at degree 3, held 180 → 112 at the attach, then 88, 71, 54, 45, 44, 43, 42, 42. The fixed point comes at refit 8, not within the spec's 5; the user accepted that. Holds never rise, and |M| is 0 throughout, so G3 and C1 are not what make this collection trusted. Force errors are at or below degree 2 in every scene on both comparisons. The exception is HO's leave-one-out on its own fitted set: one sample, refused at both degrees for having one sample; the user accepted it.
+
+**The main merge** composed main's leave-one-out recovery ranking and Forget (code 7) with the no-ratchet restore. One change was made to main's rounds so that "never worse than before" still holds under the restore. Main's pre-1805 snapshot numbers in `references.md` (128 and 122 held) were measured before the merge and not re-run.
+
+**Gate (Nov 14, merged tree, each suite alone):**
+
+| Suite | Passed | Failed |
+|---|---|---|
+| units, qm, sim, surrogate | 486 | 0 |
+| providers | 384 | 0 |
+| validate `--test surrogate` | 7 | 0 |
+| `trust_baseline_report`, cadences 50 and 10 | identical to main at 50; met at 10 | — |
+| app (incl. replays) | 675 + 1 | 0 |
+
+The trust baseline's cadence-50 hot run had risen against its Oct 21 record (worst 5.15× against 2.87×). Main gave the identical report on the same machine, so the rise is main's, not this branch's. It is an open item for main. The app suite first failed to compile: the merge had added a field that one of this branch's tests did not set.
+
+
+### The UI redesign, purge and a box that fits the cloud (Nov 14; branches `thermostat-bar`, `model-tab`, `orbitals-tab`, `purge-forgotten`, `estimated-box`)
+
+All of this came from the user's play-testing in one day. They saw the mockup of each panel inline in the chat and approved it before it was built.
+
+**The panels:**
+- **Model:** a verdict card, Teach next, Health, and folds for the rest. The bookkeeping (every old row) moved into Details.
+- **Activity:** a job card with a convergence plot. The plot has a fixed log scale and keeps the previous three solves as ghosts, so it no longer flashes. The card also has an iterations-per-sample strip, a session timeline with a failures lane, and a solve log that folds repeated rows.
+- **Orbitals:** an energy-level diagram, compact rows, and folds for box states and the honesty texts.
+- **Knowledge:** a summary chip, scene pair chips, and a pair card with a "now" marker and Teach this.
+- **View:** four looks, called Clean, Glow, Scientific and Present. Glow is the user's own style, saved.
+- **Readouts:** it absorbed the Graph tab. Its ΔE axis is in µHa, because the old graph scaled every curve to its own range and drew 1e-6 Ha noise as a full swing.
+- **Selection:** an atom card and one neighbours list that merges distances and bonds.
+- **Also new:** a Thermostat group in the bottom bar, keys 1–4 for the tools, and zoom and pan on the knowledge map.
+
+**What the user caught by eye:**
+- There was no right-hand padding.
+- Inside the new cards, slider rails and preset buttons were invisible, because the cards' fill matched the widget fill. The fix went into the shared card helper, with a contrast test.
+
+**What the reviews caught:**
+- A resize estimate was 31 pt off, because it didn't know the toolbar's new compact height.
+- The full toolbar drew its bottom 3 pt off-screen.
+
+**Purge and the fence lift:**
+- **The bug.** Forgotten samples fenced their geometries forever. Agreeing DFT answers there were thinned as "similar", so H₂ fell back on every step once the thermostat or a drag reached the fenced band, whatever the user trained.
+- **New rule.** A forgotten sample's fence now lifts after three consecutive fresh answers agree with a model fitted without it.
+- **Purge.** It deletes forgotten samples for good, with a one-file backup, under the collection lock, and the swap-in is crash-safe.
+- **The review found a Critical.** A lift could be voted by a model still trained on the forgotten sample, in the window before the refit. It also found:
+  - the lift used the union of the votes' fenced sets instead of their intersection;
+  - a post-rename error that left memory and disk out of step;
+  - a replay that treated purge as harmless.
+
+  All were fixed and re-reviewed.
+- **The user chose "purge lifts, warn".**
+- **Purging their 45 forgotten H₂ samples ended the fallbacks.** The user: "after purging it works amazing".
+
+**The estimated box:** H₂ in the 12 Bohr preset box was box-clean only when centred, because the H tail falls below the face rule only about 5 Bohr out. In Estimated mode the box is now extent + 2 × (cloud reach + 2 Bohr), with the reach taken from the app's own isolated-atom solve. H₂ gets 109³ instead of 81³, and a DFT step costs about 2.4× more.
+
+**Gate (Nov 14, merged tree):**
+- app: 736 passed out of 737.
+- One test hit its 120 s snapshot wait while the user's app shared the GPU. It passed alone.
+- `pause_and_cancel_abort_a_sampling_solve_promptly` failed twice under GPU sharing (Pause took 1.7 s against its bound). Alone it took 681 ms and passed.
+- purge: surrogate 99, providers 399, validate `--test surrogate` 7, all passing.
+
+**Paused once.** The user suspected their GPU was overheating. Everything was stopped, including a measurement script that kept relaunching itself. Since then GPU work has run one job at a time, in batches of 15 min at most, with cool-downs between them.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

@@ -11,6 +11,10 @@ use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
 use sim::dynamics::{DT_WARN_FS, F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
 
+/// The top bar's height (points), full and compact (below `ui::COMPACT_WIDTH`).
+pub const TOP_BAR: f32 = 38.0;
+pub const TOP_BAR_COMPACT: f32 = 34.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuId {
     File,
@@ -51,7 +55,7 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
     let mut hot: Vec<egui::Rect> = Vec::new();
     let mut max_button = egui::Rect::NOTHING;
     let panel = egui::Panel::top("top-bar")
-        .exact_size(if compact { 34.0 } else { 38.0 })
+        .exact_size(if compact { TOP_BAR_COMPACT } else { TOP_BAR })
         .resizable(false)
         .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, theme::LINE)))
         .show(root, |ui| {
@@ -550,16 +554,19 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
     // M7: a level coarser than a pseudised species' h_req is refused by the provider (T8's certificate);
     // the menu says so before the click, from the same record
     let pseudised = super::pseudo::pseudised(input);
-    let cost = |n: usize| match st.last_solve {
+    let last_solve = st.last_solve;
+    let cost = |n: usize| match last_solve {
         Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
         None => "—".into(),
     };
     egui::Grid::new("quality").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
         for ((name, h), probe) in LEVELS.iter().zip(QUALITY_PROBES) {
-            let n = grid_n(st.box_len, *h);
+            // the box the change would build: the kept one, or the estimated solver's (`ui::estimated_box`)
+            let l = super::estimated_box::quality_box(st, scene, *h);
+            let n = grid_n(l, *h);
             let on = (scene.grid_h - h).abs() < 5e-4;
             let r = probed(probe, ui.selectable_label(on, format!("{} · h {h:.2}", title(name))))
-                .on_hover_text(format!("h = σ = {h} Bohr → {n}³ for this {:.1} Bohr box. {}", st.box_len, accuracy_hint(name)));
+                .on_hover_text(format!("h = σ = {h} Bohr → {n}³ for this {l:.1} Bohr box. {}", accuracy_hint(name)));
             if r.clicked() && !on {
                 acts.push(Action::Quality(*h));
             }
@@ -582,7 +589,8 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
             acts.push(Action::Quality(st.quality_slider));
         }
-        let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
+        let hs = crate::quality::snap(st.quality_slider);
+        let n = grid_n(super::estimated_box::quality_box(st, scene, hs), hs);
         ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
         if let Some(why) = super::pseudo::needs_finer(&pseudised, crate::quality::snap(st.quality_slider)) {
             ui.label(RichText::new(why).size(10.5).color(super::AMBER));
@@ -810,12 +818,13 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
             let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
-            // typed in the chosen scale, kept in kelvin, clamped at absolute zero
+            // typed in the chosen scale, kept in kelvin, clamped at absolute zero, no top (the
+            // toolbar's box takes any target too: a range here would pull one above it back down)
             let tu = st.temp_units;
             let mut shown = tu.from_k(t);
             let tc = probed(
                 "thermostat-t",
-                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 5000.0)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
             )
             .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
             .changed();

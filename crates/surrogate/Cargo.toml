@@ -6,5 +6,9 @@ version.workspace = true
 [dependencies]
 units = { path = "../units" }
 
+[features]
+# test hooks for other crates' tests (`Collection::inject_purge_failure`); never in a build
+test-hooks = []
+
 [dev-dependencies]
 rand = { workspace = true }

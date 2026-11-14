@@ -88,10 +88,11 @@ fn a_forgotten_sample_is_not_fitted_and_never_released() {
     assert_eq!((s.quarantine[k], s.superseded(), s.samples()), (Q_FORGOTTEN, 0, before + 1));
 }
 
-/// Final review I1: a forgotten sample's fence is permanent (never released or superseded), so the
-/// model refuses next to it at every visit — and each agreeing teacher answer there is an ordinary
-/// one: the first is kept (as pinned above), a second at the same geometry is a copy of it and a
-/// third a hair away is thinned, as anywhere else; before, every visit added a sample.
+/// Final review I1: a forgotten sample is never released or superseded, and each agreeing teacher
+/// answer next to it is an ordinary one: the first is kept (as pinned above), a second at the same
+/// geometry is a copy of it and a third a hair away is thinned, as anywhere else; before, every
+/// visit added a sample. Since 2026-11-14 the fence can lift (`fence_lift.rs`) — but no vote counts
+/// while a refit is due (the first answer was kept and no refit has run here), so the fence stands.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn agreeing_answers_next_to_a_forgotten_sample_are_thinned() {
@@ -135,6 +136,7 @@ fn agreeing_answers_next_to_a_forgotten_sample_are_thinned() {
     let notes = visit(&mut s, 2e-3);
     assert_eq!(s.samples(), before + 1, "a third a hair away is thinned: {notes:?}");
     assert!(notes.iter().any(|n| n.contains("training spreads from a stored one")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("no vote toward lifting their fence")), "a refit is due: {notes:?}");
     assert!(s.near_quarantined(&at(&s, 0.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]) == vec![k], "the fence stays");
 }
 
@@ -316,7 +318,7 @@ fn forget_and_restore_on_a_read_only_collection_say_this_session_only() {
 }
 
 /// A model over a fresh shared collection in `dir`: 40 H₂ samples and the H reference, fitted.
-fn small_collection(dir: &std::path::Path) -> (SurrogateKs, surrogate::SurfaceKey) {
+pub(super) fn small_collection(dir: &std::path::Path) -> (SurrogateKs, surrogate::SurfaceKey) {
     let (mut s, _) = pair_student();
     s.attach_collection(dir, &h2(1.4)).unwrap();
     s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));

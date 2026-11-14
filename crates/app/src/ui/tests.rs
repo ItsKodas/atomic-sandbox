@@ -144,6 +144,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         draft_banner: None,
         bonds_label: None,
         stale_bonds_line: None,
+        experience_bonds: Vec::new(),
         pseudo_generating: None,
         probe: None,
     }
@@ -154,13 +155,14 @@ pub(crate) fn model() -> ModelStatus {
         teacher: "GpuKs",
         fitted: true,
         trusted: true,
-        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
+        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false }),
         teach_offer: None,
         untrusted_reason: None,
         samples: 273,
         pending_refit: false,
         epoch: 3,
         fit: Some((271, 40, 2.1e-6, 1.6e-5)),
+        body4_degree: None,
         residuals: None,
         force_bound: 2e-3,
         provenance_mismatch: None,
@@ -211,6 +213,9 @@ pub(crate) fn model() -> ModelStatus {
         lone_note: None,
         collections: false,
         last_import: None,
+        purge_refusal: None,
+        forgotten_in_collection: 0,
+        last_purge: None,
         use_collection: false,
         source_is_autosave: false,
         specialised: Vec::new(),
@@ -932,6 +937,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     st.activity.absorb(&rich);
     st.show_knowledge = true; // the overlay's legend over every layout
     st.view_sections = super::dock::view::Sections::all(true); // every View-panel anchor drawn
+    st.model_sections = super::dock::model::Sections::all(true); // every Model-panel anchor drawn
+    st.orbital_sections = super::dock::orbitals::Sections::all(true); // every Orbitals-panel anchor drawn
+    st.readouts_sections = super::dock::readouts::Sections::all(true); // every Readouts-panel anchor drawn
+    st.selection_sections = super::dock::selection::Sections::all(true); // every Selection-panel anchor drawn
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
@@ -977,6 +986,10 @@ fn every_layout_draws_and_sends_nothing_without_input() {
             frame(&ctx, &mut st, &inp, w, vec![]);
             st.search.open = false;
         }
+    }
+    // a wide window too: the toolbar's Thermostat group needs ≈ 1590 pt
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &input(&scene, None, &cam), 1700.0, vec![]);
     }
     // every search entry's anchor is marked by a widget group in some layout (a misspelt anchor
     // would silently stop revealing)
@@ -1048,7 +1061,12 @@ fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, nam
     press_widget_w(ctx, st, inp, 1400.0, name, drag)
 }
 
-/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact layout).
+/// A window wide enough for the toolbar's full layout (it needs `toolbar::full_width`, ≈ 1584
+/// pt since the Thermostat group: the default 1400 gets the compact bar).
+const WIDE: f32 = 1700.0;
+
+/// [`press_widget`] in a window `w` points wide (900 high; below 1240 the compact top bar, below
+/// `toolbar::full_width` the compact toolbar).
 fn press_widget_w(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, name: &str, drag: f32) -> Vec<PanelOutput> {
     for _ in 0..3 {
         frame(ctx, st, inp, w, vec![]);
@@ -1112,29 +1130,29 @@ fn clicking_the_toolbar_sends_the_old_commands() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.gpu_available = true;
-    let outs = click_widget(&ctx, &mut st, &inp, "play");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "play", 0.0);
     assert_eq!(outs.iter().filter(|o| o.toggle_play).count(), 1, "Play clicked once");
     st.speed = 50;
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "watchable"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "watchable", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::SetSpeed(1)]), "{c:?}");
     let dt = st.dt_fs;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "speed", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetSpeed(n) if *n > 1)), "{c:?}");
     assert!(st.speed > 1 && st.dt_fs == dt, "speed {} dt {}", st.speed, st.dt_fs);
     let speed = st.speed;
-    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "dt", 60.0));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "dt", 60.0));
     assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetDt(x) if *x > 0.25)), "{c:?}");
     assert_eq!(st.speed, speed);
-    let outs = click_widget(&ctx, &mut st, &inp, "element-8");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "element-8", 0.0);
     assert!(outs.iter().all(|o| o.commands.is_empty()));
     assert_eq!((st.element, st.mode), (8, ToolMode::Place));
-    click_widget(&ctx, &mut st, &inp, "solver-estimated");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-estimated", 0.0);
     assert_eq!(st.backend, Backend::Estimated);
-    click_widget(&ctx, &mut st, &inp, "solver-cpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-cpu", 0.0);
     assert_eq!(st.backend, Backend::Cpu);
-    click_widget(&ctx, &mut st, &inp, "solver-gpu");
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "solver-gpu", 0.0);
     assert_eq!(st.backend, Backend::Gpu);
-    let outs = click_widget(&ctx, &mut st, &inp, "delete");
+    let outs = press_widget_w(&ctx, &mut st, &inp, WIDE, "delete", 0.0);
     let removes: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::RemoveNucleus(1))).collect();
     assert_eq!(removes.len(), 1, "Delete removes the selected nucleus once");
 }
@@ -1223,8 +1241,9 @@ fn a_fit_that_did_not_form_shows_why_and_retries() {
     }
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "retry-fit"));
     assert!(matches!(c.as_slice(), [DynCommand::RetryFit]), "{c:?}");
-    // the Activity tab's trust group says the same and retries too
+    // the Activity tab's trust group says the same and retries too (its fold opened)
     st.open_tab(DockTab::Activity);
+    st.activity_sections.trust = true;
     for _ in 0..3 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
@@ -1313,6 +1332,138 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
     }
 }
 
+/// 2026-11-14: "Purge forgotten (N)…" in the forgotten list's header — hidden with nothing
+/// forgotten; a click opens the inline confirmation (nothing sent); Cancel closes it and sends
+/// nothing; Purge sends exactly `Command::PurgeForgotten`, recorded as `# not replayable:
+/// purge-forgotten` (a replay skips it); disabled with the provider's reason or during a pass; the
+/// outcome goes to the status line once.
+#[test]
+fn purge_forgotten_needs_its_inline_confirmation() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    let suspect = |index, formula: &str, origin: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: origin.into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let base = ModelStatus { suspects: vec![suspect(1804, "HO", "fallback", Some(38.46))], ..model() };
+    let shared = sim::ModelSource::Collection { slug: "lsda_h0.15".into(), samples: 1805, read_only: false };
+    let with = ModelStatus { forgotten_samples: vec![suspect(40, "H2", "audit", None), suspect(41, "H2", "audit", None)], forgotten: 2, forgotten_in_collection: 2, source: shared, ..base.clone() };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let reveal = |st: &mut UiState, inp: &PanelInput<'_>| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, inp, 1400.0, vec![]);
+        }
+    };
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let acted = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.actions.clone()).collect::<Vec<_>>();
+    // nothing forgotten: no button
+    let snap = snapshot(&scene, Backend::Estimated, Some(base.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    assert!(!texts(&ctx, &mut st, &inp).contains("Purge forgotten"), "hidden at N = 0");
+    // two forgotten: the button; its click only opens the confirmation
+    let snap = snapshot(&scene, Backend::Estimated, Some(with.clone()));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Purge forgotten (2)…"), "{t}");
+    let confirm = super::dock::model::purge_confirm_text(2, 2, true);
+    assert!(confirm.starts_with("Delete 2 forgotten samples from the shared collection for good?") && confirm.contains("samples.bin.bak (replacing an older backup)") && confirm.ends_with("This can't be undone from the app."), "{confirm}");
+    // review findings 4–5 ("purge lifts, warn") and the minor on wording by where the samples are
+    assert!(confirm.contains("Geometries near them will no longer fall back to DFT; if they were bad data, keep them forgotten instead."), "{confirm}");
+    let file = super::dock::model::purge_confirm_text(1, 0, false);
+    assert!(file.starts_with("Delete 1 forgotten sample from this model for good? Save model then writes the model file without it.") && !file.contains("shared collection") && !file.contains("samples.bin.bak"), "{file}");
+    let session = super::dock::model::purge_confirm_text(3, 0, true);
+    assert!(session.starts_with("Delete 3 forgotten session-only samples for good (the shared collection doesn't hold them)?") && !session.contains("samples.bin.bak"), "{session}");
+    let mixed = super::dock::model::purge_confirm_text(3, 2, true);
+    assert!(mixed.starts_with("Delete 3 forgotten samples for good — 2 from the shared collection, 1 session-only?") && mixed.contains("samples.bin.bak"), "{mixed}");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "the first click sends nothing");
+    assert!(st.purge_confirm);
+    assert!(texts(&ctx, &mut st, &inp).contains(&confirm[..60]), "the confirmation shows");
+    // Cancel: nothing sent, the confirmation closes
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-cancel");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty(), "Cancel sends nothing");
+    assert!(!st.purge_confirm);
+    assert!(!texts(&ctx, &mut st, &inp).contains(&confirm[..60]));
+    // Purge: exactly the command
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-confirm");
+    assert!(matches!(sent(&outs).as_slice(), [Command::PurgeForgotten(2)]), "{:?}", sent(&outs));
+    assert!(matches!(acted(&outs).as_slice(), [Action::PurgeForgotten(2)]), "the confirmed count");
+    assert!(!st.purge_confirm);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::PurgeForgotten(2)), Some("purge-forgotten"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::PurgeForgotten(2)));
+    assert!(line.starts_with("# not replayable: purge-forgotten"), "{line}");
+    assert!(!crate::replay::is_harmless("purge-forgotten"), "a replay refuses it, like Forget (the fences change)");
+    // a refusal that appears while the confirmation is open disables its Purge
+    click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(st.purge_confirm);
+    let busy = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap_busy = snapshot(&scene, Backend::Estimated, Some(busy));
+    let inp_busy = input(&scene, Some(&snap_busy), &cam);
+    let outs = click_widget(&ctx, &mut st, &inp_busy, "purge-confirm");
+    assert!(sent(&outs).is_empty(), "Purge is disabled while refused: {:?}", sent(&outs));
+    click_widget(&ctx, &mut st, &inp_busy, "purge-cancel");
+    assert!(!st.purge_confirm);
+    // disabled with the provider's reason: a click opens nothing
+    let refused = ModelStatus { purge_refusal: Some("a refit is running — purge once it has landed".into()), ..with.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(refused));
+    let inp = input(&scene, Some(&snap), &cam);
+    reveal(&mut st, &inp);
+    let outs = click_widget(&ctx, &mut st, &inp, "purge-forgotten");
+    assert!(sent(&outs).is_empty() && !st.purge_confirm, "disabled");
+    // the outcome on the status line, once
+    // the status line by where the samples were
+    let line = |p: sim::PurgeReport| crate::sim::purge_line(&Ok(p));
+    assert_eq!(line(sim::PurgeReport { purged: 1, collection_mode: false, ..Default::default() }), "purged 1 forgotten sample from the model (Save model writes the model file without them)");
+    assert_eq!(line(sim::PurgeReport { purged: 2, collection_mode: true, ..Default::default() }), "purged 2 forgotten session-only samples");
+    assert_eq!(
+        line(sim::PurgeReport { purged: 3, from_collection: 2, collection_mode: true, backup: Some("x/samples.bin.bak".into()), warning: None }),
+        "purged 3 forgotten samples: 2 from the shared collection (backup: samples.bin.bak), 1 session-only"
+    );
+    let report = sim::PurgeReport { purged: 2, from_collection: 2, backup: Some(std::path::PathBuf::from("models/collections/x/samples.bin.bak")), collection_mode: true, warning: None };
+    let done = ModelStatus { forgotten_samples: Vec::new(), forgotten: 0, last_purge: Some((1, Ok(report))), ..base.clone() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(done));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "purged 2 forgotten samples (backup: samples.bin.bak)");
+    st.set_status("something else");
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, "something else", "shown once");
+    let failed = ModelStatus { last_purge: Some((2, Err(surrogate_refusal()))), ..base };
+    let snap = snapshot(&scene, Backend::Estimated, Some(failed));
+    let inp = input(&scene, Some(&snap), &cam);
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.status, format!("purge forgotten samples refused: {}", surrogate_refusal()));
+}
+
+fn surrogate_refusal() -> String {
+    "another copy of the app has this collection open — close it first".into()
+}
+
 /// M8a Task 4b: the Model tab's source line — shared (writable, read-only), a file, per-scene — and
 /// the import's outcome line; the tab draws them (and the switch) without sending anything; the
 /// switch's and the import's actions send their commands and are recorded as not replayable.
@@ -1342,6 +1493,8 @@ fn the_model_tab_says_where_the_model_learns() {
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
     st.open_tab(DockTab::Model);
+    // the source switch, Import and Save a specialised model… live in the Model file fold (2026-11-14)
+    st.model_sections.set(super::dock::model::Section::File, true);
     for _ in 0..3 {
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
     }
@@ -1400,7 +1553,7 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(None)]), "{c:?}");
     // the View panel's What you see (the panel alone: the Model panel, and its "draft", go)
-    view_panel(&mut st, &[dock::view::Section::What]);
+    view_panel(&mut st, &[]); // the estimated cloud card
     let outs = click_widget(&ctx, &mut st, &inp, "cloud-refresh");
     let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
     assert_eq!(clouds.len(), 1);
@@ -1872,8 +2025,11 @@ fn fs_per_s_shows_three_figures_in_five_characters_at_most() {
 /// Every toolbar group keeps its rect (to 0.5 pt) whatever the live values — fs/s 1 vs 999 999,
 /// this tick's rate, fallbacks 0 vs 100 %, epoch 1 vs 9999, the solver line long (untrusted,
 /// sampling) vs short (DFT) vs absent, the selection, the dt warning, the pull, the speed and
-/// dt fields, the element — in the full layout and the compact one; and no group outgrows the
-/// width it was given (`toolbar::Widths`), nor the window.
+/// dt fields, the element, the thermostat (on / off, 0 K … 20 000 K) — in the full layout and the
+/// compact one; and no group outgrows the width it was given (`toolbar::Widths`), nor the
+/// window. The Thermostat group sits between dt and Tool where the window has room for it: in
+/// the full layout (1600), in the compact one at 1400 (its short slider) and 1240 (its two boxes
+/// alone), not at 1000.
 #[test]
 fn the_toolbar_groups_hold_still_when_live_values_change() {
     use toolbar::GROUPS;
@@ -1913,29 +2069,39 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         target: None,
     });
     let dft = snapshot(&scene, Backend::Gpu, None);
-    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
-    let states: [(Option<&Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool); 5] = [
-        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false),
-        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true),
-        (None, None, Some(0), 37, 0.25, 8, 0.0125, false),
-        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true),
-        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true),
+    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing, thermostat on / T)
+    type State<'a> = (Option<&'a Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool, bool, f64);
+    let states: [State; 5] = [
+        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false, false, 0.0),
+        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true, true, 20_000.0),
+        (None, None, Some(0), 37, 0.25, 8, 0.0125, false, true, 300.0),
+        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true, false, 4999.5),
+        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true, true, 1.0),
     ];
     for w in [1600.0, 1400.0, 1240.0, 1000.0] {
         let mut first: Option<std::collections::BTreeMap<&'static str, (egui::Rect, f32)>> = None;
-        for (k, &(snap, rate, selected, speed, dt, element, pull, playing)) in states.iter().enumerate() {
+        for (k, &(snap, rate, selected, speed, dt, element, pull, playing, on, t)) in states.iter().enumerate() {
             let mut st = UiState::new("h2o", &scene);
             st.gpu_available = true;
             st.backend = snap.map_or(Backend::Estimated, |s| s.backend);
             st.mode = ToolMode::Select;
             (st.speed, st.dt_fs, st.element, st.drag_force) = (speed, dt, element, pull);
+            (st.thermostat_on, st.thermostat_t) = (on, t);
             let inp = PanelInput { selected, playing, measured_fs_per_s: rate, ..input(&scene, snap, &cam) };
             for _ in 0..2 {
                 GROUPS.with(|g| g.borrow_mut().clear());
                 frame(&ctx, &mut st, &inp, w, vec![]);
             }
             let groups = GROUPS.with(|g| g.borrow().clone());
-            assert_eq!(groups.len(), 7, "{w}: {:?}", groups.keys());
+            let thermostat = w != 1000.0;
+            assert_eq!(groups.len(), if thermostat { 8 } else { 7 }, "{w}: {:?}", groups.keys());
+            if thermostat {
+                // after dt, before Tool, overlapping neither
+                let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+                assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+            }
+            assert_eq!(PROBES.with(|p| p.borrow().contains_key("tb-thermostat-slider")), w >= 1400.0, "{w}: the slider");
+            PROBES.with(|p| p.borrow_mut().clear());
             for (anchor, (rect, width)) in &groups {
                 assert!(rect.width() <= width + 0.5, "{w} state {k}: {anchor} is {} wide, given {width}", rect.width());
                 assert!(rect.right() <= w, "{w} state {k}: {anchor} ends at {} past the window", rect.right());
@@ -1953,9 +2119,259 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         }
         let f = first.unwrap();
         let compact = f["tb-time"].0.height() < 40.0;
-        assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
+        assert_eq!(compact, w < 1600.0, "{w}: the full layout fits 1600, not 1400 (it needs {:.0})", toolbar::full_width(&ctx));
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
     }
+}
+
+// ---- the toolbar's Thermostat group (user request 2026-11-14) ----
+
+/// User ruling 2026-11-14: the toolbar is compact below the width its full layout needs with the
+/// Thermostat group (`toolbar::full_width`, measured from the groups' widths); at that width it
+/// is the full layout. The default 1400-pt window is compact and still holds the Thermostat slot
+/// (its short slider) between dt and Tool, overlapping neither.
+#[test]
+fn the_toolbar_is_full_from_the_width_its_groups_need() {
+    use toolbar::GROUPS;
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let full = toolbar::full_width(&ctx);
+    assert!((1400.0..1700.0).contains(&full), "the full layout's width: {full}");
+    let mut st = UiState::new("h2o", &scene);
+    st.backend = Backend::Estimated;
+    for (w, compact) in [(1400.0, true), (full.floor() - 1.0, true), (full.ceil(), false), (WIDE, false)] {
+        GROUPS.with(|g| g.borrow_mut().clear());
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..2 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let groups = GROUPS.with(|g| g.borrow().clone());
+        assert_eq!(groups["tb-time"].0.height() < 40.0, compact, "{w}: compact {compact}");
+        let (dt, th, tool) = (groups["tb-dt"].0, groups["tb-thermostat"].0, groups["tb-tool"].0);
+        assert!(dt.right() < th.left() && th.right() < tool.left(), "{w}: dt {dt:?}, thermostat {th:?}, tool {tool:?}");
+        for (anchor, (rect, width)) in &groups {
+            assert!(rect.width() <= width + 0.5 && rect.right() <= w, "{w}: {anchor} {rect:?} given {width}");
+        }
+        for probe in ["tb-thermostat-on", "tb-thermostat-slider", "tb-thermostat-t"] {
+            let r = probed_rect(probe);
+            assert!(th.expand(0.5).contains_rect(r), "{w}: {probe} {r:?} inside the group {th:?}");
+        }
+    }
+}
+
+/// The thermostat slider's travel: T = 5000 K · u³ — monotone, 0–1000 K beyond half the travel,
+/// whole kelvin back from the travel, and a target above the top pins the slider at its end.
+#[test]
+fn the_thermostat_slider_favours_low_temperatures() {
+    use toolbar::{thermostat_from_travel as from, thermostat_travel as travel, THERMOSTAT_SLIDER_MAX_K as TOP};
+    assert_eq!((travel(0.0), travel(TOP), from(0.0), from(1.0)), (0.0, 1.0, 0.0, TOP));
+    assert!(travel(1000.0) > 0.5, "0–1000 K takes more than half the travel: {}", travel(1000.0));
+    assert!((travel(1000.0) - 0.2f64.cbrt()).abs() < 1e-12 && (travel(300.0) - 0.06f64.cbrt()).abs() < 1e-12);
+    assert_eq!(from(0.5), 625.0);
+    let mut last = -1.0;
+    for k in 0..=5000 {
+        let t = k as f64;
+        let u = travel(t);
+        assert!(u > last, "monotone at {t} K");
+        last = u;
+        assert_eq!(from(u), t, "{t} K survives the round trip");
+    }
+    for t in [5000.5, 20_000.0, 1e6] {
+        assert_eq!(travel(t), 1.0, "{t} K pins the slider at its end");
+    }
+    assert_eq!(travel(-5.0), 0.0);
+}
+
+/// The text shapes painted inside `rect` in one frame `w` wide, in paint order.
+fn texts_in(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, rect: egui::Rect) -> String {
+    fn walk(s: &egui::epaint::Shape, rect: egui::Rect, out: &mut String) {
+        match s {
+            egui::epaint::Shape::Text(t) if rect.expand(2.0).contains(t.pos) => out.push_str(t.galley.text()),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, rect, out)),
+            _ => {}
+        }
+    }
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0))), ..Default::default() };
+    let mut full = ctx.run_ui(raw, |root| {
+        show(root, st, inp);
+    });
+    full.textures_delta.clear();
+    let mut out = String::new();
+    full.shapes.iter().for_each(|c| walk(&c.shape, rect, &mut out));
+    out
+}
+
+fn actions(outs: &[PanelOutput]) -> Vec<Action> {
+    outs.iter().flat_map(|o| o.actions.iter().cloned()).collect()
+}
+
+/// The toolbar's Thermostat group sends the Physics menu's own `Action::Thermostat`: its box is the
+/// menu's checkbox (the same action, the same driver command); its slider and its value set the
+/// target in kelvin whatever the scale shown and leave the thermostat off when it is off (no
+/// driver command then); the compact slot's shorter slider maps the same.
+#[test]
+fn the_toolbar_thermostat_sends_the_menus_action() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    // the menu's checkbox, for comparison
+    let mut menu = UiState::new("h2", &scene);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let from_menu = actions(&click_widget(&ctx, &mut menu, &inp, "thermostat"));
+    egui::Popup::close_all(&ctx);
+    assert_eq!(from_menu, vec![Action::Thermostat { on: true, t: 300.0, tau: 10.0 }]);
+    // full, and compact with its short slider (at 1240 the compact slot has the boxes alone)
+    for w in [1600.0, 1300.0] {
+        let mut st = UiState::new("h2", &scene);
+        st.temp_units = TempUnits::C;
+        // the slider's middle: half the travel, 5000 K / 8, in kelvin although °C is shown
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(dyn_commands(&outs).is_empty() && !st.thermostat_on && st.thermostat_t == 625.0, "{w}: off stays off");
+        // dragged right: hotter, still off
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 12.0);
+        assert!(st.thermostat_t > 625.0 && !st.thermostat_on, "{w}: {}", st.thermostat_t);
+        assert!(actions(&outs).iter().all(|a| matches!(a, Action::Thermostat { on: false, .. })));
+        // the box: the menu's action, the menu's command
+        st.thermostat_t = 300.0;
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), from_menu, "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(Some((t, tau)))] if *t == 300.0 && *tau == 10.0), "{w}");
+        // on: a new target is sent to the driver
+        let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-slider", 0.0));
+        assert!(matches!(c.as_slice(), [DynCommand::SetThermostat(Some((t, _)))] if *t == 625.0), "{w}: {c:?}");
+        let outs = press_widget_w(&ctx, &mut st, &inp, w, "tb-thermostat-on", 0.0);
+        assert_eq!(actions(&outs), vec![Action::Thermostat { on: false, t: 625.0, tau: 10.0 }], "{w}");
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SetThermostat(None)]), "{w}");
+    }
+}
+
+/// The target box shows the target in the chosen scale and takes a typed value in it, any value
+/// from absolute zero up: 20 000 K typed is kept — the slider pinned at its end, and neither it
+/// nor the Physics menu's own box (no top either now) pulls it back to 5000 K.
+#[test]
+fn the_toolbar_thermostat_box_shows_the_scale_and_keeps_any_target() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+    }
+    let rect = probed_rect("tb-thermostat-t");
+    for (u, shown) in [(TempUnits::K, "300 K"), (TempUnits::C, "26.9 °C"), (TempUnits::F, "80.3 °F")] {
+        st.temp_units = u;
+        frame(&ctx, &mut st, &inp, 1600.0, vec![]);
+        assert_eq!(texts_in(&ctx, &mut st, &inp, 1600.0, rect), shown);
+    }
+    // typed in °F: 100 °F is 310.93 K
+    let type_in = |st: &mut UiState, text: &str| {
+        let mut outs = press_widget_w(&ctx, st, &inp, 1600.0, "tb-thermostat-t", 0.0);
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![egui::Event::Text(text.into())]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]));
+        outs.push(frame(&ctx, st, &inp, 1600.0, vec![]));
+        actions(&outs)
+    };
+    let a = type_in(&mut st, "100");
+    assert!(matches!(a.as_slice(), [Action::Thermostat { on: false, t, tau }] if (*t - units::fahrenheit_to_kelvin(100.0)).abs() < 1e-9 && *tau == 10.0), "{a:?}");
+    // above the slider's top, in kelvin
+    st.temp_units = TempUnits::K;
+    let a = type_in(&mut st, "20000");
+    assert_eq!(a, vec![Action::Thermostat { on: false, t: 20_000.0, tau: 10.0 }]);
+    assert_eq!(st.thermostat_t, 20_000.0);
+    // drawn again, toolbar and Physics menu open: nothing changes it
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1600.0, vec![]).actions.is_empty());
+    }
+    egui::Popup::close_all(&ctx);
+    assert_eq!(st.thermostat_t, 20_000.0, "kept above the slider's top");
+    assert!(texts_in(&ctx, &mut st, &inp, 1600.0, probed_rect("tb-thermostat-t")).starts_with("20000"));
+    assert!(probed_rect("tb-thermostat-slider").width() > 70.0, "the full slider");
+}
+
+// ---- the tool keys (user request 2026-11-14) ----
+
+/// Keys 1–4 pick the Tool segments in the group's order through the segments' own
+/// `Action::Tool` (so `--record` writes them): Inspect, Place, Grab, Edit. The numpad's digits
+/// arrive as the same egui keys (egui-winit maps `Numpad1` and `Digit1` to `Key::Num1`; the
+/// logical "1" too). Nothing with Ctrl / Alt / Shift held, for an auto-repeat, while a text box
+/// has the keyboard (the digit goes into the box), or with Ctrl K's search open.
+#[test]
+fn keys_1_to_4_pick_the_tools() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let digit = |key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers, repeat: bool| {
+        egui::Event::Key { key, physical_key: physical, pressed: true, repeat, modifiers }
+    };
+    let press = |st: &mut UiState, key: egui::Key, physical: Option<egui::Key>, modifiers: egui::Modifiers| {
+        let repeat = false;
+        let text = key.symbol_or_name().to_string();
+        let out = frame(&ctx, st, &inp, WIDE, vec![digit(key, physical, modifiers, repeat), egui::Event::Text(text)]);
+        // released (egui marks a press of a key it holds down as a repeat)
+        let up = egui::Event::Key { key, physical_key: physical, pressed: false, repeat: false, modifiers };
+        frame(&ctx, st, &inp, WIDE, vec![up]);
+        out.actions
+    };
+    use egui::Key::{Num1, Num2, Num3, Num4};
+    use egui::Modifiers as M;
+    for _ in 0..2 {
+        frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    }
+    assert_eq!(st.mode, ToolMode::Orbit);
+    // the top row (logical and physical key), in an order where each one changes the tool
+    for (key, mode) in [(Num4, ToolMode::Edit), (Num3, ToolMode::Select), (Num2, ToolMode::Place), (Num1, ToolMode::Orbit)] {
+        assert_eq!(press(&mut st, key, Some(key), M::NONE), vec![Action::Tool(mode)], "{key:?}");
+        assert_eq!(st.mode, mode, "{key:?}");
+    }
+    // the numpad as egui-winit hands it over, and a layout giving only the logical digit
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)]);
+    assert_eq!(press(&mut st, Num3, None, M::NONE), vec![Action::Tool(ToolMode::Select)]);
+    // the segments' own click sends the same action
+    assert_eq!(actions(&press_widget_w(&ctx, &mut st, &inp, WIDE, "tool-Edit", 0.0)), vec![Action::Tool(ToolMode::Edit)]);
+    // modifiers and auto-repeats: nothing
+    for m in [M::CTRL, M::COMMAND, M::ALT, M::SHIFT] {
+        assert!(press(&mut st, Num1, Some(Num1), m).is_empty(), "{m:?}+1");
+    }
+    assert_eq!(st.mode, ToolMode::Edit);
+    // held: egui marks the next press of a key still down an auto-repeat, which does nothing
+    let held = digit(Num1, Some(Num1), M::NONE, false);
+    assert_eq!(frame(&ctx, &mut st, &inp, WIDE, vec![held.clone(), egui::Event::Text("1".into())]).actions, vec![Action::Tool(ToolMode::Orbit)]);
+    st.mode = ToolMode::Edit;
+    assert!(frame(&ctx, &mut st, &inp, WIDE, vec![held, egui::Event::Text("1".into())]).actions.is_empty(), "a repeat");
+    frame(&ctx, &mut st, &inp, WIDE, vec![egui::Event::Key { key: Num1, physical_key: Some(Num1), pressed: false, repeat: false, modifiers: M::NONE }]);
+    assert_eq!(st.mode, ToolMode::Edit);
+    // a text box with the keyboard (the speed box, clicked into its text): the digit is typed
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "speed", 0.0);
+    assert!(ctx.egui_wants_keyboard_input(), "the speed box is being typed in");
+    let typed = press(&mut st, Num1, Some(Num1), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "typed, not a tool: {typed:?}");
+    assert_eq!(st.mode, ToolMode::Edit);
+    frame(&ctx, &mut st, &inp, WIDE, vec![key(egui::Key::Escape, M::NONE)]);
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    assert!(!ctx.egui_wants_keyboard_input());
+    // Ctrl K's search open (its field has the keyboard; the gate holds without it too)
+    st.search.toggle();
+    let typed = press(&mut st, Num2, Some(Num2), M::NONE);
+    assert!(typed.iter().all(|a| !matches!(a, Action::Tool(_))), "the search is open: {typed:?}");
+    st.search.toggle();
+    frame(&ctx, &mut st, &inp, WIDE, vec![]);
+    assert_eq!(press(&mut st, Num2, Some(Num2), M::NONE), vec![Action::Tool(ToolMode::Place)], "and back");
 }
 
 // ---- M6 Task 10: bonds, molecules, badge, relax, isotopes, the periodic table ----
@@ -2052,12 +2468,12 @@ fn clicking_the_m6_controls_sends_their_commands() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
     let mut relaxing = snapshot(&scene, Backend::Gpu, None);
     relaxing.dynamics.relax = Some(relax_progress(None));
     let inp_r = PanelInput { selected: Some(0), ..input(&scene, Some(&relaxing), &cam) };
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp_r, "relax"));
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp_r, WIDE, "relax", 0.0));
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
     let in_menu = |st: &mut UiState, inp: &PanelInput<'_>, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
@@ -2076,7 +2492,7 @@ fn clicking_the_m6_controls_sends_their_commands() {
     // View ▸ Display aids ▸ show what training is solving: on by default, display only (no command,
     // no recorded action), and found by Ctrl K
     assert!(st.show_ghost);
-    view_panel(&mut st, &[dock::view::Section::Aids]);
+    view_panel(&mut st, &[]); // the Display aids card
     let outs = click_widget(&ctx, &mut st, &inp, "show-ghost");
     assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
     assert!(!st.show_ghost);
@@ -2086,6 +2502,8 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
     assert!(matches!(search::results("what training", 1)[0].place, search::Place::Dock(DockTab::View)));
     st.open_tab(DockTab::Selection);
+    // the isotope label opens the picker (the atom card's mass label, 2026-11-14)
+    click_widget(&ctx, &mut st, &inp, "selection-isotope");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
     // the periodic table
@@ -2418,9 +2836,13 @@ fn superscripts_are_drawn_raised() {
 /// Review I2: a scene or quality change over the GPU memory budget is refused with a message
 /// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
 /// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
-/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³, two GPU solvers —
-/// teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
-/// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
+/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³ for its own 14 Bohr
+/// box, two GPU solvers — teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
+/// through — on the estimated solver's own box since 2026-11-14 (`ui::estimated_box`): H₂O's span
+/// 2.86 Bohr + 2 × (the provisional 5.98 Bohr cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the
+/// largest grid (201³), over the budget, so it falls back to the largest grid the guard passes
+/// (189³ under the 12 GB default). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here,
+/// and the card's memory when a viewer test reported it: the expected grid is the guard's own.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
@@ -2456,7 +2878,18 @@ fn a_change_over_the_vram_budget_is_refused() {
     (st.backend, st.gpu_available) = (Backend::Estimated, true);
     let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
     assert!(out.error.is_none(), "{:?}", out.error);
-    assert!(matches!(out.commands.as_slice(), [Command::SetGrid { n: 177, h }] if *h == 0.08), "{:?}", out.commands);
+    let solvers = gpu_solvers(Backend::Estimated, true);
+    let w8r = &w8;
+    let fits = |b: VramBudget| move |n: usize| vram_check(&Scene { grid_n: n, ..w8r.clone() }, solvers, b).is_ok();
+    let default = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(budget));
+    assert_eq!((default.want_n, default.n, default.capped), (201, 189, true), "under the 12 GB default");
+    let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
+    assert!((177..201).contains(&n), "{n}");
+    assert!(
+        matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
+        "{:?}",
+        out.commands
+    );
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----
@@ -2544,7 +2977,7 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
     use sim::activity::{TrustCheck, TrustKey as K};
     let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
-    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise, audit]
         .into_iter()
         .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0, worst: None })
         .collect()
@@ -2570,6 +3003,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
         atom: None,
         text: "this kind of environment isn't learned well enough yet (many-body: LOO force error 12.0× the bound, RMS 0.10×, 587 samples) — worst leave-one-out sample #345".into(),
         unlearned: None,
+        forgotten_fence: false,
     };
     let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
     let t = trust(Some(&m), &scene, &st);
@@ -2585,7 +3019,7 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
     let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
     assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");
     // the scene's own pass is not in the fit: "not this scene", even where the policy answers
-    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()) };
+    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()), forgotten_fence: false };
     let t = trust(Some(&ModelStatus { readiness: Some(unlearned), quarantined: 0, ..model() }), &scene, &st);
     assert_eq!(t.kind, TrustKind::NotHere);
     assert!(t.text.starts_with("not this scene — this scene is not learned"), "{}", t.text);
@@ -2788,11 +3222,9 @@ mod orbital_viewer {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.close_panel(DockTab::Orbitals);
-        assert!(!st.tab_shown(DockTab::Orbitals));
-        // the View panel's What you see (on screen in the default layout)
-        assert!(st.tab_shown(DockTab::View) && st.view_sections.is_open(crate::ui::dock::view::Section::What));
-        let outs = click_widget(&ctx, &mut st, &inp, "menu-show-orbitals");
+        // the Orbitals panel's show selector (the View panel's until 2026-11-14)
+        alone(&mut st, DockTab::Orbitals);
+        let outs = click_widget(&ctx, &mut st, &inp, "show-orbitals");
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "one request");
         assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: crate::ui::HOMO_TRACK, squared: false });
@@ -3181,7 +3613,8 @@ mod orbital_viewer {
         PROBES.with(|p| p.borrow_mut().clear());
         let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
         let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
-        assert!(has("↑↓ paired · 1 occupied") && has("↑↓ unoccupied") && has("#1 ↑↓") && has("occ 2"), "{texts:?}");
+        assert!(has("↑↓ paired · 1 occupied") && has("↑↓ unoccupied") && has("#1 ↑↓"), "{texts:?}");
+        assert!(!has("occ 2"), "a whole occupation is the diagram's arrows, not a badge: {texts:?}");
         assert!(!has("↑ spin") && !has("↓ spin") && !has("↓: none occupied"), "{texts:?}");
         let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
         assert!(probed("orbital-↑↓-1") && probed("orbital-↑↓-3"));
@@ -3245,8 +3678,10 @@ mod orbital_viewer {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
         let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
-        let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
-        assert!(has("#1 ↑↓") && has("↓ not converged (residual 3.0e-4)"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("#1 ↑↓")), "{texts:?}");
+        // the caveat is the row's ⚠, its full text on hover
+        let t = hover_text(&ctx, &mut st, &inp, "warn-↑↓-1");
+        assert!(t.contains("↓ not converged (residual 3.0e-4)"), "{t}");
     }
 
     /// Every pinned honesty string is in the text its widget shows (tooltips are built by these
@@ -3421,7 +3856,7 @@ mod orbital_viewer {
         assert_eq!(search::results("all orbitals", 1)[0].name, "All orbitals coloured");
         assert_eq!(search::results("density", 1)[0].name, "Density");
         for name in ["Density", "Orbitals", "All orbitals coloured", "Spin density"] {
-            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::Orbitals) && e.anchor == "d-orb-mode"), "{name}: the Orbitals panel's show selector");
         }
         assert_eq!(search::results("unoccupied", 1)[0].place, search::Place::Dock(DockTab::Orbitals));
     }
@@ -3926,9 +4361,10 @@ mod orbital_viewer {
         let mut st = UiState::new("h2o", &scene);
         st.show = ShowMode::Orbitals;
         alone(&mut st, DockTab::Orbitals);
+        st.orbital_sections.set(crate::ui::dock::orbitals::Section::Box, true); // the box state's row is in its fold
         PROBES.with(|p| p.borrow_mut().clear());
         let texts: Vec<String> = coloured_texts(&ctx, &mut st, &inp).into_iter().map(|(t, _)| t).collect();
-        for h in ["O #0", "H #1", "box states", "from an earlier geometry"] {
+        for h in ["O #0", "H #1", "Box states (1)", "from an earlier geometry"] {
             assert!(texts.iter().any(|t| t == h), "{h}: {texts:?}");
         }
         let probed = |name: &str| PROBES.with(|p| p.borrow().contains_key(name));
@@ -4131,6 +4567,381 @@ mod orbital_viewer {
         let h1 = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(faint(&coloured_texts(&ctx, &mut st, &h1)), ["#2 ↑↓"], "picked and not lit: still readable");
     }
+
+    // ---- the redesigned tab (user's approved mockup, 2026-11-14) ----
+
+    /// The probes of one frame of the tab (cleared first), drawn alone at 1400 pt.
+    fn probes_of(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> std::collections::BTreeSet<String> {
+        for _ in 0..2 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, 1400.0, vec![]);
+        PROBES.with(|p| p.borrow().keys().cloned().collect())
+    }
+
+    /// Only the mode on screen draws its controls — no greyed controls of the others; the rare
+    /// controls of All orbitals coloured are under "more"; "empty shown" only where it acts.
+    #[test]
+    fn only_the_modes_own_controls_are_drawn() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Orbitals);
+        st.volume_mode = crate::ui::VOLUME_ISO;
+        let orbitals = ["orbitals-render", "orbitals-iso"];
+        let coloured = ["orbitals-blend", "orbitals-enclosed"];
+        let more = ["orbitals-hide-core", "preset-valence", "orbitals-scale"];
+        let none_of = |p: &std::collections::BTreeSet<String>, names: &[&str], what: &str| {
+            for n in names {
+                assert!(!p.contains(*n), "{what}: {n} drawn");
+            }
+        };
+        let all_of = |p: &std::collections::BTreeSet<String>, names: &[&str], what: &str| {
+            for n in names {
+                assert!(p.contains(*n), "{what}: {n} missing");
+            }
+        };
+        st.show = ShowMode::Orbitals;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &orbitals, "Orbitals");
+        assert!(p.contains("unoccupied"));
+        none_of(&p, &coloured, "Orbitals");
+        none_of(&p, &more, "Orbitals");
+        st.show = ShowMode::Coloured;
+        st.colour_look.enclose = Some(90);
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &coloured, "Coloured");
+        assert!(p.contains("unoccupied") && p.contains("orbitals-fold-more"));
+        none_of(&p, &orbitals, "Coloured");
+        none_of(&p, &more, "Coloured, more folded");
+        st.orbital_sections.set(Section::More, true);
+        st.colour_look.enclose = None;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &more, "Coloured, more open");
+        assert!(!p.contains("orbitals-enclosed"), "draw: density has no enclosed share");
+        st.show = ShowMode::Spin;
+        let p = probes_of(&ctx, &mut st, &inp);
+        all_of(&p, &orbitals, "Spin (render and its iso)");
+        assert!(!p.contains("unoccupied"), "Spin density solves no unoccupied orbitals");
+        none_of(&p, &coloured, "Spin");
+        st.show = ShowMode::Density;
+        let p = probes_of(&ctx, &mut st, &inp);
+        none_of(&p, &[&orbitals[..], &coloured[..], &more[..], &["unoccupied"]].concat(), "Density");
+        // Ctrl K: a control of another mode is marked on its mode's button
+        let mode_button = probed_rect("show-colour");
+        assert_eq!(probed_rect("anchor-d-orb-colour"), mode_button);
+        assert_eq!(probed_rect("anchor-d-orb-style"), probed_rect("show-orbitals"));
+        // and a reveal of a "more" control unfolds it in its mode
+        st.show = ShowMode::Coloured;
+        st.orbital_sections.set(Section::More, false);
+        st.search.reveal = Some(("d-orb-colour-more", std::time::Instant::now(), false));
+        probes_of(&ctx, &mut st, &inp);
+        assert!(st.orbital_sections.is_open(Section::More), "the reveal unfolds more");
+    }
+
+    /// The level diagram: one line per spatial orbital (a closed shell's pair is one), HOMO and LUMO
+    /// labelled with ε, the gap's value; no gap for a partly filled shell; box states above the
+    /// dashed line; ↑ and ↓ columns for an open shell.
+    #[test]
+    fn the_level_diagram_labels_homo_lumo_and_the_gap() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let o = h2_closed();
+        let (split, es) = orbitals::entries(&o);
+        assert!(!split && es.len() == 2, "one entry per pair");
+        let levels = Levels::of(&o.rows);
+        let lay = orbitals::level_layout(&es, split, &levels, 120.0, 120.0);
+        assert_eq!((lay.columns, lay.lines.len()), (1, 2));
+        assert!(lay.lines[1].y < lay.lines[0].y, "σ_u above σ_g: {lay:?}");
+        assert!(lay.dashed.is_none() && lay.homo_y == Some(lay.lines[0].y) && lay.lumo_y == Some(lay.lines[1].y));
+        // on screen
+        let snap = with_payload(&scene, Backend::Gpu, o.clone());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert_eq!(p.iter().filter(|k| k.starts_with("level-")).count(), 2, "{p:?}");
+        assert!(p.contains("level-↑↓-1") && p.contains("level-↑↓-3"));
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        let has = |n: &str| texts.iter().any(|t| t == n);
+        assert!(has("HOMO −0.500 Ha") && has("LUMO 0.020 Ha") && has("gap 0.520 Ha"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("ENERGY LEVELS · ")), "{texts:?}");
+        // a partly filled shell: no gap is quoted
+        let third = 1.0 / 3.0;
+        let mut frac = payload(
+            vec![
+                row(Spin::Up, 0, 1, 0, -0.87, 1.0, idx(1)),
+                row(Spin::Down, 0, 3, 0, -0.83, 1.0, idx(1)),
+                row(Spin::Down, 1, 4, 1, -0.28, third, idx(2)),
+                row(Spin::Down, 2, 5, 2, -0.28, third, idx(3)),
+                row(Spin::Down, 3, 6, 3, -0.28, third, idx(4)),
+                row(Spin::Down, 4, 7, 4, 0.05, 0.0, idx(5)),
+            ],
+            OrbitalRequest::List,
+        );
+        frac.spin = SpinSummary { n_up: 1, n_dn: 2, integral: -1.0, abs_integral: 1.0, ..closed_spin() };
+        let (split, es) = orbitals::entries(&frac);
+        let lay = orbitals::level_layout(&es, split, &Levels::of(&frac.rows), 80.0, 120.0);
+        assert_eq!(lay.columns, 2, "↑ and ↓ side by side");
+        let p_lines: Vec<_> = lay.lines.iter().filter(|l| (es[l.entry].r.energy + 0.28).abs() < 1e-9).collect();
+        assert_eq!(p_lines.len(), 3);
+        assert!(p_lines.iter().all(|l| l.y == p_lines[0].y && l.column == 1), "the degenerate shell side by side in ↓");
+        assert!(p_lines.windows(2).all(|w| w[0].x1 <= w[1].x0), "not on top of each other");
+        let snap = with_payload(&scene, Backend::Gpu, frac);
+        let inp = input(&scene, Some(&snap), &cam);
+        for _ in 0..2 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 6.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "HOMO −0.280 Ha") && texts.iter().any(|t| t == "partly filled: no gap"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("gap ")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "1/3"), "the fraction on the arrow: {texts:?}");
+        // box states: faded above the dashed line
+        let mut boxed = h2_closed();
+        let mut b = row(Spin::Up, 2, 9, 2, 0.04, 0.0, idx(3));
+        b.box_state = true;
+        boxed.rows.push(b.clone());
+        b.spin = Spin::Down;
+        b.track = 10;
+        boxed.rows.push(b);
+        let (split, es) = orbitals::entries(&boxed);
+        let lay = orbitals::level_layout(&es, split, &Levels::of(&boxed.rows), 120.0, 120.0);
+        let d = lay.dashed.expect("a dashed line");
+        assert!(lay.lines.iter().all(|l| if l.boxed { l.y < d } else { l.y > d }), "{lay:?}");
+        assert_eq!(lay.lines.iter().filter(|l| l.boxed).count(), 1);
+    }
+
+    /// A click on a level picks the same orbital as a click on its row (closed shell: the ↑
+    /// member; open shell: the row's own channel).
+    #[test]
+    fn clicking_a_level_picks_like_its_row() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        for (o, probe) in [(h2_closed(), "↑↓-1"), (h2_closed(), "↑↓-3"), (payload(h2_rows(), OrbitalRequest::List), "↓-2")] {
+            let snap = with_payload(&scene, Backend::Gpu, o);
+            let inp = input(&scene, Some(&snap), &cam);
+            let level = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("level-{probe}")));
+            let pick = st.orbital_pick;
+            let row = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("orbital-{probe}")));
+            assert_eq!(level.len(), 1, "{probe}");
+            assert_eq!(level, row, "{probe}");
+            assert_eq!(pick, st.orbital_pick, "{probe}");
+        }
+    }
+
+    /// The compact rows: HOMO and LUMO are badges on their rows (no line of their own); the caveats
+    /// are one ⚠ with the full text on hover; a degenerate set reads ×n.
+    #[test]
+    fn homo_and_lumo_are_badges_on_the_rows() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut o = h2_closed();
+        o.rows[1].rotated = true;
+        o.rows[3].rotated = true;
+        o.rows[1].cluster = Some((2, 1e-5));
+        o.rows[3].cluster = Some((2, 1e-5));
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        probes_of(&ctx, &mut st, &inp);
+        let inside = |badge: &str, row: &str| {
+            let (b, r) = (probed_rect(badge), probed_rect(row));
+            assert!(b.center().y > r.top() && b.center().y < r.bottom(), "{badge} {b:?} on the row {row} {r:?}");
+        };
+        inside("homo-↑↓-1", "orbital-↑↓-1");
+        inside("lumo-↑↓-3", "orbital-↑↓-3");
+        inside("eps-↑↓-1", "orbital-↑↓-1");
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "×2"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("rotated for display") || t.starts_with("degenerate ×")), "no tag lines: {texts:?}");
+        let t = hover_text(&ctx, &mut st, &inp, "warn-↑↓-3");
+        assert!(t.contains("rotated for display") && t.contains("rotated within a degenerate set for display"), "{t}");
+    }
+
+    /// Box states are listed only inside their fold (closed by default), under one shared warning.
+    #[test]
+    fn box_states_are_only_in_their_fold() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut o = h2_closed();
+        for (spin, track) in [(Spin::Up, 9), (Spin::Down, 10)] {
+            let mut b = row(spin, 2, track, 2, 0.04, 0.0, idx(3));
+            b.box_state = true;
+            o.rows.push(b);
+        }
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        assert!(!st.orbital_sections.is_open(Section::Box));
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert!(p.contains("orbitals-fold-box") && !p.contains("orbital-↑↓-9"), "{p:?}");
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Box states (1)") && texts.iter().any(|t| t == "unbound at this box size"), "{texts:?}");
+        click_widget(&ctx, &mut st, &inp, "orbitals-fold-box");
+        let p = probes_of(&ctx, &mut st, &inp);
+        assert!(p.contains("orbital-↑↓-9"));
+        let texts: Vec<String> = frame_texts(&ctx, &mut st, &inp, vec![], 6.0).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts.iter().filter(|t| t.contains(orbitals::BOX_STATE_TIP)).count(), 1, "one shared warning: {texts:?}");
+        assert!(probed_rect("orbital-↑↓-9").top() > probed_rect("orbitals-list").bottom(), "below the list, in the fold");
+    }
+
+    /// The folds' open state is display state kept in the profile (`orbital_sections`): a header
+    /// click sends nothing; the line round-trips; absent is the default (the Spin readout in Spin
+    /// density mode); outside Spin mode the readout says "Spin view only".
+    #[test]
+    fn the_orbital_folds_are_kept_in_the_profile() {
+        use crate::ui::dock::orbitals::{Section, Sections};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        assert!(profile::capture(&st).contains("\norbital_sections = spin\n"));
+        let texts: Vec<String> = { probes_of(&ctx, &mut st, &inp); frame_texts(&ctx, &mut st, &inp, vec![], 5.0).into_iter().map(|(t, _)| t).collect() };
+        assert!(texts.iter().any(|t| t == "Spin view only"), "{texts:?}");
+        let outs = click_widget(&ctx, &mut st, &inp, "orbitals-fold-about");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        click_widget(&ctx, &mut st, &inp, "orbitals-fold-spin");
+        assert_eq!(st.orbital_sections.encode(), "spin,spin-other,about");
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.orbital_sections.encode(), "spin,spin-other,about");
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.orbital_sections, Sections::default());
+        profile::apply(&mut fresh, "orbital_sections = \n");
+        assert_eq!(fresh.orbital_sections, Sections::all(false));
+        assert!(!fresh.orbital_sections.is_open(Section::Spin));
+    }
+
+    /// Every honesty constant's text is still reachable: in full in About orbitals, and the view
+    /// card's one-line note carries KS_NOTE and SPIN_NOTE on hover.
+    #[test]
+    fn every_honesty_text_is_reachable() {
+        use crate::ui::dock::orbitals::Section;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, h2_closed());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        alone(&mut st, DockTab::Orbitals);
+        st.orbital_sections.set(Section::About, true);
+        let texts: Vec<String> = coloured_texts(&ctx, &mut st, &inp).into_iter().map(|(t, _)| t).collect();
+        for c in [orbitals::KS_NOTE, orbitals::SPIN_NOTE, orbitals::HOMO_TIP, orbitals::GAP_TIP, orbitals::UNOCCUPIED_TIP, orbitals::BOX_STATE_TIP, orbitals::SIGN_TIP, orbitals::PAIRED_TIP] {
+            assert!(texts.iter().any(|t| t == c), "{c:?} not in About orbitals");
+        }
+        let t = hover_text(&ctx, &mut st, &inp, "orbitals-ks-note");
+        assert!(t.contains(orbitals::KS_NOTE) && t.contains(orbitals::SPIN_NOTE), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-gap");
+        assert!(t.contains(orbitals::GAP_TIP), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-homo");
+        assert!(t.contains(orbitals::HOMO_TIP), "{t}");
+    }
+
+    /// At about 320 pt, with a grouped open-shell molecule, every fold open and the coloured mode's
+    /// controls, the sections stack without overlap, rows keep ε clear of their labels, and no text
+    /// runs past the panel's right edge.
+    #[test]
+    fn the_orbitals_panel_fits_320_pt() {
+        use crate::ui::dock::orbitals::Sections;
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let mut o = water_by_atom();
+        let mut b = row(Spin::Up, 3, 6, 3, 0.03, 0.0, idx(4));
+        b.box_state = true;
+        o.rows.push(b);
+        o.rows[0].not_converged = true;
+        o.rows[0].residual = Some(3e-4);
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for mode in [ShowMode::Coloured, ShowMode::Orbitals, ShowMode::Spin] {
+            let mut st = UiState::new("h2o", &scene);
+            st.show = mode;
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Orbitals*])").unwrap());
+            st.orbital_sections = Sections::all(true);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 4000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("orbitals-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["orbitals-view", "orbitals-levels", "orbitals-list", "orbitals-fold-box", "orbitals-fold-spin", "orbitals-fold-about"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{mode:?} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{mode:?} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            for t in [1, 2, 3, 4, 5] {
+                let arrows = if t <= 3 { "↑" } else { "↓" };
+                let (label, eps) = (probed_rect(&format!("orbital-{arrows}-{t}")), probed_rect(&format!("eps-{arrows}-{t}")));
+                assert!(label.right() < eps.left(), "{mode:?} row {t}: ε {eps:?} over the label {label:?}");
+                let share = probed_rect(&format!("share-{arrows}-{t}"));
+                assert!(eps.right() <= share.left() + 0.5 && share.right() <= panel.right() + 1.0, "{mode:?} row {t}: {eps:?} / {share:?}");
+            }
+            let warn = probed_rect("warn-↑-1");
+            assert!(warn.right() < probed_rect("eps-↑-1").left(), "{mode:?}: the ⚠ clear of ε");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{mode:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
+    }
+
 }
 
 /// The Activity tab (activity spec §3.3): state, job rows, the solve log, the views contract.
@@ -4464,7 +5275,7 @@ mod activity_tab {
         st.activity.views_sent = false; // Viewer::start
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
         // hiding the panel behind another tab of its leaf turns them off again, showing it on
-        st.open_tab(DockTab::Graph);
+        st.open_tab(DockTab::Log);
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
         st.open_tab(DockTab::Activity);
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
@@ -4510,6 +5321,7 @@ mod activity_words {
             "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
         );
         assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Misfit), None, RowCtx::default()), "the model was not trusted then: too many training samples it could not reproduce");
     }
 
     /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
@@ -4551,12 +5363,16 @@ mod activity_words {
     #[test]
     fn every_rule_and_outcome_is_worded() {
         use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
-        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::NearMisfit, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
             assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
         }
-        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }, sim::activity::TeachOutcome::MisfitDisagrees] {
             assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
         }
+        // the misfit fence's words (spec 2026-11-13 §4.3): the refusal is never silent
+        assert_eq!(rule_label(sim::activity::TeachRule::NearMisfit, None), "misfit");
+        assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
+        assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
     }
 }
 
@@ -4873,6 +5689,16 @@ mod activity_trust {
         assert_eq!(mha(0.0), "0");
     }
 
+    /// Spec 2026-11-13 §4.3: the misfit row reads as the training samples the model cannot
+    /// reproduce, the count against 10 % of the fitted samples.
+    #[test]
+    fn the_misfit_line_counts_the_samples_it_cannot_reproduce() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        let c = TrustCheck { key: K::Misfit, met: true, value: 3.0, limit: 12.3, worst: None };
+        assert_eq!(trust_line(&c, AuditSeen::Never, 20), "Few training samples it cannot reproduce — 3 of at most 12.3 (10 % of the fitted samples)");
+    }
+
     /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
     /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
     /// by default.
@@ -4971,6 +5797,8 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::Calibrated, 1.4, 1.0)))), "Two-atom arrangements — not yet (DFT checks measured its force error at 1.40× the bound over 12 DFT checks, limit 1.00×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::LooFloor, 0.8, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (leave-one-out force error 0.80× the bound on average, limit 0.71×)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
+        // open-shell model (the energy half of C1): the energy RMS with the misfits counted
+        assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
         // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
@@ -5046,7 +5874,8 @@ mod activity_trust {
     fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
         use sim::activity::TrustKey as K;
         let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+        // the misfit row too (spec 2026-11-13 §4.3): before it, those samples failed the residual rows
+        for key in [K::EnergyResidual, K::ForceResidual, K::Misfit, K::ForceNoise] {
             assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
         }
         for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {
@@ -5676,27 +6505,27 @@ fn the_workspace_shows_one_tab_per_leaf() {
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    // a tab click shows its panel, in its own leaf only (Activity and Graph are tabbed with the
-    // Log since docking Task 4)
-    click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
-    assert_eq!(shown(&st), vec![Model, Selection, View, Graph]);
+    // a tab click shows its panel, in its own leaf only (Activity is tabbed with the Log since
+    // docking Task 4)
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
+    assert_eq!(shown(&st), vec![Model, Selection, View, Activity]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Knowledge");
-    assert_eq!(shown(&st), vec![Knowledge, Selection, View, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, View, Activity]);
     click_widget(&ctx, &mut st, &inp, "dock-tab-Orbitals");
-    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Selection, Orbitals, Activity]);
     // open_tab shows a panel where it is
     st.open_tab(Readouts);
-    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Graph]);
+    assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Activity]);
     st.open_tab(Log);
     assert_eq!(shown(&st), vec![Knowledge, Readouts, Orbitals, Log]);
     // closed, it is gone; open_tab brings it back in the right column's first leaf
-    st.workspace.close_panel(Graph);
-    assert!(!st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
-    st.open_tab(Graph);
-    assert!(st.tab_shown(Graph));
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,V(0.62,[View,Orbitals,Graph*],[Log*,Activity])))");
+    st.workspace.close_panel(Activity);
+    assert!(!st.tab_shown(Activity) && !layout::panels(&st.workspace.to_node()).contains(&Activity));
+    st.open_tab(Activity);
+    assert!(st.tab_shown(Activity));
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model,Knowledge*],[Selection,Readouts*]),H(0.70,3D,V(0.62,[View,Orbitals,Activity*],[Log*])))");
     // the right column closed: a panel shown again gets a new split right of the view
-    for t in [View, Orbitals, Graph, Log, Activity] {
+    for t in [View, Orbitals, Log, Activity] {
         st.workspace.close_panel(t);
     }
     st.open_tab(Log);
@@ -5718,12 +6547,12 @@ fn the_workspace_shows_one_tab_per_leaf() {
     assert!(st.tab_shown(View) && !st.tab_shown(Orbitals));
     // the chrome renders every arrangement without a command or an error: the default, every
     // panel in one leaf, the 3D view between stacked leaves, every panel closed
-    for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,Graph,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Graph*,Readouts]))")] {
+    for text in [None, Some("H(0.4,[Model,Knowledge,Selection,Readouts,Activity,View,Orbitals,Log*],3D)"), Some("V(0.3,[Log*],V(0.5,3D,[Activity*,Readouts]))")] {
         match text {
             Some(t) => st.workspace.set_node(layout::parse(t).unwrap()),
             None => st.reset_layout(),
         }
-        assert!(layout::panels(&st.workspace.to_node()).len() == 9 || text.is_some());
+        assert!(layout::panels(&st.workspace.to_node()).len() == DockTab::PANELS.len() || text.is_some());
         for w in [1400.0, 1000.0] {
             assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{text:?} at {w}");
         }
@@ -5788,7 +6617,7 @@ fn the_workspace_is_not_recorded() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    let mut outs = vec![click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log")];
+    let mut outs = vec![click_widget(&ctx, &mut st, &inp, "dock-tab-Readouts"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log")];
     st.workspace.close_panel(DockTab::Log);
     outs.push(vec![frame(&ctx, &mut st, &inp, 1400.0, vec![])]);
     st.open_tab(DockTab::Log);
@@ -5861,7 +6690,7 @@ fn a_tiny_window_draws() {
     use super::workspace::layout::{Edge, Hidden};
     st.reset_layout();
     st.workspace.set_hidden(vec![]);
-    for (t, edge) in [(DockTab::Graph, Edge::Left), (DockTab::Log, Edge::Right), (DockTab::Readouts, Edge::Bottom)] {
+    for (t, edge) in [(DockTab::Activity, Edge::Left), (DockTab::Log, Edge::Right), (DockTab::Readouts, Edge::Bottom)] {
         st.workspace.close_panel(t);
         st.workspace.pin(t, false);
         let h = st.workspace.hidden().iter().position(|h| h.tab == t).unwrap();
@@ -5870,7 +6699,7 @@ fn a_tiny_window_draws() {
         st.workspace.set_hidden(all);
     }
     assert_eq!(st.workspace.hidden().len(), 3);
-    for t in [DockTab::Graph, DockTab::Log, DockTab::Readouts] {
+    for t in [DockTab::Activity, DockTab::Log, DockTab::Readouts] {
         st.open_tab(t);
         for size in [egui::vec2(320.0, 240.0), egui::vec2(1.0, 1.0), egui::vec2(320.0, 240.0)] {
             for _ in 0..3 {
@@ -5896,7 +6725,7 @@ fn a_tab_keeps_its_width_when_its_dot_comes_and_goes() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     // the Log behind another tab (on screen, it reads its count away)
-    st.workspace.set_node(super::workspace::layout::parse("H(0.70,3D,[Graph*,Log,View])").unwrap());
+    st.workspace.set_node(super::workspace::layout::parse("H(0.70,3D,[Activity*,Log,View])").unwrap());
     let probe = |name: &str| PROBES.with(|p| p.borrow()[name]);
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
@@ -5923,14 +6752,14 @@ fn the_painted_close_button_closes_its_leaf() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Activity*,Orbitals],[Log*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    let close = probed_rect("dock-close-Graph");
-    let graph = probed_rect("dock-tab-Graph");
+    let close = probed_rect("dock-close-Activity");
+    let graph = probed_rect("dock-tab-Activity");
     assert!(close.left() > graph.right() && (close.center().y - graph.center().y).abs() < 4.0, "close {close:?} at the bar's end, tab {graph:?}");
-    let outs = click_widget(&ctx, &mut st, &inp, "dock-close-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-close-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
 }
@@ -5948,7 +6777,7 @@ fn the_profile_keeps_the_layout() {
         assert!(!text.contains(old), "{old} in\n{text}");
     }
     assert_eq!(profile::defaults(&st), text, "a fresh state's profile is the defaults");
-    let custom = "V(0.30,[Log*,Graph],H(0.60,3D,[Model,View*]))";
+    let custom = "V(0.30,[Log*,Activity],H(0.60,3D,[Model,View*]))";
     st.workspace.set_node(layout::parse(custom).unwrap());
     let text = profile::capture(&st);
     let mut back = UiState::new("h2", &scene);
@@ -5982,7 +6811,7 @@ fn frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, time: f
 
 /// Spec D-10: unpinning takes a panel out of the tree onto the strip of the 3D view's edge its
 /// leaf lay beyond, remembering its size (the left column's Readouts: left, its 24 % width; the
-/// right column's Graph: right; a leaf under the view: bottom, its height); the strips are carved
+/// right column's Activity: right; a leaf under the view: bottom, its height); the strips are carved
 /// from the 3D view; `open_tab` opens its flyout at that edge (`tab_shown` while it is out); its
 /// pin docks it back beside the 3D view on that edge.
 #[test]
@@ -6005,15 +6834,15 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     let h = st.workspace.hidden()[0];
     assert_eq!((h.tab, h.edge), (Readouts, Edge::Left));
     assert!((320.0..345.0).contains(&h.size), "the left column's width, 24 % of 1400: {}", h.size);
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     assert_eq!(st.workspace.hidden()[1].edge, Edge::Right);
-    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity])))");
+    assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))");
     let mut view = egui::Rect::NOTHING;
     for _ in 0..2 {
         view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
     }
     let (left, right) = (probed_rect("strip-Left"), probed_rect("strip-Right"));
-    assert!(left.contains_rect(probed_rect("strip-icon-Readouts")) && right.contains_rect(probed_rect("strip-icon-Graph")), "each on its edge's strip");
+    assert!(left.contains_rect(probed_rect("strip-icon-Readouts")) && right.contains_rect(probed_rect("strip-icon-Activity")), "each on its edge's strip");
     assert!((left.left() - tile.left()).abs() < 1.0 && (left.right() - view.left()).abs() < 1.0, "the left strip at the view's left: {left:?}, view {view:?}");
     assert!((right.right() - tile.right()).abs() < 1.0 && (right.left() - view.right()).abs() < 1.0, "{right:?}, view {view:?}");
     assert!((tile.width() - view.width() - 2.0 * super::workspace::autohide::STRIP).abs() < 1.0, "the strips are carved from the tile: {tile:?} → {view:?}");
@@ -6029,7 +6858,7 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     let outs = click_widget(&ctx, &mut st, &inp, "flyout-pin-Readouts");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
     assert_eq!(st.workspace.flyout(), None);
-    assert_eq!(st.workspace.hidden().iter().map(|h| h.tab).collect::<Vec<_>>(), vec![Graph]);
+    assert_eq!(st.workspace.hidden().iter().map(|h| h.tab).collect::<Vec<_>>(), vec![Activity]);
     let enc = layout::encode(&st.workspace.to_node());
     assert!(enc.starts_with("H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,H(") && enc.contains(",[Readouts*],3D),"), "{enc}");
     assert!(st.tab_shown(Readouts));
@@ -6051,13 +6880,13 @@ fn an_unpinned_panel_folds_to_its_edge_and_pins_back() {
     st.workspace.pin(Log, true);
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,V(0.60,3D,[Log*]),[Model*])", "back where it was");
     // a closed panel unpins to the right edge; pinning a closed panel shows it
-    st.workspace.close_panel(Graph);
-    st.workspace.pin(Graph, false);
+    st.workspace.close_panel(Activity);
+    st.workspace.pin(Activity, false);
     assert_eq!(st.workspace.hidden()[0].edge, Edge::Right);
-    st.workspace.close_panel(Graph);
-    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph), "closing a hidden panel takes it off its strip");
-    st.workspace.pin(Graph, true);
-    assert!(st.tab_shown(Graph) && layout::panels(&st.workspace.to_node()).contains(&Graph));
+    st.workspace.close_panel(Activity);
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Activity), "closing a hidden panel takes it off its strip");
+    st.workspace.pin(Activity, true);
+    assert!(st.tab_shown(Activity) && layout::panels(&st.workspace.to_node()).contains(&Activity));
     st.reset_layout();
     assert!(st.workspace.hidden().is_empty());
 }
@@ -6070,12 +6899,12 @@ fn a_panel_unpinned_before_drawing_folds_to_its_side_in_the_tree() {
     use DockTab::*;
     let scene = Scene::preset("h2").unwrap();
     let mut st = UiState::new("h2", &scene);
-    for t in [Readouts, Model, Graph, View] {
+    for t in [Readouts, Model, Activity, View] {
         st.workspace.pin(t, false);
     }
     let edges: Vec<_> = st.workspace.hidden().iter().map(|h| (h.tab, h.edge, h.size)).collect();
     let d = super::workspace::autohide::DEFAULT_SIZE;
-    assert_eq!(edges, vec![(Readouts, Edge::Left, d), (Model, Edge::Left, d), (Graph, Edge::Right, d), (View, Edge::Right, d)]);
+    assert_eq!(edges, vec![(Readouts, Edge::Left, d), (Model, Edge::Left, d), (Activity, Edge::Right, d), (View, Edge::Right, d)]);
     st.workspace.set_node(layout::parse("V(0.30,[Model*],V(0.60,3D,[Log*]))").unwrap());
     st.workspace.pin(Log, false);
     st.workspace.pin(Model, false);
@@ -6089,14 +6918,14 @@ fn a_panel_unpinned_before_drawing_folds_to_its_side_in_the_tree() {
 #[test]
 fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let dt = 1.0 / 60.0;
     let mut t = 10.0;
     let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
@@ -6107,40 +6936,40 @@ fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     let mut view = egui::Rect::NOTHING;
     for _ in 0..2 {
         view = step(&mut st, vec![]).view.unwrap();
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     for i in 0..=18 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
         if i <= 13 {
             assert_eq!(st.workspace.flyout(), None, "{} ms of hover", i * 1000 / 60);
         }
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "open after 300 ms of hover");
-    assert!(st.tab_shown(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity), "open after 300 ms of hover");
+    assert!(st.tab_shown(Activity));
     // over the flyout it stays out
     for _ in 0..12 {
         step(&mut st, vec![]);
     }
-    let fly = probed_rect("flyout-Graph");
+    let fly = probed_rect("flyout-Activity");
     for _ in 0..40 {
         step(&mut st, vec![egui::Event::PointerMoved(fly.center())]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "the pointer on the flyout");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "the pointer on the flyout");
     // away from both: still out at 400 ms, gone by 600 ms
     let away = egui::pos2(view.right() - 40.0, view.center().y);
     assert!(!fly.contains(away));
     for i in 0..=36 {
         step(&mut st, vec![egui::Event::PointerMoved(away)]);
         if i <= 24 {
-            assert_eq!(st.workspace.flyout(), Some(Graph), "{} ms away", i * 1000 / 60);
+            assert_eq!(st.workspace.flyout(), Some(Activity), "{} ms away", i * 1000 / 60);
         }
     }
     assert_eq!(st.workspace.flyout(), None, "hidden after 600 ms away");
-    assert!(!st.tab_shown(Graph));
+    assert!(!st.tab_shown(Activity));
 }
 
 /// Spec D-10: a click on a strip icon keeps the flyout out until the next click elsewhere (the
@@ -6150,14 +6979,14 @@ fn hovering_a_strip_icon_opens_its_flyout_and_leaving_hides_it() {
 #[test]
 fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let mut outs = Vec::new();
     let mut t = 10.0;
     macro_rules! step {
@@ -6169,50 +6998,50 @@ fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
     for _ in 0..2 {
         step!(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     for _ in 0..2 {
         step!(&mut st, vec![]);
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     step!(&mut st, vec![egui::Event::PointerMoved(icon), pointer(icon, true)]);
     step!(&mut st, vec![pointer(icon, false)]);
-    assert_eq!(st.workspace.flyout(), Some(Graph), "a click opens it at once");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "a click opens it at once");
     for _ in 0..12 {
         step!(&mut st, vec![]);
     }
-    let fly = probed_rect("flyout-Graph");
+    let fly = probed_rect("flyout-Activity");
     let away = egui::pos2(fly.right() + 200.0, fly.center().y);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "clicked open: a second away does not hide it");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "clicked open: a second away does not hide it");
     // a click inside it does not hide it either
     step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
     step!(&mut st, vec![pointer(fly.center(), false)]);
-    assert_eq!(st.workspace.flyout(), Some(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity));
     // a click elsewhere does
     step!(&mut st, vec![egui::Event::PointerMoved(away), pointer(away, true)]);
     step!(&mut st, vec![pointer(away, false)]);
     assert_eq!(st.workspace.flyout(), None, "a click on the 3D view hides it");
     // open_tab opens it the same way; Esc hides it and does not deselect
-    st.open_tab(Graph);
+    st.open_tab(Activity);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "open_tab: stuck open");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "open_tab: stuck open");
     step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert_eq!(st.workspace.flyout(), None, "Esc hides it");
     // hover-opened, then worked in: it stays when the pointer leaves
     for _ in 0..20 {
         step!(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph));
+    assert_eq!(st.workspace.flyout(), Some(Activity));
     step!(&mut st, vec![egui::Event::PointerMoved(fly.center()), pointer(fly.center(), true)]);
     step!(&mut st, vec![pointer(fly.center(), false)]);
     for _ in 0..60 {
         step!(&mut st, vec![egui::Event::PointerMoved(away)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "a press inside keeps it out");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "a press inside keeps it out");
     step!(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty() && !o.deselect), "display state; Esc on a flyout does not deselect");
     // with no flyout, Esc deselects as before
@@ -6226,14 +7055,14 @@ fn a_clicked_flyout_stays_until_a_click_elsewhere_or_esc() {
 #[test]
 fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Graph*],3D)").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Activity*],3D)").unwrap());
     let mut t = 10.0;
     let mut step = |st: &mut UiState, events: Vec<egui::Event>| {
         frame_at(&ctx, st, &inp, t, events);
@@ -6242,15 +7071,15 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     for _ in 0..2 {
         step(&mut st, vec![]);
     }
-    let icon = probed_rect("strip-icon-Graph").center();
+    let icon = probed_rect("strip-icon-Activity").center();
     for _ in 0..20 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "hover-opened");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "hover-opened");
     step(&mut st, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert_eq!(st.workspace.flyout(), None, "Esc");
     for _ in 0..40 {
@@ -6262,7 +7091,7 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
     for _ in 0..20 {
         step(&mut st, vec![egui::Event::PointerMoved(icon)]);
     }
-    assert_eq!(st.workspace.flyout(), Some(Graph), "back on the icon: the hover opens it again");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "back on the icon: the hover opens it again");
 }
 
 /// The flyout takes the pointer over itself — egui's, so the 3D view does not orbit through it —
@@ -6271,24 +7100,24 @@ fn esc_with_the_pointer_on_the_strip_icon_keeps_the_flyout_hidden() {
 #[test]
 fn the_flyout_takes_the_pointer_and_the_3d_view_keeps_the_rest() {
     use super::workspace::layout;
-    use DockTab::Graph;
+    use DockTab::Activity;
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let inp = input(&scene, None, &cam);
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.30,[Model*],H(0.70,3D,[Graph*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.30,[Model*],H(0.70,3D,[Activity*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    st.workspace.pin(Graph, false);
-    st.open_tab(Graph);
+    st.workspace.pin(Activity, false);
+    st.open_tab(Activity);
     let mut view = egui::Rect::NOTHING;
     for _ in 0..12 {
         view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
     }
-    let (fly, strip) = (probed_rect("flyout-Graph"), probed_rect("strip-Right"));
+    let (fly, strip) = (probed_rect("flyout-Activity"), probed_rect("strip-Right"));
     assert!((fly.right() - view.right()).abs() < 1.0 && (strip.left() - view.right()).abs() < 1.0, "the flyout against the right strip: {fly:?} {strip:?} {view:?}");
     let over = |st: &mut UiState, at: egui::Pos2| {
         frame(&ctx, st, &inp, 1400.0, vec![egui::Event::PointerMoved(at)]);
@@ -6298,7 +7127,7 @@ fn the_flyout_takes_the_pointer_and_the_3d_view_keeps_the_rest() {
     assert_eq!(over(&mut st, egui::pos2(fly.left() + 4.0, fly.bottom() - 4.0)), (true, true), "all of it");
     assert_eq!(over(&mut st, egui::pos2(fly.left() - 60.0, fly.center().y)), (false, false), "the 3D view beside it is not");
     assert_eq!(over(&mut st, strip.center()), (true, true), "the strip is egui's");
-    assert_eq!(st.workspace.flyout(), Some(Graph), "opened by open_tab: still out");
+    assert_eq!(st.workspace.flyout(), Some(Activity), "opened by open_tab: still out");
 }
 
 /// A leaf's tab bar ends with its pin, left of the close button: clicking where the Pin icon is
@@ -6313,27 +7142,27 @@ fn the_tab_bar_pin_unpins_the_active_tab() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
-    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+    st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Activity*,Orbitals],[Log*]))").unwrap());
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    let (pin, pop, close, graph) = (probed_rect("dock-pin-Graph"), probed_rect("dock-pop-Graph"), probed_rect("dock-close-Graph"), probed_rect("dock-tab-Graph"));
+    let (pin, pop, close, graph) = (probed_rect("dock-pin-Activity"), probed_rect("dock-pop-Activity"), probed_rect("dock-close-Activity"), probed_rect("dock-tab-Activity"));
     // the bar ends pin, pop out, close (spec D-4)
     assert!(pin.left() > graph.right() && (pin.right() - pop.left()).abs() < 0.5 && (pop.right() - close.left()).abs() < 0.5, "pin {pin:?}, pop {pop:?}, close {close:?}");
     assert!((pin.center().y - close.center().y).abs() < 0.5 && (pop.center().y - close.center().y).abs() < 0.5);
-    let outs = click_widget(&ctx, &mut st, &inp, "dock-pin-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "dock-pin-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
     assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
     let h = st.workspace.hidden();
-    assert_eq!((h.len(), h[0].tab, h[0].edge), (1, Graph, Edge::Right));
+    assert_eq!((h.len(), h[0].tab, h[0].edge), (1, Activity, Edge::Right));
     // its flyout's close button closes it (the Window menu brings it back)
-    st.open_tab(Graph);
+    st.open_tab(Activity);
     for _ in 0..12 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]); // past the slide
     }
-    let outs = click_widget(&ctx, &mut st, &inp, "flyout-close-Graph");
+    let outs = click_widget(&ctx, &mut st, &inp, "flyout-close-Activity");
     assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
-    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Graph) && !layout::panels(&st.workspace.to_node()).contains(&Graph));
+    assert!(st.workspace.hidden().is_empty() && !st.tab_shown(Activity) && !layout::panels(&st.workspace.to_node()).contains(&Activity));
 }
 
 /// The profile keeps the auto-hidden panels (`hidden = …`, spec D-8) and reads them back onto
@@ -6353,32 +7182,33 @@ fn the_profile_keeps_the_hidden_panels() {
     for _ in 0..2 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
-    st.workspace.pin(Graph, false);
+    st.workspace.pin(Activity, false);
     st.workspace.pin(Readouts, false);
     let text = profile::capture(&st);
     let line = text.lines().find(|l| l.starts_with("hidden = ")).unwrap();
-    assert!(line.starts_with("hidden = Graph:right:") && line.contains(", Readouts:left:"), "{line}");
+    assert!(line.starts_with("hidden = Activity:right:") && line.contains(", Readouts:left:"), "{line}");
     let mut back = UiState::new("h2", &scene);
     profile::apply(&mut back, &text);
     assert_eq!(back.workspace.to_node(), st.workspace.to_node());
     assert_eq!(layout::encode_hidden(back.workspace.hidden()), layout::encode_hidden(st.workspace.hidden()));
-    back.open_tab(Graph);
-    assert!(back.tab_shown(Graph), "reachable: open_tab opens its flyout");
+    back.open_tab(Activity);
+    assert!(back.tab_shown(Activity), "reachable: open_tab opens its flyout");
     for _ in 0..2 {
         frame(&ctx, &mut back, &inp, 1400.0, vec![]);
     }
-    probed_rect("strip-icon-Graph");
+    probed_rect("strip-icon-Activity");
     probed_rect("strip-icon-Readouts");
     // a layout line without a hidden line: nothing hidden
     let mut s = UiState::new("h2", &scene);
-    s.workspace.set_hidden(vec![layout::Hidden { tab: Graph, edge: Edge::Left, size: 300.0 }]);
+    s.workspace.set_hidden(vec![layout::Hidden { tab: Activity, edge: Edge::Left, size: 300.0 }]);
     profile::apply(&mut s, &format!("layout = {}\n", layout::encode(&st.workspace.to_node())));
     assert!(s.workspace.hidden().is_empty());
     // a hidden panel the layout places: the layout's
-    profile::apply(&mut s, &format!("layout = {}\nhidden = Log:left:300, Graph:bottom:250\n", layout::encode(&layout::default_layout())));
+    profile::apply(&mut s, &format!("layout = {}\nhidden = Log:left:300, Activity:bottom:250\n", layout::encode(&layout::default_layout())));
     assert_eq!(s.workspace.hidden(), &[]);
     profile::apply(&mut s, "layout = H(0.70,3D,[Log*])\nhidden = log:left:300, GRAPH:bottom:5000, Bogus:left:300\n");
-    assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Graph, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
+    // (an old profile's Graph, merged into Readouts: Readouts takes its place when no line names Readouts)
+    assert_eq!(s.workspace.hidden(), &[layout::Hidden { tab: Readouts, edge: Edge::Bottom, size: layout::HIDDEN_MAX }]);
 }
 
 /// Deferred finding (docking D1 review): `egui_dock` clamps each split's fraction to leave 80 pt
@@ -6692,17 +7522,17 @@ mod knowledge_map {
         assert!(st.activity.knowledge.is_some(), "the map is kept from the snapshot");
         alone(&mut st, DockTab::Knowledge);
         let t = texts(&ctx, &mut st, &inp);
-        for want in ["lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a", "2140 samples · H C O", "3 trusted", "2 thin", "1 never seen", "C–C · never", "C–H · trusted", "H–H · thin", "2140 atoms", "THIS SCENE ASKS"] {
+        for want in ["Shared collection", "2140 samples", "3 trusted", "2 thin", "1 never", "C–C · never", "C–H · trusted", "H–H · thin", "THIS SCENE ASKS"] {
             assert!(t.contains(want), "{want:?} in the tab:\n{t}");
         }
         // nothing picked: the weakest pair the scene asks (C–C, never seen) and its empty histogram
-        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("never taught"), "{t}");
+        assert!(t.contains("the weakest pair this scene asks") && t.contains("nothing taught") && t.contains("Never seen — no fitted sample has these two"), "{t}");
         // a click on a line's label picks the pair: its histogram with the scene's distances
         let outs = click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
         assert_eq!(st.knowledge.pick, Pick::Pair(1, 6));
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("the pair you picked · 610 samples") && t.contains("asked now (the open scene):") && t.contains("2 at 2.06 taught"), "{t}");
+        assert!(t.contains("the pair you picked") && t.contains("(610 samples)") && t.contains("now 2.06"), "{t}");
         // a node picks its element: neighbour counts and bond angles, the scene's atoms marked
         click_widget(&ctx, &mut st, &inp, "knowledge-element-6");
         assert_eq!(st.knowledge.pick, Pick::Element(6));
@@ -6754,8 +7584,10 @@ mod knowledge_map {
         st.activity.absorb(&snap);
         alone(&mut st, DockTab::Knowledge);
         st.knowledge.pick = Pick::Pair(1, 1);
+        st.knowledge_sections.why = true; // the detail lines are in "Why thin?"
         let t = texts(&ctx, &mut st, &inp);
         assert!(t.contains("thin: taught, but not everywhere it was met"), "{t}");
+        assert!(t.contains("Still missing: three-or-more-atom arrangements around H, with H and N, 3 of 92 samples."), "the card's sentence:\n{t}");
         assert!(t.contains("Three-or-more-atom arrangements around H, with H and N — not yet (3 of 92 samples needed)"), "the short key, in the Activity tab's words:\n{t}");
         // only the keys where H sees H: not C's or N's (the Activity tab lists those elsewhere)
         assert!(t.contains("learned: pair around H, with H\n"), "{t}");
@@ -6765,6 +7597,222 @@ mod knowledge_map {
         let snap = with_map(&scene, untrusted);
         let t = texts(&ctx, &mut st, &input(&scene, Some(&snap), &cam));
         assert!(t.contains("the model as a whole is not trusted yet (max training energy residual"), "{t}");
+    }
+
+    // ---- the graph's zoom, pan and Fit (user request 2026-11-14) ----
+
+    /// The Knowledge panel's screenshot map: O and H, with O–O (never seen), O–H and H–H.
+    fn oh_map() -> sim::KnowledgeMap {
+        let mut m = knowledge::fixture_map();
+        m.elements.retain(|e| e.z != 6);
+        m.pairs.retain(|p| p.z.0 != 6 && p.z.1 != 6);
+        for p in m.pairs.iter_mut().filter(|p| p.z == (8, 8)) {
+            (p.samples, p.confidence) = (0, sim::Confidence::Unseen);
+        }
+        m
+    }
+
+    fn oh_snapshot(scene: &Scene) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(oh_map()));
+        snap
+    }
+
+    /// One frame of the panel (1400 wide), checked display only.
+    fn step(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>) {
+        let out = frame(ctx, st, inp, 1400.0, events);
+        assert!(out.commands.is_empty() && out.actions.is_empty(), "the map is display only");
+    }
+
+    fn wheel(lines: f32) -> egui::Event {
+        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, lines), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// A disc's centre and radius from its probed square.
+    fn disc(z: u8) -> (egui::Pos2, f32) {
+        let r = probed_rect(&format!("knowledge-node-{z}"));
+        (r.center(), r.width() / 2.0)
+    }
+
+    /// Presses at `from`, moves by `by` in four steps, releases.
+    fn drag(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, from: egui::Pos2, by: egui::Vec2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(from), pointer(from, true)]);
+        for k in 1..=4 {
+            step(ctx, st, inp, vec![egui::Event::PointerMoved(from + by * (k as f32 / 4.0))]);
+        }
+        step(ctx, st, inp, vec![pointer(from + by, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    fn click_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, at: egui::Pos2) {
+        step(ctx, st, inp, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        step(ctx, st, inp, vec![pointer(at, false)]);
+        step(ctx, st, inp, vec![egui::Event::PointerGone]);
+    }
+
+    /// The wheel over the map zooms about the cursor (the point under it stays put, within 1 pt)
+    /// and the panel does not scroll; elsewhere it leaves the zoom alone. A drag on empty space pans
+    /// and picks nothing; a click on a line still picks it after the pan and the zoom. Fit (and a
+    /// double-click on empty space, and the first frame) frames every node inside the map.
+    #[test]
+    fn the_knowledge_graph_zooms_pans_and_fits() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let map = probed_rect("knowledge-map");
+        let inside = |st: &UiState| {
+            for z in [1, 8] {
+                let (c, r) = disc(z);
+                assert!(map.contains_rect(egui::Rect::from_center_size(c, egui::Vec2::splat(2.0 * r))), "{z} inside {map:?} at zoom {}", st.knowledge.zoom);
+            }
+        };
+        inside(&st);
+        assert!(st.knowledge.fitted.is_some(), "fitted when first shown");
+        // the wheel, near the O node
+        let (o0, _) = disc(8);
+        let at = o0 + egui::vec2(6.0, -4.0);
+        assert!(map.contains(at));
+        let z0 = st.knowledge.zoom;
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at)]);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(at), wheel(2.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        let k = st.knowledge.zoom / z0;
+        assert!((k - 1.44).abs() < 1e-3, "two lines of 1.2×: {k}");
+        let (o1, _) = disc(8);
+        let want = at + (o0 - at) * k;
+        assert!(o1.distance(want) < 1.0, "the point under the cursor stays: O at {o1:?}, want {want:?}");
+        assert_eq!(probed_rect("knowledge-map"), map, "the panel did not scroll");
+        // the wheel elsewhere: the zoom stays
+        let away = egui::pos2(map.center().x, map.bottom() + 40.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(away), wheel(-1.0)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert!((st.knowledge.zoom / z0 - 1.44).abs() < 1e-3, "not over the map: {}", st.knowledge.zoom / z0);
+        // a drag on empty space (the map's bottom-left corner) pans and picks nothing
+        let pick = st.knowledge.pick;
+        let pan0 = st.knowledge.pan;
+        let (o1, _) = disc(8);
+        drag(&ctx, &mut st, &inp, map.left_bottom() + egui::vec2(10.0, -10.0), egui::vec2(-40.0, 0.0));
+        let moved = st.knowledge.pan - pan0;
+        assert!((moved.x + 40.0).abs() < 1.0 && moved.y.abs() < 1.0, "panned by the drag: {moved:?}");
+        assert_eq!(st.knowledge.pick, pick, "a pan picks nothing");
+        let (o2, _) = disc(8);
+        assert!((o2 - o1 - egui::vec2(-40.0, 0.0)).length() < 1.0, "O moved with it");
+        // after the pan and the zoom, a click on the O–H line (between the two nodes, off its label) picks it
+        let ((h, rh), (o, ro)) = (disc(1), disc(8));
+        let label = probed_rect("knowledge-pair-1-8");
+        let on_line = (1..20)
+            .map(|k| h + (o - h) * (k as f32 / 20.0))
+            .find(|q| map.contains(*q) && q.distance(h) > rh + 4.0 && q.distance(o) > ro + 4.0 && !label.expand(2.0).contains(*q))
+            .expect("a free point of the line in the map");
+        click_at(&ctx, &mut st, &inp, on_line);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "the line is still clickable");
+        // Fit, from far out and panned away
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(260.0, -90.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        click_widget(&ctx, &mut st, &inp, "knowledge-fit");
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        assert_eq!(st.knowledge.pick, Pick::Pair(1, 8), "Fit keeps the pick");
+        // a double-click on empty space fits too (zoomed out, the nodes pushed off to the right)
+        st.knowledge.zoom = 0.3;
+        st.knowledge.pan = egui::vec2(300.0, 0.0);
+        step(&ctx, &mut st, &inp, vec![]);
+        let corner = map.left_bottom() + egui::vec2(10.0, -10.0);
+        step(&ctx, &mut st, &inp, vec![egui::Event::PointerMoved(corner), pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, true)]);
+        step(&ctx, &mut st, &inp, vec![pointer(corner, false)]);
+        step(&ctx, &mut st, &inp, vec![]);
+        inside(&st);
+        // not refitted on a refresh of the same map; refitted when an element joins; reset with a new scene
+        st.knowledge.zoom = 2.0;
+        st.activity.absorb(&snap);
+        step(&ctx, &mut st, &inp, vec![]);
+        assert_eq!(st.knowledge.zoom, 2.0, "the same elements: no refit");
+        let full = with_map(&scene, model());
+        st.activity.absorb(&full);
+        step(&ctx, &mut st, &input(&scene, Some(&full), &cam), vec![]);
+        assert!(st.knowledge.zoom != 2.0 && st.knowledge.fitted.as_deref() == Some(&[1, 6, 8][..]), "C joined: fitted again");
+        st.knowledge.zoom = 3.0;
+        act(&mut st, &inp, Action::Preset("h2".into()));
+        assert_eq!((st.knowledge.zoom, st.knowledge.pan, st.knowledge.fitted.clone()), (1.0, egui::Vec2::ZERO, None), "a new scene resets the view");
+    }
+
+    /// Every text the map paints (its painter clips to the map): (text, font size).
+    fn map_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, map: egui::Rect) -> Vec<(String, f32)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.job.sections[0].format.font_id.size)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        full.shapes.iter().filter(|c| map.expand(1.0).contains_rect(c.clip_rect)).for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// The pair labels sit clear of every node disc (the screenshot's map: "O–O · never" sat on
+    /// the O node, the loop labels on their loops), and the text keeps its size at 0.5× and 4×.
+    #[test]
+    fn the_knowledge_graph_labels_clear_the_nodes_and_keep_their_size() {
+        let scene = chain();
+        let cam = camera();
+        let snap = oh_snapshot(&scene);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        alone(&mut st, DockTab::Knowledge);
+        for _ in 0..3 {
+            step(&ctx, &mut st, &inp, vec![]);
+        }
+        let discs = [disc(1), disc(8)];
+        for (a, b) in [(1, 1), (1, 8), (8, 8)] {
+            let r = probed_rect(&format!("knowledge-pair-{a}-{b}"));
+            for (z, (c, rad)) in [1, 8].into_iter().zip(discs) {
+                assert!(r.distance_to_pos(c) > rad, "the {a}–{b} label {r:?} clears node {z} ({c:?}, r {rad})");
+            }
+        }
+        let map = probed_rect("knowledge-map");
+        let at_1 = map_texts(&ctx, &mut st, &inp, map);
+        for want in ["O", "H", "O–H · trusted", "O–O · never", "H–H · thin", "880"] {
+            assert!(at_1.iter().any(|t| t.0 == want), "{want:?} in {at_1:?}");
+        }
+        for zoom in [0.5, 4.0] {
+            st.knowledge.zoom = zoom;
+            st.knowledge.pan = egui::Vec2::ZERO;
+            for _ in 0..2 {
+                step(&ctx, &mut st, &inp, vec![]);
+            }
+            let now = map_texts(&ctx, &mut st, &inp, map);
+            for (text, size) in &at_1 {
+                if let Some((_, s)) = now.iter().find(|t| &t.0 == text) {
+                    assert_eq!(s, size, "{text:?} at {zoom}×");
+                } else {
+                    assert!(zoom < 1.0 && text.contains('·'), "{text:?} drawn at {zoom}× (only crowded pair labels may fade out)");
+                }
+            }
+            assert!(now.iter().any(|t| t.0 == "O") && now.iter().any(|t| t.0 == "H"), "the node letters stay at {zoom}×");
+        }
     }
 
     #[test]
@@ -6781,7 +7829,7 @@ mod knowledge_map {
         assert!(!st.show_knowledge, "off by default");
         assert!(knowledge::overlay_coverage(&st, &scene.nuclei).is_empty(), "off: no tint");
         // View ▸ Display aids ▸ knowledge overlay: no command, no recorded action
-        super::view_panel(&mut st, &[crate::ui::dock::view::Section::Aids]);
+        super::view_panel(&mut st, &[]);
         let outs = click_widget(&ctx, &mut st, &inp, "show-knowledge");
         assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
         assert!(st.show_knowledge);
@@ -6812,24 +7860,289 @@ mod knowledge_map {
             DockTab::PANELS.into_iter().all(|t| p.iter().filter(|&&x| x == t).count() == 1) && p.len() == DockTab::PANELS.len()
         };
         let mut old = UiState::new("h2o", &scene);
+        // (it names the Graph panel, merged into Readouts since 2026-11-14: dropped, and its
+        // left_tab with it — the leaf's first tab shows)
         profile::apply(&mut old, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Orbitals Selection\nright_tab = Selection\nleft_tab = Graph\nleft_width = 400\ndock_open = false\n");
         assert!(once(&old), "{}", layout::encode(&old.workspace.to_node()));
         assert_eq!(
             layout::encode(&old.workspace.to_node()),
-            "H(0.24,[Activity,Readouts,Graph*,Log],H(0.70,3D,[Model,View,Orbitals,Selection*,Knowledge]))",
+            "H(0.24,[Activity*,Readouts,Log],H(0.70,3D,[Model,View,Orbitals,Selection*,Knowledge]))",
             "the moved Log stays left; Knowledge, never listed, joins the right column"
         );
-        assert!(old.tab_shown(DockTab::Selection) && old.tab_shown(DockTab::Graph));
+        assert!(old.tab_shown(DockTab::Selection) && old.tab_shown(DockTab::Activity));
         // a tab named twice keeps its first place (it was ignored by the old docks' reader)
         let mut dup = UiState::new("h2o", &scene);
         profile::apply(&mut dup, "left_tabs = Activity Readouts Graph Log\nright_tabs = Model Log\n");
         assert!(once(&dup), "{}", layout::encode(&dup.workspace.to_node()));
-        assert!(layout::encode(&dup.workspace.to_node()).starts_with("H(0.24,[Activity*,Readouts,Graph,Log],"), "{}", layout::encode(&dup.workspace.to_node()));
+        assert!(layout::encode(&dup.workspace.to_node()).starts_with("H(0.24,[Activity*,Readouts,Log],"), "{}", layout::encode(&dup.workspace.to_node()));
         // only one of the two lists: the other column gets the panels it does not name
         let mut half = UiState::new("h2o", &scene);
         profile::apply(&mut half, "right_tabs = Log Model\n");
         assert!(once(&half), "{}", layout::encode(&half.workspace.to_node()));
     }
+
+    /// The texts on screen once the pointer has rested on the probed widget for its tooltip.
+    fn hover_of(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, probe: &str) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let c = probed_rect(probe).center();
+        let mut all = String::new();
+        for k in 0..8 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events: if k == 0 { vec![egui::Event::PointerMoved(c)] } else { vec![] },
+                time: Some(10.0 + 0.3 * k as f64),
+                ..Default::default()
+            };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut all));
+        }
+        all
+    }
+
+    // ---- the redesigned panel (user's approved mockup, 2026-11-14) ----
+
+    fn knowledge_state(scene: &Scene, snap: &Snapshot) -> UiState {
+        let mut st = UiState::new("h2o", scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(snap);
+        alone(&mut st, DockTab::Knowledge);
+        st
+    }
+
+    /// The summary line: the collection as the Model tab's short surface chip (the folder key on
+    /// hover), the sample count, the pair counts in their colours; the old legend line is the ⓘ.
+    #[test]
+    fn the_knowledge_summary_is_a_chip_and_counts() {
+        assert_eq!(knowledge::map_chip("lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5"), "Shared · LSDA · h 0.15 · pseudo");
+        assert_eq!(knowledge::map_chip("lsda_h0.25_s0.25_tol1e-6_kohn-sham-gpu_none-0123"), "Shared · LSDA · h 0.25 · none");
+        assert_eq!(knowledge::map_chip(""), "This scene");
+        assert_eq!(knowledge::map_chip("lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a"), "Shared collection", "a key of another shape");
+        let scene = chain();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let mut m = knowledge::fixture_map();
+        m.slug = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5".into();
+        snap.activity.knowledge = Some(Arc::new(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["Shared · LSDA · h 0.15 · pseudo", "2140 samples", "3 trusted", "2 thin", "1 never"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("lsda_h0.15") && !t.contains("node area"), "the key and the legend are on hover:\n{t}");
+        let chip = probed_rect("knowledge-chip");
+        let counts: Vec<egui::Rect> = (0..3).map(|k| probed_rect(&format!("knowledge-count-{k}"))).collect();
+        assert!(counts.windows(2).all(|w| w[0].right() <= w[1].left()), "in order: {counts:?}");
+        assert!(counts[0].left() >= chip.right() || counts[0].top() >= chip.bottom(), "the counts after the chip, or right-aligned under it when narrow: {chip:?} {counts:?}");
+        let hover = hover_of(&ctx, &mut st, &inp, "knowledge-chip");
+        assert!(hover.contains("lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5") && hover.contains("r_cut 6.0 Bohr"), "{hover}");
+        // the counts beside the nodes, not under them
+        let (c, r) = disc(1);
+        let n = probed_rect("knowledge-count-node-1");
+        assert!(n.left() >= c.x + r && (n.center().y - c.y).abs() < 2.0, "beside the H node: {n:?} vs {c:?} r {r}");
+        assert!(t.contains("2140\n") && !t.contains("2140 atoms"), "{t}");
+    }
+
+    /// THIS SCENE ASKS: one chip per pair the scene has, weakest first; a click picks it as a click
+    /// on its line does, and the pair the card shows is outlined (nothing picked: the weakest).
+    #[test]
+    fn the_scene_chips_pick_like_the_map() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        texts(&ctx, &mut st, &inp);
+        let (cc, ch) = (probed_rect("knowledge-ask-6-6"), probed_rect("knowledge-ask-1-6"));
+        assert!(cc.left() < ch.left() || cc.top() < ch.top(), "C–C (never seen) first");
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-ask-1-6");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        let by_chip = st.knowledge.pick;
+        st.knowledge.pick = Pick::None;
+        click_widget(&ctx, &mut st, &inp, "knowledge-pair-1-6");
+        assert_eq!((by_chip, st.knowledge.pick), (Pick::Pair(1, 6), Pick::Pair(1, 6)));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("the pair you picked") && t.contains("Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met."), "{t}");
+    }
+
+    /// The card's sentence for a thin, a trusted and a never-seen pair; the bars split into taught
+    /// (green) and thin (amber) bins exactly as the overlay's count rule says; the "now" marker
+    /// stands at the open scene's distance and the old "asked now" line is gone.
+    #[test]
+    fn the_pair_card_says_one_sentence_and_marks_now() {
+        let map = knowledge::fixture_map();
+        let p = |z: (u8, u8)| map.pair(z.0, z.1).unwrap();
+        assert_eq!(knowledge::pair_sentence(&map, p((1, 6)), &[]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.");
+        assert_eq!(knowledge::pair_sentence(&map, p((6, 6)), &[]), "Never seen — no fitted sample has these two within 6.0 Bohr. Train a scene that has it.");
+        assert_eq!(knowledge::pair_sentence(&map, p((1, 1)), &[]), "Taught 1.4–5.1 Bohr (2140 samples). Not yet trusted everywhere it was met.");
+        let short = sim::SpeciesVerdict {
+            z: 1,
+            neighbours: vec![1, 7],
+            trusted: false,
+            refusal: Some((sim::ClassKey::Samples, 3.0, 92.0)),
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 0,
+            trusted_since: None,
+            inflation: 1.0,
+            samples: 3,
+            columns: 92,
+        };
+        let learned = sim::SpeciesVerdict { trusted: true, refusal: None, neighbours: vec![1], ..short.clone() };
+        let s = knowledge::pair_sentence(&map, p((1, 1)), &[("many-body", &short), ("pair", &learned)]);
+        assert_eq!(s, "Taught 1.4–5.1 Bohr (2140 samples). Still missing: three-or-more-atom arrangements around H, with H and N, 3 of 92 samples.");
+        // the bars: C–H's bin 20 (1200 distances) taught, bin 35 (4, alone) thin, empty bins none
+        let bars = knowledge::bar_colours(p((1, 6)));
+        assert_eq!((bars[20], bars[35], bars[0]), (Some(GREEN), Some(AMBER), None));
+        assert!(bars.iter().flatten().all(|c| *c == GREEN || *c == AMBER));
+        // on screen: C–H, asked at 2.06 Bohr (two C–H in the chain)
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 6);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("now 2.06") && !t.contains("asked now (the open scene)") && !t.contains("2 at 2.06 taught"), "{t}");
+        let h = probed_rect("knowledge-histogram");
+        let plot_left = h.left() + 26.0;
+        let plot_w = h.width() - 34.0;
+        let x = (plot_left + (2.06 / 6.0) as f32 * plot_w).round();
+        let now = probed_rect("knowledge-now");
+        assert!((now.left() - 4.0 - x).abs() < 1.5, "the marker at 2.06 Bohr: label {now:?}, line at {x}");
+    }
+
+    /// Teach this emits the Model tab's Sample more — the same `Action::Sample` — and follows its
+    /// enabled rule (off while a pass runs).
+    #[test]
+    fn teach_this_is_sample_more() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        let want = sample_button(&st, &inp);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-teach");
+        let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+        assert_eq!(acts, [&Action::Sample { long: want.long }], "{acts:?}");
+        // a pass running: the button is off
+        let mut running = with_map(&scene, model());
+        running.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
+        let inp = input(&scene, Some(&running), &cam);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-teach");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "disabled while sampling");
+    }
+
+    /// "Why thin?" holds the old detail lines (closed by default); its state is kept in the
+    /// profile as `knowledge_sections`.
+    #[test]
+    fn why_thin_holds_the_detail_and_is_kept_in_the_profile() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 1);
+        assert!(profile::capture(&st).contains("\nknowledge_sections = \n"));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Why thin?") && !t.contains("thin: taught, but not everywhere"), "{t}");
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-fold-why");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+        assert!(st.knowledge_sections.why);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("thin: taught, but not everywhere it was met") && t.contains("taught 1.4–5.1 Bohr · first peak ends at"), "{t}");
+        let text = profile::capture(&st);
+        assert!(text.contains("\nknowledge_sections = why\n"));
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.knowledge_sections.why);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert!(!fresh.knowledge_sections.why, "absent: closed");
+    }
+
+    /// At about 320 pt the panel's parts stack inside it and no text runs past its right edge.
+    #[test]
+    fn the_knowledge_panel_fits_320_pt() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for pick in [Pick::Pair(1, 1), Pick::Pair(6, 6), Pick::Element(6)] {
+            let mut st = UiState::new("h2o", &scene);
+            st.backend = Backend::Estimated;
+            st.activity.absorb(&snap);
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Knowledge*])").unwrap());
+            st.knowledge.pick = pick;
+            st.knowledge_sections.why = true;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("knowledge-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let mut parts = vec!["knowledge-chip", "knowledge-count-2", "knowledge-map", "knowledge-ask-6-6", "knowledge-card"];
+            if matches!(pick, Pick::Pair(..)) {
+                parts.extend(["knowledge-teach", "knowledge-histogram"]);
+            }
+            for p in &parts {
+                let r = probed_rect(p);
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{pick:?} {p}: {r:?} outside {panel:?}");
+            }
+            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect("knowledge-card").top(), "{pick:?}: stacked");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{pick:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 15, "{checked} texts checked");
+        }
+    }
+
 }
 
 /// Docking Task 4 (spec D-6, D-7): the View panel holds the View menu's controls in five folding
@@ -6838,13 +8151,17 @@ mod view_panel {
     use super::super::dock::view::{Section, Sections};
     use super::*;
 
-    /// The View menu's Ctrl K entries before the panel (27): each lives in the View panel now.
-    const FORMER: [&str; 27] = [
-        "Density", "Orbitals", "All orbitals coloured", "Spin density", "Colour dots by density / orbital", "Density: volume / isosurface", "Gamma",
+    /// The View menu's Ctrl K entries before the panel (27): each lives in the View panel now but
+    /// the four show modes, whose selector heads the Orbitals panel since 2026-11-14 ([`MODES`]).
+    const FORMER: [&str; 23] = [
+        "Colour dots by density / orbital", "Density: volume / isosurface", "Gamma",
         "Opacity", "Iso level (× ρ max)", "Refresh cloud every", "Atomic superposition between DFT clouds", "Cell box", "Floor grid", "Axes",
         "Placement plane", "Grid spacing 1 Bohr / 1 Å", "Partial core density", "Smooth motion", "Show what training is solving",
         "Knowledge overlay", "Trails", "Bonds", "Molecule names", "Name style", "Composition badge on hover", "Bond angles", "Partial charges",
     ];
+
+    /// The show modes, the View menu's other four entries.
+    const MODES: [&str; 4] = ["Density", "Orbitals", "All orbitals coloured", "Spin density"];
 
     /// Ctrl K: every View-panel entry — the 27 former View-menu ones and the panel's own — shows the
     /// View panel (from behind another tab, every section folded), unfolds the section holding its
@@ -6853,6 +8170,9 @@ mod view_panel {
     fn every_former_view_menu_entry_reveals_inside_the_view_panel() {
         for name in FORMER {
             assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::View)), "{name}");
+        }
+        for name in MODES {
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && e.place == search::Place::Dock(DockTab::Orbitals)), "{name}: the Orbitals panel's selector");
         }
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
@@ -6930,24 +8250,26 @@ mod view_panel {
         st.volume_mode = VOLUME_VOLUME;
         st.bloom = 0.0;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("gamma") && !t.contains("iso (× ρ max)") && !t.contains("dot size"), "{t}");
-        assert!(!t.contains("refresh cloud every") && t.contains("cloud options apply to the estimated solver"), "{t}");
+        assert!(t.contains("gamma") && t.contains("opacity") && !t.contains("iso (× ρ max)") && !t.contains("dot size") && t.contains("Fine-tune volume"), "{t}");
+        assert!(!t.contains("refresh every") && !t.contains("ESTIMATED MODE CLOUD") && t.contains("fields follow the atoms"), "the cloud card only under the estimated solver:\n{t}");
         assert!(!t.contains("exposure") && !t.contains("bloom from"), "{t}");
+        assert!(!t.contains("Density") || !t.contains("Spin density"), "no show selector here:\n{t}");
         st.volume_mode = VOLUME_ISO;
         st.camera_view = true;
         st.backend = Backend::Estimated;
         st.bloom = 0.5;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(!t.contains("gamma") && t.contains("iso (× ρ max)") && t.contains("exposure") && t.contains("refresh cloud every") && t.contains("bloom from"), "{t}");
+        assert!(!t.contains("gamma") && t.contains("iso (× ρ max)") && t.contains("exposure") && t.contains("refresh every") && t.contains("bloom from") && t.contains("Fine-tune isosurface"), "{t}");
         st.volume_mode = VOLUME_DOTS;
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("dot size") && !t.contains("colour dots by"), "{t}");
+        assert!(t.contains("amount") && t.contains("brightness") && t.contains("dot size") && t.contains("shimmer") && !t.contains("colour by") && t.contains("Fine-tune dots"), "{t}");
         st.show = ShowMode::Coloured;
-        assert!(texts(&ctx, &mut st, &inp).contains("colour dots by"));
-        // a folded section draws nothing of its own
+        assert!(texts(&ctx, &mut st, &inp).contains("colour by"));
+        // a folded section draws nothing of its own; the cards stay
         st.view_sections = Sections::all(false);
         let t = texts(&ctx, &mut st, &inp);
-        assert!(t.contains("What you see") && t.contains("Display aids") && !t.contains("dot size") && !t.contains("partial charges"), "{t}");
+        // (the view's own overlays — the view switch, the camera view's chip — still draw their looks)
+        assert!(t.contains("LOOK") && t.contains("DISPLAY AIDS") && t.contains("Camera") && !t.contains("with partial core") && !t.contains("partial charges") && !t.contains("label opacity") && !t.contains("field of view"), "{t}");
     }
 
     /// Drawing the panel never rewrites a stored value outside a slider's range (the review of
@@ -6973,7 +8295,7 @@ mod view_panel {
     }
 
     /// The sections fold and unfold by their headers; their open state is kept in the profile
-    /// (`view_sections`), What you see and How it looks open in a profile without it.
+    /// (`view_sections`), every fold closed in a profile without it.
     #[test]
     fn sections_fold_and_the_profile_keeps_them() {
         let scene = Scene::preset("h2").unwrap();
@@ -6983,20 +8305,24 @@ mod view_panel {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         assert_eq!(st.view_sections, Sections::default());
-        assert!(profile::capture(&st).contains("\nview_sections = what,looks\n"));
+        assert!(profile::capture(&st).contains("\nview_sections = \n"));
         alone(&mut st, DockTab::View);
         let outs = click_widget(&ctx, &mut st, &inp, "view-bonds");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        click_widget(&ctx, &mut st, &inp, "view-looks");
-        assert_eq!(st.view_sections.encode(), "what,bonds");
+        click_widget(&ctx, &mut st, &inp, "view-bonds");
+        click_widget(&ctx, &mut st, &inp, "view-finetune");
+        click_widget(&ctx, &mut st, &inp, "view-camera");
+        click_widget(&ctx, &mut st, &inp, "view-finetune");
+        click_widget(&ctx, &mut st, &inp, "view-bonds");
+        assert_eq!(st.view_sections.encode(), "camera,bonds");
         let text = profile::capture(&st);
         let mut fresh = UiState::new("h2", &scene);
         profile::apply(&mut fresh, &text);
-        assert_eq!(fresh.view_sections.encode(), "what,bonds");
+        assert_eq!(fresh.view_sections.encode(), "camera,bonds");
         profile::apply(&mut fresh, "gamma = 0.5\n");
-        assert_eq!(fresh.view_sections, Sections::default(), "absent: the default two");
-        profile::apply(&mut fresh, "view_sections = \n");
-        assert_eq!(fresh.view_sections, Sections::all(false), "empty: every section folded");
+        assert_eq!(fresh.view_sections, Sections::default(), "absent: every fold closed");
+        profile::apply(&mut fresh, "view_sections = what,looks\n");
+        assert_eq!(fresh.view_sections, Sections::all(false), "an old profile's sections (now cards): every fold closed");
     }
 
     /// Reset view settings: the look, Camera, Bonds & labels and Display aids back to their
@@ -7024,6 +8350,287 @@ mod view_panel {
         assert_eq!(st.view_sections, Sections::all(false), "the folds stay");
     }
 
+    // ---- the redesigned panel (user's approved mockup, 2026-11-14) ----
+
+    fn probes_now(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> std::collections::BTreeSet<String> {
+        for _ in 0..2 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, 1400.0, vec![]);
+        PROBES.with(|p| p.borrow().keys().cloned().collect())
+    }
+
+    /// Each preset button puts its bundle in force (the render mode by its action) and is the one
+    /// highlighted; touching a setting afterwards shows "custom".
+    #[test]
+    fn look_presets_apply_their_bundles() {
+        use super::super::dock::view::{active_preset, Look, LookPreset};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        assert_eq!(active_preset(&st), None, "the app's defaults are none of them (Clean drops the shimmer and bloom)");
+        for p in [LookPreset::Glow, LookPreset::Scientific, LookPreset::Present, LookPreset::Clean, LookPreset::Glow] {
+            let before = st.volume_mode;
+            let outs = click_widget(&ctx, &mut st, &inp, &format!("look-{}", p.word()));
+            let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+            if before != p.look().volume_mode {
+                assert_eq!(acts, [&Action::VolumeMode(p.look().volume_mode)], "{p:?}");
+            } else {
+                assert!(acts.is_empty(), "{p:?}: {acts:?}");
+            }
+            assert_eq!(Look::of(&st), p.look(), "{p:?}");
+            assert_eq!(active_preset(&st), Some(p));
+            assert!(!probes_now(&ctx, &mut st, &inp).contains("look-custom"), "{p:?}");
+        }
+        // a touched setting: custom, no preset highlighted
+        st.dots_amount = 0.9;
+        assert_eq!(active_preset(&st), None);
+        assert!(probes_now(&ctx, &mut st, &inp).contains("look-custom"));
+        // the card's ↺: the app's defaults
+        let d = UiState::new("h2", &scene);
+        click_widget(&ctx, &mut st, &inp, "view-look-reset");
+        assert_eq!(Look::of(&st), Look::of(&d));
+    }
+
+    /// Only the render mode's own controls are drawn: two in the card, the rest in "Fine-tune
+    /// <mode>" (folded by default).
+    #[test]
+    fn only_the_render_modes_controls_are_drawn() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        let all = ["look-opacity", "look-gamma", "look-iso", "look-bloom", "look-amount", "look-brightness", "look-size"];
+        for (mode, want) in [(VOLUME_VOLUME, &["look-opacity", "look-gamma"][..]), (VOLUME_ISO, &["look-iso", "look-bloom"][..]), (VOLUME_DOTS, &["look-amount", "look-brightness"][..])] {
+            st.volume_mode = mode;
+            st.view_sections = Sections::all(false);
+            let p = probes_now(&ctx, &mut st, &inp);
+            for n in all {
+                assert_eq!(p.contains(n), want.contains(&n), "mode {mode}: {n}");
+            }
+            assert!(p.contains("view-finetune") && !p.contains("show-partial-core"), "mode {mode}: the rest folded");
+            st.view_sections.set(Section::FineTune, true);
+            let p = probes_now(&ctx, &mut st, &inp);
+            assert!(p.contains("show-partial-core"), "mode {mode}: Fine-tune holds the rest");
+            if mode == VOLUME_VOLUME {
+                assert!(p.contains("look-bloom"), "bloom is fine-tuning for a volume");
+            }
+        }
+        // dots without glow: the dot size takes brightness's place (brightness acts on glowing dots only)
+        st.dots_glow = false;
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("look-size") && !p.contains("look-brightness"));
+    }
+
+    /// The show selector is not in the View panel any more; Ctrl K's mode entries find the
+    /// Orbitals panel's.
+    #[test]
+    fn the_show_selector_lives_in_the_orbitals_panel() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &Section::ALL);
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(!p.iter().any(|k| k.starts_with("menu-show") || k.starts_with("show-spin")), "{p:?}");
+        let e = search::results("spin density", 1)[0];
+        assert_eq!((e.name, e.place, e.anchor), ("Spin density", search::Place::Dock(DockTab::Orbitals), "d-orb-mode"));
+        search::pick(&ctx, &mut st, e);
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(st.tab_shown(DockTab::Orbitals) && p.contains("show-spin") && p.contains("anchor-d-orb-mode"));
+    }
+
+    /// The Display aids chips toggle the same state as the old checkboxes (the actions where those
+    /// were actions); the placement plane's and the trails' ▾ open their settings row; the
+    /// estimated cloud card only under the estimated solver.
+    #[test]
+    fn the_display_aid_chips_toggle_the_old_settings() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &[]);
+        let flips: [(&str, fn(&UiState) -> bool); 6] = [
+            ("aid-cell", |s| s.show_cell),
+            ("aid-floor", |s| s.show_floor),
+            ("aid-axes", |s| s.show_axes),
+            ("aid-place", |s| s.show_place_grid),
+            ("show-knowledge", |s| s.show_knowledge),
+            ("show-ghost", |s| s.show_ghost),
+        ];
+        for (probe, get) in flips {
+            let was = get(&st);
+            let outs = click_widget(&ctx, &mut st, &inp, probe);
+            assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "{probe}: display only");
+            assert_eq!(get(&st), !was, "{probe}");
+        }
+        let was = st.smooth_motion;
+        let outs = click_widget(&ctx, &mut st, &inp, "aid-smooth");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), [&Action::SmoothMotion(!was)]);
+        let was = st.warp_fields;
+        let outs = click_widget(&ctx, &mut st, &inp, "aid-warp");
+        assert_eq!(outs.iter().flat_map(|o| &o.actions).collect::<Vec<_>>(), [&Action::WarpFields(!was)], "the warp is a Display aid off the estimated solver");
+        assert_eq!(st.nucleus_scale, None);
+        click_widget(&ctx, &mut st, &inp, "nucleus-auto");
+        assert_eq!(st.nucleus_scale, Some(1.0));
+        assert!(probes_now(&ctx, &mut st, &inp).contains("nucleus-scale"), "its slider while not automatic");
+        click_widget(&ctx, &mut st, &inp, "nucleus-auto");
+        assert_eq!(st.nucleus_scale, None);
+        // the placement plane's spacing and the trails' length and opacity, in a row under the chips
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(!p.contains("aid-place-angstrom") && !p.contains("trail-length"));
+        click_widget(&ctx, &mut st, &inp, "aid-place-more");
+        click_widget(&ctx, &mut st, &inp, "aid-place-angstrom");
+        assert!(st.grid_in_angstrom);
+        st.show_trails = true;
+        click_widget(&ctx, &mut st, &inp, "aid-trails-more");
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("trail-length") && p.contains("trail-opacity") && !p.contains("aid-place-angstrom"), "one row at a time");
+        let texts: String = {
+            let mut out = String::new();
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            fn walk(s: &egui::epaint::Shape, out: &mut String) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            out
+        };
+        assert!(texts.contains(&format!("trails {}", crate::trails::length_text(st.trail_fs))), "the chip names the length:\n{texts}");
+        // the trail length: a press at the slider's left end sets it near its 5 fs minimum
+        let r = probed_rect("trail-length");
+        press_at(&ctx, &mut st, &inp, r.left_center() + egui::vec2(2.0, 0.0));
+        assert!(st.trail_fs < 100.0, "edited: {}", st.trail_fs);
+        // the estimated cloud card: its chips only under that solver
+        assert!(!probes_now(&ctx, &mut st, &inp).contains("cloud-refresh"));
+        st.backend = Backend::Estimated;
+        let p = probes_now(&ctx, &mut st, &inp);
+        assert!(p.contains("cloud-refresh") && p.contains("cloud-superposition") && p.contains("aid-warp"));
+    }
+
+    /// A press and release at `at`.
+    fn press_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, at: egui::Pos2) {
+        for ev in [vec![egui::Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)], vec![egui::Event::PointerGone]] {
+            frame(ctx, st, inp, 1400.0, ev);
+        }
+    }
+
+    /// Each section's ↺ resets its own settings only; Reset all view settings still resets every one.
+    #[test]
+    fn each_sections_reset_is_its_own() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let d = UiState::new("h2", &scene);
+        let mut st = UiState::new("h2", &scene);
+        view_panel(&mut st, &Section::ALL);
+        let touch = |st: &mut UiState| {
+            (st.gamma, st.show_cell, st.camera_view, st.label_opacity) = (0.3, !d.show_cell, true, 0.2);
+        };
+        let now = |st: &UiState| (st.gamma, st.show_cell, st.camera_view, st.label_opacity);
+        touch(&mut st);
+        click_widget(&ctx, &mut st, &inp, "view-aids-reset");
+        assert_eq!(now(&st), (0.3, d.show_cell, true, 0.2), "Display aids only");
+        click_widget(&ctx, &mut st, &inp, "view-look-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, true, 0.2), "the look only");
+        view_panel(&mut st, &[Section::Camera]); // (each fold on screen in its turn)
+        click_widget(&ctx, &mut st, &inp, "view-camera-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, 0.2), "Camera only");
+        view_panel(&mut st, &[Section::Bonds]);
+        click_widget(&ctx, &mut st, &inp, "view-bonds-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, d.label_opacity), "Bonds and labels");
+        touch(&mut st);
+        click_widget(&ctx, &mut st, &inp, "view-reset");
+        assert_eq!(now(&st), (d.gamma, d.show_cell, d.camera_view, d.label_opacity), "all of them");
+    }
+
+    /// At about 320 pt, every fold open, dots with the trails row and the estimated cloud card: the
+    /// parts stack inside the panel and no text runs past its right edge.
+    #[test]
+    fn the_view_panel_fits_320_pt() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for mode in [VOLUME_DOTS, VOLUME_VOLUME, VOLUME_ISO] {
+            let mut st = UiState::new("h2", &scene);
+            st.backend = Backend::Estimated;
+            st.volume_mode = mode;
+            st.show = ShowMode::Coloured;
+            st.show_trails = true;
+            st.camera_view = true;
+            st.nucleus_scale = Some(1.2);
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[View*])").unwrap());
+            st.view_sections = Sections::all(true);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+            let mut shapes = Vec::new();
+            PROBES.with(|p| p.borrow_mut().clear());
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let panel = probed_rect("view-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["view-look", "view-aids", "anchor-m-density", "view-bonds", "view-camera", "view-reset"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{mode} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{mode} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            let presets: Vec<egui::Rect> = ["clean", "glow", "scientific", "present"].iter().map(|w| probed_rect(&format!("look-{w}"))).collect();
+            assert!(presets.windows(2).all(|w| w[0].right() <= w[1].left() && (w[0].width() - w[1].width()).abs() < 0.5), "four equal buttons in a row: {presets:?}");
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{mode}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
+    }
+
     /// The Window menu (spec D-7): one row per panel, a click shows it (a closed one comes back);
     /// Reset layout gives the default; none of it is an action. The View menu is gone.
     #[test]
@@ -7043,9 +8650,9 @@ mod view_panel {
             outs
         };
         let mut outs = Vec::new();
-        assert!(!st.tab_shown(DockTab::Graph));
-        outs.extend(in_window(&mut st, "window-Graph"));
-        assert!(st.tab_shown(DockTab::Graph) && !st.tab_shown(DockTab::Log));
+        assert!(!st.tab_shown(DockTab::Activity));
+        outs.extend(in_window(&mut st, "window-Activity"));
+        assert!(st.tab_shown(DockTab::Activity) && !st.tab_shown(DockTab::Log));
         st.workspace.close_panel(DockTab::Knowledge);
         outs.extend(in_window(&mut st, "window-Knowledge"));
         assert!(st.tab_shown(DockTab::Knowledge), "a closed panel comes back");
@@ -7077,7 +8684,7 @@ mod view_panel {
         let mut st = UiState::new("h2", &scene);
         let arrangement = |st: &UiState| (layout::encode(&st.workspace.to_node()), layout::encode_hidden(st.workspace.hidden()));
         for (w, path) in [(1400.0, &["menu-Window", "layouts-submenu"][..]), (1200.0, &["menu-all", "menu-Window", "layouts-submenu"][..])] {
-            st.workspace.set_node(layout::parse("H(0.50,[Log*,Graph],V(0.30,3D,[Model*]))").unwrap());
+            st.workspace.set_node(layout::parse("H(0.50,[Log*,Readouts],V(0.30,3D,[Model*]))").unwrap());
             for p in [Preset::Training, Preset::Presenting, Preset::TwoMonitors, Preset::Training, Preset::OneMonitor] {
                 let before = arrangement(&st);
                 let mut outs = Vec::new();
@@ -7101,9 +8708,9 @@ mod view_panel {
         assert!(saved.contains(&format!("\nhidden = {}\n", layout::encode_hidden(&Preset::Presenting.tree().1))), "{saved}");
         assert!(DockTab::PANELS.into_iter().all(|t| st.workspace.present(t) && !st.tab_shown(t)), "hidden panels are present");
         st.reset_layout();
-        assert!(st.workspace.present(DockTab::Graph) && !st.tab_shown(DockTab::Graph), "a tab behind Log is present");
-        st.workspace.close_panel(DockTab::Graph);
-        assert!(!st.workspace.present(DockTab::Graph), "a closed panel is not");
+        assert!(st.workspace.present(DockTab::Readouts) && !st.tab_shown(DockTab::Readouts), "a tab behind Log is present");
+        st.workspace.close_panel(DockTab::Readouts);
+        assert!(!st.workspace.present(DockTab::Readouts), "a closed panel is not");
         // Ctrl K finds each preset (and Reset layout) in the Window menu's Layouts group
         for p in Preset::ALL {
             let r = search::results(&format!("layout {}", p.title()), 1);
@@ -7188,19 +8795,19 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
-        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Graph, "tab-menu-new-window");
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
+        let outs = tab_menu(&ctx, &mut st, &inp, DockTab::Readouts, "tab-menu-new-window");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         let id = match st.workspace.windows().as_slice() {
             [id] => *id,
             w => panic!("{w:?}"),
         };
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
-        assert!(matches!(requests(&outs).as_slice(), [WindowRequest::Open { panels, .. }] if *panels == vec![DockTab::Graph]), "{:?}", requests(&outs));
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts]);
+        assert!(matches!(requests(&outs).as_slice(), [WindowRequest::Open { panels, .. }] if *panels == vec![DockTab::Readouts]), "{:?}", requests(&outs));
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         // Orbitals into that window by its number
         tab_menu(&ctx, &mut st, &inp, DockTab::Orbitals, &format!("tab-menu-window-{id}"));
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph, DockTab::Orbitals]);
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts, DockTab::Orbitals]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
         // from inside the window, Orbitals back to the main window: it left a leaf of its own, so
         // beside the 3D view on the right
@@ -7209,12 +8816,12 @@ mod detached_windows {
         PROBES.with(|m| m.borrow_mut().clear());
         let outs = tab_menu_in_window(&wctx, &mut st, &inp, id, DockTab::Orbitals, "tab-menu-main");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph]);
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Orbitals*]),[Log*])");
     }
 
     /// Review I2: the tab menu's Reset the layout with two monitors (it runs while the main tree
-    /// is lent out) applies Two monitors whole: one detached window holding Activity over Graph,
+    /// is lent out) applies Two monitors whole: one detached window holding Activity over Readouts,
     /// both in the workspace — from the default layout, and again from Two monitors itself (the
     /// old window closes, a new one opens).
     #[test]
@@ -7232,10 +8839,10 @@ mod detached_windows {
                 [id] => *id,
                 w => panic!("one window: {w:?}"),
             };
-            assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity, DockTab::Graph]);
-            assert!(st.workspace.present(DockTab::Activity) && st.workspace.present(DockTab::Graph), "neither closed");
+            assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity, DockTab::Readouts]);
+            assert!(st.workspace.present(DockTab::Activity) && st.workspace.present(DockTab::Readouts), "neither closed");
             assert_eq!(st.workspace.to_node(), Preset::TwoMonitors.tree().0);
-            let open = WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Graph], rect: Some(SECOND), size: None, fill: true };
+            let open = WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Readouts], rect: Some(SECOND), size: None, fill: true };
             assert!(requests(outs).contains(&open), "{:?}", requests(outs));
             id
         };
@@ -7259,19 +8866,19 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
-        let outs = click_widget(&ctx, &mut st, &inp, "dock-pop-Graph");
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
+        let outs = click_widget(&ctx, &mut st, &inp, "dock-pop-Readouts");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Log*])");
         let ids = st.workspace.windows();
         assert_eq!(ids.len(), 1);
         let id = ids[0];
-        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "[Graph*,Orbitals]");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "[Readouts*,Orbitals]");
         match requests(&outs).as_slice() {
-            [WindowRequest::Open { id: o, panels, rect: None, size: Some(_), fill: false }] => assert_eq!((*o, panels.clone()), (id, vec![DockTab::Graph, DockTab::Orbitals])),
+            [WindowRequest::Open { id: o, panels, rect: None, size: Some(_), fill: false }] => assert_eq!((*o, panels.clone()), (id, vec![DockTab::Readouts, DockTab::Orbitals])),
             r => panic!("{r:?}"),
         }
-        assert!(st.tab_shown(DockTab::Graph) && st.workspace.present(DockTab::Orbitals) && !st.tab_shown(DockTab::Orbitals));
+        assert!(st.tab_shown(DockTab::Readouts) && st.workspace.present(DockTab::Orbitals) && !st.tab_shown(DockTab::Orbitals));
         // the window's own context draws its tabs (and no pin: it has no strips)
         let wctx = egui::Context::default();
         apply_theme(&wctx);
@@ -7279,16 +8886,16 @@ mod detached_windows {
         for _ in 0..2 {
             assert!(window_frame(&wctx, &mut st, &inp, id, vec![]).actions.is_empty());
         }
-        let (tab, pop, close) = (probed_rect("dock-tab-Graph"), probed_rect("dock-pop-Graph"), probed_rect("dock-close-Graph"));
+        let (tab, pop, close) = (probed_rect("dock-tab-Readouts"), probed_rect("dock-pop-Readouts"), probed_rect("dock-close-Readouts"));
         assert!(tab.right() < pop.left() && (pop.right() - close.left()).abs() < 0.5 && close.right() <= 600.5, "tab {tab:?} pop {pop:?} close {close:?}");
-        assert!(PROBES.with(|m| !m.borrow().contains_key("dock-pin-Graph")), "no pin in a detached window");
+        assert!(PROBES.with(|m| !m.borrow().contains_key("dock-pin-Readouts")), "no pin in a detached window");
         // Dock back: both panels into the main window — their leaf is gone, so together beside the
         // 3D view on the right, the shown one still shown — and the window closes
-        let outs = click_in_window(&wctx, &mut st, &inp, id, "dock-pop-Graph");
+        let outs = click_in_window(&wctx, &mut st, &inp, id, "dock-pop-Readouts");
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert!(st.workspace.windows().is_empty());
         assert_eq!(requests(&outs), vec![WindowRequest::Close { id }]);
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Graph*,Orbitals]),[Log*])");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.70,3D,[Readouts*,Orbitals]),[Log*])");
     }
 
     /// A panel's body draws in a detached window's own context, from the same state, and counts
@@ -7337,7 +8944,7 @@ mod detached_windows {
     }
 
     /// Closing the OS window (the window side reports it) docks its panels back where they
-    /// left: Activity into the leaf it shared with Log and Graph.
+    /// left: Activity into the leaf it shared with Log.
     #[test]
     fn closing_the_window_returns_activity_to_its_old_leaf() {
         let scene = Scene::preset("h2").unwrap();
@@ -7348,7 +8955,7 @@ mod detached_windows {
         assert_eq!(st.workspace.window_panels(id), vec![DockTab::Activity]);
         st.workspace.window_closed(id);
         assert!(st.workspace.windows().is_empty());
-        assert_eq!(layout::encode(&st.workspace.to_node()), before.replace("[Log*,Activity,Graph]", "[Log,Graph,Activity*]"));
+        assert_eq!(layout::encode(&st.workspace.to_node()), before.replace("[Log*,Activity]", "[Log,Activity*]"));
     }
 
     /// The profile writes one `window = x,y,w,h <tree>` line per detached window and reads them
@@ -7359,11 +8966,11 @@ mod detached_windows {
         let scene = Scene::preset("h2").unwrap();
         let mut st = UiState::new("h2", &scene);
         assert!(!profile::capture(&st).contains("window ="), "none by default");
-        let a = st.workspace.pop_out(&[DockTab::Activity, DockTab::Graph], DockTab::Graph).unwrap();
+        let a = st.workspace.pop_out(&[DockTab::Activity, DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.set_window_rect(a, Some(WinRect { x: 2600, y: 30, w: 900, h: 1000 }), true);
         st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
         let text = profile::capture(&st);
-        assert!(text.contains("\nwindow = 2600,30,900,1000 max [Activity,Graph*]\nwindow = [Log*]\n"), "{text}");
+        assert!(text.contains("\nwindow = 2600,30,900,1000 max [Activity,Readouts*]\nwindow = [Log*]\n"), "{text}");
         assert!(text.contains(&format!("\nlayout = {}\n", layout::encode(&st.workspace.to_node()))), "{text}");
         let mut back = UiState::new("h2", &scene);
         profile::apply(&mut back, &text);
@@ -7387,11 +8994,11 @@ mod detached_windows {
         let opened: Vec<Vec<DockTab>> = out.windows.iter().filter_map(|r| if let WindowRequest::Open { panels, .. } = r { Some(panels.clone()) } else { None }).collect();
         assert_eq!(opened, vec![vec![DockTab::Log]]);
         let main = layout::panels(&one.workspace.to_node());
-        assert!(main.contains(&DockTab::Activity) && main.contains(&DockTab::Graph));
+        assert!(main.contains(&DockTab::Activity) && main.contains(&DockTab::Readouts));
         assert!(one.status.contains("no connected monitor"), "{}", one.status);
     }
 
-    /// Two monitors (spec D-11): with a second monitor, Activity over Graph in a window filling
+    /// Two monitors (spec D-11): with a second monitor, Activity over Readouts in a window filling
     /// it (maximised there) and the rest as One monitor less those two; Reset layout is then Two
     /// monitors too. With one monitor it is One monitor and the status says so.
     #[test]
@@ -7403,8 +9010,8 @@ mod detached_windows {
         assert_eq!(st.workspace.to_node(), Preset::TwoMonitors.tree().0);
         let ids = st.workspace.windows();
         assert_eq!(ids.len(), 1);
-        assert_eq!(layout::encode(&st.workspace.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Graph*])");
-        let open = |id: u32| WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Graph], rect: Some(SECOND), size: None, fill: true };
+        assert_eq!(layout::encode(&st.workspace.window_node(ids[0]).unwrap()), "V(0.50,[Activity*],[Readouts*])");
+        let open = |id: u32| WindowRequest::Open { id, panels: vec![DockTab::Activity, DockTab::Readouts], rect: Some(SECOND), size: None, fill: true };
         assert_eq!(st.workspace.take_requests(), vec![open(ids[0])]);
         // applying it again replaces the window (the old one closes)
         st.apply_layout(Preset::TwoMonitors);
@@ -7434,7 +9041,7 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        let id = st.workspace.pop_out(&[DockTab::Graph, DockTab::Activity], DockTab::Graph).unwrap();
+        let id = st.workspace.pop_out(&[DockTab::Readouts, DockTab::Activity], DockTab::Readouts).unwrap();
         let first = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         assert!(matches!(first.windows.as_slice(), [WindowRequest::Open { .. }]));
         assert!(!st.tab_shown(DockTab::Activity));
@@ -7539,21 +9146,21 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))").unwrap());
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))").unwrap());
         st.workspace.set_monitors(vec![PRIMARY, SECOND]);
         st.workspace.set_work_areas(vec![WinRect { x: 0, y: 0, w: 2560, h: 1400 }, SECOND]);
         st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
-        let leaf = st.workspace.leaf_rect(DockTab::Graph).unwrap();
+        let leaf = st.workspace.leaf_rect(DockTab::Readouts).unwrap();
         let (w, h) = (leaf.width().round() as u32, leaf.height().round() as u32);
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(1700.0, 1300.0)], false, &mut main, &mut |_| vec![]);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[egui::pos2(1700.0, 1300.0)], false, &mut main, &mut |_| vec![]);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert_eq!(drawn, None, "no window under the cursor draws a target");
-        let id = st.workspace.window_of(DockTab::Graph).expect("in a new window");
-        assert_eq!(opened(&outs), vec![(id, vec![DockTab::Graph], Some(WinRect { x: 1700, y: 1400 - h as i32, w, h }))]);
+        let id = st.workspace.window_of(DockTab::Readouts).expect("in a new window");
+        assert_eq!(opened(&outs), vec![(id, vec![DockTab::Readouts], Some(WinRect { x: 1700, y: 1400 - h as i32, w, h }))]);
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
         // on the second monitor, beyond its right edge less the window's width: kept on it
@@ -7588,7 +9195,7 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Model,Activity]))").unwrap());
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*,Model,Activity]))").unwrap());
         let id = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 2.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
@@ -7606,14 +9213,14 @@ mod detached_windows {
         let (_, drawn) = drag_tab(&mut st, DockTab::Model, &[at(190.0, 400.0)], false, &mut main, &mut win);
         assert!(drawn.is_some_and(|r| r.contains(egui::pos2(190.0, 400.0))), "{drawn:?}");
         assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Activity,Log*])");
-        // its tab bar, on the Activity tab: Graph goes before it
+        // its tab bar, on the Activity tab: Readouts goes before it
         for _ in 0..2 {
             win(&mut st);
         }
         let tab = probed_rect("dock-tab-Activity").center();
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(tab.x, tab.y)], false, &mut main, &mut win);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(tab.x, tab.y)], false, &mut main, &mut win);
         assert!(drawn.is_some_and(|r| r.contains(tab)), "the tab is lit: {drawn:?}");
-        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Graph*,Activity,Log])");
+        assert_eq!(layout::encode(&st.workspace.window_node(id).unwrap()), "H(0.50,[Model*],[Readouts*,Activity,Log])");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,[Orbitals*])");
         assert_eq!(st.workspace.floats_for_test(), 0);
         // over the window's title bar (its frame, not its client area): no target, nothing moves
@@ -7635,8 +9242,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         let view = frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap();
@@ -7644,14 +9251,14 @@ mod detached_windows {
         let at = |p: egui::Pos2| egui::pos2(p.x - 1500.0, p.y - 100.0);
         let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
         let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(view.center())], false, &mut win, &mut main);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(view.center())], false, &mut win, &mut main);
         assert_eq!(drawn, None, "the 3D view's tile has no centre target");
-        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Graph], "refused: it stays");
+        assert_eq!(st.workspace.window_panels(id), vec![DockTab::Readouts], "refused: it stays");
         let left = view.center() - egui::vec2(110.0, 0.0);
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[at(left)], false, &mut win, &mut main);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[at(left)], false, &mut win, &mut main);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
         assert!(drawn.is_some_and(|r| r.contains(left)), "{drawn:?}");
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.50,[Graph*],3D),[Log*])");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,H(0.50,[Readouts*],3D),[Log*])");
         assert!(st.workspace.windows().is_empty());
         assert!(requests(&outs).contains(&WindowRequest::Close { id }), "{:?}", requests(&outs));
     }
@@ -7668,7 +9275,7 @@ mod detached_windows {
             apply_theme(c);
         }
         let mut st = UiState::new("h2", &scene);
-        let a = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        let a = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         let b = st.workspace.pop_out(&[DockTab::Log], DockTab::Log).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(b), 2200, 100, 600.0, 800.0, 1.0), place(Some(a), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
@@ -7677,7 +9284,7 @@ mod detached_windows {
         // window a's leaf centre, from window b's points
         let (outs, drawn) = drag_tab(&mut st, DockTab::Log, &[egui::pos2(1800.0 - 2200.0, 500.0 - 100.0)], false, &mut src, &mut others);
         assert!(drawn.is_some());
-        assert_eq!(layout::encode(&st.workspace.window_node(a).unwrap()), "[Graph,Log*]");
+        assert_eq!(layout::encode(&st.workspace.window_node(a).unwrap()), "[Readouts,Log*]");
         assert_eq!(st.workspace.windows(), vec![a]);
         assert!(requests(&outs).contains(&WindowRequest::Close { id: b }));
     }
@@ -7693,7 +9300,7 @@ mod detached_windows {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
+        let tree = "H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))";
         st.workspace.set_node(layout::parse(tree).unwrap());
         st.workspace.set_places(vec![place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
@@ -7702,14 +9309,14 @@ mod detached_windows {
         let (log, view) = (st.workspace.leaf_rect(DockTab::Log).unwrap(), frame(&ctx, &mut st, &inp, 1400.0, vec![]).view.unwrap());
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
         for spot in [log.left_bottom() + egui::vec2(12.0, -12.0), view.left_top() + egui::vec2(20.0, 20.0)] {
-            let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[spot], false, &mut main, &mut |_| vec![]);
+            let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[spot], false, &mut main, &mut |_| vec![]);
             assert!(opened(&outs).is_empty(), "{spot:?}");
             assert_eq!(layout::encode(&st.workspace.to_node()), layout::encode(&layout::parse(tree).unwrap()), "{spot:?}");
             assert_eq!(st.workspace.floats_for_test(), 0, "{spot:?}");
         }
-        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[log.center()], false, &mut main, &mut |_| vec![]);
+        let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[log.center()], false, &mut main, &mut |_| vec![]);
         assert!(opened(&outs).is_empty());
-        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Graph*]))");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log,Readouts*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
     }
 
@@ -7735,8 +9342,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        let tree = "H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*]))";
-        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Graph*,Orbitals],[Log*,Activity]))").unwrap());
+        let tree = "H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*]))";
+        st.workspace.set_node(layout::parse("H(0.70,3D,V(0.50,[Readouts*,Orbitals],[Log*,Activity]))").unwrap());
         let b = st.workspace.pop_out(&[DockTab::Activity], DockTab::Activity).unwrap();
         st.workspace.take_requests();
         assert_eq!(layout::encode(&st.workspace.to_node()), tree);
@@ -7751,16 +9358,16 @@ mod detached_windows {
         cover(&mut st, 40.0, 760.0);
         let mut main = |st: &mut UiState, ev: Vec<egui::Event>| frame(&ctx, st, &inp, 1400.0, ev);
         let mut win = |st: &mut UiState| vec![window_frame_at(&wctx, st, &inp, b, 1.0, vec![])];
-        let (outs, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        let (outs, drawn) = drag_tab(&mut st, DockTab::Readouts, &[log], false, &mut main, &mut win);
         assert_eq!(drawn, None, "B's corner is no target");
         assert!(opened(&outs).is_empty());
         assert_eq!(layout::encode(&st.workspace.to_node()), tree, "the main window's hidden drop was undone");
         assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity*]");
         // B's centre over the main window's Log centre: into B, once
         cover(&mut st, 300.0, 400.0);
-        let (_, drawn) = drag_tab(&mut st, DockTab::Graph, &[log], false, &mut main, &mut win);
+        let (_, drawn) = drag_tab(&mut st, DockTab::Readouts, &[log], false, &mut main, &mut win);
         assert!(drawn.is_some());
-        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity,Graph*]");
+        assert_eq!(layout::encode(&st.workspace.window_node(b).unwrap()), "[Activity,Readouts*]");
         assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.70,3D,V(0.50,[Orbitals*],[Log*]))");
         assert_eq!(st.workspace.floats_for_test(), 0);
 
@@ -7800,22 +9407,22 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_monitors(vec![PRIMARY, SECOND]);
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         let mut win = |st: &mut UiState, ev: Vec<egui::Event>| window_frame_at(&wctx, st, &inp, id, 1.0, ev);
         let mut main = |st: &mut UiState| vec![frame(&ctx, st, &inp, 1400.0, vec![])];
         // desktop (3000, 300), on the second monitor, from the window's points
-        let (outs, _) = drag_tab(&mut st, DockTab::Graph, &[egui::pos2(3000.0 - 1500.0, 300.0 - 100.0)], false, &mut win, &mut main);
+        let (outs, _) = drag_tab(&mut st, DockTab::Readouts, &[egui::pos2(3000.0 - 1500.0, 300.0 - 100.0)], false, &mut win, &mut main);
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
-        let new = st.workspace.window_of(DockTab::Graph).expect("in a new window");
+        let new = st.workspace.window_of(DockTab::Readouts).expect("in a new window");
         assert_ne!(new, id);
         assert_eq!(st.workspace.windows(), vec![new]);
         let r = requests(&outs);
         assert_eq!(r.iter().filter(|r| **r == WindowRequest::Close { id }).count(), 1, "{r:?}");
-        assert_eq!(opened(&outs), vec![(new, vec![DockTab::Graph], Some(WinRect { x: 3000, y: 1080 - 800, w: 600, h: 800 }))]);
+        assert_eq!(opened(&outs), vec![(new, vec![DockTab::Readouts], Some(WinRect { x: 3000, y: 1080 - 800, w: 600, h: 800 }))]);
     }
 
     /// Task 11 review M3: a drag whose source window closes under it is forgotten — the window
@@ -7829,8 +9436,8 @@ mod detached_windows {
         apply_theme(&ctx);
         apply_theme(&wctx);
         let mut st = UiState::new("h2", &scene);
-        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Graph])").unwrap());
-        let id = st.workspace.pop_out(&[DockTab::Graph], DockTab::Graph).unwrap();
+        st.workspace.set_node(layout::parse("H(0.70,3D,[Log*,Readouts])").unwrap());
+        let id = st.workspace.pop_out(&[DockTab::Readouts], DockTab::Readouts).unwrap();
         st.workspace.take_requests();
         st.workspace.set_places(vec![place(Some(id), 1500, 100, 600.0, 800.0, 1.0), place(None, 0, 0, 1400.0, 900.0, 1.0)]);
         for _ in 0..3 {
@@ -7838,14 +9445,14 @@ mod detached_windows {
             frame(&ctx, &mut st, &inp, 1400.0, vec![]);
         }
         let log = st.workspace.leaf_rect(DockTab::Log).unwrap().center();
-        let c = probed_rect("dock-tab-Graph").center();
+        let c = probed_rect("dock-tab-Readouts").center();
         window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(c), pointer(c, true)]);
         for p in [c + egui::vec2(12.0, 0.0), c + egui::vec2(50.0, 0.0), egui::pos2(log.x - 1500.0, log.y - 100.0)] {
             window_frame_at(&wctx, &mut st, &inp, id, 1.0, vec![egui::Event::PointerMoved(p)]);
         }
         PROBES.with(|m| m.borrow_mut().remove("drop-target"));
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
-        assert_eq!(st.workspace.dragging(), Some(DockTab::Graph));
+        assert_eq!(st.workspace.dragging(), Some(DockTab::Readouts));
         assert!(PROBES.with(|m| m.borrow().contains_key("drop-target")), "the main window draws the Log leaf's targets");
         // the window closes under the drag (Alt+F4 with the button held)
         st.workspace.window_closed(id);
@@ -9154,4 +10761,1586 @@ mod updates {
         profile::apply(&mut old, &defaults);
         assert_eq!((old.update.channel, old.update.auto_check), (Channel::Stable, true));
     }
+}
+
+/// The Model panel's restructuring (user request 2026-11-14, the approved mockup): the verdict card,
+/// Teach next, Health, then the folds — order, default folds, the verdict's words, the gaps, the
+/// Details rows, the profile, the narrow panel.
+mod model_panel {
+    use super::super::dock::model::{gaps, surface_chip, verdict, Section, Sections, Tone};
+    use super::*;
+
+    /// The text of every text shape the chrome draws in one frame (after two settling frames).
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns }
+    }
+
+    /// H₂S with an unlearned S–H pair key (12 of 60 samples), an unlearned O–S one (no O in the
+    /// scene) and a learned H–H one; strict mode refuses here by the pair class.
+    fn gappy() -> ModelStatus {
+        let sh = key(16, vec![1], Some((sim::ClassKey::Samples, 12.0, 60.0)), 12, 60);
+        let os = key(8, vec![16], Some((sim::ClassKey::Samples, 5.0, 29.0)), 5, 29);
+        let hh = key(1, vec![1], None, 400, 29);
+        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![sh, os, hh] };
+        let readiness = sim::Readiness {
+            answers: false,
+            rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair)),
+            atom: Some(1),
+            text: "rule 4b: pair environment around S, with H not learned well enough yet (12 of 60 samples)".into(),
+            unlearned: None,
+            forgotten_fence: false,
+        };
+        ModelStatus { class_loo: vec![pair], readiness: Some(readiness), ..model() }
+    }
+
+    fn est(scene: &Scene, m: ModelStatus, source: sim::Source) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Estimated, Some(m));
+        s.dynamics.source = source;
+        s.dynamics.uncertainty = Some(1.1e-4);
+        s.dynamics.fallback_fraction_100 = 0.12;
+        s
+    }
+
+    fn state(name: &str, scene: &Scene) -> UiState {
+        let mut st = UiState::new(name, scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        st
+    }
+
+    /// Verdict → Teach next → Health → Learned → Worst-fitting → Details → Model file; Teach next
+    /// and Health open by default, the rest folded (their contents not drawn).
+    #[test]
+    fn the_sections_come_in_order_with_teach_and_health_open() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = est(&scene, model(), sim::Source::Surrogate);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &scene);
+        assert_eq!(st.model_sections, Sections::default());
+        assert!(st.model_sections.is_open(Section::Teach) && st.model_sections.is_open(Section::Health));
+        for s in [Section::Gaps, Section::Plan, Section::Audits, Section::Learned, Section::Suspects, Section::Details, Section::File] {
+            assert!(!st.model_sections.is_open(s), "{s:?}");
+        }
+        let t = texts(&ctx, &mut st, &inp);
+        let order = ["model-verdict", "model-teach", "model-health", "model-fold-learned", "model-fold-suspects", "model-fold-details", "model-fold-file"];
+        let ys: Vec<f32> = order.iter().map(|p| probed_rect(p).top()).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?}: {ys:?}");
+        assert!(t.contains("Teach next") && t.contains("Health") && t.contains("Learned (1 class)") && t.contains("Worst-fitting samples") && t.contains("Details") && t.contains("Model file"), "{t}");
+        // Health's rows drawn, Details' not
+        assert!(t.contains("uncertainty") && t.contains("last audit") && t.contains("rmse 1.6e-5 Ha/Bohr"), "{t}");
+        assert!(!t.contains("model epoch") && !t.contains("mismatch work") && !t.contains("Save model…"), "{t}");
+    }
+
+    /// The verdict's headline and reason: trusted and answering; falling back for an unlearned pair
+    /// (the reason names it, the long explanation only on the "why?" hover); no model yet; Model
+    /// only where strict mode would refuse; another solver.
+    #[test]
+    fn the_verdict_says_what_answers_here_and_why() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let st = state("h2", &h2);
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let v = verdict(&st, &input(&h2, Some(&snap), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Good, "Model answering · trusted here"));
+        assert!(v.reason.starts_with("Everything this scene needs is learned."), "{}", v.reason);
+
+        let h2s = Scene::preset("h2s").unwrap();
+        let mut st = state("h2s", &h2s);
+        let snap = est(&h2s, gappy(), sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let v = verdict(&st, &inp);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here"));
+        assert_eq!(v.reason, "This scene has S–H pairs the model hasn't learned yet. Everything else here is trusted.");
+        assert!(!v.reason.contains("O–S"), "the O–S key is not this scene's");
+        // the long explanation (the old trusted / strict-here paragraphs) is the hover's, not the body's
+        let long = "rule 4b: pair environment around S, with H not learned well enough yet";
+        assert!(v.tip.contains(long) && v.tip.contains("strict mode here: refuses"), "{}", v.tip);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Falling back to DFT here") && t.contains("why?") && t.contains("12 % DFT"), "{t}");
+        assert!(t.replace('\n', " ").contains("S–H pairs the model"), "{t}");
+        assert!(!t.contains(long), "the long text stays in the tooltip: {t}");
+        probed_rect("model-why");
+
+        let none = est(&h2, ModelStatus { fitted: false, trusted: false, fit: None, ..model() }, sim::Source::Dft);
+        let v = verdict(&state("h2", &h2), &input(&h2, Some(&none), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Neutral, "No model yet"));
+
+        let mut st = state("h2s", &h2s);
+        st.draft = true;
+        st.audit_every = 0;
+        st.model_only = Some(ModelOnlySaved { draft: false, audit_every: 2000 });
+        let snap = est(&h2s, gappy(), sim::Source::Surrogate);
+        let v = verdict(&st, &input(&h2s, Some(&snap), &cam));
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Model only · guessing here"));
+        assert!(v.reason.contains("would refuse here") && v.reason.contains("S–H pairs") && v.reason.contains("nothing checks it"), "{}", v.reason);
+
+        let mut st = state("h2", &h2);
+        st.backend = Backend::Gpu;
+        assert_eq!(verdict(&st, &input(&h2, None, &cam)).headline, "Estimated solver off");
+    }
+
+    /// Teach next lists exactly the keys not learned yet — the scene's first, with k / N; the others
+    /// under "other gaps (n)", drawn when that fold opens — and "Everything this scene needs is
+    /// learned" when nothing is missing.
+    #[test]
+    fn teach_next_lists_the_unlearned_keys_scene_first() {
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let g = gaps(&gappy(), &[1, 1, 16]);
+        let rows: Vec<(&str, bool, &str, usize, usize)> = g.iter().map(|g| (g.label.as_str(), g.in_scene, g.right.as_str(), g.have, g.need)).collect();
+        assert_eq!(rows, vec![("pair S–H", true, "12 / 60", 12, 60), ("pair O–S", false, "5 / 29", 5, 29)]);
+        let snap = est(&h2s, gappy(), sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair S–H") && t.contains("12 / 60") && t.contains("other gaps (1)"), "{t}");
+        assert!(!t.contains("pair O–S") && !t.contains("Everything this scene needs is learned"), "{t}");
+        click_widget(&ctx, &mut st, &inp, "model-fold-gaps");
+        assert!(st.model_sections.is_open(Section::Gaps));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair O–S") && t.contains("5 / 29"), "{t}");
+        // all learned
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let mut st = state("h2", &h2);
+        let t = texts(&ctx, &mut st, &input(&h2, Some(&snap), &cam));
+        assert!(t.contains("Everything this scene needs is learned") && !t.contains("other gaps"), "{t}");
+    }
+
+    /// Sample more (moved up into Teach next) emits the same `Action::Sample` as before; the audits
+    /// line's switch still emits `SetAudit`.
+    #[test]
+    fn the_moved_controls_emit_their_actions() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        let outs = click_widget(&ctx, &mut st, &inp, "sample");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| matches!(a, Action::Sample { .. })), "Sample more emits Action::Sample");
+        st.audit_every = 2000;
+        let outs = click_widget(&ctx, &mut st, &inp, "audits-on");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::SetAudit(0)), "the audits line turns them off");
+    }
+
+    /// With Details open every former readout row is there (a few pinned), and Ctrl K's "Teacher
+    /// gap" unfolds Details.
+    #[test]
+    fn details_hold_every_former_row() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let m = ModelStatus { last_refit: Some(crate::sim::RefitLog { ms: 85.0, at_step: 1200, result: Ok(271) }), ..model() };
+        let snap = est(&h2, m, sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        search::pick(&ctx, &mut st, search::results("teacher gap", 1)[0]);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(st.model_sections.is_open(Section::Details), "the reveal unfolds Details");
+        for row in ["this step", "trusted", "samples", "model epoch", "last fit", "strict here", "fit vs held", "learned classes", "last refit", "fallbacks", "teacher gap", "last audit", "mismatch work", "taught at", "model: this session only", "What this model is (and is not)"] {
+            assert!(t.contains(row), "{row}: {t}");
+        }
+        let flat = t.replace('\n', " ");
+        assert!(flat.contains("271 samples, 85 ms, at step 1200") && flat.contains("271 of 273 held: 2 quarantined") && flat.contains("pair: trusted · 273 samples"), "{t}");
+    }
+
+    /// The folds' open state is display state kept in the profile (`model_sections`): a header click
+    /// sends nothing, the line round-trips, absent means the default two, empty means all folded.
+    #[test]
+    fn the_folds_are_kept_in_the_profile() {
+        let cam = camera();
+        let h2 = Scene::preset("h2").unwrap();
+        let snap = est(&h2, model(), sim::Source::Surrogate);
+        let inp = input(&h2, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2", &h2);
+        assert!(profile::capture(&st).contains("\nmodel_sections = teach,health\n"));
+        let outs = click_widget(&ctx, &mut st, &inp, "model-fold-details");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display state");
+        click_widget(&ctx, &mut st, &inp, "model-fold-health");
+        assert_eq!(st.model_sections.encode(), "teach,details");
+        let text = profile::capture(&st);
+        let mut fresh = UiState::new("h2", &h2);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.model_sections.encode(), "teach,details");
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.model_sections, Sections::default(), "absent: Teach next and Health");
+        profile::apply(&mut fresh, "model_sections = \n");
+        assert_eq!(fresh.model_sections, Sections::all(false), "empty: every fold closed");
+    }
+
+    /// At 320 pt with every fold open the sections do not overlap and no text runs past the
+    /// panel's right edge (long text wraps; summaries are cut).
+    #[test]
+    fn a_narrow_panel_wraps_without_overlap() {
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let m = ModelStatus {
+            source: sim::ModelSource::Collection { slug: "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_accepted-0123456789ab".into(), samples: 1589, read_only: false },
+            collections: true,
+            suspects: vec![sim::SampleSuspect { id: sim::SampleId { index: 350, key: 1 }, formula: "H2".into(), origin: "pass perturbation".into(), loo_ratio: Some(5.08) }],
+            ..gappy()
+        };
+        assert_eq!(surface_chip(&m, &h2s), "Shared · LSDA · h 0.15 · pseudo");
+        let snap = est(&h2s, m, sim::Source::Fallback);
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Model*])").unwrap());
+        st.model_sections = Sections::all(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 4000.0));
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let panel = probed_rect("model-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "the panel is about 320 pt wide: {panel:?}");
+        let order = ["model-verdict", "model-teach", "model-health", "model-fold-learned", "model-fold-suspects", "model-fold-details", "model-fold-file"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        // every text the panel draws ends inside it (nothing clipped at the right edge)
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 0.5) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 40, "{checked} texts checked");
+    }
+}
+
+/// The Activity panel's restructuring (user request 2026-11-14, the approved mockup): the job card
+/// with its convergence plot and strip, the session timeline with the counters, the solve log's
+/// chips and folded runs, the trust and training folds.
+mod activity_redesign {
+    use super::*;
+    use activity::jobs::{JobKey, Traces, GHOSTS};
+    use activity::log::{group_text, items, Item, LogView};
+    use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+    use std::time::Duration as D;
+
+    fn live(iteration: u32, first: f32, delta_rho: f64) -> sim::ScfLive {
+        let mut spark = [f32::NAN; sim::activity::SPARK_POINTS];
+        for (k, v) in spark.iter_mut().enumerate().take(iteration as usize) {
+            *v = first - 0.5 * k as f32;
+        }
+        sim::ScfLive {
+            attempt: 1,
+            iteration,
+            max_iter: 200,
+            delta_rho,
+            tol: 1e-6,
+            energy: -1.13,
+            d_energy: -2e-5,
+            ms_per_iteration: 2200.0,
+            since_gain: 1,
+            window: 50,
+            best_delta_rho: delta_rho,
+            stall_level: 8e-3,
+            spark,
+            spark_len: iteration as u8,
+            spark_stride: 1,
+        }
+    }
+
+    fn pass_event(outcome: K, scf: Option<usize>, end: Option<sim::ScfEnd>, ms: f64) -> sim::TeachEvent {
+        let mut e = activity_tab::event(O::Pass, R::Pass(PassJob::Perturbation), outcome, None);
+        e.scf_steps = scf;
+        e.scf_end = end;
+        e.solve_ms = ms;
+        e
+    }
+
+    /// A pass running on H₂ with a live solve at iteration 6.
+    fn running(scene: &Scene) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 39, total: 144, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 1, finished: false, target: None });
+        snap
+    }
+
+    fn probe(l: sim::ScfLive) -> sim::ProbeView {
+        sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: l.iteration, elapsed_s: 13.0, solves: 40, live: Some(l) }, ..Default::default() }
+    }
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2) -> (String, Vec<egui::epaint::ClippedShape>) {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            shapes = full.shapes;
+        }
+        (out, shapes)
+    }
+
+    /// Job card → session timeline → counters → solve log → Trust checklist → Training plots; the
+    /// two folds closed by default; the card's words.
+    #[test]
+    fn the_sections_come_in_order_with_the_folds_closed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = running(&scene);
+        let inp = PanelInput { probe: Some(probe(live(6, -0.17, 0.68))), ..input(&scene, Some(&snap), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        assert!(!st.activity_sections.trust && !st.activity.training_open);
+        st.activity.absorb(&snap);
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        let order = ["activity-job-card", "anchor-d-timeline", "anchor-d-counters", "anchor-d-solve-log", "activity-fold-trust", "activity-fold-training"];
+        let ys: Vec<f32> = order.iter().map(|p| probed_rect(p).top()).collect();
+        assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?}: {ys:?}");
+        assert!(t.contains("Sampling pass · bond scan") && t.contains("sample 40 of 144") && t.contains("27 %"), "{t}");
+        assert!(t.contains("iteration 6 · 2.2 s each") && t.contains("Δρ 6.8e-1 → 1e-6") && t.contains("target"), "{t}");
+        assert!(t.contains("THIS SESSION") && t.contains("Trust checklist") && t.contains("Training plots"), "{t}");
+        // the folds draw nothing of their own while closed
+        assert!(!t.contains("Strict mode answers at this geometry"), "{t}");
+    }
+
+    /// The plot's y axis is fixed by the job's first solve — a second solve of another magnitude
+    /// does not rescale it — and a new solve keeps the earlier ones as faint traces (at most 3);
+    /// a solve younger than 0.5 s is not animated: the last finished one is drawn bright.
+    #[test]
+    fn the_convergence_plot_keeps_its_axis_and_the_previous_solves() {
+        let t0 = Instant::now();
+        let mut tr = Traces::default();
+        tr.observe(JobKey::Pass, Some(&live(10, -0.3, 1e-4)), t0);
+        let range = tr.range.unwrap();
+        assert_eq!(range, (-7.0, 0.0), "max(1, first Δρ) down to a decade below 1e-6");
+        tr.observe(JobKey::Pass, Some(&live(2, 1.5, 30.0)), t0 + D::from_secs(2));
+        assert_eq!(tr.range.unwrap(), range, "not rescaled by a bigger solve");
+        assert_eq!(tr.ghosts.len(), 1, "the finished solve is kept");
+        assert_eq!(tr.ghosts[0].iteration, 10);
+        for k in 0..5 {
+            tr.observe(JobKey::Pass, Some(&live(1, -1.0, 0.1)), t0 + D::from_secs(3 + k));
+            tr.observe(JobKey::Pass, Some(&live(4, -1.0, 0.01)), t0 + D::from_secs(3 + k));
+        }
+        assert!(tr.ghosts.len() <= GHOSTS);
+        assert_eq!(tr.range.unwrap(), range);
+        let started = tr.current.as_ref().unwrap().started;
+        let (bright, faint) = tr.shown(started + D::from_millis(100));
+        assert!(std::ptr::eq(bright.unwrap(), tr.ghosts.back().unwrap()), "a young solve: the last finished one is bright");
+        assert_eq!(faint.len(), GHOSTS - 1);
+        let (bright, faint) = tr.shown(started + D::from_secs(1));
+        assert!(std::ptr::eq(bright.unwrap(), tr.current.as_ref().unwrap()) && faint.len() == GHOSTS);
+        // another job starts afresh
+        tr.observe(JobKey::LiveSolve, Some(&live(3, 0.5, 1.0)), t0);
+        assert!(tr.ghosts.is_empty() && tr.range != Some(range));
+    }
+
+    /// The strip has one bar per finished sample of the running pass and the current one; a failed
+    /// sample is drawn full height in the danger colour.
+    #[test]
+    fn the_strip_marks_a_failed_sample_full_height() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = running(&scene);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        st.activity.absorb(&snap);
+        snap.activity.events = vec![pass_event(K::Kept, Some(17), Some(sim::ScfEnd::Converged), 21_000.0), pass_event(K::Failed, Some(61), Some(sim::ScfEnd::Stalled), 98_000.0), pass_event(K::Kept, Some(24), None, 28_000.0)];
+        st.activity.absorb(&snap);
+        let l = live(6, -0.17, 0.68);
+        let bars = activity::strip(&st.activity, Some(&l));
+        assert_eq!(bars.iter().map(|b| (b.iterations, b.danger, b.current)).collect::<Vec<_>>(), vec![(Some(17), false, false), (Some(61), true, false), (Some(24), false, false), (Some(6), false, true)]);
+        assert!(bars[1].words.contains("61 stalled"), "{}", bars[1].words);
+        let inp = PanelInput { probe: Some(probe(l)), ..input(&scene, Some(&snap), &cam) };
+        let (_, shapes) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        let strip = probed_rect("activity-strip");
+        fn rects(s: &egui::epaint::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::epaint::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        shapes.iter().for_each(|c| rects(&c.shape, &mut all));
+        let in_strip: Vec<_> = all.into_iter().filter(|(r, _)| strip.contains_rect(*r)).collect();
+        assert!(in_strip.iter().any(|(r, c)| *c == RED && (r.height() - strip.height()).abs() < 0.5), "{in_strip:?}");
+        assert_eq!(in_strip.iter().filter(|(_, c)| *c == RED).count(), 1);
+        // the failure is pinned over the log while the pass runs, and has a mark on the failures lane
+        assert_eq!(activity::log::pinned_failure(&st.activity), Some(1));
+        assert!(st.activity.timeline.iter().any(|m| matches!(m, activity::Mark::Failure(_))));
+        assert!(activity::plots::LANES.contains(&"failures"));
+    }
+
+    /// Identical consecutive rows fold into one expandable row; failures never fold; the "failed"
+    /// chip shows only them.
+    #[test]
+    fn identical_log_rows_fold_and_failures_do_not() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = vec![
+            pass_event(K::Kept, Some(17), None, 21_000.0),
+            pass_event(K::Kept, Some(24), None, 28_000.0),
+            pass_event(K::Kept, Some(20), None, 25_000.0),
+            pass_event(K::Failed, None, Some(sim::ScfEnd::TimeLimit), 90_000.0),
+            pass_event(K::Failed, None, Some(sim::ScfEnd::TimeLimit), 91_000.0),
+            activity_tab::event(O::Fallback, R::Grade, K::Kept, Some(7)),
+        ];
+        st.activity.absorb(&snap);
+        assert_eq!(items(&st.activity), vec![Item::Group { first: 0, last: 2, n: 3 }, Item::Row(3), Item::Row(4), Item::Row(5)]);
+        let rows: Vec<&sim::TeachEvent> = (0..3).map(|i| &st.activity.rows[i].event).collect();
+        assert_eq!(group_text(&rows), "3 × nudge — kept · 21–28 s · 17–24 it");
+        // expanded by a click on the group's row
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        // the table is wider than the panel (its own horizontal scroll, whose bar floats over the
+        // last row's lower half): click its visible top-left part
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let r = probed_rect("log-group-0");
+        let at = egui::pos2(r.left() + 30.0, r.top() + 4.0);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![pointer(at, false)]);
+        frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerGone]);
+        assert_eq!(items(&st.activity), vec![Item::Group { first: 0, last: 2, n: 3 }, Item::Member(0), Item::Member(1), Item::Member(2), Item::Row(3), Item::Row(4), Item::Row(5)]);
+        // the chips
+        click_widget(&ctx, &mut st, &inp, "log-chip-failed");
+        assert_eq!(st.activity.log_view, LogView::Failed);
+        assert_eq!(items(&st.activity), vec![Item::Row(3), Item::Row(4)]);
+        click_widget(&ctx, &mut st, &inp, "log-chip-fallback");
+        assert_eq!(items(&st.activity), vec![Item::Row(5)]);
+    }
+
+    /// The trust fold's summary counts the checklist's lines; its "see Model" shows the Model
+    /// panel; the folds round-trip through the profile.
+    #[test]
+    fn the_trust_fold_counts_the_checklist_and_the_folds_are_kept() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Activity);
+        let ls = activity::trust::lines(&model(), &scene, &st);
+        let met = ls.iter().filter(|l| l.met).count();
+        let want = if met == ls.len() { format!("{met} ✓") } else { format!("{met} ✓ · {} to learn", ls.len() - met) };
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        assert!(t.contains(&want) && t.contains("see Model"), "{want}: {t}");
+        assert!(profile::capture(&st).contains("\nactivity_sections = \n"));
+        let outs = click_widget(&ctx, &mut st, &inp, "activity-fold-trust");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "display state");
+        assert!(st.activity_sections.trust);
+        let (t, _) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 1800.0));
+        assert!(t.contains("Strict mode answers at this geometry"), "the checklist inside: {t}");
+        st.activity.training_open = true;
+        let text = profile::capture(&st);
+        assert!(text.contains("\nactivity_sections = trust,training\n"));
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.activity_sections.trust && fresh.activity.training_open);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert!(!fresh.activity_sections.trust && !fresh.activity.training_open, "absent: both closed");
+        // "see Model"
+        st.activity.training_open = false;
+        click_widget(&ctx, &mut st, &inp, "activity-fold-trust-link");
+        assert!(st.tab_shown(DockTab::Model), "see Model shows the Model panel");
+    }
+
+    /// At 320 pt with the folds open and a pass running the sections do not overlap and the panel's
+    /// own text stays inside it (the solve log keeps its own horizontal scroll).
+    #[test]
+    fn a_narrow_panel_keeps_the_sections_apart() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = running(&scene);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Activity*])").unwrap());
+        st.activity_sections.trust = true;
+        st.activity.absorb(&snap);
+        snap.activity.events = activity_tab::every_kind_of_event();
+        snap.activity.fit_points = vec![crate::sim::FitPoint { epoch: 1, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.2e-4, trusted: true, at: Instant::now() }];
+        st.activity.absorb(&snap);
+        let inp = PanelInput { probe: Some(probe(live(6, -0.17, 0.68))), ..input(&scene, Some(&snap), &cam) };
+        let (t, shapes) = texts(&ctx, &mut st, &inp, egui::vec2(1400.0, 3000.0));
+        assert!(t.contains("rmse 1.2e-4 · 1 refits"), "{t}");
+        let panel = probed_rect("activity-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+        let order = ["activity-job-card", "anchor-d-timeline", "anchor-d-counters", "anchor-d-solve-log", "activity-fold-trust", "activity-fold-training"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.left() >= panel.left() - 1.0 && r.right() <= panel.right() + 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        // the panel's own clip (the solve log's table and the plots clip to their own rects)
+        for c in shapes.iter().filter(|c| (c.clip_rect.left() - panel.left()).abs() < 1.0 && (c.clip_rect.right() - panel.right()).abs() < 1.0) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 15, "{checked} texts checked");
+    }
+}
+
+/// The open-shell trust work in the restructured Model panel (merge of main, 2026-11-14): a local
+/// refusal next to a misfit sample is the verdict's reason (the long text on hover); the misfit count
+/// is in Health while it is not zero, always in Details; the last fit names a collection's body-4
+/// degree.
+mod model_panel_misfit {
+    use super::super::dock::model::{verdict, Section, Tone};
+    use super::*;
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out.replace('\n', " ")
+    }
+
+    fn misfit_check(value: f64) -> sim::activity::TrustCheck {
+        sim::activity::TrustCheck { key: sim::activity::TrustKey::Misfit, met: true, value, limit: 27.1, worst: None }
+    }
+
+    /// 2026-11-14: the verdict next to samples the user forgot names them and how the fence lifts;
+    /// a quarantined fence keeps its words; when the recent fallbacks were "not kept: box" the box
+    /// edge leads, whatever refused; the long text stays in the "why?".
+    #[test]
+    fn the_verdict_names_a_forgotten_fence_and_the_box_edge() {
+        use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+        let scene = Scene::preset("h2").unwrap();
+        let long = "within 0.30 training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once 3 fresh teacher answers in a row agree with it, or Restore the samples";
+        let fence = |forgotten: bool| sim::Readiness { answers: false, rule: Some(TeachRule::NearQuarantine), atom: None, text: long.into(), unlearned: None, forgotten_fence: forgotten };
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        let cam = camera();
+        let verdict_with = |st: &UiState, r: sim::Readiness, source: sim::Source| {
+            let m = ModelStatus { readiness: Some(r), ..model() };
+            let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+            snap.dynamics.source = source;
+            let inp = input(&scene, Some(&snap), &cam);
+            verdict(st, &inp)
+        };
+        let v = verdict_with(&st, fence(true), sim::Source::Fallback);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · near samples you forgot"));
+        assert_eq!(v.reason, "The model answers again once 3 fresh DFT answers here agree with it — or Restore the samples.");
+        assert!(v.tip.contains(long), "{v:?}");
+        let v = verdict_with(&st, fence(false), sim::Source::Fallback);
+        assert_eq!(v.headline, "Falling back to DFT here · near a quarantined sample", "only quarantined: today's words");
+        // the recent fallbacks touched the box edge
+        let push = |st: &mut UiState, outcome| {
+            let e = sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, outcome);
+            st.activity.rows.push_back(crate::ui::activity::LogRow { at: std::time::Duration::ZERO, event: e, near_face: true });
+        };
+        push(&mut st, TeachOutcome::Kept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(!crate::ui::dock::model::box_edge_fallbacks(&st), "a kept fallback among the last three");
+        push(&mut st, TeachOutcome::BoxNotKept);
+        assert!(crate::ui::dock::model::box_edge_fallbacks(&st));
+        for r in [fence(true), sim::Readiness { rule: Some(TeachRule::Spread), text: "variance".into(), ..fence(false) }] {
+            let v = verdict_with(&st, r, sim::Source::Fallback);
+            assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · touching the box edge"));
+            assert_eq!(v.reason, "The electron cloud reaches the grid's edge, so DFT answers here can't be learned. Move the molecule toward the centre or use a bigger grid.");
+        }
+        // trusted and answering here: the box words only while this step is DFT
+        let answers = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None, forgotten_fence: false };
+        assert_eq!(verdict_with(&st, answers.clone(), sim::Source::Surrogate).headline, "Model answering · trusted here");
+        assert_eq!(verdict_with(&st, answers, sim::Source::Fallback).headline, "Falling back to DFT here · touching the box edge");
+        // a newer fallback that was kept ends it
+        push(&mut st, TeachOutcome::Kept);
+        assert_eq!(verdict_with(&st, fence(true), sim::Source::Fallback).headline, "Falling back to DFT here · near samples you forgot");
+    }
+
+    #[test]
+    fn a_misfit_refusal_and_count_are_placed() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let long = "rule misfit: atom 1 is next to training sample #350, which the model cannot reproduce";
+        let readiness = sim::Readiness { answers: false, rule: Some(sim::activity::TeachRule::NearMisfit), atom: Some(1), text: long.into(), unlearned: None, forgotten_fence: false };
+        let m = ModelStatus { readiness: Some(readiness), trust_checks: vec![misfit_check(3.0)], body4_degree: Some(3), ..model() };
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+        snap.dynamics.source = sim::Source::Fallback;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        let v = verdict(&st, &inp);
+        assert_eq!((v.tone, v.headline.as_str()), (Tone::Warn, "Falling back to DFT here · near a misfit"));
+        assert!(v.reason.contains("training sample the model can't reproduce") && v.tip.contains(long), "{v:?}");
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("near a misfit") && !t.contains(long), "the long text on hover: {t}");
+        assert!(t.contains("3 of at most 27.1 training samples it can't reproduce"), "Health shows a non-zero count: {t}");
+        // none: not in Health; Details has it, and the body-4 degree on the last fit
+        let m = ModelStatus { trust_checks: vec![misfit_check(0.0)], body4_degree: Some(3), ..model() };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(!t.contains("training samples it can't reproduce"), "{t}");
+        st.model_sections.set(Section::Details, true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("0 of at most 27.1 training samples it can't reproduce") && t.contains("body-4 degree 3"), "{t}");
+    }
+}
+
+
+/// User report 2026-11-14: the panels had no padding on the right (the Activity job card, the
+/// timeline, "see Model" touched the edge). Every panel's text, at about 320 pt and wide, ends at
+/// least the left margin before the panel's right edge; so do the right-aligned "see Model"
+/// (Activity) and the "N % DFT" chip (Model).
+#[test]
+fn every_panel_keeps_its_right_margin() {
+    fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+        match s {
+            egui::epaint::Shape::Text(t) => f(t),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+            _ => {}
+        }
+    }
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.fallback_fraction_100 = 0.12;
+    snap.activity.events = activity_tab::every_kind_of_event();
+    snap.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    snap.activity.knowledge = Some(std::sync::Arc::new(knowledge::fixture_map()));
+    let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&snap), &cam) };
+    for tab in [DockTab::Model, DockTab::Activity, DockTab::Knowledge, DockTab::Orbitals, DockTab::View, DockTab::Readouts, DockTab::Selection, DockTab::Log] {
+        for w in [320.0f32, 600.0] {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx);
+            let mut st = UiState::new("h2o", &scene);
+            st.backend = Backend::Estimated;
+            st.activity.absorb(&snap);
+            st.activity_sections.trust = true;
+            st.view_sections = super::dock::view::Sections::all(true);
+            st.workspace.set_node(super::workspace::layout::parse(&format!("H({:.4},3D,[{}*])", 1.0 - w / 1400.0, tab.name())).unwrap());
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0))), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+                shapes = full.shapes;
+            }
+            let (clip, content) = (probed_rect(&format!("dock-clip-{}", tab.name())), probed_rect(&format!("dock-content-{}", tab.name())));
+            let margin = content.left() - clip.left();
+            assert!(margin >= 6.0, "{tab:?} at {w}: left margin {margin}");
+            let edge = clip.right() - margin + 0.5;
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| (c.clip_rect.left() - clip.left()).abs() < 1.0 && (c.clip_rect.right() - clip.right()).abs() < 1.0) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.top() < clip.bottom() {
+                        checked += 1;
+                        assert!(r.right() <= edge, "{tab:?} at {w}: {:?} ends at {} (the right margin ends at {edge})", t.galley.text(), r.right());
+                    }
+                });
+            }
+            assert!(checked > 0, "{tab:?} at {w}: no text checked");
+            // the right-aligned words and the boxes drawn to the full width (a card's border, the timeline)
+            let probes: &[&str] = match tab {
+                DockTab::Activity => &["activity-fold-trust-link", "activity-job-card", "activity-timeline"],
+                DockTab::Model => &["model-dft-chip", "model-verdict", "model-fold-file"],
+                _ => &[],
+            };
+            for p in probes {
+                let r = probed_rect(p);
+                assert!(r.right() <= edge, "{tab:?} at {w}: {p} {r:?} past {edge}");
+            }
+        }
+    }
+}
+
+/// The toolbar's layouts fit their heights (`toolbar::HEIGHT`, `HEIGHT_COMPACT`): the bar ends at
+/// the window's bottom edge, full (1700 pt) and compact (1400 pt) — at 84 pt the full bar was laid
+/// out 3 pt below it — and `bars_height` names the heights the chrome laid out.
+#[test]
+fn the_toolbar_fits_the_window() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    for (w, h) in [(WIDE, toolbar::HEIGHT), (1400.0, toolbar::HEIGHT_COMPACT)] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, w, vec![]);
+        }
+        let bar = probed_rect("toolbar-rect");
+        assert!((bar.bottom() - 900.0).abs() < 0.5 && (bar.height() - h).abs() < 0.5, "at {w}: {bar:?}");
+        assert_eq!(bars_height(&st, w).1, h, "at {w}");
+    }
+}
+
+/// The Readouts panel with the Graph panel merged into it (user request 2026-11-14, the approved
+/// mockup): the chart card's two plots on a real ΔE axis, the energies, the status line with the
+/// health dots, the folds; the Graph panel's migration out of profiles, presets and `--ui`.
+mod readouts_merge {
+    use super::super::dock::readouts::{delta_axis, plot_heights, Section, Sections};
+    use super::*;
+    use sim::Source;
+
+    /// A snapshot whose history holds `n` points: E total `e(i)`, T `t(i)` K, every third step a
+    /// fallback, the rest the model's.
+    fn with_history(scene: &Scene, n: usize, e: impl Fn(usize) -> f64, t: impl Fn(usize) -> f64) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Estimated, Some(model()));
+        s.dynamics.history = (0..n).map(|i| (i as f64 * 20.0, e(i), t(i))).collect::<Vec<_>>().into();
+        s.dynamics.history_source = (0..n).map(|i| if i % 3 == 0 { Source::Fallback } else { Source::Surrogate }).collect::<Vec<_>>().into();
+        s.dynamics.history_guess = vec![false; n].into();
+        s
+    }
+
+    fn texts_and_shapes(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2) -> (String, Vec<egui::epaint::ClippedShape>) {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let mut out = String::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        (out, shapes)
+    }
+
+    /// The ΔE axis: µHa with zero inside and labelled ticks at a 1-2-5 step; a flat E total stays
+    /// flat (a 1e-7 Ha wiggle within 1 pt of zero even at the plot's smallest height); past 1000 µHa
+    /// the unit is mHa.
+    #[test]
+    fn the_delta_e_axis_is_real() {
+        let wiggle: Vec<f64> = (0..400).map(|i| 1e-7 * (i as f64 * 0.7).sin()).collect();
+        let a = delta_axis(&wiggle);
+        assert_eq!(a.unit, "µHa");
+        assert!(a.lo < 0.0 && a.hi > 0.0 && a.ticks.contains(&0.0), "{a:?}");
+        assert!(a.ticks.windows(2).all(|w| (w[1] - w[0] - (a.ticks[1] - a.ticks[0])).abs() < 1e-9), "evenly spaced: {a:?}");
+        let step = a.ticks[1] - a.ticks[0];
+        assert!([1.0, 2.0, 5.0, 10.0].iter().any(|k| ((step / 10f64.powf(step.log10().floor())) - k).abs() < 1e-9), "a 1-2-5 step: {step}");
+        for view_h in [900.0, 200.0] {
+            let (_, e_h) = plot_heights(view_h);
+            let plot = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, e_h));
+            let zero = a.y(0.0, plot);
+            for d in &wiggle {
+                assert!((a.y(d * a.per_ha, plot) - zero).abs() <= 1.0, "a 1e-7 Ha wiggle draws within 1 pt of zero at {e_h} pt");
+            }
+        }
+        // a real swing: mHa past 1000 µHa
+        let swing = [0.0, 4e-4, 2.5e-3, -1e-4];
+        let a = delta_axis(&swing);
+        assert_eq!(a.unit, "mHa");
+        assert!(a.lo <= -0.1 && a.hi >= 2.5, "{a:?}");
+        assert_eq!(delta_axis(&[0.0, 9e-4]).unit, "µHa", "900 µHa stays in µHa");
+        // the minimum heights
+        assert_eq!(plot_heights(100.0), (48.0, 70.0));
+    }
+
+    /// The panel: Graph is gone, Readouts carries both plots (T over ΔE), coloured per step by who
+    /// answered it, T labelled in the chosen unit, the ticks and zero line on screen, the current E
+    /// total; the old series selector is gone; the explanatory text is the card's ⓘ.
+    #[test]
+    fn readouts_carries_both_plots() {
+        assert!(DockTab::PANELS.iter().all(|t| t.name() != "Graph"));
+        assert_eq!(search::results("graph", 1)[0].place, search::Place::Dock(DockTab::Readouts), "Ctrl K's graph finds the Readouts chart");
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_history(&scene, 300, |i| -1.1667 + 2e-6 * (i as f64 * 0.3).sin(), |i| 300.0 + 10.0 * (i as f64 / 299.0));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.temp_units = TempUnits::C;
+        let (t, shapes) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        let e_now = format!("E total {:+.6} Ha", snap.dynamics.total);
+        for want in ["E TOTAL AND T", "ΔE µHa", "27 °C", "37 °C", e_now.as_str(), "surrogate", "fallback (DFT)"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("E total + T") && !t.contains("Each curve is scaled to its own range"), "no series selector, the note is the ⓘ:\n{t}");
+        let (tp, dp) = (probed_rect("chart-t"), probed_rect("chart-delta"));
+        assert!(tp.bottom() <= dp.top() && (tp.left() - dp.left()).abs() < 0.5 && (tp.right() - dp.right()).abs() < 0.5, "stacked on one time axis: {tp:?} {dp:?}");
+        let zero = probed_rect("chart-zero");
+        assert!(dp.top() < zero.top() && zero.top() < dp.bottom());
+        // the ΔE line's colours: the model's and the fallback's
+        let mut colours = std::collections::BTreeSet::new();
+        fn segs(s: &egui::epaint::Shape, inside: egui::Rect, out: &mut std::collections::BTreeSet<[u8; 4]>) {
+            match s {
+                egui::epaint::Shape::LineSegment { points, stroke } if inside.contains(points[0]) && inside.contains(points[1]) => {
+                    out.insert(stroke.color.to_array());
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| segs(s, inside, out)),
+                _ => {}
+            }
+        }
+        shapes.iter().for_each(|c| segs(&c.shape, dp.expand(0.5), &mut colours));
+        for s in [Source::Surrogate, Source::Fallback] {
+            assert!(colours.contains(&source_colour(s).to_array()), "{s:?} coloured: {colours:?}");
+        }
+    }
+
+    /// The status line, a health warning's own line, the energies in the header's units, and the
+    /// folds holding the work rows, the breakdown and the reference comparison.
+    #[test]
+    fn the_status_line_energies_and_folds() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.dt_warning = Some("dt 0.9 fs is above the safe step for H".into());
+        snap.dynamics.work_refit = -0.000317;
+        snap.dynamics.source = Source::Surrogate;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.energy_units = EnergyUnits::Ha;
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert!(t.contains("dt 0.9 fs is above the safe step for H"), "a warning prints its text:\n{t}");
+        probed_rect("readouts-dot-1");
+        assert!(probed_rect("readouts-warning-1").top() > probed_rect("readouts-status").top());
+        assert!(t.contains("t ") && t.contains("ms/step · model, no SCF"), "{t}");
+        assert!(t.contains("KE (nuclei)") && t.contains("E conserved") && !t.contains(" eV"), "Ha only:\n{t}");
+        assert!(t.contains("walls 0 · refit −0.000317 · mismatch 0") && !t.contains("work done by tools"), "the work rows folded, their summary shown:\n{t}");
+        st.energy_units = EnergyUnits::Ev;
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert!(t.contains(" eV") && !t.contains(&format!("{:+.6} Ha", snap.dynamics.kinetic)) && !t.contains(&format!("{:+.6} Ha", snap.dynamics.total)), "eV only:\n{t}");
+        for (s, want) in [(Section::Work, "work done by tools"), (Section::Breakdown, "SCF iterations"), (Section::Compare, "An outside code answers")] {
+            st.readouts_sections = Sections::default();
+            let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+            assert!(!t.contains(want), "{s:?} folded");
+            click_widget(&ctx, &mut st, &inp, &format!("readouts-fold-{}", s.id()));
+            assert!(st.readouts_sections.is_open(s));
+            let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+            assert!(t.contains(want), "{s:?} holds {want:?}:\n{t}");
+        }
+        // kept in the profile
+        st.readouts_sections = Sections::default();
+        st.readouts_sections.set(Section::Breakdown, true);
+        let text = profile::capture(&st);
+        assert!(text.contains("\nreadouts_sections = breakdown\n"));
+        let mut fresh = UiState::new("h2", &scene);
+        profile::apply(&mut fresh, &text);
+        assert_eq!(fresh.readouts_sections, st.readouts_sections);
+    }
+
+    /// A profile naming Graph loads with Readouts in its place; with Readouts named too, Graph's
+    /// slot goes and no empty leaf is left; a detached window holding only Graph is dropped; the
+    /// presets and `--ui tab=graph` / `detach=graph` name Readouts.
+    #[test]
+    fn graph_migrates_to_readouts() {
+        use super::super::workspace::{layout, presets::Preset};
+        let scene = Scene::preset("h2").unwrap();
+        let count = |st: &UiState, t: DockTab| layout::panels(&st.workspace.to_node()).iter().filter(|&&x| x == t).count();
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, "layout = H(0.24,[Model*,Knowledge,Selection],H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Graph])))\nhidden = \n");
+        assert_eq!(layout::encode(&st.workspace.to_node()), "H(0.24,[Model*,Knowledge,Selection],H(0.70,3D,V(0.62,[View*,Orbitals],[Log*,Activity,Readouts])))", "Readouts takes Graph's place");
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, "layout = H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Graph*])))\nhidden = \n");
+        let enc = layout::encode(&st.workspace.to_node());
+        assert_eq!(enc, "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,[View*,Orbitals]))", "Graph's leaf collapsed: {enc}");
+        assert!(!enc.contains("[]") && count(&st, DockTab::Readouts) == 1);
+        // Graph only on the hidden line, Readouts in the tree: dropped
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {}\nhidden = Graph:right:320\n", layout::encode(&layout::default_layout())));
+        assert!(st.workspace.hidden().is_empty() && count(&st, DockTab::Readouts) == 1);
+        // the old Two monitors window (Activity over Graph): with Readouts in the main tree the
+        // window keeps Activity only; without it, Readouts takes Graph's place in the window
+        let main = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*,Readouts]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {main}\nhidden = \nwindow = 1920,0,1920,1040 V(0.50,[Activity*],[Graph*])\n"));
+        let ws = st.workspace.windows();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(st.workspace.window_panels(ws[0]), vec![DockTab::Activity], "the window keeps Activity only");
+        let old_two = "H(0.24,V(0.55,[Model*,Knowledge],[Selection*]),H(0.70,3D,V(0.62,[View*,Orbitals],[Log*])))";
+        let mut st = UiState::new("h2", &scene);
+        profile::apply(&mut st, &format!("layout = {old_two}\nhidden = \nwindow = 1920,0,1920,1040 V(0.50,[Activity*],[Graph*])\n"));
+        let ws = st.workspace.windows();
+        assert_eq!(st.workspace.window_panels(ws[0]), vec![DockTab::Activity, DockTab::Readouts], "Readouts in the Graph's place");
+        // the presets
+        assert_eq!(layout::encode(&Preset::TwoMonitors.window().unwrap()), "V(0.50,[Activity*],[Readouts*])");
+        assert!(layout::encode(&Preset::Training.tree().0).contains("[Readouts*]"));
+        assert!(!layout::encode(&layout::default_layout()).contains("Graph"));
+        // the screenshot harness's words
+        assert_eq!(crate::ui::panel_named("graph"), Some(DockTab::Readouts));
+        assert_eq!(crate::ui::panels_named("activity, Graph"), Ok(vec![DockTab::Activity, DockTab::Readouts]));
+    }
+
+    /// At about 320 pt the panel's parts stack inside it and no text runs past its right edge.
+    #[test]
+    fn the_readouts_panel_fits_320_pt() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 300, |i| -1.1667 + 3e-3 * (i as f64 / 299.0), |i| 300.0 + 40.0 * (i as f64 * 0.1).sin());
+        snap.dynamics.dt_warning = Some("dt 0.9 fs is above the safe step for the lightest nucleus here".into());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        for units in [EnergyUnits::Both, EnergyUnits::Ha] {
+            let mut st = UiState::new("h2", &scene);
+            st.energy_units = units;
+            st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Readouts*])").unwrap());
+            st.readouts_sections = Sections::all(true);
+            PROBES.with(|p| p.borrow_mut().clear());
+            let (_, shapes) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 3000.0));
+            let panel = probed_rect("readouts-panel");
+            assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+            let order = ["anchor-d-tiles", "readouts-chart", "anchor-d-energies", "readouts-status", "readouts-fold-work", "readouts-fold-breakdown", "readouts-fold-compare"];
+            let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{units:?} {}: {r:?} outside {panel:?}", order[i]);
+            }
+            for w in rects.windows(2) {
+                assert!(w[0].bottom() <= w[1].top() + 0.5, "{units:?} overlap: {:?} / {:?}", w[0], w[1]);
+            }
+            fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+                match s {
+                    egui::epaint::Shape::Text(t) => f(t),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+                each_text(&c.shape, &mut |t| {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                        checked += 1;
+                        assert!(r.right() <= panel.right() + 1.0, "{units:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                    }
+                });
+            }
+            assert!(checked > 30, "{checked} texts checked");
+        }
+    }
+}
+
+/// The Selection panel (user request 2026-11-14, the approved mockup): the atom card with its
+/// badge, name, charge pill and isotope label, the icon row's actions, NEIGHBOURS (guides and bonds
+/// merged, chips, angles), the molecule line, the folds; the group and the empty states.
+mod selection_redesign {
+    use super::super::dock::selection::{self as sel, BondChip, Section, Sections};
+    use super::*;
+
+    fn report(i: usize, j: usize, verdict: sim::Verdict, lap: Option<f64>) -> sim::PairReport {
+        sim::PairReport {
+            i,
+            j,
+            route: Some(sim::Route::Saddle),
+            s: Some(0.4),
+            rho_min: Some(0.2),
+            transverse_ratio: Some(1.01),
+            rho_pro: Some(0.15),
+            enhancement: Some(1.3),
+            march_end: None,
+            march_stop: None,
+            verdict,
+            laplacian: lap,
+            laplacian_noise: lap.map(|_| 0.02),
+        }
+    }
+
+    /// Water with its bonds (O–H twice; H–H examined, not bonded), the reports, the charges and
+    /// the molecule's name.
+    fn water(scene: &Scene) -> Snapshot {
+        let mut s = snapshot(scene, Backend::Gpu, None);
+        s.dynamics.bonds = Some(graph(3, &[(0, 1), (0, 2)], vec![vec![0, 1, 2]], 0.0));
+        let bonded = sim::Verdict::Bonded { multi_centre: false };
+        s.dynamics.pair_reports = vec![report(0, 1, bonded, Some(-1.2)), report(0, 2, bonded, Some(0.3)), report(1, 2, sim::Verdict::NotAccumulated, Some(0.1))].into();
+        s.labels = std::sync::Arc::new(vec![crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0))]);
+        let pos: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+        s.dynamics.charges = Some(std::sync::Arc::new(sim::PartialCharges {
+            q: vec![-0.3, 0.15, 0.15],
+            counted: vec![8.0, 1.0, 1.0],
+            z: vec![8, 1, 1],
+            positions: pos,
+            electrons: 10.0,
+            system_charge: 0,
+            t: 0.0,
+            step: 4,
+            source: sim::ChargeSource::Step,
+            ionic: "none".into(),
+            dipole: [0.0; 3],
+        }));
+        s
+    }
+
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, inp);
+            });
+            full.textures_delta.clear();
+            out.clear();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// The atom card: badge, "Oxygen #0", the pseudopotential's short form, the isotope label, the
+    /// charge pill; the icon row's actions (pin, focus, delete, deselect) and the follow toggle.
+    #[test]
+    fn the_atom_card_and_its_icon_row() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        for want in ["Oxygen", "#0", "all-electron", "¹⁶O ▾", "−0.30 e", "Del removes it · Esc deselects", "NEIGHBOURS · WITHIN 6 BOHR", "H₂O — water"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        let (card, pill) = (probed_rect("selection-card"), probed_rect("selection-charge"));
+        assert!(card.contains_rect(pill) && pill.left() > probed_rect("selection-name").right(), "the pill on the right");
+        for (probe, want) in [("sel-focus", Action::Focus), ("sel-delete", Action::Delete(0)), ("sel-deselect", Action::Deselect)] {
+            let outs = click_widget(&ctx, &mut st, &inp, probe);
+            assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == want), "{probe}: {want:?}");
+        }
+        let was = st.follow_selected;
+        let outs = click_widget(&ctx, &mut st, &inp, "follow-selected");
+        assert!(outs.iter().all(|o| o.actions.is_empty()) && st.follow_selected == !was, "follow toggles the display setting");
+        // pin: off without the dynamics' pins (its rule as before), a toggle with them
+        let outs = click_widget(&ctx, &mut st, &inp, "sel-pin");
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "no pins known: disabled");
+        let mut pins = water(&scene);
+        pins.dynamics.pins = vec![false; 3].into();
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&pins), &cam) };
+        let outs = click_widget(&ctx, &mut st, &inp, "sel-pin");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| matches!(a, Action::Pin(0, true))), "pin");
+        // the isotope picker: the same action as before
+        click_widget(&ctx, &mut st, &inp, "selection-isotope");
+        let outs = click_widget(&ctx, &mut st, &inp, "selection-isotope-18");
+        assert!(outs.iter().flat_map(|o| &o.actions).any(|a| *a == Action::SetIsotope { index: 0, a: 18 }));
+    }
+
+    /// NEIGHBOURS: the guides and the bonds in one list by distance, each with its chip (covalent,
+    /// weak contact, no bond; guessed where experience draws a bond; faded while stale), the angle
+    /// at the atom under the pair it joins, and the molecule line.
+    #[test]
+    fn neighbours_merge_guides_and_bonds() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let rows = sel::neighbours(&inp, 0);
+        assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>().len(), 2);
+        assert!(rows.windows(2).all(|w| w[0].distance <= w[1].distance), "nearest first");
+        let chip = |rows: &[sel::Neighbour], j: usize| rows.iter().find(|r| r.index == j).unwrap().chip;
+        assert_eq!((chip(&rows, 1), chip(&rows, 2)), (Some(BondChip::Covalent), Some(BondChip::WeakContact)));
+        let h = PanelInput { selected: Some(1), ..input(&scene, Some(&s), &cam) };
+        let rows = sel::neighbours(&h, 1);
+        assert_eq!(chip(&rows, 2), Some(BondChip::NoBond), "H–H: examined, not a bond");
+        let guess = PanelInput { experience_bonds: vec![(1, 2)], ..input(&scene, Some(&s), &cam) };
+        assert_eq!(chip(&sel::neighbours(&guess, 1), 2), Some(BondChip::Guessed), "experience draws it");
+        let bare = snapshot(&scene, Backend::Gpu, None);
+        assert!(sel::neighbours(&input(&scene, Some(&bare), &cam), 0).iter().all(|r| r.chip.is_none()), "no graph yet: no chip");
+        // on screen: rows in order, the angle under the second O–H, the chips' words
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("covalent") && t.contains("weak contact") && t.contains("Bohr · "), "{t}");
+        let angle = t.find("∠H–O–H").expect("the angle at O");
+        assert!(angle > t.find("H #2").unwrap() && angle > t.find("H #1").unwrap(), "under the pair it joins:\n{t}");
+        assert!(probed_rect("selection-neighbour-0").bottom() <= probed_rect("selection-neighbour-1").top() + 0.5);
+        probed_rect("selection-molecule");
+        // stale bonds: the chips faded (and the honesty line under the list)
+        let mut stale = water(&scene);
+        stale.dynamics.bonds_stale = true;
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&stale), &cam) };
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("bonds from the last DFT step"), "{t}");
+    }
+
+    /// The folds: Details holds position, electrons and the pseudopotential line; Scene molecules
+    /// and Partial charges (Σq in the header); kept in the profile; with nothing selected the empty
+    /// state, the molecules and the charges open.
+    #[test]
+    fn the_folds_and_the_empty_state() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("Details") && t.contains("Σq +0.0000 e") && !t.contains("composition") && !t.contains("Hirshfeld"), "folded:\n{t}");
+        st.selection_sections = Sections::all(true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("position") && t.contains("composition") && t.contains("electrons") && t.contains("Hirshfeld") && t.contains("Σq = +0.0000 e"), "{t}");
+        let text = profile::capture(&st);
+        assert!(text.contains("\nselection_sections = details,molecules,charges\n"));
+        let mut fresh = UiState::new("h2o", &scene);
+        profile::apply(&mut fresh, "gamma = 0.5\n");
+        assert_eq!(fresh.selection_sections, Sections::default());
+        profile::apply(&mut fresh, &text);
+        assert!(fresh.selection_sections.is_open(Section::Details));
+        // nothing selected
+        st.selection_sections = Sections::default();
+        let none = input(&scene, Some(&s), &cam);
+        let t = texts(&ctx, &mut st, &none);
+        assert!(t.contains(sel::EMPTY) && t.contains("H₂O — water") && t.contains("Hirshfeld"), "the molecules and the charges open:\n{t}");
+        // a pseudised O whose egg-box force is not certified at this grid: an amber ⚠ on the
+        // Details header (the warning is never hidden in the fold), the short form on the card
+        let mut pseudo = water(&scene);
+        pseudo.dynamics.eval.pseudised = vec![sim::PseudoSummary { z: 8, z_v: 6.0, f: 1.2, local: String::new(), r_c_max: 1.0, h_req: None, h_eb: None, r_core: 0.5, record: "the record".into() }].into();
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&pseudo), &cam) };
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("⚠ egg-box") && t.contains("pseudo · Z_v 6") && !t.contains("egg-box force not certified"), "{t}");
+        st.selection_sections.set(Section::Details, true);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("egg-box force not certified at this grid"), "the warning inside:
+{t}");
+    }
+
+    /// The Edit tool's group: "3 atoms selected", the chips, the pairwise distances sorted, the last
+    /// one clicked as a line; Delete acts as before.
+    #[test]
+    fn a_group_shows_its_pairwise_distances() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(2), ..input(&scene, Some(&s), &cam) };
+        let d = sel::pairwise(&inp, &[0, 1, 2]);
+        assert_eq!(d.len(), 3);
+        assert!(d.windows(2).all(|w| w[0].2 <= w[1].2));
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        alone(&mut st, DockTab::Selection);
+        st.mode = ToolMode::Edit;
+        st.edit_group = vec![0, 1, 2];
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("3 atoms selected") && t.contains("O #0") && t.contains("DISTANCES IN THE GROUP") && t.contains("last clicked: H #2"), "{t}");
+        probed_rect("selection-pair-2");
+    }
+
+    /// At about 320 pt the parts stack inside the panel and no text runs past its right edge.
+    #[test]
+    fn the_selection_panel_fits_320_pt() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let s = water(&scene);
+        let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&s), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Selection*])").unwrap());
+        st.selection_sections = Sections::all(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+        let mut shapes = Vec::new();
+        PROBES.with(|p| p.borrow_mut().clear());
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, &mut st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let panel = probed_rect("selection-panel");
+        assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
+        let order = ["selection-card", "selection-neighbours", "selection-molecule", "selection-fold-details", "selection-fold-molecules", "selection-fold-charges"];
+        let rects: Vec<egui::Rect> = order.iter().map(|p| probed_rect(p)).collect();
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{}: {r:?} outside {panel:?}", order[i]);
+        }
+        for w in rects.windows(2) {
+            assert!(w[0].bottom() <= w[1].top() + 0.5, "overlap: {:?} / {:?}", w[0], w[1]);
+        }
+        for k in 0..2 {
+            let (row, chip) = (probed_rect(&format!("selection-neighbour-{k}")), probed_rect(&format!("selection-chip-{k}")));
+            assert!(row.contains_rect(chip) && chip.right() <= panel.right() + 1.0, "{row:?} {chip:?}");
+        }
+        fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
+            match s {
+                egui::epaint::Shape::Text(t) => f(t),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| each_text(s, f)),
+                _ => {}
+            }
+        }
+        let mut checked = 0;
+        for c in shapes.iter().filter(|c| c.clip_rect.left() >= panel.left() - 0.5 && c.clip_rect.right() <= panel.right() + 2.5) {
+            each_text(&c.shape, &mut |t| {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
+                    checked += 1;
+                    assert!(r.right() <= panel.right() + 1.0, "{:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                }
+            });
+        }
+        assert!(checked > 20, "{checked} texts checked");
+    }
+}
+
+// ---- the estimated solver's box (user decision 2026-11-14; `ui::estimated_box`) ----
+
+/// `action` written as a script line and read back: what `--record` writes is what a replay runs.
+fn round_trip(a: &Action) {
+    let line = a.describe().expect("recorded");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(Action::parse(&words).as_ref(), Ok(a), "{line}");
+}
+
+/// A preset under a DFT solver keeps today's 81³ × 0.15 (12 Bohr); switching to the estimated
+/// solver grows it through the Action path to the estimated box — H₂'s 1.45 Bohr span + 2 × (the
+/// provisional 5.35 Bohr cloud + 2 Bohr of room) = 16.1 Bohr → 109³ (16.2 Bohr) — as the new
+/// worker's scene (`switch_scene`), the container following the cell (1.5 Bohr inside the face);
+/// a Quality change in it stays on the estimated box; leaving it returns to the preset's box; a
+/// preset loaded under it grows at once.
+#[test]
+fn the_estimated_solver_grows_a_preset_box_through_the_action_path() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let out = act(&mut st, &input(&Scene::preset("h2").unwrap(), None, &cam), Action::Preset("h2".into()));
+    let Some(Command::SetScene(mut scene)) = out.commands.first().cloned() else { panic!("{:?}", out.commands) };
+    assert_eq!((scene.grid_n, scene.grid_h, st.estimated_grid), (81, 0.15, None), "a DFT solver keeps 81³");
+    assert!((st.wall_half_width - 4.5).abs() < 1e-12);
+    // to the estimated solver: the grown scene is the new worker's
+    let a = Action::Backend(Backend::Estimated);
+    round_trip(&a);
+    let out = act(&mut st, &input(&scene, None, &cam), a);
+    let grown = out.switch_scene.clone().expect("the box grows");
+    assert_eq!((grown.grid_n, grown.grid_h), (109, 0.15));
+    assert_eq!(grown.nuclei, scene.nuclei, "the nuclei stay where they are");
+    assert!(crate::quality::box_len(&grown) >= 16.1 && crate::quality::box_len(&grown) >= 12.0);
+    assert_eq!((st.backend, st.grid_n, st.estimated_grid, st.box_len), (Backend::Estimated, 109, Some((109, 0.15)), 12.0));
+    assert!((st.wall_half_width - (8.1 - 1.5)).abs() < 1e-9, "walls: 1.5 Bohr inside the new face, {}", st.wall_half_width);
+    assert!(st.status.contains("the box grows to 16.2 Bohr (109³ × 0.15)"), "{}", st.status);
+    assert!(out.commands.is_empty(), "the respawned worker gets the walls with its run settings: {:?}", out.commands);
+    scene = grown;
+    // the same level again: nothing; another level stays on the estimated box (1.45 + 2 (4.84 + 2) at 0.25 → 63³)
+    assert!(act(&mut st, &input(&scene, None, &cam), Action::Quality(0.15)).commands.is_empty());
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Quality(0.25));
+    assert!(
+        matches!(out.commands.as_slice(), [Command::SetGrid { n: 63, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.25),
+        "{:?}",
+        out.commands
+    );
+    out.commands[0].apply(&mut scene);
+    assert_eq!(st.estimated_grid, Some((63, 0.25)));
+    // back to a DFT solver: the preset's own box at this spacing (49³ × 0.25)
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Gpu));
+    let back = out.switch_scene.expect("the box returns");
+    assert_eq!((back.grid_n, back.grid_h, st.estimated_grid), (49, 0.25, None));
+    assert!((st.wall_half_width - 4.5).abs() < 1e-9);
+    scene = back;
+    // a preset loaded under the estimated solver grows at once (SetScene); under a DFT one it does not
+    st.backend = Backend::Estimated;
+    st.quality_h = 0.15;
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Preset("h2".into()));
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if (s.grid_n, s.grid_h) == (109, 0.15)), "{:?}", out.commands);
+    assert_eq!((st.grid_n, st.box_len, st.estimated_grid), (109, 12.0, Some((109, 0.15))));
+    // the menu's grids per level follow the estimated box
+    assert!((super::estimated_box::quality_box(&st, &scene, 0.15) - 16.147).abs() < 1e-3);
+    st.backend = Backend::Gpu;
+    assert_eq!(super::estimated_box::quality_box(&st, &scene, 0.15), 12.0);
+}
+
+/// A nucleus that would sit outside the preset's box keeps the estimated one on the way out (and
+/// says so); a preset's own grid never grows on a switch between DFT solvers.
+#[test]
+fn leaving_the_estimated_solver_keeps_a_box_a_nucleus_needs() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let scene = crate::quality::preset("h2", 0.15).unwrap();
+    assert!(act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Cpu)).switch_scene.is_none(), "DFT to DFT: no change");
+    let grown = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated)).switch_scene.unwrap();
+    let mut far = grown.clone();
+    far.nuclei[0].pos = [5.5, 0.0, 0.0];
+    let out = act(&mut st, &input(&far, None, &cam), Action::Backend(Backend::Gpu));
+    assert!(out.switch_scene.is_none());
+    assert!(st.status.contains("box is kept"), "{}", st.status);
+    // and Scene ▸ Quality still returns to the preset's box
+    let out = act(&mut st, &input(&far, None, &cam), Action::Quality(0.15));
+    assert!(matches!(out.commands.first(), Some(Command::SetGrid { n: 81, .. })), "{:?}", out.commands);
+}
+
+/// A scene file keeps its own grid under the estimated solver (no regrid on the switch); the note
+/// says its box is short — "box is 12.0 Bohr; … (≈ 15.1 Bohr)" for H₂ at h = 0.25 — and its button
+/// (clicked as a user would) emits `Action::Quality` at the file's spacing, which regrids to the
+/// estimated box (63³). Another solver, or a box big enough, shows no note.
+#[test]
+fn a_scene_file_keeps_its_grid_and_the_note_offers_the_regrid() {
+    let cam = camera();
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    st.gpu_available = true;
+    st.adopt_file("h2.scene", &scene);
+    assert_eq!(super::estimated_box::note(&mut st, &scene), None, "not the estimated solver");
+    let out = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated));
+    assert!(out.switch_scene.is_none() && out.commands.is_empty(), "a file's grid is its own");
+    assert_eq!((st.backend, st.grid_n), (Backend::Estimated, 49));
+    let note = super::estimated_box::note(&mut st, &scene).expect("the box is short");
+    assert!(note.text.starts_with("box is 12.0 Bohr; samples near the walls can't be learned — a bigger grid (≈ 15.1 Bohr) avoids it"), "{}", note.text);
+    assert!(note.tip.contains("provisional") && note.tip.contains("R_cloud 4.84 Bohr of H"), "{}", note.tip);
+    assert_eq!(note.regrid, Some((63, 0.25)));
+    // the button, clicked in the Readouts panel
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    alone(&mut st, DockTab::Readouts);
+    let outs = click_widget(&ctx, &mut st, &inp, "estimated-box-regrid");
+    let acts: Vec<&Action> = outs.iter().flat_map(|o| &o.actions).collect();
+    assert_eq!(acts, [&Action::Quality(0.25)], "the regrid is the recorded Quality action");
+    round_trip(&Action::Quality(0.25));
+    let grids: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetGrid { .. })).collect();
+    assert!(matches!(grids.as_slice(), [Command::SetGrid { n: 63, h }] if *h == 0.25), "{grids:?}");
+    // regridded: no note
+    let mut big = scene.clone();
+    big.grid_n = 63;
+    assert_eq!(super::estimated_box::note(&mut st, &big), None);
+}
+
+/// Atoms placed or dragged later never regrid by themselves: the note appears once the geometry's
+/// box exceeds the current one by more than h, and a solved profile refines R_cloud (a slower
+/// tail asks for more).
+#[test]
+fn a_geometry_that_outgrows_the_box_shows_the_note() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.gpu_available = true;
+    st.backend = Backend::Gpu;
+    let scene = crate::quality::preset("h2", 0.15).unwrap();
+    let grown = act(&mut st, &input(&scene, None, &cam), Action::Backend(Backend::Estimated)).switch_scene.unwrap();
+    assert_eq!(super::estimated_box::note(&mut st, &grown), None, "the grown box fits");
+    let mut placed = grown.clone();
+    placed.nuclei.push(crate::scene::SceneNucleus { z: 1, a: None, pos: [0.0, 0.1, 0.0], vel: [0.0; 3] });
+    assert_eq!(super::estimated_box::note(&mut st, &placed), None, "within h");
+    placed.nuclei[2].pos = [0.0, 3.0, 0.0];
+    let n = super::estimated_box::note(&mut st, &placed).expect("3 Bohr more span");
+    assert!(n.text.starts_with("box is 16.2 Bohr;") && n.regrid.is_some_and(|(g, _)| g > 109), "{n:?}");
+    // a profile: an LSDA-like H tail (κ ≈ 0.73) reaches the rule farther out than the provisional bound
+    let half = 6.0;
+    let (nn, h) = (81, 0.15);
+    let kappa = (2.0f64 * 0.269).sqrt();
+    let mut rho = vec![0.0f32; nn * nn * nn];
+    for k in 0..nn {
+        for j in 0..nn {
+            for i in 0..nn {
+                let p = [i, j, k].map(|c| -half + c as f64 * h);
+                let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                rho[i + nn * (j + nn * k)] = (kappa.powi(3) / std::f64::consts::PI * (-2.0 * kappa * r).exp()) as f32;
+            }
+        }
+    }
+    let mut snap = snapshot(&grown, Backend::Estimated, None);
+    snap.atom_profiles = std::sync::Arc::new(vec![crate::cloud::radial_profile(1, &rho, nn, h, [-half; 3], None, grown.ionic)]);
+    super::estimated_box::refresh_profiles(&mut st, &input(&grown, Some(&snap), &cam));
+    assert_eq!(st.cloud_profiles.len(), 1);
+    let n = super::estimated_box::note(&mut st, &grown).expect("the solved tail asks for more");
+    assert!(!n.tip.contains("provisional"), "{}", n.tip);
+}
+
+/// User report 2026-11-14 ("no real display of the buttons or sliders, all just invisible"): inside
+/// a panel card a slider's rail differs from the card's fill by a clear contrast (the View panel's
+/// LOOK, the Orbitals view card), and the look presets are framed buttons — each with a visible
+/// outline, the active one in the accent fill.
+#[test]
+fn widgets_inside_cards_keep_their_contrast() {
+    fn rects(s: &egui::epaint::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match s {
+            egui::epaint::Shape::Rect(r) => out.push(r.clone()),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+            _ => {}
+        }
+    }
+    let contrast = |a: egui::Color32, b: egui::Color32| ((a.r() as i32 - b.r() as i32).abs() + (a.g() as i32 - b.g() as i32).abs() + (a.b() as i32 - b.b() as i32).abs()) as f32 / 3.0;
+    const MIN: f32 = 15.0;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let draw = |st: &mut UiState| -> Vec<egui::epaint::RectShape> {
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| rects(&c.shape, &mut out));
+        out
+    };
+    let rail_reads = |all: &[egui::epaint::RectShape], probe: &str| {
+        let slider = probed_rect(probe);
+        let fills: Vec<egui::Color32> = all.iter().filter(|r| slider.contains_rect(r.rect) && r.rect.height() < slider.height()).map(|r| r.fill).collect();
+        assert!(fills.iter().any(|&f| f.a() > 0 && contrast(f, theme::PANEL_2) >= MIN), "{probe}: a rail that reads against the card ({fills:?})");
+    };
+    // the View panel's LOOK card, as dots, Glow in force
+    let mut st = UiState::new("h2", &scene);
+    view_panel(&mut st, &[]);
+    let mut acts = Vec::new();
+    super::dock::view::GLOW.apply(&mut st, &mut acts);
+    st.volume_mode = VOLUME_DOTS;
+    let all = draw(&mut st);
+    rail_reads(&all, "look-amount");
+    rail_reads(&all, "look-brightness");
+    for w in ["clean", "glow", "scientific", "present"] {
+        let b = probed_rect(&format!("look-{w}"));
+        let face = all.iter().find(|r| (r.rect.min - b.min).length() < 1.5 && (r.rect.max - b.max).length() < 1.5).unwrap_or_else(|| panic!("look-{w}: no frame drawn"));
+        assert!(face.stroke.width > 0.0 && face.stroke.color.a() > 0 && contrast(face.stroke.color, theme::PANEL_2) >= MIN, "look-{w}: a visible outline ({:?})", face.stroke);
+        if w == "glow" {
+            assert_eq!(face.fill, theme::ACCENT_BG, "the active preset in the accent");
+        } else {
+            assert!(contrast(face.fill, theme::PANEL_2) >= MIN, "look-{w}: a face that reads ({:?})", face.fill);
+        }
+    }
+    // the Orbitals view card: the enclosed share's slider
+    let mut st = UiState::new("h2", &scene);
+    alone(&mut st, DockTab::Orbitals);
+    st.show = ShowMode::Coloured;
+    let all = draw(&mut st);
+    rail_reads(&all, "orbitals-enclosed");
 }

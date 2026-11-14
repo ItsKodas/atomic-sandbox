@@ -27,8 +27,6 @@ pub enum Icon {
     Move,
     /// Three lines of text on a soft rounded-square backdrop (the Readouts tab).
     Readouts,
-    /// A line chart, the area under the line filled (the Graph tab).
-    Graph,
     /// Three bonded atoms, the atoms filled (the Model tab; the empty scene's placeholder).
     Model,
     /// A pulse line on a soft rounded-square backdrop (the Activity tab).
@@ -83,7 +81,7 @@ pub enum Icon {
 impl Icon {
     /// Every icon (the painter's tests draw each).
     #[cfg(test)]
-    pub const ALL: [Icon; 32] = [
+    pub const ALL: [Icon; 31] = [
         Icon::Play,
         Icon::Pause,
         Icon::Step,
@@ -93,7 +91,6 @@ impl Icon {
         Icon::Grab,
         Icon::Move,
         Icon::Readouts,
-        Icon::Graph,
         Icon::Model,
         Icon::Activity,
         Icon::Orbitals,
@@ -235,14 +232,6 @@ fn draw(p: &Painter, rect: Rect, icon: Icon, colour: Color32, fill: Color32) {
             line(&[(4.0, 6.0), (20.0, 6.0)]);
             line(&[(4.0, 12.0), (14.0, 12.0)]);
             line(&[(4.0, 18.0), (17.0, 18.0)]);
-        }
-        Icon::Graph => {
-            // the area under the line down to y = 20, a trapezoid under each segment
-            let pts = [(3.0, 17.0), (8.0, 11.0), (12.0, 14.0), (17.0, 6.0), (21.0, 11.0)];
-            for w in pts.windows(2) {
-                fill_poly(&[w[0], w[1], (w[1].0, 20.0), (w[0].0, 20.0)]);
-            }
-            line(&pts);
         }
         Icon::Model => {
             for (x, y) in [(6.0, 6.0), (18.0, 6.0), (12.0, 18.0)] {
@@ -445,7 +434,7 @@ mod tests {
     use egui::epaint::Shape;
 
     /// The icons with a duotone fill on their main shape (the user's set, 2026-11-03).
-    const DUOTONE: [Icon; 15] = [
+    const DUOTONE: [Icon; 14] = [
         Icon::Model,
         Icon::Knowledge,
         Icon::Selection,
@@ -454,7 +443,6 @@ mod tests {
         Icon::Orbitals,
         Icon::Log,
         Icon::Activity,
-        Icon::Graph,
         Icon::Pin,
         Icon::Unpin,
         Icon::PopOut,

@@ -1,6 +1,6 @@
 //! Detached windows, the window side (docking spec D-12, D3; user decision 6: "our own OS windows
 //! for detaching, on the capture pop-out's pattern" — `capture/popout.rs`; user request: panels
-//! detachable to another monitor, the second one holding Activity and Graph). Each is a real winit
+//! detachable to another monitor, the second one holding Activity and Readouts). Each is a real winit
 //! window on the main window's GPU device with its own surface, its own egui `Context`, egui-winit
 //! `State` and egui-wgpu `Renderer`; what it shows — its `egui_dock` tree of panels, drawn from the
 //! same `UiState` and `PanelInput` as the main window — is the UI side's

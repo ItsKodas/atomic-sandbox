@@ -402,7 +402,7 @@ impl ShotUi {
             eprintln!("--ui detach: {} in detached window {} (headless: no OS window; the shot is the main window without them)", self.detach.join(", "), id.map_or("-".into(), |i| i.to_string()));
         }
         if let Some(t) = &self.tab {
-            let tab = DockTab::PANELS.into_iter().find(|p| p.name().eq_ignore_ascii_case(t)).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
+            let tab = crate::ui::panel_named(t).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
             viewer.ui.open_tab(tab);
         }
         if let Some(i) = self.select {
@@ -617,6 +617,11 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         viewer.ui.audit_every = n;
     }
     let mut shot = Shot::new(w, h).ok_or("no GPU adapter")?;
+    if backend == Backend::Estimated {
+        // the estimated solver's box, as the window starts it (`Viewer::fit_estimated_box`)
+        crate::quality::set_adapter_memory(shot.hl.ctx.device_local_memory_bytes());
+        viewer.fit_estimated_box();
+    }
     viewer.start(backend, Some(shot.hl.ctx.clone()));
     let (hl, painter) = (&shot.hl, &mut shot.painter);
     if o.ui.wait_sampling {
@@ -937,7 +942,7 @@ fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
                 m.samples,
                 m.trusted,
                 m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")),
-                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr"))
+                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}{}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr", m.body4_degree.map_or(String::new(), |d| format!(", body-4 degree {d}"))))
             );
             return if m.trusted { Ok(()) } else { Err("the model is not trusted after the pass".into()) };
         }
@@ -1053,8 +1058,8 @@ mod tests {
         }
         assert_eq!(ShotUi::parse("dock=closed").unwrap().layout, Some(Preset::Presenting));
         // detach=: the panels to pop out (docking spec D-12), read as the window's --detach
-        assert_eq!(ShotUi::parse("detach=activity, Graph").unwrap().detach, ["activity", "Graph"]);
-        assert_eq!(crate::ui::panels_named("activity, Graph"), Ok(vec![crate::ui::DockTab::Activity, crate::ui::DockTab::Graph]));
+        assert_eq!(ShotUi::parse("detach=activity, Readouts").unwrap().detach, ["activity", "Readouts"]);
+        assert_eq!(crate::ui::panels_named("activity, Readouts"), Ok(vec![crate::ui::DockTab::Activity, crate::ui::DockTab::Readouts]));
         assert!(crate::ui::panels_named("activity,bogus").is_err() && crate::ui::panels_named(" , ").is_err());
         assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
         assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");

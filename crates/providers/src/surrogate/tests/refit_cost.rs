@@ -11,7 +11,10 @@
 //! with `<runs>` a comma list of: `full` (the collection as is: the attach's own refit, then the
 //! phases, a +25-sample warm cycle, the collection writes), `sub` (the first ¼ and ½ of the
 //! samples), `species` (H only, H + O, all), `rep2`, `rep4`, … (the collection with k−1
-//! jittered replicas of every sample: P × k).
+//! jittered replicas of every sample: P × k), `d4` (spec 2026-11-13 §5.6: the collection at
+//! body-4 degree 2 and 3 — cold attach, a second refit with nothing new, +25 incremental, the
+//! phases, the floor pass), `s4` (a synthetic S = 4 store of ≥ 10 000 samples, N made C in the
+//! even-indexed samples, **labels meaningless for C: cost only**; cold attach at D₄ = 2 and 3).
 use super::*;
 use super::super::trust::key_column_counts;
 use std::time::Instant;
@@ -109,7 +112,7 @@ fn phases(s: &mut SurrogateKs, label: &str) {
 
     // the provider side: each pass of `fit_store` after the solve
     let t = Instant::now();
-    let _ = s.compute_training_residuals();
+    let _ = s.compute_residuals();
     rows.push(("training residuals (predict every member)".into(), secs(t)));
     let model = s.model.as_ref().unwrap();
     let store = s.store.as_ref().unwrap();
@@ -191,6 +194,121 @@ fn collection_writes(s: &mut SurrogateKs) {
     println!("| collection: save_history ({} points) | {t_hist:.3} s |\n| collection: write_readme | {t_readme:.3} s |\n| collection: sync_collection_status | {t_sync:.3} s |", s.audit_history.len());
 }
 
+/// `provider_on` at a forced body-4 degree (`body4_force`, Task 3's test hook), with what the
+/// attach's refit left: the degree, Q′, the fits, the holds, the trust verdict, the training
+/// residuals and the recovery note (whether the misfit set stands: the set M itself arrives with
+/// spec 2026-11-13 Task 5; until then "M non-empty" reads as "untrusted, the residuals failing").
+fn provider_at(c: Collection, d4: usize) -> (SurrogateKs, f64) {
+    let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.body4_force = Some(d4);
+    let t = Instant::now();
+    s.attach(c).unwrap();
+    if s.report().is_none() {
+        SurrogateKs::refit(&mut s).unwrap();
+    }
+    let cold = secs(t);
+    state_line(&s, &format!("D₄ = {d4} attach + cold refit {cold:.2} s"));
+    (s, cold)
+}
+
+fn state_line(s: &SurrogateKs, head: &str) {
+    let r = s.report().unwrap();
+    println!(
+        "{head}: body4_degree {:?}, Q′ {}, n_samples {}, {} fit_store calls so far, {} held of {}; trusted {} ({:?}); training residuals {:?}; recovery {:?}",
+        s.body4_degree(),
+        r.q_prime,
+        r.n_samples,
+        s.fits,
+        s.quarantined(),
+        s.samples(),
+        s.trusted(),
+        s.untrusted_reason(),
+        s.training_residuals(),
+        s.recovery_note()
+    );
+}
+
+/// Appends `k` jittered copies of fitted stored samples (spread over the store; δ ≤ 1e-4 Bohr,
+/// relabelled to first order as [`replica`]) the way a kept collection answer lands while the
+/// collection refuses the write (links `Out`, `append_events`), and marks the refit due.
+fn append_jittered(s: &mut SurrogateKs, k: usize, rng: &mut StdRng) {
+    let fitted: Vec<usize> = (0..s.samples()).filter(|&i| !s.excluded(i)).collect();
+    for j in 0..k {
+        let i = fitted[j * fitted.len() / k];
+        let src = s.store.as_ref().unwrap().samples[i].clone();
+        let mut x = src.clone();
+        let mut de = 0.0;
+        for (p, f) in x.pos.iter_mut().zip(&src.forces) {
+            for a in 0..3 {
+                let d = rng.gen_range(-1e-4..1e-4);
+                p[a] += d;
+                de -= f[a] * d;
+            }
+        }
+        x.energy += de;
+        s.store.as_mut().unwrap().push(x).unwrap();
+        let n = s.samples();
+        s.face.resize(n, f64::NAN);
+        s.quarantine.resize(n, Q_NONE);
+        if let Some(sh) = s.shared.as_mut() {
+            let (raw, box_n) = (sh.raw[i] + de, sh.box_n[i]);
+            sh.link.push(super::super::shared::Link::Out);
+            sh.raw.push(raw);
+            sh.box_n.push(box_n);
+        }
+    }
+    s.pending_refit = true;
+}
+
+/// The synthetic S = 4 store of `REFIT_COST=s4` (cost only): the collection with every N (Z = 7)
+/// of the even-indexed samples made C (Z = 6) — the labels untouched, so **meaningless for C**;
+/// what is measured is the matrix shapes of a four-species basis — C's references a copy of N's
+/// per box (each converted sample waits or fits exactly as before), then jittered replicas
+/// ([`replica`], δ ≤ 1e-4) up to ≥ `target` samples; read-only.
+fn synthetic_s4(target: usize) -> Collection {
+    let mut c = open_copy();
+    let mut converted = 0;
+    for (i, x) in c.samples.iter_mut().enumerate() {
+        if i % 2 == 0 && x.sample.z.contains(&7) {
+            for z in x.sample.z.iter_mut().filter(|z| **z == 7) {
+                *z = 6;
+            }
+            converted += 1;
+        }
+    }
+    let n_refs: Vec<(usize, surrogate::CollectionReference)> = c.references.iter().filter(|((z, _), _)| *z == 7).map(|(&(_, n), r)| (n, r.clone())).collect();
+    for (n, r) in n_refs {
+        c.references.insert((6, n), r);
+    }
+    let mut rng = StdRng::seed_from_u64(20261113);
+    let base = c.samples.clone();
+    let codes = c.quarantine.clone();
+    while c.samples.len() < target {
+        for (x, &q) in base.iter().zip(&codes) {
+            c.samples.push(replica(x, &mut rng, 1e-4));
+            c.quarantine.push(q);
+        }
+    }
+    c.read_only = true;
+    println!("synthetic S = 4: {converted} of {} base samples had their N made C (labels untouched: meaningless for C, cost only); ×{} → {} samples, {} held on disk", base.len(), c.samples.len() / base.len(), c.samples.len(), c.quarantine.iter().filter(|&&q| q != Q_NONE).count());
+    c
+}
+
+/// The floor pass `grown_body4_degree` runs per fit (`fit_floor` at D₄ = 3, one
+/// `key_column_counts` over the store), timed cold (cache cleared) and warm, with the force off.
+fn time_floor_pass(s: &mut SurrogateKs) {
+    let forced = s.body4_force.take();
+    let species = s.model.as_ref().unwrap().basis.species.clone();
+    s.fit_floor_cache.lock().unwrap().clear();
+    let t = Instant::now();
+    let d = s.grown_body4_degree(&species);
+    let cold = secs(t);
+    let t = Instant::now();
+    let _ = s.grown_body4_degree(&species);
+    println!("| grown_body4_degree (floor pass at D₄ = 3): cold {cold:.3} s, cached {:.4} s; it would choose D₄ = {d} |", secs(t));
+    s.body4_force = forced;
+}
+
 fn subset(mut c: Collection, keep: impl Fn(usize, &CollectionSample) -> bool) -> Collection {
     let idx: Vec<usize> = (0..c.samples.len()).filter(|&i| keep(i, &c.samples[i])).collect();
     c.samples = idx.iter().map(|&i| c.samples[i].clone()).collect();
@@ -200,7 +318,7 @@ fn subset(mut c: Collection, keep: impl Fn(usize, &CollectionSample) -> bool) ->
 }
 
 #[test]
-#[ignore = "measurement: COLLECTION_DIR=<copy> REFIT_COST=full,sub,species,rep2 cargo test -p providers --release refit_cost -- --ignored --nocapture --test-threads 1"]
+#[ignore = "measurement: COLLECTION_DIR=<copy> REFIT_COST=full,sub,species,rep2,d4,s4 cargo test -p providers --release refit_cost -- --ignored --nocapture --test-threads 1"]
 fn refit_cost_on_a_collection() {
     let runs = std::env::var("REFIT_COST").unwrap_or_else(|_| "full".into());
     for run in runs.split(',').map(str::trim) {
@@ -248,6 +366,43 @@ fn refit_cost_on_a_collection() {
                 println!("\n# ×{k} jittered replicas: attach + cold refit() {cold:.2} s ({n} samples)");
                 phases(&mut s, &format!("×{k} replicas ({n} samples)"));
             }
+            // spec 2026-11-13 §5.6 (Task 4): the S = 3 collection at body-4 degree 2 and 3 — the
+            // cold attach refit, a second refit with no new samples (the recovery reruns while
+            // the residuals fail), an incremental refit (+25), the phases, the floor pass
+            "d4" => {
+                for d4 in [2usize, 3] {
+                    let mut c = open_copy();
+                    c.read_only = true;
+                    let held = c.quarantine.iter().filter(|&&q| q != Q_NONE).count();
+                    println!("\n# D₄ = {d4}: the S = 3 collection, {} samples, {held} held on disk", c.samples.len());
+                    let (mut s, cold) = provider_at(c, d4);
+                    let (t, fits) = (Instant::now(), s.fits);
+                    s.pending_refit = true;
+                    SurrogateKs::refit(&mut s).unwrap();
+                    let second = secs(t);
+                    state_line(&s, &format!("D₄ = {d4} second refit, no new samples {second:.2} s ({} fit_store calls)", s.fits - fits));
+                    let mut rng = StdRng::seed_from_u64(20261113);
+                    append_jittered(&mut s, 25, &mut rng);
+                    let (t, fits) = (Instant::now(), s.fits);
+                    SurrogateKs::refit(&mut s).unwrap();
+                    let inc = secs(t);
+                    state_line(&s, &format!("D₄ = {d4} incremental refit, +25 samples {inc:.2} s ({} fit_store calls)", s.fits - fits));
+                    println!("| D₄ = {d4} | Q′ {} | cold attach {cold:.2} s | second (no new) {second:.2} s | incremental +25 {inc:.2} s |", s.report().unwrap().q_prime);
+                    phases(&mut s, &format!("S = 3, D₄ = {d4}"));
+                    time_floor_pass(&mut s);
+                }
+            }
+            // the synthetic S = 4 store (cost only: the C labels are meaningless), cold attach at
+            // D₄ = 2 and 3; the stop condition of spec §5.6 is the D₄ = 3 time against 300 s
+            "s4" => {
+                for d4 in [2usize, 3] {
+                    let c = synthetic_s4(10_000);
+                    println!("\n# synthetic S = 4, D₄ = {d4} ({} samples; labels meaningless for C: cost only)", c.samples.len());
+                    let (mut s, cold) = provider_at(c, d4);
+                    println!("| S = 4 (synthetic) | {} samples | D₄ = {d4} | Q′ {} | cold attach {cold:.2} s |", s.samples(), s.report().unwrap().q_prime);
+                    time_floor_pass(&mut s);
+                }
+            }
             other => panic!("unknown run {other}"),
         }
     }
@@ -277,7 +432,7 @@ fn refit_state(s: &SurrogateKs) -> String {
         format!("active_set {:?}", s.active_set),
         format!("null_space {:?}", s.null_space.as_ref().map(|n| n.dimension())),
         format!("quarantine {quarantine:?}"),
-        format!("degree_cap {:?}", s.degree_cap),
+        format!("degree_cap {:?} body4_degree {}", s.degree_cap, s.body4_degree),
         format!("recovery {:?}", s.recovery_note()),
         format!("trusted {} {:?}", s.trusted(), s.untrusted_reason()),
         format!("failed_audits {:?}", s.failed_audits.iter().map(|c| (c.index, c.rejudges)).collect::<Vec<_>>()),
@@ -588,4 +743,40 @@ fn a_cancelled_background_refit_installs_nothing_new() {
         // without its trust passes
         assert_eq!(s.deferred_trust, None);
     }
+}
+
+/// Spec 2026-11-13 §4.1: the body-4 degree is provider state a background refit carries — a fork
+/// that steps a degree-2 fit up to 3 installs it, no conflict; a live degree other than the
+/// snapshot's is a conflict, named.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_background_refit_carries_its_body4_degree() {
+    let dir = collection_root("bg-d4");
+    let mut s = d4_student(&dir);
+    let mut rng = StdRng::seed_from_u64(9);
+    d4_keep(&mut s, &D4_KINDS, 50, &mut rng);
+    let f3 = s.fit_floor(&basis_at(&s, 3));
+    d4_keep(&mut s, &D4_KINDS, f3 + 30, &mut rng);
+    s.body4_force = Some(2);
+    s.refit().unwrap();
+    s.body4_force = None;
+    assert_eq!(s.body4_degree(), Some(2), "the premise");
+    assert!(s.begin_background_refit());
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(r) => {
+            r.unwrap();
+        }
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("installed"),
+    }
+    assert_eq!(s.body4_degree(), Some(3));
+    assert_eq!(s.body4_degree, 3);
+    assert_eq!(s.basis().unwrap().body4_degree, 3);
+    assert!(!s.user_notes.iter().any(|n| n.contains("discarded")), "{:?}", s.user_notes);
+    // a refit that started at degree 2 against the live provider at 3
+    let mut snap = s.snapshot();
+    assert_eq!(s.background_conflict(&snap, &BTreeMap::new()), None);
+    snap.body4_degree = 2;
+    let why = s.background_conflict(&snap, &BTreeMap::new()).expect("a conflict");
+    assert!(why.contains("the body-4 degree"), "{why}");
 }

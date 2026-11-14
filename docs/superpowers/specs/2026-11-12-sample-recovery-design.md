@@ -56,6 +56,14 @@ No tolerance moves.
   - fewer than 110 samples are held.
 
   Record the numbers in `references.md`.
+
+  *Note 2026-11-14 (after the merge with the open-shell model; final whole-branch review I1):* the
+  "#1804 is held in round 1" outcome was measured before that merge (Amendments below). At HEAD it is
+  not expected: a recovery that does not restore the residuals now gives back every hold, #1804's
+  round-1 hold included (the entry state comes after the release step, #1804 in the fit), and the
+  growth rule attaches this snapshot at body-4 degree 3, where a pre-merge build measured it trusted with no
+  recovery (the open-shell Task 4 cost run), #1804 in the fit and refused only by its one-sample O{H} / H{O} keys. Not re-measured;
+  `references.md` "Leave-one-out recovery ranking", the merge paragraph.
 - **Existing recovery tests.** A test whose pinned held set or count changes is investigated, not re-pinned blindly:
   - re-pin only if the new result is still trusted and the new held set is explained;
   - otherwise it is a finding.
@@ -112,6 +120,6 @@ Rulings made during implementation and review (the ledger `.superpowers/sdd/2026
 - **Forget only a code-0 sample.** A held, superseded, box-excluded, draft, waiting or lone sample is refused by name, so Restore (back to code 0) always restores exactly what it was.
 - **The final note wording.** The recovery note counts this refit's holds ("K samples quarantined this refit (N held in all) — …"), names the worst leave-one-out ratio held against each one's own bound (or "the 2e-3 Ha/Bohr force-noise tier" in the noise-only mode), and ends ", and the fit without them recovers" (residuals, noise and the counts pass) or ", and the fit without them passes" (residuals and noise pass, short of the counts). When the fallback stands it says "ranked by their own training residual (the leave-one-out ranking did not recover the fit)". The old clause "and keeping them breaks the fit of their neighbours" overclaimed and is gone. Notes next to a forgotten sample say "forgotten", not "quarantined".
 - **Rule 8 holds.** The failed-audit drop list excludes code 7: forgetting the sample of a failed audit does not lift the global untrust; the audit is re-judged at every refit as before.
-- **Holds made by a failed recovery persist** (and are written to a collection). A held sample leaves the hold only when a later fit reproduces it (released) or a fresh agreeing answer next to it supersedes it, which ends its fence but keeps it out of the fit. Restore does not apply to a held sample.
+- **Holds made by a failed recovery persist** (and are written to a collection). *Superseded at the merge with the open-shell model (2026-11-14; its spec §4.2, G2):* a recovery whose residuals still fail after every step now ends with the codes, degree cap and fit it entered with (code 7 untouched); holds stay only when the result recovers or passes its residuals and noise. Inside `quarantine_rounds`, when neither ranking recovers, a leave-one-out result that fails the residuals yields to a training-ranking result that passes them. A held sample leaves the hold only when a later fit reproduces it (released) or a fresh agreeing answer next to it supersedes it, which ends its fence but keeps it out of the fit. Restore does not apply to a held sample.
 - **Answers next to a forgotten sample are thinned** (final review I1). A forgotten sample's fence is permanent, so an agreeing teacher answer fenced by forgotten samples alone goes through the normal thinning and copy checks instead of being kept at every step.
 - **Not in this branch:** `box_blocks_trust` subtracting a forgotten box-affected sample twice (a diagnostic line only, below the trust floor) is a follow-up.

@@ -1,5 +1,14 @@
-//! The Activity dock tab (activity spec §3.3): what runs, what the teacher was asked and why,
-//! and how the model is learning. State lives here; `jobs`, `log`, `trust`, `plots` and `headline`
+//! The Activity dock tab (activity spec §3.3; restructured 2026-11-14 from the user's approved
+//! mockup): what runs, what the teacher was asked and why, and how the model is learning. Top to
+//! bottom: the **job card** of the running job (`jobs::card`: title · stage and its control, the
+//! bar, "sample 40 of 144" / "27 % · 53 min left", the solve's iteration and Δρ line, the
+//! convergence plot on a fixed log Δρ axis with the earlier solves faint, and for a pass the
+//! iterations-per-sample strip), the other jobs one line each; the **session timeline** ("THIS
+//! SESSION · 0:05 – 0:40", a failures lane) with the counters in one line under it; the **solve
+//! log** (chips all / fallback / audit / failed, identical rows folded into one expandable row,
+//! failures never folded and the newest pinned while a pass runs); then the folds **Trust
+//! checklist** ("8 ✓ · 3 to learn · see Model") and **Training plots** ("rmse 1.2e-4 · 14 refits"),
+//! closed by default and kept in the profile (`activity_sections`); the bookkeeping line last. State lives here; `jobs`, `log`, `trust`, `plots` and `headline`
 //! draw, and `words` words. Everything is read from records already in memory (the snapshot's
 //! [`ActivityDelta`](crate::sim::ActivityDelta) and the live probe): **no view causes a teacher
 //! solve**.
@@ -58,6 +67,30 @@ pub enum Mark {
     Snapshot(Duration, f64),
     /// The toolbar's Rewind put back the snapshot taken at simulated t (fs).
     Restore(Duration, f64),
+    /// A teaching solve that failed or did not converge (`log::is_failure`).
+    Failure(Duration),
+}
+
+/// The Activity panel's folds that are open (`UiState::activity_sections`; the profile's
+/// `activity_sections`, which also carries `ActivityState::training_open`): both closed by
+/// default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sections {
+    pub trust: bool,
+}
+
+impl Sections {
+    /// The profile's value: `trust`, `training` (the Training fold is `training_open`), comma
+    /// separated.
+    pub fn encode(&self, training: bool) -> String {
+        [(self.trust, "trust"), (training, "training")].into_iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join(",")
+    }
+
+    /// The profile's value read back: (the sections, whether Training is open).
+    pub fn parse(v: &str) -> (Sections, bool) {
+        let has = |w: &str| v.split(',').any(|x| x.trim().eq_ignore_ascii_case(w));
+        (Sections { trust: has("trust") }, has("training"))
+    }
 }
 
 /// The log's chips.
@@ -116,6 +149,12 @@ pub struct ActivityState {
     last_quarantined: Option<usize>,
     pass_running: bool,
     pub headline: headline::Throttled<Option<headline::Headline>>,
+    /// The convergence plot's traces (`jobs::Traces`).
+    pub conv: jobs::Traces,
+    /// The solve log's view chip.
+    pub log_view: log::LogView,
+    /// The folded runs of the log shown expanded, by their oldest row's time.
+    pub expanded: std::collections::HashSet<Duration>,
 }
 
 impl Default for ActivityState {
@@ -149,6 +188,9 @@ impl ActivityState {
             last_quarantined: None,
             pass_running: false,
             headline: headline::Throttled::new(None),
+            conv: jobs::Traces::default(),
+            log_view: log::LogView::All,
+            expanded: Default::default(),
         }
     }
 
@@ -178,6 +220,9 @@ impl ActivityState {
             }
             self.rows_seen += 1;
             let at = self.since(e.at);
+            if log::is_failure(e) {
+                self.timeline.push(Mark::Failure(at));
+            }
             match e.origin {
                 sim::activity::TeachOrigin::Fallback => self.timeline.push(Mark::Fallback(at)),
                 sim::activity::TeachOrigin::Audit => {
@@ -274,6 +319,14 @@ impl ActivityState {
         self.last_quarantined = None;
     }
 
+    /// When the pass running now began (session time), `None` without one.
+    pub fn pass_started(&self) -> Option<Duration> {
+        self.timeline.iter().rev().find_map(|m| match m {
+            Mark::Pass(start, None, _) => Some(*start),
+            _ => None,
+        })
+    }
+
     /// Session time now (the timeline's right edge).
     pub fn clock_now(&self) -> Duration {
         self.since(Instant::now())
@@ -296,13 +349,55 @@ impl ActivityState {
     }
 }
 
-/// The tab: jobs, counters, the solve log, then (estimated solver) the trust checklist, the
-/// training views and the timeline. Each group is marked with its search anchor.
+/// The iterations-per-sample strip of the pass running now: one bar per finished pass solve
+/// (danger: a failure or an answer not kept), then the sample being solved (`live`).
+pub fn strip(st: &ActivityState, live: Option<&sim::ScfLive>) -> Vec<jobs::StripBar> {
+    let Some(since) = st.pass_started() else { return Vec::new() };
+    let mut v: Vec<jobs::StripBar> = st
+        .rows
+        .iter()
+        .rev()
+        .take_while(|r| r.at >= since)
+        .filter(|r| r.event.origin == sim::activity::TeachOrigin::Pass && r.event.is_solve())
+        .map(|r| {
+            let e = &r.event;
+            let danger = log::is_failure(e) || !(e.outcome.is_kept() || matches!(e.outcome, sim::activity::TeachOutcome::Reference | sim::activity::TeachOutcome::HeldOut));
+            jobs::StripBar { iterations: e.scf_steps, danger, current: false, words: format!("{} — {} · {}", log::rule_cell(e), words::outcome_label(e.outcome), log::solve_cell(e)) }
+        })
+        .collect();
+    v.reverse();
+    if let Some(l) = live.filter(|l| l.iteration > 0) {
+        v.push(jobs::StripBar { iterations: Some(l.iteration as usize), danger: false, current: true, words: format!("this sample: iteration {}", l.iteration) });
+    }
+    v
+}
+
+/// A fold of the tab: its header (`activity-fold-<id>` probe) and, while open, its body.
+fn fold(ui: &mut Ui, id: &str, title: &str, open: bool, summary: Option<(String, egui::Color32)>, link: Option<&str>) -> (bool, bool) {
+    let (r, l) = theme::fold_header(ui, title, open, summary, link, false);
+    super::probe_rect(&format!("activity-fold-{id}"), r.rect);
+    if let Some(l) = &l {
+        super::probe_rect(&format!("activity-fold-{id}-link"), l.rect);
+    }
+    (r.clicked(), l.is_some_and(|l| l.clicked()))
+}
+
+/// The tab: the job card, the session timeline with the counters, the solve log, then (estimated
+/// solver) the trust checklist and the training plots, folded. Each group is marked with its
+/// search anchor.
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    super::probe_rect("activity-panel", ui.clip_rect());
+    if let Some(a) = st.search.unrevealed() {
+        match a {
+            "d-trust" => st.activity_sections.trust = true,
+            "d-training" => st.activity.training_open = true,
+            _ => {}
+        }
+    }
     let estimated = st.backend == Backend::Estimated;
     let loading = st.loading.as_ref().map(|l| (l.0, l.1));
-    dock::group(ui, st, "d-jobs", |ui, _| {
-        theme::section(ui, "Jobs");
+    // 1. the job card
+    dock::group(ui, st, "d-jobs", |ui, st| {
         // a new scene loading (its first solve): a spinner, a bar and the ETA
         if let Some((t, eta)) = loading {
             let el = t.elapsed().as_secs_f64();
@@ -320,6 +415,10 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
         let rows = jobs::rows(input, input.probe.as_ref());
+        if let Some(first) = rows.first() {
+            st.activity.conv.observe(first.key, first.scf.as_ref(), Instant::now());
+        }
+        let bars = rows.first().filter(|r| r.key == jobs::JobKey::Pass).map_or_else(Vec::new, |r| strip(&st.activity, r.scf.as_ref()));
         // while playing, the solve row comes and goes between steps: the list keeps the tallest
         // height it reached until the run stops, so the groups below never jump (user request
         // 2026-11-11); paused and idle it shrinks back to "nothing running"
@@ -332,7 +431,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 if rows.is_empty() && loading.is_none() {
                     theme::note(ui, "nothing running");
                 } else {
-                    jobs::show(ui, &rows, acts);
+                    jobs::show(ui, &rows, &st.activity.conv, &bars, acts);
                 }
             })
             .response
@@ -340,41 +439,63 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             .height();
         ui.data_mut(|d| d.insert_temp(id, if keep { used.max(reserved) } else { 0.0 }));
     });
-    dock::group(ui, st, "d-counters", |ui, st| {
-        theme::section(ui, "Counters");
-        log::counters(ui, &st.activity, input.model());
+    // 2. the session: the timeline, the counters in one line
+    dock::group(ui, st, "d-timeline", |ui, st| {
+        let head = match plots::timeline_span(&st.activity) {
+            Some((t0, t1)) => format!("This session · {} – {}", crate::ui::logbook::clock(t0), crate::ui::logbook::clock(t1)),
+            None => "This session".to_string(),
+        };
+        theme::section(ui, &head);
+        plots::timeline(ui, &st.activity);
     });
+    dock::group(ui, st, "d-counters", |ui, st| log::counters(ui, &st.activity, input.model()));
+    // 3. the solve log
     dock::group(ui, st, "d-solve-log", |ui, st| {
         theme::section(ui, "Solve log");
         log::show_log(ui, &mut st.activity, estimated);
     });
     if !estimated {
         theme::note(ui, "The trust checklist, the training views and the timeline's model lanes are for the estimated solver. A plain DFT step is not a teaching solve, so it adds no log row and does not tick the counter; the display eigensolve of unoccupied orbitals (Orbitals tab) is listed as an orbitals row with its time.");
-        // the Play snapshots are every solver's (`ui::rewind`)
-        dock::group(ui, st, "d-timeline", |ui, st| {
-            theme::section(ui, "Timeline");
-            plots::timeline(ui, &st.activity);
-        });
         return;
     }
-    dock::group(ui, st, "d-trust", |ui, st| {
-        theme::section(ui, "Trust");
-        trust::show(ui, st, input, acts);
+    // 4. the folds
+    let summary = input.model().filter(|m| m.fitted).map(|m| {
+        let ls = trust::lines(m, input.scene, st);
+        let met = ls.iter().filter(|l| l.met).count();
+        let open = ls.len() - met;
+        let text = if open == 0 { format!("{met} ✓") } else { format!("{met} ✓ · {open} to learn") };
+        (text, if open == 0 { super::GREEN } else { super::AMBER })
     });
+    let open = st.activity_sections.trust;
+    let r = ui.scope(|ui| {
+        let (clicked, see_model) = fold(ui, "trust", "Trust checklist", open, summary, Some("see Model"));
+        if open {
+            ui.indent("activity-trust", |ui| trust::show(ui, st, input, acts));
+        }
+        (clicked, see_model)
+    });
+    let (clicked, see_model) = r.inner;
+    search::mark(ui, st, "d-trust", r.response.rect);
+    if see_model {
+        st.open_tab(super::DockTab::Model);
+    } else if clicked {
+        st.activity_sections.trust = !open;
+    }
     let target_t = st.plan.hot_burst_t;
     let draft = input.model().is_some_and(|m| m.draft);
-    let open = st.activity.training_open || search::opens(st, "d-training").is_some();
-    let r = egui::CollapsingHeader::new("Training").id_salt("activity-training").open(Some(open)).show(ui, |ui| plots::training(ui, &mut st.activity, Some(target_t), draft));
-    if r.header_response.clicked() {
-        st.activity.training_open = !open;
-    } else if open {
-        st.activity.training_open = true;
-    }
-    search::mark(ui, st, "d-training", r.header_response.rect);
-    dock::group(ui, st, "d-timeline", |ui, st| {
-        theme::section(ui, "Timeline");
-        plots::timeline(ui, &st.activity);
+    let open = st.activity.training_open;
+    let summary = st.activity.fit_points.last().map(|p| (format!("rmse {:.1e} · {} refits", p.rmse_f, st.activity.fit_points.len()), theme::INK_DIM));
+    let r = ui.scope(|ui| {
+        let (clicked, _) = fold(ui, "training", "Training plots", open, summary, None);
+        if open {
+            ui.indent("activity-training", |ui| plots::training(ui, &mut st.activity, Some(target_t), draft));
+        }
+        clicked
     });
+    if r.inner {
+        st.activity.training_open = !open;
+    }
+    search::mark(ui, st, "d-training", r.response.rect);
     overhead_footer(ui, &st.activity);
 }
 

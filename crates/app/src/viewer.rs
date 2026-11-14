@@ -561,6 +561,29 @@ impl Viewer {
         })
     }
 
+    /// Before the first worker starts on the estimated solver (`--backend estimated` in the window
+    /// and `--screenshot`): a preset grows to the estimated box exactly as `ui::Action::Backend`
+    /// grows it (`ui::estimated_box`), so a recorded session — whose start actions are the preset,
+    /// then the backend — replays onto the same grid. The GPU memory guard counts the estimated
+    /// solver's two GPU solvers (teacher and auditor). A scene file keeps its own grid.
+    pub fn fit_estimated_box(&mut self) {
+        if self.ui.source.preset().is_none() {
+            return;
+        }
+        self.ui.gpu_available = true;
+        let (s, _) = ui::estimated_box::grow(&self.ui, &self.scene, self.ui.box_len, self.scene.grid_h);
+        let solvers = crate::quality::gpu_solvers(Backend::Estimated, true);
+        if s.grid_n == self.scene.grid_n || crate::quality::vram_check(&s, solvers, crate::quality::vram_budget()).is_err() {
+            return;
+        }
+        if (self.ui.wall_half_width - ui::default_wall_half_width(&self.scene)).abs() < 1e-9 {
+            self.ui.wall_half_width = ui::default_wall_half_width(&s);
+        }
+        (self.ui.grid_n, self.ui.grid_h) = (s.grid_n, s.grid_h);
+        self.ui.estimated_grid = Some((s.grid_n, s.grid_h));
+        self.scene = s;
+    }
+
     /// (Re)starts the worker on `backend` with the current scene (velocities included), paused,
     /// and re-sends the panel's run settings (dt, speed, thermostat, field, COM correction); pins,
     /// the time and the drift history start afresh. `Gpu` without a context falls back to `Cpu`
@@ -952,15 +975,22 @@ impl Viewer {
     /// bar and the toolbar have fixed heights) — so a cursor event before that frame maps through
     /// the new rect, not the old one. Exact for the default layout, whose 3D tile spans the
     /// workspace's height; the next `run_ui` replaces the estimate with the chrome's own rect (a
-    /// stacked layout, a switch to compact).
+    /// stacked layout). A width that switches the top bar or the toolbar between its full and
+    /// compact layouts (`ui::bars_height`: the toolbar's full layout needs ≈ 1584 pt since the
+    /// Thermostat group, so the default 1400-pt window is compact and a maximised one full) moves
+    /// those margins by the change of the bars' heights.
     fn resize_viewport(&mut self, w: f32, h: f32) {
         let Some((sw, sh)) = self.screen.filter(|&(sw, _)| w > 0.0 && h > 0.0 && sw > 0.0) else { return };
         let vp = self.viewport;
         let sx = w / sw;
-        let bottom = sh - (vp.origin[1] + vp.size[1]);
+        let ppp = self.egui_ctx.pixels_per_point();
+        let (top0, bottom0) = ui::bars_height(&self.ui, sw / ppp);
+        let (top1, bottom1) = ui::bars_height(&self.ui, w / ppp);
+        let top = vp.origin[1] + (top1 - top0) * ppp;
+        let bottom = sh - (vp.origin[1] + vp.size[1]) + (bottom1 - bottom0) * ppp;
         self.viewport = Viewport {
-            origin: [vp.origin[0] * sx, vp.origin[1]],
-            size: [(vp.size[0] * sx).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+            origin: [vp.origin[0] * sx, top],
+            size: [(vp.size[0] * sx).max(1.0), (h - top - bottom).max(1.0)],
         };
         self.screen = Some((w, h));
     }
@@ -1250,6 +1280,7 @@ impl Viewer {
             draft_banner: None,
             bonds_label: None,
             stale_bonds_line: None,
+            experience_bonds: Vec::new(),
             probe: self.sim.as_ref().map(|w| w.probe().view()),
         };
         ui::actions::apply(&mut self.ui, &input, a, &mut out);
@@ -2700,6 +2731,11 @@ impl Viewer {
         }
         let bonds_label = self.bonds_label();
         let stale_bonds_line = self.stale_bonds_line();
+        // the pairs experience draws as bonds (the Selection panel's "guessed" chips)
+        let experience_bonds: Vec<(usize, usize)> = self
+            .experience_shown()
+            .map(|x| x.graph.bonds.iter().zip(&x.looks).filter(|(_, l)| **l == crate::overlay::BondLook::Experience).map(|(b, _)| (b.i.min(b.j), b.i.max(b.j))).collect())
+            .unwrap_or_default();
         self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
         let probe = self.sim.as_ref().map(|w| w.probe().view());
@@ -2726,6 +2762,7 @@ impl Viewer {
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                     stale_bonds_line: stale_bonds_line.clone(),
+                    experience_bonds: experience_bonds.clone(),
                     probe,
                 },
             );
@@ -2779,6 +2816,7 @@ impl Viewer {
                 draft_banner: draft_banner.clone(),
                 bonds_label: bonds_label.clone(),
                 stale_bonds_line: stale_bonds_line.clone(),
+                experience_bonds: experience_bonds.clone(),
                 probe,
             };
             let ui_state = &mut self.ui;
@@ -3677,13 +3715,13 @@ nucleus 1 {a} {} {}
         for _ in 0..3 {
             run(&mut v, vec![]);
         }
-        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Graph").copied()).expect("the Graph tab").center();
+        let c = crate::ui::PROBES.with(|p| p.borrow().get("dock-tab-Readouts").copied()).expect("the Readouts tab").center();
         let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
         run(&mut v, vec![egui::Event::PointerMoved(c), button(c, true)]);
         for dx in [12.0, 50.0] {
             run(&mut v, vec![egui::Event::PointerMoved(c + egui::vec2(dx, 0.0))]);
         }
-        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Graph));
+        assert_eq!(v.ui.workspace.dragging(), Some(ui::DockTab::Readouts));
         v.tool.selected = Some(0);
         v.input(&Event::Key { key: KeyName::Escape, down: true }, false);
         assert_eq!(v.tool.selected, Some(0), "the drag's Esc does not deselect");
@@ -3749,8 +3787,8 @@ nucleus 1 {a} {} {}
         assert!((1060.0..1100.0).contains(&(both.origin[0] + both.size[0])), "the right column is on the right: {both:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
         // closing the right column's panels gives its width back, to the window's edge
-        // (Activity and Graph are tabbed with the Log since docking Task 4)
-        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity, DockTab::Graph] {
+        // (Activity is tabbed with the Log since docking Task 4)
+        for t in [DockTab::View, DockTab::Orbitals, DockTab::Log, DockTab::Activity] {
             v.ui.workspace.close_panel(t);
         }
         let left_only = frames(&mut v);
