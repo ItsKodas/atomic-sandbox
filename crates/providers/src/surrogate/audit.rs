@@ -116,6 +116,10 @@ pub(super) enum JobKind {
     /// The isolated-atom reference of this Z: `sim::references::solve_atom`'s whole multiplicity
     /// scan on the scene's cell and σ (M6 Task 3 review I2: never on the stepping teacher).
     Reference(u8),
+    /// A Harris display solve at the job's geometry (`ForceProvider::harris_display`; live-orbitals
+    /// spec §4.2): orbitals only, display only — never a fallback, an audit, a teacher solve, a
+    /// sample or a teach event. At most one is queued (`SurrogateKs::harris_queued`).
+    HarrisDisplay,
 }
 
 /// Where a failed audit came from (the teach-around review, SHOULD-T5: the chip says which).
@@ -209,9 +213,13 @@ pub(super) struct AuditJob {
     /// The orbital shares' free-atom tables (`SurrogateKs::share_tables`), handed to the teacher
     /// before it solves; it weights them at this job's positions (module doc, "Orbitals").
     pub(super) shares: Option<Arc<ShareTables>>,
+    /// The isolated-atom profiles a [`JobKind::HarrisDisplay`] job superposes (`None` for every
+    /// other kind).
+    pub(super) harris: Option<Arc<sim::HarrisAtoms>>,
 }
 
-/// What the auditor's teacher returned for an audit or a display job.
+/// What the auditor's teacher returned for an audit or a display job. A Harris job's answer has
+/// only `orbitals` (no energy: `energy` is NaN, `forces` empty, never read).
 pub(super) struct Solved {
     pub(super) energy: f64,
     pub(super) forces: Vec<[f64; 3]>,
@@ -265,25 +273,33 @@ impl Auditor {
                 let mut view = OrbitalViewRequest::default();
                 let mut core = false;
                 while let Ok(job) = jrx.recv() {
-                    // the audits are thousands of steps apart: no extrapolation through the
-                    // previous one's geometry (the density is kept as a warm start) — but an
-                    // isolated atom's density is no warm start for a molecule, nor the reverse
                     let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_));
-                    if atom || last_atom {
-                        teacher.reset();
-                    } else {
-                        teacher.discontinuity();
+                    // a Harris display solve touches neither the SCF warm state nor its
+                    // extrapolation (it writes its own `HarrisState`; spec §4.2): no reset, no
+                    // discontinuity, and `last_atom` stays the last SCF job's
+                    if job.kind != JobKind::HarrisDisplay {
+                        // the audits are thousands of steps apart: no extrapolation through the
+                        // previous one's geometry (the density is kept as a warm start) — but an
+                        // isolated atom's density is no warm start for a molecule, nor the reverse
+                        if atom || last_atom {
+                            teacher.reset();
+                        } else {
+                            teacher.discontinuity();
+                        }
+                        last_atom = atom;
                     }
-                    last_atom = atom;
-                    // the one orbital producer: on for audits and refreshes, off for an atom
+                    // the one orbital producer: on for audits, refreshes and Harris, off for an atom
                     let want = if atom { OrbitalViewRequest::default() } else { job.view.clone() };
                     if want != view {
                         teacher.set_orbital_view(want.clone());
                         view = want;
                     }
-                    if job.core != core {
-                        teacher.set_display_partial_core(job.core);
-                        core = job.core;
+                    // every isolated-atom profile is the valence density, without ρ_pc (spec
+                    // §4.1: the superposition cloud and the Harris input are built from them)
+                    let want_core = job.core && !atom;
+                    if want_core != core {
+                        teacher.set_display_partial_core(want_core);
+                        core = want_core;
                     }
                     // the driver's display interrupt (re-review N1): a forced refresh's unoccupied
                     // eigensolve yields this job slot to the user's next command
@@ -302,6 +318,20 @@ impl Auditor {
                             done_count.store(0, Ordering::Relaxed);
                             let r = sim::references::solve_atom_reporting(teacher.as_mut(), &job.scene.cell, job.scene.sigma, job.scene.ionic, z, mass, &mut || current.load(Ordering::Relaxed) != g, &mut |k| done_count.store(k, Ordering::Relaxed));
                             (Err(String::new()), Some(r))
+                        }
+                        // display only: abandoned with its generation, and yields to the user's
+                        // next command like any display work (the driver's display interrupt)
+                        JobKind::HarrisDisplay => {
+                            let atoms = job.harris.clone().unwrap_or_else(|| Arc::new(sim::HarrisAtoms { profiles: Vec::new() }));
+                            let interrupt = job.interrupt.clone();
+                            let mut abort = || current.load(Ordering::Relaxed) != g || interrupt.as_ref().is_some_and(|i| i());
+                            let result = match teacher.harris_display(&job.scene, &atoms, &mut abort) {
+                                Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None }),
+                                Some(sim::HarrisAnswer::Solved(Err(e))) => Err(e.to_string()),
+                                Some(sim::HarrisAnswer::Queued { .. }) => Err("the background teacher queued it instead of solving".into()),
+                                None => Err("the background teacher has no Harris display".into()),
+                            };
+                            (result, None)
                         }
                         _ => (
                             teacher
@@ -390,6 +420,22 @@ impl SurrogateKs {
         true
     }
 
+    /// Queues a Harris display job at `scene` with the profiles `atoms` (`ForceProvider::harris_display`;
+    /// `surrogate` module doc, "Side densities"): the one queued Harris job is replaced (a newer
+    /// geometry wins), sent when the auditor is free, the side queue is empty and no audit is due.
+    /// Its side-job number, or `None` without an auditor, for an empty scene, or while a sampling
+    /// pass runs (a pass's solves come first; the caller asks again after it).
+    pub(super) fn queue_harris(&mut self, scene: &Scene, atoms: &Arc<sim::HarrisAtoms>) -> Option<u64> {
+        self.poll_side_jobs();
+        if self.auditor.is_none() || scene.nuclei.is_empty() || self.pass.is_some() {
+            return None;
+        }
+        self.side_jobs += 1;
+        self.harris_queued = Some((scene.clone(), atoms.clone(), self.side_jobs));
+        self.pump_side_queue();
+        Some(self.side_jobs)
+    }
+
     /// Asks the background auditor for the isolated atom Z on `scene`'s cell (σ kept, neutral,
     /// lowest multiplicity, at the origin), queued like a refresh; its display arrives through
     /// [`take_atom_densities`](Self::take_atom_densities). False without an auditor.
@@ -466,18 +512,28 @@ impl SurrogateKs {
     }
 
     /// Sends the next queued side job if the auditor is idle (`surrogate` module doc, "Side densities": a
-    /// queued request goes ahead of an audit that fell due meanwhile).
+    /// queued request goes ahead of an audit that fell due meanwhile). The queued Harris job goes
+    /// last: only with the side queue empty (refreshes, and the atoms and references it needs), no
+    /// audit due (a safety check) and no sampling pass running (spec §4.2, "Scheduling").
     pub(super) fn pump_side_queue(&mut self) {
         if !self.auditor_idle() {
             return;
         }
-        if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
-            if !self.send_job(scene, prov, kind, id) {
-                // the thread is gone: the references asked for are answered (the popped one is still
-                // in `ref_jobs`), the rest dropped
-                self.fail_references(None, "the background teacher is gone");
-                self.side_queue.clear();
-            }
+        let sent = if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
+            self.send_job(scene, prov, kind, id, None)
+        } else if !self.audit_due && self.pass.is_none() && self.harris_queued.is_some() {
+            let (scene, atoms, id) = self.harris_queued.take().expect("checked");
+            let prov = self.scene_provenance(&scene);
+            self.send_job(scene, prov, JobKind::HarrisDisplay, id, Some(atoms))
+        } else {
+            true
+        };
+        if !sent {
+            // the thread is gone: the references asked for are answered (the popped one is still
+            // in `ref_jobs`), the rest dropped
+            self.fail_references(None, "the background teacher is gone");
+            self.side_queue.clear();
+            self.harris_queued = None;
         }
     }
 
@@ -506,20 +562,21 @@ impl SurrogateKs {
     }
 
     /// Sends a job to the idle auditor; false when there is none, it is busy, or its thread is
-    /// gone (then the audits run in the step from now on).
-    pub(super) fn send_job(&mut self, scene: Scene, prov: Provenance, kind: JobKind, id: u64) -> bool {
+    /// gone (then the audits run in the step from now on). `harris`: a Harris job's profiles.
+    pub(super) fn send_job(&mut self, scene: Scene, prov: Provenance, kind: JobKind, id: u64, harris: Option<Arc<sim::HarrisAtoms>>) -> bool {
         let answered = self.answered;
         let Some(a) = self.auditor.as_mut() else { return false };
         if a.busy.is_some() {
             return false;
         }
-        // the rate flag (module doc, "Orbitals"; Task 4 review I1): a refresh is forced only when
-        // the driver forces the view (paused), an audit never, so the auditor teacher's
-        // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
-        let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
+        // the rate flag (module doc, "Orbitals"; Task 4 review I1): a refresh — or a Harris job, the
+        // same request — is forced only when the driver forces the view (paused), an audit never,
+        // so the auditor teacher's `UnoccupiedCadence` budgets the unoccupied eigensolve against
+        // its own SCF wall
+        let force = matches!(kind, JobKind::Refresh | JobKind::HarrisDisplay) && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone() };
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -647,7 +704,7 @@ impl SurrogateKs {
             return true;
         }
         self.side_jobs += 1;
-        if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs) {
+        if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs, None) {
             self.audit_due = false;
             self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
             true
@@ -731,6 +788,17 @@ impl SurrogateKs {
             }
             (JobKind::Reference(z), _) => {
                 return self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher returned no reference".into()))));
+            }
+            // display only (G4): a payload, else a note — never a teach event or a counter
+            (JobKind::HarrisDisplay, Ok(Solved { orbitals: Some(o), .. })) => {
+                self.side_harris = Some(SideDisplay { display: None, orbitals: Some(o), kind: SideKind::Harris, job: ans.job.id, positions: positions() });
+                return;
+            }
+            (JobKind::HarrisDisplay, Ok(_)) => {
+                return self.pending_notes.push("surrogate: the orbital display solve on the background teacher returned no orbitals".into());
+            }
+            (JobKind::HarrisDisplay, Err(e)) => {
+                return self.pending_notes.push(format!("surrogate: the orbital display solve (not self-consistent) on the background teacher did not finish ({e})"));
             }
             (JobKind::Atom(_) | JobKind::Refresh, Ok(_)) => {
                 return self.pending_notes.push("surrogate: the background teacher returned no density (its display is off)".into());

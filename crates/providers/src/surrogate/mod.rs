@@ -392,6 +392,33 @@
 //! is in flight. Without an auditor (the CPU teacher) none of this exists: the audits run in the
 //! step and their density is the step's own.
 //!
+//! **Harris display jobs** (live-orbitals spec §4.2): `harris_display` queues a display-only
+//! Harris solve (`JobKind::HarrisDisplay`: one diagonalisation in the potential of the superposed
+//! isolated atoms, orbitals only) and answers `HarrisAnswer::Queued` with its side-job number;
+//! `None` without an auditor, for an empty scene or while a sampling pass runs. **At most one is
+//! queued** (`harris_queued`): a newer request replaces it, so the latest positions win. It goes
+//! **last** — only when the side queue is empty (refreshes, and the atoms and references it needs)
+//! and no audit is due (a safety check) — and never during a pass. On the auditor's thread it is
+//! not an SCF job: no `reset`, no `discontinuity`, the "last job was an atom" flag left as it was;
+//! the teacher solves it into its own Harris state (`GpuKs`, `ks` module doc "Harris display"), so
+//! the next audit or refresh starts from the same warm state as without it
+//! (`harris_never_resets_the_auditor_teacher`). The job's view is set as for a refresh (the rate
+//! flag included); it is abandoned with its generation (a Forget, an installed model) and yields
+//! to the user's next command (the display interrupt), as display work does. Its payload is kept
+//! in `side_harris`, beside `side_display`, as a `SideKind::Harris` [`SideDisplay`] with no density;
+//! `take_side_display` hands out the density job's payload first, then the Harris one. A failed or
+//! cancelled Harris solve leaves a note only. It is **never** a fallback, an audit, a teacher
+//! solve, a sample or a teach event, and no counter moves (G4,
+//! `harris_job_is_never_a_fallback_or_audit`). `side_job_in_flight` holds while one is queued or
+//! running.
+//!
+//! **The isolated atoms are valence-only.** The auditor solves every `Atom` and `Reference` job
+//! with the display's partial core off, whatever `set_display_partial_core` says: each
+//! `AtomProfile` built from them is the valence density (spec §4.1; the Harris input must not
+//! contain ρ_pc, `atom_jobs_solve_without_the_partial_core`). The superposition cloud is built
+//! from the same profiles, so with "show partial core" on it is valence-only while a solved
+//! density shows ρ_pc (`app::cloud` says so).
+//!
 //! **Orbitals** (orbital-viewer spec §4.3, §7; plan Task 3, review SHOULD 12): estimated mode has
 //! **exactly one orbital producer**, the background auditor's teacher. `set_orbital_view` is kept
 //! here and travels with every job sent to the auditor; the auditor's thread hands it to its
@@ -409,7 +436,8 @@
 //! audit). All the payloads
 //! (`SideDisplay::orbitals`) come from that teacher's one tracker — tracks, colours and signs
 //! continue from one side solve to the next (the thread calls `discontinuity`, never `reset`,
-//! between them). An isolated-atom job runs with the view off (its teacher is reset around it
+//! between them; a Harris display job calls neither and shares the same tracker, "Side
+//! densities"). An isolated-atom job runs with the view off (its teacher is reset around it
 //! anyway: that is a new scene for the tracker). So **the tracks restart after an atom or
 //! reference job** (Task 3 review M3): the view's producer is dropped with the view off, and the
 //! next audit or refresh hands out fresh tracks (never a reused id, `crate::orbitals`), so a
@@ -1371,6 +1399,12 @@ pub struct SurrogateKs {
     /// isolated-atom densities that arrived (module doc, "Side densities").
     side_jobs: u64,
     side_display: Option<SideDisplay>,
+    /// The newest Harris display payload (`SideKind::Harris`; module doc, "Side densities"), held
+    /// beside `side_display` so that neither replaces the other.
+    side_harris: Option<SideDisplay>,
+    /// The one Harris display job waiting for the auditor (scene, profiles, side-job number): a
+    /// newer request replaces it (the latest positions win; module doc, "Side densities").
+    harris_queued: Option<(Scene, Arc<sim::HarrisAtoms>, u64)>,
     atom_densities: Vec<(u8, Display)>,
     /// The isolated-atom references that came back (`request_atom_reference`), not yet taken.
     atom_references: Vec<(u8, Result<AtomReference, ProviderError>)>,
@@ -1588,6 +1622,8 @@ impl SurrogateKs {
             step_notes: Vec::new(),
             side_jobs: 0,
             side_display: None,
+            side_harris: None,
+            harris_queued: None,
             atom_densities: Vec::new(),
             atom_references: Vec::new(),
             side_queue: std::collections::VecDeque::new(),
@@ -2391,9 +2427,11 @@ impl ForceProvider for SurrogateKs {
         self.side_jobs
     }
 
+    /// The density job's payload (audit or refresh) first, then the Harris one (module doc, "Side
+    /// densities"): the driver takes until `None`.
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         self.poll_side_jobs();
-        self.side_display.take()
+        self.side_display.take().or_else(|| self.side_harris.take())
     }
 
     /// The teacher's side solver (a fresh instance): the references are its surface's, never the
@@ -2452,6 +2490,13 @@ impl ForceProvider for SurrogateKs {
     fn set_share_tables(&mut self, tables: Option<Arc<ShareTables>>) {
         self.teacher.set_share_tables(tables.clone());
         self.share_tables = tables;
+    }
+
+    /// Queued on the background auditor (module doc, "Side densities"): `Queued`, the payload
+    /// arriving as a `SideKind::Harris` side display; `None` without an auditor, for an empty
+    /// scene, or while a sampling pass runs. Never a fallback, an audit, a sample or a teach event.
+    fn harris_display(&mut self, scene: &Scene, atoms: &Arc<sim::HarrisAtoms>, _should_abort: &mut dyn FnMut() -> bool) -> Option<sim::HarrisAnswer> {
+        self.queue_harris(scene, atoms).map(|job| sim::HarrisAnswer::Queued { job })
     }
 }
 
@@ -3159,7 +3204,7 @@ impl Trainable for SurrogateKs {
     }
 
     fn side_job_in_flight(&self) -> bool {
-        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty()
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty() || self.harris_queued.is_some()
     }
 
     fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {

@@ -9,7 +9,11 @@
 //! answers. Atomic units (Bohr, e/Bohr³). The isolated atom is solved at the solver's lowest
 //! multiplicity (`multiplicity: None`), not the lowest-energy one the sampling pass's references
 //! use (ruling S9): identical for H, He, Li; for N or O it may be another spin state — display
-//! only (review M5).
+//! only (review M5). The profiles are the **valence** density: the auditor solves the isolated
+//! atoms with the partial core ρ_pc off (live-orbitals spec §4.1 — the Harris display superposes
+//! the same profiles, and its input must not contain ρ_pc). So with "show partial core" on, the
+//! superposition shows no core while a solved density does (`providers::surrogate` module doc,
+//! "Side densities").
 
 pub use sim::{radial_profile, AtomProfile};
 
