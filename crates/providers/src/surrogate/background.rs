@@ -94,12 +94,14 @@ pub(super) struct BackgroundRefit {
     /// The user's Forget / Restore codes set while it runs (module doc, "The user's codes"): the
     /// last one per sample, re-applied at the install.
     user_codes: BTreeMap<usize, u8>,
-    /// The user's changes no fit held when it started (`SurrogateKs::user_changes_pending`): this
-    /// refit holds them; given back when it is discarded or fails.
-    user_changes: usize,
 }
 
 impl BackgroundRefit {
+    /// The codes the running refit started from: what it fits (`SurrogateKs::user_changes_pending`).
+    pub(super) fn snap_quarantine(&self) -> &[u8] {
+        &self.snap.quarantine
+    }
+
     /// Asks the thread to stop at its next fit (tests; `Drop` does it).
     #[cfg(test)]
     pub(super) fn cancel_now(&self) {
@@ -242,9 +244,7 @@ impl SurrogateKs {
         if let Some(p) = &probe {
             p.begin_refit(self.samples());
         }
-        // the user's changes so far are this refit's; the ones made while it runs are the next one's
-        let user_changes = std::mem::take(&mut self.user_changes);
-        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), user_changes });
+        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new() });
         true
     }
 
@@ -293,25 +293,17 @@ impl SurrogateKs {
         let handle = done.handle.take().expect("a running refit has its thread");
         let snap = std::mem::replace(&mut done.snap, Snapshot::empty());
         let user = std::mem::take(&mut done.user_codes);
-        let held = done.user_changes;
         // `done` drops at the end: the probe's refit phase ends whatever the outcome
         let (fork, result) = match handle.join() {
             Ok(x) => x,
             Err(_) => {
                 self.pending_refit = true;
-                self.user_changes += held;
                 return BackgroundPoll::Discarded("the background refit panicked; it is due again".into());
             }
         };
         if let Some(why) = self.background_conflict(&snap, &user) {
             self.pending_refit = true;
-            // its user changes are pending again, with the ones made while it ran
-            self.user_changes += held;
             return BackgroundPoll::Discarded(why);
-        }
-        if result.is_err() {
-            // a fit that failed holds nothing: the changes are still pending (`pending_refit`)
-            self.user_changes += held;
         }
         self.install_fork(*fork, &snap, result.is_ok(), &user);
         BackgroundPoll::Installed(result)
@@ -467,6 +459,13 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.pending_refit = self.samples() > p || f.pending_refit || user_moved;
+        // a user change the installed fit does not hold makes a rebuild due, whatever the copy
+        // left (review I1, 2026-11-14: a copy whose refit erred after a fit that succeeded leaves
+        // its own `pending_refit` false) — `user_changes_pending > 0` ⇒ `pending_refit`
+        if self.user_changes_pending() > 0 {
+            self.pending_refit = true;
+            self.species_dirty = true;
+        }
         // a refit that ended in an error re-judges nothing and moves no surface (`refit_inner`): the
         // failed audits stay as they stood
         if ok {

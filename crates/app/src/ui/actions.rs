@@ -688,12 +688,12 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             out.commands.push(Command::RestoreSample(id));
         }
         Action::ForgetSamples(ids) => {
-            st.forget_selection.clear();
+            // the ticks stay until the worker answers: an applied id leaves the list (and with it
+            // the selection, `dock::model::suspects`); a refused batch keeps them for another try
             st.set_status(format!("forgetting {} samples: held out of the fit until Restore; the refit follows in {} s (Refit now starts it)", ids.len(), crate::sim::FORGET_REFIT_DELAY.as_secs()));
             out.commands.push(Command::ForgetSamples(ids));
         }
         Action::RestoreSamples(ids) => {
-            st.restore_selection.clear();
             st.set_status(format!("restoring {} samples; the refit follows in {} s (Refit now starts it)", ids.len(), crate::sim::FORGET_REFIT_DELAY.as_secs()));
             out.commands.push(Command::RestoreSamples(ids));
         }

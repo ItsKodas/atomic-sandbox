@@ -57,8 +57,10 @@
 //!   stands keeps answering, judged by its own verdicts, and each tick polls it; the new model is
 //!   installed between ticks once done (or discarded when more than appended data changed meanwhile —
 //!   it is due again, after the throttle; after [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row the
-//!   next one runs in the tick, so the model still moves). Paused it runs in the tick, as before (nothing steps meanwhile, and the
-//!   order of a paused session's notes stays deterministic). The driver notices the new surface epoch and books
+//!   next one runs in the tick, so the model still moves). Paused, an active-learning refit runs in
+//!   the tick, as before (nothing steps meanwhile, and the order of a paused session's notes stays
+//!   deterministic); a refit for the user's Forget / Restore runs in the background paused too
+//!   (below, and after any number of discards: a paused worker must never block on one). The driver notices the new surface epoch and books
 //!   the jump on its next tick. Every outcome goes to the snapshot notes ("refit #k: rmse …,
 //!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
@@ -72,8 +74,9 @@
 //!   can take minutes: the Model tab stays usable). A change while a refit runs is applied at once
 //!   (the provider re-applies it at the install, `providers::surrogate` "background") and makes one
 //!   more refit due after it — coalesced, not cancelled: the running one may be nearly done, and a
-//!   cancel at every click could starve the model of any refit. The worker ticks once a budget
-//!   while the pending refit waits (paused, nothing else would start it).
+//!   cancel at every click could starve the model of any refit. While the pending refit waits and
+//!   nothing else runs, the idle worker sleeps until its due time (or the next command), like a
+//!   deferred training-view build.
 //!   A pass that ends — finished or cancelled — with fewer usable samples than its basis's Q′
 //!   is not fitted (M6 Task 3 fix round 2: below Q′ no fit can earn trust) and leaves **no
 //!   model**: its samples are kept, and since this refit needs a fitted model they are not
@@ -888,16 +891,22 @@ fn worker(
         pending,
     };
     loop {
+        // a deferred training-view build (`activity` module doc), or the user's pending refit
+        // waiting for its due time (no refit running): wait for it, not forever
         let views_wake = w.views_wake();
+        let refit_wake = w.user_refit.due().filter(|_| w.refit_started.is_none());
+        let wake = match (views_wake, refit_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         if let Some(d) = w.pace_until {
             inbox.wait_until(d);
-        } else if let Some(d) = views_wake {
-            // a deferred training-view build (`activity` module doc): wait for it, not forever
+        } else if let Some(d) = wake {
             inbox.wait_until(d);
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
         // round's pacing or the wait above was the round's, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && w.user_refit.due().is_none() && views_wake.is_none()) else {
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && wake.is_none()) else {
             w.retire();
             return;
         };
@@ -998,11 +1007,9 @@ impl Worker {
         // the auditor's channel for the next command (final review I1)
         self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
         // (a background refit in flight is polled once a budget too: paused, nothing else would
-        // wake the worker to install it — and so is the user's pending refit, waiting for its
-        // moment: paused, nothing else would wake the worker to start it. Once a budget, not at
-        // the deadline: a command before a paced deadline is applied without a tick, and an edit
-        // must not wait seconds for its evaluation)
-        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending || self.refit_started.is_some() || self.user_refit.due().is_some());
+        // wake the worker to install it. The user's pending refit is not polled: the idle worker
+        // sleeps until its due time — the loop's `wake` — and a command still lands at once)
+        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending || self.refit_started.is_some());
         if polling && self.pace_until.is_none() {
             self.pace_until = Some(t0 + budget);
         }

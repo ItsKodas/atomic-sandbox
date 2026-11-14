@@ -538,8 +538,11 @@ pub(crate) enum RefitStart {
 /// Restore holds every refit until its moment ([`UserRefit`]); then it starts, not throttled. A
 /// refit for the user's changes, or one they asked for, runs **in the background, paused too**
 /// (2026-11-14: it can take minutes, and the Model tab must stay usable); any other runs in the
-/// background while playing and in the tick while paused, as before; after
-/// [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row, in the tick.
+/// background while playing and in the tick while paused, as before. After
+/// [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row a playing refit runs in the tick (so the model
+/// still moves), but a paused one for the user's changes stays in the background (review M2: it
+/// would block the paused worker for minutes; paused, nothing steps, so a discard needs a change
+/// the user made — each discard's note says what).
 pub(crate) fn refit_start(u: &mut UserRefit, at: Instant, i: RefitInputs) -> RefitStart {
     if !i.pending || !i.fitted {
         u.clear();
@@ -555,7 +558,7 @@ pub(crate) fn refit_start(u: &mut UserRefit, at: Instant, i: RefitInputs) -> Ref
     }
     u.clear();
     let user = asked || i.user_changes > 0;
-    if (!i.paused || user) && i.discards < REFIT_DISCARDS_BEFORE_SYNC {
+    if (user && i.paused) || ((!i.paused || user) && i.discards < REFIT_DISCARDS_BEFORE_SYNC) {
         RefitStart::Background
     } else {
         RefitStart::InTick
@@ -1304,9 +1307,13 @@ mod debounce_tests {
         // due: not throttled, in the background
         assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, throttled: true, user_changes: 1, ..base }), RefitStart::Background);
         assert!(u.due().is_none(), "started");
-        // repeated discards: in the tick
+        // repeated discards: a playing refit in the tick (the model must move); a paused one for
+        // the user's changes stays in the background (review M2)
         u.changed(t0);
-        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick);
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::Background);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick, "a paused fallback refit, as before");
         // nothing due (a pass's fit took the changes) or nothing fitted: the request is dropped
         u.changed(t0);
         assert_eq!(refit_start(&mut u, t0, RefitInputs { pending: false, ..base }), RefitStart::Wait);

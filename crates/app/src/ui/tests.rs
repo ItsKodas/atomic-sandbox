@@ -12357,8 +12357,8 @@ fn drawn(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str
 /// 2026-11-14, the batched forget: a checkbox per Worst-fitting row and per forgotten row; checking
 /// rows shows "Forget N selected" / "Restore N selected", which emit one `Action::ForgetSamples` /
 /// `RestoreSamples` with the checked ids (→ `Command::ForgetSamples` / `RestoreSamples`, recorded
-/// as not replayable) and clear the selection; unchecking takes a row out; a row that leaves the
-/// list leaves the selection.
+/// as not replayable); the ticks stay until the worker answers — an applied id leaves its list and
+/// the selection, a refused batch keeps them (review M3); unchecking takes a row out.
 #[test]
 fn checked_rows_forget_and_restore_as_one_batch() {
     let suspect = |index, formula: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: 0xabc0 + index as u64 }, formula: formula.into(), origin: "fallback".into(), loo_ratio };
@@ -12397,15 +12397,38 @@ fn checked_rows_forget_and_restore_as_one_batch() {
         matches!(c.as_slice(), [Command::ForgetSamples(ids)] if ids.iter().map(|x| (x.index, x.key)).collect::<Vec<_>>() == vec![(1804, 0xabc0 + 1804), (1133, 0xabc0 + 1133)]),
         "{c:?}"
     );
-    assert!(st.forget_selection.is_empty(), "sent: the selection clears");
+    assert_eq!(st.forget_selection.len(), 2, "sent: the ticks stay until the worker answers");
+    // the worker refused (the list unchanged): still ticked, for another try
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert_eq!(st.forget_selection.len(), 2);
+    // applied: the two leave the Worst-fitting list, and the selection with them
+    let applied = ModelStatus { suspects: vec![suspect(77, "H2", Some(1.2))], ..m.clone() };
+    let snap_a = snapshot(&scene, Backend::Estimated, Some(applied));
+    let inp_a = input(&scene, Some(&snap_a), &cam);
+    frame(&ctx, &mut st, &inp_a, 1400.0, vec![]);
+    assert!(st.forget_selection.is_empty());
+    // a fresh panel for the forgotten list (the shorter list above moved the panel's scroll)
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    search::pick(&ctx, &mut st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+    for _ in 0..40 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
     // the forgotten list: Restore 2 selected
     click_widget(&ctx, &mut st, &inp, "select-forgotten-40");
     click_widget(&ctx, &mut st, &inp, "select-forgotten-41");
     for _ in 0..3 {
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     }
+    assert_eq!(st.restore_selection.iter().map(|x| x.index).collect::<Vec<_>>(), vec![40, 41], "both ticked");
     let c = sent(&click_widget(&ctx, &mut st, &inp, "restore-selected"));
     assert!(matches!(c.as_slice(), [Command::RestoreSamples(ids)] if ids.iter().map(|x| x.index).collect::<Vec<_>>() == vec![40, 41]), "{c:?}");
+    // restored: they leave the forgotten list (none left: the list is gone), and the selection
+    let restored = ModelStatus { forgotten_samples: Vec::new(), forgotten: 0, ..m.clone() };
+    let snap_r = snapshot(&scene, Backend::Estimated, Some(restored));
+    let inp_r = input(&scene, Some(&snap_r), &cam);
+    frame(&ctx, &mut st, &inp_r, 1400.0, vec![]);
     assert!(st.restore_selection.is_empty());
     // a checked row that leaves the list (forgotten meanwhile) leaves the selection
     click_widget(&ctx, &mut st, &inp, "select-sample-1133");

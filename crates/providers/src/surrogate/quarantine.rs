@@ -1790,8 +1790,6 @@ impl SurrogateKs {
         self.quarantine[i] = code;
         self.species_dirty = true;
         self.pending_refit = true;
-        // one more change no fit holds (`user_changes_pending`: the worker's debounce, the banner)
-        self.user_changes += 1;
         self.note_user_code(i, code);
         match self.write_status_now(i) {
             Ok(true) => " (written to the shared collection)".to_string(),

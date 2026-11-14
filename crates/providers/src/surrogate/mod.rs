@@ -1361,11 +1361,6 @@ pub struct SurrogateKs {
     verdict_counts: Vec<usize>,
     epoch: u64,
     pending_refit: bool,
-    /// The user's Forget / Restore changes since the fit that stands — or since the running
-    /// background refit started, which holds the ones before it (`user_changes_pending`;
-    /// 2026-11-14, the batched forget): counted per sample changed, reset by every fit that
-    /// succeeds, given back by a background refit that is discarded or fails.
-    user_changes: usize,
     pending_jump: Option<f64>,
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
@@ -1650,7 +1645,6 @@ impl SurrogateKs {
             verdict_counts: Vec::new(),
             epoch: 0,
             pending_refit: false,
-            user_changes: 0,
             pending_jump: None,
             last: None,
             consults: 0,
@@ -1810,8 +1804,23 @@ impl SurrogateKs {
     /// since the fit that stands, or — while a background refit runs — since it started (the ones
     /// before are its). Each one made a refit due (`pending_refit`); the worker's pending-refit
     /// debounce starts that refit, and the Model tab's banner counts them.
+    ///
+    /// **Derived, never counted** (review I1, 2026-11-14): the samples whose forgotten state now
+    /// differs from their state in the fit it is measured against — the running background refit's
+    /// start (`background::Snapshot::quarantine`) while one runs, else the standing fit's members
+    /// (`fit_members`). So a Forget then a Restore of one sample is no change, and every reset —
+    /// a fit, a forget of the model, a load, an attach, a pass's fit — is right by construction.
+    /// 0 without a model (nothing to refit).
     pub fn user_changes_pending(&self) -> usize {
-        self.user_changes
+        if self.model.is_none() {
+            return 0;
+        }
+        let base: &[u8] = match self.background.as_ref() {
+            Some(b) => b.snap_quarantine(),
+            None => &self.fit_members.1,
+        };
+        let was = |i: usize| base.get(i).is_some_and(|&q| q == Q_FORGOTTEN || q == Q_FORGOTTEN_UNFENCED);
+        (0..self.quarantine.len()).filter(|&i| self.is_forgotten(i) != was(i)).count()
     }
 
     /// How many times the variance (rules 6–7) has been evaluated.

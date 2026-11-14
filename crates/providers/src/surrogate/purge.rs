@@ -89,7 +89,7 @@ impl SurrogateKs {
         if self.forgotten_in_fit() > 0 {
             return Some(PURGE_WAIT_REFIT.into());
         }
-        if self.user_changes > 0 {
+        if self.user_changes_pending() > 0 {
             return Some(PURGE_WAIT_CHANGES.into());
         }
         let sh = self.shared.as_ref()?;
