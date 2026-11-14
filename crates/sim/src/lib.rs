@@ -19,7 +19,7 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
-pub use activity::{ActivityProbe, DisplaySolve, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
+pub use activity::{ActivityProbe, DisplayJob, DisplaySolve, ProbeView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls, HARRIS_SAME_GEOMETRY};
 pub use integrator::{Integrator, StepStats};
 pub use knowledge::{atom_coverage, Confidence, ElementKnowledge, KnowledgeMap, PairKnowledge};

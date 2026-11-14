@@ -322,7 +322,10 @@ fn display_row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &DisplayRow, widths: &[
     col(ui, 0, &clock(r.at), mono, theme::INK_DIM, Some(format!("{:.1} s into the session (when it ended)", r.at.as_secs_f64())));
     col(ui, 1, "—", mono, theme::INK_DIM, Some("display work after a DFT step, not a step's solve".into()));
     col(ui, 2, "orbitals", prop, theme::INK_DIM, None);
-    let what = format!("{} unoccupied per spin", d.unoccupied);
+    let what = match d.job {
+        sim::DisplayJob::Unoccupied(m) => format!("{m} unoccupied per spin"),
+        sim::DisplayJob::Harris => "orbital display solve (not self-consistent)".to_string(),
+    };
     col(ui, 3, &what, prop, theme::INK, Some("the display eigensolve: the lowest unoccupied orbitals on the converged state of the last DFT step, for the Orbitals view only — it never feeds the solve, so it is not a teaching solve and no counter counts it".into()));
     let (outcome, colour, why) = if d.interrupted {
         ("stopped", AMBER, "a command arrived (an edit, Play, a slider) and the eigensolve yielded to it; it runs again later")

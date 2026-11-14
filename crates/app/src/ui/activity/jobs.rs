@@ -122,7 +122,8 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: !cpu,
         });
     }
-    if let Some((s, m)) = probe.and_then(|p| p.display) {
+    // a Harris display solve's row is live-orbitals Task 7's (it is never scheduled before Task 6)
+    if let Some((s, sim::DisplayJob::Unoccupied(m))) = probe.and_then(|p| p.display) {
         v.push(JobRow {
             key: JobKey::Orbitals,
             title: "Computing orbitals".into(),

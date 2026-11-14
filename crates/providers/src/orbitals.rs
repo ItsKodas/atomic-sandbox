@@ -253,6 +253,10 @@ pub struct UnoccupiedState {
     solves: u64,
     /// The last attempt was interrupted by a newer command (review I2).
     interrupted: bool,
+    /// The vectors held are a Harris display solve's (`crate::ks`, "Harris display"), adopted by
+    /// the producer: the next converged payload drops them before its own plan
+    /// ([`harris_held`](Self::harris_held)), so a converged payload never shows them.
+    harris: bool,
 }
 
 impl UnoccupiedState {
@@ -272,8 +276,9 @@ impl UnoccupiedState {
     /// at (a re-evaluation without a move — an estimated refresh for another pick, a paused
     /// re-solve) the vectors are still this state's: no second eigensolve for the same geometry
     /// (final review minor 6). An interrupted attempt does not count.
+    /// A Harris solve's vectors are never this state's.
     pub fn revalidate(&mut self, positions: &[[f64; 3]]) {
-        if self.m != 0 && !self.interrupted && !self.current && self.positions == positions {
+        if self.m != 0 && !self.harris && !self.interrupted && !self.current && self.positions == positions {
             self.current = true;
         }
     }
@@ -284,6 +289,26 @@ impl UnoccupiedState {
         self.m = 0;
         self.positions.clear();
         self.interrupted = false;
+        self.harris = false;
+    }
+
+    /// The producer adopted a Harris display solve's m unoccupied vectors per channel, solved at
+    /// `positions` in `wall` (`OrbitalView::adopt_unoccupied`): the Harris payload's own rows
+    /// (current for it). Neither the cadence nor the solve count of the converged state's eigensolve
+    /// moves — the Harris solve is not one of them.
+    pub fn harris_adopted(&mut self, m: usize, positions: Vec<[f64; 3]>, wall: Duration) {
+        self.current = true;
+        self.m = m;
+        self.positions = positions;
+        self.wall = wall;
+        self.interrupted = false;
+        self.harris = true;
+    }
+
+    /// The producer holds a Harris solve's vectors: a converged payload clears them
+    /// (`OrbitalView::clear_unoccupied`, then [`dropped`](Self::dropped)) before its plan.
+    pub fn harris_held(&self) -> bool {
+        self.harris && self.m != 0
     }
 
     /// A solve was interrupted by a newer command (review I2): nothing changed, and the status
@@ -318,6 +343,7 @@ impl UnoccupiedState {
         self.wall = wall;
         self.solves += 1;
         self.interrupted = false;
+        self.harris = false;
     }
 
     /// The payload's status for a request of `requested` (spec §4.5; `sim::UnoccupiedStatus`):
@@ -1149,6 +1175,24 @@ mod tests {
         assert_eq!(st.plan(4, at(120), true), UnoccupiedPlan::Solve, "an interrupted attempt is retried");
         st.dropped();
         assert!(!st.held());
+        // a Harris solve's vectors (live orbitals): held and current for the Harris payload, never
+        // revalidated for a converged state at the same positions, and the cadence and solve count
+        // are the converged eigensolve's only; `dropped` and a converged solve forget the mark
+        let mut st = UnoccupiedState::default();
+        st.solved(4, vec![[0.0; 3]], at(0), ms(800));
+        st.harris_adopted(4, vec![[0.5, 0.0, 0.0]], ms(300));
+        assert!(st.held() && st.harris_held());
+        assert_eq!(st.solves, 1, "not an eigensolve of the converged state");
+        st.new_state(ms(30));
+        st.revalidate(&[[0.5, 0.0, 0.0]]);
+        assert!(!st.current, "a Harris solve's vectors are never a converged state's");
+        assert_eq!(st.plan(4, at(40), false), UnoccupiedPlan::Keep, "what the plan alone would do: the payload drops them first");
+        st.dropped();
+        assert!(!st.harris_held());
+        assert_eq!(st.plan(4, at(40), false), UnoccupiedPlan::Clear, "play, after the drop: none until its own solve");
+        st.harris_adopted(4, vec![[0.5, 0.0, 0.0]], ms(300));
+        st.solved(4, vec![[0.0; 3]], at(2000), ms(800));
+        assert!(!st.harris_held() && st.held());
     }
 
     fn row(spin: qo::Spin, index: usize, track: u32, energy: f64, occupation: f64) -> qo::Row {

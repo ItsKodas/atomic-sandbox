@@ -65,6 +65,33 @@
 //! 0.45–0.5 ms at H₂O 95³ × 0.15 with 10 rows × 3 nuclei, +0.5 ms on the payload
 //! (`gpu_shares_cost_is_reported`).
 //!
+//! # Harris display (`ForceProvider::harris_display`; live-orbitals spec §4)
+//! [`GpuKs`] answers a Harris display request now (`HarrisAnswer::Solved`): orbitals at the scene's
+//! positions in the potential of the superposed isolated atoms — one diagonalisation, not
+//! self-consistent, display only. The steps: `problem` (the scene's grid, electrons and occupation
+//! rule, the floor-aware tolerance as the SCF would run it); the solver for that grid (the rule
+//! `evaluate` uses; a rebuild drops the view, the Harris state and the converged density); the GPU
+//! memory guard (the solve's, the view's and [`crate::harris::harris_footprint_bytes`]; over the
+//! budget with m unoccupied orbitals but within it without, they are refused with a note; over it
+//! without, the payload is a note and nothing is solved); ρ_in from the `HarrisAtoms` profiles that
+//! fit the scene's surface ([`crate::harris::superposition`]: each atom renormalised to Z, or Z_v
+//! under a pseudopotential, the sum rescaled to the scene's N — a refusal, N = 0 included, is a
+//! note-only payload); then `qm_gpu::GpuSolver::harris` into the provider's own `HarrisState`, the
+//! probe's display slot marked `DisplayJob::Harris` while it runs (never a solve slot), and the
+//! payload through the converged payload's own tail on the Harris state (`OrbitalKind::Harris`, its
+//! rescale, a note when |rescale − 1| > 1e-9, the solve's notes). A cancelled solve is
+//! `ProviderError::Cancelled`. It never sets `density_current`, never touches `last` or the SCF's warm
+//! state, so `sample_density`, `orbital_display_now` and the next `evaluate` are what they would have
+//! been (`harris_is_not_a_teacher_solve`).
+//!
+//! **One view, both kinds.** The Harris payload goes through the same `OrbitalView` as the converged
+//! ones, so the tracks continue between them. Its unoccupied rows are the Harris solve's own
+//! (`OrbitalView::adopt_unoccupied`, only when m > 0; otherwise the view shows none, since a converged
+//! state's belong to another potential), marked in `UnoccupiedState` as a Harris solve's: the next
+//! converged payload clears them before its own plan, so it shows its own eigensolve's rows or none,
+//! never these (`converged_payload_after_harris_never_shows_harris_unoccupied`). The Harris state is
+//! dropped when the view is switched off and on a solver rebuild.
+//!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
 //! `discontinuity` was called since — the density is always the geometry last evaluated; a
@@ -161,7 +188,8 @@
 //! above). Over the budget with m unoccupied orbitals but within it without them, the payload
 //! shows the occupied rows and says why the unoccupied ones were refused; over it even without,
 //! the view's producer is dropped and the payload is a note only. At 97³ (4.63 MB a field) H₂O
-//! with m = 4 adds ≈ 0.59 GB to its 0.91 GB solve (`the_orbital_view_is_charged_to_the_vram_budget`). The estimated mode's
+//! with m = 4 adds ≈ 0.59 GB to its 0.91 GB solve (`the_orbital_view_is_charged_to_the_vram_budget`). A Harris
+//! display solve adds [`crate::harris::harris_footprint_bytes`] on top of both (module doc "Harris display"). The estimated mode's
 //! producer lives on the auditor's teacher, whose budget is half the app's (`app::worker`).
 //!
 //! The budget carries over to [`ForceProvider::side_solver`]'s second `GpuKs`, which checks it
@@ -172,14 +200,17 @@
 //! `ATOMIC_SANDBOX_VRAM_GB` does not leave it. The driver drops the side solver once its
 //! reference queue is empty (`sim::dynamics`), so the second set is held only while references
 //! are being solved.
+use crate::harris::{harris_footprint_bytes, superposition};
 use crate::orbitals::{spin_in, CpuView, PickKind, Pool, TextureKind, UnoccupiedPlan, UnoccupiedState, ViewChange, ViewState, UNOCCUPIED_MAX};
 use crate::surrogate::box_affected_face_density;
 use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product, ShareTablesGpu};
+use qm_gpu::{HarrisInput, HarrisState};
 use sim::{
-    nothing_to_solve, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
-    OrbitalField, OrbitalViewRequest, ProviderError, RadialDensity, Scene, ShareTables, Slot, SolverError, Source, Weights,
+    nothing_to_solve, ActivityProbe, AtomProfile, Cell, Display, DisplayInterrupt, DisplayJob, EnergyBreakdown, EvalStats, ForceProvider, ForceResult,
+    HarrisAnswer, HarrisAtoms, OrbitalDisplay, OrbitalField, OrbitalKind, OrbitalViewRequest, ProviderError, RadialDensity, Scene, ShareTables, Slot,
+    SolverError, Source, Weights,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -353,7 +384,7 @@ pub fn field_bytes(n: usize) -> u64 {
 /// species) the setup is `None` and the problem is exactly today's all-electron one, occupations included. With a
 /// setup the occupations are `DegenerateShells { τ = DEGENERACY_TAU }` (Task 6 review A.6: an open shell of a
 /// pseudo-atom has no well-posed integer fixed point).
-pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, System, ScfSettings), ProviderError> {
+pub fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, System, ScfSettings), ProviderError> {
     scene.check_inside_cell()?;
     let grid = Grid::cube(scene.cell.n, scene.cell.h);
     let nuclei: Vec<qm::Nucleus> = scene.nuclei.iter().map(|n| qm::Nucleus { pos: n.pos, z: n.z }).collect();
@@ -387,6 +418,25 @@ pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Resul
         None => System::new(nuclei, scene.charge, scene.multiplicity),
     };
     Ok((grid, system, settings))
+}
+
+/// The GPU's floor-aware SCF stop (spec §7 risk 6; ionic setups only — the all-electron path is
+/// untouched): the f32 storage rounding of ρ puts a floor under Δρ that grows with the electron
+/// count, so `settings.tol` is raised to `crate::pseudo::effective_gpu_tol`. Returns the note when
+/// it was raised.
+fn raise_to_gpu_floor(tol: f64, system: &System, settings: &mut ScfSettings) -> Option<String> {
+    system.ionic.as_ref()?;
+    let n_valence = (system.n_up + system.n_dn) as i64;
+    let tol_eff = crate::pseudo::effective_gpu_tol(tol, n_valence);
+    (tol_eff > settings.tol).then(|| {
+        let note = format!(
+            "GPU SCF tolerance raised from {:.1e} to {tol_eff:.1e}: twice the f32 density floor of {n_valence} valence electrons ({:.1e})",
+            settings.tol,
+            crate::pseudo::gpu_tol_floor(n_valence)
+        );
+        settings.tol = tol_eff;
+        note
+    })
 }
 
 /// A warm solve that failed before the cold retry (R15): its SCF iterations and Δρ — the final Δρ
@@ -575,7 +625,7 @@ impl CpuKs {
         match self.unocc.plan(m, now, self.orb.request().force_every_step) {
             UnoccupiedPlan::Solve => {
                 // the Activity tab's job line and log row (display only)
-                let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(sim::DisplayJob::Unoccupied(m as u32)));
                 let solved = view.unoccupied(state, nuclei, m, settings, should_abort);
                 if let Some(b) = busy {
                     b.finish(solved.is_none());
@@ -767,6 +817,20 @@ impl ForceProvider for CpuKs {
     }
 }
 
+/// What [`GpuKs::shown_payload`] shows: the cell and nuclei the state was solved at (and their
+/// positions), the provider's tolerance (`OrbitalView::update`'s τ), the spin-noise bound's SCF and
+/// eigensolver tolerances, the unoccupied count asked for and the memory guard's notes.
+struct Shown<'a> {
+    cell: &'a Cell,
+    nuclei: &'a [qm::Nucleus],
+    positions: Vec<[f64; 3]>,
+    tol: f64,
+    scf_tol: f64,
+    eig_tol: f64,
+    requested: u8,
+    guard: Vec<String>,
+}
+
 /// The GPU adapter's density textures (`crate::orbitals::Pool`: a texture leaves the pool inside
 /// a [`Display`] as an `Arc` and is written again only when the pool holds the only reference, so
 /// it is never overwritten while it can be on screen). With a viewer that keeps one result this
@@ -806,6 +870,8 @@ pub struct GpuKs {
     last: Option<(Cell, Vec<qm::Nucleus>, ScfSettings)>,
     /// The unoccupied orbitals' bookkeeping (`crate::orbitals`, "Unoccupied orbitals").
     unocc: UnoccupiedState,
+    /// The Harris display solve's own state (module doc, "Harris display"), for the solver's grid.
+    harris: HarrisState,
     /// The driver's display interrupt (`crate::orbitals`, "Cancellation").
     interrupt: Option<DisplayInterrupt>,
     /// The density shown includes ρ_pc (`set_display_partial_core`).
@@ -845,6 +911,7 @@ impl GpuKs {
             watch: OccupationWatch::default(),
             share_tables: None,
             share_gpu: None,
+            harris: HarrisState::new(),
         }
     }
 
@@ -905,13 +972,18 @@ impl GpuKs {
             v.set_face_limit(box_affected_face_density(solver.grid().h));
             v
         });
+        // a Harris solve's unoccupied vectors (module doc, "Harris display") are never this state's
+        if unocc.harris_held() {
+            view.clear_unoccupied();
+            unocc.dropped();
+        }
         // unoccupied orbitals (`crate::orbitals`, "Unoccupied orbitals")
         let now = Instant::now();
         unocc.revalidate(&positions);
         match unocc.plan(m, now, orb.request().force_every_step) {
             UnoccupiedPlan::Solve => {
                 // the Activity tab's job line and log row (display only)
-                let busy = probe.as_ref().map(|(p, _)| p.display_solve(m));
+                let busy = probe.as_ref().map(|(p, _)| p.display_solve(sim::DisplayJob::Unoccupied(m as u32)));
                 let solved = view.unoccupied(solver, nuclei, m, settings, should_abort);
                 if let Some(b) = busy {
                     b.finish(solved.is_none());
@@ -931,6 +1003,22 @@ impl GpuKs {
         }
         let solver = &*solver;
         let state = solver.state()?;
+        let shown = Shown { cell, nuclei, positions, tol: *tol, scf_tol: settings.tol, eig_tol: solver.profile().eig_tol_used, requested, guard };
+        Some(GpuKs::shown_payload(ctx, orb, view, solver, state, (orb_scalar, orb_colour), (share_tables.as_ref(), share_gpu), unocc, shown))
+    }
+
+    /// The payload of one `OrbitalView` update on `state` — the converged state's (`orbital_payload`)
+    /// or a Harris solve's (`harris_once`) — from the product textures to the shares: the product
+    /// picked from the update's own rows, its texture from the pools, the rows and verdicts with the
+    /// unoccupied status (`unocc`), the box marks, the lone pseudo-atom's labels note and the rows'
+    /// shares at `shown.nuclei`. `orb`'s ids, selection fallback and rows carry over between the two
+    /// kinds (one view: the tracks continue).
+    #[allow(clippy::too_many_arguments)]
+    fn shown_payload(ctx: &GpuContext, orb: &mut ViewState, view: &mut OrbitalView, solver: &qm_gpu::GpuSolver, state: &qm_gpu::GpuState,
+                     (orb_scalar, orb_colour): (&mut Pool<Volume3D>, &mut Pool<ColourVolume3D>),
+                     (share_tables, share_gpu): (Option<&Arc<ShareTables>>, &mut Option<(Arc<ShareTables>, Cell, ShareTablesGpu)>),
+                     unocc: &UnoccupiedState, shown: Shown) -> OrbitalDisplay {
+        let Shown { cell, nuclei, positions, tol, scf_tol, eig_tol, requested, guard } = shown;
         let dims = solver.grid().n.map(|n| n as u32);
         let (scalar, colour) = match orb.texture() {
             TextureKind::Scalar => (Some(orb_scalar.take(ctx, dims)), None),
@@ -941,7 +1029,7 @@ impl GpuKs {
         let mut include: Vec<u32> = Vec::new();
         let u = {
             let (inc, picked, vs, sv, cv) = (&mut include, &mut picked, &*orb, scalar.as_deref(), colour.as_deref());
-            view.update_with(solver, state, nuclei, *tol, move |out| {
+            view.update_with(solver, state, nuclei, tol, move |out| {
                 let p = vs.pick(out);
                 let product = match (&p.kind, sv, cv) {
                     (&PickKind::Orbital { spin, track, squared }, Some(v), _) => Product::Orbital { spin, track, squared, out: v },
@@ -966,8 +1054,7 @@ impl GpuKs {
             PickKind::None => None,
         };
         let status = unocc.status(requested, view.unoccupied_info(), &u.out, guard);
-        // the eigensolver tolerance the converged step ran at: the effective one (grid-aware)
-        let noise = u.spin.noise_l1(settings.tol, solver.profile().eig_tol_used);
+        let noise = u.spin.noise_l1(scf_tol, eig_tol);
         let mut payload = orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, noise, pick, field, status);
         orb.mark_touching(&mut payload, &u.touching);
         if state.ionic.is_some() && nuclei.len() == 1 {
@@ -976,14 +1063,14 @@ impl GpuKs {
         // the rows' shares at the evaluated nuclei, from the ψ̃ just shown (`crate::orbitals`,
         // "Orbital shares"): the GPU pass, then the CPU path's own check and set average
         let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
-        let fit = share_tables.as_ref().filter(|t| !z.is_empty() && crate::orbitals::tables_fit(Some(t), &z).is_some() && z.len() == payload.positions.len());
+        let fit = share_tables.filter(|t| !z.is_empty() && crate::orbitals::tables_fit(Some(t), &z).is_some() && z.len() == payload.positions.len());
         if let Some(tables) = fit {
             let gpu_tables = GpuKs::share_tables_on_device(share_gpu, ctx, tables, cell, &payload.positions);
             let raw = view.shares(solver, gpu_tables, &payload.positions);
             let rows: Vec<Option<Vec<f64>>> = payload.rows.iter().map(|r| raw[spin_in(r.spin).index()].get(r.index).cloned()).collect();
             crate::orbitals::settle_shares(&mut payload, &z, rows);
         }
-        Some(payload)
+        payload
     }
 
     /// `tables` packed for the GPU share pass on `cell` (`ShareTablesGpu`; the lookups are
@@ -1099,6 +1186,139 @@ impl GpuKs {
 }
 
 impl GpuKs {
+    /// The solver for `grid`: the one held, or — none yet, or another grid — a new one, the old
+    /// one's buffers freed first. A rebuild drops what belonged to the old solver: the orbital
+    /// producer (module doc, "Orbital display"), the Harris state, and the converged density
+    /// (`density_current`: the new solver holds none).
+    fn solver_for(&mut self, grid: &Grid) {
+        if self.solver.as_ref().is_none_or(|s| s.grid() != grid) {
+            self.solver = None; // free the old grid's buffers before allocating the new ones
+            self.orbital = None;
+            self.orb.rebuilt();
+            self.unocc.dropped();
+            self.harris.clear();
+            self.watch.forget();
+            self.density_current = false;
+            let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), grid);
+            s.set_density_extrapolation(self.extrapolate);
+            self.solver = Some(s);
+        }
+    }
+
+    /// [`ForceProvider::harris_display`]'s answer (module doc, "Harris display").
+    fn harris_once(&mut self, scene: &Scene, atoms: &HarrisAtoms, should_abort: &mut dyn FnMut() -> bool) -> Result<OrbitalDisplay, ProviderError> {
+        let t0 = Instant::now();
+        let (grid, system, mut settings) = problem(scene, self.tol, &mut Vec::new())?;
+        // the τ-sets' tolerance as the SCF on this teacher would run it
+        let _ = raise_to_gpu_floor(self.tol, &system, &mut settings);
+        self.check_vram(scene)?;
+        let positions: Vec<[f64; 3]> = system.nuclei.iter().map(|n| n.pos).collect();
+        // a payload that only says why nothing was solved (still a Harris answer; nothing was rescaled)
+        let note_only = |orb: &ViewState, note: String| {
+            let mut p = orb.refused(scene.cell.clone(), grid.origin, positions.clone(), note);
+            p.kind = OrbitalKind::Harris { experience: None, rescale: 1.0, wall_s: t0.elapsed().as_secs_f64() };
+            p
+        };
+        if !self.orb.on() {
+            return Ok(note_only(&self.orb, "no orbital view is on: no orbital display solve was made".into()));
+        }
+        let (n, n_up, n_dn) = (scene.cell.n, system.n_up, system.n_dn);
+        // `requested` is the app's; the solve is capped at UNOCCUPIED_MAX (as `orbital_payload`)
+        let requested = self.orb.request().unoccupied;
+        let mut m = requested.min(UNOCCUPIED_MAX) as usize;
+        // the GPU memory guard (module doc, "GPU memory"): the solve, the view and the Harris state
+        let mut guard = Vec::new();
+        if let Some(budget) = self.vram_budget {
+            let base = solve_footprint_bytes(n, (n_up + n_dn) as u64, n_up.max(n_dn) as u64);
+            let texture = self.orb.texture();
+            let pseudised = system.ionic.is_some();
+            let need = |m: usize| base + orbital_view_footprint_bytes(n, n_up, n_dn, m, texture) + harris_footprint_bytes(n, n_up, n_dn, m, pseudised);
+            let gb = |b: u64| b as f64 / 1e9;
+            if need(m) > budget {
+                if m > 0 && need(0) <= budget {
+                    guard.push(format!(
+                        "{requested} unoccupied orbitals refused: with them the orbital display solve needs ≈ {:.2} GB of GPU memory at {n}³, over {} — fewer unoccupied orbitals or a coarser quality (Scene ▸ Quality) fits",
+                        gb(need(m)), GpuKs::budget_words(budget, self.vram_note.as_deref())));
+                    m = 0;
+                } else {
+                    self.harris.clear();
+                    return Ok(note_only(&self.orb, format!(
+                        "the orbital display solve needs ≈ {:.2} GB of GPU memory at {n}³ with this scene, over {}: choose a coarser quality (Scene ▸ Quality)",
+                        gb(need(0)), GpuKs::budget_words(budget, self.vram_note.as_deref()))));
+                }
+            }
+        }
+        // ρ_in (`crate::harris`): each atom renormalised to its electrons (Z, or Z_v under a
+        // pseudopotential), the sum rescaled to the scene's N; only profiles of this surface
+        let counted: Vec<f64> = system.nuclei.iter().map(|nu| system.ionic.as_deref().map_or(nu.z as f64, |s| s.valence_charge(nu.z))).collect();
+        let fitting: Vec<AtomProfile> = atoms.profiles.iter().filter(|p| p.fits(n, scene.cell.h, scene.sigma, scene.ionic)).cloned().collect();
+        let rho = match superposition(&grid, &system.nuclei, &fitting, &counted, n_up, n_dn) {
+            Ok(r) => r,
+            Err(why) => return Ok(note_only(&self.orb, why)),
+        };
+        if should_abort() {
+            return Err(ProviderError::Cancelled);
+        }
+        self.solver_for(&grid);
+        // the probe's display slot (never its solve slots: this is not a teacher solve)
+        let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(DisplayJob::Harris));
+        qm_gpu::grid::clear_readback_fault();
+        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, unocc, harris, share_tables, share_gpu, .. } = self;
+        let solver = solver.as_mut().expect("built above");
+        let input = HarrisInput { system: &system, settings: &settings, rho_in: [&rho.up, &rho.dn], unoccupied: m };
+        let solve = match solver.harris(harris, &input, should_abort) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                if let Some(b) = busy {
+                    b.finish(true);
+                }
+                return Err(ProviderError::Cancelled);
+            }
+            Err(e) => return Err(solver_error(e)), // the guard's drop records it as stopped
+        };
+        let view = orbital.get_or_insert_with(|| {
+            let mut v = OrbitalView::new(solver);
+            v.set_face_limit(box_affected_face_density(solver.grid().h));
+            v
+        });
+        // the Harris solve's unoccupied vectors, only when some were asked for; otherwise the view
+        // shows none (a converged state's belong to another potential)
+        match harris.unoccupied() {
+            (vectors, Some(info)) if m > 0 => {
+                view.adopt_unoccupied(solver, vectors, info.clone());
+                unocc.harris_adopted(m, positions.clone(), solve.wall);
+            }
+            _ => {
+                if unocc.held() || view.unoccupied_info().is_some() {
+                    view.clear_unoccupied();
+                }
+                unocc.dropped();
+            }
+        }
+        let solver = &*solver;
+        let state = harris.state().expect("a completed Harris solve holds its state");
+        let eig_tol = solver.effective_eig_tol(&settings);
+        let shown = Shown { cell: &scene.cell, nuclei: &system.nuclei, positions, tol: *tol, scf_tol: settings.tol, eig_tol, requested, guard };
+        let mut payload = GpuKs::shown_payload(ctx, orb, view, solver, state, (orb_scalar, orb_colour), (share_tables.as_ref(), share_gpu), unocc, shown);
+        payload.notes.extend(solve.notes.iter().cloned());
+        if (rho.rescale - 1.0).abs() > 1e-9 {
+            let carried = counted.iter().sum::<f64>();
+            payload.notes.push(format!(
+                "the superposed atoms carry {carried} electrons: their density was rescaled to the scene's {} (× {:.4}, charge {:+})",
+                n_up + n_dn, rho.rescale, scene.charge));
+        }
+        // display only: a failed readback is an error, and the view that read the zeros goes
+        if let Err(e) = device_fault() {
+            self.drop_view_after_fault();
+            return Err(e);
+        }
+        payload.kind = OrbitalKind::Harris { experience: None, rescale: rho.rescale, wall_s: t0.elapsed().as_secs_f64() };
+        if let Some(b) = busy {
+            b.finish(false);
+        }
+        Ok(payload)
+    }
+
     /// One attempt of [`ForceProvider::evaluate`], with no "GPU busy" retry.
     fn evaluate_once(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         // whatever happens below, the held density is no longer this scene's until it succeeds
@@ -1108,20 +1328,7 @@ impl GpuKs {
         }
         let mut notes = Vec::new();
         let (grid, system, mut settings) = problem(scene, self.tol, &mut notes)?;
-        // the floor-aware stop (spec §7 risk 6; ionic setups only — the all-electron path is untouched): the f32 storage
-        // rounding of ρ puts a floor under Δρ that grows with the electron count
-        if system.ionic.is_some() {
-            let n_valence = (system.n_up + system.n_dn) as i64;
-            let tol_eff = crate::pseudo::effective_gpu_tol(self.tol, n_valence);
-            if tol_eff > settings.tol {
-                notes.push(format!(
-                    "GPU SCF tolerance raised from {:.1e} to {tol_eff:.1e}: twice the f32 density floor of {n_valence} valence electrons ({:.1e})",
-                    settings.tol,
-                    crate::pseudo::gpu_tol_floor(n_valence)
-                ));
-                settings.tol = tol_eff;
-            }
-        }
+        notes.extend(raise_to_gpu_floor(self.tol, &system, &mut settings));
         self.check_vram(scene)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -1142,17 +1349,7 @@ impl GpuKs {
                 pr.scf_iteration(*slot, &iteration_of(p));
             }
         };
-        if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
-            self.solver = None; // free the old grid's buffers before allocating the new ones
-            // the orbital producer belongs to the old solver: rebuilt (module doc, "Orbital display")
-            self.orbital = None;
-            self.orb.rebuilt();
-            self.unocc.dropped();
-            self.watch.forget();
-            let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), &grid);
-            s.set_density_extrapolation(self.extrapolate);
-            self.solver = Some(s);
-        }
+        self.solver_for(&grid);
         let t0 = Instant::now(); // after the build: `solve_ms` excludes it (`EvalStats` doc)
         let solver = self.solver.as_mut().expect("created above");
         // consumed by this attempt even if it is abandoned: the state it parks belongs to the
@@ -1316,6 +1513,7 @@ impl ForceProvider for GpuKs {
     fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
         if self.orb.set(request) == ViewChange::Off {
             self.drop_orbital_view();
+            self.harris.clear();
             self.orb_scalar.clear();
             self.orb_colour.clear();
         }
@@ -1343,6 +1541,11 @@ impl ForceProvider for GpuKs {
 
     fn set_share_tables(&mut self, tables: Option<Arc<ShareTables>>) {
         self.share_tables = tables;
+    }
+
+    /// A Harris display solve now (module doc, "Harris display"): always `Solved`.
+    fn harris_display(&mut self, scene: &Scene, atoms: &Arc<HarrisAtoms>, should_abort: &mut dyn FnMut() -> bool) -> Option<HarrisAnswer> {
+        Some(HarrisAnswer::Solved(self.harris_once(scene, atoms, should_abort)))
     }
 }
 
@@ -3405,5 +3608,178 @@ mod tests {
             assert_eq!(r.multiplicity, Some(want), "Z = {z}");
             assert!(r.energy > -40.0, "a valence energy, not the all-electron total: {}", r.energy);
         }
+    }
+
+    // ---- the Harris display (module doc, "Harris display"; live-orbitals Task 4) ----
+
+    /// The analytic H 1s profile e^{−2r}/π on `s`'s surface (grid, σ, ionic policy): a stand-in for
+    /// the isolated-atom profile the app's auditor solves (`sim::profiles`' own test atom).
+    fn h_atoms(s: &Scene) -> Arc<sim::HarrisAtoms> {
+        let (n, h) = (s.cell.n, s.cell.h);
+        let grid = Grid::cube(n, h);
+        let rho: Vec<f32> = grid.sample(|p| (-2.0 * (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()).exp() / std::f64::consts::PI)
+            .into_iter().map(|v| v as f32).collect();
+        Arc::new(sim::HarrisAtoms { profiles: vec![sim::radial_profile(1, &rho, n, h, grid.origin, s.sigma, s.ionic)] })
+    }
+
+    /// `harris_display` with H profiles, unwrapped: a `GpuKs` always answers `Solved`.
+    fn harris(p: &mut GpuKs, s: &Scene) -> Result<OrbitalDisplay, ProviderError> {
+        match p.harris_display(s, &h_atoms(s), &mut never()) {
+            Some(HarrisAnswer::Solved(r)) => r,
+            other => panic!("GpuKs answers now: {other:?}"),
+        }
+    }
+
+    fn homo_view() -> OrbitalViewRequest {
+        view(OrbitalRequest::Orbital { spin: Spin::Up, track: sim::TRACK_HOMO, squared: false })
+    }
+
+    /// H₃⁺ (ruling R5: the validate suite's equilateral triangle, side 2.1 Bohr, charge +1) on 33³ ×
+    /// 0.25 — built inline, providers cannot reach validate's common module.
+    fn h3_plus() -> Scene {
+        let r = 2.1 / 3f64.sqrt(); // the circumradius
+        let at = |deg: f64| Nucleus::new(1, [r * deg.to_radians().cos(), r * deg.to_radians().sin(), 0.0]);
+        let mut s = scene(33, vec![at(0.0), at(120.0), at(240.0)]);
+        s.charge = 1;
+        s
+    }
+
+    /// Spec §4.1 / Review Focus 4: H₃⁺ — three H atoms carry 3 electrons, the scene has 2 — is solved
+    /// with the superposition rescaled by 2/3, and the payload says so (its kind and a note). One
+    /// occupied level per spin, the HOMO's field drawn.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn charged_scene_is_rescaled_and_labelled() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = GpuKs::new(ctx, 1e-6);
+        p.set_orbital_view(homo_view());
+        let s = h3_plus();
+        let o = harris(&mut p, &s).expect("a Harris payload");
+        let OrbitalKind::Harris { experience, rescale, wall_s } = o.kind.clone() else { panic!("kind {:?}", o.kind) };
+        let occ: Vec<(Spin, f64, f64)> = o.rows.iter().filter(|r| r.occupation > 0.0).map(|r| (r.spin, r.energy, r.occupation)).collect();
+        println!("H₃⁺ Harris (33³ × 0.25): rescale {rescale:.15}, {wall_s:.3} s, occupied {occ:?}, notes {:?}", o.notes);
+        assert!(experience.is_none(), "Phase A");
+        assert!((rescale - 2.0 / 3.0).abs() < 1e-12, "{rescale}");
+        assert!(o.notes.iter().any(|n| n.contains("rescaled") && n.contains("0.6667")), "{:?}", o.notes);
+        assert_eq!(occ.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), vec![(Spin::Up, 1.0), (Spin::Down, 1.0)]);
+        assert!(o.field.is_some(), "the HOMO is drawn");
+    }
+
+    /// Review Focus 4: H⁺ alone has no electrons — a note-only Harris payload, no field, and the
+    /// probe's display slot never started (nothing was solved).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn no_electrons_is_a_note_not_a_solve() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = ActivityProbe::new();
+        let mut p = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), Slot::Side);
+        p.set_orbital_view(homo_view());
+        let mut s = scene(33, vec![Nucleus::new(1, [0.1, 0.0, 0.0])]);
+        s.charge = 1;
+        let o = harris(&mut p, &s).expect("a note, not an error");
+        println!("H⁺: notes {:?}", o.notes);
+        assert!(o.field.is_none() && o.rows.is_empty());
+        assert!(o.notes.iter().any(|n| n.contains("no electrons")), "{:?}", o.notes);
+        assert!(matches!(o.kind, OrbitalKind::Harris { .. }));
+        let v = probe.view();
+        assert_eq!((v.display, v.display_solves, v.side.solves), (None, 0, 0), "no display solve, no teacher solve");
+        assert!(probe.take_display_solves().is_empty());
+    }
+
+    /// G4 / anti-goals: a Harris display solve on a GPU teacher (probe slot Side) after a converged
+    /// evaluation is not a teacher solve — the side slot's count is unchanged, the display slot
+    /// counts one `DisplayJob::Harris` — and it leaves the converged state alone: `sample_density`
+    /// answers bitwise as before, and `orbital_display_now` still shows the converged state.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn harris_is_not_a_teacher_solve() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = ActivityProbe::new();
+        let mut p = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), Slot::Side);
+        p.set_orbital_view(view(OrbitalRequest::List));
+        p.evaluate(&h2(33, 1.4), &mut never()).expect("the SCF");
+        let points: Vec<[f64; 3]> = chord([-1.5, 0.1, 0.0], [1.5, -0.1, 0.2]).collect();
+        let bits = |v: Vec<f64>| v.into_iter().map(f64::to_bits).collect::<Vec<_>>();
+        let before = bits(p.sample_density(&points).expect("a converged density"));
+        let (side, shown) = (probe.view().side.solves, probe.view().display_solves);
+        probe.take_display_solves();
+        let o = harris(&mut p, &h2(33, 1.6)).expect("a Harris payload");
+        assert!(matches!(o.kind, OrbitalKind::Harris { rescale, .. } if rescale == 1.0), "{:?}", o.kind);
+        let v = probe.view();
+        assert_eq!(v.side.solves, side, "not a teacher solve");
+        assert!(!v.side.running && !v.main.running && v.display.is_none());
+        assert_eq!(v.display_solves, shown + 1);
+        let done = probe.take_display_solves();
+        let last = done.last().expect("one display solve recorded");
+        println!("H₂ Harris at R = 1.6 after the SCF at 1.4: {:.0} ms, rows {:?}", last.ms, o.rows.iter().map(|r| (r.spin, r.energy)).collect::<Vec<_>>());
+        assert_eq!((done.len(), last.job, last.interrupted), (1, sim::DisplayJob::Harris, false));
+        assert_eq!(bits(p.sample_density(&points).expect("still the converged density")), before, "the converged density is untouched");
+        let now = p.orbital_display_now(&mut never()).expect("the converged state is still current");
+        assert_eq!(now.kind, OrbitalKind::Converged);
+        assert_eq!(now.positions, vec![[0.7, 0.0, 0.0], [-0.7, 0.0, 0.0]], "the evaluated geometry, not the Harris one");
+    }
+
+    /// Spec §4.2 "VRAM": a budget of the solve's and the view's footprints + 1 byte leaves no room
+    /// for the Harris state — the payload is a note naming the GB, and nothing is solved.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn harris_over_the_vram_budget_is_a_note() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(33, 1.4);
+        let budget = solve_footprint_bytes(33, 2, 1) + orbital_view_footprint_bytes(33, 1, 1, 0, TextureKind::Scalar) + 1;
+        assert!(gpu_footprint_bytes(&s) <= budget, "the scene itself fits: only the Harris state is over");
+        let probe = ActivityProbe::new();
+        let mut p = GpuKs::new(ctx, 1e-6).with_vram_budget(budget).with_probe(probe.clone(), Slot::Side);
+        p.set_orbital_view(homo_view());
+        let o = harris(&mut p, &s).expect("a note, not an error");
+        println!("over the budget by the Harris term ({} B): {:?}", harris_footprint_bytes(33, 1, 1, 0, false), o.notes);
+        assert!(o.field.is_none() && o.rows.is_empty());
+        assert!(o.notes.iter().any(|n| n.contains("GB") && n.contains("orbital display solve")), "{:?}", o.notes);
+        assert!(matches!(o.kind, OrbitalKind::Harris { .. }));
+        assert_eq!((probe.view().display_solves, probe.view().side.solves), (0, 0), "no solve of any kind");
+    }
+
+    /// Unoccupied rows of a payload per channel, as (spin, ε bits).
+    fn unocc_eps(o: &OrbitalDisplay) -> Vec<(Spin, u64)> {
+        o.rows.iter().filter(|r| r.occupation == 0.0).map(|r| (r.spin, r.energy.to_bits())).collect()
+    }
+
+    /// Spec §4.2 / Task 4: m = 2. A Harris payload shows its own unoccupied rows; the converged
+    /// payloads after it (another geometry) show their own eigensolve's rows or none, never the
+    /// Harris vectors (whose ε differ). In play (the plan alone would Keep the held vectors: same m,
+    /// no budget measured) the converged payload shows none; paused, its own solve's.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn converged_payload_after_harris_never_shows_harris_unoccupied() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = GpuKs::new(ctx, 1e-6);
+        p.set_orbital_view(with_unoccupied(OrbitalRequest::List, 2, false));
+        p.evaluate(&h2(33, 1.4), &mut never()).expect("the SCF");
+        let h = harris(&mut p, &h2(33, 1.6)).expect("a Harris payload");
+        let harris_eps = unocc_eps(&h);
+        let u = h.unoccupied.as_ref().expect("m = 2 asked for");
+        println!("Harris unoccupied rows {:?} (status current {}, shown {:?})", h.rows.iter().filter(|r| r.occupation == 0.0).map(|r| (r.spin, r.energy)).collect::<Vec<_>>(), u.current, u.shown);
+        assert!(unocc_rows(&h).iter().all(|&k| k >= 1) && u.current, "the Harris payload shows its own: {:?}", unocc_rows(&h));
+        // play: the converged state at another geometry, then a re-display
+        let r = p.evaluate(&h2(33, 1.5), &mut never()).expect("the SCF");
+        let now = p.orbital_display_now(&mut never()).expect("a converged payload");
+        for o in r.orbitals.iter().chain([&now]) {
+            assert_eq!(o.kind, OrbitalKind::Converged);
+            let seen = unocc_eps(o);
+            println!("converged (play) unoccupied rows: {:?}", seen.iter().map(|&(s, e)| (s, f64::from_bits(e))).collect::<Vec<_>>());
+            assert!(seen.is_empty(), "play, no eigensolve of this state yet: none, never the Harris rows ({seen:?})");
+        }
+        // paused: its own eigensolve's rows, current, none of them the Harris ones
+        p.set_orbital_view(with_unoccupied(OrbitalRequest::List, 2, true));
+        let own = p.orbital_display_now(&mut never()).expect("a converged payload");
+        let seen = unocc_eps(&own);
+        println!("converged (paused) unoccupied rows: {:?}", own.rows.iter().filter(|r| r.occupation == 0.0).map(|r| (r.spin, r.energy)).collect::<Vec<_>>());
+        assert!(!seen.is_empty() && own.unoccupied.as_ref().is_some_and(|u| u.current), "its own eigensolve ran");
+        assert!(seen.iter().all(|e| !harris_eps.contains(e)), "never a Harris row: {seen:?} vs {harris_eps:?}");
     }
 }

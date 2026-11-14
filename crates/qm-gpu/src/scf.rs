@@ -1255,8 +1255,10 @@ impl GpuSolver {
                            core_overlaps: overlaps, fractional, released }))
     }
 
-    /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access").
-    pub(crate) fn effective_eig_tol(&self, settings: &ScfSettings) -> f64 {
+    /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access"); a Harris
+    /// display solve runs at it too (`crate::harris`), and `providers` reads it for that payload's
+    /// spin-noise bound.
+    pub fn effective_eig_tol(&self, settings: &ScfSettings) -> f64 {
         effective_eig_tol(settings.eig_tol, self.eig_floor_factor, &self.g)
     }
 

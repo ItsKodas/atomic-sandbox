@@ -5,13 +5,16 @@
 //! learns from it, `Trainable`) and its sampling pass ([`sampling`]). `sim` never names these
 //! types; the app builds them and hands them to `sim::Dynamics` as `Box<dyn ForceProvider>`.
 //! [`orbitals`] holds what the Kohn-Sham adapters share for the orbital display (plan Task 3 of
-//! the orbital viewer).
+//! the orbital viewer); [`harris`] the input density and GPU memory of a Harris display solve
+//! (live orbitals, Phase A), which `GpuKs::harris_display` runs.
+pub mod harris;
 pub mod ks;
 pub mod orbitals;
 pub mod pseudo;
 pub mod sampling;
 pub mod surrogate;
 
+pub use harris::{harris_footprint_bytes, superposition, RhoIn};
 pub use ks::{field_bytes, gpu_footprint_bytes, orbital_view_footprint_bytes, solve_footprint_bytes, CpuKs, GpuKs};
 pub use sampling::{atom_key, run_sampling, Holdout, PairScan, PlanSolves, Sampler, ShellCheck, TargetJob, SCAN_CUTOFF_FRACTION};
 pub use surrogate::{box_affected_face_density, AtomVerdicts, Blocker, FallbackPolicy, LooRms, SurrogateKs, TrainingResiduals, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_ROUNDS};

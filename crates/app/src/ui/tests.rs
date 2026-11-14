@@ -4398,7 +4398,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let snap = snapshot(&scene, Backend::Gpu, None);
-        let probe = sim::ProbeView { display: Some((0.3, 4)), display_solves: 2, ..Default::default() };
+        let probe = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Unoccupied(4))), display_solves: 2, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
         let job = r.iter().find(|r| r.key == JobKey::Orbitals).expect("the eigensolve's job row");
@@ -4408,7 +4408,7 @@ mod activity_tab {
         assert!(rows(&idle, idle.probe.as_ref()).iter().all(|r| r.key != JobKey::Orbitals));
 
         let mut st = activity::ActivityState::new();
-        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, unoccupied: 4, interrupted };
+        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, job: sim::DisplayJob::Unoccupied(4), interrupted };
         st.absorb_display(vec![solve(120.0, false)]);
         std::thread::sleep(Duration::from_millis(2));
         let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
