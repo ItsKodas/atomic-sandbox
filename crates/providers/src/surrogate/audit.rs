@@ -218,6 +218,10 @@ pub(super) struct AuditJob {
     pub(super) harris: Option<Arc<sim::HarrisAtoms>>,
 }
 
+/// A Harris job's error string when its solve was cancelled (a newer generation, or the display
+/// interrupt: the user's next command): `handle_answer` leaves no note for it.
+const HARRIS_CANCELLED: &str = "";
+
 /// What the auditor's teacher returned for an audit or a display job. A Harris job's answer has
 /// only `orbitals` (no energy: `energy` is NaN, `forces` empty, never read).
 pub(super) struct Solved {
@@ -327,6 +331,8 @@ impl Auditor {
                             let mut abort = || current.load(Ordering::Relaxed) != g || interrupt.as_ref().is_some_and(|i| i());
                             let result = match teacher.harris_display(&job.scene, &atoms, &mut abort) {
                                 Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None }),
+                                // superseded or yielded to the user: silent (review minor 3)
+                                Some(sim::HarrisAnswer::Solved(Err(ProviderError::Cancelled))) => Err(HARRIS_CANCELLED.into()),
                                 Some(sim::HarrisAnswer::Solved(Err(e))) => Err(e.to_string()),
                                 Some(sim::HarrisAnswer::Queued { .. }) => Err("the background teacher queued it instead of solving".into()),
                                 None => Err("the background teacher has no Harris display".into()),
@@ -422,9 +428,10 @@ impl SurrogateKs {
 
     /// Queues a Harris display job at `scene` with the profiles `atoms` (`ForceProvider::harris_display`;
     /// `surrogate` module doc, "Side densities"): the one queued Harris job is replaced (a newer
-    /// geometry wins), sent when the auditor is free, the side queue is empty and no audit is due.
-    /// Its side-job number, or `None` without an auditor, for an empty scene, or while a sampling
-    /// pass runs (a pass's solves come first; the caller asks again after it).
+    /// geometry wins), sent when the auditor is free and the side queue is empty — while playing
+    /// also only with no audit due ([`pump_side_queue`](Self::pump_side_queue)). Its side-job
+    /// number, or `None` without an auditor, for an empty scene, or while a sampling pass runs (a
+    /// pass's solves come first, and starting one drops the queued job; the caller asks again).
     pub(super) fn queue_harris(&mut self, scene: &Scene, atoms: &Arc<sim::HarrisAtoms>) -> Option<u64> {
         self.poll_side_jobs();
         if self.auditor.is_none() || scene.nuclei.is_empty() || self.pass.is_some() {
@@ -513,15 +520,18 @@ impl SurrogateKs {
 
     /// Sends the next queued side job if the auditor is idle (`surrogate` module doc, "Side densities": a
     /// queued request goes ahead of an audit that fell due meanwhile). The queued Harris job goes
-    /// last: only with the side queue empty (refreshes, and the atoms and references it needs), no
-    /// audit due (a safety check) and no sampling pass running (spec §4.2, "Scheduling").
+    /// last: only with the side queue empty (refreshes, and the atoms and references it needs) and
+    /// no sampling pass running; while playing also only with no audit due (a safety check; spec
+    /// §4.2, "Scheduling"). Paused (the driver's `force_every_step`) it does not wait for a due
+    /// audit: only an answered step dispatches that, and paused there may be none for a long time
+    /// (spec G1: a paused change is shown) — the audit goes at the next evaluate.
     pub(super) fn pump_side_queue(&mut self) {
         if !self.auditor_idle() {
             return;
         }
         let sent = if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
             self.send_job(scene, prov, kind, id, None)
-        } else if !self.audit_due && self.pass.is_none() && self.harris_queued.is_some() {
+        } else if !(self.audit_due && !self.orbital_view.force_every_step) && self.pass.is_none() && self.harris_queued.is_some() {
             let (scene, atoms, id) = self.harris_queued.take().expect("checked");
             let prov = self.scene_provenance(&scene);
             self.send_job(scene, prov, JobKind::HarrisDisplay, id, Some(atoms))
@@ -583,8 +593,13 @@ impl SurrogateKs {
                 true
             }
             _ => {
+                // the thread is gone: nothing queued can run (review minor 4: else
+                // `side_job_in_flight` would hold forever); the references asked for are answered
                 self.auditor = None;
                 self.audit_due = false;
+                self.fail_references(None, "the background teacher is gone");
+                self.side_queue.clear();
+                self.harris_queued = None;
                 false
             }
         }
@@ -739,6 +754,9 @@ impl SurrogateKs {
                 self.auditor = None;
                 self.audit_due = false;
                 self.fail_references(busy, "the background teacher stopped");
+                // nothing queued can run any more (review minor 4)
+                self.side_queue.clear();
+                self.harris_queued = None;
                 self.pending_notes.push("surrogate: the background audit thread stopped — audits run in the step from now on".into());
                 None
             }
@@ -797,6 +815,7 @@ impl SurrogateKs {
             (JobKind::HarrisDisplay, Ok(_)) => {
                 return self.pending_notes.push("surrogate: the orbital display solve on the background teacher returned no orbitals".into());
             }
+            (JobKind::HarrisDisplay, Err(e)) if e == HARRIS_CANCELLED => return,
             (JobKind::HarrisDisplay, Err(e)) => {
                 return self.pending_notes.push(format!("surrogate: the orbital display solve (not self-consistent) on the background teacher did not finish ({e})"));
             }

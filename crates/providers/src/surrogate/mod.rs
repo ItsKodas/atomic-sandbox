@@ -398,7 +398,10 @@
 //! `None` without an auditor, for an empty scene or while a sampling pass runs. **At most one is
 //! queued** (`harris_queued`): a newer request replaces it, so the latest positions win. It goes
 //! **last** — only when the side queue is empty (refreshes, and the atoms and references it needs)
-//! and no audit is due (a safety check) — and never during a pass. On the auditor's thread it is
+//! and, while playing, no audit is due (a safety check). Paused (the driver's `force_every_step`)
+//! it does not wait for a due audit — only an answered step dispatches one, and paused there may be
+//! none — so a paused change is shown and the audit goes at the next evaluate. Never during a pass:
+//! starting one drops the queued job (the caller asks again). On the auditor's thread it is
 //! not an SCF job: no `reset`, no `discontinuity`, the "last job was an atom" flag left as it was;
 //! the teacher solves it into its own Harris state (`GpuKs`, `ks` module doc "Harris display"), so
 //! the next audit or refresh starts from the same warm state as without it
@@ -406,8 +409,9 @@
 //! flag included); it is abandoned with its generation (a Forget, an installed model) and yields
 //! to the user's next command (the display interrupt), as display work does. Its payload is kept
 //! in `side_harris`, beside `side_display`, as a `SideKind::Harris` [`SideDisplay`] with no density;
-//! `take_side_display` hands out the density job's payload first, then the Harris one. A failed or
-//! cancelled Harris solve leaves a note only. It is **never** a fallback, an audit, a teacher
+//! `take_side_display` hands out the density job's payload first, then the Harris one. A failed
+//! Harris solve leaves a note only; a cancelled one (superseded, or yielding to the user) nothing.
+//! When the auditor's thread is gone the queued Harris job and the side queue go with it. It is **never** a fallback, an audit, a teacher
 //! solve, a sample or a teach event, and no counter moves (G4,
 //! `harris_job_is_never_a_fallback_or_audit`). `side_job_in_flight` holds while one is queued or
 //! running.
@@ -2819,6 +2823,9 @@ impl Trainable for SurrogateKs {
             sampler.scans().len()
         ));
         self.pass = Some(sampler);
+        // a pass owns the display's turn: the queued Harris job goes (the caller asks again after
+        // it; module doc, "Side densities")
+        self.harris_queued = None;
         Ok(())
     }
 

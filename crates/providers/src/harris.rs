@@ -39,11 +39,16 @@
 //! The renormalisation makes any profile integrate to c_A, so it would silently absorb a profile
 //! that is not the atom this solve counts: one solved under another ionic treatment (a pseudo
 //! profile under an all-electron fallback, or the reverse), one that includes ρ_pc, or an atom
-//! whose density the box cuts. When the profile's own count (`AtomProfile::electrons`) or S_A is
-//! off c_A by more than [`PROFILE_COUNT_TOLERANCE`] (10 %; a profile solved on the scene's grid
-//! carries c_A to ≈ 1 %, so the bound flags only those cases), the atom is named in a note
-//! ([`RhoIn::notes`], carried into the payload's notes). The solve still runs: the note says what
-//! the picture is built from.
+//! whose density the box cuts. Two bounds, each against c_A:
+//! - the profile's own count (`AtomProfile::electrons`, integrated on the grid it was solved on —
+//!   the isolated atom at a grid point, ≈ 1 % accurate) by more than [`PROFILE_COUNT_TOLERANCE`]
+//!   (3 %): a treatment mismatch (Z against Z_v: the core's electrons, 33 % for O), or ρ_pc in the profile (pseudo-O:
+//!   ∫ρ_pc / Z_v = 0.359 / 6 ≈ 6 %, which a 10 % bound would miss; review fix round 1, minor 2);
+//! - S_A, the profile splatted at this nucleus, by more than [`ON_GRID_TOLERANCE`] (10 %): an atom
+//!   whose density a face cuts (the splat at an off-grid position is within ≈ 2 %).
+//!
+//! Either names the atom in a note ([`RhoIn::notes`], carried into the payload's notes). The
+//! solve still runs: the note says what the picture is built from.
 //!
 //! # GPU memory ([`harris_footprint_bytes`]; spec §4.2 "VRAM")
 //! What a Harris solve holds on top of the scene's solve (`crate::ks::gpu_footprint_bytes`, which
@@ -88,9 +93,13 @@ pub struct RhoIn {
     pub notes: Vec<String>,
 }
 
-/// The sanity bound (module doc, "The sanity bound"): an atom whose on-grid electrons S_A, or
-/// whose profile's own count, is off its c_A by more than this fraction is named in a note.
-pub const PROFILE_COUNT_TOLERANCE: f64 = 0.1;
+/// The sanity bound on a profile's own count (module doc, "The sanity bound"): an atom whose
+/// profile carries a count off its c_A by more than this fraction is named in a note.
+pub const PROFILE_COUNT_TOLERANCE: f64 = 0.03;
+
+/// The sanity bound on S_A (module doc, "The sanity bound"): an atom whose profile puts a count
+/// off its c_A by more than this fraction on the grid at its position (a face cuts it) is named.
+pub const ON_GRID_TOLERANCE: f64 = 0.1;
 
 /// ρ_in of `nuclei` on `grid` (module doc, "ρ_in"): each nucleus's species profile from `profiles`
 /// (the first with its Z; the caller passes only profiles valid for the scene's surface),
@@ -120,8 +129,8 @@ pub fn superposition(grid: &qm::Grid, nuclei: &[qm::Nucleus], profiles: &[AtomPr
         }
         // the sanity bound (rule 7): the renormalisation below would hide a profile of another
         // treatment or one carrying ρ_pc (its own count off), or an atom cut by a face (S_A off)
-        let off = |x: f64| !((x / counted[a] - 1.0).abs() <= PROFILE_COUNT_TOLERANCE);
-        if off(p.electrons) || off(s_a) {
+        let off = |x: f64, tol: f64| !((x / counted[a] - 1.0).abs() <= tol);
+        if off(p.electrons, PROFILE_COUNT_TOLERANCE) || off(s_a, ON_GRID_TOLERANCE) {
             notes.push(format!(
                 "atom {a} ({}): its isolated-atom profile carries {:.3} electrons ({:.3} on the grid here) for the {} this solve counts — rescaled to {}, which hides a profile of another ionic treatment, one including the partial core, or an atom cut by the box",
                 units::elements::symbol(nuc.z), p.electrons, s_a, counted[a], counted[a]));
@@ -283,6 +292,38 @@ mod tests {
         assert!(r.per_atom[0] < 0.9 && (r.per_atom[1] - 1.0).abs() < 2e-2, "{:?}", r.per_atom);
         assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
         assert!(r.notes[0].starts_with("atom 0 (H)"), "{:?}", r.notes);
+    }
+
+    /// Review fix round 1, minor 2: a pseudo-O profile that carries the partial core is named. A
+    /// stand-in valence density (6 × the H 1s, 6 electrons) is profiled alone — no note — and with
+    /// the pseudo-O's own ρ_pc added (∫ρ_pc ≈ 0.36, 6 % of Z_v = 6: inside the S_A bound, outside
+    /// the profile-count one) — atom 0 named. 61³ × 0.2, CoresOnly.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    fn superposition_names_a_profile_with_the_partial_core() {
+        let (n, h) = (61usize, 0.2);
+        let scene = sim::Scene {
+            nuclei: vec![sim::Nucleus::new(8, [0.0; 3])], cell: sim::Cell { n, h }, charge: 0, multiplicity: None, sigma: None,
+            external_field: [0.0; 3], ionic: IonicPolicy::CoresOnly, train_mask: None,
+        };
+        let (grid, system, _) = crate::ks::problem(&scene, 1e-6, &mut Vec::new()).expect("posed");
+        let setup = system.ionic.as_deref().expect("O is pseudised under CoresOnly");
+        let core = qm::nuclear::partial_core_field(&grid, &system.nuclei, setup);
+        let valence: Vec<f64> = grid.sample(|p| 6.0 * (-2.0 * (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()).exp() / std::f64::consts::PI);
+        let profile = |rho: &[f64]| {
+            let f: Vec<f32> = rho.iter().map(|&v| v as f32).collect();
+            radial_profile(8, &f, n, h, grid.origin, None, IonicPolicy::CoresOnly)
+        };
+        let with_core: Vec<f64> = valence.iter().zip(&core).map(|(v, c)| v + c).collect();
+        let (bare, cored) = (profile(&valence), profile(&with_core));
+        let nuclei = [Nucleus { pos: [0.03, -0.07, 0.05], z: 8 }];
+        let ok = superposition(&grid, &nuclei, std::slice::from_ref(&bare), &[6.0], 3, 3).expect("built");
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&cored), &[6.0], 3, 3).expect("built");
+        println!("valence profile {:.4} e (S_A {:?}), with ρ_pc {:.4} e (S_A {:?}): {:?}", bare.electrons, ok.per_atom, cored.electrons, r.per_atom, r.notes);
+        assert!(ok.notes.is_empty(), "{:?}", ok.notes);
+        assert!((r.per_atom[0] / 6.0 - 1.0).abs() <= ON_GRID_TOLERANCE, "S_A alone would not catch it: {:?}", r.per_atom);
+        assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+        assert!(r.notes[0].starts_with("atom 0 (O)") && r.notes[0].contains("partial core"), "{:?}", r.notes);
     }
 
     /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from:

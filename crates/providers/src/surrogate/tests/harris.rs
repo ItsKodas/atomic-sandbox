@@ -168,6 +168,108 @@ fn a_due_audit_goes_before_harris() {
     assert!((ran[1].1 - 1.47).abs() < 1e-12, "the audit is the step's geometry: {ran:?}");
 }
 
+/// Review fix round 1, Important 1 (spec G1 over the brief's literal rule): **paused** (the
+/// driver's `force_every_step`) a queued Harris job does not wait for a due audit — only an
+/// answered step dispatches that, and paused there may be none — so the Harris runs when the
+/// auditor frees and the audit goes at the next evaluate. (Playing, the audit goes first:
+/// [`a_due_audit_goes_before_harris`].)
+#[test]
+fn a_paused_harris_does_not_wait_for_a_due_audit() {
+    let (s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+    let (mut s, open, log) = harris_gated(s, h);
+    s.set_orbital_view(OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+    assert!(s.request_display(&h2(1.6)));
+    let r = s.evaluate(&h2(1.45), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(s.audit_due, "the audit fell due while the auditor was busy");
+    let job = queued(&mut s, &h2(1.40), &no_atoms());
+    open.store(true, SeqCst);
+    let seen = take_until(&mut s, 2.0, |d| d.kind == SideKind::Harris);
+    assert_eq!(seen.last().map(|d| d.job), Some(job));
+    assert_eq!(*log.lock().unwrap(), vec![("solve", 1.6), ("harris", 1.40)], "paused: the Harris after the refresh");
+    assert!(s.audit_due, "the audit still waits for an answered step");
+    let r = s.evaluate(&h2(1.47), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate);
+    assert!(!s.audit_due && s.audit_in_flight(), "the next answered step dispatched it");
+}
+
+/// Review fix round 1, minor 3: a Harris solve cancelled by the display interrupt (the user's
+/// next command; or a newer generation) leaves no note and no payload — a superseded solve is not
+/// news.
+#[test]
+fn a_cancelled_harris_leaves_no_note() {
+    let (s, h) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let (mut s, _open, log) = harris_gated(s, h);
+    s.set_display_interrupt(Arc::new(|| true));
+    queued(&mut s, &h2(1.40), &no_atoms());
+    let t0 = Instant::now();
+    while Trainable::side_job_in_flight(&s) {
+        assert!(s.take_side_display().is_none(), "no payload");
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the cancelled job did not come back");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(log.lock().unwrap().is_empty(), "nothing was solved");
+    assert!(s.pending_notes.is_empty(), "no note: {:?}", s.pending_notes);
+}
+
+/// A gated auditor teacher whose thread dies (it panics) once the gate opens.
+struct Dies {
+    open: Arc<AtomicBool>,
+}
+
+impl ForceProvider for Dies {
+    fn evaluate(&mut self, _scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        while !self.open.load(SeqCst) {
+            if should_abort() {
+                return Err(ProviderError::Cancelled);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the test's auditor teacher dies (expected)");
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// Review fix round 1, minor 4: when the auditor's thread is gone, the queued Harris job (and the
+/// side queue) go with it, so `side_job_in_flight` does not hold forever (the worker would poll
+/// for ever).
+#[test]
+fn a_gone_auditor_drops_the_queued_harris() {
+    let (s, _h) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let open = Arc::new(AtomicBool::new(false));
+    let mut s = s.with_auditor(Box::new(Dies { open: open.clone() }));
+    assert!(s.request_display(&h2(1.6)));
+    queued(&mut s, &h2(1.40), &no_atoms());
+    assert!(s.request_display(&h2(1.5)), "a refresh queued behind the running one");
+    assert!(s.harris_queued.is_some() && !s.side_queue.is_empty());
+    open.store(true, SeqCst);
+    let t0 = Instant::now();
+    while s.audits_asynchronous() {
+        s.take_side_display();
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the dead thread was not noticed");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(s.harris_queued.is_none() && s.side_queue.is_empty(), "nothing left to run");
+    assert!(!Trainable::side_job_in_flight(&s));
+}
+
+/// Review fix round 1, minor 5: starting a sampling pass drops the queued Harris job (the worker
+/// asks again after the pass), and no new one is accepted during it.
+#[test]
+fn a_pass_drops_the_queued_harris() {
+    let (s, h) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let (mut s, _open, _log) = harris_gated(s, h);
+    assert!(s.request_display(&h2(1.6)));
+    queued(&mut s, &h2(1.40), &no_atoms());
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &h2(1.45), &sim::SamplingPlan::default(), &mut refs).expect("a pass");
+    assert!(s.harris_queued.is_none(), "dropped at the pass's start");
+    assert!(s.harris_display(&h2(1.45), &no_atoms(), &mut never()).is_none(), "none during a pass");
+}
+
 /// The analytic H 1s profile e^{−2r}/π on `s`'s surface (the ks tests' stand-in for the
 /// auditor's own isolated-atom profile).
 fn h_atoms(s: &Scene) -> Arc<HarrisAtoms> {
