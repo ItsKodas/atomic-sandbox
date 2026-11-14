@@ -4443,3 +4443,53 @@ So the study's cost estimate (under 1 s per failing refit at Q′ 1 590) holds: 
 - **H₂ is the weakly coupled one**: 94–100 % pass gate (ii), medians ≤ 0.025. The tail is the same few dimers each time: #1505 and #1499 in every state, then #146, #150, #889 or #1494.
 - **N₂ moves by exactly 0**: its columns share no sample with H or O (Rule 2's component argument, exact).
 - **Nothing here argues for a larger ε or a looser gate (i).** The H₃ tails (2.5–5.3× the bound) are where a looser rule would answer wrongly.
+
+## Fermi–Dirac migration (spec `2026-11-13-fermi-smearing-design.md`; A1 measurements, plan Task 3, 2026-11-14, release, RX 7900 XTX, GPU prototype)
+
+Measured on the uncommitted prototype before production code (branch `smearing-prototype`, never merged), kT =
+5 mHa. Full tables and method: `docs/superpowers/notes/2026-11-13-a1-measurements.md`. The V2 pins are in the
+spec's §9 V2 table (amended).
+
+**Witness cost** (spec §4.2; median of 5, `solve_observed` wall time; cold = same geometry, warm = nucleus 0 moved
+±0.005 Bohr alternately). All-electron rows: aufbau (today) against the witness configuration
+(`DegenerateShells` + FD). Pseudised H₂O: DS against FD.
+
+| case | grid, tol | cold (ms) | warm (ms) | extra vectors per channel |
+|---|---|---|---|---|
+| H₂ all-electron (R = 1.4) | 49³ × 0.25, 1e-6 | 230 → 708 (3.1×) | 222 → 308 (1.39×) | 0 → 1 |
+| H₃⁺ all-electron (side 1.9) | 49³ × 0.25, 1e-6 | 248 → 550 (2.2×) | 188 → 329 (1.75×) | 0 → 1 |
+| H₂O pseudised (`h2o` preset) | 57³ × 0.20, 1e-5 | 3082 → 5437 (1.76×) | 1713 → 2252 (1.31×) | 1 → 2 |
+| H₂O pseudised | 81³ × 0.15, 1e-5 | 5383 → 6924 (1.29×) | 2594 → 2817 (1.09×) | 1 → 2 |
+
+E unchanged within 5e-8 Ha (all-electron) and 1.5e-6 Ha (pseudised, the 1e-5 stop's scatter). Pseudo-O cannot run
+at 57³ × 0.25 (h > h_req = 0.20), so 57³ × 0.20 stands in. The 3p atoms in V0's 14 Bohr box cost 5–80× DS cold (V0
+note, 2026-11-14 section C).
+
+**E‴ of the stiffest bonds** (spec §6.3, κ_max = 1 Ha/Bohr³; default pseudo surface, 81³ × 0.15, tol 1e-6; one bond
+stretched at 7 points 0.8 R_e … R_e; F(R) fitted to degree 5 and the HF bond force to degree 4):
+
+| bond | R_e (Bohr) | E‴ at 0.8 R_e … R_e (Ha/Bohr³) | max (1/12)\|E‴\| (energy / force fit) |
+|---|---|---|---|
+| O–H in H₂O | 1.8488 | −4.77 … −1.80 | **0.398 / 0.402** |
+| N–H in NH₃ | 1.9367 | −4.15 … −1.40 | **0.346 / 0.350** |
+
+Both under κ_max = 1 (2.5× and 2.9×). At R_e (1/12)|E‴| = 0.15 and 0.12, consistent with "M7 forces" OH's ≈ 0.18.
+
+**V3 (FD-consistency oracle) aspect, chosen on the GPU prototype** (all-electron, 41³ × 0.30, σ = h, tol 1e-6;
+Task 6 confirms on the CPU at tol 1e-9): **H₄ rectangle 1.8 (x) × 1.95 (y) Bohr, centred, atom 0 at (−0.9, −0.975, 0)
+displaced along x.** Frontier splitting Δ = 12.93 mHa (u = Δ/4kT = 0.65); c = dΔ/dx = 0.0498–0.0540 Ha/Bohr and
+d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over the 4δ span (= −u sech²u · c to 3 digits); plain |FD(0.01) − FD(0.02)| =
+2.9e-5 Ha/Bohr; HF − R_E(δ/2, δ) = −2.27e-2 Ha/Bohr. The GPU Richardson pair (|R(δ/2, δ) − R(δ, 2δ)| = 2.3e-5) is at the
+f32 floor; the CPU test certifies it.
+
+**V5 NVE case: CO₂⁺, not N₃.** Pseudised N₃ (71³ × 0.20) is linear ²Π_g (R_e 2.224 Bohr, TS = 2 kT ln 2 within 1e-9,
+k_β = 0.128 Ha/rad², ω_b 543 cm⁻¹), but its ↓ π split grows only to 39 mHa at a 60° bend, after which the ↑ channel
+turns partial and the state changes (75°: split 30.5 mHa, the bend force collapses); it never reaches the spec's
+10 kT. **CO₂⁺** (pseudised C and O, charge +1, doublet; 71³ × 0.20, 14 Bohr): linear ²Π_g, R_e = 2.225 Bohr, TS =
+2 kT ln 2 within 1e-9, restoring and smooth to 70°, k_β = 0.107 Ha/rad², ω_b = 2.335e-3 a.u. (512 cm⁻¹). **Start:
+β = 70° (bond angle 110°) at R = 2.226, at rest, C on a grid node**: ↓ π split 47.3 mHa (9.5 kT), ↑ gap 95 mHa,
+TS 0.514 mHa (6.931 at linear: a 6.4 mHa swing), E_mode = F(70°) − F(0) = 98.75 mHa, h_b = ω_b·dt = 0.0241 at
+**dt = 0.25 fs**, **h_b²/4·E_mode = 1.4e-5 Ha** (the symmetric stretch, the only other mode a C₂ᵥ start feeds, holds
+5.8 mHa at the start: h_s²/4·E = 5.6e-6; the whole E_mode there would give 9.5e-5). Face density ≤ 1.1e-6 over
+0°–80° (rule 1.28e-5). **Steps: 300** (1.15 harmonic bend periods; per-step cost not measured). Task 11 pre-registers
+the drift and fluctuation bounds for this trajectory.

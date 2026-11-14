@@ -1062,30 +1062,38 @@ pre-registered stop below applies and the user chooses among (i)–(iii).
 
 **V2 cases.** Coordinates are D§2.1's centred ones; the rhombus and tetrahedron as listed in D§2.
 
-| policy | case | measured (prototype) | budget |
-|---|---|---|---|
-| default | H₄ rhombus | 10 | ≤ 20 |
-| default | H₄ lopsided tetra | 32 | ≤ 50 |
-| default | H₄ seed 1 | 12 | ≤ 20 |
-| default | H₅ seed 3 | 18 | ≤ 30 |
-| default | H₈ seed 8 | 14 | ≤ 25 |
-| `ionic none` | H₅ ring (radius 1.531, xy plane, vertex phase as the harness builds it) | 13 | ≤ 25 |
-| `ionic none` | H₆ seed 5 | 47 | ≤ 75 |
-| `ionic none` | H₂O + 2 H | 79 | ≤ 120 |
-| `ionic none` | lopsided tetra | 28 | ≤ 45 |
+**[A1, 2026-11-14] Amended: measured at kT = 5 mHa** with the prototype (plan Task 3 step 0; the A1 note,
+`docs/superpowers/notes/2026-11-13-a1-measurements.md` section 0), cold, 81³ × 0.15, the app's tolerance 1e-5 raised
+by `effective_gpu_tol` (1e-5 for every case; so the section 5.1 partial-level stop is the same number), stall stop
+on. Every case converged without the stall stop or the cap. The 1e-3 counts and D§6's F/TS values are superseded.
 
-- Each case must **converge** (no stall stop, no cap) within its budget, about 1.5× the prototype's count.
-- **F and TS** must match the prototype's D§6 values within 1e-5 Ha. Examples: rhombus F −2.079319, tetra
-  F −1.932837 with TS 2.7e-3, H₂O + 2 H AE F −47.339721.
-  - Production now runs the prototype's witness rule (section 4.2), so this comparison is like with like.
+| policy | case | measured at 5 mHa (iterations) | budget | F (Ha) | TS (Ha) |
+|---|---|---|---|---|---|
+| default | H₄ rhombus | 12 | ≤ 20 | −2.079322 | 2.67e-5 |
+| default | H₄ lopsided tetra | 16 | ≤ 25 | −1.943830 | 1.39e-2 |
+| default | H₄ seed 1 | 13 | ≤ 20 | −2.078602 | 2.08e-3 |
+| default | H₅ seed 3 | 15 | ≤ 25 | −2.564249 | 3.01e-3 |
+| default | H₈ seed 8 | 14 | ≤ 25 | −4.220394 | 1.63e-4 |
+| `ionic none` | H₅ ring (radius 1.531, xy plane, vertex phase as the harness builds it) | 11 | ≤ 20 | −2.470682 | 6.93e-3 (= 2 kT ln 2) |
+| `ionic none` | H₆ seed 5 | 15 | ≤ 25 | −2.973255 | 9.71e-3 |
+| `ionic none` | H₂O + 2 H | 33 | ≤ 50 | −47.350019 | 1.32e-2 |
+| `ionic none` | lopsided tetra | 15 | ≤ 25 | −1.824952 | 1.40e-2 |
+
+(`ionic none` runs with the witness configuration, `DegenerateShells` + FD, as production will.)
+
+- Each case must **converge** (no stall stop, no cap) within its budget, ⌈1.5 × the measured count⌉ rounded up to a
+  multiple of 5 (the "about 1.5×" rule, unchanged).
+- **F and TS** must match the table within 1e-5 Ha (the values are printed to 6 decimals, a ±5e-7 rounding inside
+  that tolerance).
+  - Production runs the prototype's witness rule (section 4.2), so this comparison is like with like.
 - A mismatch is investigated, never re-pinned blindly. Once checked, the pins are the production values.
 - **The controls** [SHOULD-6]: H₂ and H₂O must keep the D§6 energies within 3 × max(achieved, path scatter): H₂ 2e-6 Ha,
-  H₂O 6e-6 Ha (the suite's rule). Production changes the block size (witnesses), and so the bits.
-- **[kT-5] The table's counts and D§6's F/TS were measured at kT = 1e-3.** At 5 mHa every TS above scales by 5 for the
-  exactly degenerate cases and changes non-linearly for the pinned ones, and the iteration counts move. Plan Task 3
-  re-measures every row with the prototype at 5 mHa (and the section 5.1 stop) before any pin is written; the
-  budgets are then ≈ 1.5× those counts by the same rule, and the F/TS pins the re-measured values within 1e-5 Ha.
-  A case that does not converge at 5 mHa is a stop, not a re-budget.
+  H₂O 6e-6 Ha (the suite's rule). Production changes the block size (witnesses), and so the bits. At 5 mHa they are
+  unchanged to every printed digit (H₂ −1.136119 in 9 iterations, H₂O −17.476023 in 13; TS 0 and 1.4e-12).
+- What moved from 1e-3 (A1 note section 0): the partly occupied cases converge in fewer or equal iterations; TS
+  scales by 5 for the exactly degenerate H₅ ring and non-linearly for the pinned ones; seeds 1, 3 and 8, gapped at
+  1e-3, now carry a partial level (TS 2.1e-3, 3.0e-3, 1.6e-4). All-electron H₂O + 2 H costs 434 s of GPU (13 s per
+  iteration), the suite's slowest case.
 
 **V3 force oracle** [MUST-4].
 - **Geometry.** A near-square H₄ rectangle whose frontier gap is a few kT. Task A1 picks the aspect from a short scan
