@@ -2508,6 +2508,14 @@ impl ForceProvider for SurrogateKs {
 // `ForceProvider::as_trainable` ----
 
 impl SurrogateKs {
+    /// Every pass starts here (a new pass, a resumed one, a reference retry, a teach-around pass):
+    /// the pass owns the display's turn, so the queued Harris job goes — the caller asks again
+    /// after it (module doc, "Side densities").
+    pub(super) fn begin_pass(&mut self, sampler: Sampler) {
+        self.pass = Some(sampler);
+        self.harris_queued = None;
+    }
+
     /// After a pass (complete, cancelled or ended by a failed reference): the reference cache
     /// back, the teacher told its state is a sample geometry's, the model refitted over
     /// everything it holds — only when the samples a fit would use reach Q′ (below it the model
@@ -2822,10 +2830,7 @@ impl Trainable for SurrogateKs {
             p.total,
             sampler.scans().len()
         ));
-        self.pass = Some(sampler);
-        // a pass owns the display's turn: the queued Harris job goes (the caller asks again after
-        // it; module doc, "Side densities")
-        self.harris_queued = None;
+        self.begin_pass(sampler);
         Ok(())
     }
 
@@ -2933,7 +2938,7 @@ impl Trainable for SurrogateKs {
             p.stage,
             self.samples().saturating_sub(info.pass_start)
         ));
-        self.pass = Some(sampler);
+        self.begin_pass(sampler);
         Ok(())
     }
 
@@ -3414,7 +3419,7 @@ impl SurrogateKs {
                 names.join(", "),
                 if names.len() == 1 { "" } else { "s" }
             ));
-            self.pass = Some(sampler);
+            self.begin_pass(sampler);
             return Ok(true);
         }
         match Trainable::refit(self) {

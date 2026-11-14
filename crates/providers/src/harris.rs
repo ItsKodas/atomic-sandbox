@@ -40,10 +40,18 @@
 //! that is not the atom this solve counts: one solved under another ionic treatment (a pseudo
 //! profile under an all-electron fallback, or the reverse), one that includes ρ_pc, or an atom
 //! whose density the box cuts. Two bounds, each against c_A:
-//! - the profile's own count (`AtomProfile::electrons`, integrated on the grid it was solved on —
-//!   the isolated atom at a grid point, ≈ 1 % accurate) by more than [`PROFILE_COUNT_TOLERANCE`]
-//!   (3 %): a treatment mismatch (Z against Z_v: the core's electrons, 33 % for O), or ρ_pc in the profile (pseudo-O:
-//!   ∫ρ_pc / Z_v = 0.359 / 6 ≈ 6 %, which a 10 % bound would miss; review fix round 1, minor 2);
+//! - the profile's own count (`AtomProfile::electrons`, integrated on the grid it was solved on,
+//!   the isolated atom at a grid point), asymmetric (review fix round 2):
+//!   - **above** c_A by more than [`PROFILE_EXCESS_TOLERANCE`] (3 %): ρ_pc in the profile only adds
+//!     charge (pseudo-O: ∫ρ_pc / Z_v = 0.359 / 6 ≈ 6 %, which a 10 % bound would miss; review fix
+//!     round 1, minor 2), and so does an all-electron profile under a pseudopotential count; a
+//!     compact atom's profile carries c_A to ≈ 0.1 % (H 0.99975, a stand-in O valence 5.9985), so
+//!     it is never above by 3 %;
+//!   - **below** c_A by more than [`PROFILE_SHORTFALL_TOLERANCE`] (10 %): a pseudo profile under an
+//!     all-electron count (Z_v against Z: the core's electrons, 25 % for O) or another species'
+//!     count. Not tighter: the profile is the density inside the cell's inscribed sphere (the
+//!     radial shells stop at the nearest face), and a diffuse valence atom (a pseudo Li 2s, Na 3s)
+//!     loses a few % of its count to the cube's corners — no fault, and no note;
 //! - S_A, the profile splatted at this nucleus, by more than [`ON_GRID_TOLERANCE`] (10 %): an atom
 //!   whose density a face cuts (the splat at an off-grid position is within ≈ 2 %).
 //!
@@ -93,9 +101,15 @@ pub struct RhoIn {
     pub notes: Vec<String>,
 }
 
-/// The sanity bound on a profile's own count (module doc, "The sanity bound"): an atom whose
-/// profile carries a count off its c_A by more than this fraction is named in a note.
-pub const PROFILE_COUNT_TOLERANCE: f64 = 0.03;
+/// The sanity bound on a profile's own count from above (module doc, "The sanity bound"): an atom
+/// whose profile carries more than c_A·(1 + this) is named in a note (ρ_pc, or an all-electron
+/// profile under a pseudopotential count).
+pub const PROFILE_EXCESS_TOLERANCE: f64 = 0.03;
+
+/// The sanity bound on a profile's own count from below (module doc, "The sanity bound"): an atom
+/// whose profile carries less than c_A·(1 − this) is named in a note (a treatment mismatch); a
+/// diffuse atom's profile, which loses a few % to the cell's corners, is not.
+pub const PROFILE_SHORTFALL_TOLERANCE: f64 = 0.10;
 
 /// The sanity bound on S_A (module doc, "The sanity bound"): an atom whose profile puts a count
 /// off its c_A by more than this fraction on the grid at its position (a face cuts it) is named.
@@ -130,7 +144,9 @@ pub fn superposition(grid: &qm::Grid, nuclei: &[qm::Nucleus], profiles: &[AtomPr
         // the sanity bound (rule 7): the renormalisation below would hide a profile of another
         // treatment or one carrying ρ_pc (its own count off), or an atom cut by a face (S_A off)
         let off = |x: f64, tol: f64| !((x / counted[a] - 1.0).abs() <= tol);
-        if off(p.electrons, PROFILE_COUNT_TOLERANCE) || off(s_a, ON_GRID_TOLERANCE) {
+        let c = counted[a];
+        let profile_off = !(p.electrons <= c * (1.0 + PROFILE_EXCESS_TOLERANCE) && p.electrons >= c * (1.0 - PROFILE_SHORTFALL_TOLERANCE));
+        if profile_off || off(s_a, ON_GRID_TOLERANCE) {
             notes.push(format!(
                 "atom {a} ({}): its isolated-atom profile carries {:.3} electrons ({:.3} on the grid here) for the {} this solve counts — rescaled to {}, which hides a profile of another ionic treatment, one including the partial core, or an atom cut by the box",
                 units::elements::symbol(nuc.z), p.electrons, s_a, counted[a], counted[a]));
@@ -324,6 +340,26 @@ mod tests {
         assert!((r.per_atom[0] / 6.0 - 1.0).abs() <= ON_GRID_TOLERANCE, "S_A alone would not catch it: {:?}", r.per_atom);
         assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
         assert!(r.notes[0].starts_with("atom 0 (O)") && r.notes[0].contains("partial core"), "{:?}", r.notes);
+    }
+
+    /// Review fix round 2: the profile-count bound is asymmetric. A profile 5 % short of its count
+    /// (a diffuse valence atom whose inscribed-sphere profile misses the cell's corners) is not
+    /// named; one 12 % short (a treatment mismatch is ≥ 10 %) is. The H 1s profile's count and its
+    /// values are scaled together, and the S_A bound (10 %) is checked to stay quiet at 5 %.
+    #[test]
+    fn a_short_profile_is_named_only_beyond_the_shortfall_bound() {
+        let (n, h) = (61usize, 0.2);
+        let p = h1s_profile(n, h);
+        let grid = Grid::cube(n, h);
+        let nuclei = [Nucleus { pos: [-0.73, 0.05, 0.0], z: 1 }];
+        let scaled = |f: f64| AtomProfile { rho: p.rho.iter().map(|v| f * v).collect(), electrons: f * p.electrons, ..p.clone() };
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&scaled(0.95)), &[1.0], 1, 0).expect("built");
+        println!("5 % short: S_A {:?}, notes {:?}", r.per_atom, r.notes);
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&scaled(0.88)), &[1.0], 1, 0).expect("built");
+        println!("12 % short: S_A {:?}, notes {:?}", r.per_atom, r.notes);
+        assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+        assert!(r.notes[0].starts_with("atom 0 (H)") && r.notes[0].contains("0.880 electrons"), "{:?}", r.notes);
     }
 
     /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from:

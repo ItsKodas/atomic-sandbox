@@ -270,6 +270,18 @@ fn a_pass_drops_the_queued_harris() {
     assert!(s.harris_display(&h2(1.45), &no_atoms(), &mut never()).is_none(), "none during a pass");
 }
 
+/// Review fix round 2: every pass entry point goes through `begin_pass`, which drops the queued
+/// Harris job — here the teach-around pass (`start_teach`, the gap fixture's blocked pair class),
+/// with a Harris job planted in the queue (the fixture has no auditor to queue one through).
+#[test]
+fn a_teach_around_pass_drops_the_queued_harris() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.harris_queued = Some((h2(1.4), no_atoms(), 99));
+    s.start_teach(&in_big_cell(h2(1.6))).expect("a teach-around pass");
+    assert!(s.pass.is_some(), "premise: a pass runs");
+    assert!(s.harris_queued.is_none(), "dropped at the pass's start");
+}
+
 /// The analytic H 1s profile e^{−2r}/π on `s`'s surface (the ks tests' stand-in for the
 /// auditor's own isolated-atom profile).
 fn h_atoms(s: &Scene) -> Arc<HarrisAtoms> {
