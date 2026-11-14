@@ -896,8 +896,8 @@ impl Worker {
     /// [`Command::ForgetSample`] / [`Command::RestoreSample`] and their batches
     /// [`Command::ForgetSamples`] / [`Command::RestoreSamples`] (spec 2026-11-12 R2; the batched
     /// forget, 2026-11-14): the provider writes the samples' status at once
-    /// (`Trainable::forget_samples`: all or nothing — a stale id or a batch past the recovery's cap
-    /// is refused whole) — so they fence at once — and the refit that fits them is **debounced**
+    /// (`Trainable::forget_samples`: all or nothing — a stale id refuses the batch whole; past the
+    /// recovery's cap it is applied with its warning) — so they fence at once — and the refit that fits them is **debounced**
     /// ([`UserRefit`]: [`FORGET_REFIT_DELAY`] after the last change, or Refit now), then runs in
     /// the background, paused too (`refit_if_pending`). A change while a refit runs is applied at
     /// once (the provider re-applies it at the install) and makes one more refit due after it.

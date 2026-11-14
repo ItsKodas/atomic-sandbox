@@ -87,7 +87,7 @@ pub enum Command {
     RestoreSample(sim::SampleId),
     /// Estimated solver: the Model tab's "Forget N selected" (2026-11-14): every sample these ids
     /// name forgotten as one batch (`Trainable::forget_samples`: all or nothing — a stale id or a
-    /// batch past the recovery's 10 % cap is refused whole), then one debounced refit
+    /// batch past the recovery's 10 % cap is applied with its warning), then one debounced refit
     /// (`model` module, `UserRefit`). Never an edit, never aborts.
     ForgetSamples(Vec<sim::SampleId>),
     /// Estimated solver: "Restore N selected" (`Trainable::restore_samples`), as one batch. Never an

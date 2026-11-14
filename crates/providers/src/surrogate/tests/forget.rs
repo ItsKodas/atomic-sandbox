@@ -619,11 +619,10 @@ fn a_batch_forget_applies_every_sample_with_one_refit_due() {
     assert_eq!(s.user_changes_pending(), 0);
 }
 
-/// 2026-11-14: a batch is all or nothing — a stale id (the sample list changed), an id twice, a
-/// sample that cannot be forgotten, or a batch that would take the held and forgotten samples
-/// together past the recovery's 10 % cap (40 samples: 4) is refused whole, nothing changed; a
-/// single Forget past the cap is still applied with its warning (today's rule); one id is that
-/// single Forget.
+/// 2026-11-14: a batch is all or nothing — a stale id (the sample list changed), an id twice, or a
+/// sample that cannot be forgotten refuses it whole, nothing changed. The recovery's 10 % cap (40
+/// samples: 4) is not a refusal: a batch past it is applied with the warning a single Forget gets
+/// (the coordinator's ruling: consistent with Forgets one by one); one id is that single Forget.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_batch_is_refused_whole() {
@@ -641,20 +640,22 @@ fn a_batch_is_refused_whole() {
     let e = s.forget_samples(&ids(&s, &[1, 2])).unwrap_err();
     assert!(e.contains("sample #2 is not in the fit"), "{e}");
     assert!(unchanged(&s) && s.quarantine[1] == Q_NONE);
-    // the cap: 1 held + 4 forgotten = 5 > 4 — refused whole
-    let e = s.forget_samples(&ids(&s, &[4, 5, 6, 7])).unwrap_err();
-    assert!(e.contains("would hold out 5 of 40") && e.contains("10 %") && e.contains("nothing forgotten"), "{e}");
-    assert!(unchanged(&s));
-    // 1 + 3 = 4: within it
+    // 1 held + 3 forgotten = 4: within the cap, no warning
     s.forget_samples(&ids(&s, &[4, 5, 6])).unwrap();
     assert_eq!((s.forgotten(), s.user_changes_pending()), (3, 3));
-    // a single Forget past it is applied, with the warning; one id is that Forget
-    s.forget_samples(&ids(&s, &[7])).unwrap();
-    assert!(s.user_notes.last().is_some_and(|n| n.contains("sample #7 forgotten") && n.contains("past the 10 %")), "{:?}", s.user_notes.last());
-    assert_eq!((s.forgotten(), s.user_changes_pending()), (4, 4));
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("3 samples forgotten (#4, #5, #6)") && !n.contains("past the 10 %")), "{:?}", s.user_notes.last());
+    // a batch past it (1 + 5 = 6 > 4): applied, with a single Forget's warning
+    s.forget_samples(&ids(&s, &[7, 8])).unwrap();
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("2 samples forgotten (#7, #8)") && n.contains("now 6 of 40 samples, past the 10 %") && n.contains("it holds no more")), "{:?}", s.user_notes.last());
+    assert_eq!((s.forgotten(), s.user_changes_pending()), (5, 5));
+    assert!(s.is_forgotten(7) && s.is_forgotten(8));
+    // a single Forget past it: the same warning; one id is that Forget
+    s.forget_samples(&ids(&s, &[9])).unwrap();
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("sample #9 forgotten") && n.contains("past the 10 %")), "{:?}", s.user_notes.last());
+    assert_eq!((s.forgotten(), s.user_changes_pending()), (6, 6));
     // Restore: not forgotten, refused whole
-    let e = s.restore_samples(&ids(&s, &[4, 8])).unwrap_err();
-    assert!(e.contains("sample #8 is not forgotten"), "{e}");
+    let e = s.restore_samples(&ids(&s, &[4, 10])).unwrap_err();
+    assert!(e.contains("sample #10 is not forgotten"), "{e}");
     assert!(s.is_forgotten(4));
     let e = s.forget_samples(&[]).unwrap_err();
     assert!(e.contains("no samples selected"), "{e}");

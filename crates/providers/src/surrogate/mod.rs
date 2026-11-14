@@ -815,7 +815,8 @@
 //! carry a checked identity (`sim::SampleId`: a changed sample list is refused). A forget never
 //! touches the trust rule: a failed audit whose sample is forgotten is re-judged at every refit
 //! as before (rule 8, Task 2 fix round 1 I1). A batch (`forget_samples` / `restore_samples`,
-//! 2026-11-14) is all or nothing, and a batch Forget past the cap is refused whole; every change
+//! 2026-11-14) is all or nothing on its ids, and a batch Forget past the cap is applied with a single
+//! Forget's warning; every change
 //! counts in `user_changes_pending` until a fit holds it (the worker debounces the refit on it). An agreeing teacher answer next to it — where nothing
 //! is released or superseded — is an ordinary one: thinned and copy-checked like an envelope (rule
 //! 5) fallback's (`admit`; final review I1, `agreeing_answers_next_to_a_forgotten_sample_are_thinned`),

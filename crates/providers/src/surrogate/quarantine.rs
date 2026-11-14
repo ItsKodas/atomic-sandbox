@@ -1710,12 +1710,11 @@ impl SurrogateKs {
 
     /// **Forgets** every stored sample `ids` names **as one batch** (2026-11-14; the Model tab's
     /// "Forget N selected"): all or nothing — every id is checked first ([`check_id`](Self::check_id),
-    /// each must be forgettable as for [`forget_sample`](Self::forget_sample), none twice), and a
-    /// batch that would take the held and forgotten samples together past
-    /// [`QUARANTINE_MAX_FRACTION`] of the store is **refused whole** with the reason (a single
-    /// Forget past the cap is still applied, with [`forget_sample`](Self::forget_sample)'s warning:
-    /// one deliberate click; a batch past it is more likely a slip). Each status is written at once,
-    /// one refit is due, and one note says what was forgotten. One id is
+    /// each must be forgettable as for [`forget_sample`](Self::forget_sample), none twice). A batch
+    /// that takes the held and forgotten samples together past [`QUARANTINE_MAX_FRACTION`] of the
+    /// store is **applied** with the warning a single Forget gets (the coordinator's ruling,
+    /// 2026-11-14: a batch behaves as its Forgets one by one). Each status is written at once, one
+    /// refit is due, and one note says what was forgotten. One id is
     /// [`forget_sample`](Self::forget_sample). `Err`, nothing changed.
     pub fn forget_samples(&mut self, ids: &[sim::SampleId]) -> Result<(), String> {
         if let [id] = ids {
@@ -1723,17 +1722,16 @@ impl SurrogateKs {
         }
         let idx = self.batch_indices(ids, |s, i| s.forgettable(i))?;
         let n = self.samples();
-        let out = self.quarantined() + self.forgotten() + idx.len();
-        if out as f64 > QUARANTINE_MAX_FRACTION * n as f64 {
-            return Err(format!(
-                "forgetting these {} samples would hold out {out} of {n} (quarantined and forgotten together), past the {:.0} % the trust recovery may hold out — nothing forgotten; forget fewer, or one at a time if you mean to go past it",
-                idx.len(),
-                100.0 * QUARANTINE_MAX_FRACTION
-            ));
-        }
         let written: Vec<String> = idx.iter().map(|&i| self.set_user_code(i, Q_FORGOTTEN)).collect();
+        // the cap's warning, as a single Forget's (`forget_sample`)
+        let out = self.quarantined() + self.forgotten();
+        let cap = if out as f64 > QUARANTINE_MAX_FRACTION * n as f64 {
+            format!("; held and forgotten together are now {out} of {n} samples, past the {:.0} % the trust recovery may hold out — it holds no more", 100.0 * QUARANTINE_MAX_FRACTION)
+        } else {
+            String::new()
+        };
         self.user_notes.push(format!(
-            "surrogate: {} samples forgotten ({}) — held out of the fit until Restore, and geometries near them fall back to DFT{}; the refit decides without them",
+            "surrogate: {} samples forgotten ({}) — held out of the fit until Restore, and geometries near them fall back to DFT{}; the refit decides without them{cap}",
             idx.len(),
             Self::index_list(&idx),
             Self::batch_written(written)

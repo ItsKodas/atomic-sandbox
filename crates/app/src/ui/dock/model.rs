@@ -1206,7 +1206,7 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
             if !st.forget_selection.is_empty() {
                 let n = st.forget_selection.len();
                 if super::super::probed("forget-selected", ui.button(format!("Forget {n} selected")))
-                    .on_hover_text("forget the checked samples together: applied at once, then one refit — a batch that would hold out more than 10 % of the samples (quarantined and forgotten together) is refused whole")
+                    .on_hover_text("forget the checked samples together: applied at once, then one refit — past 10 % of the samples held out (quarantined and forgotten together) the trust recovery holds no more, as with a single Forget")
                     .clicked()
                 {
                     acts.push(Action::ForgetSamples(st.forget_selection.clone()));

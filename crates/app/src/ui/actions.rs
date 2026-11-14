@@ -136,7 +136,7 @@ pub enum Action {
     RestoreSample(sim::SampleId),
     /// "Forget N selected" (2026-11-14, the batched forget): the checked Worst-fitting rows, forgotten
     /// as one batch (`Command::ForgetSamples`: all or nothing — a stale id, or a batch past the
-    /// recovery's 10 % cap, is refused whole) with one debounced refit. Recorded, not replayable.
+    /// recovery's 10 % cap, applied with its warning) with one debounced refit. Recorded, not replayable.
     ForgetSamples(Vec<sim::SampleId>),
     /// "Restore N selected": the checked forgotten rows, restored as one batch
     /// (`Command::RestoreSamples`). Recorded, not replayable.

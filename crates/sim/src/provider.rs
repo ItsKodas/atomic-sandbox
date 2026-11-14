@@ -1127,7 +1127,7 @@ pub trait Trainable {
     /// **Forgets** every stored sample `ids` names as one batch (2026-11-14, the Model tab's
     /// "Forget N selected"): all or nothing — each id checked as for
     /// [`forget_sample`](Self::forget_sample), and a batch that would take the held and forgotten
-    /// samples together past the trust recovery's cap is refused whole. Written at once, one refit
+    /// samples together past the trust recovery's cap is applied with its warning, as one Forget. Written at once, one refit
     /// due. `Err` with the reason, nothing changed. The default: one at a time, stopping at the
     /// first refusal (a provider without batches).
     fn forget_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
