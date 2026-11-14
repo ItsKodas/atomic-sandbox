@@ -4734,3 +4734,67 @@ So the study's cost estimate (under 1 s per failing refit at Q′ 1 590) holds: 
 - **H₂ is the weakly coupled one**: 94–100 % pass gate (ii), medians ≤ 0.025. The tail is the same few dimers each time: #1505 and #1499 in every state, then #146, #150, #889 or #1494.
 - **N₂ moves by exactly 0**: its columns share no sample with H or O (Rule 2's component argument, exact).
 - **Nothing here argues for a larger ε or a looser gate (i).** The H₃ tails (2.5–5.3× the bound) are where a looser rule would answer wrongly.
+
+## Live orbitals (Harris display; spec 2026-11-14)
+
+`tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3). 2026-11-14, release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).
+
+**Geometries** (inline in the test; Bohr): H₂ R = 1.4 on x centred at 0; H₂O O–H 1.809, ∠HOH 104.5° (O at the origin); NH₃ N–H 1.913, ∠HNH 106.7° (N at the origin, C₃ along z); H₂ + H: H₂ as above, H at (3.0, 0, 0) (2.3 and 3.7 from the H₂ atoms), multiplicity auto = doublet (n↑ 2, n↓ 1); H₃⁺ equilateral, side 2.1, charge +1; pseudo-O one O at the origin, multiplicity auto = singlet (n↑ = n↓ = 3, the 2p shell shared, f = 1, ⅔, ⅔, ⅔). Grids: H₂, H₂ + H, H₃⁺ 81³ (12 Bohr); H₂O, NH₃, pseudo-O 97³ (14.4 Bohr).
+
+**The overlap measure.** Per spin channel, over the f > 0 levels, C_ij = h³⟨ψ^H_i|ψ^SCF_j⟩ (f64 Neumaier) and O = ‖C‖_F² / max(n_occ^H, n_occ^SCF) = (1/n)Σ cos²θ_k over the principal angles between the two occupied subspaces. The plan wrote the normaliser as n_σ; that is the same number whenever the f > 0 levels are n_σ whole orbitals (every case below but pseudo-O). Pseudo-O's shared shell has 4 f > 0 levels for n_σ = 3, where 1/n_σ would make the identity read 4/3; max(n_occ) is the strict choice (a count mismatch alone keeps O < 1). The f32 orbitals' normalisation (h³Σψ² = 1 to ≈ 1e-7) is this measure's floor: O can read 1 + 7e-8.
+
+### V-A1 — identity on the converged density (gate: every occupied |Δε| ≤ 1e-5 Ha, O ≥ 1 − 1e-6 per channel) — **passes**
+
+ρ_in = the SCF state's ρ↑/ρ↓; the Harris operator then differs from the SCF's last one by f_Hxc δρ with ‖δρ‖₁ ≤ tol, so |Δε| ~ 1e-6 Ha and 1 − O ~ (δV/gap)² are expected.
+
+| case | grid | SCF steps (Δρ) | max occupied \|Δε\| ↑ / ↓ (Ha) | 1 − O ↑ / ↓ | Harris (cold) |
+|---|---|---|---|---|---|
+| H₂ | 81³ | 10 (4.5e-7) | 8.9e-8 / 9.1e-8 | 8.5e-8 / −6.6e-8 | 0.70 s, both channels at the 200-iteration cap |
+| H₂O | 97³ | 17 (7.0e-7) | 2.1e-7 / 1.8e-7 | 4.7e-8 / 4.3e-8 | 2.59 s, at the cap |
+| pseudo-O (singlet, shared 2p) | 97³ | 13 (7.7e-7) | 1.6e-7 / 2.4e-7 | 3.8e-9 / 4.3e-8 | 4.29 s, block grown once per channel (n_occ 4 > n_σ 3), at the cap |
+
+Every occupied ε agrees to ≤ 2.4e-7 Ha (gate 1e-5), with the SCF's f (pseudo-O: 1, ⅔, ⅔, ⅔ in both channels): the potential assembly (V_loc and the KB projectors, V_H of ρ without ρ_pc, ½ρ_pc in each spin's xc input, the spin assignment) is the SCF's. Total 125 s, of which 85 s is generating the H pseudopotential (the dimer gate; each new process regenerates it).
+
+**Cold cost note.** Every cold Harris solve ends at the 200-iteration LOBPCG cap with max residual 2e-4–7e-2 > tol 1.5e-5: those are the guard levels (G = `UNOCC_GUARD` above the occupied ones, near-degenerate box-like states). The occupied levels are converged (the ε above agree to 2e-7). The warm refreshes (V-A3) start from these vectors and finish in 60–130 iterations.
+
+### V-A2 — superposed atoms against the SCF (record; gate O ≥ 0.95 per channel on the neutral cases) — **passes**
+
+ρ_in = `providers::superposition` of this program's own isolated-atom profiles (`atom_profile`: the isolated neutral atom on the scene's cell, σ and policy, display on, partial core off, read back and binned by `radial_profile` — the app's Atom-job path), each atom renormalised to its Z_v, the sum rescaled to N. Profiles: pseudo-H 0.99956 e on 81³ (6.0 Bohr reach), 0.99990 e on 97³; pseudo-O 5.99975 e; pseudo-N 4.99983 e. No sanity-bound note fired; on-grid S_A within 0.4 % of Z_v.
+
+| case | grid | n↑ / n↓ | rescale | O ↑ / O ↓ | ∫\|ρ_in − ρ_SCF\|/N | ∫\|ρ_out − ρ_SCF\|/N | gate |
+|---|---|---|---|---|---|---|---|
+| H₂ | 81³ | 1 / 1 | 1 | 0.996858 / 0.996858 | 0.268 | 0.0842 | ≥ 0.95 |
+| H₂O | 97³ | 4 / 4 | 1 | 0.991879 / 0.991879 | 0.136 | 0.127 | ≥ 0.95 |
+| NH₃ | 97³ | 4 / 4 | 1 | 0.987909 / 0.987909 | 0.172 | 0.162 | ≥ 0.95 |
+| H₂ + H (doublet) | 81³ | 2 / 1 | 1 | 0.996170 / 0.998706 | 0.183 | 0.0641 | ≥ 0.95 |
+| H₃⁺ (charge +1) | 81³ | 1 / 1 | 2/3 | 0.998143 / 0.998143 | 0.427 | 0.0662 | recorded only |
+
+ε_H − ε_SCF per occupied level (Ha; ↑ = ↓ for the closed shells):
+
+| case | levels (ascending) |
+|---|---|
+| H₂ | σ_g −0.0993 (ε_H −0.4758, ε_SCF −0.3764) |
+| H₂O | −0.164, −0.143, −0.168, −0.171 (SCF −0.9253, −0.4879, −0.3442, −0.2711) |
+| NH₃ | −0.187, −0.169, −0.169, −0.188 (SCF −0.7735, −0.4167 ×2, −0.2289) |
+| H₂ + H | ↑ −0.101, −0.0265 (SCF −0.4356, −0.2121); ↓ −0.0731 (SCF −0.4029) |
+| H₃⁺ | −0.126 (ε_H −0.9733, ε_SCF −0.8477) |
+
+**The ε gap (rule 7; spec §5.3 as corrected 2026-11-14).** The Harris orbitals are eigenstates of H[ρ_in] = H[ρ_SCF] + f_Hxc δρ + O(δρ²), δρ = ρ_in − ρ_SCF, so the orbitals, their ε and ρ_out differ from the SCF's at **first order** in δρ (δε_i ≈ ⟨ψ_i|V_H[δρ] + f_xc δρ|ψ_i⟩); only the Harris *total energy* (not computed or shown) is second order. Here δρ is large (∫|δρ|/N = 0.14–0.43), and the measured ε are **0.03–0.19 Ha too deep**: every level of every case on the same side, roughly a common shift per molecule (H₂O −0.14 to −0.17, NH₃ −0.17 to −0.19). The sign is the one the first-order term predicts for free atoms: a free atom's density is more diffuse than the molecule's (no contraction, no bond build-up), so V_H[ρ_in] screens the nuclei less where the occupied orbitals live and the potential there is more attractive. The H atom of H₂ + H, 3.7 Bohr from the far H and nearly free, is off by only −0.027 Ha. This is why the app shows every Harris ε, HOMO, LUMO and gap with "≈" and the tooltip (Task 7): a Harris ε is not a DFT ε, and its levels and gaps are not reliable to ~0.1–0.2 Ha. The occupied subspaces are close (O ≥ 0.988; 1 − O is quadratic in the first-order rotation: principal angles of ≈ 0.06–0.11 rad), which is what the display draws. ρ_out improves on ρ_in for the H systems (H₂ 0.268 → 0.084) but barely for H₂O and NH₃ (0.136 → 0.127, 0.172 → 0.162): one diagonalisation does not supply a polar molecule's charge transfer, so the shapes and mixing are qualitative, as the labels say. H₃⁺'s rescale (2/3 of three neutral atoms' density) gives the largest ∫|δρ| yet O = 0.998: the rescaled cloud has the right count and roughly the right shape for its one σ orbital. Phase B's experience (spec §5) targets exactly the δρ recorded here.
+
+Total 150 s (76 s H pseudopotential generation; the pseudo-O and pseudo-N tables 13 s and 16 s). Every cold Harris solve at the iteration cap, as in V-A1 (0.58–3.99 s).
+
+### V-A3 — warm refresh cost (record; target ≤ 0.3 s warm for H₂ and H₂ + H at 81³)
+
+Through `GpuKs::harris_display` on one teacher (All orbitals coloured, m = 0; the auditor teacher's path): a cold call, then five warm calls with atom 0 moved +0.01 Bohr along x before each. Times (s), warm calls: **total** = the payload's `OrbitalKind::Harris::wall_s` (set-up, superposition, solve, payload); **display** = the probe's display-solve record (the Activity row: solve + payload); **superposition** = `providers::superposition` on the same inputs, timed in the test; **solve** = `HarrisSolve::wall` of a replica `GpuSolver::harris` run on the identical input sequence, interleaved call by call (`GpuKs` does not expose its inner solve's time); payload ≈ display − solve.
+
+| case | cold total | warm total min / median | display min / median | superposition | solve min / median (LOBPCG iterations per channel) | payload | target |
+|---|---|---|---|---|---|---|---|
+| H₂ 81³ | 0.815 | 0.177 / 0.197 | 0.165 / 0.185 | 0.012 | 0.170 / 0.182 (60–66; the first warm call 105 / 144, 0.35 s) | ≲ 0.03 | **met** |
+| H₂ + H 81³ | 1.026 | 0.238 / 0.263 | 0.223 / 0.248 | 0.016 | 0.222 / 0.237 (59–65; the first warm call at the cap again, 0.73 s) | ≲ 0.03 | **met** |
+| H₂O 97³ | 2.729 | 1.129 / 1.308 | 1.104 / 1.274 | 0.025 | 1.157 / 1.260 (105–128) | ≲ 0.03 | not a target (recorded): ≈ 4× 0.3 s |
+
+The payload (the `OrbitalView` update, the colour texture, the shares) is small: display − solve scatters between −0.07 and +0.03 s, the replica's run-to-run noise, so it is ≲ 0.03 s. The first warm call after a cold one costs more (H₂ 0.38 s, H₂ + H 0.70 s total): it finishes the guard levels the cold call left at the cap. The solve is the cost; at 97³ the warm LOBPCG still needs ≈ 110 iterations per channel.
+
+**What the cadence does with this** (`app::worker::harris`: playing, one solve per max(1 s, the "refresh orbitals every N s" setting, default 2 s, last wall / 0.15)): H₂ (0.2 s → 1.3 s) and H₂ + H (0.26 s → 1.75 s) refresh every 2 s at the default, inside the 15 % budget; H₂O at 97³ (1.3 s → ≈ 8.7 s) is stretched to one refresh every ≈ 9 s while playing, so the display solves stay at ≤ 15 % of the wall time and do not slow the run (the anti-goal is held by the budget, not by the solve). Paused, each edit gets one solve after the 300 ms debounce, ≈ 1.1–1.4 s later for H₂O. Total 126 s (76 s H pseudopotential generation).
+
+**Suite time:** V-A1 126 s, V-A2 150 s, V-A3 126 s as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process generates it once, ≈ 5 min.

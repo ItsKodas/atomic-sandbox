@@ -54,6 +54,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | charges | `cargo test -p validate --release --test charges` (CPU) | ~11 min |
 | pseudopotentials | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | ~1 h, ~9 min, ~1.5–2 h |
 | orbital display | `cargo test -p validate --release --test orbitals` | ~4 min |
+| Harris display orbitals (`qm_gpu::harris`, `providers::harris`) | `cargo test -p validate --release --test harris` | ~5 min |
 | viewer / UI / worker | `cargo test -p app --release` (incl. the replay scripts) | ~10 min |
 | molecule builder | `cargo test -p app --release --bin app -- builder::` | seconds |
 
