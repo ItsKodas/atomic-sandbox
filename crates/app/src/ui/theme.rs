@@ -179,6 +179,58 @@ fn segmented_in<T: Copy + PartialEq>(ui: &mut egui::Ui, current: T, options: &[(
     picked
 }
 
+/// Inside a panel card ([`panel_card`]): the inactive widgets' fill (a slider's rail, a checkbox's
+/// box, a button's face) — lighter than the card's [`PANEL_2`] so it reads against it (user report
+/// 2026-11-14: in the cards the rails were the card's own colour and only the handles showed).
+pub const CARD_WIDGET: Color32 = rgb(0x3a3648);
+/// …hovered.
+pub const CARD_WIDGET_HOVER: Color32 = rgb(0x48425a);
+/// …and the inactive widgets' outline.
+pub const CARD_EDGE: Color32 = rgb(0x575170);
+
+/// A panel card's frame: [`PANEL_2`] fill, [`LINE`] outline, the redesigned panels' radius and
+/// margins (the Model tab's verdict card, the Activity job card, the View panel's LOOK, …).
+pub fn panel_card_frame() -> egui::Frame {
+    egui::Frame::new().fill(PANEL_2).stroke(Stroke::new(1.0, LINE)).corner_radius(8).inner_margin(Margin::symmetric(10, 8))
+}
+
+/// The widget visuals inside a card: inactive widgets on [`CARD_WIDGET`] with a [`CARD_EDGE`]
+/// outline, hovered lighter, active and open in the accent — so a slider's rail, a checkbox, a
+/// button and a text field keep their contrast against the card's fill.
+pub fn card_widgets(v: &mut egui::Visuals) {
+    let w = &mut v.widgets;
+    w.inactive.bg_fill = CARD_WIDGET;
+    w.inactive.weak_bg_fill = CARD_WIDGET;
+    w.inactive.bg_stroke = Stroke::new(1.0, CARD_EDGE);
+    w.hovered.bg_fill = CARD_WIDGET_HOVER;
+    w.hovered.weak_bg_fill = CARD_WIDGET_HOVER;
+    w.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.7));
+    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+    v.extreme_bg_color = APP;
+}
+
+/// A card: `frame` (usually [`panel_card_frame`]) holding `add`, its widgets drawn with
+/// [`card_widgets`]. Every redesigned panel's cards go through this one helper.
+pub fn panel_card<R>(ui: &mut egui::Ui, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+    frame.show(ui, |ui| {
+        card_widgets(ui.visuals_mut());
+        add(ui)
+    })
+}
+
+/// A framed choice button (the View panel's look presets, the quick presets, the log's filter
+/// chips): selected — the accent fill and outline; else a neutral face with a visible outline
+/// (`Button::selectable` draws no frame until hovered, which read as bare text in a card).
+pub fn choice_button(selected: bool, text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
+    let b = egui::Button::new(text).corner_radius(6);
+    if selected {
+        b.fill(ACCENT_BG).stroke(Stroke::new(1.0, ACCENT))
+    } else {
+        b.fill(CARD_WIDGET).stroke(Stroke::new(1.0, CARD_EDGE))
+    }
+}
+
 /// A panel's folding header (the View panel's look: a caret, the title; the Model and Activity
 /// panels' folds): `open` says which caret to draw, `summary` is cut with "…" to the room left of
 /// the title, and `link` is a clickable word at the right end (its own response, drawn over the

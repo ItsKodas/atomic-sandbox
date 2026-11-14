@@ -302,7 +302,7 @@ pub fn active_preset(st: &UiState) -> Option<LookPreset> {
 /// `{probe}-reset`, its tooltip `reset_tip`; returns whether it was clicked) and its body.
 fn card(ui: &mut Ui, title: &str, probe: &str, reset_tip: &str, body: impl FnOnce(&mut Ui)) -> bool {
     let mut reset = false;
-    let r = egui::Frame::new().fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    let r = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(theme::caps(title));
@@ -421,7 +421,7 @@ fn look_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             let w = ((ui.available_width() - 3.0 * 4.0) / 4.0).max(40.0);
             for p in LookPreset::ALL {
                 let on = active == Some(p);
-                let b = egui::Button::selectable(on, RichText::new(p.title()).size(12.0)).min_size(vec2(w, 22.0));
+                let b = theme::choice_button(on, RichText::new(p.title()).size(12.0)).min_size(vec2(w, 22.0));
                 let r = probed(&format!("look-{}", p.word()), ui.add_sized([w, 22.0], b)).on_hover_text(p.tip());
                 if r.clicked() {
                     p.look().apply(st, acts);
@@ -656,7 +656,7 @@ pub const WARP_TIP: &str = "the density and orbitals were solved at one geometry
 /// ESTIMATED MODE CLOUD (`crate::cloud`; `sim` module doc, "The cloud"): the display warp, atomic
 /// superposition between DFT clouds and the display refresh, as chips.
 fn cloud_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
-    egui::Frame::new().fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
         ui.label(theme::caps("Estimated mode cloud"));
         let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);

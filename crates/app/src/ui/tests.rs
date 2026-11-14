@@ -12090,3 +12090,69 @@ fn a_geometry_that_outgrows_the_box_shows_the_note() {
     let n = super::estimated_box::note(&mut st, &grown).expect("the solved tail asks for more");
     assert!(!n.tip.contains("provisional"), "{}", n.tip);
 }
+
+/// User report 2026-11-14 ("no real display of the buttons or sliders, all just invisible"): inside
+/// a panel card a slider's rail differs from the card's fill by a clear contrast (the View panel's
+/// LOOK, the Orbitals view card), and the look presets are framed buttons — each with a visible
+/// outline, the active one in the accent fill.
+#[test]
+fn widgets_inside_cards_keep_their_contrast() {
+    fn rects(s: &egui::epaint::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match s {
+            egui::epaint::Shape::Rect(r) => out.push(r.clone()),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+            _ => {}
+        }
+    }
+    let contrast = |a: egui::Color32, b: egui::Color32| ((a.r() as i32 - b.r() as i32).abs() + (a.g() as i32 - b.g() as i32).abs() + (a.b() as i32 - b.b() as i32).abs()) as f32 / 3.0;
+    const MIN: f32 = 15.0;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let draw = |st: &mut UiState| -> Vec<egui::epaint::RectShape> {
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, &inp);
+            });
+            full.textures_delta.clear();
+            shapes = full.shapes;
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| rects(&c.shape, &mut out));
+        out
+    };
+    let rail_reads = |all: &[egui::epaint::RectShape], probe: &str| {
+        let slider = probed_rect(probe);
+        let fills: Vec<egui::Color32> = all.iter().filter(|r| slider.contains_rect(r.rect) && r.rect.height() < slider.height()).map(|r| r.fill).collect();
+        assert!(fills.iter().any(|&f| f.a() > 0 && contrast(f, theme::PANEL_2) >= MIN), "{probe}: a rail that reads against the card ({fills:?})");
+    };
+    // the View panel's LOOK card, as dots, Glow in force
+    let mut st = UiState::new("h2", &scene);
+    view_panel(&mut st, &[]);
+    let mut acts = Vec::new();
+    super::dock::view::GLOW.apply(&mut st, &mut acts);
+    st.volume_mode = VOLUME_DOTS;
+    let all = draw(&mut st);
+    rail_reads(&all, "look-amount");
+    rail_reads(&all, "look-brightness");
+    for w in ["clean", "glow", "scientific", "present"] {
+        let b = probed_rect(&format!("look-{w}"));
+        let face = all.iter().find(|r| (r.rect.min - b.min).length() < 1.5 && (r.rect.max - b.max).length() < 1.5).unwrap_or_else(|| panic!("look-{w}: no frame drawn"));
+        assert!(face.stroke.width > 0.0 && face.stroke.color.a() > 0 && contrast(face.stroke.color, theme::PANEL_2) >= MIN, "look-{w}: a visible outline ({:?})", face.stroke);
+        if w == "glow" {
+            assert_eq!(face.fill, theme::ACCENT_BG, "the active preset in the accent");
+        } else {
+            assert!(contrast(face.fill, theme::PANEL_2) >= MIN, "look-{w}: a face that reads ({:?})", face.fill);
+        }
+    }
+    // the Orbitals view card: the enclosed share's slider
+    let mut st = UiState::new("h2", &scene);
+    alone(&mut st, DockTab::Orbitals);
+    st.show = ShowMode::Coloured;
+    let all = draw(&mut st);
+    rail_reads(&all, "orbitals-enclosed");
+}

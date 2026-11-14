@@ -1119,7 +1119,7 @@ pub const ABOUT: &[(&str, &str)] = &[
 
 /// The view card: the `show` selector, the controls of the mode on screen only, the one-line note.
 fn view_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
-    egui::Frame::new().fill(theme::PANEL_2).stroke(egui::Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
         let mut rects = Vec::new();
         if let Some(m) = show_selector(ui, st.show, &mut st.hide_cloud, "show", &mut rects) {
@@ -1294,7 +1294,7 @@ fn presets(ui: &mut Ui, st: &UiState, payload: Option<&OrbitalDisplay>, acts: &m
                 P::OneSpin => has_up,
                 P::Valence | P::Everything => true,
             };
-            let r = ui.add_enabled(enabled, egui::Button::selectable(active == Some(p), p.title()));
+            let r = ui.add_enabled(enabled, theme::choice_button(active == Some(p), p.title()));
             let r = if enabled { r.on_hover_text(preset_tip(p)) } else { r.on_disabled_hover_text(if p == P::POnly && !rows.is_empty() { P_ONLY_OFF } else { "needs a DFT step" }) };
             super::super::probe(&format!("preset-{}", p.word()), &r);
             if r.clicked() {

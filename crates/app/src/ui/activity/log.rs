@@ -313,7 +313,7 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
             (LogView::Audit, "audit", "routine checks of the model against DFT"),
             (LogView::Failed, "failed", "solves that failed or did not converge (stalled, the cap, the pass's time limit)"),
         ] {
-            if crate::ui::probed(&format!("log-chip-{label}"), ui.add(egui::Button::selectable(st.log_view == v, label))).on_hover_text(tip).clicked() {
+            if crate::ui::probed(&format!("log-chip-{label}"), ui.add(theme::choice_button(st.log_view == v, label))).on_hover_text(tip).clicked() {
                 st.log_view = v;
             }
         }
@@ -330,12 +330,12 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
                 (&mut f.kept, "kept", "answers that went into the store"),
                 (&mut f.not_kept, "not kept", "answers used for the step but not kept (similar, box-affected, other settings, failed, …) and rows that were not solved"),
             ] {
-                if ui.add(egui::Button::selectable(*on, label)).on_hover_text(tip).clicked() {
+                if ui.add(theme::choice_button(*on, label)).on_hover_text(tip).clicked() {
                     *on = !*on;
                 }
             }
             let f = &mut st.filter.orbitals;
-            if ui.add(egui::Button::selectable(*f, "orbitals")).on_hover_text("the display eigensolve of unoccupied orbitals after a DFT step (Orbitals tab): display only, not a teaching solve").clicked() {
+            if ui.add(theme::choice_button(*f, "orbitals")).on_hover_text("the display eigensolve of unoccupied orbitals after a DFT step (Orbitals tab): display only, not a teaching solve").clicked() {
                 *f = !*f;
             }
         });

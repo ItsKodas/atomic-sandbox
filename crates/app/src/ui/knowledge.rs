@@ -811,7 +811,7 @@ fn detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap<(u8
 
 /// A card (the Model tab's verdict card look), probed as `probe`.
 fn card(ui: &mut Ui, probe: &str, body: impl FnOnce(&mut Ui)) {
-    let r = egui::Frame::new().fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+    let r = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
         body(ui);
     });
