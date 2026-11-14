@@ -30,11 +30,24 @@
 //! ρ_in is the **valence** density only: the profiles must be solved without the display's ρ_pc
 //! (the auditor's Atom jobs, live-orbitals Task 5, which pins it by a test). ρ_pc never enters
 //! ρ_in's Hartree term; `GpuSolver::harris` adds ½ρ_pc to each spin's xc input (NLCC), as the SCF
-//! does. Nothing here can detect a profile that carries ρ_pc — the renormalisation to Z_v would
-//! scale it down silently — so that rule is the caller's.
+//! does. The renormalisation to Z_v would scale a profile that carries ρ_pc down silently, so the
+//! rule is the caller's (the auditor solves its `Atom` jobs with the display's ρ_pc off, which a
+//! test pins: `surrogate` tests, `atom_jobs_solve_without_the_partial_core`); the sanity bound
+//! below names such a profile when it slips through.
+//!
+//! # The sanity bound (rule 7)
+//! The renormalisation makes any profile integrate to c_A, so it would silently absorb a profile
+//! that is not the atom this solve counts: one solved under another ionic treatment (a pseudo
+//! profile under an all-electron fallback, or the reverse), one that includes ρ_pc, or an atom
+//! whose density the box cuts. When the profile's own count (`AtomProfile::electrons`) or S_A is
+//! off c_A by more than [`PROFILE_COUNT_TOLERANCE`] (10 %; a profile solved on the scene's grid
+//! carries c_A to ≈ 1 %, so the bound flags only those cases), the atom is named in a note
+//! ([`RhoIn::notes`], carried into the payload's notes). The solve still runs: the note says what
+//! the picture is built from.
 //!
 //! # GPU memory ([`harris_footprint_bytes`]; spec §4.2 "VRAM")
-//! What a Harris solve holds on top of the solve (`crate::ks::solve_footprint_bytes`) and the
+//! What a Harris solve holds on top of the scene's solve (`crate::ks::gpu_footprint_bytes`, which
+//! under an ionic setup includes the SCF's pseudo extras, `crate::ks::pseudo_extra_bytes`) and the
 //! orbital view (`crate::ks::orbital_view_footprint_bytes`) of the same n, n_σ and m, counted
 //! from `qm_gpu::harris`'s "Fields and VRAM":
 //! - the block per channel at its growth bound, n_σ + m + G + W vectors (G = `UNOCC_GUARD`; 0 for a
@@ -47,7 +60,8 @@
 //! - 13 fields: ρ_in↑↓, ρ, V_H, v_nuc, v↑↓, exc, v_xc↑↓, ρ_out↑↓ and one scratch; + 3 under an ionic
 //!   setup (ρ_pc and the two xc inputs ρ_σ + ½ρ_pc);
 //! - the solver's one `LobpcgWork` (8 fields per vector) grown to the largest block, max n_σ + m +
-//!   G + W: 8(m + G + W) over the SCF's 8·max n_σ, less the view's own growth of the same work
+//!   G + W: the solve's term counts 8·max n_σ, and under a setup its pseudo extras the SCF's own
+//!   witness growth 8W, so what is left is 8(m + G), less the view's own growth of the same work
 //!   space (`OrbitalView::work_growth_fields(m)` = 8(m + G) for m > 0), which the view's term counts;
 //! - × 1.2, the slack of the other terms (uniforms, readback buffers, allocator slack). The Harris
 //!   state's own `GpuIonic` (local tables, nonlocal point lists: ≈ (4 + 4·rows) bytes per point in
@@ -62,15 +76,21 @@ use qm_gpu::orbitals::OrbitalView;
 use sim::AtomProfile;
 
 /// The Harris solve's input density (module doc): ρ_in,↑ and ρ_in,↓ on the grid (`qm::Grid`
-/// layout, e/Bohr³), the factor s = N/C the renormalised superposition was scaled by, and each
-/// atom's on-grid electrons S_A before its renormalisation (scene order; the debug readout's).
+/// layout, e/Bohr³), the factor s = N/C the renormalised superposition was scaled by, each
+/// atom's on-grid electrons S_A before its renormalisation (scene order; the debug readout's), and
+/// the sanity bound's notes (module doc, "The sanity bound"; for the payload).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RhoIn {
     pub up: Vec<f64>,
     pub dn: Vec<f64>,
     pub rescale: f64,
     pub per_atom: Vec<f64>,
+    pub notes: Vec<String>,
 }
+
+/// The sanity bound (module doc, "The sanity bound"): an atom whose on-grid electrons S_A, or
+/// whose profile's own count, is off its c_A by more than this fraction is named in a note.
+pub const PROFILE_COUNT_TOLERANCE: f64 = 0.1;
 
 /// ρ_in of `nuclei` on `grid` (module doc, "ρ_in"): each nucleus's species profile from `profiles`
 /// (the first with its Z; the caller passes only profiles valid for the scene's surface),
@@ -87,6 +107,7 @@ pub fn superposition(grid: &qm::Grid, nuclei: &[qm::Nucleus], profiles: &[AtomPr
     let dv = grid.dv();
     let mut sum = vec![0.0f64; grid.len()];
     let mut per_atom = Vec::with_capacity(nuclei.len());
+    let mut notes = Vec::new();
     let (mut at, mut val) = (Vec::new(), Vec::new());
     for (a, nuc) in nuclei.iter().enumerate() {
         let p = profiles.iter().find(|p| p.z == nuc.z).ok_or_else(|| {
@@ -96,6 +117,14 @@ pub fn superposition(grid: &qm::Grid, nuclei: &[qm::Nucleus], profiles: &[AtomPr
         let s_a = qm_gpu::reduce::neumaier(val.iter().copied()) * dv;
         if !(s_a > 0.0) {
             return Err(format!("atom {a} ({}) puts no density on the grid (its profile's reach ends before the nearest node)", units::elements::symbol(nuc.z)));
+        }
+        // the sanity bound (rule 7): the renormalisation below would hide a profile of another
+        // treatment or one carrying ρ_pc (its own count off), or an atom cut by a face (S_A off)
+        let off = |x: f64| !((x / counted[a] - 1.0).abs() <= PROFILE_COUNT_TOLERANCE);
+        if off(p.electrons) || off(s_a) {
+            notes.push(format!(
+                "atom {a} ({}): its isolated-atom profile carries {:.3} electrons ({:.3} on the grid here) for the {} this solve counts — rescaled to {}, which hides a profile of another ionic treatment, one including the partial core, or an atom cut by the box",
+                units::elements::symbol(nuc.z), p.electrons, s_a, counted[a], counted[a]));
         }
         per_atom.push(s_a);
         let scale = counted[a] / s_a;
@@ -108,7 +137,7 @@ pub fn superposition(grid: &qm::Grid, nuclei: &[qm::Nucleus], profiles: &[AtomPr
         let f = rescale * (n_s as f64 / n_el as f64);
         sum.iter().map(|v| f * v).collect()
     };
-    Ok(RhoIn { up: split(n_up), dn: split(n_dn), rescale, per_atom })
+    Ok(RhoIn { up: split(n_up), dn: split(n_dn), rescale, per_atom, notes })
 }
 
 /// The nodes of `grid` within `p`'s reach of `pos` (their indices into `at`) and p(|r − pos|) at
@@ -153,8 +182,9 @@ pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseu
     let block = |n_s: usize| if n_s + m > 0 { n_s + m + g + w } else { 0 };
     let vectors = block(n_up) + block(n_dn);
     let fields = if pseudised { 13 + 3 } else { 13 };
-    // the one `LobpcgWork` grown to the largest block, less what the view's term counts of it
-    let work = 8 * (m + g + w) - OrbitalView::work_growth_fields(m);
+    // the one `LobpcgWork` grown to the largest block, less what the solve's term (its 8W witness
+    // growth under a setup: `crate::ks::pseudo_extra_bytes`) and the view's term count of it
+    let work = 8 * (m + g) - OrbitalView::work_growth_fields(m);
     ((vectors + fields + work) as u64 as f64 * field_bytes(n) as f64 * 1.2) as u64
 }
 
@@ -220,16 +250,53 @@ mod tests {
         assert!(e.contains("grid"), "{e}");
     }
 
+    /// Task 4 review M2 (module doc, "The sanity bound"; rule 7): the renormalisation would absorb
+    /// a profile that is not the atom the solve counts, so each such atom is named in a note — and
+    /// only then. The analytic H 1s on 61³ × 0.2 (≈ 0.99 e on the grid): counted 1 → no note;
+    /// counted 6 (a treatment mismatch: a 1-electron profile for a 6-electron count) → atom 0 named;
+    /// a profile carrying 25 % more (as one including ρ_pc would) → both atoms; an H 0.1 Bohr inside
+    /// a face (half of it cut: S_A ≈ 0.5) → that atom. The density is still built every time.
+    #[test]
+    fn superposition_names_a_profile_off_its_count() {
+        let (n, h) = (61usize, 0.2);
+        let p = h1s_profile(n, h);
+        let grid = Grid::cube(n, h);
+        let nuclei = [Nucleus { pos: [-0.73, 0.05, 0.0], z: 1 }, Nucleus { pos: [0.71, -0.03, 0.02], z: 1 }];
+        let ok = superposition(&grid, &nuclei, std::slice::from_ref(&p), &[1.0, 1.0], 1, 1).expect("built");
+        assert!(ok.notes.is_empty(), "{:?}", ok.notes);
+
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&p), &[6.0, 1.0], 4, 3).expect("built");
+        println!("counted 6 for an H profile: {:?}", r.notes);
+        assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+        assert!(r.notes[0].starts_with("atom 0 (H)") && r.notes[0].contains("for the 6 this solve counts"), "{:?}", r.notes);
+
+        let heavy = AtomProfile { rho: p.rho.iter().map(|v| 1.25 * v).collect(), electrons: 1.25 * p.electrons, ..p.clone() };
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&heavy), &[1.0, 1.0], 1, 1).expect("built");
+        println!("a profile 25 % heavy: {:?}", r.notes);
+        assert_eq!(r.notes.len(), 2, "{:?}", r.notes);
+        assert!((integral(&grid, &r.up) - 1.0).abs() < 1e-10, "still renormalised");
+
+        let half = 0.5 * (n - 1) as f64 * h;
+        let cut = [Nucleus { pos: [half - 0.1, 0.0, 0.0], z: 1 }, nuclei[1]];
+        let r = superposition(&grid, &cut, std::slice::from_ref(&p), &[1.0, 1.0], 1, 1).expect("built");
+        println!("an atom at a face: S_A = {:?}, {:?}", r.per_atom, r.notes);
+        assert!(r.per_atom[0] < 0.9 && (r.per_atom[1] - 1.0).abs() < 2e-2, "{:?}", r.per_atom);
+        assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
+        assert!(r.notes[0].starts_with("atom 0 (H)"), "{:?}", r.notes);
+    }
+
     /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from:
     /// H₂ all-electron, m = 0: blocks 2 × (1 + 2) + 13 + the work's 8·2 = 35 fields; m = 4: blocks
     /// 2 × 7 + 13 + (8·6 − the view's 8·6) = 27; pseudo-O triplet (n = 4, 2) at m = 2: blocks
-    /// (4 + 2 + 2 + 16) + (2 + 2 + 2 + 16) + 16 + (8·20 − 8·4) = 46 + 16 + 128 = 190; an empty
-    /// channel (H atom ↓, m = 0) holds no block.
+    /// (4 + 2 + 2 + 16) + (2 + 2 + 2 + 16) + 16 + (8·4 − the view's 8·4) = 46 + 16 + 0 = 62 (the
+    /// work's 8W witness growth is the solve's term's, `pseudo_extra_bytes`: Task 4 review M1); at
+    /// m = 0: (4 + 2 + 16) + (2 + 2 + 16) + 16 + 8·2 = 42 + 16 + 16 = 74; an empty channel (H atom
+    /// ↓, m = 0) holds no block.
     #[test]
     fn harris_footprint_counts_its_fields() {
         let fields = |b: u64| b as f64 / (field_bytes(33) as f64 * 1.2);
         let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps));
-        for (got, want) in [(at(1, 1, 0, false), 35.0), (at(1, 1, 4, false), 27.0), (at(4, 2, 2, true), 190.0), (at(1, 0, 0, false), 3.0 + 13.0 + 16.0)] {
+        for (got, want) in [(at(1, 1, 0, false), 35.0), (at(1, 1, 4, false), 27.0), (at(4, 2, 2, true), 62.0), (at(4, 2, 0, true), 74.0), (at(1, 0, 0, false), 3.0 + 13.0 + 16.0)] {
             assert!((got - want).abs() < 1e-3, "{got} fields, expected {want} (the bytes are truncated to an integer)");
         }
     }

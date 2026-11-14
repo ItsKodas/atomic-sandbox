@@ -71,7 +71,8 @@
 //! self-consistent, display only. The steps: `problem` (the scene's grid, electrons and occupation
 //! rule, the floor-aware tolerance as the SCF would run it); the solver for that grid (the rule
 //! `evaluate` uses; a rebuild drops the view, the Harris state and the converged density); the GPU
-//! memory guard (the solve's, the view's and [`crate::harris::harris_footprint_bytes`]; over the
+//! memory guard ([`gpu_footprint_bytes`] of the scene — its pseudo extras included — the view's and
+//! [`crate::harris::harris_footprint_bytes`]; over the
 //! budget with m unoccupied orbitals but within it without, they are refused with a note; over it
 //! without, the payload is a note and nothing is solved); ρ_in from the `HarrisAtoms` profiles that
 //! fit the scene's surface ([`crate::harris::superposition`]: each atom renormalised to Z, or Z_v
@@ -79,7 +80,8 @@
 //! note-only payload); then `qm_gpu::GpuSolver::harris` into the provider's own `HarrisState`, the
 //! probe's display slot marked `DisplayJob::Harris` while it runs (never a solve slot), and the
 //! payload through the converged payload's own tail on the Harris state (`OrbitalKind::Harris`, its
-//! rescale, a note when |rescale − 1| > 1e-9, the solve's notes). A cancelled solve is
+//! rescale, a note when |rescale − 1| > 1e-9; the setup's notes — an ionic fallback or refusal —
+//! the solve's, and the superposition's sanity-bound notes). A cancelled solve is
 //! `ProviderError::Cancelled`. It never sets `density_current`, never touches `last` or the SCF's warm
 //! state, so `sample_density`, `orbital_display_now` and the next `evaluate` are what they would have
 //! been (`harris_is_not_a_teacher_solve`).
@@ -90,7 +92,10 @@
 //! state's belong to another potential), marked in `UnoccupiedState` as a Harris solve's: the next
 //! converged payload clears them before its own plan, so it shows its own eigensolve's rows or none,
 //! never these (`converged_payload_after_harris_never_shows_harris_unoccupied`). The Harris state is
-//! dropped when the view is switched off and on a solver rebuild.
+//! dropped when the view is switched off, on a solver rebuild, on `reset`, after a failed readback
+//! (`drop_view_after_fault`: its warm vectors may hold the zeros too) and when the memory guard
+//! refuses the unoccupied orbitals (the m = 0 solve is then within the budget it was checked
+//! against).
 //!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
@@ -1164,6 +1169,8 @@ impl GpuKs {
     /// built again from the solver's state.
     fn drop_view_after_fault(&mut self) {
         self.drop_orbital_view();
+        // the Harris state's warm vectors may hold the same zeros (Task 4 review M4)
+        self.harris.clear();
         self.orb.rebuilt();
     }
 
@@ -1208,7 +1215,9 @@ impl GpuKs {
     /// [`ForceProvider::harris_display`]'s answer (module doc, "Harris display").
     fn harris_once(&mut self, scene: &Scene, atoms: &HarrisAtoms, should_abort: &mut dyn FnMut() -> bool) -> Result<OrbitalDisplay, ProviderError> {
         let t0 = Instant::now();
-        let (grid, system, mut settings) = problem(scene, self.tol, &mut Vec::new())?;
+        // the setup's notes (an ionic fallback or refusal) travel with the payload (Task 4 review M3)
+        let mut setup_notes = Vec::new();
+        let (grid, system, mut settings) = problem(scene, self.tol, &mut setup_notes)?;
         // the τ-sets' tolerance as the SCF on this teacher would run it
         let _ = raise_to_gpu_floor(self.tol, &system, &mut settings);
         self.check_vram(scene)?;
@@ -1216,6 +1225,7 @@ impl GpuKs {
         // a payload that only says why nothing was solved (still a Harris answer; nothing was rescaled)
         let note_only = |orb: &ViewState, note: String| {
             let mut p = orb.refused(scene.cell.clone(), grid.origin, positions.clone(), note);
+            p.notes.extend(setup_notes.iter().cloned());
             p.kind = OrbitalKind::Harris { experience: None, rescale: 1.0, wall_s: t0.elapsed().as_secs_f64() };
             p
         };
@@ -1226,10 +1236,11 @@ impl GpuKs {
         // `requested` is the app's; the solve is capped at UNOCCUPIED_MAX (as `orbital_payload`)
         let requested = self.orb.request().unoccupied;
         let mut m = requested.min(UNOCCUPIED_MAX) as usize;
-        // the GPU memory guard (module doc, "GPU memory"): the solve, the view and the Harris state
+        // the GPU memory guard (module doc, "GPU memory"): the scene's solve (its pseudo extras
+        // included: Task 4 review M1), the view and the Harris state
         let mut guard = Vec::new();
         if let Some(budget) = self.vram_budget {
-            let base = solve_footprint_bytes(n, (n_up + n_dn) as u64, n_up.max(n_dn) as u64);
+            let base = gpu_footprint_bytes(scene);
             let texture = self.orb.texture();
             let pseudised = system.ionic.is_some();
             let need = |m: usize| base + orbital_view_footprint_bytes(n, n_up, n_dn, m, texture) + harris_footprint_bytes(n, n_up, n_dn, m, pseudised);
@@ -1240,6 +1251,9 @@ impl GpuKs {
                         "{requested} unoccupied orbitals refused: with them the orbital display solve needs ≈ {:.2} GB of GPU memory at {n}³, over {} — fewer unoccupied orbitals or a coarser quality (Scene ▸ Quality) fits",
                         gb(need(m)), GpuKs::budget_words(budget, self.vram_note.as_deref())));
                     m = 0;
+                    // the state's vectors of the larger block go now, not after the solve: the
+                    // m = 0 solve is then within the budget it was checked against (review M5)
+                    self.harris.clear();
                 } else {
                     self.harris.clear();
                     return Ok(note_only(&self.orb, format!(
@@ -1300,7 +1314,10 @@ impl GpuKs {
         let eig_tol = solver.effective_eig_tol(&settings);
         let shown = Shown { cell: &scene.cell, nuclei: &system.nuclei, positions, tol: *tol, scf_tol: settings.tol, eig_tol, requested, guard };
         let mut payload = GpuKs::shown_payload(ctx, orb, view, solver, state, (orb_scalar, orb_colour), (share_tables.as_ref(), share_gpu), unocc, shown);
+        payload.notes.extend(setup_notes.iter().cloned());
         payload.notes.extend(solve.notes.iter().cloned());
+        // the sanity bound's (Task 4 review M2): a profile off the count this solve uses
+        payload.notes.extend(rho.notes.iter().cloned());
         if (rho.rescale - 1.0).abs() > 1e-9 {
             let carried = counted.iter().sum::<f64>();
             payload.notes.push(format!(
@@ -1456,6 +1473,8 @@ impl ForceProvider for GpuKs {
         self.density_current = false;
         self.drop_extrapolation();
         self.drop_orbital_view();
+        // a reset is a new scene: the next Harris solve starts cold too (Task 4 review M4)
+        self.harris.clear();
         self.orb.rebuilt();
     }
 
@@ -3741,6 +3760,30 @@ mod tests {
         assert!(o.notes.iter().any(|n| n.contains("GB") && n.contains("orbital display solve")), "{:?}", o.notes);
         assert!(matches!(o.kind, OrbitalKind::Harris { .. }));
         assert_eq!((probe.view().display_solves, probe.view().side.solves), (0, 0), "no solve of any kind");
+    }
+
+    /// Task 4 review M3: `problem`'s setup notes (here CoresOnly's all-electron fallback for Li)
+    /// reach the Harris payload — a note-only one too (no Li profile is given, so nothing is
+    /// solved). M4: a solved Harris state is dropped by `reset` and by `drop_view_after_fault`.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (radial Li atom); cargo test -p providers --release")]
+    fn harris_carries_setup_notes_and_reset_drops_its_state() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = GpuKs::new(ctx, 1e-6);
+        p.set_orbital_view(homo_view());
+        let li = Scene { ionic: sim::IonicPolicy::CoresOnly, ..scene(33, vec![Nucleus::new(3, [0.1, 0.0, 0.0])]) };
+        let o = harris(&mut p, &li).expect("a note, not an error");
+        println!("Li under CoresOnly with only H profiles: {:?}", o.notes);
+        assert!(o.rows.is_empty() && o.notes.iter().any(|n| n.contains("no isolated-atom profile for Li")), "{:?}", o.notes);
+        assert!(o.notes.iter().any(|n| n.contains("Li") && n.contains("all-electron")), "the setup's fallback note: {:?}", o.notes);
+        for drop in [GpuKs::reset as fn(&mut GpuKs), GpuKs::drop_view_after_fault] {
+            p.set_orbital_view(homo_view());
+            harris(&mut p, &h2(33, 1.4)).expect("a Harris payload");
+            assert!(p.harris.state().is_some(), "solved");
+            drop(&mut p);
+            assert!(p.harris.state().is_none(), "dropped");
+        }
     }
 
     /// Unoccupied rows of a payload per channel, as (spin, ε bits).
