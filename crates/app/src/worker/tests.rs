@@ -2983,6 +2983,192 @@ fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
     assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
 }
 
+/// What the stand-in estimated provider ([`HarrisFake`]) was asked for.
+#[derive(Default)]
+struct HarrisLog {
+    view: sim::OrbitalViewRequest,
+    jobs: u64,
+    side: std::collections::VecDeque<sim::SideDisplay>,
+    atoms: Vec<(u8, sim::Display)>,
+    refreshes: usize,
+    harris: Vec<(u64, Vec<[f64; 3]>, sim::OrbitalRequest, usize)>,
+}
+
+/// A stand-in for the estimated solver with a background auditor, no GPU: Morse H₂ answers the
+/// steps; a refresh is answered at once with a converged payload for the view then on, an atom
+/// density with a Gaussian on the scene's cell, a Harris job with a Harris payload for the view
+/// then on — all through the side channel the worker polls (`side_job_in_flight` while any waits).
+struct HarrisFake {
+    inner: sim::MorseDimer,
+    log: Arc<std::sync::Mutex<HarrisLog>>,
+}
+
+impl HarrisFake {
+    fn payload(view: &sim::OrbitalViewRequest, positions: Vec<[f64; 3]>, kind: sim::OrbitalKind) -> sim::OrbitalDisplay {
+        let row = sim::OrbitalInfo {
+            spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, eps_range: (-0.6, -0.6), occupation: 1.0, label: sim::OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
+        };
+        sim::OrbitalDisplay {
+            cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: Default::default(),
+            unoccupied: None, notes: Vec::new(), what: view.what.clone(), lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind,
+        }
+    }
+}
+
+impl ForceProvider for HarrisFake {
+    fn evaluate(&mut self, scene: &sim::Scene, a: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        self.inner.evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "harris-fake"
+    }
+    fn reset(&mut self) {}
+    fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
+        Some(self)
+    }
+    fn side_jobs(&self) -> u64 {
+        self.log.lock().unwrap().jobs
+    }
+    fn take_side_display(&mut self) -> Option<sim::SideDisplay> {
+        self.log.lock().unwrap().side.pop_front()
+    }
+    fn set_orbital_view(&mut self, request: sim::OrbitalViewRequest) {
+        self.log.lock().unwrap().view = request;
+    }
+    fn harris_display(&mut self, scene: &sim::Scene, atoms: &Arc<sim::HarrisAtoms>, _a: &mut dyn FnMut() -> bool) -> Option<sim::HarrisAnswer> {
+        let mut l = self.log.lock().unwrap();
+        l.jobs += 1;
+        let job = l.jobs;
+        let positions: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let what = l.view.what.clone();
+        l.harris.push((job, positions.clone(), what, atoms.profiles.len()));
+        let orbitals = HarrisFake::payload(&l.view, positions.clone(), sim::OrbitalKind::Harris { experience: None, rescale: 1.0, wall_s: 0.01 });
+        l.side.push_back(sim::SideDisplay { display: None, orbitals: Some(orbitals), kind: sim::SideKind::Harris, job, positions });
+        Some(sim::HarrisAnswer::Queued { job })
+    }
+}
+
+impl Trainable for HarrisFake {
+    fn start_pass(&mut self, _s: &sim::Scene, _p: &SamplingPlan, _r: &mut sim::AtomReferences) -> Result<(), String> {
+        Err("harris-fake: no passes".into())
+    }
+    fn pass_step(&mut self, _a: &mut dyn FnMut() -> bool) -> Result<Option<sim::SamplingProgress>, sim::ProviderError> {
+        Ok(None)
+    }
+    fn cancel_pass(&mut self) {}
+    fn pass_active(&self) -> bool {
+        false
+    }
+    fn progress(&self) -> Option<sim::SamplingProgress> {
+        None
+    }
+    fn refit(&mut self) -> Result<String, String> {
+        Err("harris-fake: no model".into())
+    }
+    fn forget(&mut self) {}
+    fn save(&self, _p: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::InvalidInput.into())
+    }
+    fn load(&mut self, _p: &std::path::Path, _s: &sim::Scene) -> Result<(), String> {
+        Err("harris-fake: no model".into())
+    }
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        &mut self.inner
+    }
+    fn status(&self, _s: &sim::Scene, _f: &[[f64; 3]]) -> sim::TrainableStatus {
+        sim::TrainableStatus {
+            teacher: "morse", fitted: false, trusted: false, untrusted_reason: None, samples: 0, pending_refit: false, epoch: 0, fit: None,
+            body4_degree: None, residuals: None, force_bound: 0.0, provenance_mismatch: None, provenance: None, audit_every: 0, draft: true,
+            quarantined: 0, superseded: 0, forgotten: 0, forgotten_in_fit: 0, box_excluded: 0, held_out: 0, lone: 0, box_affected: 0,
+            trust_floor: None, unfitted: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
+            last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
+            trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
+            model_source: Default::default(), lone_note: None,
+        }
+    }
+    fn fitted(&self) -> bool {
+        false
+    }
+    fn samples(&self) -> usize {
+        0
+    }
+    fn pending_refit(&self) -> bool {
+        false
+    }
+    fn set_audit_every(&mut self, _n: usize) {}
+    fn force_teacher_next(&mut self) {}
+    fn request_display(&mut self, scene: &sim::Scene) -> bool {
+        let mut l = self.log.lock().unwrap();
+        l.jobs += 1;
+        l.refreshes += 1;
+        let job = l.jobs;
+        let positions: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let orbitals = HarrisFake::payload(&l.view, positions.clone(), sim::OrbitalKind::Converged);
+        let display = Display::Cpu { cell: scene.cell.clone(), origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 };
+        l.side.push_back(sim::SideDisplay { display: Some(display), orbitals: Some(orbitals), kind: sim::SideKind::Refresh, job, positions });
+        true
+    }
+    fn side_job_in_flight(&self) -> bool {
+        let l = self.log.lock().unwrap();
+        !l.side.is_empty() || !l.atoms.is_empty()
+    }
+    fn request_atom_density(&mut self, z: u8, scene: &sim::Scene) -> bool {
+        let (n, h) = (scene.cell.n, scene.cell.h);
+        let o = -scene.cell.half_extent();
+        let mut rho = vec![0.0f32; n * n * n];
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let r2: f64 = [i, j, k].iter().map(|&q| (o + q as f64 * h).powi(2)).sum();
+                    rho[i + n * (j + n * k)] = ((-r2).exp() / std::f64::consts::PI.powf(1.5)) as f32;
+                }
+            }
+        }
+        let display = Display::Cpu { cell: scene.cell.clone(), origin: [o; 3], rho: Arc::new(rho), max: 1.0 };
+        self.log.lock().unwrap().atoms.push((z, display));
+        true
+    }
+    fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        std::mem::take(&mut self.log.lock().unwrap().atoms)
+    }
+}
+
+/// Task 6 review (Important 2), no GPU: a converged payload of **another** view shown at the
+/// current geometry covers nothing. Paused, a List view's refresh is shown; then ⚠ Model only,
+/// and the view changes to All orbitals coloured while the H atom is still missing (nothing is
+/// sent: not eligible, and never a refresh); once the atom is in, a Harris job is sent and its
+/// payload replaces the List one (the driver's precedence skips a payload of another view too).
+/// No further refresh under Model only.
+#[test]
+fn a_converged_payload_of_another_view_does_not_cover_its_geometry() {
+    use sim::{ColourLook, OrbitalKind, OrbitalRequest, OrbitalViewRequest, SideKind};
+    let log = Arc::new(std::sync::Mutex::new(HarrisLog::default()));
+    let l = log.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(HarrisFake { inner: sim::MorseDimer::h2(), log: l.clone() })));
+    idle(&w);
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    let s = snapshot_until(&w, "the List refresh shown", |s| s.dynamics.orbitals_side == Some(SideKind::Refresh));
+    let o = s.dynamics.orbitals.as_ref().unwrap();
+    assert_eq!((&o.what, &o.kind), (&OrbitalRequest::List, &OrbitalKind::Converged));
+    assert!(s.atom_profiles.is_empty(), "the List view asks for no atoms");
+    let here: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+    assert_eq!(log.lock().unwrap().refreshes, 1);
+    w.send(Command::SetModelOnly(true));
+    let coloured = OrbitalRequest::AllColoured { include: None, physical: false, look: ColourLook::default() };
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(coloured.clone())));
+    let s = snapshot_until(&w, "the Harris payload for All orbitals coloured", |s| {
+        s.dynamics.orbitals.as_ref().is_some_and(|o| matches!(o.kind, OrbitalKind::Harris { .. }))
+    });
+    let o = s.dynamics.orbitals.as_ref().unwrap();
+    assert_eq!((&o.what, &o.positions, s.dynamics.orbitals_side), (&coloured, &here, Some(SideKind::Harris)));
+    assert_eq!(s.atom_profiles.len(), 1, "the view asked for the H atom");
+    let l = log.lock().unwrap();
+    assert_eq!(l.refreshes, 1, "Model only: no refresh for the view change");
+    assert_eq!(l.harris.len(), 1, "one Harris job: {:?}", l.harris.iter().map(|h| h.0).collect::<Vec<_>>());
+    assert_eq!((&l.harris[0].1, &l.harris[0].2, l.harris[0].3), (&here, &coloured, 1));
+}
+
 /// Live-orbitals Task 6 (spec §4.2): under ⚠ Model only (draft on, audits off, `SetModelOnly`) an
 /// orbital view starts no DFT solve. All orbitals coloured, opened paused with no isolated atoms
 /// yet, asks the background solver for the H atom (the cloud's superposition is off here: the

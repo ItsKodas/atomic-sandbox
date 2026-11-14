@@ -18,9 +18,10 @@
 //!   solve after each geometry change, [`HARRIS_DEBOUNCE`] after a drag's last move. Playing, at
 //!   most one per max([`HARRIS_MIN_INTERVAL`], the View setting "refresh orbitals every N s"
 //!   ([`HARRIS_EVERY_DEFAULT`]), last wall / [`HARRIS_BUDGET`]) — at most 15 % of wall time.
-//!   A geometry a DFT payload already covers — a converged payload shown there, or a refresh
-//!   asked for there by a view change outside Model only — gets no Harris job (the converged one
-//!   wins at the same geometry anyway).
+//!   A geometry a DFT payload already covers — a converged payload shown there that answers the
+//!   current view (`OrbitalViewRequest::answered_by`, the driver's own test), or a refresh asked
+//!   for there by a view change outside Model only — gets no Harris job (the converged one wins
+//!   at the same geometry anyway); a converged payload of another view covers nothing.
 //! - **A job that never lands** (Task 5: a cancelled Harris job is silent and never re-sent by
 //!   the provider — a newer command raises the display interrupt): a sent job is *awaited* until
 //!   a Harris payload at its positions lands. When the background solver is idle again
@@ -242,9 +243,11 @@ impl HarrisSchedule {
 }
 
 impl Worker {
-    /// The estimated solver on the GPU teacher (a background auditor).
+    /// The estimated solver on the GPU teacher: its provider audits on a background teacher
+    /// (`TrainableStatus::audits_background`, read by `cloud_jobs` every round and at start-up —
+    /// the GPU teacher's auditor; never a backend label, so a test's stand-in provider qualifies).
     pub(super) fn estimated_gpu(&self) -> bool {
-        self.backend == Backend::Estimated && self.engine == Backend::Gpu
+        self.background_auditor
     }
 
     /// [`harris_eligible`] for `what` on `snap`'s scene with the profiles held.
@@ -281,10 +284,14 @@ impl Worker {
         let in_flight = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
         self.harris.check_lost(now, in_flight);
         let positions: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
-        // a converged (DFT) payload shown at this geometry wins over any Harris one (spec §4.2
-        // "Precedence"): nothing to solve here
-        if snap.orbitals.as_ref().is_some_and(|o| o.kind == OrbitalKind::Converged && same_geometry(&o.positions, &positions)) {
+        // a converged (DFT) payload shown at this geometry *for this view* wins over any Harris
+        // one (spec §4.2 "Precedence"): nothing to solve here, a view change included. One of
+        // another view covers nothing (the driver's precedence skips it too: Task 6 review)
+        let mut view_changed = view_changed;
+        let covering = |o: &sim::OrbitalDisplay| o.kind == OrbitalKind::Converged && snap.orbital_view.answered_by(o) && same_geometry(&o.positions, &positions);
+        if snap.orbitals.as_ref().is_some_and(covering) {
             self.harris.covered(&positions);
+            view_changed = false;
         }
         if !self.harris.due(now, snap.paused, &positions, view_changed) {
             return;

@@ -181,6 +181,27 @@ impl OrbitalViewRequest {
     pub fn same_view(&self, other: &OrbitalViewRequest) -> bool {
         self.what == other.what && self.unoccupied == other.unoccupied
     }
+
+    /// Whether payload `o` answers this view (Task 3 review M2; live-orbitals Task 6 review): the
+    /// kind and its display flags must match and so must the unoccupied count. A selected orbital
+    /// may differ only by the selection fallback: the payload shows another track only when the
+    /// requested one is not among its rows. The driver's side-payload precedence and the app's
+    /// Harris schedule share it: a payload that does not answer the view shown now neither blocks
+    /// a newer one nor counts as covering its geometry.
+    pub fn answered_by(&self, o: &OrbitalDisplay) -> bool {
+        use OrbitalRequest as R;
+        if o.unoccupied.as_ref().map_or(0, |u| u.requested) != self.unoccupied {
+            return false;
+        }
+        match (&self.what, &o.what) {
+            (R::List, R::List) | (R::SpinDensity, R::SpinDensity) => true,
+            (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
+                squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
+            }
+            (R::AllColoured { physical, look, .. }, R::AllColoured { physical: p2, look: l2, .. }) => physical == p2 && look == l2,
+            _ => false,
+        }
+    }
 }
 
 /// A row label (`qm::orbitals::Label` mirrored): `#k` (1-based index in its channel by energy) or

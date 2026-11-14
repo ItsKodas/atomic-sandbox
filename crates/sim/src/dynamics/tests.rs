@@ -2458,6 +2458,9 @@ struct OrbitLog {
     /// The next this many payloads with unoccupied orbitals say their rows are an earlier
     /// geometry's (`current: false`, not interrupted): the provider's play cap at work.
     stale_next: usize,
+    /// `orbital_display_now` answers `None`, as a surrogate does (its one producer is the side
+    /// solver): a changed view leaves the shown payload in place.
+    no_display_now: bool,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2532,6 +2535,9 @@ impl ForceProvider for Orbiting {
         let abort = should_abort();
         self.log.lock().unwrap().aborts_seen.push(abort);
         self.log.lock().unwrap().now_calls += 1;
+        if self.log.lock().unwrap().no_display_now {
+            return None;
+        }
         self.payload(self.last.clone(), Cell { n: 33, h: 0.25 })
     }
 }
@@ -2834,6 +2840,46 @@ fn harris_side_display_sets_orbitals_not_density() {
     let sd = s2.side_display.as_ref().expect("the audit's density is kept");
     assert_eq!((sd.kind, sd.seq, &sd.positions), (SideKind::Audit, audit.seq, &p), "the side density is unchanged: no Harris density");
     assert!(s2.charges.is_none() && d.charges().is_none(), "no charges from a Harris job");
+}
+
+/// Live-orbitals Task 6 review: a converged side payload shown for view A at p does not hold back
+/// a Harris payload for view B at p once the view is B — it no longer answers the view, so neither
+/// the converged-over-Harris rule nor the job order applies to it. A Harris payload for A (the old
+/// view) is still refused, and once B's payload is shown the precedence holds again among B's.
+#[test]
+fn a_payload_of_another_view_does_not_hold_back_the_current_one() {
+    use crate::provider::{ColourLook, OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    log.lock().unwrap().no_display_now = true;
+    let a = OrbitalRequest::SpinDensity;
+    let b = OrbitalRequest::AllColoured { include: None, physical: false, look: ColourLook::default() };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(a.clone())));
+    let p = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.2, 0.3]];
+    let feed = |d: &mut Dynamics, mut sd: crate::provider::SideDisplay, what: &OrbitalRequest| {
+        sd.orbitals.as_mut().unwrap().what = what.clone();
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        d.tick(f64::INFINITY, &mut never())
+    };
+    let s = feed(&mut d, side_payload(5, SideKind::Refresh, p.clone(), 105), &a);
+    assert_eq!((s.orbitals.as_ref().map(|o| o.rows[0].track), s.orbitals_side), (Some(105), Some(SideKind::Refresh)), "A's converged payload shown");
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(b.clone())));
+    let s = d.snapshot();
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(105), "the view change leaves it shown (no display now)");
+    // an older Harris job for the old view: still refused (it does not answer B)
+    let s = feed(&mut d, side_payload(4, SideKind::Harris, p.clone(), 104), &a);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(105));
+    // B's Harris payload at the same geometry: shown, though A's converged one is there
+    let s = feed(&mut d, side_payload(6, SideKind::Harris, p.clone(), 106), &b);
+    assert_eq!((s.orbitals.as_ref().map(|o| o.rows[0].track), s.orbitals_side), (Some(106), Some(SideKind::Harris)), "B's Harris payload replaces A's converged one");
+    // among B's payloads the precedence holds: a converged one at p wins, a later Harris one does not replace it
+    let s = feed(&mut d, side_payload(7, SideKind::Refresh, p.clone(), 107), &b);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(107));
+    let s = feed(&mut d, side_payload(8, SideKind::Harris, p.clone(), 108), &b);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(107), "converged beats Harris at the same geometry, for the same view");
 }
 
 /// A provider may hold a density job's display and a Harris one at once (an audit landed while a

@@ -706,6 +706,9 @@ struct Worker {
     harris_seen_seq: u64,
     harris_atoms: Option<(Arc<Vec<AtomProfile>>, Vec<u8>, Arc<sim::HarrisAtoms>)>,
     harris_note: Option<&'static str>,
+    /// The provider audits on a background teacher (`TrainableStatus::audits_background`: the
+    /// estimated solver on the GPU teacher) — Harris display solves need it.
+    background_auditor: bool,
 }
 
 /// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
@@ -903,11 +906,13 @@ fn worker(
         harris_seen_seq: 0,
         harris_atoms: None,
         harris_note: None,
+        background_auditor: false,
     };
     for c in settings {
         w.dy.apply(c);
     }
     let first = w.dy.snapshot();
+    w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.status(&first.scene, &first.forces).audits_background);
     w.publish(first);
     let mut inbox = Inbox {
         rx,
@@ -1087,8 +1092,12 @@ impl Worker {
     /// step path; nothing without a background auditor.
     fn cloud_jobs(&mut self, snap: &DynSnapshot) {
         let gpu = self.gpu.clone();
-        let Some(s) = trainable(&mut self.dy) else { return };
-        if !s.status(&snap.scene, &snap.forces).audits_background {
+        let Some(s) = trainable(&mut self.dy) else {
+            self.background_auditor = false;
+            return;
+        };
+        self.background_auditor = s.status(&snap.scene, &snap.forces).audits_background;
+        if !self.background_auditor {
             return;
         }
         let cell = &snap.scene.cell;

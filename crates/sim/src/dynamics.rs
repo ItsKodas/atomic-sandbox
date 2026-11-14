@@ -319,7 +319,9 @@
 //! bound, a surrogate's model step). The view switched off, or an empty scene, drops it. A failed
 //! evaluation leaves the last one, with its time. A side job's payload replaces the shown one only
 //! if it answers the current view (kind, display flags, unoccupied count; another orbital only by
-//! the selection fallback) and is not from an older job than the shown one's (Task 3 review M2:
+//! the selection fallback: `OrbitalViewRequest::answered_by`) and is not from an older job than the
+//! shown one's — a shown payload that no longer answers the view (it was changed since) holds
+//! nothing back, by job or by kind (live-orbitals Task 6 review) (Task 3 review M2:
 //! an audit in flight across a view change, or a held audit judged after a newer refresh, would
 //! otherwise snap the view back for a solve).
 //!
@@ -1825,8 +1827,11 @@ impl Dynamics {
             // flight across a view change, or a held audit judged after a newer refresh, would
             // snap the view back), never a Harris one over a converged one at its geometry
             if let Some(o) = sd.orbitals {
-                let shown = self.orbitals.as_ref().zip(self.orbitals_job);
-                if side_replaces(shown, &o, sd.job) && answers_view(&self.orbital_view, &o) {
+                // a shown payload that no longer answers the view (it was changed since) holds
+                // nothing back: neither the job order nor the converged-over-Harris rule applies to
+                // it (live-orbitals Task 6 review)
+                let shown = self.orbitals.as_ref().zip(self.orbitals_job).filter(|(s, _)| self.orbital_view.answered_by(s));
+                if side_replaces(shown, &o, sd.job) && self.orbital_view.answered_by(&o) {
                     self.set_orbitals(o, t, Some(sd.kind));
                     self.orbitals_job = Some(sd.job);
                 }
@@ -3274,7 +3279,8 @@ impl Tools<'_> {
 /// geometry (the same nucleus count, every nucleus within [`HARRIS_SAME_GEOMETRY`]) a converged
 /// (DFT) payload beats a Harris one whatever the job order, since it is self-consistent; within
 /// one kind, and at another geometry, the newer job wins (an older one never replaces: Task 3
-/// review M2). [`answers_view`] still applies on top.
+/// review M2). `OrbitalViewRequest::answered_by` still applies on top, to the incoming payload and
+/// (as the caller's filter) to the shown one.
 fn side_replaces(shown: Option<(&OrbitalDisplay, u64)>, incoming: &OrbitalDisplay, job: u64) -> bool {
     let Some((o, shown_job)) = shown else { return true };
     let harris = |k: &OrbitalKind| matches!(k, OrbitalKind::Harris { .. });
@@ -3288,21 +3294,3 @@ fn side_replaces(shown: Option<(&OrbitalDisplay, u64)>, incoming: &OrbitalDispla
     job >= shown_job
 }
 
-/// Whether a side job's orbital payload answers the view the app asks for now (Task 3 review M2).
-/// The kind and its display flags must match and so must the unoccupied count. A selected orbital
-/// may differ only by the selection fallback: the payload shows another track only when the
-/// requested one is not among its rows.
-fn answers_view(view: &OrbitalViewRequest, o: &OrbitalDisplay) -> bool {
-    use crate::provider::OrbitalRequest as R;
-    if o.unoccupied.as_ref().map_or(0, |u| u.requested) != view.unoccupied {
-        return false;
-    }
-    match (&view.what, &o.what) {
-        (R::List, R::List) | (R::SpinDensity, R::SpinDensity) => true,
-        (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
-            squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
-        }
-        (R::AllColoured { physical, look, .. }, R::AllColoured { physical: p2, look: l2, .. }) => physical == p2 && look == l2,
-        _ => false,
-    }
-}
