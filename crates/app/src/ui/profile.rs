@@ -1,11 +1,13 @@
 //! Profiles (user request 2026-10-19): the viewer's own look and layout — the workspace's
 //! arrangement (`layout = <tree>`, docking spec D-8: the 3D view and the panels' splits, leaves
-//! and active tabs in `workspace::layout`'s grammar; `hidden = Graph:left:340, …`, the auto-hidden
+//! and active tabs in `workspace::layout`'s grammar; `hidden = Log:left:340, …`, the auto-hidden
 //! panels with their edge and size, spec D-10; `window = 2552,-8,1920,1009 max
-//! V(0.50,[Activity*],[Graph*])`, one line per detached window — its desktop rect in physical
+//! V(0.50,[Activity*],[Readouts*])`, one line per detached window — its desktop rect in physical
 //! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
 //! `workspace::detached`), the view and density-look settings and which
-//! of the View panel's sections are open (`view_sections = what,looks`), the units, the Version
+//! of the View panel's sections are open (`view_sections = what,looks`) and which of the Model
+//! panel's folds (`model_sections = teach,health`) and of the Activity panel's
+//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
 //! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
@@ -38,6 +40,8 @@ macro_rules! fields {
 
 /// The panel an old profile's word names (`DockTab::name`, which was its `Debug` word).
 fn tab_of(w: &str) -> Option<DockTab> {
+    // (an old "Graph" is dropped: the Readouts panel it merged into is placed where it is listed,
+    // or where `layout::from_sides` puts a panel no list names)
     DockTab::PANELS.into_iter().find(|t| t.name() == w)
 }
 /// An old profile's tab list; unknown words are dropped.
@@ -68,7 +72,6 @@ pub fn capture(st: &UiState) -> String {
         };
     }
     fields!(put);
-    out += &format!("auto_refresh_bonds = {}\n", st.auto_refresh_bonds);
     out += &format!("guess_bonds = {}\n", st.guess_bonds);
     out += &format!("nucleus_scale = {}\n", st.nucleus_scale.map_or("auto".into(), |x| x.to_string()));
     out += &format!("background = {}\n", st.background.map_or("default".into(), |c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])));
@@ -81,6 +84,12 @@ pub fn capture(st: &UiState) -> String {
         out += &format!("window = {}\n", detached::encode_window(rect, max, &tree));
     }
     out += &format!("view_sections = {}\n", st.view_sections.encode());
+    out += &format!("model_sections = {}\n", st.model_sections.encode());
+    out += &format!("activity_sections = {}\n", st.activity_sections.encode(st.activity.training_open));
+    out += &format!("orbital_sections = {}\n", st.orbital_sections.encode());
+    out += &format!("knowledge_sections = {}\n", st.knowledge_sections.encode());
+    out += &format!("readouts_sections = {}\n", st.readouts_sections.encode());
+    out += &format!("selection_sections = {}\n", st.selection_sections.encode());
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
@@ -113,7 +122,6 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     fields!(get);
     // added 2026-11-13: a profile from before it (or an unreadable value) reads as on, its default
-    st.auto_refresh_bonds = kv.get("auto_refresh_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
     st.guess_bonds = kv.get("guess_bonds").and_then(|v| v.parse().ok()).unwrap_or(true);
     if let Some(v) = kv.get("nucleus_scale") {
         st.nucleus_scale = v.parse().ok();
@@ -141,12 +149,30 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     // the View panel's open sections (docking Task 4); a profile from before it opens the default two
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
+    // the Model panel's open folds (2026-11-14); a profile from before them opens Teach next and Health
+    st.model_sections = kv.get("model_sections").map_or_else(Default::default, |v| super::dock::model::Sections::parse(v));
+    // the Activity panel's folds (2026-11-14): the trust checklist and Training; absent, both closed
+    let (sections, training) = kv.get("activity_sections").map_or((Default::default(), false), |v| super::activity::Sections::parse(v));
+    st.activity_sections = sections;
+    st.activity.training_open = training;
+    // the Orbitals panel's folds (2026-11-14); a profile from before them opens the Spin readout only
+    st.orbital_sections = kv.get("orbital_sections").map_or_else(Default::default, |v| super::dock::orbitals::Sections::parse(v));
+    // the Knowledge panel's "Why thin?" fold (2026-11-14); absent, closed
+    st.knowledge_sections = kv.get("knowledge_sections").map_or_else(Default::default, |v| super::knowledge::Sections::parse(v));
+    // the Readouts panel's folds (2026-11-14); absent, all closed
+    st.readouts_sections = kv.get("readouts_sections").map_or_else(Default::default, |v| super::dock::readouts::Sections::parse(v));
+    // the Selection panel's folds (2026-11-14); absent, all closed
+    st.selection_sections = kv.get("selection_sections").map_or_else(Default::default, |v| super::dock::selection::Sections::parse(v));
     if let Some(v) = kv.get("layout") {
+        // the Graph panel merged into Readouts (2026-11-14): its name migrated on every line at once
+        let mut values: Vec<&str> = vec![v, kv.get("hidden").copied().unwrap_or_default()];
+        values.extend(lines.iter().filter(|(k, _)| *k == "window").map(|(_, v)| *v));
+        let values = layout::migrate_graph(&values);
         st.workspace.close_windows();
-        st.workspace.set_node(layout::parse(v).unwrap_or_else(layout::default_layout));
-        st.workspace.set_hidden(layout::parse_hidden(kv.get("hidden").copied().unwrap_or_default()));
+        st.workspace.set_node(layout::parse(&values[0]).unwrap_or_else(layout::default_layout));
+        st.workspace.set_hidden(layout::parse_hidden(&values[1]));
         // every `window` line, in order
-        let windows = lines.iter().filter(|(k, _)| *k == "window").filter_map(|(_, v)| detached::parse_window(v)).collect();
+        let windows = values[2..].iter().filter_map(|v| detached::parse_window(v)).collect();
         st.workspace.set_windows(windows);
     } else if kv.contains_key("left_tabs") || kv.contains_key("right_tabs") {
         let side = |k: &str| kv.get(k).map(|v| tabs_of(v)).unwrap_or_default();

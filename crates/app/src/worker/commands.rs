@@ -85,6 +85,24 @@ pub enum Command {
     /// Estimated solver: Restore of a forgotten sample (`Trainable::restore_sample`), then a refit.
     /// Never an edit, never aborts.
     RestoreSample(sim::SampleId),
+    /// Estimated solver: the Model tab's "Forget N selected" (2026-11-14): every sample these ids
+    /// name forgotten as one batch (`Trainable::forget_samples`: all or nothing — a stale id or a
+    /// batch past the recovery's 10 % cap is applied with its warning), then one debounced refit
+    /// (`model` module, `UserRefit`). Never an edit, never aborts.
+    ForgetSamples(Vec<sim::SampleId>),
+    /// Estimated solver: "Restore N selected" (`Trainable::restore_samples`), as one batch. Never an
+    /// edit, never aborts.
+    RestoreSamples(Vec<sim::SampleId>),
+    /// Estimated solver: the Model tab's "Refit now": the pending refit after the user's Forget /
+    /// Restore starts at once instead of after its delay (after a running refit lands). Never an
+    /// edit, never aborts.
+    RefitNow,
+    /// Estimated solver: the Model tab's "Purge forgotten (N)…" after its confirmation
+    /// (`Trainable::purge_forgotten`): every forgotten sample deleted for good — from the shared
+    /// collection's samples file too, its old file kept as `samples.bin.bak`. No refit (the fit
+    /// stands unchanged); the outcome is `ModelStatus::last_purge`. The count is the one the user
+    /// confirmed: refused when the forgotten list changed since. Never an edit, never aborts.
+    PurgeForgotten(usize),
     /// Estimated solver: "Save a specialised model…" (M8a Task 7): the attached collection's samples
     /// made only of `species` written to `path` (`Trainable::save_specialised`); noted, an error
     /// when refused. Never an edit (a file write).
@@ -182,6 +200,10 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
+            | Command::ForgetSamples(_)
+            | Command::RestoreSamples(_)
+            | Command::RefitNow
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
             | Command::SetAudit(_)
@@ -217,6 +239,10 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
+            | Command::ForgetSamples(_)
+            | Command::RestoreSamples(_)
+            | Command::RefitNow
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
             | Command::SetDraft(_)
@@ -258,6 +284,10 @@ impl Command {
                 | Command::ImportModel(_)
                 | Command::ForgetSample(_)
                 | Command::RestoreSample(_)
+                | Command::ForgetSamples(_)
+                | Command::RestoreSamples(_)
+                | Command::RefitNow
+                | Command::PurgeForgotten(_)
                 | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
                 | Command::SetAudit(_)
@@ -300,6 +330,10 @@ impl Command {
             | Command::ImportModel(_)
             | Command::ForgetSample(_)
             | Command::RestoreSample(_)
+            | Command::ForgetSamples(_)
+            | Command::RestoreSamples(_)
+            | Command::RefitNow
+            | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
@@ -406,8 +440,12 @@ impl Worker {
             Command::Collections(dir) => self.collections = dir,
             Command::UseModel(choice) => self.use_model(choice),
             Command::ImportModel(path) => self.import_model(&path),
-            Command::ForgetSample(i) => self.user_sample(i, true),
-            Command::RestoreSample(i) => self.user_sample(i, false),
+            Command::ForgetSample(i) => self.user_samples(&[i], true),
+            Command::RestoreSample(i) => self.user_samples(&[i], false),
+            Command::ForgetSamples(ids) => self.user_samples(&ids, true),
+            Command::RestoreSamples(ids) => self.user_samples(&ids, false),
+            Command::RefitNow => self.refit_now(),
+            Command::PurgeForgotten(n) => self.purge_forgotten(n),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {

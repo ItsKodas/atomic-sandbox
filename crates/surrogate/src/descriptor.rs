@@ -147,21 +147,31 @@
 //! triple i₁ ≤ i₂ ≤ i₃ once (B is symmetric under permutations of its items), with the parity and
 //! triangle rules above and the total-degree cap
 //!
-//!   n₁ + n₂ + n₃ + (l₁ + l₂ + l₃)/2 ≤ D₄ = min(degree_cap, [`BODY4_DEGREE_CAP`] = 2)
+//!   n₁ + n₂ + n₃ + (l₁ + l₂ + l₃)/2 ≤ D₄ = min(degree_cap, `Basis::body4_degree`)
 //!
 //! — the body-3 block's weight per l (its cap n₁ + n₂ + l counts the pair (l, l) as l), so a
-//! (1, 1, 2) triple at n = 0 is the first genuinely angular body-4 term. D₄ = 2 keeps the
-//! collection's Q′ at 38 / 284 / 1 032 / 2 688 for S = 1–4 (body-3 alone: 29 / 176 / 543 / 1 232);
-//! D₄ = 3 or 4 would give 5 344 or 10 592 at S = 4, a 0.2–0.9 GB Gram per matrix. The recovery
-//! degree cap (6) leaves D₄ at 2. P₄ = 9 / 54 / 163 / 364 per centre species.
+//! (1, 1, 2) triple at n = 0 is the first genuinely angular body-4 term. The degree is the
+//! basis's: [`Basis::new`] starts it at [`BODY4_DEGREE_START`] = 2, and the provider chooses it
+//! per refit between that and the ceiling [`BODY4_DEGREE_CAP`] = 3 (spec §4.1); a sidecar records
+//! it as `body4_cap` and loads at its own degree. Q′ at the collection's basis (n_max 8, l_max 3,
+//! degree_cap 4; body-3 alone: 29 / 176 / 543 / 1 232 for S = 1–4):
+//!
+//! | D₄ | S = 1 | 2   | 3     | 4     | P₄ per centre species (S = 1–4) | Gram per matrix at S = 4 |
+//! |----|-------|-----|-------|-------|---------------------------------|--------------------------|
+//! | 2  | 38    | 284 | 1 032 | 2 688 | 9 / 54 / 163 / 364              | 58 MB                    |
+//! | 3  | 52    | 468 | 1 902 | 5 344 | 23 / 146 / 453 / 1 028          | 0.23 GB                  |
+//!
+//! (D₄ = 4 would give 10 592 at S = 4, 0.9 GB per matrix — beyond the ceiling.) The recovery
+//! degree cap (6) leaves D₄ at the basis's degree.
 //!
 //! **Gradients** by the product rule through the three factors: ∂B/∂r_j = Σ_f δ_{s_j t_f}
 //! Σ_{m} G ∇φ_{n_f,l_fm_f}(d_ij) × (the other two A), and ∂B_i/∂r_i = −Σ_j ∂B_i/∂r_j (translation
 //! invariance). The hot path folds them into the same adjoint W_{c,lm} = ∂E_i/∂A_{c,lm} as the
 //! body-3 block: W_{c_f, l_fm_f} += c_q G × (the other two A). `body4_forces_match_finite_
-//! differences` checks both against central differences (step 1e-5 Bohr: 8e-11 and 9e-11 of the
-//! largest force), `body4_features_are_rotation_invariant` the invariance (5.6e-13 relative over
-//! five random rotations of a six-atom H/C/O cluster).
+//! differences` checks both against central differences at D₄ = 2 and 3 (step 1e-5 Bohr: 8e-11 /
+//! 9e-11 and 1.4e-10 / 1.3e-10 of the largest gradient / force), `body4_features_are_rotation_
+//! invariant` the invariance at both (5.6e-13 relative over five random rotations of a six-atom
+//! H/C/O cluster).
 //!
 //! # Gradients
 //!
@@ -228,15 +238,26 @@ pub struct Basis {
     /// Task 5): on for a shared collection's basis, off for a per-scene model's (`Basis::new`), so
     /// a per-scene sidecar keeps its basis bit for bit.
     pub body4: bool,
+    /// The body-4 block's total degree before the `degree_cap` bound (module doc, "Body-4
+    /// features"): D₄ = min(`degree_cap`, `body4_degree`). Chosen per refit by the provider between
+    /// [`BODY4_DEGREE_START`] and [`BODY4_DEGREE_CAP`] (spec §4.1); [`Basis::new`] sets the start,
+    /// so a per-scene basis keeps its layout bit for bit. Unused while `body4` is false.
+    pub body4_degree: usize,
     /// Sorted, unique nuclear charges.
     pub species: Vec<u8>,
 }
 
-/// The highest total degree of the body-4 block (module doc, "Body-4 features"): D₄ =
-/// min(`degree_cap`, 2). Two keeps Q′ at 38 / 284 / 1 032 / 2 688 for S = 1 / 2 / 3 / 4 species
-/// (D₄ = 3: 52 / 468 / 1 902 / 5 344; 4: 77 / 820 / 3 603 / 10 592 — a 10⁴-column Gram is 0.9 GB
-/// per matrix), and it is the first degree with a genuinely angular four-body term (l = 1, 1, 2).
-pub const BODY4_DEGREE_CAP: usize = 2;
+/// The body-4 degree a basis starts at ([`Basis::body4_degree`]; module doc, "Body-4 features"):
+/// the first degree with a genuinely angular four-body term (l = 1, 1, 2), Q′ = 38 / 284 / 1 032 /
+/// 2 688 for S = 1 / 2 / 3 / 4 species. [`Basis::new`] sets it, so every per-scene basis keeps its
+/// layout.
+pub const BODY4_DEGREE_START: usize = 2;
+
+/// The ceiling of [`Basis::body4_degree`] (spec §4.1): D₄ = 3 gives Q′ = 52 / 468 / 1 902 / 5 344
+/// for S = 1 / 2 / 3 / 4 (a 5 344-column Gram is 0.23 GB per matrix); 4 would give 77 / 820 /
+/// 3 603 / 10 592 (0.9 GB per matrix), measured too slow on the collection. A sidecar's
+/// `body4_cap` outside [`BODY4_DEGREE_START`] ..= [`BODY4_DEGREE_CAP`] is refused.
+pub const BODY4_DEGREE_CAP: usize = 3;
 
 /// The cutoff (Bohr) of a shared collection's basis (M8a Task 6; spec §4.3 "Reach"): the one
 /// place a collection's reach is set (the provider's fit basis, its sampling passes' scan and
@@ -387,6 +408,7 @@ impl Basis {
             degree_cap: 4,
             body3: true,
             body4: false,
+            body4_degree: BODY4_DEGREE_START,
             species,
         }
     }
@@ -526,10 +548,10 @@ impl Basis {
         self.n_body2() + self.n_body3() + self.n_body4()
     }
 
-    /// The total-degree cap of the body-4 block, D₄ = min(`degree_cap`, [`BODY4_DEGREE_CAP`])
-    /// (module doc, "Body-4 features").
+    /// The total-degree cap of the body-4 block, D₄ = min(`degree_cap`, `body4_degree`) (module
+    /// doc, "Body-4 features").
     pub fn body4_cap(&self) -> usize {
-        self.degree_cap.min(BODY4_DEGREE_CAP)
+        self.degree_cap.min(self.body4_degree)
     }
 
     /// Every body-4 term in feature order, handed to `f` (module doc, "Body-4 features"): items
@@ -1404,6 +1426,24 @@ mod tests {
             b.n_independent_columns()
         };
         assert_eq!((q(&[1]), q(&[1, 8]), q(&[1, 6, 7, 8])), (38, 284, 2688));
+        // D₄ = 3 (the ceiling, BODY4_DEGREE_CAP; spec §4.1): the Q′ the D₄ doc quotes
+        let q3 = |sp: &[u8]| {
+            let mut b = Basis::new(sp);
+            b.body4 = true;
+            b.body4_degree = 3;
+            b.n_independent_columns()
+        };
+        assert_eq!((q3(&[1]), q3(&[1, 8]), q3(&[1, 7, 8]), q3(&[1, 6, 7, 8])), (52, 468, 1902, 5344));
+        // the degree is the basis's: the default is the start, the cap reads it
+        assert_eq!(Basis::new(&[1]).body4_degree, BODY4_DEGREE_START);
+        let mut b3 = body4_basis();
+        b3.body4_degree = 3;
+        assert_eq!((b.body4_cap(), b3.body4_cap()), (2, 3));
+        b3.degree_cap = 2;
+        assert_eq!(b3.body4_cap(), 2, "degree_cap still bounds D₄");
+        for t in &b3.body4_terms() {
+            assert!(t.n.iter().sum::<usize>() + t.l.iter().sum::<usize>() / 2 <= 2);
+        }
         // every term obeys the parity, the triangle and the cap, in increasing item order
         let terms = b.body4_terms();
         for t in &terms {
@@ -1421,110 +1461,118 @@ mod tests {
 
     #[test]
     fn body4_features_are_rotation_invariant() {
-        let b = body4_basis();
-        let p4 = b.n_body2() + b.n_body3();
-        let mut worst: f64 = 0.0;
-        for seed in 0..5 {
-            let (pos, z, r) = cluster_and_rotation(seed);
-            let rotated: Vec<[f64; 3]> = pos.iter().map(|p| std::array::from_fn(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f64>() + 0.37)).collect();
-            let a = describe_values(&b, &pos, &z).unwrap();
-            let c = describe_values(&b, &rotated, &z).unwrap();
-            // permuting the atoms permutes the descriptors
-            let perm = [3, 0, 5, 1, 4, 2];
-            let pp: Vec<[f64; 3]> = perm.iter().map(|&i| pos[i]).collect();
-            let pz: Vec<u8> = perm.iter().map(|&i| z[i]).collect();
-            let d = describe_values(&b, &pp, &pz).unwrap();
-            for i in 0..pos.len() {
-                let scale = a[i][p4..].iter().fold(0.0f64, |m, v| m.max(v.abs()));
-                assert!(scale > 0.0, "atom {i} has body-4 features");
-                for k in p4..b.n_features() {
-                    let rel = (a[i][k] - c[i][k]).abs() / a[i][k].abs().max(c[i][k].abs()).max(1e-300);
-                    let abs_ok = (a[i][k] - c[i][k]).abs() <= 1e-14 * scale;
-                    assert!(rel <= 1e-10 || abs_ok, "seed {seed} atom {i} feature {k}: {} vs {}", a[i][k], c[i][k]);
-                    if a[i][k].abs() > 1e-6 * scale {
-                        worst = worst.max(rel);
+        for degree in [BODY4_DEGREE_START, BODY4_DEGREE_CAP] {
+            let mut b = body4_basis();
+            b.body4_degree = degree;
+            assert_eq!(b.body4_cap(), degree);
+            let p4 = b.n_body2() + b.n_body3();
+            let mut worst: f64 = 0.0;
+            for seed in 0..5 {
+                let (pos, z, r) = cluster_and_rotation(seed);
+                let rotated: Vec<[f64; 3]> = pos.iter().map(|p| std::array::from_fn(|i| (0..3).map(|k| r[i][k] * p[k]).sum::<f64>() + 0.37)).collect();
+                let a = describe_values(&b, &pos, &z).unwrap();
+                let c = describe_values(&b, &rotated, &z).unwrap();
+                // permuting the atoms permutes the descriptors
+                let perm = [3, 0, 5, 1, 4, 2];
+                let pp: Vec<[f64; 3]> = perm.iter().map(|&i| pos[i]).collect();
+                let pz: Vec<u8> = perm.iter().map(|&i| z[i]).collect();
+                let d = describe_values(&b, &pp, &pz).unwrap();
+                for i in 0..pos.len() {
+                    let scale = a[i][p4..].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    assert!(scale > 0.0, "atom {i} has body-4 features");
+                    for k in p4..b.n_features() {
+                        let rel = (a[i][k] - c[i][k]).abs() / a[i][k].abs().max(c[i][k].abs()).max(1e-300);
+                        let abs_ok = (a[i][k] - c[i][k]).abs() <= 1e-14 * scale;
+                        assert!(rel <= 1e-10 || abs_ok, "seed {seed} atom {i} feature {k}: {} vs {}", a[i][k], c[i][k]);
+                        if a[i][k].abs() > 1e-6 * scale {
+                            worst = worst.max(rel);
+                        }
+                    }
+                }
+                for (slot, &i) in perm.iter().enumerate() {
+                    for k in 0..b.n_features() {
+                        assert!((d[slot][k] - a[i][k]).abs() <= 1e-12 * a[i][k].abs().max(1.0));
                     }
                 }
             }
-            for (slot, &i) in perm.iter().enumerate() {
-                for k in 0..b.n_features() {
-                    assert!((d[slot][k] - a[i][k]).abs() <= 1e-12 * a[i][k].abs().max(1.0));
-                }
-            }
+            eprintln!("body-4 rotation invariance (D₄ = {degree}): worst relative difference {worst:.2e}");
         }
-        eprintln!("body-4 rotation invariance: worst relative difference {worst:.2e}");
     }
 
     #[test]
     fn body4_forces_match_finite_differences() {
         use rand::{Rng, SeedableRng};
-        let b = body4_basis();
-        let (pos, z, _) = cluster_and_rotation(11);
-        let p = b.n_features();
-        let p4 = b.n_body2() + b.n_body3();
-        // (1) the descriptor's own gradient lists against central differences of its values
-        let desc = describe(&b, &pos, &z).unwrap();
-        let h = 1e-5;
-        let mut worst_g: f64 = 0.0;
-        for (i, atom) in desc.iter().enumerate() {
-            let gmax = atom.grad.iter().flat_map(|(_, g)| g[p4..].iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
-            for (j, g) in &atom.grad {
-                for a in 0..3 {
-                    let mut pp = pos.clone();
-                    pp[*j][a] += h;
-                    let up = describe_values(&b, &pp, &z).unwrap();
-                    pp[*j][a] -= 2.0 * h;
-                    let dn = describe_values(&b, &pp, &z).unwrap();
-                    for k in p4..p {
-                        let fd = (up[i][k] - dn[i][k]) / (2.0 * h);
-                        let err = (fd - g[k][a]).abs() / gmax;
-                        worst_g = worst_g.max(err);
-                        assert!(err < 1e-6, "atom {i} wrt {j}.{a} feature {k}: fd {fd} vs {}", g[k][a]);
+        for degree in [BODY4_DEGREE_START, BODY4_DEGREE_CAP] {
+            let mut b = body4_basis();
+            b.body4_degree = degree;
+            assert_eq!(b.body4_cap(), degree);
+            let (pos, z, _) = cluster_and_rotation(11);
+            let p = b.n_features();
+            let p4 = b.n_body2() + b.n_body3();
+            // (1) the descriptor's own gradient lists against central differences of its values
+            let desc = describe(&b, &pos, &z).unwrap();
+            let h = 1e-5;
+            let mut worst_g: f64 = 0.0;
+            for (i, atom) in desc.iter().enumerate() {
+                let gmax = atom.grad.iter().flat_map(|(_, g)| g[p4..].iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
+                for (j, g) in &atom.grad {
+                    for a in 0..3 {
+                        let mut pp = pos.clone();
+                        pp[*j][a] += h;
+                        let up = describe_values(&b, &pp, &z).unwrap();
+                        pp[*j][a] -= 2.0 * h;
+                        let dn = describe_values(&b, &pp, &z).unwrap();
+                        for k in p4..p {
+                            let fd = (up[i][k] - dn[i][k]) / (2.0 * h);
+                            let err = (fd - g[k][a]).abs() / gmax;
+                            worst_g = worst_g.max(err);
+                            assert!(err < 1e-6, "atom {i} wrt {j}.{a} feature {k}: fd {fd} vs {}", g[k][a]);
+                        }
                     }
                 }
             }
-        }
-        // (2) the hot path's forces (the adjoint) against central differences of its energy, with
-        // random coefficients on the body-4 block only and on everything
-        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
-        for only4 in [true, false] {
-            let coeffs: Vec<Vec<f64>> = (0..b.n_species()).map(|_| (0..p).map(|k| if only4 && k < p4 { 0.0 } else { rng.gen_range(-1.0..1.0) }).collect()).collect();
-            let m = crate::model::Model {
-                basis: b.clone(),
-                coeffs,
-                mean: vec![0.0; p],
-                scale: vec![1.0; p],
-                ref_energy: vec![0.0; b.n_species()],
-                sigma_e: 0.0,
-                sigma_f: 0.0,
-                energy_per_atom: true,
-                lambda: 0.0,
-                sigma_inv_chol: None,
-                n_samples: 0,
-                provenance: crate::model::Provenance { grid_n: 1, h: 1.0, sigma: 1.0, tol: 1.0, charge: 0, multiplicity: None, teacher: String::new(), masses: Vec::new(), ionic: "none".into() },
-                representatives: std::sync::OnceLock::new(),
-            };
-            let (_, f) = crate::model::energy_and_forces(&m, &pos, &z).unwrap();
-            let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));
-            let sum: [f64; 3] = std::array::from_fn(|a| f.iter().map(|v| v[a]).sum::<f64>());
-            assert!(sum.iter().all(|v| v.abs() < 1e-12 * fmax), "ΣF = {sum:?}");
-            let mut worst: f64 = 0.0;
-            for j in 0..pos.len() {
-                for a in 0..3 {
-                    let mut pp = pos.clone();
-                    pp[j][a] += h;
-                    let up = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
-                    pp[j][a] -= 2.0 * h;
-                    let dn = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
-                    let fd = -(up - dn) / (2.0 * h);
-                    let err = (fd - f[j][a]).abs() / fmax;
-                    worst = worst.max(err);
-                    assert!(err < 1e-6, "only4 {only4} atom {j}.{a}: fd {fd} vs {}", f[j][a]);
+            // (2) the hot path's forces (the adjoint) against central differences of its energy, with
+            // random coefficients on the body-4 block only and on everything
+            let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+            for only4 in [true, false] {
+                let coeffs: Vec<Vec<f64>> = (0..b.n_species()).map(|_| (0..p).map(|k| if only4 && k < p4 { 0.0 } else { rng.gen_range(-1.0..1.0) }).collect()).collect();
+                let m = crate::model::Model {
+                    basis: b.clone(),
+                    coeffs,
+                    mean: vec![0.0; p],
+                    scale: vec![1.0; p],
+                    ref_energy: vec![0.0; b.n_species()],
+                    sigma_e: 0.0,
+                    sigma_f: 0.0,
+                    energy_per_atom: true,
+                    lambda: 0.0,
+                    sigma_inv_chol: None,
+                    n_samples: 0,
+                    provenance: crate::model::Provenance { grid_n: 1, h: 1.0, sigma: 1.0, tol: 1.0, charge: 0, multiplicity: None, teacher: String::new(), masses: Vec::new(), ionic: "none".into() },
+                    representatives: std::sync::OnceLock::new(),
+                };
+                let (_, f) = crate::model::energy_and_forces(&m, &pos, &z).unwrap();
+                let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));
+                let sum: [f64; 3] = std::array::from_fn(|a| f.iter().map(|v| v[a]).sum::<f64>());
+                assert!(sum.iter().all(|v| v.abs() < 1e-12 * fmax), "ΣF = {sum:?}");
+                let mut worst: f64 = 0.0;
+                for j in 0..pos.len() {
+                    for a in 0..3 {
+                        let mut pp = pos.clone();
+                        pp[j][a] += h;
+                        let up = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
+                        pp[j][a] -= 2.0 * h;
+                        let dn = crate::model::energy_and_forces(&m, &pp, &z).unwrap().0;
+                        let fd = -(up - dn) / (2.0 * h);
+                        let err = (fd - f[j][a]).abs() / fmax;
+                        worst = worst.max(err);
+                        assert!(err < 1e-6, "only4 {only4} atom {j}.{a}: fd {fd} vs {}", f[j][a]);
+                    }
                 }
+                eprintln!("body-4 forces vs central differences (D₄ = {degree}, only body-4: {only4}): worst {worst:.2e} of max |F| {fmax:.3e}");
             }
-            eprintln!("body-4 forces vs central differences (only body-4: {only4}): worst {worst:.2e} of max |F| {fmax:.3e}");
+            eprintln!("body-4 descriptor gradients vs central differences (D₄ = {degree}): worst {worst_g:.2e}");
         }
-        eprintln!("body-4 descriptor gradients vs central differences: worst {worst_g:.2e}");
     }
 
     #[test]

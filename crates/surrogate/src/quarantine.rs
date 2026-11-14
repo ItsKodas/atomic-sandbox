@@ -30,7 +30,8 @@ pub const Q_DRAFT: u8 = 4;
 /// **Forgotten by the user** (spec `2026-11-12-sample-recovery-design.md` R2: the Model tab's
 /// "Worst-fitting samples" › Forget): kept, but held out of the fit, the envelope, the grade and
 /// the leave-one-out like a held sample ([`Q_HELD`]), and it **fences** like one (geometries near it
-/// fall back to DFT: the safe side, the user said the model should not learn from it). Unlike a
+/// fall back to DFT: the safe side, the user said the model should not learn from it) — until the
+/// teacher agrees with the model there three times in a row ([`Q_FORGOTTEN_UNFENCED`], 2026-11-14). Unlike a
 /// held sample it is **never released** by a refit that reproduces it and never superseded by a
 /// fresh answer near it: only the user's Restore clears it. It counts with the held samples against
 /// the trust recovery's 10 % cap (forgetting is no way round it). Written as a collection status
@@ -56,8 +57,35 @@ pub const Q_DRAFT: u8 = 4;
 /// - A newer build reads every older file and collection as before: code 7 never appears in them.
 pub const Q_FORGOTTEN: u8 = 7;
 
-/// Whether `code` is one a file or a collection may hold ([`Q_NONE`]…[`Q_BOX`] and
-/// [`Q_FORGOTTEN`]; [`Q_DRAFT`] is carried by the sample's tag, 5 and 6 are the provider's own).
+/// **Forgotten, its fence lifted** (2026-11-14, user-approved trust change): a [`Q_FORGOTTEN`]
+/// sample whose neighbourhood earned the model back — three mutually consistent fresh
+/// teacher answers near it agreed with the model (the provider's fence voting, `providers::surrogate`
+/// "Lifting a forgotten sample's fence"). Still forgotten: out of the fit, the envelope, the grade
+/// and the leave-one-out, never released or superseded, listed for Restore (which returns it to
+/// [`Q_NONE`], clearing the lift) and purged by a purge — but it **no longer fences**. Persisted like
+/// code 7 (a collection status record, the sidecar's `sample_quarantine`); a file or collection
+/// written before it holds no 8, so every older file reads as "not lifted".
+///
+/// **An older build meeting code 8**: a model file holding one is refused whole by every earlier
+/// build ("sample_quarantine[i] = 8 is not 0, 1, 2, 3 or 7"; before 2026-11-12, "… 0, 1, 2 or 3");
+/// a shared collection's status record 8 is read as is (the reader keeps any code): that build holds
+/// the sample out of its fit (code ≠ 0), lets the model answer near it (its fence reads 1 and 7),
+/// never releases, supersedes or rewrites it — but does not list it as forgotten (it shows under its
+/// catch-all), so its Restore is this build's. Its Save model and its session autosave (sidecar
+/// writers that check the codes) **fail** while it holds such a sample ("sidecar: quarantine code
+/// 8 (0, 1, 2, 3 or 7)") rather than write it; the collection itself is untouched.
+pub const Q_FORGOTTEN_UNFENCED: u8 = 8;
+
+/// Whether `code` marks a sample the user forgot ([`Q_FORGOTTEN`], or [`Q_FORGOTTEN_UNFENCED`] once
+/// its fence was lifted): what Restore lists and a purge deletes (`crate::collection`, "Purging
+/// forgotten samples").
+pub fn is_forgotten_code(code: u8) -> bool {
+    code == Q_FORGOTTEN || code == Q_FORGOTTEN_UNFENCED
+}
+
+/// Whether `code` is one a file or a collection may hold ([`Q_NONE`]…[`Q_BOX`], [`Q_FORGOTTEN`] and
+/// [`Q_FORGOTTEN_UNFENCED`]; [`Q_DRAFT`] is carried by the sample's tag, 5 and 6 are the provider's
+/// own).
 pub fn is_persisted_code(code: u8) -> bool {
-    matches!(code, Q_NONE | Q_HELD | Q_SUPERSEDED | Q_BOX | Q_FORGOTTEN)
+    matches!(code, Q_NONE | Q_HELD | Q_SUPERSEDED | Q_BOX | Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED)
 }

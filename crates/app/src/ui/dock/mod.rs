@@ -6,12 +6,11 @@
 //! window — is the workspace tree's (`super::workspace::tree`), which draws the tabs and frames these
 //! bodies. All of it is display state: none of it is an `Action`, so nothing here is recorded.
 mod compare;
-mod graph;
 mod log;
 pub mod model;
 pub mod orbitals;
-mod readouts;
-mod selection;
+pub mod readouts;
+pub mod selection;
 pub mod view;
 
 #[cfg(test)]
@@ -31,14 +30,16 @@ pub(super) fn wide_grid(ui: &Ui, id: &str, cols: usize) -> egui::Grid {
     let w = ui.available_width();
     let gap = ui.spacing().item_spacing.x * (cols.saturating_sub(1)) as f32;
     let share = ((w - gap) / cols.max(1) as f32).max(40.0);
-    egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(w.max(share))
+    // a column may grow to what the others leave at their least (it used to be the whole width,
+    // so a long value ran past the panel's right edge instead of wrapping)
+    let most = (w - gap - share * (cols.saturating_sub(1)) as f32).max(share);
+    egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(most)
 }
 
 /// The panel's icon (its tab, docking spec D-4).
 pub(super) fn icon(tab: DockTab) -> Icon {
     match tab {
         DockTab::Readouts => Icon::Readouts,
-        DockTab::Graph => Icon::Graph,
         DockTab::Model => Icon::Model,
         DockTab::Activity => Icon::Activity,
         DockTab::Orbitals => Icon::Orbitals,
@@ -93,16 +94,13 @@ pub(super) fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String
     match tab {
         DockTab::Readouts => match d {
             Some(d) => format!(
-                "Readouts\nT {} · E total {:+.6} Ha\ndrift {}",
+                "Readouts\nT {} · E total {:+.6} Ha\ndrift {}\nE total and T: {} points",
                 super::averaged_temperature_text(d, &st.temp_avg, 1, st.temp_units),
                 d.total,
-                d.drift_per_ps.map_or("—".into(), |x| format!("{x:+.2e} Ha/ps"))
+                d.drift_per_ps.map_or("—".into(), |x| format!("{x:+.2e} Ha/ps")),
+                d.history.len()
             ),
             None => "Readouts\nno solution yet".into(),
-        },
-        DockTab::Graph => match d {
-            Some(d) => format!("Graph\nE total and T: {} points", d.history.len()),
-            None => "Graph".into(),
         },
         DockTab::Model => match input.model() {
             Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m), input.scene, st).text, m.samples, m.epoch),
@@ -161,20 +159,27 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
         }
     });
     ui.add(egui::Separator::default().spacing(6.0));
+    // the body's right edge: the tile's margin is the same on both sides (`workspace::tree`'s
+    // tab body), and while the vertical bar shows it takes its own width instead of floating over
+    // the content's right edge (user report 2026-11-14: cards and right-aligned words touched it)
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating_allocated_width = scroll.floating_allocated_width.max(scroll.bar_width + 2.0);
     egui::ScrollArea::vertical()
         .id_salt(("dock", tab as u8))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
+            // the body's visible part and its content rect (the tests' margin checks)
+            super::probe_rect(&format!("dock-clip-{}", tab.name()), ui.clip_rect());
+            super::probe_rect(&format!("dock-content-{}", tab.name()), ui.max_rect());
             match tab {
                 DockTab::Readouts => readouts::show(ui, st, input, acts),
-                DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
                 DockTab::Activity => super::activity::show(ui, st, input, acts),
                 DockTab::Orbitals => orbitals::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
-                DockTab::Knowledge => super::knowledge::tab(ui, st, input),
+                DockTab::Knowledge => super::knowledge::tab(ui, st, input, acts),
                 DockTab::View => view::show(ui, st, acts),
             }
         });

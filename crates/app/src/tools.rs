@@ -19,9 +19,6 @@ pub struct ToolState {
     pub spring: bool,
     /// (point, unit normal) of the plane the dragged nucleus moves in.
     pub drag_plane: Option<(Vec3, Vec3)>,
-    /// The Select-drag has moved its nucleus (a plain select-click has not): its end arms the
-    /// refresh of the bonds after a drag (`ui::auto_bonds`).
-    pub drag_moved: bool,
     /// Last cursor position over the 3D view (window physical pixels); `None` while it is over the
     /// chrome or outside the viewport.
     pub cursor: Option<(f32, f32)>,

@@ -46,6 +46,11 @@ impl Checkpoints {
     pub(super) fn new(dir: PathBuf) -> Checkpoints {
         Checkpoints { dir, written: None, owns: false, failed: false }
     }
+
+    /// The checkpoint folder.
+    pub(super) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
 }
 
 /// The interrupted pass in `dir`, if there is one that can be read: its checkpoint text and header.

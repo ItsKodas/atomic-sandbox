@@ -66,6 +66,9 @@ pub struct ModelStatus {
     pub epoch: u64,
     /// The last fit: samples, Q′, rmse E (Ha/atom), rmse F (Ha/Bohr per component).
     pub fit: Option<(usize, usize, f64, f64)>,
+    /// The standing model's body-4 degree D₄ (`sim::TrainableStatus::body4_degree`: a shared
+    /// collection's, grown with its samples); `None` per scene.
+    pub body4_degree: Option<usize>,
     /// The worst training residuals (Ha/atom; Ha/Bohr per component, and that atom's bound).
     pub residuals: Option<(f64, f64, f64)>,
     /// The tightest per-atom force-uncertainty bound at the current forces (Ha/Bohr per
@@ -112,6 +115,13 @@ pub struct ModelStatus {
     pub suspects: Vec<sim::SampleSuspect>,
     /// The samples the user forgot (`sim::Trainable::forgotten_samples`), each with Restore.
     pub forgotten_samples: Vec<sim::SampleSuspect>,
+    /// The user's Forget / Restore changes no fit holds yet (`sim::Trainable::user_changes_pending`;
+    /// 2026-11-14, the batched forget): while a refit runs, the ones made since it started.
+    pub user_changes_pending: usize,
+    /// When the refit they asked for starts (the worker's debounce, [`UserRefit`]; `None`: none
+    /// waiting) and whether a background refit runs now: the Model tab's banner.
+    pub refit_due: Option<Instant>,
+    pub refit_running: bool,
     /// Superseded quarantined samples, box-affected samples excluded from the fit, and samples
     /// kept since the last refit: with `quarantined`, what the store holds beyond the fit
     /// (`samples` = fit + quarantined + superseded + box_excluded + unfitted right after a refit;
@@ -183,6 +193,15 @@ pub struct ModelStatus {
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
     pub last_import: Option<Result<sim::ImportSummary, String>>,
+    /// Why "Purge forgotten (N)…" is disabled now (`sim::Trainable::purge_refusal`), `None` when it
+    /// may run.
+    pub purge_refusal: Option<String>,
+    /// Of the forgotten samples, those the shared collection holds
+    /// (`sim::Trainable::forgotten_in_collection`): the confirmation's words.
+    pub forgotten_in_collection: usize,
+    /// The last [`Command::PurgeForgotten`]'s outcome with its number (each shown once on the
+    /// status line: [`purge_line`]).
+    pub last_purge: Option<(u64, Result<sim::PurgeReport, String>)>,
     /// The user's choice is the shared collection (a folder is set, and no model file was picked
     /// since): the Model tab's switch shows it, also while a charged scene learns per-scene.
     pub use_collection: bool,
@@ -246,7 +265,8 @@ pub const IMPORT_REFERENCES_NOTE: &str = "imported species are fitted only after
 ///
 /// **Only for a condition of the fit the box samples are in** (activity plan review S15): the
 /// first unmet [`TrustKey`](sim::activity::TrustKey) must be the training energies, the training
-/// forces or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
+/// forces, the training samples the fit cannot reproduce (`Misfit`: before it, those samples
+/// failed the residual rows) or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
 /// Sample more cures it, whatever the box does, M6 final re-review), nor for a failed audit
 /// (`Audit`, `AuditForces`: judged against a fresh teacher answer that is not box-affected).
 /// Keyed on the check list the provider exports, no longer on the refusal's wording.
@@ -260,7 +280,7 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
         .trust_checks
         .iter()
         .find(|c| !c.met)
-        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::ForceNoise));
+        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::Misfit | TrustKey::ForceNoise));
     (m.fitted && !m.trusted && fit_condition && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
 
@@ -283,6 +303,13 @@ pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: us
     } else {
         line
     }
+}
+
+/// The Model tab's "last fit" line: "N samples, Q′ q: rmse e Ha/atom, f Ha/Bohr", and
+/// ", body-4 degree d" for a collection's basis (spec 2026-11-13 §4.1).
+pub fn last_fit_line((n, q, e, f): (usize, usize, f64, f64), body4_degree: Option<usize>) -> String {
+    let d4 = body4_degree.map_or(String::new(), |d| format!(", body-4 degree {d}"));
+    format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr{d4}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -454,6 +481,121 @@ pub(super) const REFIT_SAMPLES: usize = 25;
 /// runs — must not keep the model from moving).
 pub(super) const REFIT_DISCARDS_BEFORE_SYNC: u32 = 2;
 
+/// The pending refit after the user's Forget / Restore waits this long after the **last** one
+/// (2026-11-14, the batched forget; `worker` module doc, "Refits"): a refit with a non-empty misfit
+/// set can take minutes, so a run of Forgets is applied at once and refitted once.
+pub const FORGET_REFIT_DELAY: Duration = Duration::from_secs(10);
+
+/// The refit the user's Forget / Restore asked for (2026-11-14, the batched forget; `worker` module
+/// doc, "Refits"): **debounced** — due [`FORGET_REFIT_DELAY`] after the last change (each change
+/// restarts the wait), or at once after **Refit now**. Timing only: what is forgotten is the
+/// provider's, written at the click; this decides when the refit that fits it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct UserRefit {
+    /// When the refit may start; `None`: the user asked for none.
+    due: Option<Instant>,
+}
+
+/// What [`UserRefit::gate`] lets a refit do now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RefitGate {
+    /// The user asked for no refit: the usual rules (the throttle while playing).
+    Free,
+    /// A refit the user asked for is waiting for its moment: no refit starts before it.
+    Hold(Instant),
+    /// Its moment came (or Refit now): start it, not throttled.
+    Start,
+}
+
+/// What [`refit_start`] reads (`Worker::refit_if_pending`): the snapshot's play state, the
+/// provider's `pending_refit` / `fitted` / `user_changes_pending`, the playing throttle
+/// ([`REFIT_INTERVAL`], [`REFIT_SAMPLES`]) and the background discards in a row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RefitInputs {
+    pub paused: bool,
+    pub pending: bool,
+    pub fitted: bool,
+    pub user_changes: usize,
+    pub throttled: bool,
+    pub discards: u32,
+}
+
+/// What [`refit_start`] decided.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RefitStart {
+    /// No refit now.
+    Wait,
+    /// Start one in the background (`Trainable::begin_refit_background`; in the tick if the
+    /// provider cannot).
+    Background,
+    /// Run one in the tick.
+    InTick,
+}
+
+/// Whether a refit starts now, none running (`worker` module doc, "Refits"; `Worker::refit_if_pending`
+/// once its background poll and the pass check are past). Nothing due, or nothing fitted yet (the
+/// pass makes the first fit): no refit, and the user's request is dropped. The user's Forget /
+/// Restore holds every refit until its moment ([`UserRefit`]); then it starts, not throttled. A
+/// refit for the user's changes, or one they asked for, runs **in the background, paused too**
+/// (2026-11-14: it can take minutes, and the Model tab must stay usable); any other runs in the
+/// background while playing and in the tick while paused, as before. After
+/// [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row a playing refit runs in the tick (so the model
+/// still moves), but a paused one for the user's changes stays in the background (review M2: it
+/// would block the paused worker for minutes; paused, nothing steps, so a discard needs a change
+/// the user made — each discard's note says what).
+pub(crate) fn refit_start(u: &mut UserRefit, at: Instant, i: RefitInputs) -> RefitStart {
+    if !i.pending || !i.fitted {
+        u.clear();
+        return RefitStart::Wait;
+    }
+    let asked = match u.gate(at) {
+        RefitGate::Hold(_) => return RefitStart::Wait,
+        RefitGate::Start => true,
+        RefitGate::Free => false,
+    };
+    if i.throttled && !asked {
+        return RefitStart::Wait;
+    }
+    u.clear();
+    let user = asked || i.user_changes > 0;
+    if (user && i.paused) || ((!i.paused || user) && i.discards < REFIT_DISCARDS_BEFORE_SYNC) {
+        RefitStart::Background
+    } else {
+        RefitStart::InTick
+    }
+}
+
+impl UserRefit {
+    /// A Forget / Restore (or a batch of them) was applied at `at`: the wait restarts.
+    pub fn changed(&mut self, at: Instant) {
+        self.due = Some(at + FORGET_REFIT_DELAY);
+    }
+
+    /// **Refit now** at `at`: due at once (after a running refit lands, if one runs).
+    pub fn refit_now(&mut self, at: Instant) {
+        self.due = Some(at);
+    }
+
+    /// Whether a refit may start at `at` (none is running).
+    pub fn gate(&self, at: Instant) -> RefitGate {
+        match self.due {
+            None => RefitGate::Free,
+            Some(d) if at >= d => RefitGate::Start,
+            Some(d) => RefitGate::Hold(d),
+        }
+    }
+
+    /// A refit started (it fits every change so far), or none is due any more.
+    pub fn clear(&mut self) {
+        self.due = None;
+    }
+
+    /// When the refit is due (`None`: not asked for).
+    pub fn due(&self) -> Option<Instant> {
+        self.due
+    }
+}
+
 impl Worker {
     /// [`Command::EnsureModel`] (`worker` module doc, "Teaching"; "Autosave" for the ownership).
     pub(super) fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan, auto_pass: bool) {
@@ -577,6 +719,46 @@ impl Worker {
         self.dy.add_note(note);
     }
 
+    /// [`Command::PurgeForgotten`]: every forgotten sample deleted for good
+    /// (`Trainable::purge_forgotten`); no refit (the fit stands). The outcome is
+    /// `ModelStatus::last_purge`; the provider's note goes to the log.
+    pub(super) fn purge_forgotten(&mut self, confirmed: usize) {
+        let Some(t) = trainable(&mut self.dy) else {
+            self.error("purge forgotten samples: the estimated solver is not running".into());
+            return;
+        };
+        let now = t.forgotten_samples().len();
+        let r = if now != confirmed {
+            Err(format!("the forgotten list changed ({confirmed} confirmed, {now} now) — nothing purged; confirm again"))
+        } else {
+            t.purge_forgotten()
+        };
+        let slug = match t.model_source() {
+            sim::ModelSource::Collection { slug, .. } => Some(slug),
+            _ => None,
+        };
+        for n in t.take_notes() {
+            self.dy.add_note(n);
+        }
+        if let Ok(p) = &r {
+            // the model file in use no longer holds what is on disk: the autosave is this worker's
+            self.owns_autosave = true;
+            // an interrupted pass's checkpoint of this collection counts its samples file as it was
+            // (`checkpoint` module doc): discarded, never resumed against the renumbered file
+            if let (Some(ck), Some(slug), true) = (self.checkpoints.as_ref(), slug, p.from_collection > 0) {
+                let dir = ck.dir().to_path_buf();
+                if let Some((_, info)) = super::checkpoint::interrupted_pass(&dir) {
+                    if super::checkpoint::is_collection_checkpoint(&info) && info.provenance.starts_with(&format!("{}{slug}:", providers::surrogate::COLLECTION_CHECKPOINT_PREFIX)) {
+                        super::checkpoint::discard_interrupted_pass(&dir);
+                        self.dy.add_note("the interrupted training of this collection was discarded: the purge renumbered its samples, so it cannot resume".into());
+                    }
+                }
+            }
+        }
+        let k = self.last_purge.as_ref().map_or(1, |(k, _)| k + 1);
+        self.last_purge = Some((k, r));
+    }
+
     /// [`Command::SaveSpecialised`]: the attached collection's samples within `species` to `path`
     /// (`Trainable::save_specialised`); a note when written, an error when refused.
     pub(super) fn save_specialised(&mut self, path: &std::path::Path, species: &[u8]) {
@@ -648,11 +830,12 @@ impl Worker {
         (snap.sampling, snap.notes, snap.notes_total) = (d.sampling, d.notes, d.notes_total);
     }
 
-    /// Active learning (`worker` module doc, "Refits"): the surrogate kept a fallback sample and no pass
-    /// is running (a pass refits at its end).
-    /// Whether a refit ran.
+    /// Active learning (`worker` module doc, "Refits"): the surrogate kept a fallback sample, or the
+    /// user forgot or restored samples, and no pass is running (a pass refits at its end); when a
+    /// refit starts is [`refit_start`]'s.
+    /// Whether the model's state moved: a refit ran, landed, was discarded or started.
     pub(super) fn refit_if_pending(&mut self, snap: &DynSnapshot) -> bool {
-        // a background refit (playing): installed or discarded between ticks
+        // a background refit (playing, or the user's): installed or discarded between ticks
         if let Some(started) = self.refit_started {
             let Some(s) = trainable(&mut self.dy) else {
                 self.refit_started = None;
@@ -679,28 +862,32 @@ impl Worker {
             }
         }
         if sampling_active(snap) {
+            // the pass's own fit at its end holds the user's changes; the debounce waits meanwhile
             return false;
         }
-        let requested = self.refit_requested;
-        let Some(s) = trainable(&mut self.dy) else { return false };
-        // before the first fit there are no reference energies (the pass computes them and
-        // makes the first fit at its end): rule-1 fallback samples wait for it
-        if !s.pending_refit() || !s.fitted() {
-            self.refit_requested = false;
+        let at = Instant::now();
+        let Some(s) = trainable(&mut self.dy) else {
+            self.user_refit.clear();
             return false;
-        }
-        // the user's Forget / Restore of a sample asks for the refit now: not throttled
-        if let (false, Some(at), false) = (snap.paused, self.last_refit_at, requested) {
-            if at.elapsed() < REFIT_INTERVAL && s.samples() < self.samples_at_refit + REFIT_SAMPLES {
-                return false;
+        };
+        let throttled = !snap.paused && self.last_refit_at.is_some_and(|t| t.elapsed() < REFIT_INTERVAL) && s.samples() < self.samples_at_refit + REFIT_SAMPLES;
+        let inputs = RefitInputs {
+            paused: snap.paused,
+            pending: s.pending_refit(),
+            fitted: s.fitted(),
+            user_changes: s.user_changes_pending(),
+            throttled,
+            discards: self.refit_discards,
+        };
+        match refit_start(&mut self.user_refit, at, inputs) {
+            RefitStart::Wait => return false,
+            // off the step path; a provider that cannot runs it in the tick
+            // (published at once: the banner and the busy state follow it)
+            RefitStart::Background if s.begin_refit_background() => {
+                self.refit_started = Some(at);
+                return true;
             }
-        }
-        self.refit_requested = false;
-        // playing: off the step path (module doc, "Refits") — unless background refits keep being
-        // discarded, then once in the tick
-        if !snap.paused && self.refit_discards < REFIT_DISCARDS_BEFORE_SYNC && s.begin_refit_background() {
-            self.refit_started = Some(Instant::now());
-            return false;
+            RefitStart::Background | RefitStart::InTick => {}
         }
         let t = Instant::now();
         let fit = s.refit();
@@ -709,18 +896,26 @@ impl Worker {
         true
     }
 
-    /// [`Command::ForgetSample`] / [`Command::RestoreSample`] (spec 2026-11-12 R2): the provider
-    /// writes the sample's status at once (`Trainable::forget_sample`) and a refit is asked for —
-    /// at the next tick, unthrottled, in the background while playing as every refit is
-    /// (`refit_if_pending`; a background refit already running lands first and keeps the user's
-    /// code, then this one starts). A refusal is the error line.
-    pub(super) fn user_sample(&mut self, id: sim::SampleId, forget: bool) {
-        let index = id.index;
+    /// [`Command::ForgetSample`] / [`Command::RestoreSample`] and their batches
+    /// [`Command::ForgetSamples`] / [`Command::RestoreSamples`] (spec 2026-11-12 R2; the batched
+    /// forget, 2026-11-14): the provider writes the samples' status at once
+    /// (`Trainable::forget_samples`: all or nothing — a stale id refuses the batch whole; past the
+    /// recovery's cap it is applied with its warning) — so they fence at once — and the refit that fits them is **debounced**
+    /// ([`UserRefit`]: [`FORGET_REFIT_DELAY`] after the last change, or Refit now), then runs in
+    /// the background, paused too (`refit_if_pending`). A change while a refit runs is applied at
+    /// once (the provider re-applies it at the install) and makes one more refit due after it.
+    /// A refusal is the error line.
+    pub(super) fn user_samples(&mut self, ids: &[sim::SampleId], forget: bool) {
+        let verb = if forget { "forget" } else { "restore" };
+        let what = match ids {
+            [one] => format!("sample #{}", one.index),
+            _ => format!("{} samples", ids.len()),
+        };
         let Some(s) = trainable(&mut self.dy) else {
-            self.error(format!("{} sample #{index}: the estimated solver is not running", if forget { "forget" } else { "restore" }));
+            self.error(format!("{verb} {what}: the estimated solver is not running"));
             return;
         };
-        let r = if forget { s.forget_sample(id) } else { s.restore_sample(id) };
+        let r = if forget { s.forget_samples(ids) } else { s.restore_samples(ids) };
         // the provider's words on it (where the status was written) now, not at the next step
         let notes = s.take_notes();
         for n in notes {
@@ -728,10 +923,19 @@ impl Worker {
         }
         match r {
             Ok(()) => {
-                self.refit_requested = true;
+                self.user_refit.changed(Instant::now());
                 self.owns_autosave = true;
             }
-            Err(e) => self.error(format!("{} sample #{index}: {e}", if forget { "forget" } else { "restore" })),
+            Err(e) => self.error(format!("{verb} {what}: {e}")),
+        }
+    }
+
+    /// [`Command::RefitNow`]: the pending refit after the user's changes starts at once — after a
+    /// running refit lands, if one runs. Nothing pending: nothing to do.
+    pub(super) fn refit_now(&mut self) {
+        let pending = trainable(&mut self.dy).is_some_and(|s| s.pending_refit() && s.fitted());
+        if pending {
+            self.user_refit.refit_now(Instant::now());
         }
     }
 
@@ -769,7 +973,9 @@ impl Worker {
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
         let (collections, last_import, use_collection) = (self.collections.is_some(), self.last_import.clone(), self.use_collection && self.collections.is_some());
+        let last_purge = self.last_purge.clone();
         let autosave = self.autosave.clone();
+        let (refit_due, refit_running) = (self.user_refit.due(), self.refit_started.is_some());
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
         let source_is_autosave = matches!((&st.model_source, &autosave), (sim::ModelSource::File(p), Some(a)) if p == a);
@@ -788,6 +994,7 @@ impl Worker {
             pending_refit: st.pending_refit,
             epoch: st.epoch,
             fit: st.fit,
+            body4_degree: st.body4_degree,
             residuals: st.residuals,
             force_bound: st.force_bound,
             provenance_mismatch: st.provenance_mismatch,
@@ -804,6 +1011,9 @@ impl Worker {
             forgotten: st.forgotten,
             suspects: s.sample_suspects(),
             forgotten_samples: s.forgotten_samples(),
+            user_changes_pending: s.user_changes_pending(),
+            refit_due,
+            refit_running,
             superseded: st.superseded,
             box_excluded: st.box_excluded,
             unfitted: st.unfitted,
@@ -831,6 +1041,9 @@ impl Worker {
             lone_note: st.lone_note,
             collections,
             last_import,
+            purge_refusal: s.purge_refusal(),
+            forgotten_in_collection: s.forgotten_in_collection(),
+            last_purge,
             use_collection,
             source_is_autosave,
             specialised: s.specialised(),
@@ -874,7 +1087,14 @@ impl Worker {
 
 #[cfg(test)]
 mod fit_vs_held_tests {
-    use super::fit_vs_held;
+    use super::{fit_vs_held, last_fit_line};
+
+    /// Spec 2026-11-13 §4.1: a collection's fit line names its body-4 degree; a per-scene one does not.
+    #[test]
+    fn the_last_fit_line_names_a_collections_body4_degree() {
+        assert_eq!(last_fit_line((271, 40, 2.1e-6, 1.6e-5), None), "271 samples, Q′ 40: rmse 2.1e-6 Ha/atom, 1.6e-5 Ha/Bohr");
+        assert_eq!(last_fit_line((612, 468, 2.1e-6, 1.6e-5), Some(3)), "612 samples, Q′ 468: rmse 2.1e-6 Ha/atom, 1.6e-5 Ha/Bohr, body-4 degree 3");
+    }
 
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
@@ -891,5 +1111,215 @@ mod fit_vs_held_tests {
             fit_vs_held(1698, 1805, 0, 105, 1, 2, 1, 0, 0, 0),
             "1698 of 1805 held: 105 quarantined, 1 superseded, 1 forgotten; 1 forgotten since this fit (out at the next refit)"
         );
+    }
+}
+
+/// The status line after a purge (`ModelStatus::last_purge`): "purged N forgotten samples (backup:
+/// samples.bin.bak)", or the refusal.
+pub fn purge_line(r: &Result<sim::PurgeReport, String>) -> String {
+    match r {
+        Ok(p) => {
+            let s = if p.purged == 1 { "" } else { "s" };
+            let name = |b: &std::path::Path| b.file_name().map_or_else(|| b.display().to_string(), |f| f.to_string_lossy().into_owned());
+            let line = match (&p.backup, p.collection_mode) {
+                (Some(b), _) if p.from_collection == p.purged => format!("purged {} forgotten sample{s} (backup: {})", p.purged, name(b)),
+                (Some(b), _) => format!("purged {} forgotten sample{s}: {} from the shared collection (backup: {}), {} session-only", p.purged, p.from_collection, name(b), p.purged - p.from_collection),
+                (None, true) => format!("purged {} forgotten session-only sample{s}", p.purged),
+                (None, false) => format!("purged {} forgotten sample{s} from the model (Save model writes the model file without them)", p.purged),
+            };
+            match &p.warning {
+                Some(w) => format!("{line} — but {w}"),
+                None => line,
+            }
+        }
+        Err(e) => format!("purge forgotten samples refused: {e}"),
+    }
+}
+
+/// The pending refit after the user's Forget / Restore (2026-11-14, the batched forget): the
+/// debounce ([`UserRefit`]) and [`refit_start`], driven through simulated time with a stand-in for
+/// the provider's state — the order `Worker::refit_if_pending` takes them in: a running background
+/// refit is polled first (installed when its wall is over: the changes made meanwhile stay
+/// pending, as `providers::surrogate`'s install leaves them), then `refit_start` decides.
+#[cfg(test)]
+mod debounce_tests {
+    use super::{refit_start, RefitGate, RefitInputs, RefitStart, UserRefit, FORGET_REFIT_DELAY, REFIT_DISCARDS_BEFORE_SYNC};
+    use std::time::{Duration, Instant};
+
+    /// The provider's side: a refit due, the user's changes no fit holds, a background refit
+    /// running until a time (it holds the changes made before it), and every refit started.
+    struct Fake {
+        pending: bool,
+        changes: usize,
+        running_until: Option<Instant>,
+        started: Vec<(Instant, RefitStart)>,
+        wall: Duration,
+        user: UserRefit,
+    }
+
+    impl Fake {
+        fn new(wall: Duration) -> Fake {
+            Fake { pending: false, changes: 0, running_until: None, started: Vec::new(), wall, user: UserRefit::default() }
+        }
+        /// A Forget / Restore (or a batch): applied at once, a refit due, the wait restarts.
+        fn change(&mut self, at: Instant, n: usize) {
+            self.pending = true;
+            self.changes += n;
+            self.user.changed(at);
+        }
+        /// One worker tick at `at`.
+        fn tick(&mut self, at: Instant, paused: bool) {
+            if let Some(end) = self.running_until {
+                if at < end {
+                    return;
+                }
+                // installed: what was made while it ran is still due
+                self.running_until = None;
+                self.pending = self.changes > 0;
+            }
+            let i = RefitInputs { paused, pending: self.pending, fitted: true, user_changes: self.changes, throttled: false, discards: 0 };
+            match refit_start(&mut self.user, at, i) {
+                RefitStart::Wait => {}
+                RefitStart::Background => {
+                    self.started.push((at, RefitStart::Background));
+                    self.running_until = Some(at + self.wall);
+                    self.changes = 0;
+                    self.pending = false;
+                }
+                RefitStart::InTick => {
+                    self.started.push((at, RefitStart::InTick));
+                    self.changes = 0;
+                    self.pending = false;
+                }
+            }
+        }
+        /// Ticks every 16 ms from `from` for `secs` s, with `events` (offset s, n changes) on the way.
+        fn run(&mut self, from: Instant, secs: f64, paused: bool, events: &[(f64, usize)]) {
+            let mut ev = events.iter().peekable();
+            let mut t = 0.0;
+            while t <= secs {
+                let at = from + Duration::from_secs_f64(t);
+                while let Some(&&(e, n)) = ev.peek() {
+                    if e > t {
+                        break;
+                    }
+                    self.change(from + Duration::from_secs_f64(e), n);
+                    ev.next();
+                }
+                self.tick(at, paused);
+                t += 0.016;
+            }
+        }
+    }
+
+    fn secs(a: Instant, b: Instant) -> f64 {
+        b.duration_since(a).as_secs_f64()
+    }
+
+    /// Three quick Forgets refit once, FORGET_REFIT_DELAY after the last — not three times, and not
+    /// before; paused, in the background (never in the tick: the Model tab stays usable).
+    #[test]
+    fn three_quick_forgets_refit_once_after_the_delay() {
+        let t0 = Instant::now();
+        let mut f = Fake::new(Duration::from_secs(3));
+        f.run(t0, 40.0, true, &[(0.0, 1), (1.0, 1), (2.0, 1)]);
+        assert_eq!(f.started.len(), 1, "{:?}", f.started.iter().map(|(t, k)| (secs(t0, *t), *k)).collect::<Vec<_>>());
+        let (at, how) = f.started[0];
+        let d = FORGET_REFIT_DELAY.as_secs_f64();
+        assert!(secs(t0, at) >= 2.0 + d && secs(t0, at) < 2.0 + d + 0.05, "starts {} s after the last change", secs(t0, at) - 2.0);
+        assert_eq!(how, RefitStart::Background);
+        assert!(!f.pending && f.changes == 0 && f.user.due().is_none());
+    }
+
+    /// A Forget while the refit runs (a long one: a non-empty misfit set) is applied at once and
+    /// refitted exactly once more, after the running one lands — coalesced, not cancelled; a run of
+    /// changes during it still makes only one.
+    #[test]
+    fn a_forget_during_a_running_refit_makes_exactly_one_more() {
+        let t0 = Instant::now();
+        let mut f = Fake::new(Duration::from_secs(60));
+        // the first refit starts at 10 s and runs to 70 s; changes at 15, 20 and 25 s
+        f.run(t0, 300.0, true, &[(0.0, 1), (15.0, 1), (20.0, 2), (25.0, 1)]);
+        let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
+        assert_eq!(at.len(), 2, "{at:?}");
+        assert!((at[0] - 10.0).abs() < 0.05, "{at:?}");
+        // the second starts as the first lands (its wait, to 35 s, is long over)
+        assert!((at[1] - 70.0).abs() < 0.05, "{at:?}");
+        assert_eq!(f.changes, 0);
+    }
+
+    /// … and a change late in the running refit still waits its full delay after the landing if
+    /// that comes first: the debounce is from the last change.
+    #[test]
+    fn a_change_just_before_the_landing_still_waits_its_delay() {
+        let t0 = Instant::now();
+        let mut f = Fake::new(Duration::from_secs(5));
+        // first refit 10 → 15 s; a change at 14 s: due at 24 s
+        f.run(t0, 60.0, true, &[(0.0, 1), (14.0, 1)]);
+        let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
+        assert_eq!(at.len(), 2, "{at:?}");
+        assert!((at[1] - 24.0).abs() < 0.05, "{at:?}");
+    }
+
+    /// Refit now starts it at the next tick, without waiting; during a running refit it starts the
+    /// queued one as soon as that lands.
+    #[test]
+    fn refit_now_starts_it_at_once() {
+        let t0 = Instant::now();
+        let mut f = Fake::new(Duration::from_secs(30));
+        f.change(t0, 2);
+        f.tick(t0 + Duration::from_millis(500), true);
+        assert!(f.started.is_empty(), "waiting");
+        assert!(matches!(f.user.gate(t0 + Duration::from_millis(500)), RefitGate::Hold(_)));
+        f.user.refit_now(t0 + Duration::from_secs(1));
+        f.tick(t0 + Duration::from_secs(1), true);
+        assert_eq!(f.started.len(), 1);
+        assert_eq!(f.started[0], (t0 + Duration::from_secs(1), RefitStart::Background));
+        // a change while it runs, then Refit now: the queued one starts as the running one lands (31 s)
+        f.change(t0 + Duration::from_secs(2), 1);
+        f.user.refit_now(t0 + Duration::from_secs(3));
+        f.run(t0 + Duration::from_secs(3), 40.0, true, &[]);
+        let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
+        assert_eq!(at.len(), 2, "{at:?}");
+        assert!((at[1] - 31.0).abs() < 0.05, "{at:?}");
+    }
+
+    /// The rest of `refit_start`: while the user's refit waits, no refit starts (a fallback's
+    /// either: the model keeps its last fit); once due it is not throttled; nothing due or nothing
+    /// fitted drops the request; a paused refit for a fallback sample alone runs in the tick as
+    /// before, a playing one in the background; repeated discards run it in the tick.
+    #[test]
+    fn the_gate_and_the_mode() {
+        let t0 = Instant::now();
+        let base = RefitInputs { paused: true, pending: true, fitted: true, user_changes: 0, throttled: false, discards: 0 };
+        // nothing asked: a paused fallback refit in the tick, a playing one in the background, a
+        // throttled one waits
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, base), RefitStart::InTick);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { paused: false, ..base }), RefitStart::Background);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { paused: false, throttled: true, ..base }), RefitStart::Wait);
+        // pending user changes without a wait (a discarded refit gave them back): background, paused too
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { user_changes: 2, ..base }), RefitStart::Background);
+        // waiting: nothing starts, not even a playing fallback refit
+        let mut u = UserRefit::default();
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0 + Duration::from_secs(1), RefitInputs { paused: false, user_changes: 1, ..base }), RefitStart::Wait);
+        assert!(u.due().is_some(), "still waiting");
+        // due: not throttled, in the background
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, throttled: true, user_changes: 1, ..base }), RefitStart::Background);
+        assert!(u.due().is_none(), "started");
+        // repeated discards: a playing refit in the tick (the model must move); a paused one for
+        // the user's changes stays in the background (review M2)
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick);
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::Background);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick, "a paused fallback refit, as before");
+        // nothing due (a pass's fit took the changes) or nothing fitted: the request is dropped
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0, RefitInputs { pending: false, ..base }), RefitStart::Wait);
+        assert!(u.due().is_none());
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0, RefitInputs { fitted: false, ..base }), RefitStart::Wait);
+        assert!(u.due().is_none());
     }
 }

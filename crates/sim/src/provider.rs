@@ -1124,6 +1124,26 @@ pub trait Trainable {
     fn restore_sample(&mut self, _id: SampleId) -> Result<(), String> {
         Err("this provider does not learn".into())
     }
+    /// **Forgets** every stored sample `ids` names as one batch (2026-11-14, the Model tab's
+    /// "Forget N selected"): all or nothing — each id checked as for
+    /// [`forget_sample`](Self::forget_sample), and a batch that would take the held and forgotten
+    /// samples together past the trust recovery's cap is applied with its warning, as one Forget. Written at once, one refit
+    /// due. `Err` with the reason, nothing changed. The default: one at a time, stopping at the
+    /// first refusal (a provider without batches).
+    fn forget_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
+        ids.iter().try_for_each(|&id| self.forget_sample(id))
+    }
+    /// Puts every forgotten sample `ids` names back as one batch ("Restore N selected"): all or
+    /// nothing, written at once, one refit due. The default: one at a time.
+    fn restore_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
+        ids.iter().try_for_each(|&id| self.restore_sample(id))
+    }
+    /// The user's Forget / Restore changes no fit holds yet (2026-11-14): made since the fit that
+    /// stands, or — while a background refit runs — since it started. Each made a refit due; the
+    /// worker debounces that refit and the Model tab counts them. The default: 0.
+    fn user_changes_pending(&self) -> usize {
+        0
+    }
     /// The worst-fitting samples of the fit that stands, worst first (at most 8): ranked by their
     /// leave-one-out ratio from that fit's own cache, only the samples fitted now (a sample held or
     /// forgotten since is left out). Empty without a model or before a ranking exists. The default:
@@ -1135,6 +1155,28 @@ pub trait Trainable {
     /// that stands still holds it). The default: empty.
     fn forgotten_samples(&self) -> Vec<SampleSuspect> {
         Vec::new()
+    }
+    /// **Purges** every sample the user forgot, for good (the Model tab's "Purge forgotten (N)…"):
+    /// deleted from the model's samples and, when they are in the attached shared collection, from
+    /// its samples file (rewritten atomically, the old file kept as `samples.bin.bak`). Only
+    /// forgotten samples go — never held, superseded, box-affected or draft ones. The fit stands
+    /// unchanged (forgotten samples are already out of it): no refit. Sample ids are positional, so
+    /// every later sample is renumbered — a [`SampleId`] taken before the purge is refused after it.
+    /// `Err` with the reason, nothing changed ([`purge_refusal`](Self::purge_refusal)'s reasons, a
+    /// failed write). The default refuses.
+    fn purge_forgotten(&mut self) -> Result<PurgeReport, String> {
+        Err("this provider does not learn".into())
+    }
+    /// Why [`purge_forgotten`](Self::purge_forgotten) would be refused now (`None`: it may run):
+    /// nothing forgotten, a pass or a refit running, the refit after a Forget not run yet, another
+    /// copy of the app holding the collection's lock. The default: it does not learn.
+    fn purge_refusal(&self) -> Option<String> {
+        Some("this provider does not learn".into())
+    }
+    /// How many of the forgotten samples the attached shared collection holds (the rest are
+    /// session-only, or a model file's): the purge confirmation's words. The default: 0.
+    fn forgotten_in_collection(&self) -> usize {
+        0
     }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
@@ -1232,6 +1274,9 @@ pub struct TrainableStatus {
     pub epoch: u64,
     /// The last fit: (samples, Q′, rmse E per atom, rmse F).
     pub fit: Option<(usize, usize, f64, f64)>,
+    /// The standing model's body-4 degree D₄ (a shared collection's basis, grown with its samples:
+    /// `providers::surrogate`, spec 2026-11-13 §4.1); `None` without body-4 (per scene) or a model.
+    pub body4_degree: Option<usize>,
     /// Worst training residuals: (energy per atom, force, that atom's force bound).
     pub residuals: Option<(f64, f64, f64)>,
     /// The per-component force bound at the smallest force of `status`'s `forces` (Ha/Bohr).
@@ -1349,6 +1394,23 @@ pub struct ImportSummary {
     pub notes: Vec<String>,
 }
 
+/// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PurgeReport {
+    /// Forgotten samples deleted in all.
+    pub purged: usize,
+    /// Of them, deleted from the shared collection's samples file.
+    pub from_collection: usize,
+    /// The collection's backup of its samples file as it was before (`None` without a collection
+    /// write).
+    pub backup: Option<std::path::PathBuf>,
+    /// A shared collection was attached (the rest were session-only samples), else a model file's.
+    pub collection_mode: bool,
+    /// The purge stands, but something after it went wrong (the collection could not be reopened
+    /// for appending: read-only until reopened).
+    pub warning: Option<String>,
+}
+
 /// A teach-around offer (`TrainableStatus::teach_offer`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeachOffer {
@@ -1391,6 +1453,10 @@ pub struct Readiness {
     /// composition survived into the fit that stands (box-excluded, quarantined …), in words —
     /// the model has not learned this scene, whatever the policy says about this one geometry.
     pub unlearned: Option<String>,
+    /// The refusal is the quarantine fence (`TeachRule::NearQuarantine`) of samples the user forgot
+    /// alone (no quarantined one among them): the Model tab says "near samples you forgot" and how
+    /// the fence lifts (2026-11-14).
+    pub forgotten_fence: bool,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
@@ -1520,6 +1586,12 @@ pub enum ClassKey {
     /// The uncalibrated rule: the leave-one-out per-atom energy error's max as a ratio to the tier
     /// (limit 1).
     Energy,
+    /// Both paths (open-shell model Task 7c, the user's decision 2026-11-13): the leave-one-out
+    /// per-atom energy error's RMS over the class's or key's energy samples, the training samples
+    /// the model cannot reproduce (the misfit set M) included, as a ratio to the tier (limit 1).
+    /// Judged only when an M sample contributes to that energy sum, so with M empty it never
+    /// decides.
+    EnergyRms,
     /// The calibrated verdict, decided by the DFT-measured force error (`ClassLoo::measured`, in
     /// bound units) against its limit (`ENTER` = 1/√2 to become trusted, `LEAVE` = 1 to stay).
     Calibrated,

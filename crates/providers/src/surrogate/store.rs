@@ -130,6 +130,7 @@ impl SurrogateKs {
         self.active_set = None;
         self.audit_force = None;
         self.training_residuals = None;
+        self.misfit = None;
         self.class_loo = Vec::new();
         self.class_memory = BTreeMap::new();
         self.class_judge = None;
@@ -156,9 +157,11 @@ impl SurrogateKs {
         self.lone_codes.clear();
         self.face.clear();
         self.fence_votes.clear();
+        self.lift_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = None;
+        self.body4_degree = surrogate::BODY4_DEGREE_START;
         self.since_kept = THIN_EVERY;
         self.desc_cache.clear();
         self.desc_basis = None;
@@ -422,9 +425,13 @@ impl SurrogateKs {
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
+        self.lift_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
         self.degree_cap = (model.basis.body3 && model.basis.degree_cap != Basis::new(&[]).degree_cap).then_some(model.basis.degree_cap);
+        // the file's own body-4 degree (spec 2026-11-13 §4.1: a D₄ = 2 file answers at 2 — no
+        // refit, no refusal; its later refits follow the growth rule)
+        self.body4_degree = model.basis.body4_degree;
         self.desc_cache.clear();
         self.desc_basis = None;
         self.since_kept = THIN_EVERY;
@@ -443,7 +450,7 @@ impl SurrogateKs {
         self.model_gen = self.model_gen.max(newest) + 1;
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
-        self.training_residuals = self.compute_training_residuals();
+        (self.training_residuals, self.misfit) = self.compute_residuals().unzip();
         // the hysteresis memory is the file's own, saved with the model (M8a Task 2 fix round 2,
         // the task review's M4): a reload, the worker's re-spawn with its carried model and a
         // resumed training keep a verdict that sat inside the band (ENTER, LEAVE]; a file without
@@ -505,8 +512,12 @@ impl SurrogateKs {
         } else if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
             self.species_dirty = true;
             self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
+            // (review I2, 2026-11-14: the usual cause — a model saved between a Forget and its
+            // refit, whose fit still held the sample its codes call forgotten)
+            let forgot = (0..self.accumulated.max(want_n).min(self.samples())).any(|i| self.is_forgotten(i));
             self.user_notes.push(format!(
-                "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums — the fit was rebuilt from its stored samples (no DFT)"
+                "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums{} — the fit was rebuilt from its stored samples (no DFT)",
+                if forgot { " (it was saved with a sample forgotten before its refit)" } else { "" }
             ));
         }
         if lone_in_fit == 0 {
@@ -670,6 +681,7 @@ impl SurrogateKs {
         multiplicity: Option<u32>,
         model: Option<(f64, &[[f64; 3]])>,
         near: &[usize],
+        near_misfit: bool,
         keep: bool,
         thin: bool,
         dedup: bool,
@@ -692,7 +704,7 @@ impl SurrogateKs {
             notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
             return TeachOutcome::LoneNotKept;
         }
-        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, dedup, essential, prov.h, mask, notes);
+        let a = self.admit(pos, z, energy, forces, face, model, near, near_misfit, keep, thin, dedup, essential, prov.h, mask, notes);
         // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on
         // the canonical surface for the comparisons; `raw_energy` exactly as solved — fix round 3,
         // no round trip, so the duplicate check sees the teacher's bits)

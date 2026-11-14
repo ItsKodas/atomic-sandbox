@@ -3,7 +3,7 @@
 //! and with "relax both" the bond lengths and angles of both relaxed geometries. Raw total energies
 //! are never a deviation, and under pseudopotentials they are not shown at all (ours exclude the
 //! cores). Nothing here feeds the dynamics.
-use super::super::{search, theme, Action, PanelInput, UiState, AMBER, RED};
+use super::super::{theme, Action, PanelInput, UiState, AMBER, RED};
 use crate::reference::{self, Method, Probe, RelaxPhase};
 use egui::{RichText, Ui};
 
@@ -16,16 +16,8 @@ fn ang(x: f64) -> String {
     format!("{:.4}", units::bohr_to_angstrom(x))
 }
 
-pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    let open = if std::mem::take(&mut st.compare.open_request) { Some(true) } else { search::opens(st, "d-compare") };
-    let r = egui::CollapsingHeader::new("Compare with reference (PySCF)").id_salt("compare-reference").default_open(false).open(open).show(ui, |ui| {
-        st.compare.ensure_probe();
-        body(ui, st, input, acts);
-    });
-    search::mark(ui, st, "d-compare", r.header_response.rect);
-}
-
-fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+/// The comparison (the Readouts panel's "Compare with reference (PySCF)" fold, `readouts`).
+pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     theme::note(ui, "An outside code answers the current geometry in its own process, for comparison only: it never drives the dynamics.");
     match &st.compare.probe {
         Probe::NotRun | Probe::Running(_) => {

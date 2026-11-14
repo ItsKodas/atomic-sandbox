@@ -301,10 +301,17 @@
 //!   error (2 in variance), equal to the estimate's one-sigma scatter at n = 3 and wider from n = 4
 //!   (review M3), so refit-to-refit jitter of W and R does not flip the verdict. The refusal names
 //!   which term decided: the measured error (`ClassKey::Calibrated`), the leave-one-out floor
-//!   (`ClassKey::LooFloor`) or the measured energy (`ClassKey::MeasuredEnergy`).
+//!   (`ClassKey::LooFloor`), the energy LOO RMS with M (`ClassKey::EnergyRms`, below) or the
+//!   measured energy (`ClassKey::MeasuredEnergy`).
 //! - **uncalibrated** (fewer than 3 points): the rule of before, unchanged — LOO force max ≤ 1 and
 //!   rms ≤ 1, LOO energy max ≤ 1 (`super::trust::class_refusal`) — plus the worst-atom guard both
-//!   ways. Without evidence nothing is loosened; the fallbacks a refused class produces are
+//!   ways.
+//! - **the energy half of C1, both paths** (open-shell model Task 7c, the user's decision
+//!   2026-11-13): refused (`ClassKey::EnergyRms`) when the energy LOO RMS, the misfit set M
+//!   included, is beyond the tier (> 1, NaN fails) **and** an M sample contributes to that energy
+//!   sum (`ClassStats::energy_misfits` > 0). With M empty it never decides: uncalibrated the RMS is
+//!   at most the max (≤ 1 already), calibrated the verdict never read the energy LOO. The limit is
+//!   1 in both paths — no ½ entry band, the calibrated energy check is the measured one. Without evidence nothing is loosened; the fallbacks a refused class produces are
 //!   themselves evidence (rule-4b points), so a class the max rule refuses for one outlier earns
 //!   the calibrated verdict after three teacher steps of its own and a refit. A class whose only
 //!   recent comparisons were box-affected has no evidence from them (they leave no point):
@@ -429,6 +436,17 @@ pub struct ClassStats {
     pub force_max: f64,
     pub energy_rms: f64,
     pub energy_max: f64,
+    /// The misfit set M's energy samples in `energy_rms` (open-shell Task 7c): the energy-RMS
+    /// guard ([`ClassKey::EnergyRms`]) is judged only when this is above 0.
+    pub energy_misfits: usize,
+}
+
+/// The energy half of C1 (open-shell model Task 7c, the user's decision 2026-11-13): the energy
+/// LOO RMS, M included, beyond the tier — only when an M sample contributes to it, so with M
+/// empty no verdict changes. NaN or ∞ with M contributing fails (not within the limit).
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
+fn energy_rms_fails(st: &ClassStats) -> bool {
+    st.energy_misfits > 0 && !(st.energy_rms <= 1.0)
 }
 
 /// The verdict for one class.
@@ -701,6 +719,7 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
             format!("LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {n} samples", w.force_max, w.force_rms)
         }
         ClassKey::Energy => format!("LOO energy error {:.1}× the tier, {n} samples", w.energy_max),
+        ClassKey::EnergyRms => format!("LOO energy error RMS {value:.1}× the tier (training samples the model cannot reproduce included), {n} samples"),
         ClassKey::WorstAtom if w.evidence < MIN_EVIDENCE => {
             format!("a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while fewer than {MIN_EVIDENCE} comparisons judge the class; {n} samples")
         }
@@ -756,6 +775,7 @@ pub fn verdict(cal: ClassCalibration, st: &ClassStats, q_prime: usize, was_trust
         if !cal.calibrated() {
             // the rule of before, unchanged — no evidence loosens nothing
             return match super::trust::class_refusal(st.samples, q_prime, st.force_rms, st.force_max, st.energy_max) {
+                None if energy_rms_fails(st) => untrusted(ClassKey::EnergyRms, st.energy_rms, 1.0),
                 None => ClassVerdict::Trusted,
                 Some((key, value, limit)) => untrusted(key, value, limit),
             };
@@ -769,6 +789,11 @@ pub fn verdict(cal: ClassCalibration, st: &ClassStats, q_prime: usize, was_trust
         }
         if !(r <= limit) {
             return untrusted(ClassKey::LooFloor, r, limit);
+        }
+        // the energy half of C1: at the bound itself (no ENTER band — the calibrated energy check
+        // is the measured audit energy below), and only when M contributes
+        if energy_rms_fails(st) {
+            return untrusted(ClassKey::EnergyRms, st.energy_rms, 1.0);
         }
         if !(cal.measured_energy <= limit) {
             return untrusted(ClassKey::MeasuredEnergy, cal.measured_energy, limit);
