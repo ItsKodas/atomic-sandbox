@@ -49,6 +49,46 @@
 //! into this state's `Unoccupied`. With m = 0 the G guard levels are still solved (the witness) but
 //! `HarrisState::unoccupied` offers none (`qm::orbitals`: n_computed = n_occ when no row is asked for).
 //!
+//! **Three roles, three tolerances** (task 8b perf: at 109³ every refresh ended on the 200-iteration cap
+//! polishing the guard levels — box states — for 3.6 s warm; measured at 81³, the column holding the cap
+//! was always the **top** one, residual 1e-2–3e-2, every other ≤ 1e-3: the last column of a block
+//! converges at a rate set by the gap to the first level outside it, and a large box's states are a near
+//! continuum). The stop test (`eigen::lobpcg_split`) holds the lowest k − G columns — the displayed
+//! n_occ + m — to the SCF's effective tol, the guard columns below the top to `GUARD_TOL` = τ_c/100 =
+//! 1e-3 Ha, and does not test the top column: it is a **buffer** vector (standard block-eigensolver
+//! practice), iterated to speed up the others, whose Ritz value is used for nothing that needs it. To keep
+//! that true the block always holds one level above the levels that decide the occupations
+//! (`decisive_levels`: the smallest b whose lowest b levels give no short window): when the witness would
+//! be the top column, the block grows by one. Why `GUARD_TOL` is enough: the witness test (`qm::scf::degenerate_shell_occupations`) compares a guard Ritz value with
+//! ε_F + τ_c, τ_c = 0.1 Ha; a normalised vector with residual r has an eigenvalue within r of its Ritz
+//! value (|θ − λ| ≤ ‖Hx − θx‖), and a Ritz value is an **upper** bound on its eigenvalue (θ_j ≥ λ_j,
+//! Courant–Fischer on the Rayleigh–Ritz subspace), so the error is one-sided: with the levels below it
+//! resolved (as for any LOBPCG block: no level is missed below a Ritz value), θ − λ ≤ 1e-3 Ha. A level is
+//! then taken as a witness only if its true energy is ≥ ε_F + τ_c − 1e-3, i.e. only a level within 1 % of
+//! the threshold can be classified differently than at full convergence — the same knife edge any f32
+//! rounding or 0.01 Bohr move already flips, and a display decision. The direction of the error is the
+//! safe-for-display one: a guard can make a true in-window level look like a witness (that shell is then
+//! drawn with integer occupations a hair early), never create a spurious in-window level or drop an
+//! occupied one. A capped tested guard (ending above 1e-3) widens that margin to its residual, which the
+//! at-cap note prints. The buffer's Ritz value, likewise an upper bound, enters only `block_edge`'s
+//! "does a set reach the last vector" test, where being too high can split a degenerate set at the top
+//! (a ≥ 3-fold set straddling the window into both guards would then show its lower members, each held
+//! to the full tol by the shown-set rule below) and never joins one. When m > 0 the first level above the occupied ones — the witness that decides — is a
+//! displayed level and held to the full tol anyway; the guard tolerance decides only at m = 0 and for a
+//! shell reaching past the m rows. The displayed levels keep the
+//! full tol. **A displayed τ-set reaching into the guards** (the m-th row degenerate with the next level
+//! — H₂ 33³'s box pair at 0.20857 Ha straddles m = 2): `block_edge` shows the whole set, so after each
+//! solve the shown count is checked against the tight head and, when it reaches past it, the head is
+//! raised to cover the shown rows and the solve continues (warm: only those columns move). Every shown
+//! row is then held to the full tol; the set's membership itself is judged on Ritz values whose error is
+//! ~r²/δ ≤ (1e-3)²/δ — at τ = 1e-4 a guard can be misjudged as in or out of the set only when its
+//! distance δ to the rest of the spectrum is ≲ 1e-2 Ha, and a level then shown is re-solved to tol by
+//! this same rule. The raised head is remembered for the next call (`last`).
+//!
+//! **Block memory.** A released short window needs levels above n_occ + m + G for its witness
+//! (`minimal_block`); those are kept as spare guess vectors (not in the record) and the next call starts
+//! at that block, so a warm refresh does not re-grow it.
+//!
 //! **Fermi–Dirac (the approved smearing work) must revisit the split.** Every FD level has f > 0, so
 //! "f > 0" would make every computed level occupied (n_occ = k, no unoccupied rows) and the growth rule
 //! above would grow to its bound. The smearing work must split occupied from unoccupied by rank (n_occ by
@@ -81,7 +121,7 @@
 //! Grid fields f32; ε, f, residuals and the occupation rule f64 on the CPU; every reduction is the
 //! `Reducer`'s f32 partials finished with Neumaier in f64.
 use crate::batch::Batch;
-use crate::eigen::{lobpcg, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
+use crate::eigen::{lobpcg_split, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 use crate::grid::{clear_readback_fault, Field, GpuGrid};
 use crate::ionic::GpuIonic;
 use crate::orbitals::record_unoccupied;
@@ -89,8 +129,9 @@ use crate::physics::nuclear_potential_in;
 use crate::pointwise::{fill_in, lincomb_in};
 use crate::scf::{accumulate_density, take_device_error, xc_in, GpuSolver, GpuState, HarrisWork, EIGEN_MAX_ITER, POISSON_MAX_ITER};
 use gpu::GpuContext;
-use qm::orbitals::{tau, Unoccupied, UNOCC_GUARD};
-use qm::scf::{ascending, initial_orbitals, MAX_WITNESS_GROWTH};
+use qm::orbitals::{block_edge, tau, Unoccupied, UNOCC_GUARD};
+use qm::scf::{ascending, initial_orbitals, CANDIDATE_TAU, MAX_WITNESS_GROWTH};
+use qm::Occupations;
 use qm::{one_shot_occupations, QmError, ScfSettings, System};
 use std::time::{Duration, Instant};
 
@@ -142,8 +183,13 @@ pub struct HarrisState {
     v_h: Option<Field>,
     ionic: Option<GpuIonic>,
     free: Vec<Field>,
-    /// (n_σ, n_occ,σ) of the last completed solve per channel (sizes the next block) and its m.
-    last: [Option<(usize, usize)>; 2],
+    /// Levels the last solve kept above its record only as the next guess (`minimal_block`: the gap
+    /// witness of a released short window), per channel, ascending.
+    spare: [Vec<Field>; 2],
+    /// (n_σ, b − (n_σ + m + G), head − (k − G)) of the last completed solve per channel — b its minimal
+    /// block (`minimal_block`), so the next call starts at the block it needed, and how far its tight head
+    /// was raised over k − G for a shown τ-set — and its m.
+    last: [Option<(usize, usize, usize)>; 2],
     m: usize,
 }
 
@@ -155,7 +201,7 @@ impl HarrisState {
     /// Empty: the first call is cold.
     pub fn new() -> HarrisState {
         HarrisState { grid: None, state: None, unocc: [Vec::new(), Vec::new()], unocc_info: None, guess: [Vec::new(), Vec::new()],
-                      v_h: None, ionic: None, free: Vec::new(), last: [None; 2], m: 0 }
+                      v_h: None, ionic: None, free: Vec::new(), spare: [Vec::new(), Vec::new()], last: [None; 2], m: 0 }
     }
 
     /// The last completed solve (`None` before one, after an abort or an error, and after `clear`). Its
@@ -173,15 +219,16 @@ impl HarrisState {
     /// Drops everything (fields, ionic terms): the next call is cold.
     pub fn clear(&mut self) { *self = HarrisState::new(); }
 
-    /// The last solve becomes the next call's starting point: its vectors (occupied then unoccupied,
+    /// The last solve becomes the next call's starting point: its vectors (occupied, unoccupied, spare;
     /// ascending) the guess, its V_H the Poisson guess, its other fields free. A no-op without a state.
     fn park(&mut self) {
         let Some(st) = self.state.take() else { return };
         let GpuState { orbitals_up, orbitals_dn, rho, rho_up, rho_dn, v_h, v_nuc, .. } = st;
         let [uu, ud] = std::mem::take(&mut self.unocc);
-        for (guess, (o, u)) in self.guess.iter_mut().zip([(orbitals_up, uu), (orbitals_dn, ud)]) {
+        let [su, sd] = std::mem::take(&mut self.spare);
+        for (guess, (o, u, sp)) in self.guess.iter_mut().zip([(orbitals_up, uu, su), (orbitals_dn, ud, sd)]) {
             self.free.append(guess);
-            *guess = o.into_iter().chain(u).collect();
+            *guess = o.into_iter().chain(u).chain(sp).collect();
         }
         if let Some(old) = self.v_h.replace(v_h) { self.free.push(old); }
         self.free.extend([rho, rho_up, rho_dn, v_nuc]);
@@ -189,11 +236,15 @@ impl HarrisState {
     }
 }
 
-/// One channel's finished solve: the f > 0 levels (ascending) and the unoccupied vectors (the record's order).
-struct Channel { orbitals: Vec<Field>, evals: Vec<f64>, occ: Vec<f64>, unocc: Vec<Field> }
+/// One channel's finished solve: the f > 0 levels (ascending), the unoccupied vectors (the record's order)
+/// and the spare levels kept only as the next guess.
+struct Channel { orbitals: Vec<Field>, evals: Vec<f64>, occ: Vec<f64>, unocc: Vec<Field>, spare: Vec<Field> }
 
 impl Channel {
-    fn empty() -> Channel { Channel { orbitals: Vec::new(), evals: Vec::new(), occ: Vec::new(), unocc: Vec::new() } }
+    fn empty() -> Channel { Channel { orbitals: Vec::new(), evals: Vec::new(), occ: Vec::new(), unocc: Vec::new(), spare: Vec::new() } }
+
+    /// Every vector, ascending: the next call's guess.
+    fn vectors(self) -> Vec<Field> { self.orbitals.into_iter().chain(self.unocc).chain(self.spare).collect() }
 }
 
 /// The per-call fields (module doc, "Fields and VRAM"), from the state's free list.
@@ -242,6 +293,26 @@ fn grown<'w>(work: &'w mut Option<LobpcgWork>, work_k: &mut usize, ctx: &GpuCont
     work.as_mut().expect("sized above")
 }
 
+/// The guard/witness levels' LOBPCG tolerance (module doc, "Two tolerances"): τ_c/100 = 1e-3 Ha, so a
+/// guard Ritz value θ is within ‖r‖ ≤ 1e-3 Ha of an eigenvalue — 1 % of the gap the witness test reads.
+const GUARD_TOL: f64 = CANDIDATE_TAU / 100.0;
+
+/// The fewest lowest levels of `sorted` (ascending) that decide the occupations of `n` electrons under
+/// `rule`: the smallest b > n whose `one_shot_occupations` has no short window (`sorted.len()` when none
+/// does). Aufbau: n + 1 (it never reads a level above the n-th; the + 1 is the gap level).
+fn decisive_levels(sorted: &[f64], n: usize, spin: u8, rule: Occupations) -> usize {
+    let mut b = (n + 1).min(sorted.len());
+    while b < sorted.len() && one_shot_occupations(&sorted[..b], n, spin, rule).window_short { b += 1; }
+    b
+}
+
+/// The block a completed solve keeps (≤ `sorted.len()`): the record's `keep` = n_occ + m + G levels, and
+/// at least one buffer level above the decisive ones (`decisive_levels`) — more than `keep` only when a
+/// released short window needed levels above it for its witness. The next call starts there.
+fn minimal_block(sorted: &[f64], n: usize, spin: u8, rule: Occupations, keep: usize) -> usize {
+    keep.max(decisive_levels(sorted, n, spin, rule) + 1).min(sorted.len())
+}
+
 /// The levels the block must hold after an occupation pass (module doc): n_occ + m + G, and at least one
 /// more than it holds when there was no gap witness (`window_short`), capped at `k_max`. Larger than `len`
 /// ⇔ grow and solve again.
@@ -285,7 +356,7 @@ impl GpuSolver {
         let tau_scf = tau(settings.tol);
         let HarrisWork { ctx, k, r, g, grid, poisson, poisson_tol, work, work_k } = self.harris_work();
         let HarrisState { state: slot, unocc: slot_unocc, unocc_info: slot_info, guess, v_h: v_h_prev, ionic: ion_cache, free,
-                          last, m: slot_m, .. } = hs;
+                          spare: slot_spare, last, m: slot_m, .. } = hs;
 
         // --- ρ_in,σ (uploaded before anything is recorded) and this geometry's own ionic terms ---
         let (ru, rd) = (take(free, ctx, g), take(free, ctx, g));
@@ -343,6 +414,8 @@ impl GpuSolver {
         let mut done: [Option<Channel>; 2] = [None, None];
         let (mut cold, mut notes) = (false, Vec::new());
         let mut solves = [0usize; 2];
+        let mut blocks = [0usize; 2]; // the minimal block per channel (`minimal_block`)
+        let mut heads = [0usize; 2]; // the tight head's raise over block − G per channel
         // Ok(true): aborted
         let mut outcome: Result<bool, QmError> = Ok(false);
         let sum = take(free, ctx, g);
@@ -354,20 +427,27 @@ impl GpuSolver {
                 continue;
             }
             let seed = 5 + ch as u64;
-            // the block (module doc): n_σ + m + G, plus the last solve's shared-shell excess n_occ − n_σ
-            let extra = match last[ch] { Some((ln, lo)) if ln == nc => lo.saturating_sub(ln).min(MAX_WITNESS_GROWTH), _ => 0 };
+            // the block (module doc): n_σ + m + G, plus what the last solve's minimal block needed beyond it
+            let (extra, head_extra) = match last[ch] { Some((ln, e, he)) if ln == nc => (e.min(MAX_WITNESS_GROWTH), he), _ => (0, 0) };
             let k_max = nc + m + UNOCC_GUARD + MAX_WITNESS_GROWTH;
             let mut x = std::mem::take(&mut guess[ch]);
             if x.is_empty() { cold = true; }
             let k0 = nc + extra + m + UNOCC_GUARD;
             if x.len() > k0 { free.extend(x.drain(k0..)); } // ascending: the highest go
             top_up(&mut x, k0, free, ctx, g, grid, &system.nuclei, seed);
+            // the columns held to the full tol: the displayed n_occ + m (all but the top G), raised over a
+            // shown τ-set reaching into the guards (module doc, "Two tolerances")
+            let mut head = (k0 - UNOCC_GUARD + head_extra).min(k0);
             let h = GpuHamiltonian { v: if ch == 0 { &p.vu } else { &p.vd }, nl };
             let (ev, one) = loop {
                 let mut ev = vec![0.0; x.len()];
                 let w = grown(work, work_k, ctx, g, x.len());
                 solves[ch] += 1;
-                let es = match lobpcg(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
+                // the displayed levels (all but the top G) at the SCF's tol, the guard/witness levels at
+                // `GUARD_TOL` (module doc, "Two tolerances")
+                // the top column is the buffer (module doc), the guards below it at GUARD_TOL
+                let checked = (x.len() - 1).max(head);
+                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, head, GUARD_TOL.max(tol), checked, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
                     Ok(es) => es,
                     Err(e) => { free.append(&mut x); outcome = Err(take_device_error().unwrap_or(e)); break 'channels; }
                 };
@@ -385,11 +465,25 @@ impl GpuSolver {
                 // the occupations of this one diagonalisation; the f > 0 levels are the lowest by rank
                 let one = one_shot_occupations(&ev, nc, ch as u8, settings.occupations);
                 let n_occ = one.f.iter().filter(|f| **f > 0.0).count();
-                let need = block_need(n_occ, m, one.window_short, x.len(), k_max);
+                let mut sorted = ev.clone();
+                sorted.sort_by(f64::total_cmp);
+                // one buffer level above the levels that decide the occupations (module doc)
+                let decisive = decisive_levels(&sorted, nc, ch as u8, settings.occupations);
+                let need = block_need(n_occ, m, one.window_short, x.len(), k_max).max((decisive + 1).min(k_max));
                 if need > x.len() {
                     // a shared shell reached into the block, or no gap witness: grow it behind the Ritz vectors
                     top_up(&mut x, need, free, ctx, g, grid, &system.nuclei, seed);
+                    head = head.max(x.len() - UNOCC_GUARD);
                     continue;
+                }
+                // a shown τ-set reaching into the guard columns: hold it to the full tol as well
+                if m > 0 {
+                    let keep = (n_occ + m + UNOCC_GUARD).min(sorted.len());
+                    let (shown, _) = block_edge(&sorted[..keep], n_occ, keep, tau_scf);
+                    if shown > head {
+                        head = shown;
+                        continue;
+                    }
                 }
                 break (ev, one);
             };
@@ -402,18 +496,25 @@ impl GpuSolver {
             let n_occ = order.iter().take_while(|&&i| one.f[i] > 0.0).count();
             assert!(order[n_occ..].iter().all(|&i| one.f[i] == 0.0), "the occupied levels are the lowest ({:?})", one.f);
             let keep = (n_occ + m + UNOCC_GUARD).min(order.len());
+            // the levels the rule needed (`minimal_block`): the record's, and above them a released short
+            // window's witness, kept as spare guess vectors; a block larger than that loses its top levels
+            let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
+            let block = minimal_block(&sorted, nc, ch as u8, settings.occupations, keep);
+            blocks[ch] = block;
+            heads[ch] = head.saturating_sub(block.saturating_sub(UNOCC_GUARD));
             let mut slots: Vec<Option<Field>> = x.into_iter().map(Some).collect();
             let mut pick = |idx: &[usize]| -> Vec<Field> { idx.iter().map(|&i| slots[i].take().expect("each index once")).collect() };
             let orbitals = pick(&order[..n_occ]);
             let phis = pick(&order[n_occ..keep]);
-            free.extend(pick(&order[keep..])); // a block larger than needed: the top levels go
+            let spare = pick(&order[keep..block]);
+            free.extend(pick(&order[block..]));
             let evals: Vec<f64> = order[..n_occ].iter().map(|&i| ev[i]).collect();
             let occ: Vec<f64> = order[..n_occ].iter().map(|&i| one.f[i]).collect();
             let w = grown(work, work_k, ctx, g, phis.len().max(1));
             match record_unoccupied(ctx, k, g, r, &h, w, phis, &evals, tol, tau_scf, &sum, &mut info, ch) {
-                Ok(unocc) => done[ch] = Some(Channel { orbitals, evals, occ, unocc }),
+                Ok(unocc) => done[ch] = Some(Channel { orbitals, evals, occ, unocc, spare }),
                 Err((e, phis)) => {
-                    free.extend(orbitals.into_iter().chain(phis));
+                    free.extend(orbitals.into_iter().chain(phis).chain(spare));
                     outcome = Err(take_device_error().unwrap_or(e));
                     break;
                 }
@@ -423,13 +524,13 @@ impl GpuSolver {
         free.push(sum);
         match outcome {
             Err(e) => {
-                for c in done.into_iter().flatten() { free.extend(c.orbitals.into_iter().chain(c.unocc)); }
+                for c in done.into_iter().flatten() { free.extend(c.vectors()); }
                 fail!(e, p);
             }
             Ok(true) => {
                 // the finished channels' vectors and this V_H[ρ_in] are the next call's guess
                 for (gs, c) in guess.iter_mut().zip(done) {
-                    if let Some(c) = c { *gs = c.orbitals.into_iter().chain(c.unocc).collect(); }
+                    if let Some(c) = c { *gs = c.vectors(); }
                 }
                 let (rho, v_nuc, v_h) = p.finish(free);
                 free.extend([rho, v_nuc]);
@@ -454,14 +555,16 @@ impl GpuSolver {
         let ((eu, fu), (ed, fd)) = (level(&up, 0), level(&dn, 1));
         let solve = HarrisSolve { evals: [eu, ed], occ: [fu, fd], n_occ: [up.orbitals.len(), dn.orbitals.len()], notes,
                                   iterations: info.iterations, at_cap: info.at_cap, solves, cold, wall: t0.elapsed() };
-        let Channel { orbitals: orbitals_up, evals: evals_up, occ: occ_up, unocc: unocc_up } = up;
-        let Channel { orbitals: orbitals_dn, evals: evals_dn, occ: occ_dn, unocc: unocc_dn } = dn;
+        let Channel { orbitals: orbitals_up, evals: evals_up, occ: occ_up, unocc: unocc_up, spare: spare_up } = up;
+        let Channel { orbitals: orbitals_dn, evals: evals_dn, occ: occ_dn, unocc: unocc_dn, spare: spare_dn } = dn;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up, orbitals_dn, evals_up, evals_dn,
                                 rho, rho_up: ou, rho_dn: od, v_h, v_nuc, ionic: system.ionic.clone(), occ_up, occ_dn,
                                 occupations: settings.occupations });
         *slot_unocc = [unocc_up, unocc_dn];
         *slot_info = Some(info);
-        *last = [(n[0] + m > 0).then_some((n[0], solve.n_occ[0])), (n[1] + m > 0).then_some((n[1], solve.n_occ[1]))];
+        *last = [(n[0] + m > 0).then_some((n[0], blocks[0].saturating_sub(n[0] + m + UNOCC_GUARD), heads[0])),
+                 (n[1] + m > 0).then_some((n[1], blocks[1].saturating_sub(n[1] + m + UNOCC_GUARD), heads[1]))];
+        *slot_spare = [spare_up, spare_dn];
         *slot_m = m;
         Ok(Some(solve))
     }
@@ -473,6 +576,49 @@ mod tests {
     use crate::orbitals::{OrbitalView, Product, Spin};
     use crate::reduce::neumaier;
     use qm::{Grid, KsState, Nucleus, Occupations};
+
+    /// The superposed free-atom 1s densities e^{−2r}/π of H atoms at `pos`, renormalised on the grid to
+    /// one electron each, split equally between the spins (a cheap stand-in for the app's ρ_in).
+    fn superposed_h(grid: &Grid, pos: &[[f64; 3]]) -> [Vec<f64>; 2] {
+        let one = |c: [f64; 3]| {
+            let v = grid.sample(|p| { let r = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)).sqrt(); (-2.0 * r).exp() / std::f64::consts::PI });
+            let q = neumaier(v.iter().copied()) * grid.dv();
+            v.into_iter().map(|x| x / q).collect::<Vec<f64>>()
+        };
+        let mut total = vec![0.0; grid.len()];
+        for c in pos { for (t, v) in total.iter_mut().zip(one(*c)) { *t += v; } }
+        let half: Vec<f64> = total.iter().map(|t| 0.5 * t).collect();
+        [half.clone(), half]
+    }
+
+    /// Diagnostic (task 8b perf): the wall of a warm Harris refresh after a 0.1 Bohr move, H₂ (R = 1.4) on
+    /// n³ × h (env `HARRIS_DIAG_N`, default 81; `HARRIS_DIAG_H`, default 0.15 — the app's Accurate grid),
+    /// m = 4 (the app's default), ρ_in the superposed free-atom densities. Prints the cold call and three
+    /// warm moves (wall, iterations, solves, at cap).
+    #[test]
+    #[ignore = "diagnostic; run: HARRIS_DIAG_N=81 cargo test -p qm-gpu --release diag_harris_warm_refresh -- --ignored --nocapture"]
+    fn diag_harris_warm_refresh_wall() {
+        let Some(ctx) = ctx() else { return };
+        let n: usize = std::env::var("HARRIS_DIAG_N").ok().and_then(|v| v.parse().ok()).unwrap_or(81);
+        let h: f64 = std::env::var("HARRIS_DIAG_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15);
+        let grid = Grid::cube(n, h);
+        let settings = ScfSettings::for_grid(&grid);
+        let mut s = GpuSolver::new(ctx, &grid);
+        let mut hs = HarrisState::new();
+        for step in 0..4 {
+            let dx = 0.1 * step as f64;
+            let pos = [[0.7 + dx, 0.0, 0.0], [-0.7, 0.0, 0.0]];
+            let sys = System::new(pos.iter().map(|p| Nucleus { pos: *p, z: 1 }).collect(), 0, None);
+            let rho = superposed_h(&grid, &pos);
+            let input = HarrisInput { system: &sys, settings: &settings, rho_in: [&rho[0], &rho[1]], unoccupied: 4 };
+            let out = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
+            println!("H₂ {n}³ × {h} m = 4, move {dx:.1}: {} wall {:.3} s, iterations {:?}, solves {:?}, at cap {:?}, ε↑ {:.5?}",
+                     if out.cold { "cold" } else { "warm" }, out.wall.as_secs_f64(), out.iterations, out.solves, out.at_cap, out.evals[0]);
+            if let (_, Some(u)) = hs.unoccupied() {
+                for ch in 0..2 { println!("    {}: unoccupied ε {:.5?} residuals {:?} (tol {:.1e}); notes {:?}", SPIN[ch], u.evals[ch], u.residuals[ch].iter().map(|r| format!("{r:.1e}")).collect::<Vec<_>>(), u.tol, out.notes); }
+            }
+        }
+    }
 
     /// The growth trigger (review round 2): the qm unit case of a released short window
     /// (`one_shot_marks_a_short_window`: ε = −1.0, −0.40, −0.39, −0.35, n = 2 ⇒ released, f = 1, 1, 0, 0,
@@ -488,6 +634,25 @@ mod tests {
         assert_eq!(block_need(n_occ, 0, false, 4, k_max), 4, "a witnessed block of n_occ + G levels stays");
         assert_eq!(block_need(4, 2, false, 6, k_max), 8, "a shared shell: n_occ + m + G");
         assert_eq!(block_need(n_occ, 0, true, k_max, k_max), k_max, "at the bound: no further growth");
+    }
+
+    /// Block memory (task 8b, the deferred round-2 minor): the released short window of the qm unit case
+    /// (ε = −1.0, −0.40, −0.39, −0.35, then 0.2; n = 2, m = 0 ⇒ n_occ + m + G = 4) needs the 5th level for its
+    /// witness, so the minimal block is 5 — the next call starts there instead of re-growing; a witnessed
+    /// block, Aufbau and a block without the 5th level stay at what they have.
+    #[test]
+    fn minimal_block_keeps_a_released_short_windows_witness() {
+        let ds = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let levels = [-1.0, -0.40, -0.39, -0.35, 0.2];
+        assert_eq!(minimal_block(&levels, 2, 0, ds, 4), 5, "the witness 0.2 is needed");
+        assert_eq!(minimal_block(&levels[..4], 2, 0, ds, 4), 4, "nothing above: the block is what was computed");
+        assert_eq!(minimal_block(&[-1.0, -0.40, 0.1, 0.2, 0.3], 2, 0, ds, 4), 4, "witnessed within n_occ + G");
+        assert_eq!(minimal_block(&levels, 2, 0, Occupations::Aufbau, 4), 4, "Aufbau needs no witness");
+        // the decisive levels: the witness 0.2 is the 5th, so a block of 5 would make it the (untested) top
+        // buffer column — the block needs 6
+        assert_eq!(decisive_levels(&levels, 2, 0, ds), 5);
+        assert_eq!(decisive_levels(&[-1.0, -0.40, 0.1, 0.2, 0.3], 2, 0, ds), 3, "the witness 0.1 is the 3rd level");
+        assert_eq!(decisive_levels(&levels, 2, 0, Occupations::Aufbau), 3, "Aufbau: n + 1");
     }
 
     fn ctx() -> Option<GpuContext> {
@@ -794,14 +959,53 @@ mod tests {
         let again = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
         println!("second call: cold {}, iterations {:?}, solves {:?} (first call {:?} in {:?} solves, at cap {:?})",
                  again.cold, again.iterations, again.solves, out.iterations, out.solves, out.at_cap);
-        assert_eq!(out.solves, [1, 2], "the first call grew ↓ once (n_occ↓ = 4 > n↓)");
+        assert!(out.solves[1] >= 2, "the first call grew ↓ (n_occ↓ = 4 > n↓): {:?} solves", out.solves);
         assert!(!again.cold && again.evals[1].len() == 4 + 2 + UNOCC_GUARD);
-        assert_eq!(again.solves, [1, 1], "sized from the last n_occ: no growth solve");
-        // a channel that converged on the first call is converged on entry; one that stopped at the cap (↓
-        // here: its guard levels near 0.407 Ha, residual 5.7e-4 at 33³) is continued by the warm restart
-        assert!(out.at_cap[1], "the premise of the ↓ case: the first call's ↓ solve ended at the cap");
+        assert_eq!(again.solves, [1, 1], "sized from the last block and head: no growth or head solve");
+        // a channel that converged on the first call is converged on entry (before the guard tolerance of
+        // task 8b, ↓ ended on the cap here — guard levels near 0.407 Ha at residual 5.7e-4 — and the warm
+        // restart continued it for 54 iterations); a capped one would be continued
         for ch in 0..2 {
             if !out.at_cap[ch] { assert_eq!(again.iterations[ch], 0, "spin {ch}: converged on entry"); }
+        }
+        assert_eq!(out.at_cap, [false, false], "the guard levels meet GUARD_TOL within the cap");
+    }
+
+    /// Task 8b perf: a warm refresh after a 0.1 Bohr move ends below the 200-iteration cap — the guard
+    /// levels are held to `GUARD_TOL`, the displayed ones to the SCF's tol — on H₂ (49³ × 0.25, superposed
+    /// free-atom ρ_in) and pseudo-O triplet (33³, its SCF density at each geometry), m = 4 (the app's
+    /// default). Before the change both ended on the cap (H₂ 81³: warm 1.6–2.1 s, ↓ 200 iterations).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn warm_refresh_after_a_move_stays_below_the_cap() {
+        let Some(ctx) = ctx() else { return };
+        // H₂, 49³
+        let grid = Grid::cube(49, 0.25);
+        let settings = ScfSettings::for_grid(&grid);
+        let mut s = GpuSolver::new(ctx.clone(), &grid);
+        let mut hs = HarrisState::new();
+        for (step, dx) in [0.0, 0.1].into_iter().enumerate() {
+            let pos = [[0.7 + dx, 0.0, 0.0], [-0.7, 0.0, 0.0]];
+            let sys = System::new(pos.iter().map(|p| Nucleus { pos: *p, z: 1 }).collect(), 0, None);
+            let rho = superposed_h(&grid, &pos);
+            let out = s.harris(&mut hs, &HarrisInput { system: &sys, settings: &settings, rho_in: [&rho[0], &rho[1]], unoccupied: 4 }, &mut || false)
+                .expect("no failure").expect("not aborted");
+            println!("H₂ 49³ move {dx}: {} wall {:.3} s, iterations {:?}, solves {:?}, at cap {:?}, notes {:?}",
+                     if out.cold { "cold" } else { "warm" }, out.wall.as_secs_f64(), out.iterations, out.solves, out.at_cap, out.notes);
+            if step == 1 { assert!(!out.cold && out.at_cap == [false, false], "H₂: the warm refresh ended on the cap"); }
+        }
+        // pseudo-O triplet, 33³
+        let (mut s, sys, settings, _) = solved_pseudo_o(&ctx);
+        let mut hs = HarrisState::new();
+        for (step, dx) in [0.0, 0.1].into_iter().enumerate() {
+            let moved = System::with_ionic(vec![Nucleus { pos: [0.07 + dx, -0.03, 0.02], z: 8 }], 0, Some(3), sys.ionic.clone().expect("a setup"));
+            s.solve(&moved, &settings, true).expect("the SCF converges");
+            let ks = s.ks_state(s.state().unwrap());
+            let out = s.harris(&mut hs, &HarrisInput { system: &moved, settings: &settings, rho_in: [&ks.rho_up, &ks.rho_dn], unoccupied: 4 }, &mut || false)
+                .expect("no failure").expect("not aborted");
+            println!("pseudo-O 33³ move {dx}: {} wall {:.3} s, iterations {:?}, solves {:?}, at cap {:?}, notes {:?}",
+                     if out.cold { "cold" } else { "warm" }, out.wall.as_secs_f64(), out.iterations, out.solves, out.at_cap, out.notes);
+            if step == 1 { assert!(!out.cold && out.at_cap == [false, false], "pseudo-O: the warm refresh ended on the cap"); }
         }
     }
 }
