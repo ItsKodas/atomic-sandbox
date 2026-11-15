@@ -805,7 +805,12 @@ impl Accumulator {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = batch
                         .chunks(per)
-                        .map(|chunk| scope.spawn(move || chunk.iter().map(|s| this.prepare_rows(s, basis, ref_energy, per_atom, keep_rows)).collect::<Vec<_>>()))
+                        .map(|chunk| {
+                            scope.spawn(move || {
+                                crate::threads::lower_priority();
+                                chunk.iter().map(|s| this.prepare_rows(s, basis, ref_energy, per_atom, keep_rows)).collect::<Vec<_>>()
+                            })
+                        })
                         .collect();
                     handles.into_iter().flat_map(|h| h.join().expect("a design-row thread panicked")).collect()
                 })
@@ -1031,6 +1036,7 @@ impl Accumulator {
         std::thread::scope(|scope| {
             for (me, mut rows) in work.into_iter().enumerate() {
                 scope.spawn(move || {
+                    crate::threads::lower_priority();
                     for (prep, se) in preps.iter().zip(support_e) {
                         let w = prep.w;
                         // row i of this thread is its (i / threads)-th
@@ -1642,6 +1648,7 @@ fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64
     std::thread::scope(|scope| {
         for chunk in work {
             scope.spawn(move || {
+                crate::threads::lower_priority();
                 for (i, g_row, c_row) in chunk {
                     let ti = &t[index[i]];
                     for (sj, &j) in support.iter().enumerate() {
@@ -1653,9 +1660,10 @@ fn batch_update(gram: &mut [f64], gc: &mut [f64], rhs: &mut [f64], bc: &mut [f64
     });
 }
 
-/// Threads for the accumulator's threaded parts (the batch's design rows, the Gram's rows).
+/// Threads for the accumulator's threaded parts (the batch's design rows, the Gram's rows):
+/// [`crate::threads::worker_threads`] (two hardware threads left free; each worker below normal).
 fn add_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1)
+    crate::threads::worker_threads()
 }
 
 /// Samples per batch of [`Accumulator::add_many`]: their prepared rows are held at once (≈ 3N·Q′
@@ -3290,6 +3298,43 @@ mod tests {
         }
         b.add_many(&samples[..30].iter().collect::<Vec<_>>(), &basis3, &refs, &opts).unwrap();
         assert_eq!(statistics_bits(&a), statistics_bits(&b));
+    }
+
+    /// The thread count changes the wall only (`crate::threads` module doc): the accumulator's
+    /// statistics, the warm path's pending rows and the fitted coefficients are bit for bit the
+    /// same on one thread, on the capped count (`worker_threads`) and on an odd count that splits
+    /// the rows and the batches unevenly.
+    #[test]
+    fn the_fit_is_the_same_on_one_thread_and_on_the_capped_count() {
+        let mut rng = StdRng::seed_from_u64(47);
+        let basis4 = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let samples = morse_bend_samples(&mut rng, ADD_BATCH + 19);
+        let pending = morse_bend_samples(&mut rng, 7);
+        let run = |threads: usize| {
+            crate::threads::with_threads(threads, || {
+                let mut a = Accumulator::new(&basis4);
+                a.add_many(&samples.iter().collect::<Vec<_>>(), &basis4, &refs, &opts).unwrap();
+                let (cold, _) = a.refit(&opts, &provenance(), &refs).unwrap();
+                a.add_many(&pending.iter().collect::<Vec<_>>(), &basis4, &refs, &opts).unwrap();
+                let bits = statistics_bits(&a);
+                let (warm, _) = a.refit(&opts, &provenance(), &refs).unwrap();
+                (bits, cold, warm)
+            })
+        };
+        let one = run(1);
+        let capped = run(crate::threads::worker_threads());
+        let odd = run(5);
+        assert_eq!(one.0, capped.0, "the statistics, capped count");
+        assert_eq!(one.0, odd.0, "the statistics, 5 threads");
+        let coeff_bits = |m: &Model| m.coeffs.iter().flatten().map(|c| c.to_bits()).collect::<Vec<_>>();
+        for (name, m1, mc, m5) in [("cold", &one.1, &capped.1, &odd.1), ("warm", &one.2, &capped.2, &odd.2)] {
+            assert_eq!(coeff_bits(m1), coeff_bits(mc), "the {name} fit's coefficients, capped count");
+            assert_eq!(coeff_bits(m1), coeff_bits(m5), "the {name} fit's coefficients, 5 threads");
+            assert_eq!(m1, mc, "the {name} model, capped count");
+            assert_eq!(m1, m5, "the {name} model, 5 threads");
+        }
     }
 
     /// A small body-4 basis for the large-basis path tests (Q′ in the low hundreds).

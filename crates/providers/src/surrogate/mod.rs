@@ -504,8 +504,10 @@
 //!   which read rule 5e). The verdicts are bit for bit those of a pass after every fit
 //!   (`a_deferred_refit_leaves_the_eager_refits_state`); only a teach-around round count now
 //!   restarts by the standing fit's class verdict, not by an intermediate fit's that the recovery
-//!   replaced. The samples' leave-one-out runs on up to 16 threads
-//!   (`surrogate::loo::leave_one_out_many`, the same numbers in the same order).
+//!   replaced. The samples' leave-one-out runs on `surrogate::threads::worker_threads` threads
+//!   (80 % of the logical CPUs — the user's choice —, at most 16, each below normal priority — 2026-11-15, the
+//!   user's PC was laggy at 99 % CPU; `surrogate::loo::leave_one_out_many`, the same numbers in
+//!   the same order); a background refit's own thread runs below normal too.
 //! - **Trusted class — the calibrated, hysteretic verdict** (M8a Task 2 and its fix rounds 1–2, spec
 //!   §4.1; the derivation and the constants: [`calibrate`] module doc; the numbers:
 //!   `validate/references.md`, "M8a calibrated verdict"): enough samples — per environment key

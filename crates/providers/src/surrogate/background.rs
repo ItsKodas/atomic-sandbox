@@ -236,6 +236,9 @@ impl SurrogateKs {
         let handle = std::thread::Builder::new()
             .name("surrogate-refit".into())
             .spawn(move || {
+                // below normal, as the fit's own worker threads (`surrogate::threads`): a refit of
+                // minutes must not make the machine laggy
+                surrogate::threads::lower_priority();
                 let r = SurrogateKs::refit(&mut fork);
                 (Box::new(fork), r)
             })

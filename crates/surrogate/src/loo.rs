@@ -153,19 +153,25 @@ fn solve_small(mut m: Vec<f64>, mut v: Vec<f64>, n: usize) -> Option<Vec<f64>> {
     Some(v)
 }
 
-/// [`leave_one_out`] of every sample in `samples`, in order, on up to 16 threads (contiguous
-/// chunks). Each sample's residuals depend on the model and that sample alone, so the numbers are
+/// [`leave_one_out`] of every sample in `samples`, in order, on [`crate::threads::worker_threads`]
+/// threads below normal priority (contiguous chunks). Each sample's residuals depend on the model and that sample alone, so the numbers are
 /// bit for bit those of one call at a time; only the wall changes (the provider's class-wise
 /// trust pass, O(P · m · Q′²): 4.6 ms per sample at Q′ 1 032 on one thread, `references.md`
 /// "Refit cost at scale").
 pub fn leave_one_out_many(model: &Model, samples: &[&Sample]) -> Vec<Option<SampleLoo>> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).max(1);
+    let threads = crate::threads::worker_threads();
     if threads == 1 || samples.len() < 2 {
         return samples.iter().map(|s| leave_one_out(model, s)).collect();
     }
     let per = samples.len().div_ceil(threads);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = samples.chunks(per).map(|chunk| scope.spawn(move || chunk.iter().map(|s| leave_one_out(model, s)).collect::<Vec<_>>())).collect();
+        let handles: Vec<_> = samples.chunks(per).map(|chunk| {
+                scope.spawn(move || {
+                    crate::threads::lower_priority();
+                    chunk.iter().map(|s| leave_one_out(model, s)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
         handles.into_iter().flat_map(|h| h.join().expect("a leave-one-out thread panicked")).collect()
     })
 }
