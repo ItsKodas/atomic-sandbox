@@ -246,6 +246,9 @@ use crate::xc::{lsda_pw92, XcResult};
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
 use std::sync::Arc;
 
+// The Fermi–Dirac rule lives in `occupations`; re-exported so `qm::scf::fermi_dirac` resolves (spec §5).
+pub use crate::occupations::*;
+
 /// How each spin's electrons fill its Kohn–Sham levels (module doc, "Occupations").
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Occupations { Aufbau, DegenerateShells { tau: f64 } }

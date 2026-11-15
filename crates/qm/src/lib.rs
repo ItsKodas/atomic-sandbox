@@ -7,6 +7,7 @@ pub mod grid;
 pub mod ionic;
 pub mod nonlocal;
 pub mod nuclear;
+pub mod occupations;
 pub mod orbitals;
 pub mod poisson;
 pub mod radial;
@@ -19,4 +20,8 @@ pub use forces::forces;
 pub use grid::Grid;
 pub use ionic::{IonicPolicy, IonicSetup};
 pub use nuclear::Nucleus;
+pub use occupations::{
+    fd_entropy, fermi_dirac, partial_levels, witness_reached, FdOccupations, PartialLevel, ELECTRON_KT, GPU_PARTIAL_TOL, MAX_MU_HALVINGS, MU_BRACKET_KT,
+    PARTIAL_OCCUPATION_MIN, WITNESS_GAP, WITNESS_TAIL_KT,
+};
 pub use scf::{extrapolate_sigma, scf, scf_observed, valence_electrons, Energy, KsState, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};
