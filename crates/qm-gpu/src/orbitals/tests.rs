@@ -6,6 +6,12 @@ use crate::scf::GpuSolver;
 use qm::orbitals as cpu;
 use qm::{Grid, Nucleus, ScfSettings, System};
 
+/// The SCF settings of the display tests: `ScfSettings::for_grid` with `Occupations::Aufbau` — held until plan Task 9
+/// switches it (the orbital display shows the providers' all-electron states, which `providers::ks::problem` holds at
+/// Aufbau until then; `for_grid` defaults to FermiDirac since plan Task 7, whose witness vectors the display does not yet
+/// handle: measured 2026-11-16, four of these tests fail on FD states).
+fn display_settings(grid: &Grid) -> ScfSettings { ScfSettings { occupations: qm::Occupations::Aufbau, ..ScfSettings::for_grid(grid) } }
+
 
 fn ctx() -> Option<GpuContext> {
     let c = GpuContext::new_headless();
@@ -353,7 +359,7 @@ fn display_copy_matches_cpu_reference() {
 fn h_atom_display_texture_is_normalised() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(49, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let nuclei = vec![nucleus([0.0; 3], 1)];
     s.solve(&System::new(nuclei.clone(), 0, None), &settings, false).expect("H converges");
@@ -384,7 +390,7 @@ fn h_atom_display_texture_is_normalised() {
 fn spin_texture_integrates_to_the_unpaired_count() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(49, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let nuclei = vec![nucleus([0.0; 3], 1)];
     s.solve(&System::new(nuclei.clone(), 0, None), &settings, false).expect("H converges");
@@ -452,7 +458,7 @@ fn colour_volume_matches_the_cpu_reference() {
 fn one_readback_per_update() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let vol = Volume3D::new(&s.ctx, [33; 3]);
     let cvol = ColourVolume3D::new(&s.ctx, [33; 3]);
@@ -481,7 +487,7 @@ fn one_readback_per_update() {
 fn update_does_not_write_solver_fields() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let vol = Volume3D::new(&s.ctx, [33; 3]);
     let cvol = ColourVolume3D::new(&s.ctx, [33; 3]);
@@ -525,7 +531,7 @@ fn update_does_not_write_solver_fields() {
 fn display_updates_between_solves_leave_the_scf_bitwise_unchanged() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let geometry = |t: usize| -> Vec<Nucleus> { let d = 0.7 + 0.03 * t as f64; vec![nucleus([d, 0.01 * t as f64, 0.0], 1), nucleus([-d, 0.0, 0.0], 1)] };
     let run = |with_view: bool| -> Vec<(u64, u64, usize, Vec<[u64; 3]>)> {
         let mut s = GpuSolver::new(ctx.clone(), &grid);
@@ -604,7 +610,7 @@ fn cpu_step_on_gpu_scalars_matches_the_cpu_pipeline() {
                               ("Li", 33, vec![nucleus([0.1, 0.0, 0.0], 3)]),
                               ("Ne", 41, vec![nucleus([0.37 * 0.25, -0.21 * 0.25, 0.12 * 0.25], 10)])] {
         let grid = Grid::cube(n, 0.25);
-        let settings = ScfSettings::for_grid(&grid);
+        let settings = display_settings(&grid);
         let mut s = GpuSolver::new(ctx.clone(), &grid);
         if let Err(e) = s.solve(&System::new(nuclei.clone(), 0, None), &settings, false) { panic!("{what}: {e:?}"); }
         let state = s.state().expect("converged");
@@ -802,7 +808,7 @@ const FACE_LIMIT_H025: f64 = 2e-5;
 /// A converged GPU solve of `nuclei` on n³ at h = 0.25 (σ = h, tol 1e-6).
 fn solved(ctx: &GpuContext, n: usize, nuclei: &[Nucleus]) -> (GpuSolver, ScfSettings) {
     let grid = Grid::cube(n, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx.clone(), &grid);
     s.solve(&System::new(nuclei.to_vec(), 0, None), &settings, false).expect("the SCF converges");
     (s, settings)
@@ -1144,7 +1150,7 @@ fn unoccupied_uses_the_pseudo_hamiltonian() {
     let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([
         (8, Ionic::Pseudo(filtered_at(8, h))), (1, Ionic::AllElectron { sigma: h })])));
     let sys = System::with_ionic(nuclei.clone(), 0, None, setup);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx.clone(), &grid);
     s.solve(&sys, &settings, false).expect("the SCF converges");
     let mut view = OrbitalView::new(&s);

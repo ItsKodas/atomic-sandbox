@@ -302,6 +302,84 @@ not usable either. The energy does not catch it either: with the old target H₂
 is therefore the **asserted** H₂O step-count guard in `energies_match_at_fixed_sigma`: GPU
 steps ≤ CPU steps + 5 (achieved 17 vs 17; the old target's 27 fails it by 5).
 
+### Fermi–Dirac on the GPU; FD is `for_grid`'s default (plan 2026-11-13 Task 7, 2026-11-16, release, RX 7900 XTX)
+
+`qm-gpu` runs `Occupations::FermiDirac { kt }` on the shared host rule (`qm::fermi_dirac`, `witness_reached`,
+`partial_levels` on the GPU's f64 Rayleigh–Ritz eigenvalues; `qm_gpu::scf` "Fermi–Dirac occupations"), with spec §5.1's
+partial-level stop: a GPU step whose occupations have a partial level is tested against max(tol, `GPU_PARTIAL_TOL` =
+1e-5), every other step against tol (`ScfStats::tol_used` reports which; the CPU always reports tol).
+`ScfSettings::for_grid` now returns FermiDirac at kT = `ELECTRON_KT` = 5 mHa, so every all-electron case of this suite
+solves witness vectors. Held at `Aufbau` until plan Task 9 (the providers' all-electron surface and its tag move
+together): `providers::ks::problem`'s all-electron branch, `cpu_provider_matches_qm_directly`, `timing_table` (below),
+the qm-gpu orbital-display tests and its orbital-lag witness; `BondForce::settings` until Task 10. The pseudo cases keep
+`DegenerateShells` explicitly until Task 10.
+
+**V4** (`gpu_fd_h4_square_matches_cpu`, `gpu_fd_pseudo_o_m3_matches_cpu`, `gpu_fd_pseudo_o_m1_matches_cpu`; 49³ × 0.25,
+σ = h; CPU at tol 1e-6, GPU at its partial-level stop 1e-5; the H₄ square a = 1.8 centred on the middle grid point, the
+lone pseudo-O (`CoresOnly`, `from_tables` at h = 0.25) on it, so the frontier pairs/p sets are degenerate on the grid).
+Bounds: F and TS within the suite's class bound (`E_BOUND_H2` = 2e-6 for H₄, `E_BOUND_PSEUDO` = 6e-6 for O), μ within
+`EPS_BOUND_PSEUDO` = 1e-5, each f within `EPS_BOUND_PSEUDO`/(2kT) = 1e-3, Σf per CPU-degenerate cluster within 1e-9, the
+same state class (TS within 5 % of the closed form = symmetric), forces within `F_BOUND_H2` = 5e-6 / `F_BOUND_PSEUDO` =
+6e-5.
+
+| system | F_cpu | F_gpu | ΔF | TS_cpu = TS_gpu (closed form) | ΔTS | max \|Δμ\| | max \|Δf\| | class | max \|ΔF_I\| (max \|F_I\|) | steps cpu / gpu | tol_used cpu / gpu |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| H₄ square | −1.721953786 | −1.721953640 | +1.46e-7 | 1.386294e-2 (4 kT ln 2) | −9.9e-14 | 1.6e-6 | 1.9e-6 | symmetric / symmetric | 2.6e-6 (8.8e-2) | 10 / 9 | 1e-6 / 1e-5 |
+| pseudo-O M = 3 | −16.114269705 | −16.114269362 | +3.44e-7 | 9.547713e-3 (3 kT s(⅓)) | −3.9e-15 | 3.6e-6 | 4.3e-7 | symmetric / symmetric | 1.8e-7 (0, symmetric site) | 14 / 31 | 1e-6 / 1e-5 |
+| pseudo-O M = 1 | −16.067788821 | −16.067789120 | −2.99e-7 | 1.909543e-2 (6 kT s(⅔)) | −2.9e-13 | 2.1e-6 | 3.6e-6 | symmetric / symmetric | 1.5e-7 (0) | 11 / 21 | 1e-6 / 1e-5 |
+
+Every degenerate cluster's Σf agrees to the 12 printed digits (H₄: 1 per spin; O M = 3: 3 ↑ and 1 ↓; M = 1: 2 and 2).
+Both solvers stored the same blocks (5 / 5 per spin: H₄ and O grow 2–3 witnesses). ΔTS is second order in Δε, as spec
+§9 V4 says (the GPU's p levels split by ≤ 1.5e-7 Ha around a CPU degeneracy of ≤ 3e-11). **The pre-registered M = 1 stop
+(plan F15) did not fire:** the GPU converged at the 1e-5 stop in 21 steps, no stall and no cap. The H₄ GPU solve ended 2
+of 22 eigensolves at the LOBPCG cap (worst 1.46e-3, the witnesses in the box-state cluster on early steps; a note, the
+final step converged at 7.4e-6).
+
+**The existing cases under FD** (same run; all pass at their unchanged bounds):
+
+| system | E_cpu (F) | E_gpu (F) | ΔE | steps cpu / gpu | bound |
+|---|---|---|---|---|---|
+| H | −0.424224232 | −0.424224223 | +8.3e-9 | 7 / 8 | 1e-6 |
+| He | −2.138685118 | −2.138685076 | +4.2e-8 | 11 / 12 | 2e-6 |
+| H₂ R = 1.4 | −0.962715541 | −0.962715500 | +4.1e-8 | 9 / 10 | 2e-6 |
+| LiH R = 3.0 | −5.320421060 | −5.320421010 | +5.0e-8 | 13 / 11 | 3e-6 |
+| H₂O | −37.528379899 | −37.528383152 | −3.25e-6 | 16 / 17 (step guard ≤ +5 holds) | 2e-5 |
+
+Forces max |ΔF|: H₂ R = 1.0 / 1.4 / 2.5 2.68e-6 / 2.97e-6 / 1.64e-6 (bound 5e-6), H₂O 2.97e-6 (6e-5). H₂ curve shape
+max |ΔE − mean| 1.18e-7 cold / 1.08e-7 warm (5e-6). The CPU H, He and H₂ numbers equal the Aufbau run's to the printed
+digits (FD ≡ Aufbau on a gapped closed shell: F − E_A = −4.5e-12 for H₂ at 33³); LiH moves by −1.2e-7 (its small frontier
+gap: TS 1.6e-7 at 33³) and H₂O by −2.7e-8. The pseudo cases
+(`DegenerateShells`) are unchanged: pseudo-O ΔE −4.21e-7, CH₄ −2.70e-7, H₂O (All) −1.67e-6, OH −2.85e-7.
+
+**Cost: the suite took 1420 s (23.7 min) instead of ~3.5 min.** Every all-electron CPU reference now solves witness
+vectors, and the witness of a light atom in a 12 Bohr box sits in a cluster of box states that LOBPCG converges slowly
+(it often stops at its 200-iteration cap: CPU `max_eigen_residual` 2.2e-2 for H₂O, 1.4e-4 for He; the witness's f is
+≤ e^{−36}, so no energy or force moves). CPU walls with the suite's twelve tests concurrent: H 59 s (5.1 s under Aufbau),
+H₂O 454 s (88 s), LiH 179 s (32 s), H₄ 114 s, pseudo-O 102–107 s. The GPU walls moved less (H₂O 19.8 s contended).
+
+**`timing_table` is held at Aufbau** (until plan Task 9). Under FD the 97³ × 0.25 H₂O (a 24 Bohr box) fails cold with
+"no gap witness within 16 extra levels of spin 0": the box-state density of spec §4.2 NOTE-6, reached by an all-electron
+closed shell in the suite's largest box (the witness needs ε ≥ μ + 36 kT ≈ ε_HOMO + 0.33 Ha, and a 24 Bohr box holds more
+than 16 states below that). That is a decision for before Task 9 switches the app's all-electron surface, not a cap
+raised here. The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold 1.79 s.
+
+**Re-pins** (each with its reason in the test): `qm` `none_policy_is_bitwise_today` and `qm-gpu`
+`gpu_none_policy_is_bitwise_today` keep the pre-M7 Aufbau bits under an explicit `Aufbau` and pin the `for_grid` (FD)
+bits beside them — "all-electron now solves witness vectors (FD, spec 2026-11-13)": CPU H₂ F = −0.952449176832
+(Aufbau −4.5e-12; TS 4.3e-20), LiH F = −5.219911361078 (Aufbau −1.0e-8 = −TS 1.59e-7 + ΔE +1.49e-7); GPU H₂
+−0.952449244390 (−8.0e-8, the witness path), LiH −5.219911456346 (+5.0e-7, inside the f32 path scatter; TS 1.59e-7).
+`lithium_runs_with_unequal_spin_channels` (CPU) and `empty_channel_and_lithium_run` (GPU) assert the witnesses (more than
+2 / 1 stored, Σf = 2 / 1) instead of exactly 2 / 1; Li at σ = h = 0.25 has its 2s and 2p 0.018 Ha apart, so FD shares
+them (2s f = 0.75, each 2p 0.083; TS 7.1e-3 on both solvers) and the GPU stops at 1e-5 (asserted).
+
+**The σ → 0 oracles under FD** (`--test oracles`, CPU f64; `validate::converged` takes `for_grid`'s FermiDirac): every
+oracle passes at its unchanged bound and every printed number equals the Aufbau table above — H a = −0.477710, He
+−2.822561 (+12.3 mHa), H₂ R_e = 1.4511 (R_e(σ) 1.6008 / 1.6530 / 1.7092 / 1.7685), F(R_e) → +0.0010, and V3 (ratio
+3.9395, b/e −0.0212). The new assertion TS ≤ 1e-12 at every σ of H and He and at every H₂ point holds with the largest TS
+5.6e-15 (spec §4.3: a closed shell gapped far beyond 74 kT). **Wall 3080 s (51 min) instead of ~31 min** — the witness
+vectors. The tests run concurrently and the bond scan (16 solves at 81³) is the long pole at the full 3080 s; H 852 s,
+He 1398 s, the H₂ force 658 s, V3 395 s (V3 was FD already).
+
 ## Dynamics (M4 Task 7, `tests/dynamics.rs`, 2026-10-13, release, RX 7900 XTX)
 
 Run with `cargo test -p validate --release --test dynamics` (~6 min, four tests

@@ -83,6 +83,20 @@
 //! the brief's δ = 0.01 bound, the (0.02, 0.04) Richardson agreement and, as the direct check,
 //! the GPU HF against the CPU HF.
 //!
+//! # Occupations: the force is −dF/dR (spec 2026-11-13 §4.4; `qm::forces` "Occupations: the force is −dF/dR")
+//! Under `Occupations::FermiDirac { kt }` (the default of `ScfSettings::for_grid`; `scf` module doc, "Fermi–Dirac
+//! occupations") the GPU SCF converges to a stationary point of the Mermin free energy F_h = E_h − kT·S at fixed N_σ,
+//! stationary in ψ (the Kohn–Sham equations of ρ_σ = Σ_i f_iσ ψ_iσ²) and in f (∂F_h/∂f_iσ = ε_iσ + kT ln(f/(1 − f)) =
+//! μ_σ is the Fermi–Dirac rule). S has no explicit R and N_σ is fixed, so
+//!   dF_h/dR_I = ∂E_h/∂R_I|_{ψ, f} + Σ_σ μ_σ dN_σ/dR_I = ∂E_h/∂R_I|_{ψ, f},
+//! the Hellmann–Feynman force of the f-weighted density (and, under a setup, of the f-weighted projector sums with the
+//! state's `occ_*`, witnesses included) that this module computes, unchanged: **the force is −dF/dR of the Mermin
+//! functional, not −dE/dR**. They differ by d(kT·S)/dR — 0 in a gapped system, up to a few mHa/Bohr where a level crosses
+//! μ — so the force pairs with `Energy::total` (= F), not `Energy::internal` (= E). Under `Aufbau` and
+//! `DegenerateShells` S = 0 and the f are fixed, so the same expression is −dE/dR. The floors are the ones above: the
+//! SCF residual (on a solve with a partial level the GPU stops at Δρ < 1e-5, spec §5.1: V0 measured ≤ 3.2e-6 Ha/Bohr per
+//! component against a tighter re-solve), the LOBPCG residual and the f32 partial sums.
+//!
 //! # The forces do not sum to zero
 //! As on the CPU, Σ_I F_I ≠ 0 on a grid: the egg-box effect breaks translational invariance
 //! (moving every nucleus by the same δ changes E_h), bounded by ~4e-5 Ha/Bohr per nucleus at
@@ -716,7 +730,7 @@ mod tests {
         let Some(ctx) = GpuContext::new_headless() else { return };
         use crate::ionic::tests::filtered_at;
         use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
-        use qm::{Occupations, DEGENERACY_TAU};
+        use qm::{Occupations, ELECTRON_KT};
         let h = 0.15;
         let setup = |zs: &[u8]| std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h,
             zs.iter().map(|&z| (z, if z == 8 { Ionic::Pseudo(filtered_at(8, h)) } else { Ionic::AllElectron { sigma: h } })).collect()));
@@ -731,7 +745,8 @@ mod tests {
             let grid = Grid::cube(n, h);
             let mut s = GpuSolver::new(ctx.clone(), &grid);
             let mut settings = ScfSettings::for_grid(&grid);
-            settings.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+            // Fermi–Dirac at the production kT (plan Task 7: the GPU runs it; `for_grid`'s default, set explicitly here)
+            settings.occupations = Occupations::FermiDirac { kt: ELECTRON_KT };
             let st = s.solve(&sys, &settings, false).unwrap().1;
             let state = s.state().unwrap();
             let t = Instant::now();

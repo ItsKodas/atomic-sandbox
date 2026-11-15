@@ -30,6 +30,11 @@ fn atom_oracle(name: &str, z: u8, n: usize, h: f64, rho0_cusp: f64) -> (f64, Vec
             sig[k], e[k], e[k] - a, d1, (e[k] - a) / d1, stats[k].iterations, stats[k].delta_rho, stats[k].boundary_density, stats[k].energy);
     }
     eprintln!("  extrapolated a = {a:+.6}");
+    // spec 2026-11-13 §9 (plan Task 7): the oracles run `for_grid`'s FermiDirac at kT = 5 mHa; a closed-shell atom is
+    // gapped far beyond 74 kT, so −TS must vanish (S ≤ 1e-14, section 4.3) and F is the E the reference tabulates
+    for (k, s) in stats.iter().enumerate() {
+        assert!(s.energy.ts <= 1e-12, "{name} σ = {}: TS = {:e} (a gapped atom carries no entropy)", sig[k], s.energy.ts);
+    }
     (a, stats.iter().flat_map(|s| s.warnings.iter().cloned()).collect())
 }
 
@@ -93,6 +98,8 @@ fn h2_force(g: &Grid, r: f64, sigma: f64, tol: f64, eig_tol: f64, warm: Option<&
     let sys = h2(r);
     let (state, st) = converged(g, &sys, sigma, tol, eig_tol, warm);
     assert!(st.warnings.is_empty(), "R = {r}, σ = {sigma}: {:?}", st.warnings);
+    // FermiDirac at kT = 5 mHa (`for_grid`, plan Task 7): H₂ is gapped (≈ 0.36 Ha ≫ 74 kT), so −TS vanishes
+    assert!(st.energy.ts <= 1e-12, "R = {r}, σ = {sigma}: TS = {:e}", st.energy.ts);
     let f = forces(g, &state, &sys.nuclei, sigma).unwrap();
     assert!((f[0][0] + f[1][0]).abs() < 1e-6 && f[0][1].abs() < 1e-6 && f[0][2].abs() < 1e-6, "R = {r}: {f:?}");
     (f[0][0], state, st.iterations)

@@ -384,7 +384,12 @@ pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Resul
             settings.occupations = qm::Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
             System::with_ionic(nuclei, scene.charge, scene.multiplicity, setup)
         }
-        None => System::new(nuclei, scene.charge, scene.multiplicity),
+        None => {
+            // held until plan Task 9 switches it (the all-electron surface moves together with its provenance tag;
+            // `ScfSettings::for_grid` defaults to FermiDirac since plan Task 7)
+            settings.occupations = qm::Occupations::Aufbau;
+            System::new(nuclei, scene.charge, scene.multiplicity)
+        }
     };
     Ok((grid, system, settings))
 }
@@ -1659,6 +1664,7 @@ mod tests {
         let sys = qm::System::new(vec![qm::Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, qm::Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
         let mut settings = qm::ScfSettings::for_grid(&grid);
         settings.tol = 1e-6;
+        settings.occupations = qm::Occupations::Aufbau; // held until plan Task 9 switches it (`problem`'s all-electron branch)
         let (state, stats) = qm::scf(&grid, &sys, &settings, None).expect("qm::scf");
         let f = qm::forces(&grid, &state, &sys.nuclei, settings.sigma).expect("qm::forces");
         println!("H₂ 33³: E = {:+.12} Ha ({} steps), F = {:?}", r.energy, r.stats.scf_steps, r.forces);

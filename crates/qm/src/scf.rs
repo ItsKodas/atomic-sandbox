@@ -144,10 +144,12 @@
 //!
 //! # Occupations (spec 2026-11-13 §4–5; `DegenerateShells`: pseudopotential spec §5.7, M7 Task 6 review, ruling A)
 //! `ScfSettings.occupations` picks how each spin channel σ (N_σ electrons) fills its levels. Three schemes:
-//! - **`Aufbau`** (the default of `for_grid` until plan Task 7 flips it; the providers' choice under
-//!   `IonicPolicy::None` until then; afterwards only the kT → 0 reference) is everything above: each spin fills its
-//!   N_σ lowest levels, k_σ = N_σ vectors are solved, not one operation differs from the solver before M7.
-//! - **`FermiDirac { kt }`** (spec 2026-11-13; production kT = `ELECTRON_KT` = 5 mHa, T_el = kT/k_B ≈ 1 579 K): the
+//! - **`Aufbau`** (the default of `for_grid` until plan Task 7 flipped it to `FermiDirac`; the providers' choice under
+//!   `IonicPolicy::None` until plan Task 9 switches it; afterwards only the kT → 0 reference) is everything above: each
+//!   spin fills its N_σ lowest levels, k_σ = N_σ vectors are solved, not one operation differs from the solver before
+//!   M7.
+//! - **`FermiDirac { kt }`** (spec 2026-11-13; the default of `for_grid` since plan Task 7, at the production kT =
+//!   `ELECTRON_KT` = 5 mHa, T_el = kT/k_B ≈ 1 579 K): the
 //!   Mermin–Kohn–Sham ensemble at fixed N_σ per spin (the fixed-spin-moment ensemble, so a forced or "auto"
 //!   multiplicity keeps its meaning), with ground-state LSDA xc. All of it is in atomic units (ε, μ, kT in Ha, k_B = 1).
 //!   - *The rule* (`occupations::fermi_dirac`, its module doc has the derivation): on every SCF step, from that step's
@@ -193,7 +195,7 @@
 //!     |ε − μ| ≲ 13.8 kT).
 //!   - *Warm start* (spec §5): `KsState.occupations` records the scheme with its kT and the guard compares it with
 //!     `==`, so a state converged at another kT or under another scheme never seeds the solve (the cold path runs).
-//! - **`DegenerateShells { tau }`** (the providers' choice under `CoresOnly` and `All` until plan Task 7; removed in
+//! - **`DegenerateShells { tau }`** (the providers' choice under `CoresOnly` and `All` until plan Task 9; removed in
 //!   plan Task 10), τ = `DEGENERACY_TAU`:
 //!   - Why: with integer aufbau a partly filled degenerate shell has no well-posed fixed point. For
 //!     pseudo-O at h = 0.20, M = 1 (two of three p per spin) has no aufbau-consistent state (the empty
@@ -422,10 +424,12 @@ pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub 
 
 impl ScfSettings {
     /// σ = h (smallest width the grid resolves), tol 1e-6, 200 iterations, α = 0.3, eig_tol 1e-6,
-    /// DIIS history 6, integer aufbau occupations, the stall stop at `SCF_STALL_WINDOW`.
+    /// DIIS history 6, Fermi–Dirac occupations at kT = `ELECTRON_KT` (module doc, "Occupations"; spec 2026-11-13 §5:
+    /// the oracles test the path the app runs; plan Task 7), the stall stop at `SCF_STALL_WINDOW`. A caller that needs
+    /// the kT → 0 reference sets `Occupations::Aufbau` explicitly.
     pub fn for_grid(grid: &Grid) -> ScfSettings {
-        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6, occupations: Occupations::Aufbau,
-                      stall_window: SCF_STALL_WINDOW }
+        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6,
+                      occupations: Occupations::FermiDirac { kt: ELECTRON_KT }, stall_window: SCF_STALL_WINDOW }
     }
 }
 
@@ -598,8 +602,9 @@ pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub x
 /// `energy.ts` = kT·S); `mu` = μ_σ per spin [↑, ↓] (`None` for an empty channel; a physical number only where the
 /// channel has a partial level, spec §4.1); `partial` = every level with min(f, 1 − f) ≥ `PARTIAL_OCCUPATION_MIN`, in
 /// ascending ε per spin, ↑ first. Under the other schemes S = 0, μ = [None, None] and `partial` is empty.
-/// `tol_used`: the Δρ tolerance the convergence test compared against (`settings.tol` on the CPU; spec §5.1's GPU stop
-/// for a solve with a partial level is wired in plan Task 7).
+/// `tol_used`: the Δρ tolerance the converged step was tested against — always `settings.tol` on the CPU (f64 has no
+/// occupation-noise floor); on the GPU max(`settings.tol`, `GPU_PARTIAL_TOL`) when that step's occupations have a
+/// partial level (spec §5.1, `qm_gpu::scf` "Fermi–Dirac occupations"), else `settings.tol`.
 #[derive(Debug, Clone)]
 pub struct ScfStats {
     pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
@@ -1226,8 +1231,11 @@ mod tests {
         let g = Grid::cube(49, 0.25);
         let li = System::new(vec![Nucleus { pos: [0.0; 3], z: 3 }], 0, None);
         let (state, stats) = scf(&g, &li, &ScfSettings::for_grid(&g), None).unwrap();
-        assert_eq!(state.orbitals_up.len(), 2);
-        assert_eq!(state.orbitals_dn.len(), 1);
+        // re-pinned (plan Task 7): all-electron now solves witness vectors (FD, spec 2026-11-13) — (2, 1) electrons in
+        // more stored levels per spin (were exactly 2 and 1 under Aufbau)
+        assert!(state.orbitals_up.len() > 2 && state.orbitals_dn.len() > 1, "{} / {}", state.orbitals_up.len(), state.orbitals_dn.len());
+        assert!((state.occ_up.iter().sum::<f64>() - 2.0).abs() < 1e-12 && (state.occ_dn.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        eprintln!("Li 49³ (FD): stored {} / {}, TS {:.3e}, partial {:?}", state.orbitals_up.len(), state.orbitals_dn.len(), stats.energy.ts, stats.partial);
         assert!(stats.delta_rho < 1e-6);
         assert_relative_eq!(g.integrate(&state.rho()), 3.0, epsilon = 1e-8);
     }
@@ -1275,28 +1283,48 @@ mod tests {
 
     // ---- M7 Task 6: the ionic setup in the SCF ----
 
-    // Step 1's output on the code before M7 (86974e3), verbatim:
+    // Step 1's output on the code before M7 (86974e3), verbatim. Held: asserted under an explicit `Occupations::Aufbau`
+    // (the kT → 0 reference path, unchanged by plan Task 7).
     const BASE_H2_E: u64 = 0xbfee7a76b2327147;
     const BASE_H2_FX: u64 = 0x3fc07b1358ca116a; // 10 SCF steps
     const BASE_LIH_E: u64 = 0xc014e13070f24df5;
     const BASE_LIH_FX: u64 = 0xbf97397795d2fce0; // 13 SCF steps
+    // Re-pinned (plan Task 7, 2026-11-16; printed by this test): the same scenes under `ScfSettings::for_grid`'s default
+    // since Task 7, FermiDirac at kT = 5 mHa — all-electron now solves witness vectors (FD, spec 2026-11-13). The move
+    // from the Aufbau bits above and the −TS of each are recorded beside the values.
+    const FD_H2_E: u64 = 0xbfee7a76b232ffed; // -0.952449176832 (Aufbau −0.952449176828: −4.5e-12; TS 4.3e-20; 10 steps, 2 / 2 stored)
+    const FD_H2_FX: u64 = 0x3fc07b139b8e8122; // +0.128755999523 (Aufbau +0.128755968432)
+    const FD_LIH_E: u64 = 0xc014e130719f64f8; // -5.219911361078 (Aufbau −5.219911351003: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 15 steps, 6 / 6 stored)
+    const FD_LIH_FX: u64 = 0xbf973980c2ecf2d0; // -0.022680293939 (Aufbau −0.022680157203)
 
-    /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces).
+    /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces) — under `Aufbau`, set
+    /// explicitly since plan Task 7 made FermiDirac `for_grid`'s default; the for_grid (FD) solves are pinned beside it.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn none_policy_is_bitwise_today() {
         let g = Grid::cube(33, 0.25);
-        let s = ScfSettings::for_grid(&g);
-        for (sys, e_bits, f_bits) in [
-            (System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None), BASE_H2_E, BASE_H2_FX),
-            (System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None), BASE_LIH_E, BASE_LIH_FX),
-        ] {
+        let fd = ScfSettings::for_grid(&g);
+        let aufbau = ScfSettings { occupations: Occupations::Aufbau, ..fd };
+        let scenes = || [("H2", System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None)),
+                         ("LIH", System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None))];
+        for ((_, sys), (e_bits, f_bits)) in scenes().into_iter().zip([(BASE_H2_E, BASE_H2_FX), (BASE_LIH_E, BASE_LIH_FX)]) {
             assert!(sys.ionic.is_none());
-            let (st, stats) = scf(&g, &sys, &s, None).unwrap();
-            let f = crate::forces(&g, &st, &sys.nuclei, s.sigma).unwrap();
+            let (st, stats) = scf(&g, &sys, &aufbau, None).unwrap();
+            let f = crate::forces(&g, &st, &sys.nuclei, aufbau.sigma).unwrap();
             assert_eq!(stats.energy.total.to_bits(), e_bits);
             assert_eq!(f[0][0].to_bits(), f_bits);
             assert!(stats.core_overlaps.is_empty() && st.ionic.is_none());
+        }
+        for ((name, sys), (e_bits, f_bits)) in scenes().into_iter().zip([(FD_H2_E, FD_H2_FX), (FD_LIH_E, FD_LIH_FX)]) {
+            let (st, stats) = scf(&g, &sys, &fd, None).unwrap();
+            let f = crate::forces(&g, &st, &sys.nuclei, fd.sigma).unwrap();
+            eprintln!("{name} (FD, for_grid): F {:+.12} (TS {:.3e}, E {:+.12}, {} steps, stored {} / {}) F_x0 {:+.12}",
+                      stats.energy.total, stats.energy.ts, stats.energy.internal, stats.iterations, st.orbitals_up.len(), st.orbitals_dn.len(), f[0][0]);
+            eprintln!("    const FD_{name}_E: u64 = 0x{:016x}; // {:+.12}", stats.energy.total.to_bits(), stats.energy.total);
+            eprintln!("    const FD_{name}_FX: u64 = 0x{:016x}; // {:+.12}", f[0][0].to_bits(), f[0][0]);
+            assert_eq!(stats.energy.total.to_bits(), e_bits, "{name} FD energy");
+            assert_eq!(f[0][0].to_bits(), f_bits, "{name} FD F_x0");
+            assert!(stats.core_overlaps.is_empty() && st.ionic.is_none() && st.occupations == fd.occupations);
         }
     }
 
@@ -1499,7 +1527,8 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn closed_shells_are_aufbau_under_the_rule() {
         let g = Grid::cube(33, 0.25);
-        let aufbau = ScfSettings::for_grid(&g);
+        // `Aufbau` explicitly: `for_grid` defaults to FermiDirac since plan Task 7 (this test is DS against aufbau)
+        let aufbau = ScfSettings { occupations: Occupations::Aufbau, ..ScfSettings::for_grid(&g) };
         let mut shared = ScfSettings::for_grid(&g);
         shared.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
         for nuc in [vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }],

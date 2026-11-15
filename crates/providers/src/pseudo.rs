@@ -789,6 +789,9 @@ impl BondForce {
         let mut s = qm::ScfSettings::for_grid(&self.grid);
         s.tol = DIMER_PROCEDURE.scf_tol;
         s.eig_tol = DIMER_PROCEDURE.eig_tol;
+        // held until plan Task 10 switches it (the dimer procedure moves with its hash there; `for_grid` defaults to
+        // FermiDirac since plan Task 7)
+        s.occupations = qm::Occupations::Aufbau;
         s
     }
 
