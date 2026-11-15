@@ -24,70 +24,106 @@
 //! solve on ρ_in = ρ_SCF reproduces the SCF's eigenpairs to its tolerance
 //! (`harris_on_the_converged_density_reproduces_the_scf`).
 //!
-//! **The block: the lowest n_occ,σ + m + G states** (spec §4.1; m the unoccupied count asked for, G =
-//! `UNOCC_GUARD`, n_occ,σ the levels with f > 0). n_occ,σ is known only after the occupations, and under
-//! `DegenerateShells` a shared shell makes it exceed n_σ (pseudo-O triplet ↓: n = 2, f = 1, ⅓, ⅓, ⅓ ⇒
-//! n_occ = 4). So each channel starts from k_σ = n_σ + m + G plus the previous call's n_occ − n_σ (when it
-//! had the same n_σ), solves (one LOBPCG at the SCF's effective tol, `effective_eig_tol`, and cap,
-//! `EIGEN_MAX_ITER`), applies `qm::one_shot_occupations`, and grows the block (`block_need`) when
-//! n_occ + m + G > k_σ **or** the occupations found no gap witness (`window_short`: the top computed level
-//! within τ_c of ε_F — which can come with a released cluster and n_occ = n_σ, so the count alone would
-//! not see it; then one more level, as the SCF's growth does): the new columns are fresh
-//! `qm::scf::initial_orbitals` ones (seed 5 ↑ / 6 ↓, the columns past those already held) behind the
-//! current Ritz vectors, and it solves again — the converged columns need no further work, but the solve
-//! runs until the new columns converge or reach the cap; this is the SCF's witness growth (`qm::scf`
-//! "Occupations"), bounded by `MAX_WITNESS_GROWTH` — then re-applies the occupations. A block larger than needed (the shell split since the last call) is trimmed from the
-//! top. So every completed solve keeps exactly n_occ + m + G levels: G above the occupied ones and above
-//! the m asked for, which hold the `DegenerateShells` gap witness whenever the shell has one within that
-//! reach, and the unoccupied record always has m + G vectors, the count `block_edge` reads m from. A
-//! short window is left only at the growth bound (the note says so, and is emitted only then). The guess is this state's
-//! previous vectors (trimmed, or topped up with fresh columns), else `initial_orbitals`. Occupied and
-//! unoccupied come out of the **same** Rayleigh–Ritz, so there is no separate unoccupied step and no
-//! `occupied_disagreement` check (spec §4.2: the builder's choice). The f > 0 levels (the lowest by rank
-//! under both rules) become the state's orbitals with their f; the rest go through the view's own tail
-//! (`orbitals::record_unoccupied`: re-measured ε and residual, sorted, τ-set face density, block edge)
-//! into this state's `Unoccupied`. With m = 0 the G guard levels are still solved (the witness) but
-//! `HarrisState::unoccupied` offers none (`qm::orbitals`: n_computed = n_occ when no row is asked for).
+//! **The block: the lowest n_occ,σ + m + G states** (spec §4.1; m the unoccupied count
+//! asked for, G = `UNOCC_GUARD`, n_occ,σ the levels with f > 0). n_occ,σ is known only after the
+//! occupations, and under `DegenerateShells` a shared shell makes it exceed n_σ (pseudo-O triplet ↓: n = 2,
+//! f = 1, ⅓, ⅓, ⅓ ⇒ n_occ = 4). So each channel starts from a split (`start_split`: the last call's need when
+//! it had the same n_σ, else n_σ + m + G vectors), solves (one LOBPCG at the SCF's effective tol,
+//! `effective_eig_tol`, and cap, `EIGEN_MAX_ITER`), applies `qm::one_shot_occupations`, and asks
+//! `split_need` what this pass needs: n_occ + m + G tested levels, **or** every level that decides the
+//! occupations when that is more (`decisive_levels`, the smallest b whose lowest b levels give no short
+//! window: with no gap witness, `window_short` — the top computed level within τ_c of ε_F, which can come
+//! with a released cluster and n_occ = n_σ, so the count alone would not see it — every computed level
+//! decides, so the block grows by one level, as the SCF's growth does), and one buffer (below). When
+//! the block is short the new columns are fresh `qm::scf::initial_orbitals` ones (seed 5 ↑ / 6 ↓, the
+//! columns past those already held) behind the current Ritz vectors, and it solves again — the converged
+//! columns need no further work, but the solve runs until the new columns converge or reach the cap; this
+//! is the SCF's witness growth (`qm::scf` "Occupations"), bounded by `MAX_WITNESS_GROWTH` tested levels
+//! beyond n_σ + m + G (`split_bound`) — then re-applies the occupations. A block larger than needed (the
+//! shell split since the last call) is trimmed from the top. So every completed solve keeps n_occ + m + G
+//! levels in its record: G above the occupied ones and above the m asked for, which hold the
+//! `DegenerateShells` gap witness whenever the shell has one within that reach, and the unoccupied record
+//! always has m + G vectors, the count `block_edge` reads m from. A short window is left only at the growth
+//! bound (the note says so, and is emitted only then). The guess is this state's previous vectors (trimmed,
+//! or topped up with fresh columns), else `initial_orbitals`. Occupied and unoccupied come out of the
+//! **same** Rayleigh–Ritz, so there is no separate unoccupied step and no `occupied_disagreement` check
+//! (spec §4.2: the builder's choice). The f > 0 levels (the lowest by rank under both rules) become the
+//! state's orbitals with their f; the rest go through the view's own tail (`orbitals::record_unoccupied`:
+//! re-measured ε and residual, sorted, τ-set face density, block edge) into this state's `Unoccupied`.
+//! With m = 0 the G guard levels are still solved (the witness) but `HarrisState::unoccupied` offers none
+//! (`qm::orbitals`: n_computed = n_occ when no row is asked for).
 //!
 //! **Three roles, three tolerances** (task 8b perf: at 109³ every refresh ended on the 200-iteration cap
 //! polishing the guard levels — box states — for 3.6 s warm; measured at 81³, the column holding the cap
 //! was always the **top** one, residual 1e-2–3e-2, every other ≤ 1e-3: the last column of a block
 //! converges at a rate set by the gap to the first level outside it, and a large box's states are a near
-//! continuum). The stop test (`eigen::lobpcg_split`) holds the lowest k − G columns — the displayed
-//! n_occ + m — to the SCF's effective tol, the guard columns below the top to `GUARD_TOL` = τ_c/100 =
-//! 1e-3 Ha, and does not test the top column: it is a **buffer** vector (standard block-eigensolver
-//! practice), iterated to speed up the others, whose Ritz value is used for nothing that needs it. To keep
-//! that true the block always holds one level above the levels that decide the occupations
-//! (`decisive_levels`: the smallest b whose lowest b levels give no short window): when the witness would
-//! be the top column, the block grows by one. Why `GUARD_TOL` is enough: the witness test (`qm::scf::degenerate_shell_occupations`) compares a guard Ritz value with
-//! ε_F + τ_c, τ_c = 0.1 Ha; a normalised vector with residual r has an eigenvalue within r of its Ritz
-//! value (|θ − λ| ≤ ‖Hx − θx‖), and a Ritz value is an **upper** bound on its eigenvalue (θ_j ≥ λ_j,
-//! Courant–Fischer on the Rayleigh–Ritz subspace), so the error is one-sided: with the levels below it
-//! resolved (as for any LOBPCG block: no level is missed below a Ritz value), θ − λ ≤ 1e-3 Ha. A level is
-//! then taken as a witness only if its true energy is ≥ ε_F + τ_c − 1e-3, i.e. only a level within 1 % of
-//! the threshold can be classified differently than at full convergence — the same knife edge any f32
-//! rounding or 0.01 Bohr move already flips, and a display decision. The direction of the error is the
-//! safe-for-display one: a guard can make a true in-window level look like a witness (that shell is then
-//! drawn with integer occupations a hair early), never create a spurious in-window level or drop an
-//! occupied one. A capped tested guard (ending above 1e-3) widens that margin to its residual, which the
-//! at-cap note prints. The buffer's Ritz value, likewise an upper bound, enters only `block_edge`'s
-//! "does a set reach the last vector" test, where being too high can split a degenerate set at the top
-//! (a ≥ 3-fold set straddling the window into both guards would then show its lower members, each held
-//! to the full tol by the shown-set rule below) and never joins one. When m > 0 the first level above the occupied ones — the witness that decides — is a
-//! displayed level and held to the full tol anyway; the guard tolerance decides only at m = 0 and for a
-//! shell reaching past the m rows. The displayed levels keep the
-//! full tol. **A displayed τ-set reaching into the guards** (the m-th row degenerate with the next level
-//! — H₂ 33³'s box pair at 0.20857 Ha straddles m = 2): `block_edge` shows the whole set, so after each
-//! solve the shown count is checked against the tight head and, when it reaches past it, the head is
-//! raised to cover the shown rows and the solve continues (warm: only those columns move). Every shown
-//! row is then held to the full tol; the set's membership itself is judged on Ritz values whose error is
-//! ~r²/δ ≤ (1e-3)²/δ — at τ = 1e-4 a guard can be misjudged as in or out of the set only when its
-//! distance δ to the rest of the spectrum is ≲ 1e-2 Ha, and a level then shown is re-solved to tol by
-//! this same rule. The raised head is remembered for the next call (`last`).
+//! continuum). The stop test (`eigen::lobpcg_split`; the tiers are a `Split`) holds the lowest columns —
+//! the displayed n_occ + m — to the SCF's effective tol, the tested columns above them — the record's
+//! guards, and any witness levels above the record — to `GUARD_TOL` = τ_c/100 = 1e-3 Ha, and does not test
+//! the top column: it is a **buffer** vector (standard block-eigensolver practice), iterated to speed up
+//! the others, whose Ritz value must decide nothing. The witness is never the buffer (`decisive_levels`:
+//! when it would be, the block grows by one). Only at the growth bound, where no buffer fits, is every
+//! column tested — and when the window is still short there, every computed level is shared (f > 0, in
+//! ρ_out), so every column is held to the SCF's tol (review M1).
 //!
-//! **Block memory.** A released short window needs levels above n_occ + m + G for its witness
-//! (`minimal_block`); those are kept as spare guess vectors (not in the record) and the next call starts
-//! at that block, so a warm refresh does not re-grow it.
+//! **The record's edge** (task 8b fix 1, review I2). Normally the buffer is the record's last vector, and
+//! `block_edge` reads every record value: a τ-set reaching the last vector is hidden whole, so a buffer
+//! Ritz value too high by r²/δ ≫ τ (residual 1e-2–3e-2) could split a set truly reaching the edge and show
+//! its lower members as complete. It can do so only when the window's last row (position n_occ + m − 1)
+//! and the first guard (n_occ + m) are one τ-set: `block_edge` shows the single-linkage τ-sets that start
+//! inside the window (start < m) and hides one that ends on the last vector; with a gap > τ between
+//! positions m − 1 and m (relative to n_occ) every set starting inside the window ends by m − 1, two short
+//! of the last vector (G = 2), the set after it starts at m and is neither shown nor counted, and the last
+//! value takes part in neither — the shown rows and the hidden count are the same whatever it is (the
+//! view's update recomputes `block_edge` from the same values, and a τ-set's face density concerns only
+//! shown sets). So when, after a solve, those two positions are within 2τ (`record_edge_matters`; the
+//! margin covers the record's f32 re-measure of the same vectors) the last record vector is tested at
+//! `GUARD_TOL` and one buffer is added above the record; otherwise the record's last vector stays the
+//! buffer. The reviewer's fix — a buffer above the record always — was measured first: one vector more
+//! costs 1.4–1.55× per LOBPCG iteration (the Gram readback is ∝ (3k)²), and with the record's last vector
+//! tested in the near continuum, 7 of 16 warm 0.1 Bohr refreshes of H₂ (81³, 109³, m = 4) took 140–186
+//! iterations instead of ≈ 90 — each one a converged σ_g column replaced, in one Rayleigh–Ritz step, by a
+//! combination of the W and P directions (no X component, residual 5 Ha; a known fragility of LOBPCG's raw
+//! [X W P] basis, Hetmaniuk & Lehoucq, J. Comput. Phys. 218 (2006) 324) and re-converged from there; the
+//! 8b layout had none in the same 16 (`harris_record_edge_is_a_tested_guard` exercises the edge case).
+//!
+//! Why `GUARD_TOL` is enough: the witness test (`qm::scf::degenerate_shell_occupations`) compares a guard
+//! Ritz value with ε_F + τ_c, τ_c = 0.1 Ha; a normalised vector with residual r has an eigenvalue within r
+//! of its Rayleigh quotient (|θ − λ| ≤ ‖Hx − θx‖), so with the levels below it resolved (as for any LOBPCG
+//! block: no level is missed below a Ritz value) |θ − λ| ≤ 1e-3 Ha. A level is then classified as a
+//! witness or not as at full convergence unless its true energy is within 1e-3 of ε_F + τ_c, i.e. within
+//! 1 % of the threshold — the same knife edge any f32 rounding or 0.01 Bohr move already flips, and a
+//! display decision. After a Rayleigh–Ritz step the error is moreover one-sided, θ_j ≥ λ_j (Courant–Fischer
+//! on the Rayleigh–Ritz subspace), the safe direction for display: a guard can make a true in-window level
+//! look like a witness (that shell is then drawn with integer occupations a hair early), never create a
+//! spurious in-window level or drop an occupied one. A warm guess accepted at iteration 0 is not rotated
+//! (`eigen` module doc: the guess is neither rotated nor rescaled), so its Rayleigh quotients carry only
+//! the two-sided bound: there the 1 % band applies on either side of the threshold (the same margin, no
+//! guaranteed direction). A capped tested guard (ending above 1e-3) widens that band to its residual, which
+//! the at-cap note prints (the displayed and the guard tiers' residuals, `EigenStats::split_residual`; the
+//! buffer's enters neither — task 8b printed the max over all columns, the buffer's included, review M2). When m > 0 the first level above the occupied ones — the witness that decides
+//! — is a displayed level and held to the full tol anyway; the guard tolerance decides only at m = 0 and
+//! for a shell reaching past the m rows. The displayed levels keep the full tol.
+//!
+//! **A displayed τ-set reaching into the guards** (the m-th row degenerate with the next level — H₂ 33³'s
+//! box pair at 0.20857 Ha straddles m = 2): `block_edge` shows the whole set, so after each solve the shown
+//! count is checked against the head and, when it reaches past it, the head is raised to cover the shown
+//! rows and the solve continues (warm: only those columns move). Every shown row is then held to the full
+//! tol; the set's membership itself is judged on Ritz values whose error is ~r²/δ ≤ (1e-3)²/δ — at
+//! τ = 1e-4 a guard (the record's last vector included, when it matters) can be misjudged as in or out of
+//! the set only when its distance δ to the rest of the spectrum is ≲ 1e-2 Ha, and a level then shown is
+//! re-solved to tol by this same rule.
+//!
+//! **Block memory.** A completed solve leaves the split its final occupation pass needed (`Memory`: the
+//! block — a released short window's witness levels and a buffer above the record are kept as spare
+//! guess vectors — the raised head and the tested count), and the next call with the same n_σ starts
+//! there, so a warm refresh does not re-grow its block or re-raise its head. It is the **need** that is
+//! remembered, never the split the call ran with (raised from its start, never lowered within a call):
+//! task 8b remembered the head it ran with, so every raise and every shrink of the block accumulated — one
+//! way, until n_σ changed — up to every column at the full tol, the buffer included (review I1). A call
+//! right after n_occ dropped still runs the previous split once (its columns already meet it: the warm
+//! guess); the next is back at the minimal one (`split_memory_is_no_ratchet`,
+//! `harris_split_follows_n_occ_between_calls`).
 //!
 //! **Fermi–Dirac (the approved smearing work) must revisit the split.** Every FD level has f > 0, so
 //! "f > 0" would make every computed level occupied (n_occ = k, no unoccupied rows) and the growth rule
@@ -153,8 +189,11 @@ pub struct HarrisInput<'a> {
 /// levels with f > 0 (the state's orbitals); `notes` the informational lines (a released shell, a short
 /// window, an eigensolve at its cap); `iterations`/`at_cap` per channel (summed over the block's growth
 /// solves; at the cap in any of them); `solves` the LOBPCG calls per channel (1, plus one per growth of the
-/// block; 0 for a skipped channel); `cold` = some non-empty channel had no previous vector to start
-/// from (all from `initial_orbitals`); `wall` the call's wall time.
+/// block; 0 for a skipped channel); `split` per channel the last LOBPCG solve's (block length, head,
+/// checked): the lowest `head` columns held to the SCF's tol, `head..checked` to `GUARD_TOL`, the rest
+/// buffers (module doc, "Three roles, three tolerances"; (0, 0, 0) for a skipped channel); `cold` = some
+/// non-empty channel had no previous vector to start from (all from `initial_orbitals`); `wall` the
+/// call's wall time.
 #[derive(Clone, Debug)]
 pub struct HarrisSolve {
     pub evals: [Vec<f64>; 2],
@@ -164,6 +203,7 @@ pub struct HarrisSolve {
     pub iterations: [usize; 2],
     pub at_cap: [bool; 2],
     pub solves: [usize; 2],
+    pub split: [(usize, usize, usize); 2],
     pub cold: bool,
     pub wall: Duration,
 }
@@ -183,13 +223,12 @@ pub struct HarrisState {
     v_h: Option<Field>,
     ionic: Option<GpuIonic>,
     free: Vec<Field>,
-    /// Levels the last solve kept above its record only as the next guess (`minimal_block`: the gap
-    /// witness of a released short window), per channel, ascending.
+    /// Levels the last solve kept above its record only as the next guess (`split_need`: a released short
+    /// window's witness levels and the buffer), per channel, ascending.
     spare: [Vec<Field>; 2],
-    /// (n_σ, b − (n_σ + m + G), head − (k − G)) of the last completed solve per channel — b its minimal
-    /// block (`minimal_block`), so the next call starts at the block it needed, and how far its tight head
-    /// was raised over k − G for a shown τ-set — and its m.
-    last: [Option<(usize, usize, usize)>; 2],
+    /// The last completed solve's final split need per channel (`Memory`), so the next call starts at the
+    /// block and tiers it needed.
+    last: [Option<Memory>; 2],
     m: usize,
 }
 
@@ -293,8 +332,9 @@ fn grown<'w>(work: &'w mut Option<LobpcgWork>, work_k: &mut usize, ctx: &GpuCont
     work.as_mut().expect("sized above")
 }
 
-/// The guard/witness levels' LOBPCG tolerance (module doc, "Two tolerances"): τ_c/100 = 1e-3 Ha, so a
-/// guard Ritz value θ is within ‖r‖ ≤ 1e-3 Ha of an eigenvalue — 1 % of the gap the witness test reads.
+/// The guard/witness levels' LOBPCG tolerance (module doc, "Three roles, three tolerances"): τ_c/100 =
+/// 1e-3 Ha, so a guard Ritz value θ is within ‖r‖ ≤ 1e-3 Ha of an eigenvalue — 1 % of the gap the witness
+/// test reads.
 const GUARD_TOL: f64 = CANDIDATE_TAU / 100.0;
 
 /// The fewest lowest levels of `sorted` (ascending) that decide the occupations of `n` electrons under
@@ -306,20 +346,65 @@ fn decisive_levels(sorted: &[f64], n: usize, spin: u8, rule: Occupations) -> usi
     b
 }
 
-/// The block a completed solve keeps (≤ `sorted.len()`): the record's `keep` = n_occ + m + G levels, and
-/// at least one buffer level above the decisive ones (`decisive_levels`) — more than `keep` only when a
-/// released short window needed levels above it for its witness. The next call starts there.
-fn minimal_block(sorted: &[f64], n: usize, spin: u8, rule: Occupations, keep: usize) -> usize {
-    keep.max(decisive_levels(sorted, n, spin, rule) + 1).min(sorted.len())
+/// One channel's eigensolve split (module doc, "Three roles, three tolerances"): `len` vectors, the lowest
+/// `head` held to the SCF's tol, `head..checked` to `GUARD_TOL`, `checked..len` untested buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Split { len: usize, head: usize, checked: usize }
+
+/// The largest block of a channel with n_σ electrons and m unoccupied rows: n_σ + m + G tested levels, up to
+/// `MAX_WITNESS_GROWTH` more for a shared shell's gap witness (the SCF's growth bound), and the buffer.
+fn split_bound(n: usize, m: usize) -> usize { n + m + UNOCC_GUARD + MAX_WITNESS_GROWTH + 1 }
+
+/// Whether the record's last vector can change what `block_edge` shows (module doc, "The record's edge"):
+/// only when the window's last row (position n_occ + m − 1 of `sorted`, ascending) and the first guard
+/// (n_occ + m) are one τ-set — tested with 2τ, a margin over the record's re-measure of the same vectors
+/// (f32 rounding, ~1e-8 Ha). False at m = 0 (no window) and while the block does not reach the first guard.
+fn record_edge_matters(sorted: &[f64], n_occ: usize, m: usize, tau: f64) -> bool {
+    m > 0 && sorted.len() > n_occ + m && sorted[n_occ + m] - sorted[n_occ + m - 1] <= 2.0 * tau
 }
 
-/// The levels the block must hold after an occupation pass (module doc): n_occ + m + G, and at least one
-/// more than it holds when there was no gap witness (`window_short`), capped at `k_max`. Larger than `len`
-/// ⇔ grow and solve again.
-fn block_need(n_occ: usize, m: usize, window_short: bool, len: usize, k_max: usize) -> usize {
-    let need = n_occ + m + UNOCC_GUARD;
-    let need = if window_short { need.max(len + 1) } else { need };
-    need.min(k_max)
+/// The split one occupation pass asks for (module doc): the displayed n_occ + m levels — or up to a shown
+/// τ-set's end `shown` — at the SCF's tol; tested, every level that decides the occupations (`decisive`,
+/// `decisive_levels`) and every record vector (n_occ + m + G) but the last, and the last too when
+/// `edge` (`record_edge_matters`: its Ritz value can change the shown rows, review I2); one untested buffer
+/// above them — the record's last vector when it is not tested, never the witness. With no room for a
+/// buffer under `k_max` every column is tested; and a short window there (`window_short`: every computed
+/// level within τ_c of ε_F shares, f > 0, and enters ρ_out) holds every column to the SCF's tol (review M1).
+fn split_need(n_occ: usize, m: usize, shown: usize, decisive: usize, edge: bool, window_short: bool, k_max: usize) -> Split {
+    let head = (n_occ + m).max(shown);
+    let record = n_occ + m + UNOCC_GUARD;
+    let tested = (if edge { record } else { record - 1 }).max(decisive).max(head);
+    if tested < k_max { return Split { len: tested + 1, head, checked: tested }; }
+    Split { len: k_max, head: if window_short { k_max } else { head.min(k_max) }, checked: k_max }
+}
+
+/// What a completed solve leaves for the next call of a channel (`HarrisState::last`): its n_σ and its
+/// final occupation pass's `split_need`, as offsets over n_σ + m — never the head or block the call ran
+/// with, which a too-large start would otherwise carry on for ever (review I1: a one-way ratchet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Memory { n: usize, len: usize, head: usize, checked: usize }
+
+impl Memory {
+    fn of(need: Split, n: usize, m: usize) -> Memory {
+        let base = n + m;
+        Memory { n, len: need.len.saturating_sub(base), head: need.head.saturating_sub(base), checked: need.checked.saturating_sub(base) }
+    }
+}
+
+/// The split a call starts from: the last call's need (`Memory`) when it had this n_σ, clamped to the
+/// minimal split — the displayed n_σ + m at tol, the G guards, the last of them the buffer — and to
+/// `split_bound`; the minimal split otherwise. The final pass then raises it where this call needs more.
+fn start_split(mem: Option<Memory>, n: usize, m: usize) -> Split {
+    let base = n + m;
+    let min = Split { len: base + UNOCC_GUARD, head: base, checked: base + UNOCC_GUARD - 1 };
+    match mem {
+        Some(mm) if mm.n == n => {
+            let len = (base + mm.len).clamp(min.len, split_bound(n, m));
+            let checked = (base + mm.checked).clamp(min.checked, len);
+            Split { len, head: (base + mm.head).clamp(min.head, checked), checked }
+        }
+        _ => min,
+    }
 }
 
 const SPIN: [&str; 2] = ["↑", "↓"];
@@ -414,8 +499,8 @@ impl GpuSolver {
         let mut done: [Option<Channel>; 2] = [None, None];
         let (mut cold, mut notes) = (false, Vec::new());
         let mut solves = [0usize; 2];
-        let mut blocks = [0usize; 2]; // the minimal block per channel (`minimal_block`)
-        let mut heads = [0usize; 2]; // the tight head's raise over block − G per channel
+        let mut splits = [(0usize, 0usize, 0usize); 2];
+        let mut needs: [Option<Memory>; 2] = [None, None]; // the last occupation pass's split, for `last`
         // Ok(true): aborted
         let mut outcome: Result<bool, QmError> = Ok(false);
         let sum = take(free, ctx, g);
@@ -427,27 +512,24 @@ impl GpuSolver {
                 continue;
             }
             let seed = 5 + ch as u64;
-            // the block (module doc): n_σ + m + G, plus what the last solve's minimal block needed beyond it
-            let (extra, head_extra) = match last[ch] { Some((ln, e, he)) if ln == nc => (e.min(MAX_WITNESS_GROWTH), he), _ => (0, 0) };
-            let k_max = nc + m + UNOCC_GUARD + MAX_WITNESS_GROWTH;
+            let guard_tol = GUARD_TOL.max(tol);
+            let k_max = split_bound(nc, m);
+            // the split to start from (module doc, "Block memory"): what the last call's final occupation
+            // pass needed, when it had this n_σ; else the displayed n_σ + m and G guards, the last the buffer
+            let mut cur = start_split(last[ch], nc, m);
             let mut x = std::mem::take(&mut guess[ch]);
             if x.is_empty() { cold = true; }
-            let k0 = nc + extra + m + UNOCC_GUARD;
-            if x.len() > k0 { free.extend(x.drain(k0..)); } // ascending: the highest go
-            top_up(&mut x, k0, free, ctx, g, grid, &system.nuclei, seed);
-            // the columns held to the full tol: the displayed n_occ + m (all but the top G), raised over a
-            // shown τ-set reaching into the guards (module doc, "Two tolerances")
-            let mut head = (k0 - UNOCC_GUARD + head_extra).min(k0);
+            if x.len() > cur.len { free.extend(x.drain(cur.len..)); } // ascending: the highest go
+            top_up(&mut x, cur.len, free, ctx, g, grid, &system.nuclei, seed);
             let h = GpuHamiltonian { v: if ch == 0 { &p.vu } else { &p.vd }, nl };
-            let (ev, one) = loop {
+            let (ev, one, need) = loop {
                 let mut ev = vec![0.0; x.len()];
                 let w = grown(work, work_k, ctx, g, x.len());
                 solves[ch] += 1;
-                // the displayed levels (all but the top G) at the SCF's tol, the guard/witness levels at
-                // `GUARD_TOL` (module doc, "Two tolerances")
-                // the top column is the buffer (module doc), the guards below it at GUARD_TOL
-                let checked = (x.len() - 1).max(head);
-                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, head, GUARD_TOL.max(tol), checked, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
+                splits[ch] = (cur.len, cur.head, cur.checked);
+                // the lowest `head` at the SCF's tol, the guards up to `checked` at GUARD_TOL, the rest
+                // buffers (module doc, "Three roles, three tolerances")
+                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, cur.head, guard_tol, cur.checked, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
                     Ok(es) => es,
                     Err(e) => { free.append(&mut x); outcome = Err(take_device_error().unwrap_or(e)); break 'channels; }
                 };
@@ -460,32 +542,28 @@ impl GpuSolver {
                 info.iterations[ch] += es.iterations;
                 if es.stop == EigenStop::MaxIter && !info.at_cap[ch] {
                     info.at_cap[ch] = true;
-                    notes.push(format!("spin {}: the eigensolve ended at its {EIGEN_MAX_ITER}-iteration cap (max residual {:.1e} > tol {tol:.1e})", SPIN[ch], es.max_residual));
+                    // the tested tiers' residuals (review M2): the buffers' is in `max_residual` only
+                    let (hr, gr) = es.split_residual.expect("a split solve");
+                    notes.push(format!("spin {}: the eigensolve ended at its {EIGEN_MAX_ITER}-iteration cap (displayed levels' residual {hr:.1e}, tol {tol:.1e}; guard levels' {gr:.1e}, tol {guard_tol:.0e})", SPIN[ch]));
                 }
                 // the occupations of this one diagonalisation; the f > 0 levels are the lowest by rank
                 let one = one_shot_occupations(&ev, nc, ch as u8, settings.occupations);
                 let n_occ = one.f.iter().filter(|f| **f > 0.0).count();
                 let mut sorted = ev.clone();
                 sorted.sort_by(f64::total_cmp);
-                // one buffer level above the levels that decide the occupations (module doc)
                 let decisive = decisive_levels(&sorted, nc, ch as u8, settings.occupations);
-                let need = block_need(n_occ, m, one.window_short, x.len(), k_max).max((decisive + 1).min(k_max));
-                if need > x.len() {
-                    // a shared shell reached into the block, or no gap witness: grow it behind the Ritz vectors
-                    top_up(&mut x, need, free, ctx, g, grid, &system.nuclei, seed);
-                    head = head.max(x.len() - UNOCC_GUARD);
-                    continue;
-                }
-                // a shown τ-set reaching into the guard columns: hold it to the full tol as well
-                if m > 0 {
-                    let keep = (n_occ + m + UNOCC_GUARD).min(sorted.len());
-                    let (shown, _) = block_edge(&sorted[..keep], n_occ, keep, tau_scf);
-                    if shown > head {
-                        head = shown;
-                        continue;
-                    }
-                }
-                break (ev, one);
+                // the record's shown rows (a τ-set reaching into the guards raises the head over n_occ + m)
+                let keep = n_occ + m + UNOCC_GUARD;
+                let shown = if keep <= sorted.len() { block_edge(&sorted[..keep], n_occ, keep, tau_scf).0 } else { 0 };
+                let edge = record_edge_matters(&sorted, n_occ, m, tau_scf);
+                let need = split_need(n_occ, m, shown, decisive, edge, one.window_short, k_max);
+                // never lower within a call (the next solve is warm: only the raised columns move)
+                let next = Split { len: cur.len.max(need.len), head: cur.head.max(need.head), checked: cur.checked.max(need.checked) };
+                if next == cur { break (ev, one, need); }
+                // a shared shell or a witness reached past the tested columns, or a shown set into the guards:
+                // grow behind the Ritz vectors and/or raise the tiers, and solve again
+                top_up(&mut x, next.len, free, ctx, g, grid, &system.nuclei, seed);
+                cur = next;
             };
             if one.released { notes.push(format!("spin {}: a shared shell of spread ≥ τ was split (one-shot release)", SPIN[ch])); }
             if one.window_short {
@@ -496,12 +574,12 @@ impl GpuSolver {
             let n_occ = order.iter().take_while(|&&i| one.f[i] > 0.0).count();
             assert!(order[n_occ..].iter().all(|&i| one.f[i] == 0.0), "the occupied levels are the lowest ({:?})", one.f);
             let keep = (n_occ + m + UNOCC_GUARD).min(order.len());
-            // the levels the rule needed (`minimal_block`): the record's, and above them a released short
-            // window's witness, kept as spare guess vectors; a block larger than that loses its top levels
-            let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
-            let block = minimal_block(&sorted, nc, ch as u8, settings.occupations, keep);
-            blocks[ch] = block;
-            heads[ch] = head.saturating_sub(block.saturating_sub(UNOCC_GUARD));
+            // the block the final pass needed (`split_need`): the record, above it the witness levels a
+            // released short window needed and the buffer when it is not the record's last vector, kept as
+            // spare guess vectors; a block larger
+            // than that (the shell split since the last call) loses its top levels
+            let block = need.len.min(order.len());
+            needs[ch] = Some(Memory::of(need, nc, m));
             let mut slots: Vec<Option<Field>> = x.into_iter().map(Some).collect();
             let mut pick = |idx: &[usize]| -> Vec<Field> { idx.iter().map(|&i| slots[i].take().expect("each index once")).collect() };
             let orbitals = pick(&order[..n_occ]);
@@ -554,7 +632,7 @@ impl GpuSolver {
         };
         let ((eu, fu), (ed, fd)) = (level(&up, 0), level(&dn, 1));
         let solve = HarrisSolve { evals: [eu, ed], occ: [fu, fd], n_occ: [up.orbitals.len(), dn.orbitals.len()], notes,
-                                  iterations: info.iterations, at_cap: info.at_cap, solves, cold, wall: t0.elapsed() };
+                                  iterations: info.iterations, at_cap: info.at_cap, solves, split: splits, cold, wall: t0.elapsed() };
         let Channel { orbitals: orbitals_up, evals: evals_up, occ: occ_up, unocc: unocc_up, spare: spare_up } = up;
         let Channel { orbitals: orbitals_dn, evals: evals_dn, occ: occ_dn, unocc: unocc_dn, spare: spare_dn } = dn;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up, orbitals_dn, evals_up, evals_dn,
@@ -562,8 +640,7 @@ impl GpuSolver {
                                 occupations: settings.occupations });
         *slot_unocc = [unocc_up, unocc_dn];
         *slot_info = Some(info);
-        *last = [(n[0] + m > 0).then_some((n[0], blocks[0].saturating_sub(n[0] + m + UNOCC_GUARD), heads[0])),
-                 (n[1] + m > 0).then_some((n[1], blocks[1].saturating_sub(n[1] + m + UNOCC_GUARD), heads[1]))];
+        *last = needs;
         *slot_spare = [spare_up, spare_dn];
         *slot_m = m;
         Ok(Some(solve))
@@ -593,8 +670,8 @@ mod tests {
 
     /// Diagnostic (task 8b perf): the wall of a warm Harris refresh after a 0.1 Bohr move, H₂ (R = 1.4) on
     /// n³ × h (env `HARRIS_DIAG_N`, default 81; `HARRIS_DIAG_H`, default 0.15 — the app's Accurate grid),
-    /// m = 4 (the app's default), ρ_in the superposed free-atom densities. Prints the cold call and three
-    /// warm moves (wall, iterations, solves, at cap).
+    /// m = 4 (the app's default), ρ_in the superposed free-atom densities. Prints the cold call and
+    /// `HARRIS_DIAG_MOVES` (default 3) warm +0.1 Bohr moves (wall, iterations, solves, at cap).
     #[test]
     #[ignore = "diagnostic; run: HARRIS_DIAG_N=81 cargo test -p qm-gpu --release diag_harris_warm_refresh -- --ignored --nocapture"]
     fn diag_harris_warm_refresh_wall() {
@@ -605,7 +682,8 @@ mod tests {
         let settings = ScfSettings::for_grid(&grid);
         let mut s = GpuSolver::new(ctx, &grid);
         let mut hs = HarrisState::new();
-        for step in 0..4 {
+        let moves: usize = std::env::var("HARRIS_DIAG_MOVES").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        for step in 0..=moves {
             let dx = 0.1 * step as f64;
             let pos = [[0.7 + dx, 0.0, 0.0], [-0.7, 0.0, 0.0]];
             let sys = System::new(pos.iter().map(|p| Nucleus { pos: *p, z: 1 }).collect(), 0, None);
@@ -620,39 +698,80 @@ mod tests {
         }
     }
 
-    /// The growth trigger (review round 2): the qm unit case of a released short window
-    /// (`one_shot_marks_a_short_window`: ε = −1.0, −0.40, −0.39, −0.35, n = 2 ⇒ released, f = 1, 1, 0, 0,
-    /// n_occ = n = 2, `window_short`) needs one more level although n_occ + m + G = 4 = the block at m = 0; a
-    /// witnessed block of the right size needs none; a shared shell needs n_occ + m + G; the bound caps both.
+    fn split(len: usize, head: usize, checked: usize) -> Split { Split { len, head, checked } }
+
+    /// The split one occupation pass asks for. The growth trigger (review round 2): the qm unit case of a
+    /// released short window (`one_shot_marks_a_short_window`: ε = −1.0, −0.40, −0.39, −0.35, n = 2 ⇒
+    /// released, f = 1, 1, 0, 0, n_occ = n = 2, `window_short`) has every computed level deciding, so the block
+    /// grows by one although n_occ + m + G = 4 = the block at m = 0; with the 5th level (0.2) computed it is
+    /// the witness, tested, with the buffer above it (block memory, task 8b: the next call starts at 6
+    /// instead of re-growing). A witnessed block tests its record but the last vector, which is the buffer
+    /// — unless that vector can change the shown rows (`edge`, review I2: then it is tested and one buffer
+    /// sits above the record); a shared shell and a shown τ-set raise the tiers; at the bound no buffer
+    /// fits and every column is tested, and a short window there holds every column to the SCF's tol
+    /// (review M1: those levels are all f > 0).
     #[test]
-    fn block_need_grows_a_short_window() {
-        let o = one_shot_occupations(&[-1.0, -0.40, -0.39, -0.35], 2, 0, Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU });
+    fn split_need_tests_the_record_and_the_witness_below_a_buffer() {
+        let ds = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let short = [-1.0, -0.40, -0.39, -0.35];
+        let o = one_shot_occupations(&short, 2, 0, ds);
         let n_occ = o.f.iter().filter(|f| **f > 0.0).count();
         assert!(o.window_short && o.released && n_occ == 2, "{o:?}");
-        let k_max = 2 + UNOCC_GUARD + MAX_WITNESS_GROWTH;
-        assert_eq!(block_need(n_occ, 0, o.window_short, 4, k_max), 5, "a short window grows by one level");
-        assert_eq!(block_need(n_occ, 0, false, 4, k_max), 4, "a witnessed block of n_occ + G levels stays");
-        assert_eq!(block_need(4, 2, false, 6, k_max), 8, "a shared shell: n_occ + m + G");
-        assert_eq!(block_need(n_occ, 0, true, k_max, k_max), k_max, "at the bound: no further growth");
+        let k_max = split_bound(2, 0);
+        assert_eq!(k_max, 2 + UNOCC_GUARD + MAX_WITNESS_GROWTH + 1);
+        assert_eq!(decisive_levels(&short, 2, 0, ds), 4, "no witness: every computed level decides");
+        assert_eq!(split_need(2, 0, 2, 4, false, true, k_max), split(5, 2, 4), "a short window grows by one level");
+        let levels = [-1.0, -0.40, -0.39, -0.35, 0.2];
+        assert_eq!(decisive_levels(&levels, 2, 0, ds), 5, "the witness 0.2 is the 5th level");
+        assert_eq!(split_need(2, 0, 2, 5, false, false, k_max), split(6, 2, 5), "the witness tested, the buffer above it");
+        let witnessed = [-1.0, -0.40, 0.1, 0.2, 0.3];
+        assert_eq!(decisive_levels(&witnessed, 2, 0, ds), 3, "the witness 0.1 is the 3rd level");
+        assert_eq!(decisive_levels(&levels, 2, 0, Occupations::Aufbau), 3, "Aufbau: n + 1");
+        assert_eq!(split_need(2, 0, 2, 3, false, false, k_max), split(4, 2, 3), "the record n_occ + G, its last vector the buffer");
+        let k_max = split_bound(2, 2);
+        assert_eq!(split_need(4, 2, 6, 5, false, false, k_max), split(8, 6, 7), "a shared shell: n_occ + m at tol, + G − 1 tested");
+        assert_eq!(split_need(4, 2, 7, 5, true, false, k_max), split(9, 7, 8), "a shown τ-set into the guards: at tol, the record's edge tested");
+        assert_eq!(split_need(4, 2, 6, 9, false, false, k_max), split(10, 6, 9), "a witness above the record: tested, a buffer above");
+        assert_eq!(split_need(4, 2, 6, k_max, false, false, k_max), split(k_max, 6, k_max), "at the bound: no buffer");
+        assert_eq!(split_need(k_max, 2, k_max, k_max, false, true, k_max), split(k_max, k_max, k_max), "a short window at the bound: all at tol");
+        // the record's edge: the window's last row and the first guard one τ-set (τ = 1e-4; 2τ margin)
+        let tau = 1e-4;
+        assert!(record_edge_matters(&[-0.5, 0.1, 0.2, 0.2 + 5e-5, 0.3], 1, 2, tau), "linked across the window edge");
+        assert!(!record_edge_matters(&[-0.5, 0.1, 0.2, 0.25, 0.3], 1, 2, tau), "a gap at the window edge");
+        assert!(!record_edge_matters(&[-0.5, 0.1, 0.1 + 5e-5, 0.25, 0.3], 1, 2, tau), "a set inside the window");
+        assert!(!record_edge_matters(&[-0.5, 0.1, 0.1, 0.1], 1, 0, tau), "m = 0: no window");
+        assert!(!record_edge_matters(&[-0.5, 0.1, 0.2], 1, 2, tau), "the block does not reach the first guard");
     }
 
-    /// Block memory (task 8b, the deferred round-2 minor): the released short window of the qm unit case
-    /// (ε = −1.0, −0.40, −0.39, −0.35, then 0.2; n = 2, m = 0 ⇒ n_occ + m + G = 4) needs the 5th level for its
-    /// witness, so the minimal block is 5 — the next call starts there instead of re-growing; a witnessed
-    /// block, Aufbau and a block without the 5th level stay at what they have.
+    /// Review I1 (task 8b fix 1; the reviewer's `ratchet.py`): a call starts from the last call's final
+    /// need, never from the split it ran with, so a block or head raised for one call is not carried on.
+    /// ↓ of pseudo-O triplet (n = 2, m = 4), each call simulated as the in-call rule (raise to the need, never
+    /// lower, until stable) on (n_occ, shown): the shared p shell (4, 8), Aufbau (2, 6), a shown set reaching
+    /// one guard (2, 7: the record's edge then matters, so its last vector is tested under a buffer). A call right after a drop still runs the previous split (its columns already met
+    /// it: the warm guess), once; the next is back at the minimal split. Before the fix the head ratcheted
+    /// to the block's length (every column at the SCF's tol, the buffer included) and stayed there.
     #[test]
-    fn minimal_block_keeps_a_released_short_windows_witness() {
-        let ds = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
-        let levels = [-1.0, -0.40, -0.39, -0.35, 0.2];
-        assert_eq!(minimal_block(&levels, 2, 0, ds, 4), 5, "the witness 0.2 is needed");
-        assert_eq!(minimal_block(&levels[..4], 2, 0, ds, 4), 4, "nothing above: the block is what was computed");
-        assert_eq!(minimal_block(&[-1.0, -0.40, 0.1, 0.2, 0.3], 2, 0, ds, 4), 4, "witnessed within n_occ + G");
-        assert_eq!(minimal_block(&levels, 2, 0, Occupations::Aufbau, 4), 4, "Aufbau needs no witness");
-        // the decisive levels: the witness 0.2 is the 5th, so a block of 5 would make it the (untested) top
-        // buffer column — the block needs 6
-        assert_eq!(decisive_levels(&levels, 2, 0, ds), 5);
-        assert_eq!(decisive_levels(&[-1.0, -0.40, 0.1, 0.2, 0.3], 2, 0, ds), 3, "the witness 0.1 is the 3rd level");
-        assert_eq!(decisive_levels(&levels, 2, 0, Occupations::Aufbau), 3, "Aufbau: n + 1");
+    fn split_memory_is_no_ratchet() {
+        let (n, m) = (2, 4);
+        let k_max = split_bound(n, m);
+        assert_eq!(start_split(None, n, m), split(8, 6, 7), "minimal: n + m at tol, G guards, the last the buffer");
+        let mut last = None;
+        let mut ran = Vec::new();
+        for (n_occ, shown) in [(4, 8), (2, 6), (2, 6), (2, 7), (2, 6), (2, 6), (4, 8), (2, 6), (2, 6)] {
+            let mut cur = start_split(last, n, m);
+            let need = loop {
+                let need = split_need(n_occ, m, shown, n + 1, shown > n_occ + m, false, k_max);
+                let next = split(cur.len.max(need.len), cur.head.max(need.head), cur.checked.max(need.checked));
+                if next == cur { break need; }
+                cur = next;
+            };
+            last = Some(Memory::of(need, n, m));
+            ran.push(cur);
+        }
+        let (shared, aufbau, raised) = (split(10, 8, 9), split(8, 6, 7), split(9, 7, 8));
+        assert_eq!(ran, [shared, shared, aufbau, raised, raised, aufbau, shared, shared, aufbau]);
+        // another n_σ: the memory does not apply
+        assert_eq!(start_split(Some(Memory::of(shared, n, m)), n + 1, m), split(9, 7, 8));
     }
 
     fn ctx() -> Option<GpuContext> {
@@ -959,9 +1078,15 @@ mod tests {
         let again = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
         println!("second call: cold {}, iterations {:?}, solves {:?} (first call {:?} in {:?} solves, at cap {:?})",
                  again.cold, again.iterations, again.solves, out.iterations, out.solves, out.at_cap);
-        assert!(out.solves[1] >= 2, "the first call grew ↓ (n_occ↓ = 4 > n↓): {:?} solves", out.solves);
+        // review M4, the measured counts pinned: ↑ (n_occ = n = 4) starts at (8, 6, 7) and solves once more
+        // for the shown pair 0.37513 / 0.37515 Ha (2.2e-5 apart < τ = 1e-4) straddling m = 2 — the head raised
+        // to 7 and, the record's edge mattering, its last vector tested under a buffer; ↓ starts at (6, 4, 5),
+        // grows to 8 for the shared shell (n_occ↓ = 4 > n↓ = 2), then makes the same raise
+        assert_eq!(out.solves, [2, 3], "↑ one head raise; ↓ one growth and one head raise");
+        assert_eq!(out.split, [(9, 7, 8); 2], "the record n_occ + m + G = 8 tested, a buffer above, the shown 7 at tol");
         assert!(!again.cold && again.evals[1].len() == 4 + 2 + UNOCC_GUARD);
         assert_eq!(again.solves, [1, 1], "sized from the last block and head: no growth or head solve");
+        assert_eq!(again.split, out.split, "started at the last call's need");
         // a channel that converged on the first call is converged on entry (before the guard tolerance of
         // task 8b, ↓ ended on the cap here — guard levels near 0.407 Ha at residual 5.7e-4 — and the warm
         // restart continued it for 54 iterations); a capped one would be continued
@@ -969,6 +1094,103 @@ mod tests {
             if !out.at_cap[ch] { assert_eq!(again.iterations[ch], 0, "spin {ch}: converged on entry"); }
         }
         assert_eq!(out.at_cap, [false, false], "the guard levels meet GUARD_TOL within the cap");
+    }
+
+    /// Review I1 (task 8b fix 1): what a warm call starts from follows the last call's needs, never a
+    /// ratchet of earlier calls. Pseudo-O triplet 33³ (its SCF density), m = 4, the occupation rule switched
+    /// between calls: ↓ (n↓ = 2) has n_occ = 4 under `DegenerateShells` (the shared p shell) and 2 under
+    /// `Aufbau`, at the same n↓, so the block memory carries over; ↑ has n_occ = 4 under both. Every call's
+    /// last solve has exactly one untested buffer (len = checked + 1), tests the record (n_occ + m + G) but
+    /// its last vector — that one too when the record's edge matters (`record_edge_matters` on the returned
+    /// levels: the buffer is then above the record) — and holds at least the displayed levels to tol
+    /// (head ≥ max(n_occ + m, shown)); a call with the previous call's n_occ holds exactly those — a call
+    /// right after n_occ dropped may still hold the previous block, once. No warm call ends on the cap.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn harris_split_follows_n_occ_between_calls() {
+        let Some(ctx) = ctx() else { return };
+        let (mut s, sys, ds, scf) = solved_pseudo_o(&ctx);
+        let ab = ScfSettings { occupations: Occupations::Aufbau, ..ds };
+        let tau_scf = tau(ds.tol);
+        let m = 4;
+        let mut hs = HarrisState::new();
+        let mut prev: Option<[usize; 2]> = None;
+        let mut failures = Vec::new();
+        for (call, (rule, st)) in [("DS", &ds), ("AB", &ab), ("AB", &ab), ("AB", &ab), ("DS", &ds), ("DS", &ds), ("AB", &ab)].into_iter().enumerate() {
+            let input = HarrisInput { system: &sys, settings: st, rho_in: [&scf.rho_up, &scf.rho_dn], unoccupied: m };
+            let out = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
+            for ch in 0..2 {
+                let n_occ = out.n_occ[ch];
+                let keep = n_occ + m + UNOCC_GUARD;
+                let (shown, _) = qm::orbitals::block_edge(&out.evals[ch], n_occ, out.evals[ch].len(), tau_scf);
+                let want_head = (n_occ + m).max(shown);
+                let edge = record_edge_matters(&out.evals[ch], n_occ, m, tau_scf);
+                let want_checked = if edge { keep } else { keep - 1 };
+                let (len, head, checked) = out.split[ch];
+                let steady = prev.is_some_and(|p| p[ch] == n_occ);
+                println!("call {call} {rule} spin {}: n_occ {n_occ}, shown {shown}, edge {edge}, split (len {len}, head {head}, checked {checked}), want ({want_head}, {want_checked}), steady {steady}, iterations {}, solves {}, at cap {}, cold {}",
+                         SPIN[ch], out.iterations[ch], out.solves[ch], out.at_cap[ch], out.cold);
+                let mut fail = |what: String| failures.push(format!("call {call} {rule} spin {}: {what}", SPIN[ch]));
+                if out.evals[ch].len() != keep { fail(format!("{} kept levels, not n_occ + m + G = {keep}", out.evals[ch].len())); }
+                if len != checked + 1 { fail(format!("len {len} ≠ checked {checked} + 1: not exactly one buffer")); }
+                if checked < want_checked || head < want_head { fail(format!("head {head} / checked {checked} below {want_head} / {want_checked}")); }
+                if steady && (head, checked) != (want_head, want_checked) { fail(format!("steady: (head, checked) = ({head}, {checked}), want ({want_head}, {want_checked})")); }
+                if call > 0 && (out.cold || out.at_cap[ch]) { fail(format!("warm call: cold {} at cap {}", out.cold, out.at_cap[ch])); }
+            }
+            prev = Some(out.n_occ);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Review I2 (task 8b fix 1): the record's last vector is a tested guard, never the untested buffer, so a
+    /// degenerate set reaching the record edge is judged on Ritz values whose residual is ≤ `GUARD_TOL` (error
+    /// ~r²/δ) and hidden whole. An H atom at the centre of 49³ × 0.25 (a grid point: the cubic symmetry is
+    /// exact on the grid, so the p- and d-like box levels are 3-fold degenerate to the f32 rounding),
+    /// superposed free-atom ρ_in split equally (so V↑ = V↓), m = 6. Measured spectrum (Ha): 1s −0.16392,
+    /// p 0.10735 ×3, s 0.15515, d 0.23802 ×3, 0.28852. ↓ (n↓ = 0) keeps m + G = 8 levels: 1s, p ×3, s and the
+    /// d triplet, which starts inside the window (position 5 < m) and ends on the record's last vector, so
+    /// `block_edge` hides all three (shown 5, hidden 3); ↑ (n_occ 1) keeps 9, the d triplet inside and 0.28852
+    /// last (shown 8). In both channels the window's last row and the first guard are d members, so the
+    /// record's edge matters (`record_edge_matters`) and the last record vector is tested under a buffer.
+    /// Before the fix the ↓ record's last vector was the buffer at residual 5.3e-3 (its Ritz value 1.4e-5
+    /// high — inside τ here, but bounded only by r²/δ ≈ 6e-4 > τ = 1e-4 with δ ≈ 0.05 Ha).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn harris_record_edge_is_a_tested_guard() {
+        let Some(ctx) = ctx() else { return };
+        let grid = Grid::cube(49, 0.25);
+        let settings = ScfSettings::for_grid(&grid);
+        let tau_scf = tau(settings.tol);
+        let mut s = GpuSolver::new(ctx, &grid);
+        let sys = System::new(vec![Nucleus { pos: [0.0; 3], z: 1 }], 0, None);
+        assert_eq!((sys.n_up, sys.n_dn), (1, 0));
+        let rho = superposed_h(&grid, &[[0.0; 3]]);
+        let mut hs = HarrisState::new();
+        let m = 6;
+        let out = s.harris(&mut hs, &HarrisInput { system: &sys, settings: &settings, rho_in: [&rho[0], &rho[1]], unoccupied: m }, &mut || false)
+            .expect("no failure").expect("not aborted");
+        let info = hs.unoccupied().1.expect("a record").clone();
+        println!("H atom 49³ m = {m}: iterations {:?}, solves {:?}, at cap {:?}, split {:?}, notes {:?}", out.iterations, out.solves, out.at_cap, out.split, out.notes);
+        for (ch, spin) in SPIN.iter().enumerate() {
+            println!("  spin {spin}: ε {:.6?}; record residuals {:?}, hidden {}", out.evals[ch],
+                     info.residuals[ch].iter().map(|r| format!("{r:.1e}")).collect::<Vec<_>>(), info.hidden[ch]);
+        }
+        assert_eq!(out.at_cap, [false, false]);
+        for (spin, residuals) in SPIN.iter().zip(&info.residuals) {
+            let last = *residuals.last().expect("a record");
+            assert!(last <= GUARD_TOL, "spin {spin}: the record's last vector has residual {last:.2e} > GUARD_TOL: it is not a tested guard");
+        }
+        let (up, dn) = (&out.evals[0], &out.evals[1]);
+        assert_eq!((up.len(), dn.len()), (1 + m + UNOCC_GUARD, m + UNOCC_GUARD));
+        // ↓: the d triplet on the record's last three vectors, one set (spread ≤ τ, apart from the s below),
+        // at the ↑ channel's triplet (the same operator; there it lies inside the record)
+        let spread = dn[7] - dn[5];
+        assert!(spread <= tau_scf, "↓ d triplet spread {spread:.2e} > τ {tau_scf:.0e}: the set is split ({dn:?})");
+        assert!(dn[5] - dn[4] > tau_scf, "the triplet is a set of its own ({dn:?})");
+        for (i, e) in dn.iter().enumerate().skip(5) { assert!((e - up[6]).abs() <= tau_scf, "↓ #{i} {e} vs ↑ triplet {}", up[6]); }
+        assert_eq!(qm::orbitals::block_edge(dn, 0, dn.len(), tau_scf), (5, 3), "the set reaching the record edge is hidden whole");
+        assert_eq!(info.hidden[1], 3, "the record hides the triplet");
+        assert_eq!(qm::orbitals::block_edge(up, 1, up.len(), tau_scf), (8, 0), "↑: the triplet lies inside the record");
     }
 
     /// Task 8b perf: a warm refresh after a 0.1 Bohr move ends below the 200-iteration cap — the guard

@@ -58,7 +58,10 @@
 //! amplification α = max_i ‖T y_i‖₂ and the iteration accepts it only when
 //! α ≤ max(`ALPHA_MAX`, `ALPHA_RESIDUAL_FRACTION` × max_residual/floor): near convergence at
 //! most 2× an orthonormal basis's noise; far from it whatever keeps the injected noise
-//! (α × floor, fresh each step — it is not cumulative) below a tenth of the residual.
+//! (α × floor, fresh each step — it is not cumulative) below a tenth of the residual. (Under
+//! `lobpcg_split` "the residual" is the split stop test's, max_{i < checked} ρ_i·tol/tol_i: the
+//! untested buffer columns may sit far above it, and their residual must not relax the guard
+//! for the columns already at their tolerance.)
 //! Otherwise — the **fallback** — the W and P columns are orthogonalised against X and each
 //! other on the grid by Task 5's MGS (one readback per vector after the first, whose dots are
 //! already in B), H is re-applied to them, the Gram is re-measured (one more readback) and the
@@ -239,6 +242,10 @@ pub struct EigenStats {
     /// Largest coefficient amplification α of a raw-subspace Rayleigh–Ritz step in this call
     /// (before any fallback; 1 for an orthonormal basis).
     pub alpha_worst: f64,
+    /// Under the split stop test of `lobpcg_split`: the true max residual of the returned X over the
+    /// head columns (held to `tol`) and over the tail columns `head..checked` (held to `tail_tol`; 0 when
+    /// there are none); the untested buffer columns enter only `max_residual`. `None` otherwise.
+    pub split_residual: Option<(f64, f64)>,
 }
 
 /// Model of the f32 residual floor ‖(H − λ)δx‖ for ‖x‖ = 1 (module doc): the RMS rounding of
@@ -645,6 +652,7 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
         let (mut a_mat, mut b_mat, res2) = assemble(m, nk, &theta, &dots)?;
         let mut max_res = 0.0f64;
         let mut split_res = 0.0f64; // max_i ρ_i·tol/tol_i under a split stop test (`lobpcg_split`)
+        let (mut head_res, mut tail_res) = (0.0f64, 0.0f64); // its two tiers' true max residuals
         for i in 0..nk {
             let xx = b_mat[(i, i)];
             lambda[i] = a_mat[(i, i)] / xx; // = θ_i + ⟨x_i, r_i⟩/⟨x_i, x_i⟩, the Rayleigh quotient of the stored x_i
@@ -652,19 +660,21 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
             let res = (res2[i] / xx).sqrt();
             max_res = max_res.max(res);
             if let Some((head, tail_tol, checked)) = tail {
+                if i < head { head_res = head_res.max(res); } else if i < checked { tail_res = tail_res.max(res); }
                 if i < checked { split_res = split_res.max(if i < head { res } else { res * (tol / tail_tol) }); }
             }
         }
+        let split_residual = tail.map(|_| (head_res, tail_res));
         // the stop test's residual: the true max, or the split one (`tail`)
         let stop_res = if tail.is_some() { split_res } else { max_res };
         if stop_res < 0.5 * best { best = stop_res; best_it = iterations; }
         if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
-            stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
+            stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual };
             break;
         }
         if let Some(abort) = should_abort.as_mut() {
             if abort() {
-                stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
+                stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual };
                 break;
             }
         }
@@ -681,7 +691,10 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
                 eprintln!("lobpcg it {iterations}: max_res {max_res:.2e} α {alpha:.2} σ(B̃) min {:.2e} max {:.2e} m {m}", sig.min(), sig.max());
                 if sig.min() < 1e-6 && iterations.is_multiple_of(10) { eprintln!("  B̃ = {:.4}", bn); }
             }
-            if alpha <= alpha_max.max(alpha_fraction * max_res / floor) { (th, c) } else {
+            // the noise budget is a tenth of the residual still to be removed: under a split stop test
+            // that of the tested columns (`stop_res`) — an untested buffer far from convergence must not
+            // relax the guard for columns already at tol (task 8b fix 1); otherwise the true max
+            if alpha <= alpha_max.max(alpha_fraction * stop_res / floor) { (th, c) } else {
                 fallbacks += 1;
                 let mut mgs = Mgs::new((0..nk).map(|i| Col { f: s[i], norm2: b_mat[(i, i)] }).collect());
                 // w_0's projection dots are already in B: ⟨x_j, w_0⟩ and ⟨w_0, w_0⟩
