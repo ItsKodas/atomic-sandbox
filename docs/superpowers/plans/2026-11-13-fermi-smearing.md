@@ -544,6 +544,7 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
 - Modify `crates/app/src/ui/pseudo.rs`, `occupation_lines`: compile-level change to per-level rows. The wording comes in Task 12.
 - Modify the synthetic teachers in `crates/providers/src/sampling/tests.rs` and `crates/providers/src/surrogate/tests.rs`: they set `branch_jump` instead of `occupation_changed`.
 - **Task 7 review amendment (I2, ruling 2026-11-16):** remove the three extra Task 7 holds (the qm-gpu orbital tests' `display_settings` helper, `eigen_tol_follows_delta_rho_and_removes_orbital_lag`, validate `timing_table`). The orbital display (`crates/qm-gpu/src/orbitals.rs`, the occupied-pair checks near l. 1009/1051 and the projection) treats only f-bearing columns (f ≥ `PARTIAL_OCCUPATION_MIN`) as converged occupied eigenpairs; witness columns are never compared or projected as occupied. The orbital-lag test's residual check reads the f-bearing columns' residual. The all-electron GPU memory estimate counts witness growth up to `MAX_WITNESS_GROWTH`. Run `cargo test -p validate --release --test orbitals` in this task's gates.
+- **Task 8 review amendment (M5, M6):** the untrainable-reason suffix "— spec §5.6" (store.rs ~698, sampling/mod.rs ~1591) names the right spec section per reason (branch jump: FD spec §6.3); `ks.rs` picks the guard's surface with `is_all_electron_tag` (or pins its equivalence with `system.ionic.is_none()`).
 - Create `crates/providers/src/fd_regression.rs` (V2, `#[cfg(test)]`). The diag harness is not on the tree (it left in Task 3 step 6); read its generators with `git show smearing-prototype:crates/providers/src/scf_stall_diag.rs` and never merge that branch.
 - Modify: references.md and `docs/dev-reference.md` ("Occupations (Fermi–Dirac)": tags, `legacy_tag_of`, re-pins; "SCF stall stop": no release restart).
 
@@ -664,6 +665,7 @@ Runs after the preview build that follows Task 9, before Task 10. Witness column
 **Interfaces:**
 - Consumes: Task 6's `v3_h4()`; Task 3's NVE case.
 
+- **Task 8 review amendment (I1):** the GPU NVE run records the branch_jump flag count (expected 0) and the largest m/b.
 - [ ] **Step 1: Time the case and pre-register the NVE bounds.** Task 3's case is CO₂⁺ (spec §9 V5 2, amended): 71³ × 0.20, C on a grid node, β = 70° at R = 2.226, at rest, dt = 0.25 fs.
   - First time a few warm MD steps (the per-step cost at 71³ was not measured in A1) and measure the path scatter σ_path of F for this system under the 1e-5 partial-level stop (warm vs cold at the start geometry).
   - Steps: ≥ 2 bend periods (≈ 600 steps; 300 steps = 0.075 ps cannot resolve drift at `DRIFT_BOUND` 2e-4 Ha/ps against the Verlet swing). If 600 steps exceed one 15-min GPU batch, split the run into checkpointed batches.
