@@ -313,11 +313,17 @@ pub enum Occupations { Aufbau, DegenerateShells { tau: f64 }, FermiDirac { kt: f
 /// cluster's converged spread. A solver constant.
 pub const DEGENERACY_TAU: f64 = 1e-3;
 
-/// The most extra vectors a spin channel may grow to find the gap witness (a method literal: the largest
-/// symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it; spec 2026-11-13 §4.2 measured
-/// at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box). `pub` for `qm-gpu::scf`, which implements the same
-/// rule.
-pub const MAX_WITNESS_GROWTH: usize = 16;
+/// The most extra vectors a spin channel may grow to find the gap witness (a method literal and a cost cap only: the
+/// largest symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it; spec 2026-11-13 §4.2
+/// measured at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box). 32 since plan 2026-11-13 Task 7 fix round 1
+/// (was 16): a cold all-electron H₂O at 97³ × 0.25 (a 24.5 Bohr box) reached 16 on its 3rd and 4th SCF steps, whose
+/// spectrum is far from self-consistent (Δρ_prev 4.8 and 2.3; ε_N = −0.152 / −0.132 Ha against ≈ −0.26 converged, μ ≈
+/// −0.067 / −0.053), so the window top μ + 36 kT ≈ +0.11–0.13 Ha held 15–16 box states; the block stayed orthonormal
+/// (max |⟨ψ_i|ψ_j⟩| ≤ 2.5e-8, Ritz gaps ≥ 2.4e-4 Ha), no collapsed columns. Raising the cap is bit-neutral for every
+/// solve that stays under 16: the cap is read only after a failed witness test with 16 extras already grown, where a
+/// solve under 16 errored. The GPU memory guard counts it (`providers::ks`). `pub` for `qm-gpu::scf`, which
+/// implements the same rule.
+pub const MAX_WITNESS_GROWTH: usize = 32;
 
 /// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
 /// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).

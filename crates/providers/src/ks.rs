@@ -280,8 +280,24 @@ pub fn footprint_bytes_in(cache: &std::sync::Mutex<crate::pseudo::PseudoCache>, 
     if fp.pseudised {
         base + pseudo_extra_bytes(scene.cell.n, scene.cell.h, k_max, &fp.ions)
     } else {
-        base
+        base + witness_extra_bytes(scene.cell.n)
     }
+}
+
+/// The witness growth's fields at its cap `qm::scf::MAX_WITNESS_GROWTH` extra vectors per spin: the one `LobpcgWork`
+/// (sized for the larger spin) grows by 8 fields a vector, and each spin stores that many more orbitals and kinetic
+/// scratch fields: (8 + 2 + 2)·cap fields (a bound — most solves grow a few).
+fn witness_growth_fields() -> u64 {
+    let growth = qm::scf::MAX_WITNESS_GROWTH as u64;
+    8 * growth + 2 * growth + 2 * growth
+}
+
+/// The witness growth of an all-electron solve under `FermiDirac` (`witness_growth_fields`, with the 1.2 slack of
+/// [`solve_footprint_bytes`]): plan 2026-11-13 Task 7 fix round 1 counts it ahead of plan Task 9, which switches the
+/// providers' all-electron surface from the held `Aufbau` (exactly N_σ vectors) to FD, so until then it is a bound
+/// the held solves never use.
+pub fn witness_extra_bytes(n: usize) -> u64 {
+    (witness_growth_fields() as f64 * field_bytes(n) as f64 * 1.2) as u64
 }
 
 /// [`gpu_footprint_bytes`] from the counts: n³ grid, N electrons, k_max = max(n↑, n↓).
@@ -294,9 +310,10 @@ pub fn solve_footprint_bytes(n: usize, n_el: u64, k_max: u64) -> u64 {
 /// orbitals, for the pseudised ions given as (r, rows) — the radius of the ion's projector/partial-core ball in
 /// Bohr and its number of projector rows Σ(2l + 1) — with the 1.2 slack of [`solve_footprint_bytes`] applied:
 /// - ρ_pc and the two XC input fields ρ_σ + ½ρ_pc (Task 8a review SHOULD-5): 3 fields;
-/// - the `DegenerateShells` witness, at its cap `qm::scf::MAX_WITNESS_GROWTH` = 16 extra vectors per spin: the one
-///   `LobpcgWork` (sized for the larger spin) grows by 16 vectors × 8 fields, and each spin stores 16 more orbitals
-///   and 16 more kinetic scratch fields: 8·16 + 2·16 + 2·16 fields (a bound — a typical shared shell needs one);
+/// - the `DegenerateShells` witness, at its cap `qm::scf::MAX_WITNESS_GROWTH` (32 since plan 2026-11-13 Task 7 fix
+///   round 1) extra vectors per spin: the one `LobpcgWork` (sized for the larger spin) grows by 8 fields a vector,
+///   and each spin stores that many more orbitals and kinetic scratch fields: (8 + 2 + 2)·cap fields
+///   (`witness_growth_fields`; a bound — a typical shared shell needs one);
 /// - the v̄ scratch of the force path (Task 8b ruling (c)): 6 fields;
 /// - the display copy of ρ + ρ_pc (`GpuSolver::copy_density_with_core_to_volume`): 1 field;
 /// - the force weights, Σ_rows n_pts × 20 B with n_pts = (4π/3)(r/h)³ points in the ball (Task 8b ruling (c));
@@ -306,8 +323,7 @@ pub fn solve_footprint_bytes(n: usize, n_el: u64, k_max: u64) -> u64 {
 /// The `qm_gpu::ionic` projector buffers are the force weights' sibling (the same point lists) and are inside
 /// the weights term.
 pub fn pseudo_extra_bytes(n: usize, h: f64, k_max: u64, ions: &[(f64, u64)]) -> u64 {
-    let growth = qm::scf::MAX_WITNESS_GROWTH as u64;
-    let fields = 3 + (8 * growth + 2 * growth + 2 * growth) + 6 + 1;
+    let fields = 3 + witness_growth_fields() + 6 + 1;
     let mut bytes = fields * field_bytes(n);
     let rows: u64 = ions.iter().map(|i| i.1).sum();
     for &(r, rws) in ions {
@@ -873,9 +889,9 @@ impl GpuKs {
         let solver = solver.as_mut()?;
         let (cell, nuclei, settings) = last.as_ref()?;
         let positions: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
-        let (n, n_up, n_dn, origin) = {
+        let (n, n_up, n_dn, origin, all_electron) = {
             let st = solver.state()?;
-            (st.grid.n[0], st.orbitals_up.len(), st.orbitals_dn.len(), st.grid.origin)
+            (st.grid.n[0], st.orbitals_up.len(), st.orbitals_dn.len(), st.grid.origin, st.ionic.is_none())
         };
         // `requested` is the app's (the driver matches it); the solve is capped at UNOCCUPIED_MAX
         let requested = orb.request().unoccupied;
@@ -883,7 +899,9 @@ impl GpuKs {
         // the GPU memory guard (module doc, "GPU memory"): the view, not the scene, is refused
         let mut guard = Vec::new();
         if let Some(budget) = *vram_budget {
-            let base = solve_footprint_bytes(n, (n_up + n_dn) as u64, n_up.max(n_dn) as u64);
+            // the scene guard's all-electron witness bound too (`witness_extra_bytes`, plan 2026-11-13 Task 7 fix round 1),
+            // so a budget the scene passes is judged on the same base
+            let base = solve_footprint_bytes(n, (n_up + n_dn) as u64, n_up.max(n_dn) as u64) + if all_electron { witness_extra_bytes(n) } else { 0 };
             let need = |m: usize| base + orbital_view_footprint_bytes(n, n_up, n_dn, m, orb.texture());
             let gb = |b: u64| b as f64 / 1e9;
             if need(m) > budget {
@@ -1607,8 +1625,11 @@ mod tests {
         assert!((r - (105.0f64 / 57.0).powi(3)).abs() < 1e-6, "∝ (n + 2·GHOST)³: {r}");
         assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
         // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
-        let w = gpu_footprint_bytes(&h2o(97)) as f64 / 1e6;
+        // re-pinned (plan 2026-11-13 Task 7 fix round 1): the estimate now adds the all-electron FD witness growth
+        // (`witness_extra_bytes`, a bound at the cap); the solve part keeps its window
+        let w = solve_footprint_bytes(97, 10, 5) as f64 / 1e6;
         assert!((600.0..1400.0).contains(&w), "{w} MB");
+        assert_eq!(gpu_footprint_bytes(&h2o(97)), solve_footprint_bytes(97, 10, 5) + witness_extra_bytes(97));
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
         let mut g = GpuKs::new(ctx.clone(), 1e-6).with_vram_budget(small / 2);
@@ -2707,7 +2728,8 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore)]
     fn the_orbital_view_is_charged_to_the_vram_budget() {
         let s = h2(49, 1.4);
-        assert_eq!(solve_footprint_bytes(49, 2, 1), gpu_footprint_bytes(&s), "one formula");
+        // + the all-electron FD witness growth (plan 2026-11-13 Task 7 fix round 1)
+        assert_eq!(solve_footprint_bytes(49, 2, 1) + witness_extra_bytes(49), gpu_footprint_bytes(&s), "one formula");
         let fb = field_bytes(49) as f64;
         let fields = |m: usize| (orbital_view_footprint_bytes(49, 1, 1, m, TextureKind::None) as f64 / (1.2 * fb)).round() as usize;
         // m = 0: K = 2 shown + scratch + row buffer; m = 4: + 2·6 shown + 2·6 kept + 2·6 new (the
@@ -3217,8 +3239,9 @@ mod tests {
         // a warm one: the exact valence count and extent
         let warm = std::sync::Mutex::new(PseudoCache::default());
         warm.lock().unwrap().table(8).expect("O is accepted");
-        // None: the all-electron formula, 8 electrons (triplet: k_max = 5), whatever the cache holds
-        assert_eq!(footprint_bytes_in(&warm, &none), solve_footprint_bytes(none.cell.n, 8, 5));
+        // None: the all-electron formula, 8 electrons (triplet: k_max = 5), whatever the cache holds, plus the
+        // all-electron FD witness growth (plan 2026-11-13 Task 7 fix round 1)
+        assert_eq!(footprint_bytes_in(&warm, &none), solve_footprint_bytes(none.cell.n, 8, 5) + witness_extra_bytes(none.cell.n));
         // pseudo: 6 valence electrons (k_max = 4) plus the extras
         let fp = footprint_in(&warm, &pseudo);
         assert!(fp.pseudised && fp.n_valence == 6, "{fp:?}");

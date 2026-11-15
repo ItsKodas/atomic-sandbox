@@ -357,11 +357,25 @@ vectors, and the witness of a light atom in a 12 Bohr box sits in a cluster of b
 ≤ e^{−36}, so no energy or force moves). CPU walls with the suite's twelve tests concurrent: H 59 s (5.1 s under Aufbau),
 H₂O 454 s (88 s), LiH 179 s (32 s), H₄ 114 s, pseudo-O 102–107 s. The GPU walls moved less (H₂O 19.8 s contended).
 
-**`timing_table` is held at Aufbau** (until plan Task 9). Under FD the 97³ × 0.25 H₂O (a 24 Bohr box) fails cold with
-"no gap witness within 16 extra levels of spin 0": the box-state density of spec §4.2 NOTE-6, reached by an all-electron
-closed shell in the suite's largest box (the witness needs ε ≥ μ + 36 kT ≈ ε_HOMO + 0.33 Ha, and a 24 Bohr box holds more
-than 16 states below that). That is a decision for before Task 9 switches the app's all-electron surface, not a cap
-raised here. The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold 1.79 s.
+**`timing_table` is held at Aufbau** (until plan Task 9). Under FD the 97³ × 0.25 H₂O (a 24.5 Bohr box) failed cold
+with "no gap witness within 16 extra levels of spin 0". The self-consistent state should need only ~5–8 extras: the
+window top μ + 36 kT ≈ +0.05–0.06 Ha holds about 4 empty-box states (Task 7 review I1). **Cause (Task 7 fix round 1
+diagnostic, a traced cold solve):** a transient, pre-convergence step, not the converged spectrum and not the
+eigensolver.
+- Steps 1–2 needed 1 extra per spin.
+- Step 3 (Δρ_prev 4.78) had ε_N = −0.152 and μ = −0.067 Ha, so the top was +0.113 Ha; it needed 15–16 extras.
+- Step 4 (Δρ_prev 2.33) had ε_N = −0.132 and μ = −0.053, so the top was +0.127; it hit the cap of 16. The converged
+  ε_N is ≈ −0.26.
+- The levels between were box states from +0.020 to +0.116 Ha.
+- The block stayed orthonormal (max |⟨ψ_i|ψ_j⟩| ≤ 2.9e-8) with Ritz gaps ≥ 2.4e-4 Ha: no collapsed or duplicate
+  columns.
+
+`qm::scf::MAX_WITNESS_GROWTH` is now 32 (bit-neutral below 16; the GPU memory guard counts it, all-electron included).
+With it, step 4 passes (19 extras on ↑). The solve still did not converge within the 15-minute GPU batch: cut off at
+15 min in step 4, ↓ at 17 extras. Each growth re-solves a ~20-vector block at 97³ with LOBPCG at its cap (step
+residuals 1e-2 against a step tol of 1e-3). So the table stays held: the all-electron FD cost at large boxes is the
+open item (plan Task 9b). The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold
+1.79 s.
 
 **Re-pins** (each with its reason in the test): `qm` `none_policy_is_bitwise_today` and `qm-gpu`
 `gpu_none_policy_is_bitwise_today` keep the pre-M7 Aufbau bits under an explicit `Aufbau` and pin the `for_grid` (FD)

@@ -336,8 +336,11 @@ fn timing_table() {
         let grid = Grid::cube(n, 0.25);
         // held until plan Task 9 switches it: the table times the app's all-electron surface, which
         // `providers::ks::problem` keeps at Aufbau until then. Measured 2026-11-16 under `for_grid`'s FermiDirac (plan
-        // Task 7): H₂O at 97³ × 0.25 (a 24 Bohr box) fails cold with "no gap witness within 16 extra levels of spin 0"
-        // — spec 2026-11-13 NOTE-6's box-state density, a decision for before Task 9, not a cap to raise here
+        // Task 7): H₂O at 97³ × 0.25 failed cold with "no gap witness within 16 extra levels". Cause (Task 7 fix round 1
+        // diagnostic): transient pre-convergence steps 3–4 (ε_N −0.15 / −0.13 Ha, μ −0.067 / −0.053, so the window top
+        // is at +0.11–0.13 Ha above 15–16 box states), not the converged spectrum and not collapsed columns (overlaps
+        // ≤ 3e-8). With the cap now 32 it passes that step, but the solve was still not converged after the 15-min GPU
+        // batch — the cost (references.md "Fermi–Dirac on the GPU")
         let settings = ScfSettings { occupations: Occupations::Aufbau, ..ScfSettings::for_grid(&grid) };
         let t = Instant::now();
         let mut s = GpuSolver::new(ctx.clone(), &grid);

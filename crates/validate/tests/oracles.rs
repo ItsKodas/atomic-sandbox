@@ -15,8 +15,8 @@ fn h2(r: f64) -> System {
 }
 
 /// Runs the atom ladder, prints the E(σ) table with the fit and the residual against the
-/// first-order curve, and returns (a, warnings seen).
-fn atom_oracle(name: &str, z: u8, n: usize, h: f64, rho0_cusp: f64) -> (f64, Vec<String>) {
+/// first-order curve, and returns (a, warnings seen, TS per σ).
+fn atom_oracle(name: &str, z: u8, n: usize, h: f64, rho0_cusp: f64) -> (f64, Vec<String>, Vec<f64>) {
     let g = Grid::cube(n, h);
     let sig = sigma_ladder(h);
     let t0 = Instant::now();
@@ -30,20 +30,26 @@ fn atom_oracle(name: &str, z: u8, n: usize, h: f64, rho0_cusp: f64) -> (f64, Vec
             sig[k], e[k], e[k] - a, d1, (e[k] - a) / d1, stats[k].iterations, stats[k].delta_rho, stats[k].boundary_density, stats[k].energy);
     }
     eprintln!("  extrapolated a = {a:+.6}");
-    // spec 2026-11-13 §9 (plan Task 7): the oracles run `for_grid`'s FermiDirac at kT = 5 mHa; a closed-shell atom is
-    // gapped far beyond 74 kT, so −TS must vanish (S ≤ 1e-14, section 4.3) and F is the E the reference tabulates
-    for (k, s) in stats.iter().enumerate() {
-        assert!(s.energy.ts <= 1e-12, "{name} σ = {}: TS = {:e} (a gapped atom carries no entropy)", sig[k], s.energy.ts);
+    (a, stats.iter().flat_map(|s| s.warnings.iter().cloned()).collect(), stats.iter().map(|s| s.energy.ts).collect())
+}
+
+/// Spec 2026-11-13 §9 (plan Task 7): the oracles run `for_grid`'s FermiDirac at kT = 5 mHa. H (1s against levels
+/// ≳ 0.35 Ha up) and He (closed shell) are gapped far beyond 74 kT, so −TS must vanish (S ≤ 1e-14, spec §4.3) and F is
+/// the E the reference tabulates. Not asserted for the ignored Li oracle (review M3): its 2s and 2p lie within ~15 kT at
+/// these σ, so it carries a real TS (7.1e-3 Ha at σ = 0.25, 49³).
+fn assert_gapped(name: &str, ts: &[f64]) {
+    for (k, t) in ts.iter().enumerate() {
+        assert!(*t <= 1e-12, "{name} σ #{k}: TS = {t:e} (a gapped atom carries no entropy)");
     }
-    (a, stats.iter().flat_map(|s| s.warnings.iter().cloned()).collect())
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn h_atom_lsda() {
     // NIST LSD H: −0.478671 Ha. 81³ at h = 0.15 (12 Bohr), σ = 0.15..0.24 (module doc: fit bias ≲ 0.6 mHa).
-    let (e, warnings) = atom_oracle("H", 1, 81, 0.15, 1.0 / std::f64::consts::PI);
+    let (e, warnings, ts) = atom_oracle("H", 1, 81, 0.15, 1.0 / std::f64::consts::PI);
     assert!(warnings.is_empty(), "{warnings:?}");
+    assert_gapped("H", &ts);
     assert!((e - (-0.478671)).abs() < 4e-3, "H LSD: got {e}, reference −0.478671");
 }
 
@@ -55,8 +61,9 @@ fn he_atom_lsda() {
     // the smearing series is pre-asymptotic at Z·σ_max = 0.48 (module doc); at h = 0.10 it is
     // +12.3 mHa — inside the 15 mHa bound with 2.7 mHa margin, the grid error between the two
     // spacings being < 0.5 mHa at equal σ. Z·h, not h, is what this oracle is sensitive to.
-    let (e, warnings) = atom_oracle("He", 2, 101, 0.10, 3.6);
+    let (e, warnings, ts) = atom_oracle("He", 2, 101, 0.10, 3.6);
     assert!(warnings.is_empty(), "{warnings:?}");
+    assert_gapped("He", &ts);
     assert!((e - (-2.834836)).abs() < 1.5e-2, "He LSD: got {e}, reference −2.834836");
 }
 
@@ -88,7 +95,7 @@ fn he_atom_lsda() {
 #[test]
 #[ignore]
 fn li_atom_lsda() {
-    let (e, warnings) = atom_oracle("Li", 3, 107, 0.15, 13.8);
+    let (e, warnings, _) = atom_oracle("Li", 3, 107, 0.15, 13.8);
     assert!(warnings.is_empty(), "{warnings:?}");
     assert!((e - (-7.343957)).abs() < 4e-2, "Li LSD: got {e}, reference −7.343957");
 }

@@ -2375,6 +2375,10 @@ mod tests {
         let cold = s.solve(&sys, &target, false).unwrap().1;
         for other in [Occupations::FermiDirac { kt: 2e-3 }, Occupations::Aufbau, Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU }] {
             s.solve(&sys, &ScfSettings { occupations: other, ..base }, false).unwrap();
+            // the guard reached (review M2, the CPU twin's check): the other-kT and DS states fit FD's orbital counts,
+            // so only the `==` scheme guard refuses them; the Aufbau state (exactly N_σ vectors) fails `counts_match`
+            let fits = counts_match(s.state().expect("converged"), sys.n_up, sys.n_dn, target.occupations);
+            assert_eq!(fits, other != Occupations::Aufbau, "{other:?}: counts_match {fits}");
             let warm = s.solve(&sys, &target, true).unwrap().1;
             println!("warm from {other:?}: {} steps, F {:+.12}, TS {:.3e} (cold {} steps, F {:+.12})", warm.iterations, warm.energy.total, warm.energy.ts, cold.iterations, cold.energy.total);
             assert_eq!(warm.energy.total.to_bits(), cold.energy.total.to_bits(), "{other:?}: F");
