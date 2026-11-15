@@ -543,6 +543,7 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
 - Modify every consumer that rebuilds a total from components (re-grep `kinetic +`, `.xc +`, `components(`): `crates/qm-gpu/src/scf.rs` (energy assembly, done in Task 7; verify), `crates/sim/src/dynamics.rs` (`energy_ks` doc), `crates/validate/tests/gpu_vs_cpu.rs` `components()`, the app breakdown, the sidecar, `sim::references`.
 - Modify `crates/app/src/ui/pseudo.rs`, `occupation_lines`: compile-level change to per-level rows. The wording comes in Task 12.
 - Modify the synthetic teachers in `crates/providers/src/sampling/tests.rs` and `crates/providers/src/surrogate/tests.rs`: they set `branch_jump` instead of `occupation_changed`.
+- **Task 7 review amendment (I2, ruling 2026-11-16):** remove the three extra Task 7 holds (the qm-gpu orbital tests' `display_settings` helper, `eigen_tol_follows_delta_rho_and_removes_orbital_lag`, validate `timing_table`). The orbital display (`crates/qm-gpu/src/orbitals.rs`, the occupied-pair checks near l. 1009/1051 and the projection) treats only f-bearing columns (f ≥ `PARTIAL_OCCUPATION_MIN`) as converged occupied eigenpairs; witness columns are never compared or projected as occupied. The orbital-lag test's residual check reads the f-bearing columns' residual. The all-electron GPU memory estimate counts witness growth up to `MAX_WITNESS_GROWTH`. Run `cargo test -p validate --release --test orbitals` in this task's gates.
 - Create `crates/providers/src/fd_regression.rs` (V2, `#[cfg(test)]`). The diag harness is not on the tree (it left in Task 3 step 6); read its generators with `git show smearing-prototype:crates/providers/src/scf_stall_diag.rs` and never merge that branch.
 - Modify: references.md and `docs/dev-reference.md` ("Occupations (Fermi–Dirac)": tags, `legacy_tag_of`, re-pins; "SCF stall stop": no release restart).
 
@@ -581,6 +582,19 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
 - [ ] **Step 7: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5).
 
 **Time:** about 40 min of gates.
+
+---
+
+### Task 9b: Witness columns at a guard tolerance (cost only) — **physics** (added by the Task 7 review, ruling 2026-11-16)
+
+Runs after the preview build that follows Task 9, before Task 10. Witness columns carry f ≤ e^−36; only their eigenvalue bound matters.
+
+- Loose vs tight is decided **per column by f** (loose only when f < 1e-10), never by position: columns between the occupied levels and the witness can be partly occupied and stay at the SCF tolerance.
+- The witness test uses an eigenvalue **lower bound**, θ − ‖r‖ ≥ μ + window, never the Ritz value alone.
+- The convergence gate reads the tight columns only; the reported eigensolver residual is split (tight / guard), as in live-orbitals' Harris split stop.
+- Grow several witness vectors per re-solve (doubling the extra block) instead of one.
+- Tests: CPU f64 loose-vs-tight on H₂O, LiH, Li, H₄ square, pseudo-O M = 1 and 3: |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr; the lower-bound assertion; a column that changes class mid-solve; cold GPU solves stay bitwise reproducible; V4 re-passes; re-time gpu_vs_cpu and oracles (they rose 3.5 → 23.7 min and 31 → 51 min at Task 7) and record the times.
+- Physics review before commit.
 
 ---
 
