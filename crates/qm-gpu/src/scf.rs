@@ -1461,6 +1461,14 @@ impl GpuSolver {
         self.check_state(state);
         self.r.many(&self.ctx, &self.k, &self.g, &[Reduction::Max(&state.rho)])[0] as f32
     }
+
+    /// ∫|ρ↑ − ρ↓| d³r (electrons): the orbital view's spin reduction (`SpinSummary::abs_integral`'s source,
+    /// `Reduction::AbsDiffSum`) on the converged state, without a view (one reduction, one readback). The
+    /// `branch_jump` guard's spin measure (`providers::branch_jump`); display and diagnostics only.
+    pub fn spin_abs_integral(&self, state: &GpuState) -> f64 {
+        self.check_state(state);
+        self.r.many(&self.ctx, &self.k, &self.g, &[Reduction::AbsDiffSum(&state.rho_up, &state.rho_dn)])[0]
+    }
 }
 
 #[cfg(test)]
@@ -2026,6 +2034,24 @@ mod tests {
         assert!(peak > 0.1 && peak < 0.5, "H peak density {peak} (σ-smeared 1/π ≈ 0.32)");
         // a corner voxel is tiny: the interior, not a ghost cell or a shifted copy
         assert!(direct[0] < 1e-4 && direct[0] >= 0.0, "corner voxel {}", direct[0]);
+    }
+
+    /// `spin_abs_integral` (the `branch_jump` guard's spin measure) is the CPU `qm::orbitals::spin_summary` ∫|m| of the
+    /// same converged densities: one H atom (∫|m| = 1 electron) and Li (n↑ − n↓ = 1).
+    #[test]
+    fn spin_abs_integral_matches_the_cpu_sum() {
+        let Some((mut s, grid, settings)) = solver(33) else { return };
+        for (name, system) in [("H", hydrogen([0.0; 3])), ("Li", lithium())] {
+            s.solve(&system, &settings, false).unwrap();
+            let state = s.state().unwrap();
+            let gpu = s.spin_abs_integral(state);
+            let ks = s.ks_state(state);
+            let cpu = qm::orbitals::spin_summary(&grid, &ks.rho_up, &ks.rho_dn, system.n_up, system.n_dn).abs_integral;
+            println!("{name} 33³: ∫|ρ↑ − ρ↓| GPU {gpu:.9}, CPU sum of the same f32 densities {cpu:.9}");
+            assert!((gpu - cpu).abs() <= 1e-6 * cpu, "{name}: {gpu} vs {cpu}");
+            // ∫|m| ≥ |∫m| = n↑ − n↓ = 1, with equality for H (one orbital); Li's core is spin-polarised, so m < 0 somewhere
+            assert!(cpu >= 1.0 - 1e-4 && (name != "H" || cpu <= 1.0 + 1e-4), "{name}: one unpaired electron, {cpu}");
+        }
     }
 
     /// Diagnostic (ignored; `cargo test -p qm-gpu --release -- --ignored --nocapture diag_`):

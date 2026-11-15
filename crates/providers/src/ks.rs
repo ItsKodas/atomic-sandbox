@@ -117,6 +117,20 @@
 //! density shown — a display of the generator's core model, computed after the solve, never fed back.
 //! [`gpu_footprint_bytes`] counts the valence electrons and [`pseudo_extra_bytes`] under a setup.
 //!
+//! # The branch_jump guard (spec 2026-11-13 §6.3; plan Task 8)
+//! Each adapter holds a [`crate::branch_jump::BranchJumpGuard`] and judges every successful evaluation against *its own
+//! previous one*: ΔF against the forces' trapezoid work, within 3σ of the surface's path scatter at the tolerance the
+//! solve stopped at (`ScfStats::tol_used`, `branch_jump::noise_tier`) plus 3κ̂‖ΔR‖³. A flagged step carries
+//! `EvalStats::branch_jump = Some(m)` and the warning `sim::branch_jump_warning(m)`; the surrogate never trains on it
+//! (`EvalStats::untrainable`). Under the surrogate "previous" is the last teacher call, as for the occupation watch
+//! above, so only fallback streaks are judged (consecutive calls ≤ 0.1 Bohr apart): sampling-pass solves and sparse
+//! audits are not covered (R-NOTE-b). The guard forgets on `reset` (every edit, so every scene replace) and on a grid
+//! change, and restarts by itself on any change of species, atom count, cell or origin; `discontinuity` keeps it (a
+//! teleport of more than 0.1 Bohr is not judged anyway). With N↑ = N↓ a judged step also reports
+//! `EvalStats::spin_change`, |Δ∫|ρ↑ − ρ↓|| — the CPU from `qm::orbitals::spin_summary`, the GPU from
+//! `GpuSolver::spin_abs_integral` (one extra reduction and readback per such evaluation). It runs beside the
+//! occupation watch until plan Task 9 deletes the watch.
+//!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
 //!   state as its warm start).
@@ -172,6 +186,7 @@
 //! `ATOMIC_SANDBOX_VRAM_GB` does not leave it. The driver drops the side solver once its
 //! reference queue is empty (`sim::dynamics`), so the second set is held only while references
 //! are being solved.
+use crate::branch_jump::{noise_tier, BranchJumpGuard, Evaluation};
 use crate::orbitals::{spin_in, CpuView, PickKind, Pool, TextureKind, UnoccupiedPlan, UnoccupiedState, ViewChange, ViewState, UNOCCUPIED_MAX};
 use crate::surrogate::box_affected_face_density;
 use gpu::{ColourVolume3D, GpuContext, Volume3D};
@@ -521,6 +536,34 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         core_overlaps,
         fractional: fractional.into_iter().map(|c| sim::SharedShell { spin: c.spin, first: c.first, count: c.count, f: c.f, spread: c.spread }).collect(),
         occupation_changed,
+        branch_jump: None,
+        spin_change: None,
+    }
+}
+
+/// The `branch_jump` guard on one finished evaluation (module doc, "The branch_jump guard"; spec 2026-11-13 §6.3):
+/// judged against the same provider's previous evaluation on the tier of the surface and of the tolerance the solve
+/// stopped at (`ScfStats::tol_used`); a flagged step gets `EvalStats::branch_jump` and the spec §6.6 warning, a judged
+/// one at N↑ = N↓ the spin measure. `spin_abs`: ∫|ρ↑ − ρ↓| when N↑ = N↓, else `None`.
+#[allow(clippy::too_many_arguments)]
+fn judge_branch(guard: &mut BranchJumpGuard, stats: &mut EvalStats, scene: &Scene, grid: &Grid, system: &System, forces: &[[f64; 3]], tol_used: f64,
+                spin_abs: Option<f64>) {
+    let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+    let positions: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    let j = guard.judge(&Evaluation {
+        z: &z,
+        positions: &positions,
+        forces,
+        energy: stats.energy.total,
+        cell: scene.cell.clone(),
+        origin: grid.origin,
+        spin_abs,
+        tier: noise_tier(system.ionic.is_none(), tol_used),
+    });
+    stats.branch_jump = j.branch_jump();
+    stats.spin_change = j.spin_change;
+    if let Some(m) = stats.branch_jump {
+        stats.warnings.push(sim::branch_jump_warning(m));
     }
 }
 
@@ -551,6 +594,8 @@ pub struct CpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
+    /// The `branch_jump` guard (module doc): the previous evaluation and its κ window.
+    guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
     share_tables: Option<Arc<ShareTables>>,
 }
@@ -565,6 +610,7 @@ impl CpuKs {
             interrupt: None,
             show_core: false,
             watch: OccupationWatch::default(),
+            guard: BranchJumpGuard::new(),
             share_tables: None,
         }
     }
@@ -656,6 +702,7 @@ impl ForceProvider for CpuKs {
         if self.grid.as_ref() != Some(&grid) {
             self.warm = None;
             self.watch.forget();
+            self.guard.reset();
             self.grid = Some(grid.clone());
             // the orbital producer is grid-sized: rebuilt (module doc, "Orbital display")
             self.view = None;
@@ -677,6 +724,8 @@ impl ForceProvider for CpuKs {
         .map_err(solver_error)?;
         drop(prev);
         let forces = qm::forces(&grid, &state, &system.nuclei, settings.sigma).map_err(solver_error)?;
+        // the guard's spin measure (N↑ = N↓ only): the CPU spin reduction, compensated
+        let spin_abs = (system.n_up == system.n_dn).then(|| qm::orbitals::spin_summary(&grid, &state.rho_up, &state.rho_dn, system.n_up, system.n_dn).abs_integral);
         self.unocc.new_state(t0.elapsed());
         let display = self.display.then(|| {
             // ρ (+ ρ_pc when asked: the generator's core model, a display aid, never solved)
@@ -706,7 +755,9 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, &system, &mut self.watch);
+        let tol_used = stats.tol_used;
+        let mut stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, &system, &mut self.watch);
+        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, tol_used, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 
@@ -717,6 +768,7 @@ impl ForceProvider for CpuKs {
     fn reset(&mut self) {
         self.warm = None;
         self.watch.forget();
+        self.guard.reset();
         self.density_current = false;
         self.rho = None;
         self.view = None;
@@ -832,6 +884,8 @@ pub struct GpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
+    /// The `branch_jump` guard (module doc): the previous evaluation and its κ window.
+    guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
     share_tables: Option<Arc<ShareTables>>,
     /// Those tables on the device, for the cell they were packed for: re-uploaded only when the
@@ -864,6 +918,7 @@ impl GpuKs {
             interrupt: None,
             show_core: false,
             watch: OccupationWatch::default(),
+            guard: BranchJumpGuard::new(),
             share_tables: None,
             share_gpu: None,
         }
@@ -1172,6 +1227,7 @@ impl GpuKs {
             self.orb.rebuilt();
             self.unocc.dropped();
             self.watch.forget();
+            self.guard.reset();
             let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), &grid);
             s.set_density_extrapolation(self.extrapolate);
             self.solver = Some(s);
@@ -1205,6 +1261,9 @@ impl GpuKs {
         };
         let state = solver.state().expect("a converged solve exposes its state");
         let forces = solver.forces(state, &system.nuclei, settings.sigma).map_err(solver_error)?;
+        // the guard's spin measure (N↑ = N↓ only): the orbital view's spin reduction, one readback (a failed one is
+        // caught by the `device_fault` below and the evaluation repeated)
+        let spin_abs = (system.n_up == system.n_dn).then(|| solver.spin_abs_integral(state));
         self.unocc.new_state(t0.elapsed());
         let display = self.display.then(|| {
             let volume = self.textures.take(&self.ctx, grid.n.map(|n| n as u32));
@@ -1245,7 +1304,9 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, &system, &mut self.watch);
+        let tol_used = stats.tol_used;
+        let mut stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, &system, &mut self.watch);
+        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, tol_used, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 }
@@ -1279,6 +1340,7 @@ impl ForceProvider for GpuKs {
     fn reset(&mut self) {
         self.cold = true;
         self.watch.forget();
+        self.guard.reset();
         self.density_current = false;
         self.drop_extrapolation();
         self.drop_orbital_view();
@@ -1505,7 +1567,8 @@ mod tests {
         let clean = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).expect("clean solve");
         let total = qm_gpu::grid::readbacks_on_this_thread() - before;
         assert!(total > 20, "test premise: an evaluation reads back many times ({total})");
-        // the last two land in the forces and the display maximum after the SCF
+        // the last two land after the SCF: the guard's spin measure (H₂ has N↑ = N↓; plan 2026-11-13 Task 8) and the
+        // display maximum (the forces' readbacks just before them)
         for skip in [0, total / 2, total - 2, total - 1] {
             let mut g = GpuKs::new(ctx.clone(), 1e-6);
             qm_gpu::grid::clear_readback_fault();
@@ -1518,7 +1581,7 @@ mod tests {
                 // the clean one — the same bits (the `qm-gpu` injection test pins that)
                 assert_eq!(r.energy.to_bits(), clean.energy.to_bits(), "skip {skip}: {} vs {}", r.energy, clean.energy);
             } else {
-                // in the forces or the display maximum, after a converged SCF: the solver keeps
+                // in the spin measure or the display maximum, after a converged SCF: the solver keeps
                 // that state, so the retry is a warm solve from it, converged to the same Δρ tol
                 // (1e-6) but not the same iterates: equal to the SCF's own accuracy, not bitwise
                 assert!((r.energy - clean.energy).abs() < 1e-5, "skip {skip}: {} vs {}", r.energy, clean.energy);

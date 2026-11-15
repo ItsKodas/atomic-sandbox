@@ -4438,7 +4438,11 @@ fn fnv1a(text: &str) -> u64 {
 /// neighbours" → ", and the fit without them recovers"; the 907 lines are otherwise identical
 /// (diffed against the previous GOLDEN_TRACE), and with the old clause substituted back the trace
 /// hashes to the previous pin exactly.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xfeaa_fe54_5608_3db3;
+/// **Re-pinned for plan 2026-11-13 Task 8** (0xfeaa_fe54_5608_3db3 → below): `EvalStats` gained `branch_jump` and
+/// `spin_change` (the analytic teacher holds no guard: 341 occurrences of ", branch_jump: None, spin_change: None" in
+/// the 907-line trace). Removing exactly those strings from the new trace reproduces the old digest
+/// 0xfeaa_fe54_5608_3db3 — no decision, answer, note, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x09f6_9183_02c2_fda9;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's

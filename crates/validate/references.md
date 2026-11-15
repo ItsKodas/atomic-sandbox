@@ -4922,3 +4922,77 @@ TS 0.514 mHa (6.931 at linear: a 6.4 mHa swing), E_mode = F(70°) − F(0) = 98.
 the bend, F(70°) = 98.75 mHa against ½k_ββ² = 80 mHa; 300 steps = 0.075 ps cannot resolve drift at `DRIFT_BOUND`).
 Task 11 times the per-step cost (not measured here) and measures σ_path under the 1e-5 stop, then pre-registers
 the drift and fluctuation (3 × (h²/4·E_mode + 2σ_path)) bounds for this trajectory.
+
+### The branch_jump guard (plan 2026-11-13 Task 8, 2026-11-16, release, RX 7900 XTX; `providers::branch_jump`)
+
+**The check** (spec §6.3; derivation in the `providers::branch_jump` module doc). Two consecutive evaluations of the
+same provider: ΔF = E₁ − E₀, W = −½Σ_I(F_I,0 + F_I,1)·ΔR_I (the trapezoid estimate of ΔF; on a smooth surface
+m = |ΔF − W| ≤ (1/12)|E‴|‖ΔR‖³), flagged when m > b = 3(√2σ_E + ‖ΔR‖σ_F/√2) + 3κ̂‖ΔR‖³ with κ̂ = min(median of
+m/‖ΔR‖³ over the last 8 judged, unflagged, third-order-dominated steps, κ_max). Pre-registered, reviewed in plan Task 8
+step 6, never loosened: **factor 3, window 8, reach 0.1 Bohr (largest single-atom displacement judged), κ_max = 1
+Ha/Bohr³** ((1/12)·6Da³ = 0.34 for D = 0.2 Ha, a = 1.5 Bohr⁻¹, rounded up; the measured (1/12)|E‴| of O–H in H₂O and
+N–H in NH₃ reach 0.40 and 0.35 at 0.8 R_e, "Fermi–Dirac migration" above).
+
+**The tiers** (`noise_tier(all_electron, ScfStats::tol_used)`, ruling R8; σ_E in Ha, σ_F in Ha/Bohr per component):
+
+| tier | used when | σ_E | σ_F | source |
+|---|---|---|---|---|
+| pseudo, sample | tol_used ≤ 1e-6 | 1.87e-6 | 5e-5 (`PSEUDO_FORCE_NOISE`) | H₂O (`All`) warm vs cold, "GPU vs CPU at fixed σ" (pseudo path scatter); the GPU pseudo force scatter at 1e-6 |
+| all-electron, sample | tol_used ≤ 1e-6 | 5.4e-6 | **2.4e-5** | H₂O GPU path scatter (M3 Task 8); σ_F measured below (no all-electron force scatter was on record) |
+| pseudo, app | otherwise (1e-5; every partial-level GPU stop) | **1.6e-6** | **9.0e-5** | measured below: the larger of H₂O and linear OH |
+| all-electron, app | otherwise | **4.7e-6** | **1.4e-5** | measured below: all-electron H₂O |
+
+**Measurement** (`branch_jump::tests::tier_scatter_measurement`, `#[ignore]`d; `BRANCH_JUMP_TIER_CASE=<case> cargo test -p
+providers --release tier_scatter_measurement -- --ignored --nocapture`). `GpuSolver` driven directly with explicit
+`FermiDirac { kt: ELECTRON_KT }` (the providers still run the old occupation rule until plan Task 9) on the scene
+`providers::ks::problem` builds at the app's Accurate grid for the H₂O preset's 14 Bohr box, **95³ × 0.15**, σ = h,
+density extrapolation off. One cold solve at R₀, then 5 repeats of {warm solve at R₀ + δ (every atom 0.02 Bohr in a
+seeded random direction), warm solve back at R₀}; per repeat |E_warm − E_cold| and the largest per-component
+|F_warm − F_cold|. **σ is the largest of the 5** (each a difference of two solves, so conservative by up to √2 against a
+per-solve σ, as the sample tier's 1.87e-6 is), rounded up to two digits.
+
+| case | ionic, tol (stop) | steps cold / warm, wall | \|E_warm − E_cold\| (5 repeats) | max \|ΔF\| per repeat | σ_E (rms) | σ_F (rms of maxima) |
+|---|---|---|---|---|---|---|
+| H₂O | `Accepted`, `effective_gpu_tol(1e-5)` = 1e-5 (gapped) | 13 / 9–10, 6.8 s / 2.5–3.3 s | 6.0e-7, 1.2e-6, 1.6e-6, 7.9e-7, 9.8e-7 | 2.6e-5, 3.9e-5, 3.6e-5, 1.3e-5, 1.7e-5 | **1.56e-6** (1.07e-6) | **3.93e-5** (2.81e-5) |
+| linear OH (R = 1.85, along x) | `Accepted`, asked 1e-6, **stopped at 1e-5** (partial π↓ pair, f = ½, ½; TS 6.93 mHa) | 14 / 12–17, 5.1 s / 4.5–9.4 s | 5.4e-7, 1.6e-8, 3.5e-7, 3.9e-7, 8.3e-8 | 9.9e-6, 3.5e-5, 2.9e-5, **8.9e-5**, 3.9e-5 | 5.35e-7 (3.37e-7) | **8.95e-5** (4.83e-5) |
+| H₂O all-electron | `None`, 1e-5 (gapped, TS 1.6e-15) | 16 / 10–14, 94 s / 38–60 s | 1.2e-6, 3.3e-6, 1.9e-6, 2.2e-7, 4.7e-6 | 1.4e-5, 9.0e-6, 7.0e-6, 4.9e-6, 1.3e-5 | **4.66e-6** (2.74e-6) | **1.35e-5** (1.01e-5) |
+| H₂O all-electron | `None`, 1e-6 (gapped) | 20 / 12–13, 92 s / 32–50 s | 1.1e-6, 3.6e-6, 1.6e-6, 4.4e-7, 3.5e-6 | 2.0e-5, 1.1e-5, 6.2e-6, 2.3e-5, 5.3e-6 | 3.60e-6 (2.40e-6) | **2.35e-5** (1.51e-5) |
+
+- **Pseudo app tier = the larger of H₂O and OH per quantity**: σ_E 1.56e-6 → **1.6e-6** (H₂O), σ_F 8.95e-5 → **9.0e-5**
+  (OH, whose partial-level stop is the pinned teacher case [kT-5]).
+- **All-electron app tier** (H₂O): **4.7e-6**, **1.4e-5**. The all-electron FD solve at this grid converged (no witness
+  cap, NOTE-6), so the provisional pseudo ×5 fallback was not needed. Its LOBPCG hit the 200-iteration cap in 1–10 of
+  20–44 calls per solve (the witness columns among box states, plan Task 9b's cost item); each solve still converged.
+- **Rule 7 notes on the numbers.** The app-tier σ_E come out *below* the older sample-tier σ_E (pseudo 1.6e-6 against
+  1.87e-6, all-electron 4.7e-6 against 5.4e-6): those were measured on other grids (51³ × 0.20 and 49³ × 0.25) and with
+  other warm paths, and a looser stop need not show a larger warm/cold difference on a gapped molecule (the 1e-5 stop's
+  own error is second order in Δρ, spec §5.1). They are recorded as measured, not raised to the sample tier. The OH
+  force scatter at its 1e-5 stop (8.95e-5) is 1.8× `PSEUDO_FORCE_NOISE`, within the "up to ≈ 7e-5 on warm teacher chains"
+  range noted for that constant's measurement, and one repeat in five sets it (the rms of the maxima is 4.8e-5).
+- **The all-electron tiers are not ordered in σ_F**: the 1e-6 run's largest force difference (2.35e-5) exceeds the 1e-5
+  run's (1.35e-5) on the same geometry and neighbours — with five draws each, the maximum is itself a noisy estimate (the
+  rms of the maxima, 1.5e-5 and 1.0e-5, are within each other's scatter). So a sample-tolerance all-electron solve is
+  judged slightly more loosely than an interactive one. Recorded as measured; a sixth draw or a pooled estimate is a
+  review decision, not a tuning here.
+
+**What the guard's tests found** (`cargo test -p providers --release branch_jump`, CPU, instant; analytic Morse dimer
+D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr on the pseudo sample tier):
+- a +12 mHa jump at a 0.02 Bohr step: m = 12.00 mHa against b = 2.15e-5 → flagged at that step only; the same after 50
+  steps of 1e-3 Bohr (noise-dominated: the window stays empty) and at every jump of a ±12 mHa every-other-step stream
+  (no flagged step enters the window);
+- smooth paths over R ∈ [0.8, 2.0]·R_e, out and back, never flagged. Tightest m/b with one atom moving: 0.016, 0.30,
+  0.66 at ‖ΔR‖ = 0.005, 0.02, 0.05 Bohr; with both atoms moving symmetrically (the bond changes by √2‖ΔR‖, so
+  m/‖ΔR‖³ = 2√2·(1/12)|E‴|): 0.045, 0.72, **0.97** (‖ΔR‖ = 0.05, R ≈ 1.94 on the way back out, where the window median
+  lags the falling |E‴|). On this stiff Morse the symmetric 0.05 Bohr path uses nearly all of the factor 3: (1/12)|E‴|
+  reaches 1.1 at 0.8 R_e, ×2√2 = 3.2 per ‖ΔR‖³ against 3κ_max = 3. For the app's bonds ((1/12)|E‴| ≤ 0.40 at 0.8 R_e) the
+  symmetric factor gives ≤ 1.1 against 3. Recorded for the step 6 review; not changed.
+- the trapezoid error is third order (halving the step divides m by 8.0 ± 0.5) and equals (1/12)|E‴|h³ at the midpoint
+  within 5 %.
+- V7 (`validate --test surrogate branch_jump_step_is_not_trained_on`): a 12 mHa switch in a 12-step fallback streak is
+  warned and absent from the store; the 11 other steps are kept.
+- `a_scripted_session_decides_exactly_as_before` re-pinned (0xfeaa_fe54_5608_3db3 → 0x09f6_9183_02c2_fda9): the two new
+  `EvalStats` fields' `{:?}` text, 341 occurrences; removing exactly those reproduces the old digest.
+
+**Coverage** (rule 7, R-NOTE-b): sampling-pass solves and sparse audits are not judged; under the surrogate only
+fallback streaks are. The CPU f64 path is judged on these GPU tiers (conservative: its scatter is far smaller).
+

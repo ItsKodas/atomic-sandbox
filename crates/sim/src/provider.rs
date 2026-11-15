@@ -560,6 +560,16 @@ pub struct EvalStats {
     /// (a few mHa), so the answer is used and never kept as training data (Task 6 review A.6).
     /// Also a warning, [`OCCUPATION_CHANGE_WARNING`].
     pub occupation_changed: bool,
+    /// Plan 2026-11-13 Task 8 (spec §6.3, the `providers::branch_jump` guard): `Some(m)` when this step's change of F
+    /// disagrees with the forces' trapezoid work since the same provider's previous evaluation by m (Ha) beyond the
+    /// noise and third-order bound — the SCF moved to another stationary state. The answer is used for its step and
+    /// never trained on; also a warning, [`branch_jump_warning`]. `None`: not flagged, or not judged (the first
+    /// evaluation after a reset or a grid/box/atom-set change, a single-atom displacement over 0.1 Bohr, a provider
+    /// without the guard).
+    pub branch_jump: Option<f64>,
+    /// With a judged step at N↑ = N↓: |Δ∫|ρ↑ − ρ↓|| (electrons) since the previous evaluation, where a
+    /// restricted ↔ broken-symmetry switch shows (spec §6.3, "Spin measure"); reported, never decided on.
+    pub spin_change: Option<f64>,
 }
 
 /// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
@@ -568,6 +578,14 @@ pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
 
 /// The prefix of the warning for a shared-shell pattern that changed between consecutive steps.
 pub const OCCUPATION_CHANGE_WARNING: &str = "occupation pattern changed";
+
+/// The short reason [`EvalStats::untrainable`] gives for a step the `branch_jump` guard flagged (spec §6.3).
+pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
+
+/// The warning of a flagged step (spec §6.6): the mismatch `m` (Ha) shown in mHa with one decimal.
+pub fn branch_jump_warning(m: f64) -> String {
+    format!("F changed by {:.1} mHa more than the forces' work: the SCF moved to another stationary state (not trained on)", m * 1e3)
+}
 
 /// One shared (fractionally occupied) cluster of one spin channel (`qm::scf::FractionalShell`): spin
 /// (0 ↑, 1 ↓), the index of its first level in ascending order, its size, the occupation f of each
@@ -639,18 +657,24 @@ impl Default for EvalStats {
             core_overlaps: Vec::new(),
             fractional: Vec::new(),
             occupation_changed: false,
+            branch_jump: None,
+            spin_change: None,
         }
     }
 }
 
 impl EvalStats {
     /// Why this answer must never be a training sample, if it must not (M7): the cores of two ions overlap
-    /// ([`CORE_OVERLAP_WARNING`], spec §5.6 — the frozen-core approximation is outside its domain) or the
-    /// shared-shell occupation pattern changed since the previous evaluation ([`OCCUPATION_CHANGE_WARNING`] —
-    /// E(R) jumps by the orbital-polarisation energy there). The answer is still used for its step.
+    /// ([`CORE_OVERLAP_WARNING`], spec §5.6 — the frozen-core approximation is outside its domain), the
+    /// `branch_jump` guard flagged the step ([`BRANCH_JUMP_WARNING`], spec 2026-11-13 §6.3 — F changed by more than
+    /// the forces' work: another stationary state) or the shared-shell occupation pattern changed since the previous
+    /// evaluation ([`OCCUPATION_CHANGE_WARNING`] — E(R) jumps by the orbital-polarisation energy there; plan
+    /// 2026-11-13 Task 9 removes it). The answer is still used for its step.
     pub fn untrainable(&self) -> Option<&'static str> {
         if !self.core_overlaps.is_empty() {
             Some(CORE_OVERLAP_WARNING)
+        } else if self.branch_jump.is_some() {
+            Some(BRANCH_JUMP_WARNING)
         } else if self.occupation_changed {
             Some(OCCUPATION_CHANGE_WARNING)
         } else {
@@ -1656,5 +1680,33 @@ mod ionic_tests {
         s.core_overlaps = vec![(0, 1, 0.8)];
         assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are named first");
         assert_eq!(CORE_OVERLAP_WARNING, "cores overlap");
+    }
+
+    /// Plan 2026-11-13 Task 8 (spec §6.3): a step the `branch_jump` guard flagged is untrainable, named after the
+    /// core overlaps and before the old occupation-pattern watch (which plan Task 9 removes).
+    #[test]
+    fn untrainable_reports_branch_jump() {
+        let mut s = EvalStats::default();
+        assert_eq!((s.branch_jump, s.spin_change), (None, None), "not judged by default");
+        s.branch_jump = Some(0.012);
+        assert_eq!(s.untrainable(), Some(BRANCH_JUMP_WARNING));
+        s.occupation_changed = true;
+        assert_eq!(s.untrainable(), Some(BRANCH_JUMP_WARNING), "the branch jump is named before the occupation watch");
+        s.core_overlaps = vec![(0, 1, 0.8)];
+        assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are still named first");
+        s.core_overlaps.clear();
+        s.branch_jump = None;
+        assert_eq!(s.untrainable(), Some(OCCUPATION_CHANGE_WARNING));
+    }
+
+    /// Spec §6.6's warning text, m in mHa with one decimal (F14; plan Task 12 asserts the same text in the UI).
+    #[test]
+    fn untrainable_branch_jump_warning_text() {
+        assert_eq!(
+            branch_jump_warning(0.012),
+            "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)"
+        );
+        assert_eq!(BRANCH_JUMP_WARNING, "F changed by more than the forces' work");
+        assert!(branch_jump_warning(0.012).starts_with("F changed by "));
     }
 }

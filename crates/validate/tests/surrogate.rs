@@ -174,6 +174,13 @@
 //!   The numbers of record: `references.md`, "M8a trust baseline"; what Task 2's calibrated,
 //!   hysteretic verdict is measured against. In this mode the repro's gated assertions become notes
 //!   in the report (audits every 50 are not the gated scenario).
+//! - `branch_jump_step_is_not_trained_on` (spec 2026-11-13 §9 V7; plan Task 8): a synthetic teacher — the analytic
+//!   Morse dimer of the guard's own tests (D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr) behind a
+//!   `providers::branch_jump::BranchJumpGuard` on the pseudo sample tier, as the Kohn–Sham adapters hold one — streams
+//!   12 fallback steps of 0.02 Bohr with a 12 mHa switch of branch at step 6 (E shifted from there on). No model
+//!   exists, so every step is a teacher call (rule 1). The switch step is warned (`sim::branch_jump_warning`), its
+//!   note says "sample not kept", and its geometry is absent from the store; every step before and after it is kept.
+//!   CPU only (no GPU), milliseconds.
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (the `Locked`
 //! teacher), one evaluation at a time, so the per-solve times in the timing rows are uncontended
@@ -1912,4 +1919,94 @@ fn lih_shell_check_measurement() {
         }
         println!("  teacher: {}; wall {:.0} s", snapshot(&log).summary(), t.elapsed().as_secs_f64());
     }
+}
+
+/// The V7 synthetic teacher (module doc, `branch_jump_step_is_not_trained_on`): the guard's analytic Morse dimer, E
+/// shifted by `jump` (Ha) from step `switch_at` on, judged by a `BranchJumpGuard` exactly as `providers::ks` does — a
+/// flagged step carries `EvalStats::branch_jump` and the spec §6.6 warning.
+struct BranchingMorse {
+    guard: providers::branch_jump::BranchJumpGuard,
+    step: usize,
+    switch_at: usize,
+    jump: f64,
+}
+
+impl ForceProvider for BranchingMorse {
+    fn evaluate(&mut self, scene: &Scene, _: &mut dyn FnMut() -> bool) -> Result<ForceResult, sim::ProviderError> {
+        let (d, a, r_e) = (0.2, 1.5, 1.8);
+        let (p0, p1) = (scene.nuclei[0].pos, scene.nuclei[1].pos);
+        let v: [f64; 3] = std::array::from_fn(|k| p1[k] - p0[k]);
+        let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let x = (-a * (r - r_e)).exp();
+        let shift = if self.step >= self.switch_at { self.jump } else { 0.0 };
+        self.step += 1;
+        let energy = d * ((1.0 - x) * (1.0 - x) - 1.0) + shift;
+        let de = 2.0 * d * a * (1.0 - x) * x;
+        let u = v.map(|c| c / r);
+        let forces = vec![u.map(|c| de * c), u.map(|c| -de * c)];
+        let mut stats = sim::EvalStats::default();
+        stats.energy.total = energy;
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let positions: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let j = self.guard.judge(&providers::branch_jump::Evaluation {
+            z: &z,
+            positions: &positions,
+            forces: &forces,
+            energy,
+            cell: scene.cell.clone(),
+            origin: [-0.5 * (scene.cell.n as f64 - 1.0) * scene.cell.h; 3],
+            spin_abs: None,
+            tier: providers::branch_jump::PSEUDO_SAMPLE_TIER,
+        });
+        stats.branch_jump = j.branch_jump();
+        if let Some(m) = stats.branch_jump {
+            stats.warnings.push(sim::branch_jump_warning(m));
+        }
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
+    }
+
+    fn name(&self) -> &'static str {
+        "branching Morse"
+    }
+
+    fn reset(&mut self) {
+        self.guard.reset();
+    }
+}
+
+/// Spec 2026-11-13 §9 V7 (module doc): a 12 mHa branch switch in a fallback streak is warned and never trained on;
+/// the steps before and after it are.
+#[test]
+fn branch_jump_step_is_not_trained_on() {
+    const STEPS: usize = 12;
+    const SWITCH: usize = 6;
+    let teacher = BranchingMorse { guard: providers::branch_jump::BranchJumpGuard::new(), step: 0, switch_at: SWITCH, jump: 0.012 };
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default());
+    let dir = [0.6, 0.48, 0.64];
+    let mut kept_before = 0;
+    for i in 0..STEPS {
+        // atom 0 fixed, atom 1 stepped 0.02 Bohr outward from R = 1.6 (a fallback streak: every call is the teacher's)
+        let r = 1.6 + 0.02 * i as f64;
+        let sc = scene(N_H2, vec![Nucleus::new(1, [0.0; 3]), Nucleus::new(1, dir.map(|c| c * r))]);
+        let res = s.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("step {i}: {e}"));
+        assert_eq!(res.stats.source, Source::Fallback, "step {i}: no model, the teacher answers");
+        let kept = s.samples();
+        if i == SWITCH {
+            let m = res.stats.branch_jump.unwrap_or_else(|| panic!("step {i}: the switch is flagged"));
+            assert!((m - 0.012).abs() < 1e-4, "m ≈ the 12 mHa switch: {m:e}");
+            assert!(res.stats.warnings.iter().any(|w| *w == sim::branch_jump_warning(m)), "{:?}", res.stats.warnings);
+            assert!(res.stats.notes.iter().any(|n| n.contains("sample not kept") && n.contains(sim::BRANCH_JUMP_WARNING)), "{:?}", res.stats.notes);
+            assert_eq!(kept, kept_before, "step {i}: the switch step is not kept");
+        } else {
+            assert_eq!(res.stats.branch_jump, None, "step {i}: smooth (the guard's first evaluation is not judged)");
+            assert_eq!(kept, kept_before + 1, "step {i}: kept");
+        }
+        kept_before = kept;
+    }
+    assert_eq!(s.samples(), STEPS - 1);
+    // the switch step's geometry is absent from the trained samples; its neighbours are present
+    let store = s.store().expect("samples");
+    let has = |r: f64| store.samples.iter().any(|x| (x.pos[1][0] - dir[0] * r).abs() < 1e-12);
+    assert!(!has(1.6 + 0.02 * SWITCH as f64), "the switch geometry is not stored");
+    assert!(has(1.6 + 0.02 * (SWITCH - 1) as f64) && has(1.6 + 0.02 * (SWITCH + 1) as f64), "the steps either side are");
 }
