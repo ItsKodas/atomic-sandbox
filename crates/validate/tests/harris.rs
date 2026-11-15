@@ -40,9 +40,10 @@
 //! from the SCF's by δV = f_Hxc δρ with ‖δρ‖₁ ≤ tol (1e-6, or the floor-aware GPU tol under a
 //! setup, ≤ 8e-7 here): |Δε_i| ≈ |⟨ψ_i|δV|ψ_i⟩| ~ 1e-6 Ha, and 1 − O ≈ (1/n)Σ_{i,a}
 //! |⟨ψ_a|δV|ψ_i⟩|²/(ε_a − ε_i)² ~ 1e-11. Gates (spec §7): every occupied |Δε| ≤ 1e-5 Ha, O ≥ 1 −
-//! 1e-6 per channel. This proves the potential assembly (v_ion with V_loc and the KB projectors,
-//! V_H of ρ without ρ_pc, v_xc with ½ρ_pc per spin, the spin assignment) is the SCF's. Cases: H₂,
-//! H₂O and a pseudo-O atom.
+//! 1e-6 per channel, and every f^H = f^S to 1e-12. This proves the potential assembly (v_ion with
+//! V_loc and the KB projectors, V_H of ρ without ρ_pc, v_xc with ½ρ_pc per spin) is the SCF's, and —
+//! through the H₂ + H doublet, whose ↑ and ↓ potentials differ by the exchange splitting — the spin
+//! assignment (v_xc,↑ on ↑). Cases: H₂, H₂ + H (doublet), H₂O and a pseudo-O atom.
 //!
 //! **V-A2 (record + gate): superposed atoms against the SCF.** ρ_in = the renormalised, rescaled
 //! superposition of this program's own isolated-atom profiles (`providers::harris::superposition`
@@ -57,7 +58,8 @@
 //!
 //! **V-A3 (record): warm refresh cost** through `GpuKs::harris_display` (the auditor teacher's
 //! path) on one teacher: a cold call, then five warm calls, atom 0 moved +0.01 Bohr along x before
-//! each. Wall times, each call:
+//! each, then one warm call after a 0.1 Bohr move (a playing run's step between two refreshes, or a
+//! drag; recorded on its own row). Wall times, each call:
 //! - **total**: `OrbitalKind::Harris::wall_s` (problem set-up, superposition, solve, payload);
 //! - **display**: the probe's display-solve record (`ActivityProbe::take_display_solves`: the
 //!   Activity row's number — the solve and the payload);
@@ -102,6 +104,8 @@ const H: f64 = 0.15;
 /// V-A1 gates (spec §7).
 const IDENTITY_EPS: f64 = 1e-5;
 const IDENTITY_OVERLAP: f64 = 1.0 - 1e-6;
+/// V-A1: the one-shot occupations equal the SCF's (the same rule on ε equal to ~1e-7 Ha; exact fractions).
+const OCC_EPS: f64 = 1e-12;
 /// V-A2 gate (spec §7): every neutral case.
 const SUPERPOSED_OVERLAP: f64 = 0.95;
 /// V-A3 target (spec §7), recorded only.
@@ -286,9 +290,9 @@ const SPIN: [&str; 2] = ["↑", "↓"];
 // ---- V-A1 ----
 
 /// V-A1 (gate; module doc): Harris on ρ_in = the converged SCF density reproduces the SCF —
-/// every occupied |ε^H − ε^S| ≤ 1e-5 Ha and O_σ ≥ 1 − 1e-6 — for H₂ (81³), H₂O and pseudo-O (97³),
-/// all under `Accepted`. Measured (2026-11-14): max |Δε| 8.9e-8 / 2.1e-7 / 2.4e-7 Ha, 1 − O ≤ 8.5e-8
-/// (pseudo-O with the SCF's f = 1, ⅔, ⅔, ⅔); `references.md` "Live orbitals".
+/// every occupied |ε^H − ε^S| ≤ 1e-5 Ha, |f^H − f^S| ≤ 1e-12 and O_σ ≥ 1 − 1e-6 — for H₂ and the
+/// H₂ + H doublet (81³: the spin assignment), H₂O and pseudo-O (97³), all under `Accepted`. Measured (2026-11-15): max |Δε| 9.1e-8 / 4.9e-8 / 1.3e-7 / 2.2e-7 Ha, 1 − O ≤ 1.2e-7,
+/// every f equal (pseudo-O 1, ⅔, ⅔, ⅔); `references.md` "Live orbitals".
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn va1_identity_on_the_converged_density() {
@@ -296,7 +300,7 @@ fn va1_identity_on_the_converged_density() {
     let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let t_all = Instant::now();
     let mut failures = Vec::new();
-    for (name, sc) in [("H₂", h2()), ("H₂O", h2o()), ("pseudo-O", pseudo_o())] {
+    for (name, sc) in [("H₂", h2()), ("H₂ + H", h2_plus_h()), ("H₂O", h2o()), ("pseudo-O", pseudo_o())] {
         let t = Instant::now();
         let (grid, system, settings, notes) = posed(&sc);
         println!("V-A1 {name}: {}³ × {H}, σ = h, {:?} (setup {}), tol {:.1e}, occupations {:?}; setup notes {notes:?}",
@@ -313,6 +317,7 @@ fn va1_identity_on_the_converged_density() {
                 let d = (eh - es).abs();
                 worst = worst.max(d);
                 println!("    {} #{i}: ε_H {eh:+.8} (f {fh:.4}) ε_SCF {es:+.8} (f {fs:.4}) |Δ| {d:.2e}", SPIN[ch]);
+                if (fh - fs).abs() > OCC_EPS { failures.push(format!("{name} {} #{i}: f_H {fh} vs f_SCF {fs}", SPIN[ch])); }
             }
             println!("  {name} {}: max occupied |Δε| = {worst:.2e} Ha (gate {IDENTITY_EPS:.0e}); O = 1 − {:.2e} (gate 1 − 1e-6)", SPIN[ch], 1.0 - o[ch]);
             if worst > IDENTITY_EPS { failures.push(format!("{name} {}: max |Δε| = {worst:.3e} > {IDENTITY_EPS:.0e} Ha", SPIN[ch])); }
@@ -392,8 +397,10 @@ fn min(v: &[f64]) -> f64 { v.iter().copied().fold(f64::INFINITY, f64::min) }
 /// V-A3 (record; module doc): one teacher's `harris_display` (All orbitals coloured, m = 0), a cold
 /// call then five warm ones each after atom 0 moves +0.01 Bohr; min/median wall of the total, the
 /// display record, the superposition, the solve (replica) and the payload, for H₂ and H₂ + H at 81³
-/// and H₂O at 97³, against the ≤ 0.3 s target (no assert). Measured (2026-11-14), warm median total:
-/// H₂ 0.197 s, H₂ + H 0.263 s (target met), H₂O 1.31 s; cold 0.8 / 1.0 / 2.7 s.
+/// and H₂O at 97³, against the ≤ 0.3 s target (no assert); then one warm call after a 0.1 Bohr move
+/// (its own row). Measured (2026-11-15, after task 8b), warm median total: H₂ 0.115 s, H₂ + H 0.147 s
+/// (target met), H₂O 0.460 s; the 0.1 Bohr step 0.138 / 0.186 / 0.585 s; cold 0.68 / 0.67 / 1.52 s
+/// (2026-11-14: warm 0.197 / 0.263 / 1.31 s).
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn va3_warm_refresh_cost() {
@@ -413,8 +420,9 @@ fn va3_warm_refresh_cost() {
         let mut moved = sc.clone();
         // per call: total, display, superposition, solve, payload (s)
         let mut rows: Vec<[f64; 5]> = Vec::new();
-        for call in 0..6 {
-            if call > 0 { moved.nuclei[0].pos[0] += 0.01; }
+        for call in 0..7 {
+            // calls 1–5: +0.01 Bohr each; call 6: +0.1 Bohr (its own row)
+            if call > 0 { moved.nuclei[0].pos[0] += if call == 6 { 0.1 } else { 0.01 }; }
             let (grid, system, settings, _) = posed(&moved);
             let c = counted(&system);
             let t = Instant::now();
@@ -434,13 +442,16 @@ fn va3_warm_refresh_cost() {
                      if rs.cold { "cold" } else { "warm" }, moved.nuclei[0].pos[0], rs.iterations, rs.solves, rs.at_cap, display - solve, payload.rows.len());
             rows.push([wall_s, display, sup, solve, display - solve]);
         }
-        let warm: Vec<[f64; 5]> = rows[1..].to_vec();
+        let warm: Vec<[f64; 5]> = rows[1..6].to_vec();
+        let step = rows[6];
         let col = |k: usize| -> Vec<f64> { warm.iter().map(|r| r[k]).collect() };
         let names = ["total", "display", "superposition", "solve", "payload"];
         let stats: Vec<String> = (0..5).map(|k| format!("{} min {:.3} / median {:.3} s", names[k], min(&col(k)), median(&col(k)))).collect();
         let met = median(&col(0)) <= WARM_TARGET_S;
-        println!("  {name} warm (5 calls): {}; cold total {:.3} s; target ≤ {WARM_TARGET_S} s {}\n", stats.join(", "), rows[0][0], if met { "met" } else { "NOT met" });
-        summary.push(format!("{name} {}³: cold {:.3} s; warm {}; target {}", sc.cell.n, rows[0][0], stats.join(", "), if met { "met" } else { "not met" }));
+        println!("  {name} warm (5 calls): {}; cold total {:.3} s; 0.1 Bohr step: total {:.3} s, solve {:.3} s; target ≤ {WARM_TARGET_S} s {}\n",
+                 stats.join(", "), rows[0][0], step[0], step[3], if met { "met" } else { "NOT met" });
+        summary.push(format!("{name} {}³: cold {:.3} s; warm {}; 0.1 Bohr step total {:.3} s (solve {:.3} s); target {}",
+                             sc.cell.n, rows[0][0], stats.join(", "), step[0], step[3], if met { "met" } else { "not met" }));
     }
     println!("V-A3 summary:");
     for r in &summary { println!("  {r}"); }
