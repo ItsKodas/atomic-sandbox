@@ -46,7 +46,7 @@ pub mod version;
 mod workspace;
 
 pub use actions::Action;
-#[cfg(test)]
+/// The Orbitals panel module (its honesty texts and the Harris label are read by the viewer).
 pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
 /// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.

@@ -215,6 +215,7 @@ mod model;
 pub use activity::*;
 pub use commands::*;
 // (the notes `Snapshot::harris_note` carries, for the viewer's labels)
+#[cfg(test)]
 pub use harris::{HARRIS_PAUSED_PASS, HARRIS_WAITING_ATOMS};
 pub use model::*;
 
