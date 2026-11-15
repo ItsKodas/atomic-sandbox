@@ -17,22 +17,25 @@
 //!   evaluated once in f64 before bisecting; they fail only if |ε|/kT ≳ 1e14 absorbs the 50 kT margin.
 //! - **Two bisections**, each halving [lo, hi] at mid = ½lo + ½hi (cannot overflow) and stopping when mid equals
 //!   an endpoint in f64, i.e. when lo and hi are adjacent floats:
-//!   - (≥) mid → hi when Σf(mid) − n ≥ 0, else → lo. Invariant Σf(lo) < n ≤ Σf(hi), so hi ends on μ₋, the least
-//!     f64 μ with Σf ≥ n;
-//!   - (≤) mid → lo when Σf(mid) − n ≤ 0, else → hi. Invariant Σf(lo) ≤ n < Σf(hi), so lo ends on μ₊, the greatest
-//!     f64 μ with Σf ≤ n.
+//!   - (≥) mid → hi when Σf(mid) − n ≥ 0, else → lo. Invariant Σf(lo) < n ≤ Σf(hi), so hi converges to a crossing
+//!     μ₋ (the least f64 μ with Σf ≥ n, up to rounding: the f64 Σf need not be monotone in its last ulp);
+//!   - (≤) mid → lo when Σf(mid) − n ≤ 0, else → hi. Invariant Σf(lo) ≤ n < Σf(hi), so lo converges to a crossing
+//!     μ₊ (the greatest f64 μ with Σf ≤ n, up to rounding).
 //!   - μ = ½μ₋ + ½μ₊. In a gapped channel Σf == n *exactly* in f64 over a plateau of μ (1 − f_HOMO below ½ ulp(1),
 //!     f_LUMO below ½ ulp(n)), from about ε_HOMO + 37 kT to ε_LUMO − 36 kT once the gap exceeds ≈ 74 kT, and a
 //!     single tie rule would put μ on one edge. μ₋ and μ₊ are the two edges, so μ is the plateau midpoint (near the
 //!     FD root at mid-gap); every f is the same to ≤ e^{−36} anywhere on the plateau. Without a plateau μ₋ and μ₊
 //!     coincide or are adjacent floats around the root, μ is one of them, and
 //!     |Σf − n| ≤ (dΣf/dμ)·ulp(μ) ≤ k·ulp(μ)/(4kT).
-//! - **Termination.** A bisection exhausts its bracket after ≈ 60 halvings for |μ| ~ 1 and at most ≈ 1 100 when μ
-//!   approaches 0 through the subnormals [NOTE-1]; `MAX_MU_HALVINGS` = 2 048 is a backstop that never binds, so
-//!   termination never rests on the stop rule alone. `halvings` reports the larger of the two counts.
+//! - **Termination** [NOTE-1]. A bisection exhausts its bracket after ≈ 60 halvings at |μ| ~ 1; ≲ 120 near μ = 0 at
+//!   kT = 5 mHa (measured 113–116: within |x| < 1.1e-16 e^x rounds to 1, so Σf is flat over ≈ ±1.1e-16·kT around a
+//!   root at 0 and the bisection stops there); ≈ 1 100 only for a subnormal kT, whose flat zone is itself below the
+//!   subnormal spacing, so the bisection runs through the subnormals. `MAX_MU_HALVINGS` = 2 048 is a backstop that never binds, so termination never rests on the stop rule
+//!   alone. `halvings` reports the larger of the two counts.
 //! - **Inputs refused before bisecting** (`QmError::Numerical`) [SHOULD-1]: k < n + 1 (then Σf ≤ k = n at every μ,
-//!   no bracket), a non-finite eigenvalue (a NaN never equals an endpoint, so the stop would never fire), and a kT
-//!   that is not finite and > 0. n = 0 is an unsolved channel: every f = 0, μ = None, S = 0, no level needed.
+//!   no bracket), a non-finite eigenvalue (a NaN never equals an endpoint, so the stop would never fire), a kT
+//!   that is not finite and > 0, and a bracket that fails its one check (an end not finite, or not
+//!   Σf(lo) < n < Σf(hi)). n = 0 is an unsolved channel: every f = 0, μ = None, S = 0, no level needed.
 //! - No tolerance parameter; the result is a deterministic function of the f64 inputs (the same bits on every run
 //!   and in both solvers).
 //!
@@ -72,7 +75,8 @@ pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
 pub const GPU_PARTIAL_TOL: f64 = 1e-5;
 /// The μ bracket's margin beyond the extreme levels, in kT.
 pub const MU_BRACKET_KT: f64 = 50.0;
-/// Backstop on each μ bisection; never binds for finite inputs (≤ ≈ 1 100 halvings).
+/// Backstop on each μ bisection; never binds for finite inputs (≲ 120 halvings at kT = 5 mHa, ≈ 1 100 only for a
+/// subnormal kT; module doc, "Termination").
 pub const MAX_MU_HALVINGS: usize = 2048;
 
 /// One channel's Fermi–Dirac occupations.
@@ -142,7 +146,7 @@ pub fn fermi_dirac(evals: &[f64], n: usize, kt: f64) -> Result<FdOccupations, Qm
     let nf = n as f64;
     let lo = evals.iter().copied().fold(f64::INFINITY, f64::min) - MU_BRACKET_KT * kt;
     let hi = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max) + MU_BRACKET_KT * kt;
-    if !(total(evals, lo, kt) < nf && total(evals, hi, kt) > nf) {
+    if !(lo.is_finite() && hi.is_finite() && total(evals, lo, kt) < nf && total(evals, hi, kt) > nf) {
         return Err(QmError::Numerical(format!("the Fermi–Dirac μ bracket [{lo:e}, {hi:e}] does not bracket n = {n} at kT = {kt:e}")));
     }
     let (mu_minus, h_ge) = bisect(evals, nf, kt, lo, hi, true);

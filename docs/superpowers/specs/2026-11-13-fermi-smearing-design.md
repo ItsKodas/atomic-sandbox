@@ -109,11 +109,16 @@ f_iσ = 1 / (1 + exp(x_iσ)),   x_iσ = (ε_iσ − μ_σ) / kT,   Σ_i f_iσ = 
   f ≥ 1 − e^{−50}, and k_σ > N_σ gives Σf > N_σ. No other bracket logic is needed.
 - **Non-finite input** [SHOULD-1]. A non-finite eigenvalue raises `QmError::Numerical` before the bisection starts.
   Without this check a NaN would never compare equal to an endpoint, so the stop rule below would never fire.
+  - The bracket is also checked once, as built (Task 4; kept by its review): both ends finite and
+    Σf(lo) < N_σ < Σf(hi), else `QmError::Numerical`. It changes no bracket; it fails only when |ε|/kT ≳ 1e14 absorbs
+    the 50 kT margin, where the bisection would otherwise converge silently onto an end. k_σ < N_σ + 1 and a kT that
+    is not finite and > 0 are refused the same way.
 - **Step.** Halve the bracket on the sign of Σf(mid) − N_σ. Stop when the midpoint equals an endpoint in f64, i.e. the
   bracket is exhausted.
   - The count is about 60 halvings when |μ| ~ 1 (a 20 Ha bracket, as for all-electron O 1s).
-  - The worst case for finite inputs is about 1 100, when μ is near 0 and the f64 spacing reaches subnormals
-    [NOTE-1]. That is still µs.
+  - Near μ = 0 at kT = 5 mHa it is ≲ 120 (measured 113–116, Task 4): within |x| < 1.1e-16, e^x rounds to 1, so Σf is
+    flat over ≈ ±1.1e-16·kT around a root at 0 and the bisection stops there. About 1 100 is reached only for a
+    subnormal kT, whose flat zone lies below the subnormal spacing [NOTE-1]. That is still µs.
   - A backstop cap of 2 048 halvings never binds. It is there only so that termination never depends on the stop rule
     alone.
 - **Ties and the gapped plateau** [MUST-1]. In a gapped channel, Σf is exactly N_σ in f64 over a whole plateau of μ.
@@ -124,8 +129,10 @@ f_iσ = 1 / (1 + exp(x_iσ)),   x_iσ = (ε_iσ − μ_σ) / kT,   Σ_i f_iσ = 
   - On the plateau, "halve on the sign" is undefined, and a tie rule would drive μ to one edge rather than to the FD
     root near mid-gap.
   - The solver therefore runs the bisection twice:
-    - with Σf(mid) − N_σ ≥ 0 moving the upper end, which converges to the least μ with Σf ≥ N_σ;
-    - with Σf(mid) − N_σ ≤ 0 moving the lower end, which converges to the greatest μ with Σf ≤ N_σ.
+    - with Σf(mid) − N_σ ≥ 0 moving the upper end, which converges to a crossing (the least μ with Σf ≥ N_σ, up to
+      rounding);
+    - with Σf(mid) − N_σ ≤ 0 moving the lower end, which converges to a crossing (the greatest μ with Σf ≤ N_σ, up
+      to rounding).
   - It reports the midpoint of the two. Without a plateau the two coincide to f64.
   - Only the f matter for the physics, and they are identical to ≤ e^{−36} anywhere on the plateau.
   - μ_σ is a reported diagnostic only where the channel has a partial level (section 5). In a gapped channel it is
@@ -431,8 +438,8 @@ d(TS)/dR. That is 0 in gapped systems and up to a few mHa/Bohr where a level cro
 
 **Comes**
 
-- `Occupations::FermiDirac { kt }`, and `pub fn fermi_dirac(evals, n, kt) -> FdOccupations { f, mu, entropy }` in
-  `qm::scf`.
+- `Occupations::FermiDirac { kt }`, and `pub fn fermi_dirac(evals, n, kt) -> Result<FdOccupations, QmError>`
+  (`FdOccupations { f, mu, entropy, halvings }`) in `qm::occupations`, re-exported from `qm::scf` and the crate root.
   - It is host f64 code, used by the CPU loop and imported by `qm-gpu`, just as `qm-gpu` imports
     `degenerate_shell_occupations` today. CPU and GPU therefore share every operation after the eigenvalues
     (G4: the eigenvalues come from the f64 Rayleigh–Ritz on the host in both).
@@ -479,7 +486,8 @@ sample carries the same pinned levels, and the sample teacher's 1e-6 would stall
 Δρ < tol_eff                                   if the step's occupations have no partial level
 Δρ < max(tol_eff, GPU_PARTIAL_TOL)             if they have one (min(f, 1 − f) ≥ PARTIAL_OCCUPATION_MIN in either channel)
 tol_eff = effective_gpu_tol(tol, N)            under an ionic setup (unchanged: max(tol, 2·5e-8·N)); tol otherwise
-GPU_PARTIAL_TOL = 1e-5                         (a qm-gpu solver constant; the user's 2026-11-14 value)
+GPU_PARTIAL_TOL = 1e-5                         (a solver constant defined once in qm::occupations, re-exported by
+                                               qm-gpu (preflight F11); the user's 2026-11-14 value)
 ```
 
 - "Partial" is the spec's existing definition (section 5, `partial_levels`): a level within 13.8 kT = 69 mHa of μ.

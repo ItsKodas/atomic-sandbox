@@ -93,7 +93,7 @@ Spin-polarized Kohn-Sham DFT on a real-space grid.
 
 **Eigensolver.** LOBPCG, block, preconditioned, warm-started from the previous frame's orbitals. Gram matrices reduced on GPU; the N×N Rayleigh-Ritz problem solved on CPU in f64. Chebyshev-filtered subspace iteration is the known upgrade if needed.
 
-**SCF loop.** Density from occupied orbitals → Poisson → XC → H → eigensolve → Pulay/DIIS density mixing → repeat until density change < tolerance. Integer aufbau occupations in v1; Fermi smearing later for metals/degenerate states.
+**SCF loop.** Density from occupied orbitals → Poisson → XC → H → eigensolve → Pulay/DIIS density mixing → repeat until density change < tolerance. Fermi–Dirac occupations at kT = 5 mHa; the SCF converges to a stationary point of F = E − TS (spec `2026-11-13-fermi-smearing-design.md`; integer aufbau occupations in v1, kept in `qm` as the kT → 0 reference).
 
 **Forces.** Hellmann-Feynman: F_I = −∫ ρ ∇V_I dr + Σ_J Z_I Z_J / R_IJ. No Pulay terms (grid basis doesn't move with nuclei). The egg-box effect (grid-phase energy ripple) is measured in validation and must be below threshold.
 
@@ -160,7 +160,7 @@ Subagents are dispatched on the tagged model. See `CLAUDE.md` and `.claude/agent
 ## 11. Roadmap beyond v1 (not in this spec's scope)
 
 1. Self-generated pseudopotentials (from our own all-electron atomic solves) for Z > 10.
-2. Periodic cells; Fermi smearing; PBE.
+2. Periodic cells; PBE. (Fermi smearing is done for finite boxes: Fermi–Dirac at kT = 5 mHa, spec `2026-11-13-fermi-smearing-design.md`; periodic cells and PBE remain.)
 3. Second rung: classical atomistic `ForceProvider` — hand-written force field and/or pretrained ML potential (MACE/UMA-class via ONNX) for thousands–millions of atoms.
 4. QM/MM composite provider (quantum region embedded in classical surroundings).
 5. Coarse-grained / continuum rung for household-scale objects.

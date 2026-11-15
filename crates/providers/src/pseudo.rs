@@ -263,7 +263,7 @@ pub fn setup_in(cache: &Mutex<PseudoCache>, scene: &Scene, sigma_ae: f64, notes:
 /// or refused species), else `"<policy word>/<surface_hash:016x>/shared<τ>/<τ_c>/stop2x<floor>"`: the policy, the identity
 /// of the tables the policy can hand out ([`surface_hash`]: since Task 11 not the whole recipe — a `CoresOnly` model from
 /// before the dimer gate keeps its provenance, an `All` one does not), the occupation scheme the pseudo path solves with (`DegenerateShells`: τ = `qm::DEGENERACY_TAU` decides
-/// the shared state and τ_c = `qm::scf::CANDIDATE_TAU` which levels are candidates — Task 6 review A.6, Task 9 physics
+/// the shared state and τ_c = `qm::WITNESS_GAP` (the value of the former `qm::scf::CANDIDATE_TAU`) which levels are candidates — Task 6 review A.6, Task 9 physics
 /// review SHOULD-3) and the GPU stop *rule* max(tol, 2·floor·N) ([`GPU_DRHO_FLOOR_PER_ELECTRON`]). The rule, not its
 /// N-dependent value, is the compared identity: an Add or Remove must not split a model's surface (MUST-1).
 pub fn provenance_tag(scene: &Scene) -> String {
@@ -338,7 +338,9 @@ fn tag_with(policy: IonicPolicy) -> String {
         surface_word(policy),
         surface_hash(policy),
         qm::DEGENERACY_TAU,
-        qm::scf::CANDIDATE_TAU,
+        // TODO(plan Task 9): the tag's new format. Until then the old text: τ_c = 0.1 Ha, now `qm::WITNESS_GAP` (the
+        // former `qm::scf::CANDIDATE_TAU`, deleted in Task 5; the same f64, so the same string)
+        qm::WITNESS_GAP,
         GPU_DRHO_FLOOR_PER_ELECTRON
     )
 }
@@ -1264,7 +1266,7 @@ mod tests {
         let private = Mutex::new(PseudoCache::default());
         let water = scene(&[8, 1, 1], IonicPolicy::CoresOnly, 33, 0.2);
         let tag = tag_in(&private, &water);
-        let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared{:e}/{:e}/stop2x{:e}", qm::DEGENERACY_TAU, qm::scf::CANDIDATE_TAU, GPU_DRHO_FLOOR_PER_ELECTRON);
+        let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared{:e}/{:e}/stop2x{:e}", qm::DEGENERACY_TAU, qm::WITNESS_GAP, GPU_DRHO_FLOOR_PER_ELECTRON);
         assert_eq!(tag, minus_4, "a CoresOnly water model from -4 must still load");
         assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), minus_4, "O alone: the same surface");
         let c = private.lock().unwrap();

@@ -12,7 +12,32 @@
 //! There is no Pulay term (a basis that moved with R_I — atom-centred functions — would add
 //! one). The Hellmann-Feynman force is therefore the *exact* gradient of the discrete energy
 //! the SCF reports, including its egg-box ripple, up to the non-self-consistency of the state
-//! (first order in Δρ and in the eigensolver residual, both ≤ 1e-8 here).
+//! (first order in Δρ and in the eigensolver residual, both ≤ 1e-8 here). With fractional
+//! occupations the reported energy is the free energy F and the argument extends to f (next section).
+//!
+//! # Occupations: the force is −dF/dR (spec 2026-11-13 §4.4, SHOULD-8)
+//! Under `Occupations::FermiDirac { kt }` (`scf` module doc, "Occupations") the SCF converges to a stationary
+//! point of the Mermin free energy at fixed electron counts N_σ,
+//!   F_h[{ψ}, {f}; R] = E_h[{ψ}, {f}; R] − kT·S[{f}],   S = Σ_iσ s(f_iσ),   ρ_σ = Σ_i f_iσ ψ_iσ²,
+//! with E_h the functional above (T_s and, under a setup, E_NL f-weighted). It is stationary in both:
+//! - in ψ (orthonormality-preserving variations): the Kohn–Sham equations of the f-weighted density;
+//! - in f at fixed N_σ: ∂F_h/∂f_iσ = ε_iσ + kT ln(f_iσ/(1 − f_iσ)) (∂E_h/∂f_iσ = ε_iσ, and −kT ∂s/∂f), which
+//!   equals μ_σ for every i exactly when f_iσ = 1/(1 + e^{(ε_iσ − μ_σ)/kT}) — the Fermi–Dirac rule the SCF
+//!   applies, μ_σ the Lagrange multiplier of Σ_i f_iσ = N_σ.
+//! So, with S carrying no explicit R and N_σ fixed,
+//!   dF_h/dR_I = ∂E_h/∂R_I |_{ψ, f} + Σ_σ μ_σ Σ_i df_iσ/dR_I = ∂E_h/∂R_I |_{ψ, f} + Σ_σ μ_σ dN_σ/dR_I = ∂E_h/∂R_I |_{ψ, f}.
+//! That is the Hellmann–Feynman force of the f-weighted density (and of the f-weighted projector sums under a setup)
+//! that this module computes, unchanged: the force is −dF/dR of the Mermin functional, stationary in ψ and f, not
+//! −dE/dR. The two differ by d(kT·S)/dR — 0 in a gapped system, up to a few mHa/Bohr where a level crosses μ — so
+//! the force pairs with `Energy::total` (= F), not with `Energy::internal` (= E).
+//! What the code reads: the converged state's (ρ_out, f_out), ρ_σ = Σ_i f_iσ ψ_iσ² (`KsState::rho_up/rho_dn`) with
+//! the final step's f (`KsState::occ_*`), the FD occupations of that step's levels of H[ρ_in]. They differ from the
+//! self-consistent (ρ, f) by first order in the SCF residual, as the orbitals do. The floors are therefore today's:
+//! the SCF and eigensolver residuals (first order) and the discrete Hartree map's asymmetry (≲ 1e-5 Ha/Bohr,
+//! "Expected size of the egg-box force" below).
+//! Under `Aufbau` (f = 1: the kT → 0 limit) and `DegenerateShells` (f fixed by its rule, constant in R within a
+//! pattern; removed in plan Task 10) S = 0 and the f do not vary, so the same expression is −dE_h/dR. No force code
+//! depends on the scheme: the all-electron path reads the weighted ρ, the pseudised one ρ and `occ_*`.
 //!
 //! # Sign chain
 //! V_I depends on r and R_I only through u = r − R_I, so ∂V_I/∂R_I = −∇_u V_I = −∇_r V_I and
@@ -83,10 +108,10 @@
 //! [`IonicSetup`] the SCF minimises (`scf` module doc, "Ionic species (M7)")
 //!   E_h = T_s + h³Σ_p ρ_p V_loc(r_p; R) + E_NL(R) + E_H[ρ] + E_xc[ρ↑ + ½ρ_pc(R), ρ↓ + ½ρ_pc(R)] + E_ii(R),
 //! ρ_σ = Σ_i f_iσ ψ_iσ², E_NL = Σ_iσ f_iσ Σ_{I,lm} E_KB c_lm[ψ_iσ]², c_lm = h³Σ_p β_lm(r_p − R_I) ψ(r_p).
-//! The no-Pulay argument above is unchanged: the grid does not move with R, E_h is stationary in ψ
-//! at fixed occupations (Janak: ∂E/∂f_i = ε_i, so with the f frozen the weighted functional is
-//! stationary, `scf` "Occupations"), and T_s, E_H do not depend on R. So
-//!   F_I = −dE_h/dR_I = −∂E_h/∂R_I |_{ψ, f},
+//! The no-Pulay argument above is unchanged: the grid does not move with R, the functional the SCF converges
+//! (F_h = E_h − kT·S under `FermiDirac`, E_h itself under the other schemes) is stationary in ψ and in f
+//! ("Occupations: the force is −dF/dR" above), S and T_s, E_H do not depend on R explicitly. So
+//!   F_I = −dF_h/dR_I = −∂E_h/∂R_I |_{ψ, f},
 //! and every R-dependence is a function of u = r − R_I (∂/∂R_I = −∇_u). Five explicit terms, each
 //! the negative R-derivative of one *frozen* energy (ρ, ρ_σ, ψ and f held fixed) — which is why each
 //! is a separate `pub(crate)` function, checked against central differences of its own energy
@@ -116,7 +141,7 @@
 //! Every radial derivative is the exact derivative of the interpolant the energy samples, so the HF
 //! force is the gradient of the sampled E_h to rounding and the SCF residual (on-site points d < 1e-8
 //! are skipped: every radial integrand is odd and smooth through d = 0, as g′ above). The force is
-//! formed from the occupations f_iσ (`KsState.occ_*`, spec §5.7): ρ in the local and partial-core terms
+//! formed from the occupations f_iσ (`KsState.occ_*`, `scf` "Occupations"): ρ in the local and partial-core terms
 //! is the weighted output density, and the nonlocal sum carries f_iσ.
 //! Expected HF − FD for the molecules here (OH, plan Task 7): the central difference's truncation
 //! δ²|E‴|/6 with a Morse estimate (D ≈ 0.17 Ha, a ≈ 1.2 Bohr⁻¹: |E‴| ≈ 6Da³ ≈ 1.8 Ha/Bohr³) is ≈ 3e-5 at
@@ -455,7 +480,7 @@ mod tests {
     /// blind below its bound. Two pseudo-O ions off the grid points (ion–ion, overlapping spheres, projector
     /// spheres clipped by the 6.4 Bohr box); a mixed setup's all-electron H (σ = h) beside them exercises
     /// `local_lr_forces`' all-electron branch. The frozen state is synthetic: a density blob per ion, an s-like
-    /// and a p-like orbital with occupations 1 and ⅔ (spec §5.7), spin 0.6/0.4.
+    /// and a p-like orbital with occupations 1 and ⅔ (a fractional f, `scf` "Occupations"), spin 0.6/0.4.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn force_terms_are_exact_derivatives_of_frozen_energies() {

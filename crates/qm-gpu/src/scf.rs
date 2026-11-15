@@ -225,7 +225,8 @@ use gpu::{GpuContext, Volume3D};
 use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use qm::nuclear::{centres, deposit_centres, deposit_charge, ionic_repulsion, nuclear_repulsion, Centre};
-use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, CANDIDATE_TAU, MAX_WITNESS_GROWTH};
+use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, MAX_WITNESS_GROWTH};
+use qm::WITNESS_GAP;
 use qm::{Energy, Occupations, QmError, ScfProgress, ScfSettings, ScfStats, StallWatch, System};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -593,11 +594,12 @@ fn accumulate_density(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &Field, orbi
 }
 
 /// `qm::scf::counts_match` on a GPU state: exactly N_σ orbitals per spin under `Aufbau` (today's test); under
-/// `DegenerateShells` the same electron count Σf with at least one witness per occupied spin.
+/// `DegenerateShells` (and `FermiDirac`, which `run` refuses until plan Task 7) the same electron count Σf with at least
+/// one witness per occupied spin.
 fn counts_match(s: &GpuState, n_up: usize, n_dn: usize, occ: Occupations) -> bool {
     match occ {
         Occupations::Aufbau => s.orbitals_up.len() == n_up && s.orbitals_dn.len() == n_dn,
-        Occupations::DegenerateShells { .. } => {
+        Occupations::DegenerateShells { .. } | Occupations::FermiDirac { .. } => {
             let fits = |len: usize, f: &[f64], n: usize| len == f.len() && (f.iter().sum::<f64>() - n as f64).abs() < 1e-9
                 && (if n == 0 { len == 0 } else { len > n });
             fits(s.orbitals_up.len(), &s.occ_up, n_up) && fits(s.orbitals_dn.len(), &s.occ_dn, n_dn)
@@ -650,12 +652,12 @@ impl Channel<'_> {
         }
         loop {
             self.solve(orbs, evals, work, work_k, inner)?;
-            if let Some((f, shell)) = degenerate_shell_occupations(evals, self.n, CANDIDATE_TAU) {
+            if let Some((f, shell)) = degenerate_shell_occupations(evals, self.n, WITNESS_GAP) {
                 let spin = self.spin;
                 return Ok((f, shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread }).into_iter().collect()));
             }
             if orbs.len() >= self.n + MAX_WITNESS_GROWTH {
-                return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {} (τ_c = {CANDIDATE_TAU} Ha)", self.spin)));
+                return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {} (τ_c = {WITNESS_GAP} Ha)", self.spin)));
             }
             let seed = 1000 + 2 * orbs.len() as u64 + self.spin as u64;
             let f = pool.take(self.ctx, self.g);
@@ -822,7 +824,12 @@ impl GpuSolver {
         let t0 = Instant::now();
         clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
         // spec §5.7 (module doc "Ionic species and occupations (M7)"): τ of DegenerateShells, None under Aufbau
-        let shared_tau = match settings.occupations { Occupations::Aufbau => None, Occupations::DegenerateShells { tau } => Some(tau) };
+        let shared_tau = match settings.occupations {
+            Occupations::Aufbau => None,
+            Occupations::DegenerateShells { tau } => Some(tau),
+            // compile shim (plan Task 5): the GPU loop on the shared host rule is plan Task 7
+            Occupations::FermiDirac { .. } => return Err(QmError::Numerical("FermiDirac: GPU support lands in plan Task 7".into())),
+        };
         let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
         self.converged = false;
         // E_nn (valence charges under a setup) and the core overlaps, before anything is touched (coincident nuclei)
@@ -1197,7 +1204,9 @@ impl GpuSolver {
             if let Some(e) = take_device_error() { fail!(e, iterations); }
             let (external, hartree, xc, boundary) = (vals[0] + e_nl, 0.5 * vals[1], vals[2], vals[3]);
             let negative = core.is_some() && (vals[4 + nk] > 0.0 || vals[5 + nk] > 0.0);
-            (Energy { kinetic, external, hartree, xc, nuclear: e_nn, total: kinetic + external + hartree + xc + e_nn }, boundary, negative)
+            // E as before; no entropy term until plan Task 7 (FermiDirac is refused above): ts = 0, total = internal
+            let internal = kinetic + external + hartree + xc + e_nn;
+            (Energy { kinetic, external, hartree, xc, nuclear: e_nn, internal, ts: 0.0, total: internal }, boundary, negative)
         };
         // the clamped points, counted exactly only when some exist (`qm::scf`'s `domain_violations`)
         let clamped = match core {
@@ -1227,7 +1236,8 @@ impl GpuSolver {
                                 ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations });
         *converged = true;
         Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings,
-                           core_overlaps: overlaps, fractional, released }))
+                           core_overlaps: overlaps, fractional, released, entropy: 0.0, mu: [None, None], partial: Vec::new(),
+                           tol_used: settings.tol }))
     }
 
     /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access").

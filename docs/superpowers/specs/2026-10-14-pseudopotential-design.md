@@ -306,6 +306,14 @@ The frozen-core approximation fails when the *core densities* of two ions overla
 
 ### 5.7 Occupations of a degenerate open shell (Task 6 ruling)
 
+> **Amendment: superseded 2026-11-13 by `2026-11-13-fermi-smearing-design.md`.** `Occupations::DegenerateShells` and
+> its two phases are replaced by Fermi–Dirac occupations at kT = 5 mHa (`Occupations::FermiDirac`, `qm::occupations`);
+> τ_c becomes `WITNESS_GAP` (the same 0.1 Ha, now one arm of the FD witness), and `DEGENERACY_TAU`, the release and
+> the phase-2 restart go (plan Task 10). The levels this section shares by rule are now co-occupied by the FD rule
+> itself, made continuous. The evidence below for why integer occupation fails stays as history. The last paragraph's
+> stability claim (the symmetric state unstable to orbital polarisation below ≈ 3 mHa) is answered by that spec's V0
+> measurement: at kT = 5 mHa every accepted open-shell species converges to the symmetric ensemble (§4.7(d) there).
+
 Wherever something is pseudised (`CoresOnly` with at least one species that has a core and is accepted; `All`) the SCF occupies with `Occupations::DegenerateShells` (τ = 1e-3 Ha, τ_c = 0.1 Ha). Where nothing is pseudised — policy `None`, or `CoresOnly` with only core-less or recipe-refused species — it keeps today's integer aufbau (`Occupations::Aufbau`), bit for bit (§6.1); the provenance tag is then `"none"`, so one tag names one surface. The scheme is a property of the scene: one pseudised atom anywhere puts the whole scene on `DegenerateShells`, and it can change only through an edit that restarts the energy history.
 
 **Why.** With integer aufbau a partly filled degenerate shell has no well-posed fixed point (Task 6, pseudo-O at h = 0.20; M6 found the same all-electron).
