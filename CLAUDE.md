@@ -46,7 +46,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | Change | Command | Time |
 |---|---|---|
 | any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~6.5 min + ~5.5 min |
-| solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~31 min, ~3.5 min |
+| solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~31 min, ~5.5 min |
 | dynamics | `cargo test -p validate --release --test dynamics` | ~6 min |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~12–17 min |
 | shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
@@ -54,6 +54,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | charges | `cargo test -p validate --release --test charges` (CPU) | ~11 min |
 | pseudopotentials | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | ~1 h, ~9 min, ~1.5–2 h |
 | orbital display | `cargo test -p validate --release --test orbitals` | ~4 min |
+| live orbitals (Harris display solves) | `cargo test -p validate --release --test harris` (V-A4 H₂O alone ~15 min) | ~11 min |
 | Harris display orbitals (`qm_gpu::harris`, `providers::harris`) | `cargo test -p validate --release --test harris` | ~5 min |
 | viewer / UI / worker | `cargo test -p app --release` (incl. the replay scripts) | ~10 min |
 | molecule builder | `cargo test -p app --release --bin app -- builder::` | seconds |
