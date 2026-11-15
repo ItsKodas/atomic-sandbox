@@ -4925,15 +4925,34 @@ the drift and fluctuation (3 × (h²/4·E_mode + 2σ_path)) bounds for this traj
 
 ### The branch_jump guard (plan 2026-11-13 Task 8, 2026-11-16, release, RX 7900 XTX; `providers::branch_jump`)
 
-**The check** (spec §6.3; derivation in the `providers::branch_jump` module doc). Two consecutive evaluations of the
-same provider: ΔF = E₁ − E₀, W = −½Σ_I(F_I,0 + F_I,1)·ΔR_I (the trapezoid estimate of ΔF; on a smooth surface
-m = |ΔF − W| ≤ (1/12)|E‴|‖ΔR‖³), flagged when m > b = 3(√2σ_E + ‖ΔR‖σ_F/√2) + 3κ̂‖ΔR‖³ with κ̂ = min(median of
-m/‖ΔR‖³ over the last 8 judged, unflagged, third-order-dominated steps, κ_max). Pre-registered, reviewed in plan Task 8
-step 6, never loosened: **factor 3, window 8, reach 0.1 Bohr (largest single-atom displacement judged), κ_max = 1
-Ha/Bohr³** ((1/12)·6Da³ = 0.34 for D = 0.2 Ha, a = 1.5 Bohr⁻¹, rounded up; the measured (1/12)|E‴| of O–H in H₂O and
-N–H in NH₃ reach 0.40 and 0.35 at 0.8 R_e, "Fermi–Dirac migration" above).
+**The check** (spec §6.3 as amended by Task 8 fix round 1; derivation in the `providers::branch_jump` module doc). Two
+consecutive evaluations of the same provider: ΔF = E₁ − E₀, W = −½Σ_I(F_I,0 + F_I,1)·ΔR_I (the trapezoid estimate of
+ΔF; on a smooth surface m = |ΔF − W| = (1/12)|∂³E/∂u³|‖ΔR‖³ at some point of the step, u the unit 3N direction),
+flagged when m > b = 3(√(σ_E,0² + σ_E,1²) + ½‖ΔR‖√(σ_F,0² + σ_F,1²)) + 3κ_max‖ΔR‖³ (each evaluation's own tier,
+review M4). Pre-registered, never loosened: **factor 3, reach 0.1 Bohr (largest single-atom displacement judged),
+κ_max = 1 Ha/Bohr³** ((1/12)·6Da³ = 0.34 for D = 0.2 Ha, a = 1.5 Bohr⁻¹, rounded up; the measured (1/12)|V‴| of O–H in
+H₂O and N–H in NH₃ reach 0.40 and 0.35 at 0.8 R_e, "Fermi–Dirac migration" above; with the 2√2 of two equal masses
+moving oppositely along one bond, 1.13 and 0.99, under 3κ_max = 3; ≈ 1.19× for O–H in MD, review M2).
 
-**The tiers** (`noise_tier(all_electron, ScfStats::tol_used)`, ruling R8; σ_E in Ha, σ_F in Ha/Bohr per component):
+**Fix round 1 (review C1): κ_max always, no running median.** The first build used κ̂ = min(median of m/‖ΔR‖³ over the
+last 8 judged, unflagged, third-order-dominated steps, κ_max). The running median is biased low on large-amplitude bond
+motion and locks in, because flagged steps never enter it: Morse V‴ ∝ x − 4x² vanishes at R_e + ln 4/a (2.8 Bohr for
+H₂, 3.0 for O–H), steps there fill the window with m/‖ΔR‖³ ≈ 0.001–0.005, and the third derivative rises 100–300×
+within a few steps into the well. The review's replica flagged 655 of 2999 steps of H₂ forming from rest at 4 Bohr, and
+2–17 per collision. With κ_max always (`h2_forming_from_rest_is_never_flagged`: LSDA-like H₂ Morse D 0.17, a 1.03, R_e
+1.45, velocity Verlet 0.25 fs, 3000 steps, r ∈ [0.81, 4.00]: **0 flags of 2999 judged, worst m/b 0.33**;
+`o_h_collision_is_never_flagged`: O–H Morse D 0.17, a 1.21, R_e 1.85 — fitted to the measured E‴ −1.80 at R_e, giving
+−4.9 at 0.8 R_e against −4.77 measured — H onto O from 5 Bohr at E_rel 0, 0.005, 0.01, 0.02 Ha: **0 flags of 2651–2977
+judged, worst m/b 0.24–0.25**). `BRANCH_JUMP_WINDOW` is gone.
+
+**What it can see (rule 7; review I2).** The reach is per atom, the bound uses the 3N norm: N atoms each moving δ give
+‖ΔR‖ = √N·δ and b ≈ 3κ_max·N^{3/2}·δ³ + n. At the reach (δ = 0.1 Bohr) the third-order term is **3.0, 8.5, 15.6, 33.5
+and 94.9 mHa for N = 1, 2, 3, 5 and 10**, so **a 12 mHa jump is not detectable on a step that moves three or more atoms
+near the reach**. MD steps are far shorter: an H moves about 0.013, 0.024 and 0.041 Bohr per 0.25 fs step at 300, 1000
+and 3000 K (all ten atoms at 0.041 Bohr: 6.5 mHa + n).
+
+**The tiers** (`noise_tier(all_electron, ScfStats::tol_used, E)`, ruling R8; σ_E in Ha, σ_F in Ha/Bohr per component;
+**σ_E = max(the tier's, c·|E|)** with c = 9e-8 pseudo, 1.0e-7 all-electron, fix round 1 below):
 
 | tier | used when | σ_E | σ_F | source |
 |---|---|---|---|---|
@@ -4975,17 +4994,46 @@ per-solve σ, as the sample tier's 1.87e-6 is), rounded up to two digits.
   judged slightly more loosely than an interactive one. Recorded as measured; a sixth draw or a pooled estimate is a
   review decision, not a tuning here.
 
+**I1 (fix round 1): does the scatter grow with system size?** The same harness, density extrapolation **on** (the MD
+case: per repeat the history dropped, then warm solves at R₀ − 2δ, R₀ − δ and R₀, the last two from 2ρ_t − ρ_{t−1}),
+`Accepted`, 1e-5, on the largest preset, **SiH₄** (5 atoms, 8 valence electrons; the `sih4` preset geometry), at
+Accurate and Balanced, and H₂O beside it (one GPU batch, 647 s):
+
+| case | grid | \|E\| (Ha) | cold / warm R₀ steps, wall | σ_E max (rms) | σ_E/\|E\| | σ_F max (rms of maxima) |
+|---|---|---|---|---|---|---|
+| SiH₄, extrapolation on | Balanced 57³ × 0.25 | 6.4542 | 11 / 6–10, 14 s / 3.8–16 s | 5.16e-7 (3.31e-7) | 8.0e-8 | 2.76e-6 (2.02e-6) |
+| SiH₄, extrapolation on | Accurate 95³ × 0.15 | 6.4540 | 10 / 7–12, 27 s / 5–7 s | 4.44e-7 (2.29e-7) | 6.9e-8 | 2.78e-6 (2.19e-6) |
+| H₂O, extrapolation on | Accurate 95³ × 0.15 | 17.4766 | 13 / 8, 5.8 s / 1.6–2.0 s | 4.85e-7 (3.68e-7) | 2.8e-8 | 1.68e-5 (1.31e-5) |
+| H₂O, extrapolation off (Step 1) | Accurate 95³ × 0.15 | 17.4766 | | 1.56e-6 | 8.9e-8 | 3.93e-5 |
+| H₂O all-electron, off (Step 1) | Accurate 95³ × 0.15 | 46.558 | | 4.66e-6 | 1.0e-7 | 1.35e-5 |
+
+- Extrapolation on gives *smaller* warm/cold differences than the Step 1 protocol (H₂O 4.9e-7 against 1.56e-6; forces
+  1.7e-5 against 3.9e-5), so the Step 1 tiers (extrapolation off) are the conservative ones for MD. Every preset carries
+  ≤ 8 valence electrons on the default `Accepted` surface (H₂O, H₂S, HCl, PH₃, SiH₄: 8), so on the presets the scatter
+  cannot grow by electron count; SiH₄ (the most atoms) sits under H₂O's tiers at both qualities (σ_E 5.2e-7 against
+  1.6e-6, σ_F 2.8e-6 against 9.0e-5).
+- Across surfaces, on one protocol, σ_E tracks |E|: 8.9e-8·|E| pseudo and 1.0e-7·|E| all-electron on H₂O (the f32
+  path's relative precision; SiH₄'s 8.0e-8·|E| with extrapolation on is the same size). **Pre-registered rule
+  (one global rule per surface): σ_E = max(tier, c·|E|), c = 9e-8 pseudo (`PSEUDO_RELATIVE_SIGMA_E`, 1.56e-6/17.477
+  rounded up), 1.0e-7 all-electron (`ALL_ELECTRON_RELATIVE_SIGMA_E`, 4.66e-6/46.558).** It does not bind on any measured
+  case (the tiers were measured on H₂O; SiH₄'s c·|E| = 5.8e-7 is under the tier and over its measured 5.2e-7) and grows
+  σ_E for scenes larger than H₂O (a 10× |E| scene gets 10× H₂O's σ_E). Test: `the_energy_scatter_scales_with_the_energy`.
+- σ_F shows no growth (SiH₄ 2.8e-6 against H₂O's 1.7e-5 on the same protocol): no |E| term for it.
+- **Range covered** (rule 7): measured scenes up to 5 atoms and 8 valence electrons pseudo (|E| ≤ 17.5 Ha) and 10
+  electrons all-electron (|E| 46.6 Ha). Larger scenes rely on the c·|E| rule, an extrapolation of the f32 relative
+  precision, not a measurement; Task 11's GPU NVE records its flag count (plan amendment 60034eb).
+
 **What the guard's tests found** (`cargo test -p providers --release branch_jump`, CPU, instant; analytic Morse dimer
-D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr on the pseudo sample tier):
-- a +12 mHa jump at a 0.02 Bohr step: m = 12.00 mHa against b = 2.15e-5 → flagged at that step only; the same after 50
-  steps of 1e-3 Bohr (noise-dominated: the window stays empty) and at every jump of a ±12 mHa every-other-step stream
-  (no flagged step enters the window);
-- smooth paths over R ∈ [0.8, 2.0]·R_e, out and back, never flagged. Tightest m/b with one atom moving: 0.016, 0.30,
-  0.66 at ‖ΔR‖ = 0.005, 0.02, 0.05 Bohr; with both atoms moving symmetrically (the bond changes by √2‖ΔR‖, so
-  m/‖ΔR‖³ = 2√2·(1/12)|E‴|): 0.045, 0.72, **0.97** (‖ΔR‖ = 0.05, R ≈ 1.94 on the way back out, where the window median
-  lags the falling |E‴|). On this stiff Morse the symmetric 0.05 Bohr path uses nearly all of the factor 3: (1/12)|E‴|
-  reaches 1.1 at 0.8 R_e, ×2√2 = 3.2 per ‖ΔR‖³ against 3κ_max = 3. For the app's bonds ((1/12)|E‴| ≤ 0.40 at 0.8 R_e) the
-  symmetric factor gives ≤ 1.1 against 3. Recorded for the step 6 review; not changed.
+D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr on the pseudo sample tier; numbers after fix round 1):
+- a +12 mHa jump at a 0.02 Bohr step: m = 12.00 mHa against b = 3.41e-5 → flagged at that step only; the same after 50
+  steps of 1e-3 Bohr and at every jump of a ±12 mHa every-other-step stream;
+- smooth paths over R ∈ [0.8, 2.0]·R_e, out and back, never flagged. Tightest m/b with one atom moving: 0.016, 0.26,
+  0.34 at ‖ΔR‖ = 0.005, 0.02, 0.05 Bohr; with both atoms moving symmetrically (the bond changes by √2‖ΔR‖, so
+  m/‖ΔR‖³ = 2√2·(1/12)|V‴|): 0.045, 0.72, **0.92** (‖ΔR‖ = 0.05 at R ≈ 1.51). On this stiff Morse the symmetric
+  0.05 Bohr path uses most of the factor 3: (1/12)|V‴| reaches 1.1 at 0.8 R_e, ×2√2 = 3.2 per ‖ΔR‖³ against 3κ_max = 3,
+  held by |V‴| falling over the step. (The first build's 0.97 was the running median's lag, R 2.006 → 1.935 with κ̂ 0.143
+  against a local 0.518, review M3.) For the app's bonds ((1/12)|V‴| ≤ 0.40 at 0.8 R_e) the symmetric factor gives
+  ≤ 1.13 against 3.
 - the trapezoid error is third order (halving the step divides m by 8.0 ± 0.5) and equals (1/12)|E‴|h³ at the midpoint
   within 5 %.
 - V7 (`validate --test surrogate branch_jump_step_is_not_trained_on`): a 12 mHa switch in a 12-step fallback streak is
@@ -4993,6 +5041,12 @@ D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr on the pseudo sample tier):
 - `a_scripted_session_decides_exactly_as_before` re-pinned (0xfeaa_fe54_5608_3db3 → 0x09f6_9183_02c2_fda9): the two new
   `EvalStats` fields' `{:?}` text, 341 occurrences; removing exactly those reproduces the old digest.
 
-**Coverage** (rule 7, R-NOTE-b): sampling-pass solves and sparse audits are not judged; under the surrogate only
-fallback streaks are. The CPU f64 path is judged on these GPU tiers (conservative: its scatter is far smaller).
+**Coverage** (rule 7, R-NOTE-b): sampling-pass solves and sparse audits, usually more than 0.1 Bohr apart, are not
+judged (dense scans and teach path points closer than that are, review M8); under the surrogate otherwise only fallback
+streaks are. The CPU f64 path is judged on these GPU tiers (conservative: its scatter is far smaller).
+
+**`PSEUDO_FORCE_NOISE` and the sample tier under FD (review M9).** `PSEUDO_FORCE_NOISE` (5e-5) was measured under
+`DegenerateShells` at 1e-6; under FD the cases it came from (lone pseudo-O, OH) carry a partial level and stop at 1e-5,
+so they are judged on the app tier (9.0e-5), and the pseudo sample tier now covers gapped pseudo solves at ≤ 1e-6, whose
+FD force scatter (H₂O 3.93e-5 even at 1e-5) is under 5e-5.
 

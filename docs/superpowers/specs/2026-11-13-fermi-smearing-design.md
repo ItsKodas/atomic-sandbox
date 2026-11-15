@@ -582,8 +582,10 @@ CPU teacher simply never reaches it), as `stop2x<floor>` already is.
   ΔF = F(R_{t+1}) − F(R_t)          (the energy change)
   W  = −½ Σ_I (F_I,t + F_I,t+1)·ΔR_I   (the trapezoid work estimate)
   m  = |ΔF − W|                        (the mismatch)
-  b  = 3·(√2·σ_E + ‖ΔR‖·σ_F/√2) + 3·κ̂·‖ΔR‖³
+  b  = 3·(√(σ_E,t² + σ_E,t+1²) + ½‖ΔR‖·√(σ_F,t² + σ_F,t+1²)) + 3·κ_max·‖ΔR‖³
   ```
+
+  (each evaluation brings its own tier; with equal tiers the noise term is 3(√2σ_E + ‖ΔR‖σ_F/√2); plan Task 8 review M4)
 
   - **σ_E and σ_F** are the surface's measured per-solve path scatters of the energy and of a force component, **at
     the tolerance the evaluation was solved at** (re-review R-MUST-A).
@@ -594,25 +596,27 @@ CPU teacher simply never reaches it), as `stop2x<floor>` already is.
       recorded in `references.md`. The guard picks the tier from `EvalStats::scf_tol_used`.
     - They are taken from the references, not fitted per scene.
   - **‖ΔR‖** is the Euclidean norm of the 3N-vector of displacements.
-  - **κ̂** stands in for the trapezoid's third-order term, (1/12)|E‴| along the step (re-review R-MUST-A).
-    - κ̂ = min(κ_med, κ_max).
-    - κ_med is the running median of m/‖ΔR‖³ over the last 8 judged, **unflagged** steps whose third-order term would
-      dominate the noise term (3κ_max‖ΔR‖³ ≥ the noise term 3(√2σ_E + ‖ΔR‖σ_F/√2)).
-    - Steps where the noise dominates are judged, but never enter the window. A run of 1e-3 Bohr relax steps, where m
-      is pure noise and m/‖ΔR‖³ ≈ 3e3, therefore cannot inflate κ̂ and blind the guard.
-    - A flagged step never enters the window either, so a trajectory that flips branches repeatedly cannot calibrate
-      its own jumps away.
+  - **The third-order term uses κ_max, always** (plan Task 8 fix round 1, review C1). κ_max bounds the trapezoid's
+    third-order term, (1/12)|∂³E/∂u³| along the step's unit 3N direction u = ΔR/‖ΔR‖ (re-review R-MUST-A).
     - **κ_max = 1 Ha/Bohr³** is a global constant, not per element: (1/12)·6Da³ for a Morse bond with D = 0.2 Ha and
-      a = 1.5 Bohr⁻¹, rounded up. The "M7 forces" OH gives (1/12)·E‴ ≈ 0.18, below it. The plan's physics review
-      confirms it against measured E‴ of the stiffest app bonds (O–H and N–H at short range).
-    - κ_max is used alone until the window fills, so after a reset a 0.1 Bohr drag step on a stiff bond is not falsely
-      flagged.
-    - **With κ̂ ≤ κ_max, b at a 0.1 Bohr step is ≤ 3e-3 Ha**, below every jump section 4.7(e) documents (12–24 mHa).
-      At a typical 0.02 Bohr MD step on the pseudo surface, b ≈ 1.2e-5 Ha + 3κ̂·8e-6 ≤ 4e-5 Ha.
+      a = 1.5 Bohr⁻¹, rounded up. The "M7 forces" OH gives (1/12)·E‴ ≈ 0.18, below it. Along one bond, ∂³E/∂u³ is the
+      bond's V‴ times 1 when one atom moves, 2√2 when two equal masses move oppositely, ≈ 1.19 for O–H in MD; the measured
+      (1/12)|V‴| at 0.8 R_e (O–H 0.40, N–H 0.35) give 1.13 and 0.99 with the 2√2, under 3κ_max = 3 (review M2).
+    - **Superseded: a running median κ̂ = min(κ_med, κ_max)** over the last 8 judged, unflagged steps. The running
+      median is biased low on large-amplitude bond motion and locks in, because flagged steps never enter it (Task 8
+      review C1: a replica flagged 655 of 2999 steps of H₂ forming from rest at 4 Bohr). Morse V‴ vanishes at
+      R_e + ln 4/a, steps there fill the window with m/‖ΔR‖³ ≈ 0.001–0.005, and the third derivative then rises 100–300×
+      within a few steps into the well. The window and its constant are removed; the guard flags on the derived bound.
+    - **What it can see** (rule 7; review I2). The reach is per atom, the bound uses the 3N norm: with N atoms each
+      moving δ, b ≈ 3κ_max·N^{3/2}·δ³ + n. At the reach (δ = 0.1 Bohr) the third-order term is 3.0, 8.5, 15.6, 33.5 and
+      94.9 mHa for N = 1, 2, 3, 5 and 10, so **a 12 mHa jump (the smallest section 4.7(e) documents) is not detectable on
+      a step that moves three or more atoms near the reach**. MD steps are far shorter: an H moves about 0.013, 0.024 and
+      0.041 Bohr per 0.25 fs step at 300, 1000 and 3000 K (b ≈ 1e-5–7e-3 Ha + n). At a typical 0.02 Bohr one-atom step
+      on the pseudo surface, b ≈ 1.2e-5 Ha + 2.4e-5 ≤ 4e-5 Ha.
   - **The step is judged** only when the largest single-atom displacement since the previous evaluation is ≤ 0.1 Bohr:
     consecutive MD, relax or drag steps, and consecutive teacher calls during a fallback streak. Otherwise
     `branch_jump` is `None` (not judged).
-  - **The history restarts** (the window is emptied and the next evaluation is not judged) on:
+  - **The history restarts** (the next evaluation is not judged) on:
     - an edit that resets the provider;
     - an evaluation on a different grid, box or box placement than the previous one. A box change alters the discrete
       surface by egg-box and wall terms, and would otherwise be flagged (re-review R-MUST-A).
@@ -621,11 +625,11 @@ CPU teacher simply never reaches it), as `stop2x<floor>` already is.
     role the occupation-pattern watch had.
   - **Spin measure.** For N↑ = N↓ the change of ∫|ρ↑ − ρ↓| between the two evaluations is reported with it, since the
     restricted ↔ broken-symmetry switch shows there.
-  - **The constants' derivation** (the factor 3, the window of 8, the 0.1 Bohr reach) is reviewed by the physics
-    reviewer in the plan. None of them may be loosened to make a test pass.
+  - **The constants' derivation** (the factor 3, κ_max = 1, the 0.1 Bohr reach) is reviewed by the physics reviewer in
+    the plan. None of them may be loosened to make a test pass. (The window of 8 went with the running median, review C1.)
   - **Coverage, stated honestly.** The guard does not judge:
-    - sampling-pass solves, which are of unrelated perturbed geometries (displacement > 0.1 Bohr from the previous
-      solve);
+    - sampling-pass solves, which are of unrelated perturbed geometries (usually more than 0.1 Bohr from the previous
+      solve; dense scans and teach path points closer than that are judged, review M8);
     - the surrogate's sparse audits, whose teacher calls are usually more than 0.1 Bohr apart (re-review R-NOTE-b).
 
     Under the surrogate, only fallback streaks are judged. Every other label relies on the leave-one-out machinery, as
@@ -1372,7 +1376,8 @@ key.
       atom displacement ≤ 0.1 Bohr).
     - The bound is 3× the path-scatter noise at the evaluation's own tolerance, plus 3κ̂‖ΔR‖³. Here κ̂ = min(running
       median over the last 8 judged, unflagged, curvature-dominated steps; κ_max = 1 Ha/Bohr³), with κ_max used alone
-      until the window fills (re-review).
+      until the window fills (re-review). **Superseded by plan Task 8 fix round 1 (review C1): the bound uses κ_max
+      always (section 6.3).**
     - A grid, box or placement change restarts the history.
     - On a failure: a warning, and no surrogate training on that step.
     - For N↑ = N↓ the change of ∫|ρ↑ − ρ↓| is reported with it.
@@ -1475,7 +1480,8 @@ key.
 
 39. **The branch-jump bound** (R-MUST-A):
     - **κ̂** = min(κ_med, κ_max). κ_med skips noise-dominated and flagged steps. κ_max = 1 Ha/Bohr³ is global and is
-      confirmed by the plan's physics review against measured E‴.
+      confirmed by the plan's physics review against measured E‴. (Superseded by plan Task 8 fix round 1: κ_max
+      always, section 6.3.)
     - **Noise tier:** σ_E and σ_F are those of the evaluation's own tolerance; the app-tolerance tier is measured in A4.
     - **History restart:** on any grid, box or placement change.
     - **Coverage:** the guard is stated not to judge sparse surrogate audits (R-NOTE-b).

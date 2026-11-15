@@ -120,7 +120,7 @@
 //! # The branch_jump guard (spec 2026-11-13 §6.3; plan Task 8)
 //! Each adapter holds a [`crate::branch_jump::BranchJumpGuard`] and judges every successful evaluation against *its own
 //! previous one*: ΔF against the forces' trapezoid work, within 3σ of the surface's path scatter at the tolerance the
-//! solve stopped at (`ScfStats::tol_used`, `branch_jump::noise_tier`) plus 3κ̂‖ΔR‖³. A flagged step carries
+//! solve stopped at (`ScfStats::tol_used`, `branch_jump::noise_tier`) plus 3κ_max‖ΔR‖³. A flagged step carries
 //! `EvalStats::branch_jump = Some(m)` and the warning `sim::branch_jump_warning(m)`; the surrogate never trains on it
 //! (`EvalStats::untrainable`). Under the surrogate "previous" is the last teacher call, as for the occupation watch
 //! above, so only fallback streaks are judged (consecutive calls ≤ 0.1 Bohr apart): sampling-pass solves and sparse
@@ -558,7 +558,7 @@ fn judge_branch(guard: &mut BranchJumpGuard, stats: &mut EvalStats, scene: &Scen
         cell: scene.cell.clone(),
         origin: grid.origin,
         spin_abs,
-        tier: noise_tier(system.ionic.is_none(), tol_used),
+        tier: noise_tier(system.ionic.is_none(), tol_used, stats.energy.total),
     });
     stats.branch_jump = j.branch_jump();
     stats.spin_change = j.spin_change;
@@ -594,7 +594,7 @@ pub struct CpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
-    /// The `branch_jump` guard (module doc): the previous evaluation and its κ window.
+    /// The `branch_jump` guard (module doc): the previous evaluation.
     guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
     share_tables: Option<Arc<ShareTables>>,
@@ -884,7 +884,7 @@ pub struct GpuKs {
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
     watch: OccupationWatch,
-    /// The `branch_jump` guard (module doc): the previous evaluation and its κ window.
+    /// The `branch_jump` guard (module doc): the previous evaluation.
     guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
     share_tables: Option<Arc<ShareTables>>,

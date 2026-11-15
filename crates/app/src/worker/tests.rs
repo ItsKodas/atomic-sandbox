@@ -3533,3 +3533,10 @@ fn the_knowledge_map_ships_when_the_fit_changes() {
     w.send(Command::SetAudit(7));
     snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
 }
+
+/// Plan 2026-11-13 Task 8 review M7: the sampling teacher's tolerance is the one the `branch_jump` guard's sample tier
+/// keys on (`providers::branch_jump::SAMPLE_TOL` mirrors this private constant).
+#[test]
+fn sample_tol_is_the_branch_jump_guards() {
+    assert_eq!(SAMPLE_TOL, providers::branch_jump::SAMPLE_TOL);
+}
