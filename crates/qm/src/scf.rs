@@ -1902,7 +1902,7 @@ mod tests {
 
     /// Spec §5 (V1): on gapped systems Fermi–Dirac is aufbau's kT → 0 limit. At an explicit kT = 1e-3 (spec ruling 46
     /// [kT-5]; the 1e-8 bound holds for any gap ≥ 0.05 Ha there) |F − E_Aufbau| ≤ 1e-8 and TS ≤ 1e-12, H₂ (R = 1.4) and
-    /// H₂O, 41³ × 0.30, tol = eig_tol = 1e-9. The production kT's gap, TS and F − E_Aufbau are printed for references.md.
+    /// H₂O, 41³ × 0.30, tol = eig_tol = 1e-9. The production kT's numbers are `fd_at_production_kt_on_gapped_measurement`.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn fd_matches_aufbau_on_gapped() {
@@ -1912,15 +1912,31 @@ mod tests {
         for (name, sys) in [("H₂ R=1.4", h2_sys(1.4)), ("H₂O", h2o_sys())] {
             let (_, ea) = scf(&g, &sys, &a, None).unwrap();
             let (_, e1) = scf(&g, &sys, &ScfSettings { occupations: fd(1e-3), ..a }, None).unwrap();
-            let (st5, e5) = scf(&g, &sys, &ScfSettings { occupations: fd(ELECTRON_KT), ..a }, None).unwrap();
-            eprintln!("{name} 41³ × 0.30: E_Aufbau {:.12} ({} steps); kT 1e-3: F − E_Aufbau {:+.2e}, TS {:.2e} ({} steps); \
-                       kT {ELECTRON_KT}: frontier gap {:.6} Ha, TS {:.2e}, F − E_Aufbau {:+.2e}, partial {}, stored ↑ {} ↓ {} ({} steps)",
-                      ea.energy.total, ea.iterations, e1.energy.total - ea.energy.total, e1.energy.ts, e1.iterations,
-                      frontier_gap(&st5, &sys), e5.energy.ts, e5.energy.total - ea.energy.total, e5.partial.len(),
-                      st5.orbitals_up.len(), st5.orbitals_dn.len(), e5.iterations);
+            eprintln!("{name} 41³ × 0.30: E_Aufbau {:.12} ({} steps); kT 1e-3: F − E_Aufbau {:+.2e}, TS {:.2e} ({} steps)",
+                      ea.energy.total, ea.iterations, e1.energy.total - ea.energy.total, e1.energy.ts, e1.iterations);
             assert!((e1.energy.total - ea.energy.total).abs() <= 1e-8, "{name}: F {} vs E_Aufbau {}", e1.energy.total, ea.energy.total);
             assert!(e1.energy.ts <= 1e-12, "{name}: TS {:e}", e1.energy.ts);
             assert!(ea.energy.ts == 0.0 && ea.entropy == 0.0 && ea.mu == [None, None] && ea.partial.is_empty());
+        }
+    }
+
+    /// The production-kT companion of `fd_matches_aufbau_on_gapped` (print only, no gate; Task 5 review ruling: moved out
+    /// of the qm suite's gate for time): the same systems and settings at kT = `ELECTRON_KT`, printing the frontier gap,
+    /// TS, F − E_Aufbau, the partial-level count and the stored block. Task 5 measured H₂ gap 0.361915 Ha, TS 1.45e-16,
+    /// F − E_A −5.0e-10; H₂O gap 0.290994 Ha, TS 1.39e-13, F − E_A +5.77e-9.
+    #[test]
+    #[ignore = "measurement: numbers recorded in references.md"]
+    fn fd_at_production_kt_on_gapped_measurement() {
+        let g = Grid::cube(41, 0.30);
+        let mut a = ScfSettings::for_grid(&g);
+        (a.tol, a.eig_tol, a.occupations) = (1e-9, 1e-9, Occupations::Aufbau);
+        for (name, sys) in [("H₂ R=1.4", h2_sys(1.4)), ("H₂O", h2o_sys())] {
+            let (_, ea) = scf(&g, &sys, &a, None).unwrap();
+            let (st5, e5) = scf(&g, &sys, &ScfSettings { occupations: fd(ELECTRON_KT), ..a }, None).unwrap();
+            eprintln!("{name} 41³ × 0.30: E_Aufbau {:.12} ({} steps); kT {ELECTRON_KT}: frontier gap {:.6} Ha, TS {:.2e}, \
+                       F − E_Aufbau {:+.2e}, partial {}, stored ↑ {} ↓ {} ({} steps)",
+                      ea.energy.total, ea.iterations, frontier_gap(&st5, &sys), e5.energy.ts, e5.energy.total - ea.energy.total,
+                      e5.partial.len(), st5.orbitals_up.len(), st5.orbitals_dn.len(), e5.iterations);
         }
     }
 
@@ -1958,7 +1974,10 @@ mod tests {
     }
 
     /// Review Focus 1 / spec §5 "Warm start": `KsState.occupations` carries kT and the guard compares it with `==`, so a
-    /// state converged at another kT, or under `Aufbau`, never seeds an FD solve — the result is the cold solve's bits.
+    /// state converged at another kT, under `DegenerateShells` or under `Aufbau`, never seeds an FD solve — the result is
+    /// the cold solve's bits. The other-kT and `DegenerateShells` states fit FD's counts (N_σ in Σf, a witness above), so
+    /// they reach the `==` guard itself (Task 5 review); the `Aufbau` one (exactly N_σ orbitals) is refused by
+    /// `counts_match` first.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn fd_warm_state_from_other_scheme_is_cold() {
@@ -1968,8 +1987,12 @@ mod tests {
         let target = ScfSettings { occupations: fd(ELECTRON_KT), ..base };
         let (_, cold) = scf(&g, &sys, &target, None).unwrap();
         let (other_kt, _) = scf(&g, &sys, &ScfSettings { occupations: fd(2e-3), ..base }, None).unwrap();
+        let (shells, _) = scf(&g, &sys, &ScfSettings { occupations: Occupations::DegenerateShells { tau: DEGENERACY_TAU }, ..base }, None).unwrap();
         let (aufbau, _) = scf(&g, &sys, &ScfSettings { occupations: Occupations::Aufbau, ..base }, None).unwrap();
-        for (name, w) in [("FD kT 2e-3", &other_kt), ("Aufbau", &aufbau)] {
+        assert!(counts_match(&other_kt, &sys, target.occupations) && counts_match(&shells, &sys, target.occupations),
+                "the other-kT and DegenerateShells legs must reach the == guard");
+        assert!(!counts_match(&aufbau, &sys, target.occupations), "the Aufbau leg is refused by counts_match");
+        for (name, w) in [("FD kT 2e-3", &other_kt), ("DegenerateShells", &shells), ("Aufbau", &aufbau)] {
             let (_, warm) = scf(&g, &sys, &target, Some(w)).unwrap();
             assert_eq!(warm.energy.total.to_bits(), cold.energy.total.to_bits(), "{name}");
             assert_eq!(warm.energy.ts.to_bits(), cold.energy.ts.to_bits(), "{name}");

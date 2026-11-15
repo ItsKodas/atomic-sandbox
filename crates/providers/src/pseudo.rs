@@ -1266,7 +1266,8 @@ mod tests {
         let private = Mutex::new(PseudoCache::default());
         let water = scene(&[8, 1, 1], IonicPolicy::CoresOnly, 33, 0.2);
         let tag = tag_in(&private, &water);
-        let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared{:e}/{:e}/stop2x{:e}", qm::DEGENERACY_TAU, qm::WITNESS_GAP, GPU_DRHO_FLOOR_PER_ELECTRON);
+        // The literal a -4 sidecar holds (Task 5 review): built from today's constants it would follow them if they moved.
+        let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared1e-3/1e-1/stop2x5e-8");
         assert_eq!(tag, minus_4, "a CoresOnly water model from -4 must still load");
         assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), minus_4, "O alone: the same surface");
         let c = private.lock().unwrap();
