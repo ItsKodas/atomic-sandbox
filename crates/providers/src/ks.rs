@@ -823,13 +823,15 @@ impl ForceProvider for CpuKs {
 }
 
 /// What [`GpuKs::shown_payload`] shows: the cell and nuclei the state was solved at (and their
-/// positions), the provider's tolerance (`OrbitalView::update`'s τ), the spin-noise bound's SCF and
-/// eigensolver tolerances, the unoccupied count asked for and the memory guard's notes.
+/// positions), the SCF tolerance the state was solved at — `settings.tol` after
+/// `raise_to_gpu_floor`, the one value behind both `OrbitalView::update`'s τ = `qm::orbitals::tau`
+/// and the spin-noise bound (a Harris solve's τ-sets use the same τ, so the view and the solve
+/// group levels alike; review N1) — the eigensolver tolerance, the unoccupied count asked for and
+/// the memory guard's notes.
 struct Shown<'a> {
     cell: &'a Cell,
     nuclei: &'a [qm::Nucleus],
     positions: Vec<[f64; 3]>,
-    tol: f64,
     scf_tol: f64,
     eig_tol: f64,
     requested: u8,
@@ -936,7 +938,7 @@ impl GpuKs {
         if !self.density_current {
             return None;
         }
-        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, vram_budget, vram_note, unocc, probe, share_tables, share_gpu, .. } = self;
+        let GpuKs { solver, ctx, orb, orbital, orb_scalar, orb_colour, last, vram_budget, vram_note, unocc, probe, share_tables, share_gpu, .. } = self;
         let solver = solver.as_mut()?;
         let (cell, nuclei, settings) = last.as_ref()?;
         let positions: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
@@ -1008,7 +1010,7 @@ impl GpuKs {
         }
         let solver = &*solver;
         let state = solver.state()?;
-        let shown = Shown { cell, nuclei, positions, tol: *tol, scf_tol: settings.tol, eig_tol: solver.profile().eig_tol_used, requested, guard };
+        let shown = Shown { cell, nuclei, positions, scf_tol: settings.tol, eig_tol: solver.profile().eig_tol_used, requested, guard };
         Some(GpuKs::shown_payload(ctx, orb, view, solver, state, (orb_scalar, orb_colour), (share_tables.as_ref(), share_gpu), unocc, shown))
     }
 
@@ -1023,7 +1025,7 @@ impl GpuKs {
                      (orb_scalar, orb_colour): (&mut Pool<Volume3D>, &mut Pool<ColourVolume3D>),
                      (share_tables, share_gpu): (Option<&Arc<ShareTables>>, &mut Option<(Arc<ShareTables>, Cell, ShareTablesGpu)>),
                      unocc: &UnoccupiedState, shown: Shown) -> OrbitalDisplay {
-        let Shown { cell, nuclei, positions, tol, scf_tol, eig_tol, requested, guard } = shown;
+        let Shown { cell, nuclei, positions, scf_tol, eig_tol, requested, guard } = shown;
         let dims = solver.grid().n.map(|n| n as u32);
         let (scalar, colour) = match orb.texture() {
             TextureKind::Scalar => (Some(orb_scalar.take(ctx, dims)), None),
@@ -1034,7 +1036,7 @@ impl GpuKs {
         let mut include: Vec<u32> = Vec::new();
         let u = {
             let (inc, picked, vs, sv, cv) = (&mut include, &mut picked, &*orb, scalar.as_deref(), colour.as_deref());
-            view.update_with(solver, state, nuclei, tol, move |out| {
+            view.update_with(solver, state, nuclei, scf_tol, move |out| {
                 let p = vs.pick(out);
                 let product = match (&p.kind, sv, cv) {
                     (&PickKind::Orbital { spin, track, squared }, Some(v), _) => Product::Orbital { spin, track, squared, out: v },
@@ -1277,7 +1279,7 @@ impl GpuKs {
         // the probe's display slot (never its solve slots: this is not a teacher solve)
         let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(DisplayJob::Harris));
         qm_gpu::grid::clear_readback_fault();
-        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, unocc, harris, share_tables, share_gpu, .. } = self;
+        let GpuKs { solver, ctx, orb, orbital, orb_scalar, orb_colour, unocc, harris, share_tables, share_gpu, .. } = self;
         let solver = solver.as_mut().expect("built above");
         let input = HarrisInput { system: &system, settings: &settings, rho_in: [&rho.up, &rho.dn], unoccupied: m };
         let solve = match solver.harris(harris, &input, should_abort) {
@@ -1312,7 +1314,7 @@ impl GpuKs {
         let solver = &*solver;
         let state = harris.state().expect("a completed Harris solve holds its state");
         let eig_tol = solver.effective_eig_tol(&settings);
-        let shown = Shown { cell: &scene.cell, nuclei: &system.nuclei, positions, tol: *tol, scf_tol: settings.tol, eig_tol, requested, guard };
+        let shown = Shown { cell: &scene.cell, nuclei: &system.nuclei, positions, scf_tol: settings.tol, eig_tol, requested, guard };
         let mut payload = GpuKs::shown_payload(ctx, orb, view, solver, state, (orb_scalar, orb_colour), (share_tables.as_ref(), share_gpu), unocc, shown);
         payload.notes.extend(setup_notes.iter().cloned());
         payload.notes.extend(solve.notes.iter().cloned());

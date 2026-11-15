@@ -75,8 +75,9 @@
 //! positions m − 1 and m (relative to n_occ) every set starting inside the window ends by m − 1, two short
 //! of the last vector (G = 2), the set after it starts at m and is neither shown nor counted, and the last
 //! value takes part in neither — the shown rows and the hidden count are the same whatever it is (the
-//! view's update recomputes `block_edge` from the same values, and a τ-set's face density concerns only
-//! shown sets). So when, after a solve, those two positions are within 2τ (`record_edge_matters`; the
+//! view's update recomputes `block_edge` from the same values with the same τ: `providers::ks` hands the
+//! view the solve's own tolerance, `settings.tol` after the GPU floor raise; and a τ-set's face density
+//! concerns only shown sets). So when, after a solve, those two positions are within 2τ (`record_edge_matters`; the
 //! margin covers the record's f32 re-measure of the same vectors) the last record vector is tested at
 //! `GUARD_TOL` and one buffer is added above the record; otherwise the record's last vector stays the
 //! buffer. The reviewer's fix — a buffer above the record always — was measured first: one vector more
