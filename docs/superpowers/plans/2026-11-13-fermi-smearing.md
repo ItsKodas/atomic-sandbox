@@ -594,6 +594,7 @@ Runs after the preview build that follows Task 9, before Task 10. Witness column
 - The convergence gate reads the tight columns only; the reported eigensolver residual is split (tight / guard), as in live-orbitals' Harris split stop.
 - Grow several witness vectors per re-solve (doubling the extra block) instead of one.
 - Tests: CPU f64 loose-vs-tight on H₂O, LiH, Li, H₄ square, pseudo-O M = 1 and 3: |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr; the lower-bound assertion; a column that changes class mid-solve; cold GPU solves stay bitwise reproducible; V4 re-passes; re-time gpu_vs_cpu and oracles (they rose 3.5 → 23.7 min and 31 → 51 min at Task 7) and record the times.
+- **The witness cap and the memory guard** (Task 7 fix round 1/2, ruling 2026-11-16): cold all-electron H₂O at 97³ × 0.25 grows past 16 extras on transient steps 3–4 (μ ≈ −0.06 Ha before self-consistency; no column collapse); cap 32 passed step 4 at 19 extras but had not converged in 15 min. Raising the cap means the memory guard must count it (at 32, 384 fields: Precise 141³ no longer fits the auditor's half budget). Decide here, after the cost fixes, with the measured growth: preferably derive the growth cap from the VRAM budget (cap = min(32, what fits), error message names the budget) instead of a bigger constant. Re-run the 97³ H₂O cold case and record steps, extras and time.
 - Physics review before commit.
 
 ---
