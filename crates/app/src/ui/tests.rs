@@ -5095,9 +5095,9 @@ mod activity_tab {
         let r = rows(&paused, paused.probe.as_ref());
         let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
         assert!(solve.control.is_none() && solve.no_control_why.is_some());
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&refit, refit.probe.as_ref());
-        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples"));
+        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · estimating…"));
         // the first-pass offer waits for "Start anyway"
         snap.model.as_mut().unwrap().pass_offer = Some(PassOffer { plan: sim::SamplingPlan::default(), solves: 365, eta_s: 366.0, per_solve_s: 1.0, full_solves: 512, full_eta_s: 512.0 });
         let offered = input(&scene, Some(&snap), &cam);
@@ -5410,7 +5410,7 @@ mod activity_headline {
         assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
         // a refit
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
-        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some((0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 250 samples");
         // the CPU solver (no step count)
         let mut snap = snapshot(&scene, Backend::Cpu, None);
@@ -10095,7 +10095,7 @@ mod updates {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let idle = input(&scene, None, &cam);
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
         let root = temp_root("restart");
@@ -10282,7 +10282,7 @@ mod updates {
         assert!(frame(&ctx, &mut st, &stopped, 1400.0, vec![]).restart_for_update, "stopped: the restart follows");
         assert_eq!(st.update.guard, Guard::Idle);
         // paused onto a running refit: that is still waited for
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
         act(&mut st, &playing, Action::RestartToUpdate);
         click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
         assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
@@ -10395,8 +10395,8 @@ mod updates {
         assert_eq!(st.update.guard, Guard::Idle);
         // N3: Cancel it and restart (for the refit) while playing turns to the playing question
         // and is spent there; after Pause and restart the refit is waited for again
-        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
         act(&mut st, &refit, Action::RestartToUpdate);
         assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
         let outs = click_widget(&ctx, &mut st, &refit_playing, "guard-cancel-restart");
@@ -10415,7 +10415,7 @@ mod updates {
     fn closing_the_panel_calls_a_pending_restart_off() {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
         let idle = input(&scene, None, &cam);
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
@@ -12447,6 +12447,108 @@ fn checked_rows_forget_and_restore_as_one_batch() {
     }
 }
 
+/// A running refit's view for the tests: `elapsed_s` seconds in, `samples` samples of 2 species,
+/// no stage yet and no history (estimating…).
+fn refit_view(elapsed_s: f64, samples: u32) -> sim::RefitView {
+    sim::RefitView { elapsed_s, samples, species: 2, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating }
+}
+
+/// A refit view with a history estimate of `total_s` from `from` refits (6 fits, 3 leave-one-out
+/// passes expected) and `stages`, its countdown as the probe computes it.
+fn refit_view_est(elapsed_s: f64, samples: u32, total_s: f64, from: u32, stages: sim::RefitStages) -> sim::RefitView {
+    let estimate = sim::RefitEstimate { total_s, from, exponent: 1.0, kind: sim::RefitKind::Recovery, fits: 6, loo: 3 };
+    sim::RefitView { elapsed_s, samples, species: 3, background: true, stages, estimate: Some(estimate), eta: sim::refit_eta::eta(elapsed_s, Some(&estimate), &stages) }
+}
+
+/// 2026-11-15, the refit's time estimate (`sim::refit_eta`): the words — "about 2:20 left (from
+/// your last 3 refits)", "estimating…" without a history, "finishing…" past the estimate (never a
+/// negative time) — the stage line, the thousands, and the Activity card / headline / Model banner
+/// that carry them.
+#[test]
+fn the_refit_estimate_words_card_headline_and_banner() {
+    use super::activity::headline::{headline, BarMode};
+    use super::activity::jobs::{rows, JobKey, JobProgress};
+    use super::activity::words::{refit_eta_words, refit_stage_words, thousands};
+    use super::dock::model::refit_banner;
+    assert_eq!([thousands(0), thousands(999), thousands(2077), thousands(1_234_567)], ["0", "999", "2,077", "1,234,567"]);
+    let st = |fits, loo, recovery, at_s| sim::RefitStages { fits, loo, recovery, at_s };
+    // the history alone: 140 s total, 0.4 s in → 139.6 s left, rounded up to 2:20
+    let v = refit_view_est(0.4, 2077, 140.0, 3, st(0, 0, false, 0.0));
+    assert_eq!(refit_eta_words(&v, true), "about 2:20 left (from your last 3 refits)");
+    assert_eq!(refit_eta_words(&v, false), "about 2:20 left");
+    assert_eq!(refit_eta_words(&refit_view_est(0.4, 2077, 140.0, 1, st(0, 0, false, 0.0)), true), "about 2:20 left (from your last refit)");
+    assert_eq!(refit_stage_words(&v), "starting");
+    // counting down, then finishing… past the estimate, never negative
+    assert_eq!(refit_eta_words(&refit_view_est(80.0, 2077, 140.0, 3, st(0, 0, false, 0.0)), false), "about 1:00 left");
+    for t in [139.5, 140.0, 141.0, 900.0] {
+        assert_eq!(refit_eta_words(&refit_view_est(t, 2077, 140.0, 3, st(0, 0, false, 0.0)), true), "finishing…", "{t} s");
+    }
+    assert_eq!(refit_eta_words(&refit_view(5.0, 2077), true), "estimating…");
+    // the stages: "of N" while within the history's counts, the trust recovery named
+    assert_eq!(refit_stage_words(&refit_view_est(30.0, 2077, 140.0, 3, st(4, 1, false, 29.0))), "fit 4 of 6 · leave-one-out 1 of 3");
+    assert_eq!(refit_stage_words(&refit_view_est(30.0, 2077, 140.0, 3, st(7, 0, true, 29.0))), "fit 7 · trust recovery");
+    assert_eq!(refit_stage_words(&refit_view(3.0, 2077)), "starting");
+    assert_eq!(refit_stage_words(&sim::RefitView { stages: st(2, 1, false, 1.0), ..refit_view(3.0, 2077) }), "fit 2 · leave-one-out 1");
+
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    // the Activity card: title, count line, the bar driven by the estimate
+    let v = refit_view_est(42.0, 2077, 140.0, 3, st(4, 1, false, 41.0));
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(v), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let r = rows(&inp, inp.probe.as_ref());
+    let row = r.iter().find(|r| r.key == JobKey::Refit).unwrap();
+    let left = refit_eta_words(&v, true);
+    assert!(left.starts_with("about ") && left.ends_with(" left (from your last 3 refits)"), "{left}");
+    assert_eq!(row.stage.as_deref(), Some(format!("2,077 samples · {left}").as_str()));
+    assert_eq!(row.count.as_deref(), Some("fit 4 of 6 · leave-one-out 1 of 3"));
+    let f = v.eta.fraction().unwrap() as f32;
+    assert!(matches!(row.progress, JobProgress::Estimate(x) if x == f && x > 0.0 && x < 1.0));
+    // the headline: the same time left, the bar a fraction
+    let h = headline(&inp, inp.probe.as_ref()).unwrap();
+    assert_eq!(h.text, format!("Refitting · 2,077 samples · {}", refit_eta_words(&v, false)));
+    assert!(matches!(h.bar, BarMode::Fraction(x) if x == f));
+    // no history: a sweeping bar, "estimating…"
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(5.0, 2077)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let row = rows(&inp, inp.probe.as_ref()).into_iter().find(|r| r.key == JobKey::Refit).unwrap();
+    assert!(matches!(row.progress, JobProgress::Indeterminate));
+    assert_eq!(row.stage.as_deref(), Some("2,077 samples · estimating…"));
+    assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 2,077 samples · 5.0 s · estimating…");
+    // the Model banner: the same time left; a running refit with nothing queued from 2 s on
+    let now = std::time::Instant::now();
+    let m = |n: usize, running| ModelStatus { user_changes_pending: n, refit_running: running, ..model() };
+    assert_eq!(refit_banner(&m(0, true), false, now, Some(&v)).as_deref(), Some(format!("refitting · {}", refit_eta_words(&v, false)).as_str()));
+    assert_eq!(refit_banner(&m(0, false), false, now, Some(&refit_view(0.5, 20))), None, "a refit of milliseconds flashes no banner");
+    assert_eq!(refit_banner(&m(2, true), false, now, Some(&refit_view(0.5, 20))).as_deref(), Some("refitting · estimating… · 2 more pending after this one"));
+    let past = refit_view_est(300.0, 2077, 140.0, 3, st(0, 0, false, 0.0));
+    assert_eq!(refit_banner(&m(1, true), false, now, Some(&past)).as_deref(), Some("refitting · finishing… · 1 more pending after this one"));
+}
+
+/// UI frame tests (2026-11-15): the Activity tab draws the refit's card with its estimate, and the
+/// Model tab its banner with the time left — no Refit now while it runs.
+#[test]
+fn the_refit_estimate_is_drawn_in_the_activity_card_and_the_model_banner() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    let snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { refit_running: true, ..model() }));
+    let v = refit_view_est(42.0, 2077, 140.0, 3, sim::RefitStages { fits: 4, loo: 1, recovery: false, at_s: 41.0 });
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(v), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    alone(&mut st, DockTab::Activity);
+    assert!(drawn(&ctx, &mut st, &inp, "activity-job-card"));
+    assert!(drawn(&ctx, &mut st, &inp, "activity-job-title"));
+    alone(&mut st, DockTab::Model);
+    assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+    assert!(!PROBES.with(|p| p.borrow().contains_key("refit-now")), "no Refit now while a refit runs");
+    // a refit of milliseconds: no banner
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(0.2, 20)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    assert!(!drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+}
+
 /// 2026-11-14, the batched forget: the pending-refit banner's words — "N changes pending · refit in
 /// 8 s" while the debounce waits, "· refit starting" once due, "· the sampling pass's fit takes
 /// them" during a pass, "refitting · N more pending after this one" while a refit runs, nothing with
@@ -12459,14 +12561,14 @@ fn the_pending_refit_banner_and_refit_now() {
     use std::time::{Duration, Instant};
     let now = Instant::now();
     let pending = |n, due: Option<Instant>, running| ModelStatus { user_changes_pending: n, refit_due: due, refit_running: running, ..model() };
-    assert_eq!(refit_banner(&pending(0, None, false), false, now), None);
-    assert_eq!(refit_banner(&pending(0, None, true), false, now), None);
-    assert_eq!(refit_banner(&pending(2, Some(now + Duration::from_millis(7400)), false), false, now).as_deref(), Some("2 changes pending · refit in 8 s"));
-    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(3)), false), false, now).as_deref(), Some("1 change pending · refit in 3 s"));
-    assert_eq!(refit_banner(&pending(1, Some(now), false), false, now).as_deref(), Some("1 change pending · refit starting"));
-    assert_eq!(refit_banner(&pending(3, Some(now), false), true, now).as_deref(), Some("3 changes pending · the sampling pass's fit takes them"));
-    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(9)), true), false, now).as_deref(), Some("refitting · 1 more pending after this one"));
-    assert_eq!(refit_banner(&pending(2, None, false), false, now).as_deref(), Some("2 changes pending · refit due"));
+    assert_eq!(refit_banner(&pending(0, None, false), false, now, None), None);
+    assert_eq!(refit_banner(&pending(0, None, true), false, now, None), None);
+    assert_eq!(refit_banner(&pending(2, Some(now + Duration::from_millis(7400)), false), false, now, None).as_deref(), Some("2 changes pending · refit in 8 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(3)), false), false, now, None).as_deref(), Some("1 change pending · refit in 3 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now), false), false, now, None).as_deref(), Some("1 change pending · refit starting"));
+    assert_eq!(refit_banner(&pending(3, Some(now), false), true, now, None).as_deref(), Some("3 changes pending · the sampling pass's fit takes them"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(9)), true), false, now, None).as_deref(), Some("refitting · 1 more pending after this one"));
+    assert_eq!(refit_banner(&pending(2, None, false), false, now, None).as_deref(), Some("2 changes pending · refit due"));
     // drawn: the verdict card's banner and Refit now
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
@@ -12488,11 +12590,11 @@ fn the_pending_refit_banner_and_refit_now() {
     assert!(matches!(&row.control, Some((l, Action::RefitNow)) if l == "Refit now"));
     // running with more queued: no Refit now in the card, the Refitting row says what follows
     let snap = snapshot(&scene, Backend::Estimated, Some(pending(1, Some(Instant::now() + Duration::from_secs(60)), true)));
-    let inp = PanelInput { probe: Some(sim::ProbeView { refit: Some((12.0, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let inp = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(12.0, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
     assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner") && !PROBES.with(|p| p.borrow().contains_key("refit-now")));
     let r = rows(&inp, inp.probe.as_ref());
     assert!(r.iter().all(|r| r.key != JobKey::PendingRefit));
-    assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · 1 more pending after this one"), "{:?}", r.iter().map(|r| &r.detail).collect::<Vec<_>>());
+    assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · estimating… · 1 more pending after this one"), "{:?}", r.iter().map(|r| &r.detail).collect::<Vec<_>>());
     // nothing pending: no banner, no row
     let snap = snapshot(&scene, Backend::Estimated, Some(model()));
     let inp = input(&scene, Some(&snap), &cam);

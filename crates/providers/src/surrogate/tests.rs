@@ -4260,6 +4260,70 @@ fn a_refit_reports_its_phase_on_the_probe() {
     assert_eq!((v.refit, v.refits), (None, 2), "the refit was bracketed and closed");
 }
 
+/// 2026-11-15, the refit time estimate (`sim::refit_eta`): a refit that ends with a fit leaves a
+/// record (its samples, species, stages, wall; a failed one none); a background refit publishes its
+/// stages on the probe while it runs and records them at its install; with a collection attached the
+/// history is written to `refit_times.csv` and read back at the next attach (a corrupt line skipped,
+/// with a note), and the running refit's view carries the estimate it gives.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn refit_times_are_recorded_published_and_kept_with_the_collection() {
+    // a failed refit leaves no record
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let mut s = s.with_probe(probe.clone());
+    assert!(s.refit().is_err());
+    assert!(probe.refit_history().is_empty());
+
+    let dir = collection_root("refit-times");
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = pair_student();
+    let mut s = s.with_probe(probe.clone());
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let slug = s.provenance_for(&h2(1.4)).surface_key().slug();
+    // one synchronous refit (the H₂ fit) inside
+    let (h2_steps, all) = teach_h2_then_h2_he(&mut s);
+    let h = probe.refit_history();
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].samples as usize, h[0].species, h[0].background), (h2_steps, 1, false));
+    assert!(h[0].fits >= 1 && h[0].loo >= 1 && h[0].wall_s > 0.0, "{:?}", h[0]);
+    // a background refit: its stages on the probe while it runs (the phase stays open until the
+    // install), with the estimate from the one record
+    assert!(s.pending_refit() && s.begin_refit_background());
+    let t0 = std::time::Instant::now();
+    let v = loop {
+        let v = probe.view().refit.expect("the refit's phase is open until the install");
+        if v.stages.fits >= 1 && v.stages.loo >= 1 {
+            break v;
+        }
+        assert!(t0.elapsed().as_secs() < 120, "no stages published: {v:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!((v.samples as usize, v.species, v.background), (all, 2, true));
+    let e = v.estimate.expect("one record: an estimate");
+    assert_eq!(e.from, 1);
+    assert!(e.total_s > 0.0 && v.eta != sim::RefitEta::Estimating);
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert!(probe.view().refit.is_none());
+    let h = probe.refit_history();
+    assert_eq!(h.len(), 2);
+    assert_eq!((h[1].samples as usize, h[1].species, h[1].background), (all, 2, true));
+    assert!(h[1].fits >= 1 && h[1].loo >= 1, "{:?}", h[1]);
+    // written with the collection, read back at the next attach (a corrupt line skipped)
+    let path = dir.join(&slug).join(surrogate::REFIT_TIMES_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(sim::refit_eta::decode(&text), (h.clone(), 0));
+    drop(s);
+    std::fs::write(&path, format!("{text}this is not a record\n")).unwrap();
+    let probe2 = sim::ActivityProbe::new();
+    let (s2, _) = pair_student();
+    let mut s2 = s2.with_probe(probe2.clone());
+    s2.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert_eq!(probe2.refit_history(), h);
+    let notes = Trainable::take_notes(&mut s2);
+    assert!(notes.iter().any(|n| n.contains("1 unreadable lines of refit_times.csv skipped")), "{notes:?}");
+}
+
 // ---- the decision golden (Activity Task 2: the codes, outcomes and events change no decision) ----
 
 /// `MorseDimer` answers only two nuclei; the pass's isolated-atom references need one. This

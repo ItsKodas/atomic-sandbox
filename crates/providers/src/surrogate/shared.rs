@@ -286,6 +286,15 @@ impl SurrogateKs {
         self.audit_history = c.history.clone();
         self.model_gen = self.model_gen.max(newest) + 1;
         let slug = c.key.slug();
+        // the collection's refit history for the time estimate (`sim::refit_eta`; none on file:
+        // the session's stands, and is written with the next refit)
+        if let (Some(p), Some(text)) = (self.probe.as_ref(), c.read_refit_times()) {
+            let (history, bad) = sim::refit_eta::decode(&text);
+            if bad > 0 {
+                self.user_notes.push(format!("shared collection {slug}: {bad} unreadable lines of {} skipped (refit times, for the estimate only)", surrogate::REFIT_TIMES_FILE));
+            }
+            p.set_refit_history(history);
+        }
         let held_out = c.quarantine.iter().filter(|&&q| q != Q_NONE).count();
         let read_only = c.read_only;
         let stamp = history_stamp(&c.history);

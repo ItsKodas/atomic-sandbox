@@ -1593,9 +1593,64 @@ pub struct SurrogateKs {
     /// A background refit's copy: set when the live provider let it go (dropped or replaced) —
     /// its refit stops at its next fit (`fit_store_with`).
     refit_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The running refit's stages so far (`refit_stage`; `sim::refit_eta`), `None` outside a
+    /// refit: a fit or leave-one-out pass outside one (a view's) is not a stage.
+    refit_counts: Option<sim::RefitStages>,
+    /// A background refit's copy: the live provider's probe, for the stages only (the phase and
+    /// the history are the live provider's).
+    stage_probe: Option<Arc<sim::ActivityProbe>>,
 }
 
 impl SurrogateKs {
+    /// A stage of the running refit starts (`sim::refit_eta`, "The countdown"): counted, and
+    /// published on the probe; a no-op outside a refit. Bookkeeping only.
+    pub(super) fn refit_stage(&mut self, stage: sim::RefitStage) {
+        let Some(c) = self.refit_counts.as_mut() else { return };
+        match stage {
+            sim::RefitStage::Fit => c.fits += 1,
+            sim::RefitStage::LeaveOneOut => c.loo += 1,
+            sim::RefitStage::Recovery => c.recovery = true,
+        }
+        if let Some(p) = self.probe.as_ref().or(self.stage_probe.as_ref()) {
+            p.refit_stage(stage);
+        }
+    }
+
+    /// The species of the samples held (a refit's record and estimate key).
+    pub(super) fn store_species(&self) -> usize {
+        let mut z: Vec<u8> = self.store.as_ref().map(|st| st.samples.iter().flat_map(|s| s.z.iter().copied()).collect()).unwrap_or_default();
+        z.sort_unstable();
+        z.dedup();
+        z.len()
+    }
+
+    /// A refit that ended with a fit (`refit`, or a background one's install or discard): its
+    /// record joins the probe's history (`sim::refit_eta`), written to the attached collection's
+    /// `refit_times.csv` when it is writable. Never read by a fit or a verdict; without a probe
+    /// nothing is kept.
+    pub(super) fn record_refit(&mut self, wall_s: f64, samples: usize, species: usize, background: bool, c: sim::RefitStages) {
+        let Some(p) = self.probe.clone() else { return };
+        let at_unix_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let rec = sim::RefitRecord {
+            at_unix_s,
+            wall_s,
+            samples: samples.min(u32::MAX as usize) as u32,
+            species: species.min(u32::MAX as usize) as u32,
+            background,
+            kind: if c.recovery { sim::RefitKind::Recovery } else { sim::RefitKind::Plain },
+            fits: c.fits,
+            loo: c.loo,
+        };
+        let history = p.record_refit(rec);
+        let failed = match self.shared.as_ref().filter(|sh| !sh.coll.read_only) {
+            Some(sh) => sh.coll.save_refit_times(&sim::refit_eta::encode(&history)).err(),
+            None => None,
+        };
+        if let Some(e) = failed {
+            self.note_write_failure(&e);
+        }
+    }
+
     /// A refit's outcome in `Trainable::refit`'s words (one line), noting the error while no model
     /// formed.
     fn refit_summary(&mut self, r: Result<FitReport, FitError>) -> Result<String, String> {
@@ -1742,6 +1797,8 @@ impl SurrogateKs {
             background: None,
             refit_fork: false,
             refit_cancel: None,
+            refit_counts: None,
+            stage_probe: None,
         }
     }
 

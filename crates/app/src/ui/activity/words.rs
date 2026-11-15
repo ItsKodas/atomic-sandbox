@@ -4,6 +4,68 @@ use providers::surrogate::{FENCE_VOTES, THIN_EVERY};
 use sim::activity::{EnvClass, PassJob, TeachOutcome as K, TeachRule as R, TrustKey};
 use units::isotopes::symbol;
 
+/// "2,077" for 2077.
+pub fn thousands(n: u64) -> String {
+    let d = n.to_string();
+    let mut out = String::with_capacity(d.len() + d.len() / 3);
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A refit's time left (`sim::refit_eta`), worded as the estimate it is: "about 2:20 left (from
+/// your last 3 refits)" — the source only with `source` —, "estimating…" without a history,
+/// "finishing…" in its last second or past the estimate (never a negative time). The minutes and
+/// seconds round up, so the countdown never shows 0:00 while it runs.
+pub fn refit_eta_words(v: &sim::RefitView, source: bool) -> String {
+    match v.eta {
+        sim::RefitEta::Estimating => "estimating…".into(),
+        sim::RefitEta::Finishing => "finishing…".into(),
+        sim::RefitEta::Left { remaining_s, .. } => {
+            let s = remaining_s.max(0.0).ceil() as u64;
+            let from = match v.estimate.map_or(0, |e| e.from) {
+                _ if !source => String::new(),
+                0 => String::new(),
+                1 => " (from your last refit)".into(),
+                k => format!(" (from your last {k} refits)"),
+            };
+            format!("about {}:{:02} left{from}", s / 60, s % 60)
+        }
+    }
+}
+
+/// A refit's stages so far: "fit 4 of 12 · leave-one-out 1 of 5", the totals the history's
+/// (`sim::RefitEstimate`; dropped once the refit runs past them), "· trust recovery" once it entered
+/// it; "starting" before its first fit.
+pub fn refit_stage_words(v: &sim::RefitView) -> String {
+    let st = v.stages;
+    if st.fits == 0 && st.loo == 0 {
+        return "starting".into();
+    }
+    let of = |k: u32, total: Option<u32>| match total.filter(|&t| t >= k && t > 0) {
+        Some(t) => format!("{k} of {t}"),
+        None => k.to_string(),
+    };
+    let mut parts = Vec::new();
+    if st.fits > 0 {
+        parts.push(format!("fit {}", of(st.fits, v.estimate.map(|e| e.fits))));
+    }
+    if st.loo > 0 {
+        parts.push(format!("leave-one-out {}", of(st.loo, v.estimate.map(|e| e.loo))));
+    }
+    if st.recovery {
+        parts.push("trust recovery".into());
+    }
+    parts.join(" · ")
+}
+
+/// What a refit's estimate is, for its hover.
+pub const REFIT_ETA_TIP: &str = "The time left is an estimate: the mean wall of your last (up to 5) comparable refits — the same kind (with or without the trust recovery) and species count — scaled by the sample count (time ∝ samples unless your history clearly shows otherwise), refined by the fits and leave-one-out passes as they finish. The history is kept with the shared collection (refit_times.csv), or for this session with a model file";
+
 /// What a log row (or a stuck streak) knew about its answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowCtx {
