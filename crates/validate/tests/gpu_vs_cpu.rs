@@ -339,8 +339,8 @@ fn timing_table() {
         // Task 7): H₂O at 97³ × 0.25 failed cold with "no gap witness within 16 extra levels". Cause (Task 7 fix round 1
         // diagnostic): transient pre-convergence steps 3–4 (ε_N −0.15 / −0.13 Ha, μ −0.067 / −0.053, so the window top
         // is at +0.11–0.13 Ha above 15–16 box states), not the converged spectrum and not collapsed columns (overlaps
-        // ≤ 3e-8). With the cap now 32 it passes that step, but the solve was still not converged after the 15-min GPU
-        // batch — the cost (references.md "Fermi–Dirac on the GPU")
+        // ≤ 3e-8). A trial cap of 32 passed that step, but the solve was still not converged after the 15-min GPU batch;
+        // the cap stays 16 and plan Task 9b owns it and the cost (references.md "Fermi–Dirac on the GPU")
         let settings = ScfSettings { occupations: Occupations::Aufbau, ..ScfSettings::for_grid(&grid) };
         let t = Instant::now();
         let mut s = GpuSolver::new(ctx.clone(), &grid);

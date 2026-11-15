@@ -370,11 +370,12 @@ eigensolver.
 - The block stayed orthonormal (max |⟨ψ_i|ψ_j⟩| ≤ 2.9e-8) with Ritz gaps ≥ 2.4e-4 Ha: no collapsed or duplicate
   columns.
 
-`qm::scf::MAX_WITNESS_GROWTH` is now 32 (bit-neutral below 16; the GPU memory guard counts it, all-electron included).
-With it, step 4 passes (19 extras on ↑). The solve still did not converge within the 15-minute GPU batch: cut off at
-15 min in step 4, ↓ at 17 extras. Each growth re-solves a ~20-vector block at 97³ with LOBPCG at its cap (step
-residuals 1e-2 against a step tol of 1e-3). So the table stays held: the all-electron FD cost at large boxes is the
-open item (plan Task 9b). The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold
+A trial cap of 32 (fix round 1) passed step 4 (19 extras on ↑). The solve still did not converge within the 15-minute
+GPU batch: cut off at 15 min in step 4, ↓ at 17 extras. Each growth re-solves a ~20-vector block at 97³ with LOBPCG at
+its cap (step residuals 1e-2 against a step tol of 1e-3). It also cost the memory guard 192 more fields. So
+`qm::scf::MAX_WITNESS_GROWTH` stays 16 for now (fix round 2), and the GPU memory guard counts it for all-electron
+scenes too (192 fields). The cap, its budget and the all-electron FD cost at large boxes belong to plan Task 9b; the
+table stays held until then. The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold
 1.79 s.
 
 **Re-pins** (each with its reason in the test): `qm` `none_policy_is_bitwise_today` and `qm-gpu`

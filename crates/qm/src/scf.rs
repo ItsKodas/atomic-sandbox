@@ -315,15 +315,16 @@ pub const DEGENERACY_TAU: f64 = 1e-3;
 
 /// The most extra vectors a spin channel may grow to find the gap witness (a method literal and a cost cap only: the
 /// largest symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it; spec 2026-11-13 §4.2
-/// measured at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box). 32 since plan 2026-11-13 Task 7 fix round 1
-/// (was 16): a cold all-electron H₂O at 97³ × 0.25 (a 24.5 Bohr box) reached 16 on its 3rd and 4th SCF steps, whose
-/// spectrum is far from self-consistent (Δρ_prev 4.8 and 2.3; ε_N = −0.152 / −0.132 Ha against ≈ −0.26 converged, μ ≈
-/// −0.067 / −0.053), so the window top μ + 36 kT ≈ +0.11–0.13 Ha held 15–16 box states; the block stayed orthonormal
-/// (max |⟨ψ_i|ψ_j⟩| ≤ 2.5e-8, Ritz gaps ≥ 2.4e-4 Ha), no collapsed columns. Raising the cap is bit-neutral for every
-/// solve that stays under 16: the cap is read only after a failed witness test with 16 extras already grown, where a
-/// solve under 16 errored. The GPU memory guard counts it (`providers::ks`). `pub` for `qm-gpu::scf`, which
-/// implements the same rule.
-pub const MAX_WITNESS_GROWTH: usize = 32;
+/// measured at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box).
+///
+/// Measured (plan 2026-11-13 Task 7 fix rounds 1–2): a cold all-electron H₂O at 97³ × 0.25 (a 24.5 Bohr box) reaches
+/// 16 on its 3rd and 4th SCF steps. Their spectrum is far from self-consistent: Δρ_prev 4.8 and 2.3, ε_N = −0.152 /
+/// −0.132 Ha against ≈ −0.26 converged, μ ≈ −0.067 / −0.053. So the window top μ + 36 kT ≈ +0.11–0.13 Ha holds
+/// 15–16 box states. The block stays orthonormal (max |⟨ψ_i|ψ_j⟩| ≤ 2.9e-8, Ritz gaps ≥ 2.4e-4 Ha): no collapsed
+/// columns. A cap of 32 passed step 4 (19 extras) but did not converge within a 15-minute GPU run, because every growth
+/// re-solves the ~20-vector block, so the cap stays 16. The cap and its memory budget (`providers::ks`, which counts it)
+/// are decided in plan Task 9b. `pub` for `qm-gpu::scf`, which implements the same rule.
+pub const MAX_WITNESS_GROWTH: usize = 16;
 
 /// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
 /// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).

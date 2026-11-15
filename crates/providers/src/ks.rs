@@ -292,8 +292,8 @@ fn witness_growth_fields() -> u64 {
     8 * growth + 2 * growth + 2 * growth
 }
 
-/// The witness growth of an all-electron solve under `FermiDirac` (`witness_growth_fields`, with the 1.2 slack of
-/// [`solve_footprint_bytes`]): plan 2026-11-13 Task 7 fix round 1 counts it ahead of plan Task 9, which switches the
+/// The witness growth of an all-electron solve under `FermiDirac` (`witness_growth_fields` at the cap, 192 fields, with
+/// the 1.2 slack of [`solve_footprint_bytes`]): plan 2026-11-13 Task 7 fix rounds 1–2 count it ahead of plan Task 9, which switches the
 /// providers' all-electron surface from the held `Aufbau` (exactly N_σ vectors) to FD, so until then it is a bound
 /// the held solves never use.
 pub fn witness_extra_bytes(n: usize) -> u64 {
@@ -310,8 +310,8 @@ pub fn solve_footprint_bytes(n: usize, n_el: u64, k_max: u64) -> u64 {
 /// orbitals, for the pseudised ions given as (r, rows) — the radius of the ion's projector/partial-core ball in
 /// Bohr and its number of projector rows Σ(2l + 1) — with the 1.2 slack of [`solve_footprint_bytes`] applied:
 /// - ρ_pc and the two XC input fields ρ_σ + ½ρ_pc (Task 8a review SHOULD-5): 3 fields;
-/// - the `DegenerateShells` witness, at its cap `qm::scf::MAX_WITNESS_GROWTH` (32 since plan 2026-11-13 Task 7 fix
-///   round 1) extra vectors per spin: the one `LobpcgWork` (sized for the larger spin) grows by 8 fields a vector,
+/// - the `DegenerateShells` witness, at its cap `qm::scf::MAX_WITNESS_GROWTH` (16; plan 2026-11-13 Task 9b decides
+///   the cap and its budget) extra vectors per spin: the one `LobpcgWork` (sized for the larger spin) grows by 8 fields a vector,
 ///   and each spin stores that many more orbitals and kinetic scratch fields: (8 + 2 + 2)·cap fields
 ///   (`witness_growth_fields`; a bound — a typical shared shell needs one);
 /// - the v̄ scratch of the force path (Task 8b ruling (c)): 6 fields;
@@ -1625,8 +1625,8 @@ mod tests {
         assert!((r - (105.0f64 / 57.0).powi(3)).abs() < 1e-6, "∝ (n + 2·GHOST)³: {r}");
         assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
         // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
-        // re-pinned (plan 2026-11-13 Task 7 fix round 1): the estimate now adds the all-electron FD witness growth
-        // (`witness_extra_bytes`, a bound at the cap); the solve part keeps its window
+        // re-pinned (plan 2026-11-13 Task 7 fix rounds 1–2): the estimate now adds the all-electron FD witness growth
+        // (`witness_extra_bytes`, a bound at the cap of 16: 192 fields); the solve part keeps its window
         let w = solve_footprint_bytes(97, 10, 5) as f64 / 1e6;
         assert!((600.0..1400.0).contains(&w), "{w} MB");
         assert_eq!(gpu_footprint_bytes(&h2o(97)), solve_footprint_bytes(97, 10, 5) + witness_extra_bytes(97));
@@ -2728,7 +2728,7 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore)]
     fn the_orbital_view_is_charged_to_the_vram_budget() {
         let s = h2(49, 1.4);
-        // + the all-electron FD witness growth (plan 2026-11-13 Task 7 fix round 1)
+        // + the all-electron FD witness growth at the cap of 16 (plan 2026-11-13 Task 7 fix rounds 1–2)
         assert_eq!(solve_footprint_bytes(49, 2, 1) + witness_extra_bytes(49), gpu_footprint_bytes(&s), "one formula");
         let fb = field_bytes(49) as f64;
         let fields = |m: usize| (orbital_view_footprint_bytes(49, 1, 1, m, TextureKind::None) as f64 / (1.2 * fb)).round() as usize;
@@ -3240,7 +3240,7 @@ mod tests {
         let warm = std::sync::Mutex::new(PseudoCache::default());
         warm.lock().unwrap().table(8).expect("O is accepted");
         // None: the all-electron formula, 8 electrons (triplet: k_max = 5), whatever the cache holds, plus the
-        // all-electron FD witness growth (plan 2026-11-13 Task 7 fix round 1)
+        // all-electron FD witness growth at the cap of 16 (plan 2026-11-13 Task 7 fix rounds 1–2)
         assert_eq!(footprint_bytes_in(&warm, &none), solve_footprint_bytes(none.cell.n, 8, 5) + witness_extra_bytes(none.cell.n));
         // pseudo: 6 valence electrons (k_max = 4) plus the extras
         let fp = footprint_in(&warm, &pseudo);
@@ -3259,6 +3259,17 @@ mod tests {
         // H2 under CoresOnly pseudises nothing: counted as today
         let h2c = Scene { ionic: sim::IonicPolicy::CoresOnly, ..h2(33, 1.4) };
         assert_eq!(footprint_bytes_in(&warm, &h2c), footprint_bytes_in(&warm, &h2(33, 1.4)));
+        // plan 2026-11-13 Task 7 fix round 2: with the witness term at the cap of 16 (192 fields), the Precise H₂O preset
+        // (141³ × 0.10, the 14 Bohr box) fits the estimated mode's auditor share again — half of the 12.9 GB adapter
+        // budget of the RX 7900 XTX, 6.45 GB — both all-electron and pseudised under `Accepted` (counted at the bound
+        // by a cache that holds no table: the conservative estimate)
+        let precise = |ionic: sim::IonicPolicy| Scene { cell: Cell { n: 141, h: 0.10 }, ionic, ..h2o(141) };
+        let auditor = 6.45e9;
+        for (what, policy) in [("all-electron", sim::IonicPolicy::None), ("Accepted (bound)", sim::IonicPolicy::Accepted)] {
+            let need = footprint_bytes_in(&std::sync::Mutex::new(PseudoCache::default()), &precise(policy)) as f64;
+            println!("Precise H₂O 141³ × 0.10, {what}: {:.2} GB of the auditor's {:.2} GB", need / 1e9, auditor / 1e9);
+            assert!(need <= auditor, "{what}: {need:e} B over the auditor's half budget");
+        }
     }
 
     /// Spec §7 risk 6 and MUST-1 of the Task 9 physics review: under a pseudo scene the GPU solver's SCF actually
