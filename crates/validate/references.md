@@ -4887,4 +4887,4 @@ Means are f64 Neumaier sums. **Split** (a display split): "near the bond length"
 ### V-A4 suite time
 Three processes: H₂O 997 s (the 60-solve sampling pass 528 s at 97³; 60 SCF re-solves at 4–9 s, 20 Harris 0.5–1.0 s, the O reference 28 s), the H₂ scan 90 s, H₂ + H 75 s. The H₂O set exceeds the 15-minute GPU batch on its own: run it alone, with a cool-down after.
 
-**Suite time:** 2026-11-15: V-A1 87 s, V-A2 116 s, V-A3 97 s (2026-11-14: 126 / 150 / 126 s) as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process would generate it once, ≈ 5 min (an estimate from the three runs, not measured as one process).
+**Suite time:** 2026-11-15: V-A1 87 s, V-A2 116 s, V-A3 97 s (2026-11-14: 126 / 150 / 126 s) as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process would generate it once, ≈ 5 min (an estimate from the three runs; measured 2026-11-16 as one process with V-A4 added: 640 s).
