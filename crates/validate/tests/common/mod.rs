@@ -393,3 +393,18 @@ pub fn timing_row(test: &str, system: &str, n: usize, tol: f64, log: &EvalLog, w
     format!("| {test} | {system} | {n}³ | {tol:.0e} | {} | {:.1} | {:.0} | {:.1} | {:.0} | {:.1} | {result} |",
             log.calls, log.gpu.as_secs_f64(), ms(log.gpu) / c, log.scf_steps as f64 / c, log.readbacks as f64 / c, wall.as_secs_f64())
 }
+
+// ---- the V3 FD-consistency geometry (Fermi–Dirac smearing, spec 2026-11-13 §9 "V3 force oracle") ----
+/// V3's pinned case, shared by `oracles.rs`' `fd_forces_are_minus_df_dx_near_a_pinned_pair` and the V5 work integral
+/// (plan 2026-11-13 Tasks 6 and 11): all-electron H₄, a near-square a × b = 1.8 × 1.95 Bohr rectangle in the xy plane
+/// centred on the origin, on 41³ × 0.30 (a 12 Bohr box), charge 0, auto multiplicity (n↑ = n↓ = 2). Returns
+/// (grid, system, atom, axis): atom 0 at (−0.9, −0.975, 0), moved along x (axis 0), i.e. toward atom 1, which shortens
+/// the 1.8 side and widens the frontier split Δ of the near-degenerate pair (c = dΔ/dx > 0). Task 3 (A1 note §1) chose
+/// the aspect on the GPU; Task 6 confirmed it on the CPU at tol 1e-9 (`references.md` "Fermi–Dirac migration", V3).
+/// The caller sets σ = h, tol, eig_tol and `FermiDirac { kt: ELECTRON_KT }` explicitly.
+pub fn v3_h4() -> (qm::Grid, qm::System, usize, usize) {
+    let (a, b) = (1.8, 1.95);
+    let corners = [[-a / 2.0, -b / 2.0], [a / 2.0, -b / 2.0], [a / 2.0, b / 2.0], [-a / 2.0, b / 2.0]];
+    let nuclei = corners.iter().map(|&[x, y]| qm::Nucleus { pos: [x, y, 0.0], z: 1 }).collect();
+    (qm::Grid::cube(41, 0.30), qm::System::new(nuclei, 0, None), 0, 0)
+}

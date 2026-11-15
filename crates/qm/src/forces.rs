@@ -82,7 +82,7 @@
 //! E‴ ≈ −6 D a³ with D ≈ 0.17 Ha, a ≈ 1.0 Bohr⁻¹ gives |E‴| ≈ 1.1 Ha/Bohr³, i.e. ≈ 2e-5 at
 //! δ = 0.01 (×4 at δ = 0.02); (ii) energy noise over 2δ — the SCF energy is second order in the
 //! density and orbital residuals (Δρ < 1e-9, LOBPCG residual < 1e-8 ⇒ ≪ 1e-12 Ha) and first
-//! order in the Poisson residual (1e-10 relative ⇒ ~1e-10 Ha), so ≲ 1e-8 Ha/Bohr; (iii) the
+//! order in the Poisson residual (`scf::poisson_tol`: 1e-11 relative at tol 1e-9 ⇒ ≲ 1e-10 Ha), so ≲ 1e-8 Ha/Bohr; (iii) the
 //! first-order non-stationarity of the KS fixed point for E_h, if the discrete Hartree map
 //! ρ ↦ V_H (Dirichlet Laplacian + multipole boundary) is not exactly symmetric — of the order
 //! of the Poisson boundary error (3.5e-5 in V_H, Task 5) times ∫|∂ρ/∂R| ≈ 1, so ≲ 1e-5. The

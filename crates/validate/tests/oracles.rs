@@ -2,7 +2,9 @@
 //! prints its raw table (`--nocapture`) so a miss can be attributed; the assertion bounds are
 //! the brief's and are never loosened here. Run with `cargo test -p validate --release`.
 
-use qm::{forces, Grid, KsState, Nucleus, System};
+mod common;
+
+use qm::{forces, scf, Grid, KsState, Nucleus, Occupations, ScfSettings, System, ELECTRON_KT};
 use std::time::Instant;
 use validate::{converged, energy_ladder, extrapolate_sigma, first_order_shift, interpolated_root, sigma_ladder};
 
@@ -172,4 +174,165 @@ fn h2_force_vanishes_at_equilibrium() {
     let f0 = extrapolate_sigma(&sig, &fx);
     eprintln!("H2 force at R_e: 81³, h = 0.15, F(σ) = {fx:?} → extrapolated {f0:+.6} Ha/Bohr, wall {:.1} s", t0.elapsed().as_secs_f64());
     assert!(f0.abs() < 1e-2, "residual force at R_e after σ → 0: {f0} (F(σ) = {fx:?})");
+}
+
+// ---- V3: the FD-consistency force oracle (Fermi–Dirac smearing, spec 2026-11-13 §9 "V3 force oracle") ----
+//
+// Derivation (atomic units; a force is −d/dx; F, E, TS in Ha; x in Bohr).
+//
+// Mermin: F[{ψ}, {f}] = E_KS[ρ] − kT·Σ_iσ s(f_iσ), s(f) = −f ln f − (1 − f) ln(1 − f), ρ_σ = Σ_i f_iσ|ψ_iσ|², with
+// Σ_i f_iσ = N_σ per channel (multiplier μ_σ). ∂E_KS/∂f_i = ε_i, so ∂/∂f_i [F − μ_σ(Σf − N_σ)] = ε_i − μ_σ
+// − kT ln((1 − f_i)/f_i) = 0 gives f_i = 1/(1 + e^{(ε_i − μ_σ)/kT}): Fermi–Dirac occupations make F stationary in
+// f, and the Kohn–Sham equations make it stationary in ψ (orthonormality). So dF/dx = ∂F/∂x at fixed {ψ, f}
+// = ∫ρ ∂V_ext/∂x + ∂E_nn/∂x, i.e. the Hellmann–Feynman force is HF_x = −dF/dx. E alone is not stationary in f:
+// dE/dx = dF/dx + d(TS)/dx, hence HF_x + dE/dx = d(TS)/dx, nonzero exactly where a partial level's f moves.
+//
+// Stencil: FD_X(d) = −[X(x + d) − X(x − d)]/(2d) = −X′ − X‴d²/6 − X⁽⁵⁾d⁴/120 + O(d⁶), X ∈ {F (`total`), E (`internal`)}.
+// Richardson R_X(a, 2a) = (4·FD_X(a) − FD_X(2a))/3 = −X′ + X⁽⁵⁾a⁴/30 + O(a⁶). Hence
+//   R(δ/2, δ) − R(δ, 2δ) = −X⁽⁵⁾δ⁴/32: 15× the remainder of R(δ/2, δ) (X⁽⁵⁾δ⁴/480), and 3.75× FD(δ)'s own δ⁴ term
+//   (X⁽⁵⁾δ⁴/120), the spec's "3.75×"; either way ≤ 2.5e-5 certifies R(δ/2, δ) to ≤ 1.7e-6.
+// The δ-scaling check: with e = FD_F(δ) − R_F(δ/2, δ) ≈ −F‴δ²/6 and b = HF − R_F(δ/2, δ), FD_F(2δ) − R_F ≈ 4e, so
+//   (FD_F(2δ) − HF)/(FD_F(δ) − HF) = (4e − b)/(e − b) ∈ [3, 5]  ⇔  b/e ∈ [−½, ¼]: −e/2 ≤ b ≤ e/4 for e > b (the
+//   spec's form), e/4 ≤ b ≤ −e/2 for e < b (this case: F‴ > 0 makes e < 0).
+// Spec §9 V3 pre-registration: if the ratio is asserted and b lies outside that interval, stop and report (a spec
+// decision, never a re-pin).
+
+/// δ of the V3 stencil (Bohr): central differences at δ/2, δ and 2δ (spec §9 V3 "Method").
+const V3_DELTA: f64 = 0.01;
+/// SCF tolerance of the V3 solves (spec §9 V3: CPU f64, tol 1e-9; `qm` then asks its Poisson solves for 1e-11).
+const V3_TOL: f64 = 1e-9;
+/// Eigensolver tolerance of the V3 solves (Task 6 ruling, test-local). Near the pinned pair an eigen residual r leaves the
+/// pair's mutual rotation θ ≈ r/Δ unresolved, which moves ρ_out by ≈ (f₁ − f₂)·θ ≈ 1e-8 at r = 1e-9 (Δ = 12.9 mHa,
+/// f ≈ 0.79/0.21): measured, a warm re-solve at eig_tol 1e-9 sat at Δρ 1e-8 … 2e-7 for 200 steps, at 1e-10 it converged
+/// in 19.
+const V3_EIG_TOL: f64 = 1e-10;
+
+/// One V3 stencil point: displacement x, F, E, TS, the frontier split Δ, SCF steps and the final Δρ.
+struct V3Point { x: f64, f: f64, e: f64, ts: f64, split: f64, iterations: usize, delta_rho: f64, face: f64 }
+
+/// The V3 stencil: HF at x = 0, the seven points x ∈ {0, ±δ/2, ±δ, ±2δ} in ascending x (the centre cold, the six
+/// displaced solves warm from it), and the centre re-solved warm from the +δ/2 state (its F − the cold F, E likewise:
+/// the CPU path scatter).
+struct V3Stencil { hf: f64, points: Vec<V3Point>, scatter: (f64, f64), wall: f64 }
+
+impl V3Stencil {
+    fn at(&self, x: f64) -> &V3Point { self.points.iter().find(|p| p.x == x).unwrap_or_else(|| panic!("no stencil point at {x}")) }
+    /// FD_X(d) = −[X(+d) − X(−d)]/(2d), a force.
+    fn fd(&self, x: fn(&V3Point) -> f64, d: f64) -> f64 { -(x(self.at(d)) - x(self.at(-d))) / (2.0 * d) }
+    /// R_X(a, 2a) = (4·FD_X(a) − FD_X(2a))/3.
+    fn rich(&self, x: fn(&V3Point) -> f64, a: f64) -> f64 { (4.0 * self.fd(x, a) - self.fd(x, 2.0 * a)) / 3.0 }
+}
+
+/// The frontier split of a state (Ha): ε at ascending rank N_σ minus ε at N_σ − 1 (0-based), averaged over the two
+/// channels (both occupied here).
+fn frontier_split(st: &KsState, sys: &System) -> f64 {
+    let split = |evals: &[f64], n: usize| {
+        let mut e = evals.to_vec();
+        e.sort_by(f64::total_cmp);
+        assert!(n >= 1 && e.len() > n, "a witness above rank {n}: {e:?}");
+        e[n] - e[n - 1]
+    };
+    0.5 * (split(&st.evals_up, sys.n_up) + split(&st.evals_dn, sys.n_dn))
+}
+
+/// `f` over `items` on at most 4 threads (`qm` is single-threaded; the machine is shared), results in input order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<R>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..4.min(items.len()) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= items.len() { break; }
+                *out[i].lock().unwrap() = Some(f(&items[i]));
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap().expect("every item ran")).collect()
+}
+
+/// Solves the V3 stencil on `common::v3_h4()` (CPU f64, σ = h, tol `V3_TOL`, eig_tol `V3_EIG_TOL`, `FermiDirac { kt:
+/// ELECTRON_KT }`) and prints its table. Every solve must converge without a warning.
+fn v3_stencil() -> V3Stencil {
+    let (g, sys, atom, axis) = common::v3_h4();
+    let mut s = ScfSettings::for_grid(&g);
+    (s.tol, s.eig_tol, s.occupations) = (V3_TOL, V3_EIG_TOL, Occupations::FermiDirac { kt: ELECTRON_KT });
+    let moved = |x: f64| {
+        let mut nuclei = sys.nuclei.clone();
+        nuclei[atom].pos[axis] += x;
+        System { nuclei, n_up: sys.n_up, n_dn: sys.n_dn, ionic: None }
+    };
+    let solve = |x: f64, warm: Option<&KsState>| {
+        let (st, stats) = scf(&g, &moved(x), &s, warm).unwrap_or_else(|e| panic!("V3 x = {x:+}: {e}"));
+        // the box warning alone is allowed: its face density (≈ 1.7e-5, the partly occupied level's slow tail) is the
+        // same Dirichlet box at every x, part of the discrete problem whose F the stencil differentiates
+        let is_box = |w: &String| w.starts_with("density on box faces is ") && w.ends_with(": box too small");
+        assert!(stats.warnings.iter().all(is_box) && stats.warnings.len() <= 1, "V3 x = {x:+}: {:?}", stats.warnings);
+        let p = V3Point { x, f: stats.energy.total, e: stats.energy.internal, ts: stats.energy.ts, split: frontier_split(&st, &sys),
+                          iterations: stats.iterations, delta_rho: stats.delta_rho, face: stats.boundary_density };
+        (st, p)
+    };
+    let t0 = Instant::now();
+    let (centre, c0) = solve(0.0, None);
+    let hf = forces(&g, &centre, &sys.nuclei, s.sigma).unwrap()[atom][axis];
+    let xs = [-2.0 * V3_DELTA, -V3_DELTA, -0.5 * V3_DELTA, 0.5 * V3_DELTA, V3_DELTA, 2.0 * V3_DELTA];
+    let mut out = par_map(&xs, |&x| solve(x, Some(&centre)));
+    let (_, again) = solve(0.0, Some(&out[3].0));
+    let scatter = (again.f - c0.f, again.e - c0.e);
+    let mut points: Vec<V3Point> = out.drain(..).map(|(_, p)| p).collect();
+    points.insert(3, c0);
+    let wall = t0.elapsed().as_secs_f64();
+    eprintln!("V3 H₄ 1.8 × 1.95, atom {atom} along axis {axis}: 41³ × 0.30, σ = h, CPU f64, tol {V3_TOL:.0e}, eig_tol {V3_EIG_TOL:.0e}, FD kT {ELECTRON_KT}; wall {wall:.0} s");
+    for p in &points {
+        eprintln!("  x {:+.3}  F {:+.12}  E {:+.12}  TS {:.9e}  Δ {:.6e} (u = {:.3})  {} steps  Δρ {:.1e}  face {:.2e}",
+                  p.x, p.f, p.e, p.ts, p.split, p.split / (4.0 * ELECTRON_KT), p.iterations, p.delta_rho, p.face);
+    }
+    eprintln!("  centre warm from +δ/2 − cold: F {:+.2e}, E {:+.2e} ({} steps)", scatter.0, scatter.1, again.iterations);
+    for w in points.windows(2) {
+        let dx = w[1].x - w[0].x;
+        eprintln!("  [{:+.3}, {:+.3}]: c = dΔ/dx {:.5}  d(TS)/dx {:+.5e}  (d(TS)/dx)/c {:+.3}", w[0].x, w[1].x,
+                  (w[1].split - w[0].split) / dx, (w[1].ts - w[0].ts) / dx, (w[1].ts - w[0].ts) / (w[1].split - w[0].split));
+    }
+    V3Stencil { hf, points, scatter, wall }
+}
+
+/// V3 [MUST-4] (spec 2026-11-13 §9 "V3 force oracle"; plan Task 6; the derivation above): near a pinned pair the
+/// Hellmann–Feynman force is −dF/dx, F = E − TS, and not −dE/dx. `common::v3_h4()` (H₄ 1.8 × 1.95, atom 0 along x;
+/// frontier split ≈ 2.6 kT), CPU f64, 41³ × 0.30, σ = h, tol 1e-9, eig_tol 1e-10, `FermiDirac { kt: ELECTRON_KT }`; eight
+/// solves (the centre cold, the six displaced ones warm from it, the centre again warm for the path scatter). The
+/// bounds are the spec's, verbatim: |R_F(δ/2, δ) − R_F(δ, 2δ)| ≤ 2.5e-5 Ha/Bohr (certifies the δ⁴ remainder); the
+/// δ-scaling ratio (FD_F(2δ) − HF)/(FD_F(δ) − HF) ∈ [3, 5] when |FD_F(δ) − HF| ≥ 1e-5 (pre-registered stop: b outside
+/// [−e/2, e/4] is a spec decision); |HF − R_F(δ/2, δ)| ≤ 1e-4 (the "M7 forces" Richardson bound); |HF − R_E(δ/2, δ)|
+/// ≥ 5e-4 (tells F's derivative from E's). Measured numbers: `references.md` "Fermi–Dirac migration", V3.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
+fn fd_forces_are_minus_df_dx_near_a_pinned_pair() {
+    let v = v3_stencil();
+    let (f, e): (fn(&V3Point) -> f64, fn(&V3Point) -> f64) = (|p| p.f, |p| p.e);
+    let d = V3_DELTA;
+    let hf = v.hf;
+    let (fd_half, fd1, fd2) = (v.fd(f, 0.5 * d), v.fd(f, d), v.fd(f, 2.0 * d));
+    let (r_fine, r_coarse) = (v.rich(f, 0.5 * d), v.rich(f, d));
+    let (r_e_fine, r_e_coarse) = (v.rich(e, 0.5 * d), v.rich(e, d));
+    let trunc = fd1 - r_fine; // e
+    let offset = hf - r_fine; // b
+    let ratio = (fd2 - hf) / (fd1 - hf);
+    let ratio_asserted = (fd1 - hf).abs() >= 1e-5;
+    eprintln!("V3: HF {hf:+.10}  FD_F(δ/2, δ, 2δ) {fd_half:+.10} {fd1:+.10} {fd2:+.10}  plain |FD(δ) − FD(2δ)| {:.3e}", (fd1 - fd2).abs());
+    eprintln!("    R_F(δ/2, δ) {r_fine:+.10}  R_F(δ, 2δ) {r_coarse:+.10}  |difference| {:.3e} (≤ 2.5e-5)", (r_fine - r_coarse).abs());
+    eprintln!("    R_E(δ/2, δ) {r_e_fine:+.10}  R_E(δ, 2δ) {r_e_coarse:+.10}  FD_E(δ/2, δ, 2δ) {:+.10} {:+.10} {:+.10}",
+              v.fd(e, 0.5 * d), v.fd(e, d), v.fd(e, 2.0 * d));
+    eprintln!("    HF − R_F(δ/2, δ) = b {offset:+.3e} (|b| ≤ 1e-4);  HF − R_E(δ/2, δ) {:+.4e} (≥ 5e-4)", hf - r_e_fine);
+    eprintln!("    e = FD_F(δ) − R_F(δ/2, δ) {trunc:+.3e} (implied F‴ = −6e/δ² {:+.3}); FD_F(δ) − HF {:+.3e}; ratio (FD(2δ) − HF)/(FD(δ) − HF) {ratio:.4} \
+               ({}); b/e {:+.4} (in [−½, ¼] ⇔ ratio in [3, 5])",
+              -6.0 * trunc / (d * d), fd1 - hf, if ratio_asserted { "asserted" } else { "not asserted: |FD(δ) − HF| < 1e-5" }, offset / trunc);
+    eprintln!("    path scatter (centre warm − cold): F {:+.2e}, E {:+.2e}; wall {:.0} s", v.scatter.0, v.scatter.1, v.wall);
+    assert!((r_fine - r_coarse).abs() <= 2.5e-5, "R_F(δ/2, δ) {r_fine} vs R_F(δ, 2δ) {r_coarse}: the δ⁴ remainder is not certified");
+    if ratio_asserted {
+        assert!((3.0..=5.0).contains(&ratio),
+                "δ-scaling ratio {ratio} ∉ [3, 5] (e = {trunc:e}, b = {offset:e}, b/e = {}): STOP and report: spec 2026-11-13 §9 V3 \
+                 pre-registration, a spec decision for the user, never a re-pin", offset / trunc);
+    }
+    assert!((hf - r_fine).abs() <= 1e-4, "HF {hf} vs R_F(δ/2, δ) {r_fine}: HF is not −dF/dx within the M7 Richardson bound");
+    assert!((hf - r_e_fine).abs() >= 5e-4, "HF {hf} vs R_E(δ/2, δ) {r_e_fine}: the test does not tell dF/dx from dE/dx here");
 }
