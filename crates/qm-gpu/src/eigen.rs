@@ -58,7 +58,10 @@
 //! amplification α = max_i ‖T y_i‖₂ and the iteration accepts it only when
 //! α ≤ max(`ALPHA_MAX`, `ALPHA_RESIDUAL_FRACTION` × max_residual/floor): near convergence at
 //! most 2× an orthonormal basis's noise; far from it whatever keeps the injected noise
-//! (α × floor, fresh each step — it is not cumulative) below a tenth of the residual.
+//! (α × floor, fresh each step — it is not cumulative) below a tenth of the residual. (Under
+//! `lobpcg_split` "the residual" is the split stop test's, max_{i < checked} ρ_i·tol/tol_i: the
+//! untested buffer columns may sit far above it, and their residual must not relax the guard
+//! for the columns already at their tolerance.)
 //! Otherwise — the **fallback** — the W and P columns are orthogonalised against X and each
 //! other on the grid by Task 5's MGS (one readback per vector after the first, whose dots are
 //! already in B), H is re-applied to them, the Gram is re-measured (one more readback) and the
@@ -239,6 +242,10 @@ pub struct EigenStats {
     /// Largest coefficient amplification α of a raw-subspace Rayleigh–Ritz step in this call
     /// (before any fallback; 1 for an orthonormal basis).
     pub alpha_worst: f64,
+    /// Under the split stop test of `lobpcg_split`: the true max residual of the returned X over the
+    /// head columns (held to `tol`) and over the tail columns `head..checked` (held to `tail_tol`; 0 when
+    /// there are none); the untested buffer columns enter only `max_residual`. `None` otherwise.
+    pub split_residual: Option<(f64, f64)>,
 }
 
 /// Model of the f32 residual floor ‖(H − λ)δx‖ for ‖x‖ = 1 (module doc): the RMS rounding of
@@ -527,7 +534,7 @@ pub(crate) fn rayleigh_residuals(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: 
 #[allow(clippy::too_many_arguments)]
 pub fn lobpcg(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
               work: &mut LobpcgWork, tol: f64, max_iter: usize, should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
-    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, should_abort)
+    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, None, should_abort)
 }
 
 /// `lobpcg` that accepts the guess as it is (0 iterations, X untouched) when its residual is
@@ -540,14 +547,36 @@ pub fn lobpcg_with_guess_tol(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Red
                              work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize,
                              should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     assert!(guess_tol >= tol, "lobpcg: guess_tol {guess_tol} must not be below tol {tol}");
-    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, should_abort)
+    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, None, should_abort)
 }
 
-/// `lobpcg` with the guard's two constants as parameters (tests force the fallback with 0, 0).
+/// `lobpcg` whose stop test holds the lowest `head` columns to `tol`, columns `head..checked` to
+/// `tail_tol` ≥ `tol`, and does not test columns `checked..` at all — they are iterated as buffer vectors
+/// (they speed up the others: the block's convergence rate is set by the gap to the first level *outside*
+/// it) and their Ritz pairs come back as computed (the Harris display solve, `crate::harris`: its displayed
+/// levels at the SCF's tol, its guard/witness levels only as tight as their use needs, its top level a
+/// buffer). The test reads c = max_{i < checked} ρ_i·tol/tol_i (ρ_i the true residual of column i, tol_i
+/// its tolerance) in place of max_i ρ_i — for `Stop::Converged`, the floor-stall diagnosis (its running
+/// minimum) and the guess acceptance alike — so `Converged` means every tested column met its own
+/// tolerance. `EigenStats::max_residual` stays the true max over **all** columns. Column order: the
+/// Rayleigh–Ritz returns X ascending, so after the first step "the lowest `head`" are the first; at the
+/// guess they are the first `head` as given (a warm guess is stored ascending).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lobpcg_split(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
+                           work: &mut LobpcgWork, tol: f64, head: usize, tail_tol: f64, checked: usize, max_iter: usize,
+                           should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
+    assert!(tail_tol >= tol, "lobpcg_split: tail_tol {tail_tol} must not be below tol {tol}");
+    assert!(head <= checked && checked <= x.len() && checked > 0, "lobpcg_split: need 0 < head ≤ checked ≤ {} (head {head}, checked {checked})", x.len());
+    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, Some((head, tail_tol, checked)), should_abort)
+}
+
+/// `lobpcg` with the guard's two constants as parameters (tests force the fallback with 0, 0) and the
+/// split stop test of `lobpcg_split` (`tail` = (head, tail_tol, checked); `None`: every column at `tol`, the
+/// instruction-for-instruction path of `lobpcg`/`lobpcg_with_guess_tol`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                           work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
-                          mut should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
+                          tail: Option<(usize, f64, usize)>, mut should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     let nk = x.len();
     assert!(nk > 0, "lobpcg: no eigenpairs requested");
     assert!(nk <= work.k, "lobpcg: work was built for k = {}, called with {nk} vectors", work.k);
@@ -622,20 +651,30 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
         gram_dispatches += nd;
         let (mut a_mat, mut b_mat, res2) = assemble(m, nk, &theta, &dots)?;
         let mut max_res = 0.0f64;
+        let mut split_res = 0.0f64; // max_i ρ_i·tol/tol_i under a split stop test (`lobpcg_split`)
+        let (mut head_res, mut tail_res) = (0.0f64, 0.0f64); // its two tiers' true max residuals
         for i in 0..nk {
             let xx = b_mat[(i, i)];
             lambda[i] = a_mat[(i, i)] / xx; // = θ_i + ⟨x_i, r_i⟩/⟨x_i, x_i⟩, the Rayleigh quotient of the stored x_i
             evals[i] = lambda[i];
-            max_res = max_res.max((res2[i] / xx).sqrt());
+            let res = (res2[i] / xx).sqrt();
+            max_res = max_res.max(res);
+            if let Some((head, tail_tol, checked)) = tail {
+                if i < head { head_res = head_res.max(res); } else if i < checked { tail_res = tail_res.max(res); }
+                if i < checked { split_res = split_res.max(if i < head { res } else { res * (tol / tail_tol) }); }
+            }
         }
-        if max_res < 0.5 * best { best = max_res; best_it = iterations; }
-        if let Some(stop) = classify(max_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
-            stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
+        let split_residual = tail.map(|_| (head_res, tail_res));
+        // the stop test's residual: the true max, or the split one (`tail`)
+        let stop_res = if tail.is_some() { split_res } else { max_res };
+        if stop_res < 0.5 * best { best = stop_res; best_it = iterations; }
+        if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
+            stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual };
             break;
         }
         if let Some(abort) = should_abort.as_mut() {
             if abort() {
-                stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
+                stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual };
                 break;
             }
         }
@@ -652,7 +691,10 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
                 eprintln!("lobpcg it {iterations}: max_res {max_res:.2e} α {alpha:.2} σ(B̃) min {:.2e} max {:.2e} m {m}", sig.min(), sig.max());
                 if sig.min() < 1e-6 && iterations.is_multiple_of(10) { eprintln!("  B̃ = {:.4}", bn); }
             }
-            if alpha <= alpha_max.max(alpha_fraction * max_res / floor) { (th, c) } else {
+            // the noise budget is a tenth of the residual still to be removed: under a split stop test
+            // that of the tested columns (`stop_res`) — an untested buffer far from convergence must not
+            // relax the guard for columns already at tol (task 8b fix 1); otherwise the true max
+            if alpha <= alpha_max.max(alpha_fraction * stop_res / floor) { (th, c) } else {
                 fallbacks += 1;
                 let mut mgs = Mgs::new((0..nk).map(|i| Col { f: s[i], norm2: b_mat[(i, i)] }).collect());
                 // w_0's projection dots are already in B: ⟨x_j, w_0⟩ and ⟨w_0, w_0⟩
@@ -986,7 +1028,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let h = GpuHamiltonian { v: &rig.v, nl: None };
         let tol = 2.0 * residual_floor_estimate(&rig.g);
-        let stats = lobpcg_with(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, tol, 500, 0.0, 0.0, None).unwrap();
+        let stats = lobpcg_with(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, tol, 500, 0.0, 0.0, None, None).unwrap();
         let m = gram(&rig, &x);
         let worst_orth = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
         let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);

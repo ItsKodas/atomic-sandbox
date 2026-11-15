@@ -160,6 +160,9 @@ pub enum Action {
     /// The estimated solver's cloud: atomic superposition between DFT clouds, and the display
     /// refresh (on, every s seconds).
     Cloud { superposition: bool, refresh: bool, refresh_s: f64 },
+    /// The View setting "refresh orbitals every N s" (estimated solver: the Harris display
+    /// solves' interval while playing; `worker::harris`). Script word `orbital-refresh <s>`.
+    OrbitalRefresh(f64),
     /// Draft mode: the model answers every step (unsafe).
     Draft(bool),
     /// The toolbar's ⚠ Model only (user request 2026-11-12): on = draft on and audits off (the
@@ -306,6 +309,8 @@ fn model_only_on(st: &mut UiState, out: &mut PanelOutput) {
     (st.draft, st.audit_every) = (true, 0);
     out.commands.push(Command::SetDraft(true));
     out.commands.push(Command::SetAudit(0));
+    // a changed orbital view then asks for a Harris display solve, not a DFT refresh
+    out.commands.push(Command::SetModelOnly(true));
 }
 
 /// ⚠ Model only off: the draft mode and audit cadence it replaced, exactly.
@@ -314,13 +319,15 @@ fn model_only_off(st: &mut UiState, out: &mut PanelOutput) {
     (st.draft, st.audit_every) = (saved.draft, saved.audit_every);
     out.commands.push(Command::SetDraft(saved.draft));
     out.commands.push(Command::SetAudit(saved.audit_every));
+    out.commands.push(Command::SetModelOnly(false));
 }
 
 /// A hand change of draft mode or the audit cadence while ⚠ Model only is on (user request
 /// 2026-11-12): the user's choice wins — Model only turns itself off and restores nothing over it
 /// (the other setting stays as Model only left it), and the status line says so.
-fn model_only_by_hand(st: &mut UiState, what: &str) {
+fn model_only_by_hand(st: &mut UiState, what: &str, out: &mut PanelOutput) {
     if st.model_only.take().is_some() {
+        out.commands.push(Command::SetModelOnly(false));
         st.set_status(format!("model only is off: you changed {what} by hand, so nothing was restored over it"));
     }
 }
@@ -707,7 +714,7 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             out.commands.push(Command::PurgeForgotten(n));
         }
         Action::SetAudit(n) => {
-            model_only_by_hand(st, "the audit cadence");
+            model_only_by_hand(st, "the audit cadence", out);
             st.audit_every = n;
             out.commands.push(Command::SetAudit(n));
         }
@@ -730,8 +737,12 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.cloud_refresh_s = refresh_s;
             out.commands.push(st.cloud_command());
         }
+        Action::OrbitalRefresh(s) => {
+            st.orbital_refresh_s = s;
+            out.commands.push(st.orbital_refresh_command());
+        }
         Action::Draft(on) => {
-            model_only_by_hand(st, "draft mode");
+            model_only_by_hand(st, "draft mode", out);
             st.draft = on;
             out.commands.push(Command::SetDraft(on));
         }
@@ -1181,6 +1192,7 @@ impl Action {
             VolumeMode(m) => format!("volume-mode {m}"),
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
             Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
+            OrbitalRefresh(s) => format!("orbital-refresh {s}"),
             Draft(b) => format!("draft {b}"),
             ModelOnly(b) => format!("model-only {b}"),
             DragForce(f) => format!("drag-force {f}"),
@@ -1380,6 +1392,10 @@ impl Action {
             "cloud" => {
                 want(3)?;
                 Cloud { superposition: flag(args[0])?, refresh: flag(args[1])?, refresh_s: num(head, args[2])? }
+            }
+            "orbital-refresh" => {
+                want(1)?;
+                OrbitalRefresh(num(head, args[0])?)
             }
             "drag-force" => {
                 want(1)?;

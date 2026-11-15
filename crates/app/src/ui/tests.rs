@@ -104,6 +104,13 @@ fn m5b_actions_send_walls_cloud_and_draft() {
     assert!(matches!(c.commands.as_slice(), [Command::SetCloud { superposition: false, refresh_s: Some(x) }] if *x == 4.0));
     let c = act(&mut st, &inp, Action::Draft(true));
     assert!(matches!(c.commands.as_slice(), [Command::SetDraft(true)]) && st.draft);
+    // "refresh orbitals every N s" (live-orbitals Task 6): 2 s by default, sent as the worker's
+    // Harris cadence, a script's value kept within the slider's 1–10 s
+    assert_eq!(st.orbital_refresh_s, 2.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(3.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(3)) && st.orbital_refresh_s == 3.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(60.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(10)), "{:?}", c.commands);
 }
 
 /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms
@@ -242,6 +249,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         engine: if backend == Backend::Cpu { Backend::Cpu } else { Backend::Gpu },
         model,
         atom_profiles: Default::default(),
+        harris_note: None,
         edits: 0,
         driver_commands: 0,
         commands: 0,
@@ -1595,27 +1603,28 @@ fn model_only_saves_and_restores_draft_and_audits() {
     assert!(st.model_only.is_none() && overlays::model_only_chip(&st).is_none(), "every session starts with it off");
     act(&mut st, &inp, Action::SetAudit(500));
     let out = act(&mut st, &inp, Action::ModelOnly(true));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0)]), "{:?}", out.commands);
+    // (and the worker's Model only: a changed orbital view then asks for a Harris solve, live-orbitals Task 6)
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0), Command::SetModelOnly(true)]), "{:?}", out.commands);
     assert!(st.draft && st.audit_every == 0);
     assert_eq!(st.model_only, Some(ModelOnlySaved { draft: false, audit_every: 500 }));
     assert_eq!(st.audit_every_on, 500, "\"audits on\" would bring back the replaced cadence");
     assert_eq!(overlays::model_only_chip(&st), Some("model only — no DFT checks"));
     assert!(act(&mut st, &inp, Action::ModelOnly(true)).commands.is_empty(), "already on: nothing");
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(!st.draft && st.audit_every == 500 && st.model_only.is_none() && overlays::model_only_chip(&st).is_none());
     assert!(act(&mut st, &inp, Action::ModelOnly(false)).commands.is_empty(), "already off: nothing");
     // draft already on before: it stays on after
     act(&mut st, &inp, Action::Draft(true));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     // the solver leaves Estimated: off, restored
     let mut st = fresh();
     act(&mut st, &inp, Action::SetAudit(700));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Backend(Backend::Gpu));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(st.backend == Backend::Gpu && st.model_only.is_none() && !st.draft && st.audit_every == 700);
     // not on another solver (the toggle is hidden there; a script could still ask)
     let out = act(&mut st, &inp, Action::ModelOnly(true));
@@ -1624,14 +1633,14 @@ fn model_only_saves_and_restores_draft_and_audits() {
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Draft(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetDraft(false)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && !st.draft && st.audit_every == 0);
     assert!(st.status.contains("by hand"), "{}", st.status);
     // a hand change of the cadence: off, the cadence kept, draft left on
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::SetAudit(300));
-    assert!(matches!(out.commands.as_slice(), [Command::SetAudit(300)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetAudit(300)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && st.draft && st.audit_every == 300);
     // Ctrl K finds it by either name
     for q in ["model only", "no DFT checks"] {
@@ -3184,6 +3193,7 @@ mod orbital_viewer {
             what,
             lone_atom: LoneAtomLabels::NotLoneAtom,
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 
@@ -3848,6 +3858,172 @@ mod orbital_viewer {
         // and none at all in Density mode
         st.show = ShowMode::Density;
         assert_eq!(shown.label(&st, Some(&cpu_teacher)), None);
+    }
+
+    // ---- live orbitals (live-orbitals Task 7: the Harris display solve's labels, spec §6) ----
+
+    /// A Harris display payload over `rows` at `positions`.
+    fn harris_payload(rows: Vec<OrbitalInfo>, positions: Vec<[f64; 3]>, rescale: f64) -> OrbitalDisplay {
+        OrbitalDisplay { positions, kind: sim::OrbitalKind::Harris { experience: None, rescale, wall_s: 0.31 }, ..payload(rows, OrbitalRequest::List) }
+    }
+
+    /// Spec §6 / §4.3: a Harris payload at the current positions is drawn at full strength and says
+    /// what it is — solved once in the potential of superposed atoms, not self-consistent — never
+    /// "last DFT solve"; moved since, it is faded and says "an earlier geometry"; a charged scene's
+    /// says the atoms were rescaled; with no payload yet, the reason no display solve runs is the label.
+    #[test]
+    fn harris_labels_say_what_they_are() {
+        use super::super::dock::orbitals::{HARRIS_DENSITY_NOTE, HARRIS_NOTE, HARRIS_RESCALED};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        let here: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let mut snap = with_payload(&scene, Backend::Estimated, harris_payload(h2_rows(), here.clone(), 1.0));
+        let mut m = model();
+        m.audits_background = true;
+        snap.model = Some(m);
+        snap.dynamics.orbitals_t = units::fs_to_au_time(12.5);
+        snap.dynamics.orbitals_side = Some(SideKind::Harris);
+        let mut shown = OrbitalShown::default();
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), 1.0, "a Harris payload at the current positions is current");
+        let label = shown.label(&st, Some(&snap)).expect("a display solve's orbitals are always labelled");
+        assert!(label.starts_with("orbitals solved once at t = 12.50 fs in the potential of superposed atoms, not self-consistent"), "{label}");
+        assert!(label.contains(HARRIS_NOTE), "{label}");
+        assert!(!label.contains("last DFT solve") && !label.contains("earlier geometry") && !label.contains(HARRIS_RESCALED), "{label}");
+        // Spin density: the field drawn is this solve's output
+        st.show = ShowMode::Spin;
+        snap.dynamics.orbitals.as_mut().unwrap().field = Some(sim::OrbitalField::Cpu { values: std::sync::Arc::new(vec![0.0; 8]), signed: true, scale: 1.0 });
+        assert!(shown.label(&st, Some(&snap)).unwrap().contains(HARRIS_DENSITY_NOTE));
+        st.show = ShowMode::Orbitals;
+        // the nuclei moved on by 0.1 Bohr: faded, an earlier geometry
+        snap.dynamics.scene.nuclei[0].pos[0] += 0.1;
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), SURROGATE_DENSITY_FADE);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.contains(HARRIS_NOTE) && label.contains("earlier geometry"), "{label}");
+        // a charged scene: the superposed atoms were rescaled to its electrons
+        snap.dynamics.orbitals = Some(harris_payload(h2_rows(), here.clone(), 0.667));
+        snap.dynamics.scene.nuclei[0].pos[0] -= 0.1;
+        shown.follow(&snap.dynamics);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.contains(HARRIS_RESCALED) && label.contains("× 0.667") && !label.contains("earlier geometry"), "{label}");
+        assert_eq!(shown.fade(), 1.0);
+        // a converged background payload keeps its own (faded) label
+        snap.dynamics.orbitals = Some(OrbitalDisplay { positions: here.clone(), ..payload(h2_rows(), OrbitalRequest::List) });
+        snap.dynamics.orbitals_side = Some(SideKind::Refresh);
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), SURROGATE_DENSITY_FADE);
+        assert!(shown.label(&st, Some(&snap)).unwrap().contains("last DFT solve"));
+        // ... with the reason no display solve runs said first
+        snap.harris_note = Some(crate::sim::HARRIS_WAITING_ATOMS);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.starts_with(crate::sim::HARRIS_WAITING_ATOMS) && label.contains("last DFT solve"), "{label}");
+        // no payload yet: the note is the label
+        snap.dynamics.orbitals = None;
+        snap.harris_note = Some(crate::sim::HARRIS_PAUSED_PASS);
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.label(&st, Some(&snap)).as_deref(), Some(crate::sim::HARRIS_PAUSED_PASS));
+    }
+
+    /// Spec §6: a Harris payload's ε cells, the levels line and the diagram's HOMO / LUMO / gap
+    /// print with "≈" and say on hover that they are approximate; a converged payload's print none.
+    /// The details line names the display solve; its per-atom electrons are not drawn.
+    #[test]
+    fn harris_eps_cells_are_approximate() {
+        use super::super::dock::orbitals::{harris_line, levels_line, visible_notes, HARRIS_EPS_TIP, PER_ATOM_NOTE};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let here: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let mut o = harris_payload(h2_rows(), here.clone(), 1.0);
+        o.notes = vec![format!("{PER_ATOM_NOTE}: atom 0 H 0.9931 → 1, atom 1 H 0.9931 → 1")];
+        // the pure parts
+        let levels = Levels::of_payload(&o);
+        assert!(levels.approx);
+        let (_, es) = orbitals::entries(&o);
+        let v = es[0].view(&levels);
+        assert!(v.ha.starts_with('≈') && v.ev.starts_with('≈') && v.eps_tip().contains(HARRIS_EPS_TIP), "{v:?}");
+        let line = levels_line(&levels).unwrap();
+        assert!(line.contains("HOMO ≈−0.500 Ha") && line.contains("gap ≈0.520 Ha"), "{line}");
+        assert!(visible_notes(&o, false).is_empty(), "the per-atom electrons are for the log");
+        assert!(harris_line(&o.kind).is_some_and(|l| l.contains("not self-consistent") && l.contains("0.31 s")));
+        assert_eq!(harris_line(&sim::OrbitalKind::Converged), None);
+        // rendered
+        let snap = with_payload(&scene, Backend::Estimated, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.open_tab(DockTab::Orbitals);
+        let texts = frame_texts(&ctx, &mut st, &inp, vec![], 1.0);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("≈−0.500")), "an ε cell: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "HOMO ≈−0.500 Ha"), "the diagram's HOMO: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.starts_with(PER_ATOM_NOTE)), "not drawn");
+        let t = hover_text(&ctx, &mut st, &inp, "eps-↑-1");
+        assert!(t.contains(HARRIS_EPS_TIP), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-homo");
+        assert!(t.contains(HARRIS_EPS_TIP), "{t}");
+        // a converged payload: no "≈" anywhere in the panel
+        let snap = with_payload(&scene, Backend::Gpu, OrbitalDisplay { positions: here, ..payload(h2_rows(), OrbitalRequest::List) });
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let texts = frame_texts(&ctx, &mut st, &inp, vec![], 1.0);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("−0.500")), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.starts_with('≈') || t.contains("≈−") || t.contains("gap ≈")), "{texts:?}");
+        let t = hover_text(&ctx, &mut st, &inp, "eps-↑-1");
+        assert!(!t.contains(HARRIS_EPS_TIP), "{t}");
+    }
+
+    /// Spec §4.3: an orbital display solve has its own job row — never "DFT fallback" — and its own
+    /// words in the solve log; ⚠ Model only says what it still runs; the Density view says the list
+    /// gets no fresh rows under Model only.
+    #[test]
+    fn harris_job_row_is_not_a_fallback() {
+        use activity::jobs::{rows, JobKey, HARRIS_JOB_TITLE};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut m = model();
+        m.audits_background = true;
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let probe = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Harris)), ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let jobs: Vec<&activity::jobs::JobRow> = r.iter().filter(|r| r.key == JobKey::Orbitals).collect();
+        assert_eq!(jobs.len(), 1, "one row");
+        assert_eq!(jobs[0].title, HARRIS_JOB_TITLE);
+        assert_eq!(jobs[0].title, "Orbital display solve");
+        assert!(jobs[0].detail.contains("not self-consistent") && jobs[0].detail.contains("0.3 s"), "{}", jobs[0].detail);
+        assert!(jobs[0].control.is_none() && jobs[0].no_control_why.is_some_and(|w| w.contains("not self-consistent")));
+        assert!(r.iter().all(|r| r.title != "DFT fallback"), "{:?}", r.iter().map(|r| &r.title).collect::<Vec<_>>());
+        // the solve log's words (Task 4 review M6): not the unoccupied eigensolve's
+        let (what, hover) = activity::log::display_words(sim::DisplayJob::Harris);
+        assert!(what.contains("not self-consistent") && !hover.contains("converged state"), "{what} / {hover}");
+        assert!(activity::log::display_words(sim::DisplayJob::Unoccupied(4)).1.contains("converged state"));
+        // ⚠ Model only's promise
+        let tip = super::super::toolbar::MODEL_ONLY_TIP;
+        assert!(tip.contains("display-only orbital solves") && tip.contains("not self-consistent") && tip.contains("no DFT runs for forces or motion"), "{tip}");
+        // the Density view under Model only: the list is not refreshed
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Density;
+        st.open_tab(DockTab::Orbitals);
+        let inp = input(&scene, Some(&snap), &cam);
+        let texts = |st: &mut UiState| frame_texts(&ctx, st, &inp, vec![], 1.0).into_iter().map(|(t, _)| t).collect::<Vec<_>>().join("\n");
+        assert!(!texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
+        st.model_only = Some(super::super::ModelOnlySaved { draft: false, audit_every: 2000 });
+        assert!(texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
+        // no payload yet (fix round 1, minor 5): an orbital view of the estimated GPU solver says a
+        // display solve fills it, or why none runs; the DFT solvers still need a DFT step
+        st.show = ShowMode::Orbitals;
+        assert_eq!(orbitals::no_orbitals_note(&inp, &st), orbitals::HARRIS_PENDING);
+        let mut paused = snapshot(&scene, Backend::Estimated, snap.model.clone());
+        paused.harris_note = Some(crate::sim::HARRIS_PAUSED_PASS);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&paused), &cam), &st), crate::sim::HARRIS_PAUSED_PASS);
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&gpu), &cam), &st), "needs a DFT step");
     }
 
     /// Ctrl K finds the modes by their names.
@@ -5211,7 +5387,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let snap = snapshot(&scene, Backend::Gpu, None);
-        let probe = sim::ProbeView { display: Some((0.3, 4)), display_solves: 2, ..Default::default() };
+        let probe = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Unoccupied(4))), display_solves: 2, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
         let job = r.iter().find(|r| r.key == JobKey::Orbitals).expect("the eigensolve's job row");
@@ -5221,7 +5397,7 @@ mod activity_tab {
         assert!(rows(&idle, idle.probe.as_ref()).iter().all(|r| r.key != JobKey::Orbitals));
 
         let mut st = activity::ActivityState::new();
-        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, unoccupied: 4, interrupted };
+        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, job: sim::DisplayJob::Unoccupied(4), interrupted };
         st.absorb_display(vec![solve(120.0, false)]);
         std::thread::sleep(Duration::from_millis(2));
         let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -8529,6 +8705,8 @@ mod view_panel {
         st.backend = Backend::Estimated;
         let p = probes_now(&ctx, &mut st, &inp);
         assert!(p.contains("cloud-refresh") && p.contains("cloud-superposition") && p.contains("aid-warp"));
+        // "refresh orbitals every N s" beside them (live-orbitals Task 6)
+        assert!(p.contains("orbital-refresh-s"));
     }
 
     /// A press and release at `at`.

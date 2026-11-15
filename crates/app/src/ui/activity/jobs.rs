@@ -88,6 +88,11 @@ pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     (parts.join(" · "), tag)
 }
 
+/// An orbital display solve's job title (live-orbitals spec §4.3; never "DFT fallback").
+pub const HARRIS_JOB_TITLE: &str = "Orbital display solve";
+/// Why it has no control, and what it is (also the solve log's hover).
+pub const HARRIS_JOB_WHY: &str = "display only: one diagonalisation in the potential of the superposed isolated atoms at the current nuclei, for the orbital view of the estimated solver — not self-consistent, no SCF; it never feeds a step, nothing learns from it, no counter counts it, and a newer command or geometry replaces it";
+
 /// The rows for what the worker does now. `probe` is the live solve state (`PanelInput::probe`).
 pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRow> {
     let mut v = Vec::new();
@@ -138,8 +143,8 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             count: None,
         });
     }
-    if let Some((s, m)) = probe.and_then(|p| p.display) {
-        v.push(JobRow {
+    match probe.and_then(|p| p.display) {
+        Some((s, sim::DisplayJob::Unoccupied(m))) => v.push(JobRow {
             key: JobKey::Orbitals,
             title: "Computing orbitals".into(),
             detail: format!("{m} unoccupied orbital{} per spin for the Orbitals view, on the last DFT step's converged state · display only", if m == 1 { "" } else { "s" }),
@@ -152,7 +157,24 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
-        });
+        }),
+        // an orbital display solve (live-orbitals spec §4.3): its own job, never a fallback, an
+        // audit or a teacher solve
+        Some((s, sim::DisplayJob::Harris)) => v.push(JobRow {
+            key: JobKey::Orbitals,
+            title: HARRIS_JOB_TITLE.into(),
+            detail: format!("orbital display solve (not self-consistent) · {s:.1} s"),
+            progress: JobProgress::Indeterminate,
+            elapsed_s: Some(s),
+            eta_s: None,
+            control: None,
+            no_control_why: Some(HARRIS_JOB_WHY),
+            scf: None,
+            keeps_block: false,
+            stage: None,
+            count: None,
+        }),
+        None => {}
     }
     let pending = m.map_or(0, |m| m.user_changes_pending);
     if let Some(r) = probe.and_then(|p| p.refit) {

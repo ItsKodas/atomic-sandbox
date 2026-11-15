@@ -211,6 +211,15 @@
 //! The display solve writes only the nonlocal operator's projection scratch (`proj_dot` partials,
 //! `proj_finish` coefficients), which every apply recomputes from its input, so the next solve is
 //! unaffected.
+//!
+//! The Harris display solve (`crate::harris`, `GpuSolver::harris`) borrows through a fourth,
+//! `harris_work`, which needs **no** converged state: the kernels, the reducer, the `GpuPoisson`
+//! and the same `LobpcgWork` grown to the Harris block. It never touches `warm`, `converged`,
+//! `prev_rho`, the pool or the cached `ionic` (`harris_work` does not lend them). The Poisson solver
+//! is as stateless across calls as LOBPCG: every solve rebuilds b = 4πρ + L_bc from its input (the
+//! ghost table refilled from that ρ's moments), recomputes r = b − A·v from the caller's guess v,
+//! and each V-cycle starts from x ← 0 on every level, so its work fields carry nothing from one
+//! call to the next; the guess v is the caller's own field (the SCF's V_H, or the Harris state's).
 use crate::batch::Batch;
 use crate::eigen::{lobpcg_with_guess_tol, residual_floor_estimate, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 use crate::grid::{clear_readback_fault, take_readback_fault, Field, GpuGrid};
@@ -241,7 +250,7 @@ pub(crate) fn take_device_error() -> Option<QmError> {
 /// Relative residual requested from every Poisson solve — below the f32 floor on purpose (module
 /// doc), so each solve runs to the floor and the floor is accepted — and its iteration cap.
 pub const POISSON_TOL: f64 = 1e-8;
-const POISSON_MAX_ITER: usize = 5000;
+pub(crate) const POISSON_MAX_ITER: usize = 5000;
 /// LOBPCG Rayleigh–Ritz steps per call (as on the CPU); also the display eigensolve's cap.
 pub(crate) const EIGEN_MAX_ITER: usize = 200;
 /// LOBPCG tolerance = max(settings.eig_tol, this × `residual_floor_estimate`).
@@ -368,6 +377,22 @@ pub(crate) struct DisplayWork<'a> {
     pub state: &'a GpuState,
     pub work: &'a mut LobpcgWork,
     pub ionic: Option<&'a GpuIonic>,
+}
+
+/// What a Harris display solve borrows from the solver (`GpuSolver::harris_work`, module doc "Display
+/// access"): no state of the SCF's, only its stateless machinery — kernels, reducer, the Poisson solver
+/// (and its tolerance) and the LOBPCG work space with its size (the Harris solve grows it as its block
+/// grows; the SCF re-creates it only when it needs more than `work_k`).
+pub(crate) struct HarrisWork<'a> {
+    pub ctx: &'a GpuContext,
+    pub k: &'a Kernels,
+    pub r: &'a Reducer,
+    pub g: &'a GpuGrid,
+    pub grid: &'a qm::Grid,
+    pub poisson: &'a mut GpuPoisson,
+    pub poisson_tol: f64,
+    pub work: &'a mut Option<LobpcgWork>,
+    pub work_k: &'a mut usize,
 }
 
 /// A pool of padded fields reused across solves (never shrinks). Every consumer overwrites the
@@ -582,7 +607,7 @@ pub(crate) fn xc_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, up: &Field, dn: &Fi
 
 /// ρ = Σ_i ψ_i² (`occ` None: today's sequence of `mul_add_sq`), or Σ_i f_i ψ_i² with f = 0 skipped and f = 1 by the
 /// unweighted kernel (`qm::scf::weighted_density`; recorded).
-fn accumulate_density(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &Field, orbitals: &[Field], occ: Option<&[f64]>) {
+pub(crate) fn accumulate_density(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &Field, orbitals: &[Field], occ: Option<&[f64]>) {
     fill_in(b, k, g, rho, 0.0);
     match occ {
         None => for psi in orbitals { mul_add_sq_in(b, k, g, rho, psi); },
@@ -1230,8 +1255,10 @@ impl GpuSolver {
                            core_overlaps: overlaps, fractional, released }))
     }
 
-    /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access").
-    pub(crate) fn effective_eig_tol(&self, settings: &ScfSettings) -> f64 {
+    /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access"); a Harris
+    /// display solve runs at it too (`crate::harris`), and `providers` reads it for that payload's
+    /// spin-noise bound.
+    pub fn effective_eig_tol(&self, settings: &ScfSettings) -> f64 {
         effective_eig_tol(settings.eig_tol, self.eig_floor_factor, &self.g)
     }
 
@@ -1252,6 +1279,16 @@ impl GpuSolver {
         // all-electron solve leaves a stale cache, hence the gate on the state's own setup
         let ionic = if state.ionic.is_some() { Some(ionic.as_ref().expect("a pseudo state was solved with the ionic terms")) } else { None };
         Some(DisplayWork { k: kernels, state, work: work.as_mut().expect("sized above"), ionic })
+    }
+
+    /// What a Harris display solve borrows (module doc, "Display access"; `crate::harris`): the
+    /// kernels, the reducer, the Poisson solver at this solver's `poisson_tol`, and this solver's
+    /// `LobpcgWork` slot with its size (grown by the Harris solve as its block needs). No converged
+    /// state is needed and none of the SCF's state (warm start, parked densities, the ionic cache,
+    /// the pool) is lent.
+    pub(crate) fn harris_work(&mut self) -> HarrisWork<'_> {
+        let GpuSolver { ctx, k: kernels, r, g, grid, poisson, work, work_k, poisson_tol, .. } = self;
+        HarrisWork { ctx, k: kernels, r, g, grid, poisson, poisson_tol: *poisson_tol, work, work_k }
     }
 
     /// The vectors the LOBPCG work space holds now (tests: the display solve grows it).
@@ -1567,7 +1604,7 @@ mod tests {
     #[test]
     fn lobpcg_cap_warns_only_on_the_final_step() {
         let tol = 1e-6;
-        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0 };
+        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None };
         let ms = Duration::from_millis(1);
         // early cap hit, final step converged: note, no warning
         let mut a = Inner::new(tol);

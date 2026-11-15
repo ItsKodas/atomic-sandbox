@@ -195,6 +195,15 @@
 //!   reports every shared cluster of the final state, `ScfStats.released` every release).
 //! - The warm-start guard also requires the same scheme (`KsState.occupations`), so an integer,
 //!   broken-symmetry state never seeds a shared solve.
+//! - One shot (`one_shot_occupations`, live-orbitals spec §4.1): a single diagonalisation with no SCF
+//!   loop (the Harris display solve of the estimated mode) applies the same rule once to its levels:
+//!   `Aufbau` fills the N_σ lowest; `DegenerateShells` runs phase 1 with τ_c on the computed levels,
+//!   then phase 2's decision (`decide`) once on those same levels — there is no second convergence,
+//!   so "the converged spread" is the one-shot spread. There is no witness growth either: when the top
+//!   computed level lies within τ_c of ε_F (`degenerate_shell_occupations` returns `None`), every
+//!   computed level within τ_c of ε_F is the cluster — it always straddles ε_F, so it is shared, then
+//!   decided — and `OneShot.window_short` reports that the window was cut by the block size. The
+//!   result is a display occupation, never a Kohn–Sham fixed point's.
 //!
 //! # The stall stop (`StallWatch`, `ScfSettings::stall_window`)
 //! A solve that cannot converge used to run to `max_iter` (200) before failing, and the providers'
@@ -313,6 +322,59 @@ pub fn released_occupations(sorted: &[f64], electrons: f64, tau: f64) -> Vec<f64
         left -= take;
     }
     f
+}
+
+/// The occupations of one spin channel after a single diagonalisation (`one_shot_occupations`; module doc,
+/// "Occupations", one-shot paragraph): `f` in the order of the given `evals`, Σf = n; `shared` the cluster shared in
+/// the final `f` (`None` when every f is 0 or 1; `first` is a rank in ascending order); `released` iff phase 2 split
+/// the candidate cluster; `window_short` iff the top computed level lay within τ_c of ε_F (no gap witness).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OneShot { pub f: Vec<f64>, pub shared: Option<FractionalShell>, pub released: bool, pub window_short: bool }
+
+/// Applies `rule` once to the levels `evals` (any order) of spin `spin` holding `n` electrons (module doc,
+/// "Occupations", one-shot paragraph). `Aufbau`: 1 on the n lowest by rank. `DegenerateShells { tau }`: phase 1 with
+/// τ_c (`degenerate_shell_occupations`; without a gap witness every computed level within τ_c of ε_F is shared and
+/// `window_short` is set), then phase 2 once (`decide`: a shared cluster of spread ≥ `tau` is released). Panics if
+/// n > 0 and `evals.len() < n` (`Aufbau`) or `evals.len() <= n` (`DegenerateShells`).
+pub fn one_shot_occupations(evals: &[f64], n: usize, spin: u8, rule: Occupations) -> OneShot {
+    let none = |f| OneShot { f, shared: None, released: false, window_short: false };
+    if n == 0 { return none(vec![0.0; evals.len()]); }
+    let order = ascending(evals);
+    match rule {
+        Occupations::Aufbau => {
+            assert!(evals.len() >= n, "aufbau needs {n} levels ({} given)", evals.len());
+            let mut f = vec![0.0; evals.len()];
+            for &i in &order[..n] { f[i] = 1.0; }
+            none(f)
+        }
+        Occupations::DegenerateShells { tau } => {
+            let k = evals.len();
+            assert!(k > n, "the rule needs at least one level above the {n} electrons ({k} given)");
+            let (f, shell, window_short) = match degenerate_shell_occupations(evals, n, CANDIDATE_TAU) {
+                Some((f, shell)) => (f, shell, false),
+                None => {
+                    // no gap witness: the cluster |ε − ε_F| < τ_c is a contiguous run of ranks containing ε_F (rank
+                    // n − 1) and the top level (rank k − 1 ≥ n), so it always straddles ε_F and is shared
+                    let e_f = evals[order[n - 1]];
+                    let first = order.iter().position(|&i| (evals[i] - e_f).abs() < CANDIDATE_TAU).expect("ε_F is in its own cluster");
+                    let count = k - first;
+                    let fc = (n - first) as f64 / count as f64;
+                    let mut f = vec![0.0; k];
+                    for (rank, &i) in order.iter().enumerate() { f[i] = if rank < first { 1.0 } else { fc }; }
+                    let spread = evals[order[k - 1]] - evals[order[first]];
+                    (f, Some((first, count, fc, spread)), true)
+                }
+            };
+            let shells: Vec<FractionalShell> = shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread }).into_iter().collect();
+            let mut released = Vec::new();
+            let by_rank = decide(evals, &f, &shells, tau, &mut released);
+            let mut f = vec![0.0; k];
+            for (rank, &i) in order.iter().enumerate() { f[i] = by_rank[rank]; }
+            let runs = shared_runs(evals, &order, &by_rank, spin);
+            debug_assert!(runs.len() <= 1, "one cluster, at most one partly filled group: {runs:?}");
+            OneShot { f, shared: runs.into_iter().next(), released: !released.is_empty(), window_short }
+        }
+    }
 }
 
 /// Nuclei, the number of electrons in each spin channel, and the ionic setup (`None`: today's
@@ -1346,6 +1408,68 @@ mod tests {
         let mut rel = Vec::new();
         let by_rank = decide(&[-0.80, -0.27, -0.27, -0.27, 0.07], &[1.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0], &[kept], tau, &mut rel);
         assert!(rel.is_empty() && (by_rank[1] - 1.0 / 3.0).abs() < 1e-15);
+    }
+
+    /// One-shot `Aufbau` (module doc, "Occupations", one-shot paragraph): 1 on the n lowest by rank, in the order of
+    /// `evals`; n = 0 is all zeros under either rule.
+    #[test]
+    fn one_shot_aufbau_fills_the_lowest() {
+        let evals = [-0.1, 0.3, -0.6, -0.2];
+        let o = one_shot_occupations(&evals, 2, 0, Occupations::Aufbau);
+        assert_eq!(o.f, vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(o.f.iter().sum::<f64>(), 2.0);
+        assert!(o.shared.is_none() && !o.released && !o.window_short, "{o:?}");
+        for rule in [Occupations::Aufbau, Occupations::DegenerateShells { tau: DEGENERACY_TAU }] {
+            let o = one_shot_occupations(&evals, 0, 1, rule);
+            assert_eq!((o.f, o.shared, o.released, o.window_short), (vec![0.0; 4], None, false, false));
+        }
+    }
+
+    /// One-shot `DegenerateShells`: a p set split by 6e-5 < τ across ε_F (two of three electrons) is shared 2/3 each
+    /// and kept (spread < τ).
+    #[test]
+    fn one_shot_shares_a_degenerate_p_shell() {
+        let o = one_shot_occupations(&[-1.0, -0.40000, -0.40004, -0.39998, 0.2], 3, 1, Occupations::DegenerateShells { tau: DEGENERACY_TAU });
+        assert_eq!(o.f[0], 1.0);
+        for i in 1..4 { assert!((o.f[i] - 2.0 / 3.0).abs() < 1e-15, "{o:?}"); }
+        assert_eq!(o.f[4], 0.0);
+        assert!((o.f.iter().sum::<f64>() - 3.0).abs() < 1e-12);
+        let c = o.shared.as_ref().expect("a shared shell");
+        assert!(c.spin == 1 && c.first == 1 && c.count == 3 && (c.f - 2.0 / 3.0).abs() < 1e-15 && (c.spread - 6e-5).abs() < 1e-12, "{c:?}");
+        assert!(!o.released && !o.window_short, "{o:?}");
+    }
+
+    /// One-shot `DegenerateShells`: the candidate cluster (−0.402, −0.400, −0.395; one electron) has spread 7e-3 ≥ τ,
+    /// so phase 2 releases it once — f is `released_occupations` of the cluster.
+    #[test]
+    fn one_shot_releases_a_split_cluster() {
+        let evals = [-1.0, -0.402, -0.400, -0.395, 0.2];
+        let o = one_shot_occupations(&evals, 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU });
+        assert!(o.released && !o.window_short, "{o:?}");
+        assert_eq!(o.f[0], 1.0);
+        assert_eq!(o.f[1..4].to_vec(), released_occupations(&evals[1..4], 1.0, DEGENERACY_TAU));
+        assert_eq!(o.f[4], 0.0);
+        assert!((o.f.iter().sum::<f64>() - 2.0).abs() < 1e-12);
+        assert!(o.shared.is_none(), "the release leaves every level integer: {o:?}");
+    }
+
+    /// One-shot `DegenerateShells` with the top computed level within τ_c of ε_F (no gap witness): the cluster is every
+    /// computed level within τ_c, `window_short` is set, and — its spread 0.05 being ≥ τ (ruling R1 of the Phase A
+    /// plan: the brief's "share the remaining electron" holds for phase 1 only) — phase 2 releases it.
+    #[test]
+    fn one_shot_marks_a_short_window() {
+        let evals = [-1.0, -0.40, -0.39, -0.35];
+        let o = one_shot_occupations(&evals, 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU });
+        assert!(o.window_short && o.released, "{o:?}");
+        assert_eq!(o.f[0], 1.0);
+        assert_eq!(o.f[1..4].to_vec(), released_occupations(&evals[1..4], 1.0, DEGENERACY_TAU));
+        assert!((o.f.iter().sum::<f64>() - 2.0).abs() < 1e-12);
+        // a short window whose cluster is tight (spread < τ) stays shared: the remaining electron over all three
+        let o = one_shot_occupations(&[-1.0, -0.40, -0.4002, -0.3996], 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU });
+        assert!(o.window_short && !o.released, "{o:?}");
+        for i in 1..4 { assert!((o.f[i] - 1.0 / 3.0).abs() < 1e-15, "{o:?}"); }
+        let c = o.shared.expect("a shared shell");
+        assert!(c.first == 1 && c.count == 3, "{c:?}");
     }
 
     /// Spec §5.7: the rule is inert on closed shells. H₂ and LiH (as in `none_policy_is_bitwise_today`) under

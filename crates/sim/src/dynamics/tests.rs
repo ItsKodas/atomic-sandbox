@@ -2458,6 +2458,9 @@ struct OrbitLog {
     /// The next this many payloads with unoccupied orbitals say their rows are an earlier
     /// geometry's (`current: false`, not interrupted): the provider's play cap at work.
     stale_next: usize,
+    /// `orbital_display_now` answers `None`, as a surrogate does (its one producer is the side
+    /// solver): a changed view leaves the shown payload in place.
+    no_display_now: bool,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2496,7 +2499,7 @@ impl Orbiting {
         });
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
-            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None,
+            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None, kind: crate::provider::OrbitalKind::Converged,
         })
     }
 }
@@ -2532,6 +2535,9 @@ impl ForceProvider for Orbiting {
         let abort = should_abort();
         self.log.lock().unwrap().aborts_seen.push(abort);
         self.log.lock().unwrap().now_calls += 1;
+        if self.log.lock().unwrap().no_display_now {
+            return None;
+        }
         self.payload(self.last.clone(), Cell { n: 33, h: 0.25 })
     }
 }
@@ -2717,10 +2723,10 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
         let unoccupied = (unocc > 0).then(|| UnoccupiedStatus { requested: unocc, ..Default::default() });
         let o = OrbitalDisplay {
             cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None, spin: SpinSummary::default(),
-            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None,
+            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None, kind: crate::provider::OrbitalKind::Converged,
         };
         let display = Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 };
-        SideDisplay { display, orbitals: Some(o), kind: SideKind::Audit, job, positions: Vec::new() }
+        SideDisplay { display: Some(display), orbitals: Some(o), kind: SideKind::Audit, job, positions: Vec::new() }
     };
     let shown = |d: &Dynamics| d.snapshot().orbitals.map(|o| o.rows.iter().map(|r| r.track).collect::<Vec<_>>());
     let feed = |d: &mut Dynamics, sd: SideDisplay| {
@@ -2750,6 +2756,156 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
     assert_eq!(shown(&d), Some(vec![51, 52]), "the selection fallback (track 50 gone)");
     feed(&mut d, side(8, OrbitalRequest::Orbital { spin: Spin::Up, track: 50, squared: true }, &[50], 0));
     assert_eq!(shown(&d), Some(vec![51, 52]), "|ψ|² is not the phase view");
+}
+
+// ---- Harris display orbitals (live-orbitals spec §4.2–4.3; Phase A Task 3) ----
+
+/// An orbital payload of `kind` at `positions` answering the spin-density view, its one row's
+/// track `track` (what the tests read back to tell payloads apart).
+fn kind_payload(positions: Vec<[f64; 3]>, kind: crate::provider::OrbitalKind, track: u32) -> OrbitalDisplay {
+    use crate::provider::*;
+    let row = OrbitalInfo {
+        spin: Spin::Up, index: 0, track, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
+        cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
+    };
+    OrbitalDisplay {
+        cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
+        unoccupied: None, notes: Vec::new(), what: OrbitalRequest::SpinDensity, lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None, kind,
+    }
+}
+
+fn harris_kind() -> crate::provider::OrbitalKind {
+    crate::provider::OrbitalKind::Harris { experience: None, rescale: 1.0, wall_s: 0.3 }
+}
+
+/// A side job's delivery: a density for an Audit or Refresh, none for a Harris job (its orbitals
+/// are the payload).
+fn side_payload(job: u64, kind: SideKind, positions: Vec<[f64; 3]>, track: u32) -> crate::provider::SideDisplay {
+    let okind = if kind == SideKind::Harris { harris_kind() } else { crate::provider::OrbitalKind::Converged };
+    let display = (kind != SideKind::Harris).then(|| Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 });
+    crate::provider::SideDisplay { display, orbitals: Some(kind_payload(positions.clone(), okind, track)), kind, job, positions }
+}
+
+/// Spec §4.2 "Precedence": at the same geometry (every nucleus within `HARRIS_SAME_GEOMETRY`) a
+/// converged (DFT) payload replaces a Harris one whatever the job order, and a Harris payload
+/// never replaces a converged one; at another geometry, or with another nucleus count, the newer
+/// job wins (an older one never replaces).
+#[test]
+fn side_replaces_prefers_converged_at_the_same_geometry() {
+    use crate::provider::OrbitalKind;
+    let p = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.2, 0.3]];
+    let moved: Vec<[f64; 3]> = p.iter().map(|r| [r[0] + 0.01, r[1], r[2]]).collect();
+    let tiny: Vec<[f64; 3]> = p.iter().map(|r| [r[0] + 0.5 * HARRIS_SAME_GEOMETRY, r[1], r[2]]).collect();
+    let harris = |pos: &Vec<[f64; 3]>| kind_payload(pos.clone(), harris_kind(), 0);
+    let dft = |pos: &Vec<[f64; 3]>| kind_payload(pos.clone(), OrbitalKind::Converged, 0);
+    assert!(side_replaces(None, &harris(&p), 1), "nothing shown: anything replaces");
+    assert!(side_replaces(Some((&harris(&p), 10)), &dft(&p), 9), "converged beats Harris at the same geometry, though older");
+    assert!(side_replaces(Some((&harris(&p), 10)), &dft(&tiny), 9), "…within HARRIS_SAME_GEOMETRY");
+    assert!(!side_replaces(Some((&dft(&p), 9)), &harris(&p), 10), "Harris never beats converged at the same geometry, though newer");
+    assert!(!side_replaces(Some((&harris(&p), 10)), &dft(&moved), 9), "another geometry: the older converged one loses");
+    assert!(side_replaces(Some((&dft(&p), 9)), &harris(&moved), 11), "another geometry: the newer Harris one wins");
+    assert!(side_replaces(Some((&harris(&p), 10)), &harris(&p), 11) && !side_replaces(Some((&harris(&p), 11)), &harris(&p), 10), "one kind: the newer job wins");
+    assert!(side_replaces(Some((&dft(&p), 9)), &dft(&p), 12) && !side_replaces(Some((&dft(&p), 12)), &dft(&p), 9));
+    let two = p[..2].to_vec();
+    assert!(side_replaces(Some((&dft(&p), 9)), &harris(&two), 10), "2 nuclei vs 3: the newer wins");
+    assert!(!side_replaces(Some((&harris(&two), 10)), &dft(&p), 9), "2 nuclei vs 3: the older loses, converged or not");
+}
+
+/// A Harris side job (no density) sets the shown orbitals — the snapshot's `orbitals`, with
+/// `orbitals_side == Some(Harris)` — and leaves the side density (an earlier audit's) alone, so
+/// nothing reads charges from it (`measure_side_charges` takes the worker's `side_display`).
+#[test]
+fn harris_side_display_sets_orbitals_not_density() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    let p = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.2, 0.3]];
+    let feed = |d: &mut Dynamics, sd: crate::provider::SideDisplay| {
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        d.tick(f64::INFINITY, &mut never())
+    };
+    let s1 = feed(&mut d, side_payload(1, SideKind::Audit, p.clone(), 101));
+    let audit = s1.side_display.clone().expect("the audit's density");
+    assert_eq!(audit.kind, SideKind::Audit);
+    let moved: Vec<[f64; 3]> = p.iter().map(|r| [r[0], r[1] + 0.2, r[2]]).collect();
+    let s2 = feed(&mut d, side_payload(2, SideKind::Harris, moved.clone(), 102));
+    let o = s2.orbitals.as_ref().expect("the Harris payload is shown");
+    assert_eq!((o.rows[0].track, &o.kind, &o.positions), (102, &harris_kind(), &moved));
+    assert_eq!(s2.orbitals_side, Some(SideKind::Harris));
+    assert!(s2.orbitals_seq > s1.orbitals_seq);
+    let sd = s2.side_display.as_ref().expect("the audit's density is kept");
+    assert_eq!((sd.kind, sd.seq, &sd.positions), (SideKind::Audit, audit.seq, &p), "the side density is unchanged: no Harris density");
+    assert!(s2.charges.is_none() && d.charges().is_none(), "no charges from a Harris job");
+}
+
+/// Live-orbitals Task 6 review: a converged side payload shown for view A at p does not hold back
+/// a Harris payload for view B at p once the view is B — it no longer answers the view, so neither
+/// the converged-over-Harris rule nor the job order applies to it. A Harris payload for A (the old
+/// view) is still refused, and once B's payload is shown the precedence holds again among B's.
+#[test]
+fn a_payload_of_another_view_does_not_hold_back_the_current_one() {
+    use crate::provider::{ColourLook, OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    log.lock().unwrap().no_display_now = true;
+    let a = OrbitalRequest::SpinDensity;
+    let b = OrbitalRequest::AllColoured { include: None, physical: false, look: ColourLook::default() };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(a.clone())));
+    let p = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.2, 0.3]];
+    let feed = |d: &mut Dynamics, mut sd: crate::provider::SideDisplay, what: &OrbitalRequest| {
+        sd.orbitals.as_mut().unwrap().what = what.clone();
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        d.tick(f64::INFINITY, &mut never())
+    };
+    let s = feed(&mut d, side_payload(5, SideKind::Refresh, p.clone(), 105), &a);
+    assert_eq!((s.orbitals.as_ref().map(|o| o.rows[0].track), s.orbitals_side), (Some(105), Some(SideKind::Refresh)), "A's converged payload shown");
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(b.clone())));
+    let s = d.snapshot();
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(105), "the view change leaves it shown (no display now)");
+    // an older Harris job for the old view: still refused (it does not answer B)
+    let s = feed(&mut d, side_payload(4, SideKind::Harris, p.clone(), 104), &a);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(105));
+    // B's Harris payload at the same geometry: shown, though A's converged one is there
+    let s = feed(&mut d, side_payload(6, SideKind::Harris, p.clone(), 106), &b);
+    assert_eq!((s.orbitals.as_ref().map(|o| o.rows[0].track), s.orbitals_side), (Some(106), Some(SideKind::Harris)), "B's Harris payload replaces A's converged one");
+    // among B's payloads the precedence holds: a converged one at p wins, a later Harris one does not replace it
+    let s = feed(&mut d, side_payload(7, SideKind::Refresh, p.clone(), 107), &b);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(107));
+    let s = feed(&mut d, side_payload(8, SideKind::Harris, p.clone(), 108), &b);
+    assert_eq!(s.orbitals.as_ref().map(|o| o.rows[0].track), Some(107), "converged beats Harris at the same geometry, for the same view");
+}
+
+/// A provider may hold a density job's display and a Harris one at once (an audit landed while a
+/// Harris job ran): both are taken in one tick — the density is the audit's, the orbitals the
+/// Harris job's (another geometry, newer job).
+#[test]
+fn both_side_displays_of_one_tick_are_taken() {
+    use crate::provider::{OrbitalKind, OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    let p = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.0, 1.2, 0.3]];
+    let moved: Vec<[f64; 3]> = p.iter().map(|r| [r[0] + 0.3, r[1], r[2]]).collect();
+    {
+        let mut l = log.lock().unwrap();
+        l.jobs = 6;
+        l.side.push_back(side_payload(5, SideKind::Audit, p.clone(), 105));
+        l.side.push_back(side_payload(6, SideKind::Harris, moved.clone(), 106));
+    }
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(log.lock().unwrap().side.is_empty(), "both taken in one tick");
+    let sd = s.side_display.as_ref().expect("the audit's density");
+    assert_eq!((sd.kind, &sd.positions), (SideKind::Audit, &p));
+    let o = s.orbitals.as_ref().expect("orbitals");
+    assert_eq!((o.rows[0].track, &o.positions), (106, &moved), "the Harris job's: another geometry, newer");
+    assert_ne!(o.kind, OrbitalKind::Converged);
+    assert_eq!(s.orbitals_side, Some(SideKind::Harris));
 }
 
 /// Task 4 review I2: the driver hands its display interrupt to the provider (for display work
@@ -2956,7 +3112,7 @@ impl ShareRecorder {
         };
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(), unoccupied: None, notes: Vec::new(),
-            what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: fit.then_some(z),
+            what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom, share_z: fit.then_some(z), kind: crate::provider::OrbitalKind::Converged,
         })
     }
 }

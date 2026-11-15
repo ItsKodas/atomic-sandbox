@@ -1056,6 +1056,7 @@ mod tests {
             what,
             lone_atom: LoneAtomLabels::NotLoneAtom,
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 

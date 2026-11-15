@@ -31,6 +31,9 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// the cloud is drawn at this fraction and labelled with the time it was solved at.
 pub const SURROGATE_DENSITY_FADE: f32 = 0.3;
 
+/// A display solve's per-atom input goes to the Log panel at most this often (`Viewer::log_harris_input`).
+const HARRIS_INPUT_LOG_EVERY: Duration = Duration::from_secs(30);
+
 /// The atomic superposition is rebuilt at most this often (≈ 30 Hz: a 49³ build is ~1–3 ms on
 /// the render thread).
 const SUPERPOSITION_EVERY: Duration = Duration::from_millis(33);
@@ -108,6 +111,7 @@ impl DensityShown {
             source: match sd.kind {
                 sim::SideKind::Audit => DensitySource::Audit,
                 sim::SideKind::Refresh => DensitySource::Refresh,
+                sim::SideKind::Harris => unreachable!("a Harris job carries no density"),
             },
             superposition: None,
         };
@@ -159,27 +163,53 @@ pub const ORBITALS_CPU_TEACHER: &str = "the estimated solver on the CPU has no b
 /// The orbitals on screen (orbital-viewer spec §7): mirrors [`DensityShown`]. A payload from a
 /// background solve of the estimated solver (`DynSnapshot::orbitals_side`) is real but not the
 /// current step's — the estimated solver has no electrons — so it is drawn faded and labelled with
-/// the time it was solved at.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// the time it was solved at. A Harris display solve's payload (live-orbitals spec §4.3, §6) is
+/// not faded while it is at the current positions (it is current), and always carries its own
+/// label ([`ui::orbital_tab::harris_label`]): what was solved and that it is not self-consistent.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrbitalShown {
     /// Simulated time (fs) of the geometry the payload was solved at.
     pub from: Option<f64>,
     /// The payload is a background solve's: shown faded.
     pub faded: bool,
+    /// A Harris display solve's payload: its rescale factor and the density experience it used.
+    pub harris: Option<(f64, Option<sim::ExperienceUse>)>,
+    /// The payload was solved at the snapshot's positions (every nucleus within
+    /// [`sim::HARRIS_SAME_GEOMETRY`]).
+    pub current: bool,
+}
+
+/// Every nucleus within [`sim::HARRIS_SAME_GEOMETRY`] (the same count).
+fn same_positions(a: &[[f64; 3]], b: &[[f64; 3]]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(p, q)| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt() <= sim::HARRIS_SAME_GEOMETRY)
 }
 
 impl OrbitalShown {
     /// Follows a snapshot: its newest payload (none: the view is off, or nothing yet).
     pub fn follow(&mut self, d: &sim::DynSnapshot) {
         *self = match &d.orbitals {
-            Some(_) => OrbitalShown { from: Some(units::au_time_to_fs(d.orbitals_t)), faded: d.orbitals_side.is_some() },
+            Some(o) => {
+                let here: Vec<[f64; 3]> = d.scene.nuclei.iter().map(|n| n.pos).collect();
+                let harris = match &o.kind {
+                    sim::OrbitalKind::Harris { experience, rescale, .. } => Some((*rescale, experience.clone())),
+                    sim::OrbitalKind::Converged => None,
+                };
+                OrbitalShown { from: Some(units::au_time_to_fs(d.orbitals_t)), faded: d.orbitals_side.is_some(), harris, current: same_positions(&o.positions, &here) }
+            }
             None => OrbitalShown::default(),
         };
     }
 
-    /// The volume pass's fade factor: [`SURROGATE_DENSITY_FADE`] for a background solve's orbitals.
+    /// The volume pass's fade factor: [`SURROGATE_DENSITY_FADE`] for a background solve's orbitals,
+    /// except a Harris payload at the current positions (1: it is current).
     pub fn fade(&self) -> f32 {
-        if self.faded { SURROGATE_DENSITY_FADE } else { 1.0 }
+        match &self.harris {
+            Some(_) if self.current => 1.0,
+            Some(_) => SURROGATE_DENSITY_FADE,
+            None if self.faded => SURROGATE_DENSITY_FADE,
+            None => 1.0,
+        }
     }
 
     /// The text over the view in an orbital mode (`None`: nothing to say — the current step's own
@@ -196,17 +226,32 @@ impl OrbitalShown {
         if s.backend == Backend::Estimated && s.model.as_ref().is_some_and(|m| !m.audits_background) {
             return Some(ORBITALS_CPU_TEACHER.into());
         }
-        let Some(o) = d.orbitals.as_ref() else { return Some(ORBITALS_NEED_DFT.into()) };
+        // why no orbital display solve runs (waiting for the atoms, a pass): said first
+        let note = s.harris_note;
+        let Some(o) = d.orbitals.as_ref() else { return Some(note.unwrap_or(ORBITALS_NEED_DFT).into()) };
         if o.spin.n_up + o.spin.n_dn == 0 && o.rows.is_empty() {
             return Some(ORBITALS_NO_ELECTRONS.into());
         }
         if o.field.is_none() && ui.show != ui::ShowMode::Orbitals {
-            // refused (the GPU memory guard) or nothing to draw: the payload says why
-            return o.notes.first().cloned();
+            // refused (the GPU memory guard) or nothing to draw: the payload says why (the per-atom
+            // electrons of a display solve are for the log)
+            return o.notes.iter().find(|n| !n.starts_with(ui::orbital_tab::PER_ATOM_NOTE)).cloned();
         }
         let t = self.from?;
+        let with_note = |l: String| Some(match note {
+            Some(n) => format!("{n} — {l}"),
+            None => l,
+        });
+        if let Some((rescale, experience)) = &self.harris {
+            // a display solve's orbitals are always labelled (rule 7); in Spin density the field is its output
+            let mut l = ui::orbital_tab::harris_label(t, *rescale, experience.as_ref(), self.current);
+            if ui.show == ui::ShowMode::Spin {
+                l += &format!(". {}", ui::orbital_tab::HARRIS_DENSITY_NOTE);
+            }
+            return with_note(l);
+        }
         if self.faded {
-            return Some(format!("orbitals from t = {t:.2} fs (last DFT solve). The estimated solver has no electrons"));
+            return with_note(format!("orbitals from t = {t:.2} fs (last DFT solve). The estimated solver has no electrons"));
         }
         // paused on a geometry the payload was not solved at (an edit, a failed evaluation)
         let here: Vec<[f64; 3]> = d.scene.nuclei.iter().map(|n| n.pos).collect();
@@ -421,6 +466,8 @@ pub struct Viewer {
     orbital_sent: Option<sim::OrbitalViewRequest>,
     orbital_waiting: bool,
     orbital_at: [Option<Instant>; 2],
+    /// When a display solve's per-atom electrons were last logged, and the text ([`Viewer::log_harris_input`]).
+    harris_input_logged: Option<(Instant, String)>,
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
     /// last `run_ui`. The renderer and every mouse ↔ world path use it.
     pub viewport: Viewport,
@@ -530,6 +577,7 @@ impl Viewer {
             orbital_sent: None,
             orbital_waiting: false,
             orbital_at: [None, None],
+            harris_input_logged: None,
             viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
             auto_pass: true,
@@ -671,6 +719,11 @@ impl Viewer {
                 },
             });
             teach.push(self.ui.cloud_command());
+            // the Harris display's cadence and ⚠ Model only (`worker::harris`)
+            teach.push(self.ui.orbital_refresh_command());
+            if self.ui.model_only.is_some() {
+                teach.push(Command::SetModelOnly(true));
+            }
             if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
@@ -1567,6 +1620,9 @@ impl Viewer {
                     self.orbital_seq = Some(s.dynamics.orbitals_seq);
                     if new_orbitals {
                         self.orbital_waiting = false;
+                        if let Some(o) = &s.dynamics.orbitals {
+                            self.log_harris_input(o);
+                        }
                     }
                     if step_density {
                         self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
@@ -1992,6 +2048,21 @@ impl Viewer {
         self.rate.push_back((now, d.sim_time_fs()));
         while self.rate.front().is_some_and(|f| now - f.0 > RATE_WINDOW) {
             self.rate.pop_front();
+        }
+    }
+
+    /// A display solve's input, per atom: the on-grid electrons of each isolated-atom profile
+    /// before its renormalisation (`providers::harris::PER_ATOM_NOTE`; live-orbitals Task 4) — the
+    /// debug readout, never drawn in the panel. stderr and the Log panel at most once per
+    /// [`HARRIS_INPUT_LOG_EVERY`] (a playing view lands one every few seconds), and only when the
+    /// text changed since the last one logged.
+    fn log_harris_input(&mut self, o: &sim::OrbitalDisplay) {
+        let Some(n) = o.notes.iter().find(|n| n.starts_with(ui::orbital_tab::PER_ATOM_NOTE)) else { return };
+        let due = self.harris_input_logged.as_ref().is_none_or(|(t, last)| last != n && t.elapsed() >= HARRIS_INPUT_LOG_EVERY);
+        if due {
+            eprintln!("{n}");
+            self.ui.log.push(ui::logbook::LogKind::Note, n.clone());
+            self.harris_input_logged = Some((Instant::now(), n.clone()));
         }
     }
 
@@ -2996,6 +3067,7 @@ mod tests {
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,
@@ -3042,6 +3114,7 @@ mod tests {
                 engine: Backend::Gpu,
                 model: None,
                 atom_profiles: Default::default(),
+                harris_note: None,
                 edits,
                 driver_commands: 0,
                 commands: 0,
@@ -3108,6 +3181,7 @@ mod tests {
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,
@@ -3264,7 +3338,7 @@ mod tests {
         use sim::{OrbitalDisplay, OrbitalRequest, Spin};
         let payload = |what| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows: Vec::new(), field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
         };
         let empty = sim::BondGraph { bonds: Vec::new(), components: Vec::new(), step: 0, sim_time: 0.0, n_nuclei: 0 };
         let mut v = Viewer::new("h2").unwrap();
@@ -3544,6 +3618,7 @@ nucleus 1 {a} {} {}
                 engine: Backend::Gpu,
                 model: None,
                 atom_profiles: Default::default(),
+                harris_note: None,
                 edits: 0,
                 driver_commands: 0,
                 commands: 0,
@@ -4180,7 +4255,7 @@ nucleus 1 {a} {} {}
         };
         let payload = |what, rows| OrbitalDisplay {
             cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,
-            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
         };
         let mut v = pinned("h2");
         let mut d = sim::DynSnapshot::default();
@@ -4391,6 +4466,7 @@ nucleus 1 {a} {} {}
             engine: Backend::Gpu,
             model: None,
             atom_profiles: Default::default(),
+            harris_note: None,
             edits: 0,
             driver_commands: 0,
             commands: 0,

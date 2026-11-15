@@ -4622,7 +4622,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -5028,7 +5028,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -6541,7 +6541,7 @@ impl ForceProvider for Producer {
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
                 field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
             });
         }
         Ok(r)
@@ -8443,7 +8443,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -8469,7 +8469,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
@@ -11355,6 +11355,9 @@ mod fence_lift;
 /// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
 /// the stored scenes, a measurement only (`scope_measure.rs`).
 mod scope_measure;
+
+/// Live-orbitals Task 5: the background auditor's Harris display job (`harris.rs`).
+mod harris;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

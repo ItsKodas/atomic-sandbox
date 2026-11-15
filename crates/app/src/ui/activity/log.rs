@@ -444,6 +444,18 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
     });
 }
 
+/// A display solve's "what" cell and its hover: the unoccupied eigensolve on the converged state,
+/// or an orbital display solve (Harris; live-orbitals Task 4 review M6: its own words).
+pub fn display_words(job: sim::DisplayJob) -> (String, &'static str) {
+    match job {
+        sim::DisplayJob::Unoccupied(m) => (
+            format!("{m} unoccupied per spin"),
+            "the display eigensolve: the lowest unoccupied orbitals on the converged state of the last DFT step, for the Orbitals view only — it never feeds the solve, so it is not a teaching solve and no counter counts it",
+        ),
+        sim::DisplayJob::Harris => ("orbital display solve (not self-consistent)".to_string(), super::jobs::HARRIS_JOB_WHY),
+    }
+}
+
 /// A display eigensolve's row: "orbitals" in the origin column, the orbitals it solved for, and
 /// its wall time in the solve column; no step, outcome or |ΔE| (it is not a teaching solve).
 fn display_row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &DisplayRow, widths: &[f32; 7], mono: &FontId, prop: &FontId) {
@@ -461,10 +473,14 @@ fn display_row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &DisplayRow, widths: &[
         }
     };
     col(ui, 0, &clock(r.at), mono, theme::INK_DIM, Some(format!("{:.1} s into the session (when it ended)", r.at.as_secs_f64())));
-    col(ui, 1, "—", mono, theme::INK_DIM, Some("display work after a DFT step, not a step's solve".into()));
+    let when = match d.job {
+        sim::DisplayJob::Unoccupied(_) => "display work after a DFT step, not a step's solve",
+        sim::DisplayJob::Harris => "display work between DFT solves, not a step's solve",
+    };
+    col(ui, 1, "—", mono, theme::INK_DIM, Some(when.into()));
     col(ui, 2, "orbitals", prop, theme::INK_DIM, None);
-    let what = format!("{} unoccupied per spin", d.unoccupied);
-    col(ui, 3, &what, prop, theme::INK, Some("the display eigensolve: the lowest unoccupied orbitals on the converged state of the last DFT step, for the Orbitals view only — it never feeds the solve, so it is not a teaching solve and no counter counts it".into()));
+    let (what, hover) = display_words(d.job);
+    col(ui, 3, &what, prop, theme::INK, Some(hover.into()));
     let (outcome, colour, why) = if d.interrupted {
         ("stopped", AMBER, "a command arrived (an edit, Play, a slider) and the eigensolve yielded to it; it runs again later")
     } else {
